@@ -142,7 +142,7 @@ From the workspace root, run:
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=$(pwd) \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project /path/to/devbench devbench notify-test --event work_unit_done
 ```
 

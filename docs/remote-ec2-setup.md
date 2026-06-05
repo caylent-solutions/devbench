@@ -119,7 +119,7 @@ Inside the session, set the same per-backlog env vars the laptop launch commands
 
 ```bash
 export DEVBENCH_WORKSPACE_ROOT=/workspaces/<your-spec-repo>
-export DEVBENCH_CLAUDE_MODEL=claude-opus-4-7
+export DEVBENCH_CLAUDE_MODEL=claude-opus-4-8
 export DEVBENCH_ORCHESTRATOR_SESSION_ID=<unique-session-id>     # E230 hook-tail filter
 ```
 
@@ -131,7 +131,7 @@ Three panes (tmux is the usual harness):
 
 1. **Orchestrator pane** -- the interactive Claude session.
    ```bash
-   PATH=... DEVBENCH_CLAUDE_MODEL=claude-opus-4-7 DEVBENCH_WORKSPACE_ROOT=$DEVBENCH_WORKSPACE_ROOT \
+   PATH=... DEVBENCH_CLAUDE_MODEL=claude-opus-4-8 DEVBENCH_WORKSPACE_ROOT=$DEVBENCH_WORKSPACE_ROOT \
      DEVBENCH_ORCHESTRATOR_SESSION_ID=$DEVBENCH_ORCHESTRATOR_SESSION_ID \
      claude --plugin-dir /path/to/devbench/plugin/devbench --dangerously-skip-permissions
    ```

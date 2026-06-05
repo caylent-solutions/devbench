@@ -43,7 +43,7 @@ This file contains a `claudeAiOauth` object with an `accessToken` that has the `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEVBENCH_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Path to the Claude Code credentials file |
-| `DEVBENCH_CLAUDE_MODEL` | *(required)* | SDK caller's model -- governs the orchestrate skill's coordination calls (e.g. `claude-opus-4-7`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)) and default to each agent's `.md` frontmatter. |
+| `DEVBENCH_CLAUDE_MODEL` | *(required)* | SDK caller's model -- governs the orchestrate skill's coordination calls (e.g. `claude-opus-4-8`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)) and default to each agent's `.md` frontmatter. |
 | `DEVBENCH_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
 
 ### Verifying Authentication
@@ -125,13 +125,13 @@ When `DEVBENCH_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock`
 |----------|---------|-------------|
 | `DEVBENCH_USE_BEDROCK` | `false` | Set to `1`, `true`, or `yes` to enable Bedrock |
 | `DEVBENCH_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock API calls (falls back to `AWS_REGION`) |
-| `DEVBENCH_CLAUDE_MODEL` | *(required)* | SDK caller's Bedrock model ID -- governs the orchestrate skill's coordination calls (e.g. `us.anthropic.claude-opus-4-7-v1`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)). |
+| `DEVBENCH_CLAUDE_MODEL` | *(required)* | SDK caller's Bedrock model ID -- governs the orchestrate skill's coordination calls (e.g. `us.anthropic.claude-opus-4-8-v1`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)). |
 | `DEVBENCH_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
 
 ### Usage
 
 ```bash
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 DEVBENCH_USE_BEDROCK=1 \
 DEVBENCH_BEDROCK_REGION=us-east-1 \
 make start
@@ -143,7 +143,7 @@ mode -- non-interactive is the recommended default.)
 ### Verifying Authentication
 
 ```bash
-DEVBENCH_USE_BEDROCK=1 DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_USE_BEDROCK=1 DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 python3 -c "
 from devbench.config import USE_BEDROCK, BEDROCK_REGION
 print(f'Bedrock enabled: {USE_BEDROCK}')
@@ -204,8 +204,8 @@ agents:
 
 Every field defaults to `null` when absent (the agent runs on its frontmatter model). The values must match your authentication channel:
 
-- `use_bedrock: false` -- short names (`opus` / `sonnet`) or full Anthropic API ids (`claude-opus-4-7`, `claude-sonnet-4-6`).
-- `use_bedrock: true` -- full Bedrock ARNs (`us.anthropic.claude-opus-4-7-v1`, `us.anthropic.claude-sonnet-4-6-v1`).
+- `use_bedrock: false` -- short names (`opus` / `sonnet`) or full Anthropic API ids (`claude-opus-4-8`, `claude-sonnet-4-6`).
+- `use_bedrock: true` -- full Bedrock ARNs (`us.anthropic.claude-opus-4-8-v1`, `us.anthropic.claude-sonnet-4-6-v1`).
 
 Mismatches fail fast at config-load time with an actionable error message, rather than as a generic 401/404 on the first agent invocation.
 

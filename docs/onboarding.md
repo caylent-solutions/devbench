@@ -211,7 +211,7 @@ tasks are promoted to `in-queue`, launch DevBench:
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -298,7 +298,7 @@ uv run --project $DEVBENCH_DIR devbench promote --epic E1
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/payment-service-ws \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -332,7 +332,7 @@ To process only a subset of the backlog:
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/payment-service-ws \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project $DEVBENCH_DIR devbench start --include "E1-E3"
 ```
 

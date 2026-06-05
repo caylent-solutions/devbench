@@ -72,7 +72,7 @@ Once Backlog B's 14 modules are tagged on terraform-modules main, the operator r
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=/workspaces/rpm-migration/caylent-telemetry-spec \
-DEVBENCH_CLAUDE_MODEL=claude-opus-4-7 \
+DEVBENCH_CLAUDE_MODEL=claude-opus-4-8 \
 uv run --project /workspaces/rpm-migration/devbench \
   devbench set-status E0-F4-S1-T1 done
 uv run --project /workspaces/rpm-migration/devbench \

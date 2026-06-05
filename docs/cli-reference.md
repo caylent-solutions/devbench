@@ -12,7 +12,7 @@ uv run devbench <command> [args]
 Two environment variables MUST be set before any command runs; commands that depend on them exit non-zero with a clear message when unset:
 
 - `DEVBENCH_WORKSPACE_ROOT` -- absolute path to the backlog workspace (contains `BACKLOG.md`, `backlog/`, `.devbench/`).
-- `DEVBENCH_CLAUDE_MODEL` -- SDK caller's model id (example: `us.anthropic.claude-opus-4-7-v1`). Governs the orchestrate skill's coordination calls only. Per-agent work models live in the `agents:` block of `devbench.yaml` (see [ADR-25](adr/25-per-agent-model-overrides.md)).
+- `DEVBENCH_CLAUDE_MODEL` -- SDK caller's model id (example: `us.anthropic.claude-opus-4-8-v1`). Governs the orchestrate skill's coordination calls only. Per-agent work models live in the `agents:` block of `devbench.yaml` (see [ADR-25](adr/25-per-agent-model-overrides.md)).
 
 Optional: `--config <path>` (or `DEVBENCH_CONFIG_PATH` env var) overrides the default `backlog/config/devbench.yaml` lookup.
 
@@ -663,7 +663,7 @@ agents:
     changes_manifest: opus
 ```
 
-Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`) or an Anthropic API id (`claude-opus-4-7`). `haiku` is rejected at config-load time for all per-agent fields (caylent-solutions/devbench#198). `DEVBENCH_AGENT_MODEL_<NAME>` env vars (e.g. `DEVBENCH_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
+Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`) or an Anthropic API id (`claude-opus-4-8`). `haiku` is rejected at config-load time for all per-agent fields (caylent-solutions/devbench#198). `DEVBENCH_AGENT_MODEL_<NAME>` env vars (e.g. `DEVBENCH_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
 
 ---
 

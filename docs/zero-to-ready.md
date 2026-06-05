@@ -177,7 +177,7 @@ Set the required environment variables in your shell profile or before each invo
 
 - `export DEVBENCH_USE_BEDROCK=1`
 - `export DEVBENCH_BEDROCK_REGION=us-east-1`
-- `export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1`
+- `export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1`
 
 Verify AWS auth with `aws sts get-caller-identity`. Expected output: a JSON object with
 `UserId`, `Account`, and `Arn`. If this command fails, resolve AWS credentials before
@@ -602,12 +602,12 @@ Pass `--include` (and optionally `--exclude`) to `devbench start`:
 ```bash
 # Run only epics E1 through E3 plus E5:
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project $DEVBENCH_DIR devbench start --include "E1-E3, E5"
 
 # Run E1 through E10 but skip E5 and everything under E7-F3:
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project $DEVBENCH_DIR devbench start \
   --include "E1-E10" --exclude "E5, E7-F3"
 ```
@@ -638,7 +638,7 @@ uv run --project $DEVBENCH_DIR devbench scope show
 
 # Step 3: Launch interactive Claude Code; the orchestrate skill respects scope.json:
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 claude --dangerously-skip-permissions \
   --plugin-dir $DEVBENCH_DIR/plugin/devbench
 
@@ -723,7 +723,7 @@ uv run --project $DEVBENCH_DIR devbench drain --reason "single-WU test run"
 
 # Step 2: start the orchestrator; it will process one WU then exit:
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -743,7 +743,7 @@ via environment variables:
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project $DEVBENCH_DIR devbench validate-backlog
 ```
 
@@ -789,7 +789,7 @@ itself is the right place to manage the run, not a live console session.
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -810,17 +810,17 @@ the same workspace:
 ```bash
 # Terminal 2: every tool call, judge verdict, status transition streamed live.
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project $DEVBENCH_DIR devbench hook-tail
 
 # Terminal 3: live progress dashboard (epic counts, judges, CI, cost).
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run --project $DEVBENCH_DIR devbench report
 
 # Terminal 4 (optional): low-frequency status snapshot.
 cd ~/my-workspace && watch -n 60 \
-  'DEVBENCH_WORKSPACE_ROOT=$PWD DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+  'DEVBENCH_WORKSPACE_ROOT=$PWD DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
    uv run --project $DEVBENCH_DIR devbench status'
 ```
 
@@ -909,7 +909,7 @@ and write files without per-tool confirmation):
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 make -C $DEVBENCH_DIR start-interactive
 ```
 
@@ -918,7 +918,7 @@ each file operation -- slower but safer if you want to watch each tool call conf
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 DEVBENCH_SAFE_PERMISSIONS=1 \
 make -C $DEVBENCH_DIR start-interactive
 ```

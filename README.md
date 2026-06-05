@@ -191,7 +191,7 @@ make clean                # Remove caches
 Two environment variables MUST be set before any command runs (otherwise startup exits non-zero):
 
 - `DEVBENCH_WORKSPACE_ROOT` -- absolute path to the workspace containing `BACKLOG.md` and `backlog/`.
-- `DEVBENCH_CLAUDE_MODEL` -- model identifier (for example, `us.anthropic.claude-opus-4-7-v1`).
+- `DEVBENCH_CLAUDE_MODEL` -- model identifier (for example, `us.anthropic.claude-opus-4-8-v1`).
 
 Everything else is optional. Per-repo settings, git-ops mode, stop-hook tuning, token pricing, and reporting timezone all live in `backlog/config/devbench.yaml` (relative to `DEVBENCH_WORKSPACE_ROOT`). Override the default lookup with the `--config <path>` CLI flag or `DEVBENCH_CONFIG_PATH` env var.
 
@@ -213,7 +213,7 @@ For the full annotated YAML, value-resolution precedence, and every config key, 
 - **Draft status default** (control whether newly created work units land in `draft` or `in-queue`; `draft` requires explicit `devbench promote` before the orchestrator can claim the task): set `backlog.default_status_for_new_work_units` in `devbench.yaml`. Default `in-queue` preserves backwards compatibility. See [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md).
 - **HOLD lifecycle** (`devbench hold <id>` / `devbench unhold <id>`): tasks deliberately deferred without breaking dep-chain math.
 - **Display timezone** in `devbench report` and `devbench hook-tail`: set `report.display_timezone` (IANA zone name) in `devbench.yaml`, or override per invocation via `DEVBENCH_REPORT_TIMEZONE`. See [model-pricing.md](docs/model-pricing.md#other-settings-under-report).
-- **Per-model token pricing** (needed when you run anything other than Opus 4.7): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.
+- **Per-model token pricing** (needed when you run anything other than Opus 4.8): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.
 - **Cost premium multipliers**: `report.data_residency_multiplier` (default 1.10) and `report.fast_mode_multiplier` (default 6.0) are applied per-call to the residency-flagged / fast-mode token subsets. Composes with cache + base-rate multipliers, applies before the `report.token_cost_discount` (issue #124).
 - **Hook-tail column caps**: tune `hook_tail.agent_width`, `hook_tail.tool_width`, `hook_tail.description_max` (default 120), `hook_tail.stdout_preview_max` in `devbench.yaml`, or override via `DEVBENCH_HOOK_TAIL_*` env vars (issue #134).
 - **Slack notifications** (operator pings on work-unit done/blocked, PR opened/merged, orchestrator stop, etc.): each lifecycle event is a separate toggle under `notifications.events.*`. Webhook URL + Slack user id flow via env vars so secrets never touch the yaml. See [docs/slack-notifications.md](docs/slack-notifications.md) for the full setup walkthrough.
@@ -292,13 +292,13 @@ repos:
 # Shell 1: start interactive session
 cd /path/to/devbench && \
   DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
-  DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+  DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
   claude --plugin-dir plugin/devbench
 
 # Shell 2: watch progress
 cd /path/to/devbench && watch -n 30 \
   'DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
-   DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+   DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
    uv run devbench status'
 ```
 
@@ -312,7 +312,7 @@ The `make start-interactive` and `make start` targets are thin wrappers. If you 
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 claude --dangerously-skip-permissions --plugin-dir /path/to/devbench/plugin/devbench
 ```
 
@@ -320,7 +320,7 @@ claude --dangerously-skip-permissions --plugin-dir /path/to/devbench/plugin/devb
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 claude --plugin-dir /path/to/devbench/plugin/devbench
 ```
 
@@ -330,7 +330,7 @@ Setting `DEVBENCH_SAFE_PERMISSIONS=1` when invoking `make start-interactive` sel
 
 ```bash
 DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
-DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-8-v1 \
 uv run python -m devbench.cli start
 ```
 

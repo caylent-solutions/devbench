@@ -6497,39 +6497,25 @@ def cmd_start(*argv: str) -> int:
                 tool-use is observed.
         """
         nonlocal _sdk_result_text
-        # Issue #232: install the SDK-teardown exception filter so the
-        # known cross-task cancel-scope RuntimeError raised by
-        # claude-agent-sdk Query.close() during session shutdown is
-        # downgraded to a WARNING (with a link to the upstream tracking
-        # issue #231) instead of surfacing as
-        # ``[asyncio] ERROR Task exception was never retrieved`` AFTER
-        # the orchestrator has already exited successfully. The context
-        # manager installs the filter on enter and uninstalls on exit;
-        # the single ``async with`` keeps this function's branch count
-        # flat (no extra ``try / finally`` branches in this scope, so
-        # the existing ruff PLR0912 12-branch cap is preserved).
-        from devbench.sdk_teardown_filter import guard as _sdk_teardown_guard
-
-        async with _sdk_teardown_guard():
-            async for message in query(
-                prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-                options=ClaudeAgentOptions(
-                    plugins=[{"type": "local", "path": str(plugin_path)}],
-                    permission_mode="bypassPermissions",
-                ),
-            ):
-                logger.info("sdk message: %s", message)
-                _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                if _log_terminal_exit_if_applicable(_sdk_result_text):
-                    return
-                # Issue #188 + #212: drain-on-claim short-circuit. Combined
-                # condition (rather than nested ifs) keeps ``_run`` under
-                # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
-                # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
-                if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
-                    raise _DrainRequested(drain_state.reason)
-            # Clean exit from the SDK loop -- done.
-            return
+        async for message in query(
+            prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
+            options=ClaudeAgentOptions(
+                plugins=[{"type": "local", "path": str(plugin_path)}],
+                permission_mode="bypassPermissions",
+            ),
+        ):
+            logger.info("sdk message: %s", message)
+            _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+            if _log_terminal_exit_if_applicable(_sdk_result_text):
+                return
+            # Issue #188 + #212: drain-on-claim short-circuit. Combined
+            # condition (rather than nested ifs) keeps ``_run`` under
+            # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
+            # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
+            if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
+                raise _DrainRequested(drain_state.reason)
+        # Clean exit from the SDK loop -- done.
+        return
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop

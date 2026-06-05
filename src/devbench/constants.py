@@ -497,6 +497,7 @@ class ModelRates:
 # transcript ``message.model`` field (e.g. ``claude-opus-4-7``, NOT
 # ``us.anthropic.claude-opus-4-7-v1``).
 DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
+    "claude-opus-4-8": ModelRates(input=5.0, output=25.0),
     "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
     "claude-opus-4-6": ModelRates(input=5.0, output=25.0),
     "claude-opus-4-5": ModelRates(input=5.0, output=25.0),
@@ -512,7 +513,7 @@ DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
 
 # Rates applied to the ``"<unknown>"`` aggregation bucket: any transcript
 # message whose ``model`` field is missing, or any model id that does not
-# appear in the loaded ``report.models`` table. Default mirrors Opus 4.7 list
+# appear in the loaded ``report.models`` table. Default mirrors Opus 4.8 list
 # so devbench errs on the conservative (over-report) side -- under-reporting
 # is the operator-pain failure mode #223 is filed against.
 DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)

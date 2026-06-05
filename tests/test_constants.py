@@ -372,6 +372,56 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
         assert "sonnet" in ALLOWED_AGENT_MODEL_SHORT_NAMES
 
 
+class TestDefaultModelRatesOpus48:
+    """AC-254-2: DEFAULT_MODEL_RATES contains claude-opus-4-8 entry and mirror comment is updated."""
+
+    @pytest.mark.unit
+    def test_opus_48_in_default_model_rates(self) -> None:
+        """DEFAULT_MODEL_RATES['claude-opus-4-8'] equals ModelRates(input=5.0, output=25.0)."""
+        from devbench.constants import DEFAULT_MODEL_RATES, ModelRates
+
+        assert "claude-opus-4-8" in DEFAULT_MODEL_RATES, (
+            "claude-opus-4-8 must be present in DEFAULT_MODEL_RATES (AC-254-2)"
+        )
+        assert DEFAULT_MODEL_RATES["claude-opus-4-8"] == ModelRates(input=5.0, output=25.0), (
+            "claude-opus-4-8 rate must be ModelRates(input=5.0, output=25.0) per D-254-1"
+        )
+
+    @pytest.mark.unit
+    def test_mirror_comment_reads_opus_48(self) -> None:
+        """The fallback mirror comment in constants.py reads 'mirrors Opus 4.8 list'."""
+        import inspect
+
+        import devbench.constants as _c
+
+        source = inspect.getsource(_c)
+        assert "mirrors Opus 4.8 list" in source, (
+            "The fallback comment must read 'mirrors Opus 4.8 list' after the update (AC-254-2)"
+        )
+        assert "mirrors Opus 4.7 list" not in source, (
+            "The stale 'mirrors Opus 4.7 list' comment must be replaced with 'mirrors Opus 4.8 list'"
+        )
+
+    @pytest.mark.unit
+    def test_existing_opus_entries_retained(self) -> None:
+        """AC-254a-1: 4.7/4.6/4.5 rate entries are retained unchanged."""
+        from devbench.constants import DEFAULT_MODEL_RATES, ModelRates
+
+        assert DEFAULT_MODEL_RATES["claude-opus-4-7"] == ModelRates(input=5.0, output=25.0)
+        assert DEFAULT_MODEL_RATES["claude-opus-4-6"] == ModelRates(input=5.0, output=25.0)
+        assert DEFAULT_MODEL_RATES["claude-opus-4-5"] == ModelRates(input=5.0, output=25.0)
+
+    @pytest.mark.unit
+    def test_issue_223_clause_preserved(self) -> None:
+        """AC-254a-1: The #223 clause is preserved verbatim in the fallback comment."""
+        import inspect
+
+        import devbench.constants as _c
+
+        source = inspect.getsource(_c)
+        assert "#223" in source, "The #223 clause must be preserved in the fallback comment (AC-254a-1)"
+
+
 class TestSkillIterateUntilPerfectConstants:
     """Issue #204: constants that bound the skill iterate-until-perfect loop."""
 

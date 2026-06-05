@@ -480,3 +480,9 @@ Edit the work unit `.md` file, change `## Status: done` to `## Status: in-queue`
 ### I rejected a proposal and it came back
 
 Fixed by [ADR-09](docs/adr/09-idempotent-materialise-proposal.md). If you see resurrection after ADR-09 shipped, report it as a regression (the resurrection-guard test in `tests/test_cli.py::TestCmdSweepProposalsResurrectionGuard` would have failed).
+
+## License
+
+devbench is licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+The software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied (Apache-2.0 Section 7, Disclaimer of Warranty), and the contributors' liability is limited as described in Apache-2.0 Section 8 (Limitation of Liability). You assume all risk associated with your use or redistribution of the software.

@@ -6,6 +6,10 @@ build-backend = "hatchling.build"
 name = "devbench"
 version = "0.1.0"
 description = "Autonomous SDLC orchestration system"
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.84.0",

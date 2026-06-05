@@ -4118,6 +4118,27 @@ class TestPerModelHelpersCoverage:
         result = _per_model_totals_from_aggregator(empty, None, datetime(2026, 1, 1, tzinfo=UTC))
         assert result == {}
 
+    def test_resolve_rates_for_model_opus_4_8(self) -> None:
+        """AC-254-5: claude-opus-4-8 resolves to $5 input / $25 output per MTok.
+
+        Anthropic model catalog -- https://docs.anthropic.com/en/docs/about-claude/models
+        4.8 list pricing matches 4.7 ($5/$25 per MTok).
+        """
+        from devbench.reporting.report import (
+            REPORT_CACHE_READ_MULTIPLIER,
+            REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+            REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+            _resolve_rates_for_model,
+        )
+
+        in_r, out_r, c_read, c_5m, c_1h, corr = _resolve_rates_for_model("claude-opus-4-8")
+        assert in_r == 5.0
+        assert out_r == 25.0
+        assert c_read == REPORT_CACHE_READ_MULTIPLIER
+        assert c_5m == REPORT_CACHE_WRITE_5MIN_MULTIPLIER
+        assert c_1h == REPORT_CACHE_WRITE_1HR_MULTIPLIER
+        assert corr == 1.0
+
 
 @pytest.mark.unit
 class TestByRolePanel:

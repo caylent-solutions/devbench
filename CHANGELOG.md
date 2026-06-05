@@ -89,6 +89,17 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **claude-opus-4-8 model support** (issue #254d). `DEFAULT_MODEL_RATES` and
+  `REPORT_MODEL_RATES` now include `claude-opus-4-8` priced at $5.00 input /
+  $25.00 output per MTok -- identical to claude-opus-4-7 list pricing.
+  `validate_agent_model_value` accepts both the Anthropic API form
+  (`claude-opus-4-8`) and the Bedrock cross-region inference form
+  (`us.anthropic.claude-opus-4-8-v1`) without any changes to the validation
+  patterns; the existing `ANTHROPIC_AGENT_MODEL_PATTERN` and
+  `BEDROCK_AGENT_MODEL_PATTERN` regexes already match the 4.8 ids.
+  Source: Anthropic model catalog --
+  https://docs.anthropic.com/en/docs/about-claude/models
+
 - **`spec-to-backlog` append-mode `BACKLOG.md` regeneration**
   (issue #225). Materialising a new spec on top of an existing
   populated backlog (E17+ on top of E1-E16) previously required the

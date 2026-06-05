@@ -6,7 +6,7 @@ Skipped by default (CI does not have the workspace). Enable with
 
     DEVBENCH_INTEGRATION_TEST=1 \
     DEVBENCH_WORKSPACE_ROOT=/workspaces/rpm-migration/kanon-migration-backlog \
-    DEVBENCH_CLAUDE_MODEL=claude-opus-4-7 \
+    DEVBENCH_CLAUDE_MODEL=claude-opus-4-8 \
         uv run pytest tests/test_integration/ -v
 
 This is the "bet your life" verification. Every numeric value the report

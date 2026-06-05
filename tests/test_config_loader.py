@@ -3179,6 +3179,57 @@ class TestHaikuRejectionValidatorHelper:
 
 
 # ---------------------------------------------------------------------------
+# Opus 4.8 acceptance -- AC-254-1 (issue #254d)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOpus48Acceptance:
+    """AC-254-1: validate_agent_model_value accepts both claude-opus-4-8 and
+    its Bedrock cross-region inference id us.anthropic.claude-opus-4-8-v1,
+    and rejects a bad id with the existing verbatim message.
+
+    Source: Anthropic model catalog -- https://docs.anthropic.com/en/docs/about-claude/models
+    4.8 list pricing matches 4.7 ($5 input / $25 output per MTok).
+    """
+
+    def test_short_anthropic_id_accepted(self) -> None:
+        """claude-opus-4-8 (Anthropic API form) passes when use_bedrock=False."""
+        from devbench.config_loader import validate_agent_model_value
+
+        # Must not raise.
+        validate_agent_model_value("yaml", "executor", "claude-opus-4-8", False)
+
+    def test_bedrock_id_accepted(self) -> None:
+        """us.anthropic.claude-opus-4-8-v1 (Bedrock form) passes when use_bedrock=True."""
+        from devbench.config_loader import validate_agent_model_value
+
+        # Must not raise.
+        validate_agent_model_value("yaml", "executor", "us.anthropic.claude-opus-4-8-v1", True)
+
+    def test_bad_id_rejected_with_verbatim_message(self) -> None:
+        """A clearly invalid id raises ValueError citing 'not a valid Anthropic API'."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="not a valid Anthropic API"):
+            validate_agent_model_value("yaml", "executor", "claude-opus-BADID", False)
+
+    @pytest.mark.parametrize(
+        ("model_id", "use_bedrock"),
+        [
+            ("claude-opus-4-8", False),
+            ("us.anthropic.claude-opus-4-8-v1", True),
+        ],
+    )
+    def test_parametrized_4_8_forms_accepted(self, model_id: str, use_bedrock: bool) -> None:
+        """Both 4.8 id forms pass validate_agent_model_value without raising."""
+        from devbench.config_loader import validate_agent_model_value
+
+        # Must not raise for either form.
+        validate_agent_model_value("yaml", "executor", model_id, use_bedrock)
+
+
+# ---------------------------------------------------------------------------
 # SkillsConfig -- issue #221 E1-E10 (application-agnostic SKILL.md + config)
 # ---------------------------------------------------------------------------
 

@@ -387,17 +387,141 @@ Validate `slack.webhook_url` (when present) starts with `https://`. Validate eve
 
 ---
 
-## Step 16 -- Final validation and write
+## Step 16 -- log_file (top-level scalar)
+
+The `log_file:` top-level field declares the workspace-relative path to the orchestrator's aggregate log file. Both the writer (`setup_logging`) and the readers (`devbench report`, `devbench hook-tail`) consult this single source of truth so they cannot diverge across shell sessions.
+
+Ask the operator:
+
+> "log_file [default: logs/orchestrator.log]: Workspace-relative path to the orchestrator's aggregate log file.
+>
+>   Leave blank to accept the default. The path is resolved relative to DEVBENCH_WORKSPACE_ROOT when not absolute.
+>   Override at runtime via the DEVBENCH_LOG_FILE environment variable (env takes precedence over this field).
+>   Named sessions additionally write a per-session log at .devbench/sessions/<name>/orchestrator.log
+>   (accessible via 'devbench report --session <name>').
+>
+>   Example: logs/orchestrator.log (the default)"
+
+Reject any path that is absolute (starts with `/`). Prompt the operator to supply a workspace-relative path instead:
+
+> "[INVALID] log_file must be a workspace-relative path (no leading /). Re-enter."
+
+---
+
+## Step 17 -- report section
+
+The `report:` section configures per-model token pricing and cost-estimation knobs. Operators typically populate the `models:` block from `docs/model-pricing.md`'s Standard pricing table.
+
+Ask the operator:
+
+> "Section: report (token pricing and cost estimation; leave blank to skip and keep defaults)
+>
+>   models -- Per-model token pricing table. For each Claude model id (e.g.
+>              claude-sonnet-4-6) you want to track separately, supply:
+>                input   -- USD per 1M input tokens
+>                output  -- USD per 1M output tokens
+>              Optional per-entry fields:
+>                cache_read_multiplier      -- per-model cache-read cost factor
+>                cache_write_5min_multiplier
+>                cache_write_1hr_multiplier
+>                correction_factor          -- contract correction factor (> 0, default 1.0)
+>              Operators with a single model may leave models empty and rely on default_model.
+>
+>   default_model -- Rates applied to any model id not present in models, or to
+>                    messages whose model field is missing. [default: input=5.0, output=25.0]
+>
+>   cache_read_multiplier          -- Global cache-read cost multiplier [default: 0.10]
+>   cache_write_5min_multiplier    -- 5-minute cache-write multiplier [default: 1.25]
+>   cache_write_1hr_multiplier     -- 1-hour cache-write multiplier [default: 2.0]
+>   data_residency_multiplier      -- Multiplier when usage.inference_geo is set (US-only inference) [default: 1.10]
+>   fast_mode_multiplier           -- Multiplier when usage.speed == 'fast' (Opus fast-mode) [default: 6.0]
+>   recent_pace_tasks              -- Number of most recently completed tasks to average for Recent pace projection [default: 10]
+>   display_timezone               -- Report-specific IANA timezone (falls back to top-level display_timezone and then OS local)"
+
+Validate each provided multiplier / rate value is a non-negative float. Reject with:
+
+> "[INVALID] <field> must be a non-negative number. Re-enter."
+
+Validate `correction_factor` (when provided) is strictly greater than 0. Reject with:
+
+> "[INVALID] correction_factor must be > 0. Re-enter."
+
+Validate `display_timezone` (when provided) is a non-empty string; the final round-trip validation will catch unrecognised zone names.
+
+---
+
+## Step 18 -- orchestrate section
+
+The `orchestrate:` section controls orchestrator runtime tuning knobs.
+
+Ask the operator:
+
+> "Section: orchestrate (orchestrator runtime tuning; leave blank to use built-in defaults)
+>
+>   max_cascade_depth -- Cap on recovery-of-a-recovery cascade depth. When a
+>                        proposal would land at depth >= this cap, the source task
+>                        transitions to NEEDS_OPERATOR_ATTENTION instead of
+>                        materialising another recovery layer.
+>                        [integer >= 1, default: 2]
+>                        Override at runtime via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH."
+
+Validate the provided value (when not blank) is an integer >= 1. Reject with:
+
+> "[INVALID] orchestrate.max_cascade_depth must be an integer >= 1. Re-enter."
+
+---
+
+## Step 19 -- skills section
+
+The `skills:` section configures the bundled `spec-to-backlog` and `create-spec` authoring skills. Every field is optional; absent values fall through to skill-side defaults.
+
+Ask the operator:
+
+> "Section: skills (authoring-skill configuration; leave all blank to use skill-side defaults)
+>
+>   exemplar_backlog_path -- Workspace-relative or absolute path to a representative
+>                            BACKLOG.md the spec-to-backlog skill consults to
+>                            internalise the project's quality bar. Absent = skill
+>                            uses only the embedded canonical-section list.
+>                            (e.g. backlog/_exemplars/representative/BACKLOG.md)
+>
+>   exemplar_spec_path    -- Workspace-relative or absolute path to a representative
+>                            spec file the create-spec skill consults for its quality
+>                            bar. Absent = skill uses only the embedded 16-section
+>                            skeleton.
+>                            (e.g. spec/_exemplars/representative.md)
+>
+>   fan_out_threshold     -- When the Epic decomposition yields more than this many
+>                            leaf tasks, spec-to-backlog fans the per-task authoring
+>                            out across one sub-Agent per Feature instead of writing
+>                            tasks serially. [integer >= 1, default: 10]
+>
+>   max_iterations        -- Maximum self-critique iterations per skill invocation
+>                            before emitting a [SKILL_MAX_ITERATIONS_REACHED] audit
+>                            comment. [integer >= 1, default: 5]"
+
+Validate `fan_out_threshold` and `max_iterations` (when provided) are integers >= 1. Reject with:
+
+> "[INVALID] skills.<field> must be an integer >= 1. Re-enter."
+
+Reject any `exemplar_backlog_path` or `exemplar_spec_path` that contains `..` components with:
+
+> "[INVALID] exemplar path must not contain '..'. Re-enter."
+
+---
+
+## Step 20 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. Every section must be
 present in the emitted file regardless of whether the operator changed its
 values from the defaults -- include all sections (repos, merge_strategy,
-max_executor_retries, use_bedrock, bedrock_region, timeouts, limits, git_ops,
-task_factory, manifest_amendment, validate, stop_hook, hook_tail, debug,
-backlog, skills, quota_handling, agents, notifications) with their collected
-values or annotated defaults. This ensures the written file is a complete,
-self-documenting reference config whose values equal the loader defaults
-field-by-field for every section the operator accepted unchanged (AC-260-1).
+max_executor_retries, use_bedrock, bedrock_region, log_file, timeouts, limits,
+git_ops, task_factory, manifest_amendment, validate, stop_hook, hook_tail,
+debug, backlog, skills, orchestrate, report, quota_handling, agents,
+notifications) with their collected values or annotated defaults. This ensures
+the written file is a complete, self-documenting reference config whose values
+equal the loader defaults field-by-field for every section the operator
+accepted unchanged (AC-260-1).
 
 Run the full validation round-trip:
 
@@ -437,10 +561,14 @@ Report:
 >   repos:              <N repos configured>
 >   merge_strategy:     <value>
 >   use_bedrock:        <value>
+>   log_file:           <value or 'logs/orchestrator.log (default)'>
 >   git_ops:            single_branch=<value>, defer_pr=<value>, auto_finalize=<value>, auto_merge=<value>
 >   task_factory:       enabled=<value>, auto_accept_proposals=<value>
 >   manifest_amendment: enabled=<value>
 >   backlog:            default_status_for_new_work_units=<value>
+>   skills:             fan_out_threshold=<value>, max_iterations=<value>
+>   orchestrate:        max_cascade_depth=<value>
+>   report:             <N models configured>, default_model=input:<value>/output:<value>
 >   notifications:      enabled=<value>, events=<comma-separated list of enabled events>
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>
 >

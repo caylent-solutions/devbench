@@ -37,6 +37,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 - [Amendment workflow](#amendment-workflow)
 - [Proposal workflow (task factory)](#proposal-workflow-task-factory)
 - [Environment migration](#environment-migration)
+- [configure-devbench skill](#configure-devbench-skill)
 
 ---
 
@@ -1352,3 +1353,78 @@ Two forms:
 2. **Un-materialised reject** (`--unmaterialised <source-id>`) -- archives the whole proposal JSON to `<workspace>/.devbench/rejected-proposals/<source-id>-unmaterialised-<timestamp>.json` and writes a `[PROPOSAL_JSON_REJECTED]` audit comment. Refuses when any task in the JSON already has a materialised draft; use the per-draft form for those first.
 
 Exactly one form must be supplied; missing or both-supplied raises an argument-parse error. `--reason` is required and non-empty.
+
+---
+
+## Environment migration
+
+For migrating from environment-variable-only configuration to a workspace config file, run the `configure-devbench` skill (see [configure-devbench skill](#configure-devbench-skill) below). The skill walks through every `RuntimeConfig` section -- including `log_file`, `report`, `orchestrate`, and `skills` -- and produces a validated `backlog/config/devbench.yaml` that consolidates all previously scattered env-var knobs into a single source of truth.
+
+After writing the config file, every `devbench` subcommand reads it at startup via the `DEVBENCH_CONFIG_PATH` or default `backlog/config/devbench.yaml` lookup. Individual env-var overrides continue to take precedence (env > yaml > code default).
+
+---
+
+## configure-devbench skill
+
+The `configure-devbench` authoring skill walks the operator through every `RuntimeConfig` section interactively and produces a complete, validated `backlog/config/devbench.yaml`. Each collected value is round-tripped through `RuntimeConfig` parsing immediately; invalid values are rejected with the parser's error message and the operator is re-prompted.
+
+### Invocation
+
+From any Claude Code session with the devbench-authoring plugin available:
+
+```
+claude run devbench-authoring:configure-devbench
+```
+
+If `backlog/config/devbench.yaml` already exists, the skill reads it and pre-populates defaults for every question. Enter a blank line to accept the shown default.
+
+### Walk-through steps (issue #233)
+
+The skill walks through 20 steps, validating each section before moving to the next:
+
+1. **Read existing config** -- pre-populates defaults if `devbench.yaml` exists.
+2. **repos** -- target repositories (`org/repo` key, `checkout_directory`, `default_branch`, per-repo `merge_strategy`).
+3. **Top-level scalars** -- `merge_strategy`, `max_executor_retries`, `use_bedrock`, `bedrock_region`.
+4. **timeouts** -- per-operation timeout values in seconds (`gh_api`, `test`, `security_fetch`, `llm`, `command`, `orchestrator_poll_interval`, `github_check`).
+5. **limits** -- threshold and limit values (`alert_summary`, `output_truncation`, `llm_evidence_truncation`, `llm_file_context`, `llm_file_preview_chars`, `ci_failure_log_bytes`).
+6. **agents** -- per-agent model overrides for executor, blocker_resolver, manifest_amender, security_reviewer, task_factory, review_supervisor, and per-judge review_team entries.
+7. **git_ops** -- `single_branch`, `defer_pr`, `auto_finalize`, `auto_merge`, `pause_before_merge`, `update_submodule`, `inline_orphan_cleanup`, `ci_failure_retry`, `local_only`. Validates mutually exclusive combinations.
+8. **task_factory** -- `enabled`, `auto_accept_proposals`.
+9. **manifest_amendment** -- `enabled`, `allowed_reasons`, `max_requests_per_execution`.
+10. **validate** -- `check_orphan_path_tokens` (rule 20 toggle).
+11. **stop_hook** -- `max_blocks`, `window_seconds`, `stale_task_minutes`.
+12. **hook_tail** -- column-cap settings: `agent_width`, `tool_width`, `description_max`, `stdout_preview_max`.
+13. **debug** -- `check_registration_retries`, `check_registration_delay_seconds`, `blocked_recovery_window_seconds` (leave blank for production workspaces).
+14. **backlog** -- `default_status_for_new_work_units` (`in-queue` or `draft`).
+15. **notifications** -- master switch, per-event toggles, and Slack endpoint.
+16. **log_file** -- workspace-relative path to the orchestrator's aggregate log file. Both `setup_logging` (writer) and `devbench report` / `devbench hook-tail` (readers) consult this single source of truth so they cannot diverge. [default: `logs/orchestrator.log`]
+17. **report** -- per-model token pricing (`report.models` table), `default_model` rates, global cache multipliers (`cache_read_multiplier`, `cache_write_5min_multiplier`, `cache_write_1hr_multiplier`), `data_residency_multiplier`, `fast_mode_multiplier`, `recent_pace_tasks`, and `display_timezone`.
+18. **orchestrate** -- `max_cascade_depth` cap on recovery-of-a-recovery cascade depth. [default: `2`; override via `DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH`]
+19. **skills** -- authoring-skill knobs: `exemplar_backlog_path`, `exemplar_spec_path`, `fan_out_threshold` [default: 10], `max_iterations` [default: 5].
+20. **Final validation and write** -- assembles the complete YAML (all sections present regardless of whether the operator changed their values from the defaults), runs the full `RuntimeConfig` round-trip, then writes `backlog/config/devbench.yaml`.
+
+### Output
+
+| Artefact | Location | Condition |
+|----------|----------|-----------|
+| Config file | `backlog/config/devbench.yaml` | Written after all 20 steps validate |
+| `devbench-commands.txt` | `<workspace>/devbench-commands.txt` | Refreshed with foreground and daemon launch commands |
+| Summary message | stdout | `[CONFIGURE_DEVBENCH_DONE]` block listing every configured section |
+
+### Four-surface consistency
+
+The four configuration surfaces that must agree for every section are:
+
+1. **Schema** -- `src/devbench/config-schema.json` (structural shape)
+2. **Loader defaults** -- field defaults in `src/devbench/config_loader.py`
+3. **Sample config** -- `sample-config.yaml` (annotated reference)
+4. **configure-devbench** -- step prompts and default labels in `plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`
+
+Mismatches between these surfaces cause the operator to configure a value they believe is the default but which is actually different from what the loader applies. Verify all four surfaces agree before merging any change to one of them.
+
+### Cross-references
+
+- [`plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`](../plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md) -- full skill prompt with every step
+- [`docs/skills/configure-devbench.md`](skills/configure-devbench.md) -- operator quickstart
+- [`sample-config.yaml`](../sample-config.yaml) -- annotated reference config
+- [`docs/zero-to-ready.md`](zero-to-ready.md) -- Step 7 (manual alternative to running this skill)

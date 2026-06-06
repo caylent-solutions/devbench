@@ -50,7 +50,7 @@ defaults for every question. Enter a blank line to accept the shown default.
 
 ## What the skill does (step by step)
 
-The skill walks through 16 sections, validating each before moving to the next:
+The skill walks through 20 steps, validating each before moving to the next:
 
 1. **Read existing config** -- pre-populates defaults if `devbench.yaml` exists.
 2. **repos section** -- target repositories. Required fields per entry:
@@ -76,7 +76,18 @@ The skill walks through 16 sections, validating each before moving to the next:
 14. **backlog section** -- `default_status_for_new_work_units` (`in-queue` or `draft`).
 15. **notifications section** -- per-event Slack toggles under `notifications.events.*`
     plus the `notifications.slack` endpoint (PR #202).
-16. **Final validation and write** -- assembles the YAML, runs the full
+16. **log_file** -- workspace-relative path to the orchestrator's aggregate log file.
+    Both the writer (`setup_logging`) and readers (`devbench report`,
+    `devbench hook-tail`) consult this single source of truth so they cannot diverge.
+    [default: `logs/orchestrator.log`]
+17. **report section** -- per-model token pricing (`report.models` table),
+    `default_model` rates, global cache multipliers, `data_residency_multiplier`,
+    `fast_mode_multiplier`, `recent_pace_tasks`, and `display_timezone`.
+18. **orchestrate section** -- `max_cascade_depth` cap on recovery-of-a-recovery
+    cascade depth. [default: `2`]
+19. **skills section** -- `exemplar_backlog_path`, `exemplar_spec_path`,
+    `fan_out_threshold` [default: 10], `max_iterations` [default: 5].
+20. **Final validation and write** -- assembles the YAML, runs the full
     `RuntimeConfig` round-trip, then writes `backlog/config/devbench.yaml`.
 
 ## Validation protocol
@@ -128,7 +139,7 @@ rejects absolute paths and `..` traversals immediately.
 
 | Artefact | Location | Condition |
 |----------|----------|-----------|
-| Config file | `backlog/config/devbench.yaml` | Written after all 16 sections validate |
+| Config file | `backlog/config/devbench.yaml` | Written after all 20 steps validate |
 | Summary message | stdout | `[CONFIGURE_DEVBENCH_DONE]` with a section summary |
 
 ## Cross-references

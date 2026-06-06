@@ -10097,7 +10097,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "start": (
         cmd_start,
         0,
-        "Run orchestrate skill via Agent SDK (non-interactive). Flag: --daemon detaches to background (#209).",
+        (
+            "Run orchestrate skill via Agent SDK (non-interactive). "
+            "Flags: --daemon detaches to background; "
+            "--include <tokens> scopes to matching units; "
+            "--exclude <tokens> skips matching units; "
+            "--name <session> sets session name; "
+            "--allow-overlap permits concurrent sessions (#209, #249)."
+        ),
     ),
     "instances": (cmd_instances, 0, "List every live devbench orchestrator on this host (#209). Flag: --json"),
     "stop-instance": (

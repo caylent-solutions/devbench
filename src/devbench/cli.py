@@ -97,6 +97,7 @@ def _pre_parse_config(argv: list[str]) -> None:
 
 _pre_parse_config(sys.argv)
 
+from devbench.actionability import check_actionability
 from devbench.backlog.amendment import (
     REVIEW_FAILURES_DIR_NAME,
     AmendmentError,
@@ -532,14 +533,14 @@ def _print_actionable_summary(
         active: Work units currently IN_PROGRESS or IN_REVIEW.
     """
     active_ids = {u.id for u in active}
-    actionable = [u for u in parser.get_parallel_candidates(units) if u.id not in active_ids]
+    all_candidates, all_done_flag, blocked_count = check_actionability(parser, units)
+    actionable = [u for u in all_candidates if u.id not in active_ids]
     if actionable:
         print(f"\nNext actionable: {actionable[0].id} -- {actionable[0].title}")
-    elif parser.all_done(units):
+    elif all_done_flag:
         print("\nAll work units are DONE.")
     else:
-        blocked = parser.get_blocked_units(units)
-        print(f"\nNo actionable units. {len(blocked)} blocked.")
+        print(f"\nNo actionable units. {blocked_count} blocked.")
 
 
 @dataclass

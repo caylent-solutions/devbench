@@ -53,6 +53,7 @@ from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from devbench.actionability import check_actionability
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
@@ -2731,6 +2732,20 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
     return rendered
 
 
+def _no_actionable_line(parser: BacklogParser, units: list[WorkUnit]) -> str | None:
+    """Return the no-actionable line when nothing is actionable and not all done.
+
+    Returns the verbatim ``'No actionable units. <N> blocked.'`` string when
+    the backlog has no actionable candidates and is not fully done; returns
+    ``None`` otherwise.  Extracted from :func:`generate_report` so the branch
+    count of that function stays within the linter threshold.
+    """
+    actionable, all_done_flag, blocked_count = check_actionability(parser, units)
+    if not actionable and not all_done_flag:
+        return f"\nNo actionable units. {blocked_count} blocked."
+    return None
+
+
 def generate_report(
     log_path: Path,
     since: datetime | None = None,
@@ -3068,6 +3083,14 @@ def generate_report(
 
     lines.append("")
     lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))
+
+    # AC-251-1: emit the no-actionable line when candidates are empty and not
+    # all done. This mirrors the verbatim format from cmd_status so both
+    # surfaces are always consistent. The line is appended in both the default
+    # and --once (since=<ts>) render paths.
+    _no_act = _no_actionable_line(parser, units)
+    lines.extend([_no_act] if _no_act is not None else [])
+
     if since is None:
         # B9: per-unit listings at the very end so the user can act on each.
         # Order surfaces the most operationally-actionable panels first

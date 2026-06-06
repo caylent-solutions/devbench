@@ -239,7 +239,7 @@ Ask the operator:
 > "Section: task_factory
 >
 >   enabled               -- Run the blocker-resolver + task-factory loop after amendment rejects.
->                            Requires manifest_amendment.enabled: true. [true/false, default: false]
+>                            Requires manifest_amendment.enabled: true. [true/false, default: true]
 >   auto_accept_proposals -- Auto-promote task-factory drafts to in-queue without operator review.
 >                            [true/false, default: true]; set false for the 'proposed' draft review step.
 >                            Only takes effect when enabled: true."
@@ -389,7 +389,17 @@ Validate `slack.webhook_url` (when present) starts with `https://`. Validate eve
 
 ## Step 16 -- Final validation and write
 
-Assemble the complete YAML from all collected sections. Run the full validation round-trip:
+Assemble the complete YAML from all collected sections. Every section must be
+present in the emitted file regardless of whether the operator changed its
+values from the defaults -- include all sections (repos, merge_strategy,
+max_executor_retries, use_bedrock, bedrock_region, timeouts, limits, git_ops,
+task_factory, manifest_amendment, validate, stop_hook, hook_tail, debug,
+backlog, skills, quota_handling, agents, notifications) with their collected
+values or annotated defaults. This ensures the written file is a complete,
+self-documenting reference config whose values equal the loader defaults
+field-by-field for every section the operator accepted unchanged (AC-260-1).
+
+Run the full validation round-trip:
 
 ```bash
 python -c "

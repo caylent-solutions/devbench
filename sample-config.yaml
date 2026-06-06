@@ -2,7 +2,7 @@
 #
 # Copy this file to `<workspace>/backlog/config/devbench.yaml` as a starting
 # point. Every YAML field defined in `src/devbench/config-schema.json` is
-# represented below at its default value. Delete sections you do not need.
+# represented below at its default value.
 #
 # Precedence: env var > this YAML > code default. Schema validation runs at
 # load time; any unknown key fails with a clear error.

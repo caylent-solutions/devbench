@@ -36,7 +36,7 @@ Make `cmd_get_diff` mode-aware, gated on the existing `git_ops.defer_pr` config 
 **defer_pr mode** (`defer_pr: true`):
 
 1. Emit staged and unstaged.
-2. If BOTH are empty the executor has just committed; substitute `git show --format= HEAD` so the post-commit security review still sees this task's commit.
+2. If BOTH are empty the executor has just committed; perform a task-attributed commit lookup via `git log --grep "^<unit-id>:"` and emit those commit diffs so the post-commit security review still sees this task's actual changes. If no task-attributed commit is found, exit `GET_DIFF_NO_ATTRIBUTABLE` (45) with a verbatim diagnostic on stderr.
 3. Emit untracked synthetic hunks unchanged.
 4. DO NOT emit `git diff origin/<default>`. That hunk is the source of the misread and has no correct interpretation in this mode.
 
@@ -48,7 +48,7 @@ All five review judge prompts additionally carry a defensive "Scope contract" li
 
 - **Kanon (and every future `defer_pr: true` backlog) sees scope-correct review output.** The T3 / T6 failure mode does not recur.
 - **No behaviour change in the default posture.** Per-task-branch workflows keep the four-hunk output byte-identically.
-- **Post-commit reviews work.** When the executor has committed and the working tree is clean, `get-diff` returns `git show HEAD` instead of an empty string, so security-review (which typically runs after commit) still sees the task's actual changes.
+- **Post-commit reviews work.** When the executor has committed and the working tree is clean, `get-diff` performs a task-attributed commit lookup via `git log --grep "^<unit-id>:"` so security-review (which typically runs after commit) still sees the task's actual changes. If no task-attributed commit is found, `get-diff` exits `GET_DIFF_NO_ATTRIBUTABLE` (45) with a verbatim diagnostic on stderr so operators can diagnose the missing commit attribution.
 - **Regression surface shrinks.** Three plugin-structure regression pins (`TestReviewJudgesUseGetDiffForScope`) now fail any PR that drops the "use get-diff for scope" contract or reintroduces the `git diff origin/main` anti-pattern in a judge prompt.
 - **No new configuration to maintain.** The fix reuses `devbench.config.DEFER_PR`, already populated by `config_loader` from `git_ops.defer_pr`. Operators do not learn a new flag.
 
@@ -67,7 +67,7 @@ All five review judge prompts additionally carry a defensive "Scope contract" li
 ## Related files
 
 ### Python
-- `src/devbench/cli.py::cmd_get_diff` -- mode-aware branch on `DEFER_PR`, `git show HEAD` substituted when working tree is empty in `defer_pr` mode, `git diff origin/<default>` skipped entirely in `defer_pr` mode.
+- `src/devbench/cli.py::cmd_get_diff` -- mode-aware branch on `DEFER_PR`, task-attributed commit lookup via `git log --grep "^<unit-id>:"` when working tree is empty in `defer_pr` mode (exits `GET_DIFF_NO_ATTRIBUTABLE` (45) when no attributable commit is found), `git diff origin/<default>` skipped entirely in `defer_pr` mode.
 
 ### Plugin prompts
 - `plugin/devbench/agents/review_team/code-reviewer.md` -- scope-contract line added after get-diff invocation.
@@ -77,7 +77,7 @@ All five review judge prompts additionally carry a defensive "Scope contract" li
 - `plugin/devbench/agents/security-reviewer.md` -- same.
 
 ### Tests
-- `tests/test_cli.py::TestCmdGetDiffModeAware` -- 7 unit cases (non-defer_pr back-compat pin, defer_pr excludes branch-vs-main, pre-commit returns staged+unstaged, post-commit returns git-show-HEAD, accumulated prior commits do not leak, untracked still rendered, all-empty returns "(no changes)").
+- `tests/test_cli.py::TestCmdGetDiffModeAware` -- 7 unit cases (non-defer_pr back-compat pin, defer_pr excludes branch-vs-main, pre-commit returns staged+unstaged, post-commit performs task-attributed commit lookup, accumulated prior commits do not leak, untracked still rendered, all-empty returns "(no changes)").
 - `tests/test_plugin/test_agent_structure.py::TestReviewJudgesUseGetDiffForScope` -- 3 regression pins parametrized across all 5 judges.
 - `tests/test_integration/test_get_diff_defer_pr_mode.py` -- 2 end-to-end cases (real git repo with 3 prior commits on a shared branch; defer_pr returns task-local scope only, non-defer_pr keeps branch-vs-default hunk).
 

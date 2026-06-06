@@ -964,7 +964,7 @@ Print the combined git diff for the work unit's target repo, scoped to *what thi
 Mode-aware per ADR-12:
 
 - **Per-task-branch mode** (default, `git_ops.defer_pr: false`): emits staged + unstaged + `git diff origin/<default_branch>` + untracked hunks. Each work unit runs on its own branch, so the branch-vs-default diff IS the task's scope.
-- **defer_pr mode** (`git_ops.single_branch: <branch>` + `git_ops.defer_pr: true`): emits staged + unstaged + untracked only. When staged and unstaged are both empty the executor has just committed, so `git show HEAD` is substituted. The branch-vs-default hunk is deliberately skipped because it would include every prior completed task's commits on the shared branch.
+- **defer_pr mode** (`git_ops.single_branch: <branch>` + `git_ops.defer_pr: true`): emits staged + unstaged + untracked only. When staged and unstaged are both empty the executor has just committed; the command performs a task-attributed commit lookup via `git log --grep "^<unit-id>:"` and emits those commit diffs. If no task-attributed commit is found, exits `GET_DIFF_NO_ATTRIBUTABLE` (45) with a verbatim diagnostic on stderr. The branch-vs-default hunk is deliberately skipped because it would include every prior completed task's commits on the shared branch.
 
 Exit 0 on success; exit 1 when the work unit is not found or no local path is configured for its repo. Output is `(no changes)` when every hunk is empty.
 

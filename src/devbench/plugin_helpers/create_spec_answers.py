@@ -25,6 +25,15 @@ from typing import Any
 
 import yaml
 
+__all__ = [
+    "BLOCKED_MESSAGE_TEMPLATE",
+    "REQUIRED_BLOCKS",
+    "MalformedAnswersError",
+    "MissingBlockError",
+    "load_answers_file",
+    "validate_answers",
+]
+
 # ---------------------------------------------------------------------------
 # Public constants
 # ---------------------------------------------------------------------------

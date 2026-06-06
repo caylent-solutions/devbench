@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 import yaml
 
+import devbench.plugin_helpers.create_spec_answers as _mod
 from devbench.plugin_helpers.create_spec_answers import (
     BLOCKED_MESSAGE_TEMPLATE,
     REQUIRED_BLOCKS,
@@ -68,6 +69,18 @@ class TestConstants:
         # The template must produce the verbatim spec message when formatted.
         msg = BLOCKED_MESSAGE_TEMPLATE.format(block="A")
         assert msg == "[BLOCKED] create-spec headless: missing answer for Block A"
+
+    def test_all_exports_are_complete(self) -> None:
+        """__all__ enumerates every public name in the module."""
+        expected = {
+            "REQUIRED_BLOCKS",
+            "BLOCKED_MESSAGE_TEMPLATE",
+            "MalformedAnswersError",
+            "MissingBlockError",
+            "load_answers_file",
+            "validate_answers",
+        }
+        assert set(_mod.__all__) == expected
 
 
 # ---------------------------------------------------------------------------

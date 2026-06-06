@@ -17,6 +17,73 @@ You are a meticulous specification author. Your goal is to produce a `spec/<proj
 
 ---
 
+## Headless mode (--answers-file)
+
+Issue #256. When the operator invokes the skill with `--answers-file <path>`, the skill runs headlessly: no prompts are presented, Steps 2 and 5 are auto-satisfied, and any failure exits immediately with a non-zero code.
+
+**Detection**: At skill startup, check whether `--answers-file <path>` was supplied as an argument. If it was, enter headless mode for the entire session.
+
+**Loading and validation**: Use `devbench.plugin_helpers.create_spec_answers.load_answers_file` and `validate_answers` to parse and validate the file. The file must be a YAML mapping keyed by Block letter A-G (Appendix D-6). If a required block is absent, emit the verbatim message to stderr and exit non-zero:
+
+```
+[BLOCKED] create-spec headless: missing answer for Block <X>
+```
+
+If the file cannot be parsed as YAML or is not a mapping, emit `ERROR: answers file <path> could not be parsed as YAML: <detail>` to stderr and exit non-zero.
+
+**Step 2 (operator questions) -- auto-satisfied**: When answers are present, skip all operator prompts. Use the pre-loaded block answers as the inputs to Step 3 directly. Do NOT ask the operator any questions.
+
+**Step 5 (final operator review) -- auto-satisfied**: When the rubric score is zero after the self-critique loop, proceed directly to Step 6 (write the spec) without presenting the spec to the operator for approval.
+
+**Non-zero rubric after max_iterations in headless mode**: If the iterate-until-perfect loop reaches `skills.max_iterations` without converging to a zero rubric score, emit the `[BLOCKED]` comment (same format as interactive mode) to stderr and exit non-zero:
+
+```
+[BLOCKED] create-spec headless: iterate-until-perfect loop reached max_iterations=<N> without converging.
+Unresolved rubric items:
+- <item number>: <detail> -- <suggested-fix>
+...
+Re-run the skill with an updated answers file addressing the above items.
+```
+
+Do NOT write a partial spec when headless mode exits with `[BLOCKED]`.
+
+### Appendix D-6 -- Answers file YAML schema
+
+The answers file is a YAML mapping where each key is one of the Block letters A through G and each value is a string containing the operator's pre-collected answers for that block's questions. All seven blocks are required.
+
+```yaml
+# answers.yaml -- headless create-spec answers file (Appendix D-6)
+A: |
+  1. Project name: <name>. Problem: <one-sentence problem statement>.
+  2. Current codebase state: <primitives, commands, existing behavior>.
+  3. Behavior changes: <list old vs new, or "None">.
+B: |
+  4. Goals: <goal 1 with worked example>, <goal 2 with worked example>, ...
+  5. Non-goals: <list of explicitly out-of-scope asks>.
+  6. Multi-repo scope: <description, or "None">.
+C: |
+  7. New commands: <exact CLI syntax, semantics, error handling, edge cases,
+     worked example -- one sub-section per command>.
+D: |
+  8. File format changes: <schema description, or "None">.
+  9. Existing primitives to reuse: <function/class/constant names and modules>.
+E: |
+  10. NFRs: <performance, security, compatibility constraints>.
+  11. Error handling and logging conventions: <description>.
+F: |
+  12. Testing requirements: <coverage targets, integration scenarios>.
+  13. Documentation updates: <list of docs to create or modify>.
+G: |
+  14. Acceptance criteria: <AC-1: ..., AC-2: ..., ...>.
+  15. Resolved decisions: <decision + rationale + alternatives considered>.
+  16. Out of scope: <list of adjacent asks this spec does NOT cover>.
+  17. Future work: <explicitly deferred items>.
+```
+
+Block values may be multi-line strings. Empty string values are structurally valid (present but blank); they satisfy the "block present" check but may produce a lower-quality spec section.
+
+---
+
 ## Step 1 -- Internalise the canonical spec structure (and the workspace exemplar when configured)
 
 This skill is application-agnostic: it does NOT depend on any specific workspace having a particular exemplar file.

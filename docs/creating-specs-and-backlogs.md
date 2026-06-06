@@ -417,6 +417,76 @@ Key metrics:
 
 ---
 
+## Headless create-spec (--answers-file)
+
+Issue #256. The `create-spec` skill can run without operator prompts by supplying a pre-collected answers file:
+
+```bash
+devbench create-spec --answers-file answers.yaml
+```
+
+When `--answers-file` is present the skill:
+
+1. Loads and validates the answers file. The file must be a YAML mapping keyed by Block letters A through G (see Appendix D-6 in the SKILL.md). All seven blocks are required.
+2. Skips all operator question prompts (Step 2 is auto-satisfied).
+3. Authors the spec from the pre-supplied answers and runs the self-critique loop.
+4. Writes the spec to `spec/<project-name>.md` directly when the rubric score is zero (Step 5 is auto-satisfied).
+5. Exits non-zero with a `[BLOCKED]` message if a required block is missing or if the rubric does not converge within `skills.max_iterations`.
+
+### Answers file format
+
+Create a YAML file with one key per Block letter:
+
+```yaml
+# answers.yaml
+A: |
+  Project: my-tool. Problem: the CLI lacks headless automation support.
+  Current state: interactive prompts require human at keyboard.
+  Behavior changes: none -- headless mode is additive.
+B: |
+  Goals: enable CI pipelines to invoke create-spec without a TTY.
+  Non-goals: changing the interactive flow for human operators.
+  Multi-repo scope: none.
+C: |
+  New flags: --answers-file <path> (optional; triggers headless mode).
+  Semantics: load answers, skip prompts, write spec, exit 0 on success.
+  Errors: missing block exits 1 with [BLOCKED] message.
+D: |
+  Format: YAML mapping A-G. No schema changes to the output spec file.
+  Primitives to reuse: load_answers_file, validate_answers from create_spec_answers.
+E: |
+  NFRs: must work in CI (no TTY). Exit code 0 on success, non-zero on failure.
+  Error convention: [BLOCKED] prefix for spec-quality failures.
+F: |
+  Testing: unit tests for parser (valid + missing block cases). 100% branch coverage.
+  Docs: update creating-specs-and-backlogs.md with headless section.
+G: |
+  AC-1: --answers-file writes spec with no prompt (happy path).
+  AC-2: missing required block exits 1 with verbatim [BLOCKED] message.
+  AC-3: non-zero rubric after max_iterations exits 1 with [BLOCKED] message.
+  Decisions: YAML chosen for human-editability and multi-line string support.
+  Out of scope: partial-answer files, answer file generation, interactive fallback.
+  Future work: --answers-stdin for piped input.
+```
+
+### Fail-fast behaviour
+
+A missing required block (any of A through G) causes immediate exit with a non-zero code and the verbatim message:
+
+```
+[BLOCKED] create-spec headless: missing answer for Block <X>
+```
+
+A malformed YAML file (parse error or non-mapping root) exits with:
+
+```
+ERROR: answers file <path> could not be parsed as YAML: <detail>
+```
+
+Neither condition writes a partial spec.
+
+---
+
 ## Checklist: Before You Start Execution
 
 - [ ] Spec is complete with audit findings, target architecture, phases, test plans

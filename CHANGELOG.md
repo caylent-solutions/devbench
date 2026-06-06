@@ -3,6 +3,67 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] -- 2026-06-06
+
+This release covers Epics E0-E9: the Opus 4.8 GA rollout, SDK upgrade and
+quota handling, blocked-task lifecycle resilience, observability and CLI
+ergonomics, backlog integrity and git-ops hardening, authoring defaults,
+skill autonomy and review, operator workflow and backlog assistant, done-integrity
+hardening, and the release sync and full validation gate.
+
+### Per-epic summary
+
+- **E0 -- Opus 4.8 GA Rollout** (#254): Added `claude-opus-4-8` model support
+  at $5.00 input / $25.00 output per MTok (mirrors Opus 4.7 list pricing).
+  Updated `docs/model-pricing.md` with the 4.8 block and pricing table row.
+  Replaced default model ids across skills, agents, and config examples.
+
+- **E1 -- SDK Upgrade and Quota** (#255, #231, #234, #236): Upgraded
+  `claude-agent-sdk` to `>=0.2.87`; removed the `sdk_teardown_filter`
+  workaround. Added quota wait-and-resume (`quota.py`) so the orchestrator
+  pauses on `overloaded_error` / `rate_limit_error` and resumes automatically
+  after the reset window rather than exiting.
+
+- **E2 -- Blocked-Task Lifecycle Resilience** (#248, #253): Added composite
+  `RUNTIME_DEGRADATION` + structural-blocker classification and rendering.
+  Added cascade circuit-breaker (`cascade_requeue_max_cycles`). Tightened the
+  `[BLOCKED_PENDING_PROPOSAL]` regex; implemented marker-cycle detection and
+  `add-dep` cycle prevention; added `NO_ACTIONABLE` diagnostic output.
+
+- **E3 -- Observability and CLI Ergonomics** (#249, #250, #251, #252): Updated
+  `devbench start` description. Added `OrchestratorState` dataclass and liveness
+  banner. Extracted actionability check into a shared helper. Added orchestrator
+  state panel to `devbench status`.
+
+- **E4 -- Backlog Integrity and Git-Ops Hardening** (#240, #241, #243, #245, #247):
+  Removed get-diff fallback; added `CLAIM_BLOCKED_PRECLAIM` (44) and
+  `GET_DIFF_NO_ATTRIBUTABLE` (45) exit codes. Added `--cascade` to
+  `hold`/`unhold`/`decline`/`set-status`. Added `reconcile-backlog-md` command.
+  Added validate-backlog checks C1/C3/C4/C6/C7.
+
+- **E5 -- Authoring Defaults** (#233, #259, #260): Flipped
+  `manifest_amendment.enabled` to `true` by default. `configure-devbench` now
+  emits all default sections. Closed ADR-11 and the seven opt-in docs.
+
+- **E6 -- Skill Autonomy and Review** (#256, #257): Added headless `create-spec`
+  mode via `--answers-file`. Added deterministic TDD gate to `test-reviewer`
+  rejecting `TDD_CYCLE_MISSING` when RED exit code was 0.
+
+- **E7 -- Operator Workflow and Backlog Assistant** (#242, #244, #246):
+  Added `--operator-mode` to `request-amendment`. Added `local_only` repo config.
+  Added the nine-skill `devbench-backlog-assistant` plugin.
+
+- **E8 -- Done-Integrity Hardening** (H1-H4): `force_status` and `set-status done`
+  now refuse to write `done` directly; only `mark-done` (judge-gated) and parent
+  rollup can set `done`. `_last_round_all_passed` counts only canonical verdict
+  lines. `guard-verdict-format.sh` is default-deny for canonical verdicts. The
+  orchestrator fails closed when guard hooks are not loaded.
+
+- **E9 -- Release Sync and Full Validation**: Plugin manifest versions synced.
+  Skills and agents updated to `claude-opus-4-8` defaults. Doc-change matrix
+  completed; staleness audit clean. ADR-25 (done-integrity) and ADR-26
+  (self-completion autonomy) added. Release-acceptance gate implemented.
+
 ## [Unreleased] -- v-next
 
 This release bundles the orchestrator self-healing work, the canonical

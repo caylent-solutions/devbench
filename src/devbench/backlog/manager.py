@@ -422,6 +422,10 @@ class BacklogManager:
             backtick-quoted path-shaped tokens in ``## Acceptance Criteria`` and
             ``## Definition of Done`` must appear in the Task's Changes Manifest after
             normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
+        21. No marker cycles (issue #253a): ``BLOCKED_PENDING_PROPOSAL`` markers in
+            work-unit ``## Comments`` sections must not form cycles. 2-node cycles
+            are reported as ``marker cycle: <id-a> <-> <id-b>``; N-node cycles as
+            ``marker cycle: a -> b -> c -> a``.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -445,6 +449,7 @@ class BacklogManager:
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
         self._check_dep_cycles(backlog_index, errors)
+        errors.extend(self._check_marker_cycles(backlog_index, workspace_root))
         self._check_status_summary(backlog_index, rows, errors)
         if fix:
             fix_count, fix_files = self._apply_fixes(rows, workspace_root)
@@ -887,6 +892,105 @@ class BacklogManager:
                 deps.append(dep_id)
             graph[row_id] = deps
         return graph
+
+    def _build_marker_graph(self, backlog_index: Path, workspace_root: Path) -> dict[str, list[str]]:
+        """Build a ``{unit_id: [marker_target_id, ...]}`` map from work-unit files.
+
+        Uses the shared :meth:`_extract_pending_proposal_markers` extractor so
+        only markers in the ``## Comments`` section are included (AC-253a-1).
+        Only target IDs that are themselves present in the index are included
+        as edges; unknown targets are silently dropped so a missing or
+        misspelled target cannot crash the graph build.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            workspace_root: Workspace root containing the ``backlog/`` subdirectory.
+
+        Returns:
+            A dict mapping each indexed unit ID to the list of marker-target
+            IDs it carries in its ``## Comments`` section.
+        """
+        graph: dict[str, list[str]] = {}
+        if not backlog_index.exists():
+            return graph
+        rows = self._parse_backlog_rows(backlog_index)
+        known_ids: set[str] = {
+            row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-") and row_id.lower() != "id"
+        }
+        for row_id, _, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            wu_path = workspace_root / file_path if file_path else None
+            if wu_path is None or not wu_path.exists():
+                graph[row_id] = []
+                continue
+            marker_targets = self._extract_pending_proposal_markers(wu_path)
+            # Restrict edges to indexed IDs only -- unknown targets are skipped.
+            graph[row_id] = [t for t in sorted(marker_targets) if t in known_ids]
+        return graph
+
+    def _check_marker_cycles(self, backlog_index: Path, workspace_root: Path) -> list[str]:
+        """Issue #253a: detect cycles in the BLOCKED_PENDING_PROPOSAL marker graph.
+
+        Walks the marker graph built via :meth:`_build_marker_graph` using
+        DFS-with-recursion-stack, mirroring :meth:`_check_dep_cycles`.
+
+        For 2-node cycles (A <-> B) the message format is::
+
+            marker cycle: <sorted-id-a> <-> <sorted-id-b>
+
+        For cycles of three or more nodes the message format is::
+
+            marker cycle: <a> -> <b> -> <c> -> <a>
+
+        Each cycle is reported exactly once (normalised by rotating to the
+        lexicographically smallest node).
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            workspace_root: Workspace root containing the ``backlog/`` subdirectory.
+
+        Returns:
+            A list of error strings -- one per distinct cycle found.
+        """
+        graph = self._build_marker_graph(backlog_index, workspace_root)
+        if not graph:
+            return []
+
+        color: dict[str, int] = dict.fromkeys(graph, 0)
+        stack: list[str] = []
+        reported: set[tuple[str, ...]] = set()
+        cycle_errors: list[str] = []
+
+        def visit(node: str) -> None:
+            color[node] = 1
+            stack.append(node)
+            for nxt in graph.get(node, ()):
+                if color[nxt] == 1:
+                    # Back-edge: extract cycle, normalise, and dedupe.
+                    cycle_start = stack.index(nxt)
+                    cycle = tuple(stack[cycle_start:])
+                    rotation = cycle.index(min(cycle))
+                    normalised = cycle[rotation:] + cycle[:rotation]
+                    if normalised not in reported:
+                        reported.add(normalised)
+                        if len(normalised) == 2:
+                            id_a, id_b = sorted(normalised)
+                            cycle_errors.append(f"marker cycle: {id_a} <-> {id_b}")
+                        else:
+                            chain = " -> ".join([*normalised, normalised[0]])
+                            cycle_errors.append(f"marker cycle: {chain}")
+                    continue
+                if color[nxt] == 0:
+                    visit(nxt)
+            stack.pop()
+            color[node] = 2
+
+        for node in sorted(graph):
+            if color.get(node) == 0:
+                visit(node)
+
+        return cycle_errors
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.

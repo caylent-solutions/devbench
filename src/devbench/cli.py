@@ -195,6 +195,7 @@ from devbench.constants import (
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
+from devbench.instances import is_pid_alive, pid_file_path, read_pid_file
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
     materialise_shadow_plugin,
@@ -225,6 +226,28 @@ from devbench.utils.process import run_command
 __all__ = ["_format_duration"]
 
 logger = logging.getLogger("devbench.cli")
+
+
+@dataclass
+class OrchestratorState:
+    """Resolved orchestrator status for rendering in ``cmd_status`` (issue #252).
+
+    Attributes:
+        status: ``"running"`` or ``"stopped"``.
+        mode: Orchestrator mode (``"daemon"`` or ``"foreground"``); ``None`` when stopped.
+        pid: OS process ID; ``None`` when stopped.
+        instance_id: Human-readable instance identifier; ``None`` when stopped.
+        uptime: Formatted uptime string (``"HH:MM:SS"`` or ``"Dd HH:MM:SS"``); ``None`` when stopped.
+        detail: Auxiliary status detail (e.g. ``"no pid file"``, ``"stale pid file"``);
+            empty string when running.
+    """
+
+    status: str
+    mode: str | None
+    pid: int | None
+    instance_id: str | None
+    uptime: str | None
+    detail: str
 
 
 @dataclass
@@ -369,6 +392,106 @@ def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> N
         f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})",
         file=file if file is not None else sys.stdout,
     )
+
+
+def _format_uptime(started_at: str) -> str:
+    """Format uptime from ISO-8601 UTC ``started_at`` to ``HH:MM:SS`` or ``Dd HH:MM:SS``.
+
+    Returns ``"unknown"`` when *started_at* is empty or unparsable.
+
+    Args:
+        started_at: ISO-8601 UTC timestamp string (e.g. ``"2026-06-06T12:00:00Z"``).
+
+    Returns:
+        Uptime as ``"HH:MM:SS"`` for under 24 hours, ``"Dd HH:MM:SS"`` for 24h or more,
+        or ``"unknown"`` when *started_at* is empty or cannot be parsed.
+    """
+    if not started_at:
+        return "unknown"
+    try:
+        started = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return "unknown"
+    total_seconds = max(0, int((datetime.now(tz=UTC) - started).total_seconds()))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours >= 24:
+        days, rem_hours = divmod(hours, 24)
+        return f"{days}d {rem_hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _resolve_orchestrator_state(workspace: Path) -> OrchestratorState:
+    """Resolve orchestrator status from the canonical PID file (issue #252, AC-252-1).
+
+    Reads ``<workspace>/.devbench/orchestrator.pid`` via :func:`~devbench.instances.pid_file_path`
+    and :func:`~devbench.instances.read_pid_file`, then checks liveness with
+    :func:`~devbench.instances.is_pid_alive`.  Never calls ``discover_instances``
+    (AC-252a-1).
+
+    Args:
+        workspace: Path to the workspace root directory.
+
+    Returns:
+        An :class:`OrchestratorState` with ``status="running"``
+        when the PID file exists and the process is alive, ``"stopped"`` with
+        ``detail="stale pid file"`` when the PID file exists but the process is dead,
+        or ``"stopped"`` with ``detail="no pid file"`` when the file is absent.
+    """
+    pid_path = pid_file_path(workspace)
+    inst = read_pid_file(pid_path)
+    if inst is None:
+        return OrchestratorState(
+            status="stopped",
+            mode=None,
+            pid=None,
+            instance_id=None,
+            uptime=None,
+            detail="no pid file",
+        )
+    if not is_pid_alive(inst.pid):
+        return OrchestratorState(
+            status="stopped",
+            mode=None,
+            pid=None,
+            instance_id=None,
+            uptime=None,
+            detail="stale pid file",
+        )
+    return OrchestratorState(
+        status="running",
+        mode=inst.mode,
+        pid=inst.pid,
+        instance_id=inst.instance_id,
+        uptime=_format_uptime(inst.started_at),
+        detail="",
+    )
+
+
+def _render_orchestrator_state(state: OrchestratorState) -> None:
+    """Print the orchestrator status line based on *state* (spec AC-252-1).
+
+    Renders exactly one of:
+
+    - ``Orchestrator: running (<mode>)  pid <N>  instance <id>  uptime <HH:MM:SS>``
+    - ``Orchestrator: stopped (stale pid file)``
+    - ``Orchestrator: stopped (no pid file)``
+
+    Double-space separators between the running-line fields are required by spec
+    section 2 G5.
+
+    Args:
+        state: The resolved :class:`OrchestratorState`.
+    """
+    if state.status == "running":
+        print(
+            f"Orchestrator: running ({state.mode})"
+            f"  pid {state.pid}"
+            f"  instance {state.instance_id}"
+            f"  uptime {state.uptime}"
+        )
+    else:
+        print(f"Orchestrator: stopped ({state.detail})")
 
 
 def _print_active_units(active: list[WorkUnit]) -> None:
@@ -572,6 +695,7 @@ def cmd_status(*argv: str) -> int:
         _render_scope_banner(scope.include, scope.exclude, scope.started_at)
 
     _render_drain_banner(WORKSPACE_ROOT)
+    _render_orchestrator_state(_resolve_orchestrator_state(WORKSPACE_ROOT))
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     all_units = parser.parse_index()

@@ -2169,7 +2169,9 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
     return ""
 
 
-_BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+_BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(
+    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)"
+)
 
 
 def _cascade_cycle_signature(marker_ids: list[str], unsatisfied_dep_ids: list[str]) -> str:

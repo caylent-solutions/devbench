@@ -1353,7 +1353,8 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> tuple[R
 
     Args:
         path: Config file path (used in error messages).
-        repo_name: The ``org/repo`` key.
+        repo_name: The repos map key -- either a two-segment ``org/repo`` form
+            or a bare single-segment name for local-only repos.
         repo_data: Raw value from YAML (may be None or a dict after schema validation).
 
     Returns:

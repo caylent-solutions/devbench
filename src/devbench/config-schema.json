@@ -163,7 +163,7 @@
         },
         "local_only": {
           "type": "boolean",
-          "description": "When true, the target repo(s) are treated as local-only -- no origin git remote, never pushed, no PRs, no CI. ensure_branch creates the work-unit branch off the local default branch (no 'git fetch origin'). Requires defer_pr: true, forbids pause_before_merge: true, and requires every entry in repos: to set an explicit default_branch:. Used for operational workflows (AWS teardowns, evidence capture, audits) where devbench drives work but does not edit application code. Default: false."
+          "description": "When true, the target repo(s) are treated as local-only -- no origin git remote, never pushed, no PRs, no CI. ensure_branch creates the work-unit branch off the local default branch (no 'git fetch origin'). Requires defer_pr: true, forbids pause_before_merge: true, and requires every repo with effective local_only==true to set an explicit default_branch:. Used for operational workflows (AWS teardowns, evidence capture, audits) where devbench drives work but does not edit application code. Default: false."
         },
         "auto_finalize": {
           "type": "boolean",

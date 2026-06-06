@@ -349,8 +349,9 @@ class TestEnsureBranchLocalOnly:
     """ensure_branch must not call git fetch origin for a local_only repo."""
 
     def test_ensure_branch_skips_fetch_origin_for_local_only(self, tmp_path: Path) -> None:
-        """When RUNTIME_CONFIG.git_ops.local_only is True, ensure_branch must not
-        run git fetch origin."""
+        """Per-repo local_only: True causes ensure_branch to skip git fetch origin
+        even when git_ops.local_only is False (proving per-repo precedence over
+        the top-level fallback via _effective_local_only)."""
         from devbench.github.git_ops import GitOpsService
 
         repo_path = tmp_path / "repo"
@@ -367,8 +368,14 @@ class TestEnsureBranchLocalOnly:
                 return 1, "", ""
             return 0, "main\n", ""
 
+        # Per-repo local_only=True with top-level git_ops.local_only=False
+        # proves that _effective_local_only uses per-repo value first.
+        mock_repo_cfg = MagicMock()
+        mock_repo_cfg.local_only = True
+
         mock_config = MagicMock()
-        mock_config.git_ops.local_only = True
+        mock_config.git_ops.local_only = False
+        mock_config.repos = {"workspace-local": mock_repo_cfg}
 
         with (
             patch("devbench.github.git_ops.run_command", side_effect=_fake_run_command),

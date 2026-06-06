@@ -78,6 +78,12 @@ ValueError: Config file '...': at most one local_only repo is allowed; found: <i
 
 **Requires `default_branch`.** Every repo whose effective `local_only` is `true` must
 declare an explicit `default_branch`; there is no `origin/HEAD` to fall back to.
+Omitting it raises:
+
+```
+ValueError: Config file '...': local_only repos require an explicit default_branch:.
+Missing on: <repo-ids>. There is no origin to fall back to in local-only mode.
+```
 
 **Example -- workspace-local repo without a GitHub remote:**
 

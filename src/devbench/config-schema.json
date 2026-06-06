@@ -8,10 +8,10 @@
   "properties": {
     "repos": {
       "type": "object",
-      "description": "Map of org/repo keys to per-repository configuration.",
+      "description": "Map of repo keys to per-repository configuration. Keys may be two-segment 'org/repo' (e.g. 'caylent/devbench') or bare single-segment names (e.g. 'workspace-local') for local-only repos without a GitHub remote. Three-segment and empty-segment keys are rejected.",
       "minProperties": 1,
       "patternProperties": {
-        "^[^/]+/[^/]+$": {
+        "^[^/]+(/[^/]+)?$": {
           "type": ["object", "null"],
           "description": "Per-repository configuration.",
           "additionalProperties": false,
@@ -28,6 +28,10 @@
               "type": "string",
               "enum": ["merge", "squash", "rebase"],
               "description": "Per-repo PR merge strategy override."
+            },
+            "local_only": {
+              "type": "boolean",
+              "description": "When true, this repo has no origin remote and is never pushed. ensure_branch skips git fetch origin and git-ops-finalize is a no-op. Overrides git_ops.local_only for this repo when set. At most one local_only repo is allowed. Requires default_branch to be set."
             }
           }
         }

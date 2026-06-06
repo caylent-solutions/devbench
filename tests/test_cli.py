@@ -6182,6 +6182,37 @@ class TestCmdGitOpsFinalize:
         assert result == 1
         assert "defer_pr" in capsys.readouterr().err.lower()
 
+    @pytest.mark.unit
+    def test_git_ops_finalize_skips_when_repo_is_local_only(self, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-FIX-001/AC-FIX-002: cmd_git_ops_finalize returns 0 immediately
+        and logs [AUTO_FINALIZE_SKIPPED] local_only=true when the resolved
+        repo has effective local_only == True.  commit_and_push must not be
+        called."""
+        import logging
+
+        from devbench.config_loader import AUTO_FINALIZE_SKIPPED_LOCAL_ONLY, RepoConfig
+        from devbench.github.git_ops import GitOpsService
+
+        local_only_repo = RepoConfig(local_only=True, default_branch="main")
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.repos = {"caylent-solutions/git-repo": local_only_repo}
+        mock_ops = MagicMock(spec=GitOpsService)
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0, "local_only repos must cause cmd_git_ops_finalize to return 0"
+        mock_ops.commit_and_push.assert_not_called()
+        assert AUTO_FINALIZE_SKIPPED_LOCAL_ONLY in caplog.text, (
+            f"Expected log message {AUTO_FINALIZE_SKIPPED_LOCAL_ONLY!r} not found in caplog"
+        )
+
 
 class TestCmdGitOpsFinalizeNotifications:
     """Issue #219: cmd_git_ops_finalize and _handle_finalize_ci_result fire

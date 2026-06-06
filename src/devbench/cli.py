@@ -154,7 +154,12 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import QuotaHandlingConfig, RepoConfig, get_configured_default_branch
+from devbench.config_loader import (
+    AUTO_FINALIZE_SKIPPED_LOCAL_ONLY,
+    QuotaHandlingConfig,
+    RepoConfig,
+    get_configured_default_branch,
+)
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
@@ -5537,6 +5542,12 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
 
     canonical_repo = resolve_repo(repo_name)
     validate_repo(canonical_repo)
+
+    repo_cfg = RUNTIME_CONFIG.repos.get(canonical_repo)
+    if repo_cfg is not None and repo_cfg.local_only:
+        logger.info(AUTO_FINALIZE_SKIPPED_LOCAL_ONLY)
+        return 0
+
     repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
     if repo_path is None:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)

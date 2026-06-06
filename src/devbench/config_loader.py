@@ -1053,20 +1053,28 @@ class RepoConfig:
             the ``/`` in ``org/repo``).
         merge_strategy: Per-repo PR merge strategy override.  When ``None``,
             the top-level ``RuntimeConfig.merge_strategy`` is used.
+        local_only: When ``True``, this repo has no ``origin`` remote and is
+            never pushed. ``ensure_branch`` skips ``git fetch origin`` and
+            ``git-ops-finalize`` is a no-op for it. The effective value is
+            this field when it is explicitly set in YAML; otherwise it
+            inherits from ``git_ops.local_only``. At most one local_only
+            repo is allowed across the entire repos map (enforced at config
+            load). Defaults to ``False``.
         resolved_checkout_path: Absolute filesystem path to the repo
             checkout, populated by ``load_runtime_config``. Equal to
             ``<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
             after resolution. Consumers MUST read this field instead of
             re-resolving the path inline (E213).
-        validated_repo: Canonical ``org/repo`` form for this entry,
-            populated by ``load_runtime_config`` from the YAML repos map
-            key. Stored verbatim so consumers do not re-validate the
-            shape per-call.
+        validated_repo: Canonical repo key for this entry (either
+            ``org/repo`` or a bare name for local-only repos), populated
+            by ``load_runtime_config`` from the YAML repos map key. Stored
+            verbatim so consumers do not re-validate the shape per-call.
     """
 
     default_branch: str | None = None
     checkout_directory: str | None = None
     merge_strategy: str | None = None
+    local_only: bool = False
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
 
@@ -1340,7 +1348,7 @@ def resolve_config_path(
     return workspace_root / DEFAULT_CONFIG_SUBPATH
 
 
-def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoConfig:
+def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> tuple[RepoConfig, bool | None]:
     """Parse and validate a single repo entry from raw YAML.
 
     Args:
@@ -1349,22 +1357,33 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         repo_data: Raw value from YAML (may be None or a dict after schema validation).
 
     Returns:
-        ``RepoConfig`` populated from *repo_data*.
+        A ``(RepoConfig, per_repo_local_only)`` pair where ``per_repo_local_only``
+        is the explicitly-set ``local_only`` value from YAML (``True`` or ``False``),
+        or ``None`` when the key was absent from the repo entry.  The
+        ``RepoConfig.local_only`` field is left at its default (``False``) here;
+        callers are responsible for resolving the effective value using the top-level
+        ``git_ops.local_only`` fallback.
 
     Raises:
         ValueError: If *checkout_directory* is absolute or contains ``..``.
     """
     if not isinstance(repo_data, dict):
-        return RepoConfig()
+        return RepoConfig(), None
 
     default_branch: str | None = repo_data.get("default_branch")
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
+    local_only_raw = repo_data.get("local_only")
+    # None means "not set in YAML"; bool means explicitly set.
+    per_repo_local_only: bool | None = bool(local_only_raw) if local_only_raw is not None else None
 
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
-        return RepoConfig(
-            default_branch=default_branch,
-            merge_strategy=repo_merge_strategy,
+        return (
+            RepoConfig(
+                default_branch=default_branch,
+                merge_strategy=repo_merge_strategy,
+            ),
+            per_repo_local_only,
         )
 
     if Path(raw_checkout).is_absolute():
@@ -1377,10 +1396,13 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
             f"Config file '{path}': repos.{repo_name}.checkout_directory "
             f"must not contain parent traversal ('..'), got '{raw_checkout}'."
         )
-    return RepoConfig(
-        default_branch=default_branch,
-        checkout_directory=raw_checkout,
-        merge_strategy=repo_merge_strategy,
+    return (
+        RepoConfig(
+            default_branch=default_branch,
+            checkout_directory=raw_checkout,
+            merge_strategy=repo_merge_strategy,
+        ),
+        per_repo_local_only,
     )
 
 
@@ -1389,6 +1411,7 @@ def _parse_repos(
     repos_raw: dict,
     allowed_orgs: list[str],
     workspace_root: Path | None = None,
+    top_level_local_only: bool = False,
 ) -> dict[str, RepoConfig]:
     """Build the repos mapping from the raw YAML ``repos`` block.
 
@@ -1402,37 +1425,56 @@ def _parse_repos(
     ``None`` the field stays ``None`` -- callers that operate without a
     workspace root (some tests) must tolerate that absence.
 
+    The effective ``local_only`` for each repo is resolved using per-repo-then-
+    top-level precedence: if the YAML entry for a repo sets ``local_only``, that
+    value is used; otherwise *top_level_local_only* (from ``git_ops.local_only``)
+    is inherited.  At most one repo may have an effective ``local_only == True``;
+    a ``ValueError`` is raised otherwise.
+
     Args:
         path: Config file path (used in error messages).
         repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
         allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
         workspace_root: Absolute path to ``DEVBENCH_WORKSPACE_ROOT`` for
             populating ``resolved_checkout_path``.
+        top_level_local_only: Value of ``git_ops.local_only`` from the YAML
+            top-level block, used as the fallback when a repo entry does not
+            set its own ``local_only`` key.
 
     Returns:
-        Mapping of ``org/repo`` → ``RepoConfig`` with ``validated_repo``
-        and (when *workspace_root* is set) ``resolved_checkout_path``
-        populated.
+        Mapping of repo key → ``RepoConfig`` with ``validated_repo``,
+        resolved ``local_only``, and (when *workspace_root* is set)
+        ``resolved_checkout_path`` populated.
 
     Raises:
-        ValueError: If a repo key's org is not in *allowed_orgs*.
+        ValueError: If a repo key's org is not in *allowed_orgs*, or if
+            more than one repo has an effective ``local_only == True``.
     """
     repos: dict[str, RepoConfig] = {}
     for repo_key, repo_data in repos_raw.items():
         repo_name = str(repo_key)
-        if allowed_orgs:
+        if allowed_orgs and "/" in repo_name:
             org = repo_name.split("/", maxsplit=1)[0]
             if org not in allowed_orgs:
                 raise ValueError(
                     f"Config file '{path}': repo '{repo_name}' belongs to org '{org}', "
                     f"which is not in allowed_orgs: {allowed_orgs}."
                 )
-        cfg = _parse_repo_config(path, repo_name, repo_data)
+        cfg, per_repo_local_only = _parse_repo_config(path, repo_name, repo_data)
+        # Effective local_only: per-repo when explicitly set, else top-level fallback.
+        cfg.local_only = per_repo_local_only if per_repo_local_only is not None else top_level_local_only
         cfg.validated_repo = repo_name
         if workspace_root is not None:
             checkout_dir = cfg.checkout_directory or repo_name.split("/", maxsplit=1)[-1]
             cfg.resolved_checkout_path = workspace_root / checkout_dir
         repos[repo_name] = cfg
+
+    local_only_ids = sorted(name for name, cfg in repos.items() if cfg.local_only)
+    if len(local_only_ids) > 1:
+        raise ValueError(
+            f"Config file '{path}': at most one local_only repo is allowed; found: " + ", ".join(local_only_ids)
+        )
+
     return repos
 
 
@@ -1538,7 +1580,16 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
     workspace_root_raw = _env.get("DEVBENCH_WORKSPACE_ROOT", "")
     workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
-    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs, workspace_root)
+    # Extract git_ops.local_only early so _parse_repos can apply the top-level fallback.
+    _git_ops_raw_for_repos = raw.get("git_ops") or {}
+    top_level_local_only = bool(_git_ops_raw_for_repos.get("local_only", False))
+    repos = _parse_repos(
+        path,
+        raw.get("repos") or {},
+        allowed_orgs,
+        workspace_root,
+        top_level_local_only=top_level_local_only,
+    )
 
     # Populate TimeoutConfig from YAML timeouts block (absent keys yield None).
     timeouts_raw = raw.get("timeouts") or {}
@@ -1618,15 +1669,18 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         auto_finalize=auto_finalize,
         auto_merge=auto_merge,
     )
-    if local_only:
-        missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]
-        if missing_default_branch:
-            raise ValueError(
-                f"Config file '{path}': git_ops.local_only: true requires every entry in "
-                f"repos: to set an explicit default_branch:. Missing on: "
-                f"{', '.join(sorted(missing_default_branch))}. There is no origin to fall "
-                "back to in local-only mode."
-            )
+    # Every local_only repo (effective value) must have an explicit default_branch;
+    # there is no origin/HEAD to fall back to in local-only mode.
+    missing_default_branch = [
+        repo_name for repo_name, repo_cfg in repos.items() if repo_cfg.local_only and not repo_cfg.default_branch
+    ]
+    if missing_default_branch:
+        raise ValueError(
+            f"Config file '{path}': local_only repos require an explicit default_branch:. "
+            f"Missing on: "
+            f"{', '.join(sorted(missing_default_branch))}. There is no origin to fall "
+            "back to in local-only mode."
+        )
 
     # Populate DebugConfig from YAML debug block (absent keys yield None).
     debug_raw = raw.get("debug") or {}

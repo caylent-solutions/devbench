@@ -38,7 +38,10 @@ For every configurable parameter:
 
 ## `repos:` (required)
 
-At least one entry is required. Each key must be in `org/repo` format.
+At least one entry is required. Each key is either a two-segment `org/repo` identifier
+(e.g. `caylent-solutions/devbench`) or a bare single-segment name (e.g. `workspace-local`)
+for repos that have no GitHub remote. Three-segment keys (e.g. `org/repo/extra`) and
+empty-segment keys (e.g. `org/`) are rejected at load time.
 
 ```yaml
 repos:
@@ -46,6 +49,46 @@ repos:
     default_branch: main          # optional -- omit to fall back to origin/HEAD
     checkout_directory: devbench  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
     merge_strategy: squash        # optional -- overrides top-level merge_strategy
+    local_only: false             # optional -- see local_only below
+```
+
+### `repos.<key>.local_only`
+
+| Property | Value |
+|----------|-------|
+| **Type** | boolean |
+| **Default** | `false` |
+
+When `true`, this repo has no `origin` remote and is never pushed:
+
+- `ensure_branch` creates the work-unit branch off the local default branch without
+  running `git fetch origin`.
+- `git-ops-finalize` is a no-op and returns 0 immediately (logs
+  `[AUTO_FINALIZE_SKIPPED] local_only=true`).
+
+**Effective-value precedence.** The per-repo `local_only` key wins when explicitly set
+(`true` or `false`); otherwise the repo inherits the top-level `git_ops.local_only` value.
+
+**At-most-one constraint.** At most one repo may have an effective `local_only == true`
+across the entire `repos:` map. Violating this constraint raises:
+
+```
+ValueError: Config file '...': at most one local_only repo is allowed; found: <ids>
+```
+
+**Requires `default_branch`.** Every repo whose effective `local_only` is `true` must
+declare an explicit `default_branch`; there is no `origin/HEAD` to fall back to.
+
+**Example -- workspace-local repo without a GitHub remote:**
+
+```yaml
+repos:
+  workspace-local:
+    default_branch: main
+    local_only: true
+git_ops:
+  defer_pr: true
+  single_branch: feat/work
 ```
 
 ---
@@ -159,7 +202,8 @@ git_ops:
   pause_before_merge: false     # push + wait for CI, then transition to in-review
   inline_orphan_cleanup: true   # chore commit before task commit when orphans detected
   ci_failure_retry: true        # rc=2 on CI failure triggers executor retry with log feedback
-  auto_finalize: false          # auto-run git-ops-finalize when all WUs terminal
+  local_only: false             # top-level fallback; per-repo repos.<key>.local_only takes precedence
+  auto_finalize: false          # auto-run git-ops-finalize when all WUs terminal (incompatible with local_only)
   auto_merge: false             # auto-merge after CI green (requires auto_finalize + defer_pr)
   orphan_patterns: []           # replaces built-in orphan fnmatch list when non-empty
   pr_review_resolution:
@@ -169,6 +213,14 @@ git_ops:
     settle_seconds: 60
     poll_interval: 5
 ```
+
+### `git_ops.local_only`
+
+Top-level fallback for all repos in the `repos:` map. When `true`, every repo that does
+not explicitly set its own `local_only` key inherits this value. Per-repo
+`repos.<key>.local_only` takes precedence when explicitly set (overrides in both directions).
+
+See `repos.<key>.local_only` above for the full semantics, constraints, and examples.
 
 ---
 

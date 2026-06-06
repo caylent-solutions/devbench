@@ -140,15 +140,15 @@ class TestLoadRuntimeConfig:
 
     def test_raises_value_error_on_invalid_repo_key_format(self, tmp_path: Path) -> None:
         """
-        Given: a repo key without a slash (not 'org/repo' format)
+        Given: a repo key with three segments (three-slash format is not 'org/repo')
         When: load_runtime_config is called
         Then: ValueError is raised referencing the invalid key
         """
         cfg = self._write_yaml(
             tmp_path / "cfg.yaml",
-            "repos:\n  notavalidrepo:\n    default_branch: main\n",
+            "repos:\n  caylent/foo/bar:\n    default_branch: main\n",
         )
-        with pytest.raises(ValueError, match="notavalidrepo"):
+        with pytest.raises(ValueError, match="caylent/foo/bar"):
             load_runtime_config(cfg, {})
 
     def test_parses_single_repo_without_default_branch(self, tmp_path: Path) -> None:
@@ -487,7 +487,7 @@ class TestJsonSchemaValidation:
 
     def test_schema_enforces_org_repo_key_format(self, tmp_path: Path) -> None:
         """
-        Given: a repo key without a slash
+        Given: a repo key with three segments (three-slash format is rejected)
         When: load_runtime_config is called
         Then: ValueError is raised referencing the invalid key (AC-2)
         """
@@ -495,11 +495,11 @@ class TestJsonSchemaValidation:
             tmp_path / "cfg.yaml",
             """\
             repos:
-              notavalidrepo:
+              caylent/foo/bar:
                 default_branch: main
             """,
         )
-        with pytest.raises(ValueError, match="notavalidrepo"):
+        with pytest.raises(ValueError, match="caylent/foo/bar"):
             load_runtime_config(cfg, {})
 
     def test_schema_rejects_invalid_merge_strategy(self, tmp_path: Path) -> None:
@@ -1967,7 +1967,7 @@ class TestVNextCanonicalConfig:
               local_only: true
             """,
         )
-        with pytest.raises(ValueError, match=r"requires every entry in repos: to set an explicit default_branch"):
+        with pytest.raises(ValueError, match=r"local_only repos require an explicit default_branch"):
             load_runtime_config(cfg, {})
 
     def test_orphan_patterns_parse_from_yaml(self, tmp_path: Path) -> None:

@@ -167,16 +167,25 @@ class TestOrchestrateMarketplaceManifest:
 
 @pytest.mark.unit
 class TestAuthoringMarketplaceManifest:
-    """Authoring marketplace lists exactly one plugin: devbench-authoring (issue #224 AC-2)."""
+    """Authoring marketplace lists two plugins after issue #246: devbench-authoring and devbench-backlog-assistant."""
 
-    def test_marketplace_lists_exactly_one_plugin(self, authoring_marketplace_manifest: dict[str, Any]) -> None:
+    def test_marketplace_lists_exactly_two_plugins(self, authoring_marketplace_manifest: dict[str, Any]) -> None:
         plugins = authoring_marketplace_manifest.get("plugins", [])
         assert isinstance(plugins, list)
-        assert len(plugins) == 1, (
-            f"authoring marketplace must list exactly one plugin (issue #224 AC-2); got {len(plugins)}"
+        assert len(plugins) == 2, (
+            f"authoring marketplace must list exactly two plugins after issue #246; got {len(plugins)}"
         )
 
     def test_plugin_entry_is_devbench_authoring(self, authoring_marketplace_manifest: dict[str, Any]) -> None:
-        plugin = authoring_marketplace_manifest["plugins"][0]
-        assert plugin["name"] == "devbench-authoring"
-        assert plugin["source"].rstrip("/") == "./devbench-authoring"
+        names = [p["name"] for p in authoring_marketplace_manifest["plugins"]]
+        assert "devbench-authoring" in names, f"authoring marketplace must include devbench-authoring; got {names}"
+        entry = next(p for p in authoring_marketplace_manifest["plugins"] if p["name"] == "devbench-authoring")
+        assert entry["source"].rstrip("/") == "./devbench-authoring"
+
+    def test_plugin_entry_is_devbench_backlog_assistant(self, authoring_marketplace_manifest: dict[str, Any]) -> None:
+        names = [p["name"] for p in authoring_marketplace_manifest["plugins"]]
+        assert "devbench-backlog-assistant" in names, (
+            f"authoring marketplace must include devbench-backlog-assistant after issue #246; got {names}"
+        )
+        entry = next(p for p in authoring_marketplace_manifest["plugins"] if p["name"] == "devbench-backlog-assistant")
+        assert entry["source"].rstrip("/") == "./devbench-backlog-assistant"

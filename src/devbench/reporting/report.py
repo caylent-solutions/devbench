@@ -82,6 +82,7 @@ from devbench.constants import (
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
+from devbench.instances import is_pid_alive, pid_file_path, read_pid_file
 from devbench.reporting.event_index import EventIndex
 from devbench.scope import ScopeFilter
 
@@ -1257,52 +1258,80 @@ def _orchestrator_liveness_banner(
     session_id: str | None,
     threshold_seconds: int,
     *,
+    pid_file: Path | None = None,
     display_tz: tzinfo | None = None,
     now: datetime | None = None,
 ) -> str:
-    """Render a one-line orchestrator-alive status banner (issue #161).
+    """Render a one-line orchestrator-alive status banner (issue #161, #250).
 
-    Three states derived from log-activity recency:
-      * **ALIVE** (green) -- last log line within ``threshold_seconds``.
-      * **STOPPED** (red) -- last log line older than ``threshold_seconds``.
-        Banner includes the elapsed-since duration and last-seen timestamp.
-      * **STARTING** (yellow) -- log file missing or empty.
+    Three states derived from live-PID presence (issue #250):
+      * **ALIVE** (green) -- a live PID exists AND the log has a parseable
+        timestamp.
+      * **STOPPED** (red) -- no live PID, regardless of log recency.  Banner
+        includes the elapsed-since duration and last-seen timestamp when a
+        parseable log line exists.
+      * **STARTING** (yellow) -- a live PID exists but no parseable log line
+        has been written yet (log missing, empty, or tail is an untimestamped
+        traceback).
 
-    Boundary: a delta exactly equal to ``threshold_seconds`` is ALIVE; one
-    second past is STOPPED. ANSI colour is emitted only when stdout is a
-    TTY and ``NO_COLOR`` is unset (mirrors ``_should_use_color``); pipes
-    and CI redirects receive plain text.
+    An untimestamped traceback tail (non-empty file, ``_read_last_log_timestamp``
+    returns ``None``) is never treated as ALIVE -- it maps to STARTING when a
+    live PID exists, or STOPPED when none does.
 
-    The threshold is sourced by callers from ``stop_hook.window_seconds``
-    so the banner stays aligned with the operator's already-tuned
-    circuit-breaker quiet window.
+    ANSI colour is emitted only when stdout is a TTY and ``NO_COLOR`` is unset
+    (mirrors ``_should_use_color``); pipes and CI redirects receive plain text.
+
+    The ``threshold_seconds`` parameter is retained for the STOPPED-state
+    elapsed-since display but no longer governs the ALIVE/STOPPED decision.
 
     Args:
         log_path: Path to the structured orchestrator log.
-        session_id: Optional ``DEVBENCH_ORCHESTRATOR_SESSION_ID`` value. When
-            empty/None, the banner suppresses the trailing
-            ``-- session ...`` suffix.
-        threshold_seconds: Quiet-window cap. ``stop_hook.window_seconds``.
-        display_tz: Display-timezone for the STOPPED-state last-seen
-            timestamp. ``None`` falls back to system local.
+        session_id: Optional ``DEVBENCH_ORCHESTRATOR_SESSION_ID`` value.  When
+            empty/None the banner suppresses the trailing ``-- session ...``
+            suffix.
+        threshold_seconds: Used only for display of the elapsed-since duration
+            in the STOPPED state.  Sourced from ``stop_hook.window_seconds``.
+        pid_file: Path to the orchestrator PID file.  When ``None`` the banner
+            falls back to STOPPED (safe default -- no evidence of a live
+            process).
+        display_tz: Display-timezone for the STOPPED-state last-seen timestamp.
+            ``None`` falls back to system local.
         now: Override for the current wall-clock (test injection point).
     """
     current = now if now is not None else datetime.now(UTC)
-    last_ts = _read_last_log_timestamp(log_path)
     suffix = f" -- session {session_id}" if session_id else ""
 
-    if last_ts is None:
+    # Determine whether a live orchestrator process exists.
+    live_pid = False
+    if pid_file is not None:
+        inst = read_pid_file(pid_file)
+        if inst is not None:
+            live_pid = is_pid_alive(inst.pid)
+
+    last_ts = _read_last_log_timestamp(log_path)
+
+    if not live_pid:
+        # No live PID -- always STOPPED, regardless of log recency.
+        if last_ts is not None:
+            delta = max(0.0, (current - last_ts).total_seconds())
+            seen = _format_local_timestamp(last_ts, display_tz)
+            body = f"[ORCHESTRATOR STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
+        else:
+            # No parseable log line; use the configured quiet window as a
+            # lower-bound estimate of how long the orchestrator has been idle.
+            min_quiet = _format_duration(threshold_seconds)
+            body = f"[ORCHESTRATOR STOPPED] no activity recorded; quiet for at least {min_quiet}"
+        color = _COLOR_RED_LIGHT
+    elif last_ts is None:
+        # Live PID but no parseable log line yet (empty file, missing file,
+        # or untimestamped traceback tail) -- STARTING.
         body = "[ORCHESTRATOR STARTING] log file empty; no activity recorded yet"
         color = _COLOR_YELLOW
     else:
+        # Live PID and parseable log line -- ALIVE.
         delta = max(0.0, (current - last_ts).total_seconds())
-        if delta <= threshold_seconds:
-            body = f"[ORCHESTRATOR ALIVE] last activity {_format_duration(delta)} ago"
-            color = _COLOR_GREEN
-        else:
-            seen = _format_local_timestamp(last_ts, display_tz)
-            body = f"[ORCHESTRATOR STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
-            color = _COLOR_RED_LIGHT
+        body = f"[ORCHESTRATOR ALIVE] last activity {_format_duration(delta)} ago"
+        color = _COLOR_GREEN
 
     line = body + suffix
     if not _should_use_color():
@@ -2764,6 +2793,7 @@ def generate_report(
         log_path=log_path,
         session_id=session_id,
         threshold_seconds=STOP_HOOK_WINDOW_SECONDS,
+        pid_file=pid_file_path(WORKSPACE_ROOT),
         display_tz=banner_display_tz,
     )
 

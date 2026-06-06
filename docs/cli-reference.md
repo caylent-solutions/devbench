@@ -161,11 +161,11 @@ Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKE
 
 **In-progress duration (issue #158):** the `In-progress tasks:` panel suffixes every row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). Multiple in-progress transitions for the same task (blocked-then-resumed) resolve to the most recent one. When neither the structured log nor the work-unit's audit comments yield a parseable timestamp the row renders `(in-progress, timer unavailable)` -- never silently omitted. The same suffix appears on `devbench status` and `devbench status --detail` Active rows.
 
-**Orchestrator-alive banner (issue #161):** the very first line of `devbench report` is a one-line liveness banner derived from log-activity recency. Three states:
+**Orchestrator-alive banner (issue #161):** the very first line of `devbench report` is a one-line liveness banner that is PID-authoritative. Three states:
 
-- `[ORCHESTRATOR ALIVE]` (green) -- last log line is within `stop_hook.window_seconds`. Suffix names the elapsed-since duration (`last activity 12s ago`).
-- `[ORCHESTRATOR STOPPED]` (red) -- last log line older than `stop_hook.window_seconds`. Suffix names elapsed-since plus the last-seen UTC timestamp so the operator can see when the loop went quiet (`no activity for 14m (last seen 2026-05-04 13:21 UTC)`).
-- `[ORCHESTRATOR STARTING]` (yellow) -- log file missing or empty. The orchestrator is starting up or no events have been written yet.
+- `[ORCHESTRATOR ALIVE]` (green) -- a live PID exists AND the log contains a parseable timestamp. Suffix names the elapsed-since duration (`last activity 12s ago`).
+- `[ORCHESTRATOR STOPPED]` (red) -- no live PID, regardless of log recency. Suffix names elapsed-since plus the last-seen UTC timestamp when a log line is available (`no activity for 14m (last seen 2026-05-04 13:21 UTC)`), or a "no activity recorded" message when the log has no parseable timestamp.
+- `[ORCHESTRATOR STARTING]` (yellow) -- a live PID exists but the log file is missing, empty, or has no parseable log line yet (including an untimestamped traceback tail). The orchestrator process is running but has not written a timestamped event.
 
 Every banner ends with the active session id when `DEVBENCH_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
 

@@ -16,11 +16,12 @@ Each single-condition failure makes the gate exit non-zero.
 from __future__ import annotations
 
 import importlib
+import importlib.abc
 import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,7 +39,7 @@ def _import_gate() -> Any:
     # Register in sys.modules before exec so @dataclass can resolve cls.__module__
     # (required for Python 3.14 compatibility).
     sys.modules["release_acceptance"] = module
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    cast(importlib.abc.Loader, spec.loader).exec_module(module)
     return module
 
 
@@ -130,7 +131,7 @@ class TestConditionBCIMatrix:
 
 @pytest.mark.unit
 class TestConditionCBranchCoverage:
-    """Condition (c): 100 percent branch coverage on new/changed modules."""
+    """Condition (c): branch coverage on new/changed modules must meet the threshold."""
 
     def test_passes_when_coverage_at_100_percent(self, gate: Any) -> None:
         with patch("subprocess.run") as mock_run:
@@ -147,6 +148,25 @@ class TestConditionCBranchCoverage:
             result = gate.check_branch_coverage(REPO_ROOT)
         assert result.passed is False
         assert result.label == "branch_coverage"
+
+    def test_passes_custom_cov_source_and_threshold(self, gate: Any) -> None:
+        """check_branch_coverage must accept cov_source and cov_fail_under parameters."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            result = gate.check_branch_coverage(REPO_ROOT, cov_source="mymodule", cov_fail_under=90)
+        assert result.passed is True
+        # Verify the custom parameters were passed to pytest
+        called_cmd = mock_run.call_args[0][0]
+        assert "--cov=mymodule" in called_cmd
+        assert "--cov-fail-under=90" in called_cmd
+
+    def test_failure_message_includes_threshold(self, gate: Any) -> None:
+        """Failure message must include the configured threshold value."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=2, stdout="coverage fail", stderr="")
+            result = gate.check_branch_coverage(REPO_ROOT, cov_source="mymod", cov_fail_under=95)
+        assert result.passed is False
+        assert "95" in result.message
 
 
 @pytest.mark.unit

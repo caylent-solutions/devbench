@@ -24,13 +24,16 @@ stdout.
 from __future__ import annotations
 
 import argparse
+import importlib.abc
 import importlib.util
 import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 # ---------------------------------------------------------------------------
 # Data carrier
@@ -105,18 +108,29 @@ def check_ci_matrix(repo_root: Path) -> ConditionResult:
     )
 
 
-def check_branch_coverage(repo_root: Path) -> ConditionResult:
-    """Condition (c): 100 percent branch coverage on new/changed modules."""
+def check_branch_coverage(
+    repo_root: Path,
+    *,
+    cov_source: str = "devbench",
+    cov_fail_under: int = 100,
+) -> ConditionResult:
+    """Condition (c): branch coverage on new/changed modules must meet the threshold.
+
+    Args:
+        repo_root: Absolute path to the repository root.
+        cov_source: The coverage source module or path (default: "devbench").
+        cov_fail_under: Minimum required branch coverage percentage (default: 100).
+    """
     result = _run(
         [
             "uv",
             "run",
             "pytest",
             "tests/",
-            "--cov=devbench",
+            f"--cov={cov_source}",
             "--cov-branch",
             "--cov-report=term-missing",
-            "--cov-fail-under=100",
+            f"--cov-fail-under={cov_fail_under}",
             "--cov-precision=2",
             "-q",
         ],
@@ -127,7 +141,9 @@ def check_branch_coverage(repo_root: Path) -> ConditionResult:
     return ConditionResult(
         passed=False,
         label="branch_coverage",
-        message=(f"Branch coverage below 100%. Exit {result.returncode}. stdout: {result.stdout.strip()[:500]}"),
+        message=(
+            f"Branch coverage below {cov_fail_under}%. Exit {result.returncode}. stdout: {result.stdout.strip()[:500]}"
+        ),
     )
 
 
@@ -167,7 +183,7 @@ def _load_constants_known_judges(repo_root: Path) -> frozenset[str]:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load constants module from {constants_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    cast("importlib.abc.Loader", spec.loader).exec_module(module)
     known: frozenset[str] = getattr(module, "KNOWN_JUDGE_NAMES", frozenset())
     return frozenset(known)
 
@@ -344,7 +360,7 @@ def run_gate(repo_root: Path) -> int:
     Returns 0 when all conditions pass; returns 1 when any condition fails.
     Results are printed to stdout (structured) and diagnostics to stderr.
     """
-    checkers = [
+    checkers: list[tuple[str, Callable[[Path], ConditionResult]]] = [
         ("a", check_make_validate),
         ("b", check_ci_matrix),
         ("c", check_branch_coverage),

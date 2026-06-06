@@ -459,3 +459,52 @@ class TestSkillIterateUntilPerfectConstants:
             assert isinstance(tag, str)
             assert tag.startswith("[SKILL_"), f"audit tag must start with '[SKILL_' (got {tag!r})"
             assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"
+
+
+class TestQuotaHandlingConstants:
+    """Issue #234, #254: RECOVERY_PROBE_MODEL and QUOTA_HANDLING_DEFAULT_ENABLED constants."""
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_is_importable(self) -> None:
+        """RECOVERY_PROBE_MODEL is importable from devbench.constants without error."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "RECOVERY_PROBE_MODEL")
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_is_non_empty_string(self) -> None:
+        """RECOVERY_PROBE_MODEL is a non-empty str naming the recovery-probe model."""
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert isinstance(RECOVERY_PROBE_MODEL, str)
+        assert len(RECOVERY_PROBE_MODEL) > 0
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_value(self) -> None:
+        """RECOVERY_PROBE_MODEL equals 'claude-opus-4-8' per issue #254."""
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert RECOVERY_PROBE_MODEL == "claude-opus-4-8", "RECOVERY_PROBE_MODEL must be 'claude-opus-4-8' (issue #254)"
+
+    @pytest.mark.unit
+    def test_quota_handling_default_enabled_is_importable(self) -> None:
+        """QUOTA_HANDLING_DEFAULT_ENABLED is importable from devbench.constants."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "QUOTA_HANDLING_DEFAULT_ENABLED")
+
+    @pytest.mark.unit
+    def test_quota_handling_default_enabled_is_bool(self) -> None:
+        """QUOTA_HANDLING_DEFAULT_ENABLED is of type bool."""
+        from devbench.constants import QUOTA_HANDLING_DEFAULT_ENABLED
+
+        assert isinstance(QUOTA_HANDLING_DEFAULT_ENABLED, bool)
+
+    @pytest.mark.unit
+    def test_quota_handling_default_enabled_is_true(self) -> None:
+        """QUOTA_HANDLING_DEFAULT_ENABLED equals True (issue #234: enabled by default)."""
+        from devbench.constants import QUOTA_HANDLING_DEFAULT_ENABLED
+
+        assert QUOTA_HANDLING_DEFAULT_ENABLED is True, (
+            "QUOTA_HANDLING_DEFAULT_ENABLED must be True so quota wait-and-resume is active by default (issue #234)"
+        )

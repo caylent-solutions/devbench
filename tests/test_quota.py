@@ -19,7 +19,7 @@ AC-234-1, AC-234a-1.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -714,3 +714,152 @@ class TestDetectQuotaErrorEdgeCases:
         big = "a" * 100_000
         result = detect_quota_error(big)
         assert result is None
+
+    def test_no_raise_when_inner_raises(self) -> None:
+        """detect_quota_error catches exceptions from _detect_quota_error_inner."""
+
+        class AlwaysRaises:
+            @property
+            def status_code(self) -> int:
+                raise RuntimeError("inner boom")
+
+            @property
+            def content(self) -> list[object]:
+                raise RuntimeError("inner boom")
+
+            @property
+            def error(self) -> str:
+                raise RuntimeError("inner boom")
+
+            @property
+            def is_error(self) -> bool:
+                raise RuntimeError("inner boom")
+
+            @property
+            def response(self) -> dict[str, object]:
+                raise RuntimeError("inner boom")
+
+        result = detect_quota_error(AlwaysRaises())
+        assert result is None
+
+
+@pytest.mark.unit
+class TestInternalHelperBranchCoverage:
+    """Branch-coverage tests for internal helpers not fully exercised by rule tests."""
+
+    def test_parse_reset_at_invalid_minute_over_59(self) -> None:
+        """Minute > 59 returns None (unreachable via normal regex but defensively checked)."""
+        # The regex \d{2} matches 99, so "resets 4:99pm (UTC)" passes regex then fails validation.
+        assert _parse_reset_at_from_text("resets 4:99pm (UTC)") is None
+
+    def test_get_error_type_non_dict_body(self) -> None:
+        """_apply_rules_1_to_5 with status_code=402 and a non-dict body -> ApiBillingError."""
+        # body is not a dict -- covers _get_error_type's non-dict branch
+        obj = _make_sdk_exc(status_code=402)
+        obj.body = "not-a-dict"
+        result = detect_quota_error(obj)
+        assert isinstance(result, ApiBillingError)
+
+    def test_get_error_type_error_section_not_dict(self) -> None:
+        """body['error'] is not a dict -> ApiBillingError (covers non-dict error_section branch)."""
+        obj = _make_sdk_exc(status_code=402)
+        obj.body = {"error": "not-a-dict"}
+        result = detect_quota_error(obj)
+        assert isinstance(result, ApiBillingError)
+
+    def test_get_bedrock_error_code_error_section_not_dict(self) -> None:
+        """response['Error'] is not a dict -> None from bedrock rule."""
+        obj = _make_bedrock_exc("ThrottlingException")
+        obj.response = {"Error": "not-a-dict"}
+        result = detect_quota_error(obj)
+        assert result is None
+
+    def test_extract_reset_at_from_content_with_text_block(self) -> None:
+        """_extract_reset_at_from_content finds reset time in a block.text field."""
+        clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        # AssistantMessage with text block containing reset info
+        text_block = SimpleNamespace(text="resets 4:10pm (UTC)")
+        obj = SimpleNamespace(error="rate_limit", content=[text_block])
+        with patch("devbench.quota._get_current_utc", return_value=clock):
+            result = detect_quota_error(obj)
+        assert result is not None
+        assert result.reset_at is not None
+        assert result.reset_at.hour == 16
+
+    def test_extract_reset_at_from_content_content_field_branch(self) -> None:
+        """_extract_reset_at_from_content checks block.content str field when block.text is None."""
+        clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        # Block has no .text but has .content str with reset info
+        block = SimpleNamespace(content="resets 4:10pm (UTC)")
+        obj = SimpleNamespace(error="rate_limit", content=[block])
+        with patch("devbench.quota._get_current_utc", return_value=clock):
+            result = detect_quota_error(obj)
+        assert result is not None
+        # The rate_limit rule fires; reset_at may or may not be populated depending
+        # on whether the content field text is a parseable string -- it should be.
+        assert isinstance(result, SubscriptionRateLimitError)
+
+    def test_extract_reset_at_text_not_parseable_falls_through_to_content(self) -> None:
+        """When block.text is a str but not parseable, _extract_reset_at_from_content
+        falls through to check block.content for a parseable reset time."""
+        clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        # block.text is a str but has no reset-at pattern; block.content has the pattern
+        block = SimpleNamespace(text="no reset here", content="resets 4:10pm (UTC)")
+        obj = SimpleNamespace(error="rate_limit", content=[block])
+        with patch("devbench.quota._get_current_utc", return_value=clock):
+            result = detect_quota_error(obj)
+        assert result is not None
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert result.reset_at is not None
+        assert result.reset_at.hour == 16
+
+    def test_extract_reset_at_content_field_not_parseable_returns_none(self) -> None:
+        """When block.content is a str but not parseable, returns None for that block."""
+        # Block with text that doesn't parse, content that doesn't parse either
+        block = SimpleNamespace(text="no reset", content="also no reset")
+        obj = SimpleNamespace(error="rate_limit", content=[block])
+        result = detect_quota_error(obj)
+        # rate_limit fires but reset_at is None since neither field has reset info
+        assert result is not None
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert result.reset_at is None
+
+    def test_detect_quota_error_catches_inner_exception(self) -> None:
+        """detect_quota_error catches any exception from _detect_quota_error_inner."""
+
+        class StrRaises:
+            def __str__(self) -> str:
+                raise RuntimeError("str() raises")
+
+        # StrRaises is a BaseException if we subclass it; we need isinstance(obj, BaseException)
+        # to be True so that str(obj) is called in rule 9.
+        class BadError(Exception):
+            def __str__(self) -> str:
+                raise RuntimeError("str() raises")
+
+        result = detect_quota_error(BadError())
+        assert result is None
+
+    def test_extract_reset_at_non_list_content_returns_none(self) -> None:
+        """_extract_reset_at_from_content returns None when content is not list/tuple."""
+        # Trigger via rule 7 with non-list content
+        obj = SimpleNamespace(error="rate_limit", content="not-a-list")
+        result = detect_quota_error(obj)
+        assert result is not None
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert result.reset_at is None
+
+    def test_extract_reset_at_block_content_field_non_str_continues_loop(self) -> None:
+        """When block.content is not a str, loop continues to next block without reset."""
+        # First block: text=None (no .text attribute), content=non-string -> skip content branch
+        # Second block: text with parseable reset
+        clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        block_no_str_content = SimpleNamespace(content=42)  # content is int, not str
+        block_with_reset = SimpleNamespace(text="resets 4:10pm (UTC)")
+        obj = SimpleNamespace(error="rate_limit", content=[block_no_str_content, block_with_reset])
+        with patch("devbench.quota._get_current_utc", return_value=clock):
+            result = detect_quota_error(obj)
+        assert result is not None
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert result.reset_at is not None
+        assert result.reset_at.hour == 16

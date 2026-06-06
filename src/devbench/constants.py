@@ -814,3 +814,20 @@ SKILL_AUDIT_MAX_ITERATIONS_REACHED: str = "[SKILL_MAX_ITERATIONS_REACHED]"
 
 # Audit-row tag emitted when a skill converges (unresolved count <= threshold).
 SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"
+
+# ---------------------------------------------------------------------------
+# Quota handling constants (issue #234, #254)
+# ---------------------------------------------------------------------------
+# Model used to probe whether the quota has recovered after a rate-limit wait.
+# Updated to Opus 4.8 under issue #254 (the probe must succeed on the
+# recovery path; using the same model that was rate-limited confirms the
+# subscription tier has refreshed).
+RECOVERY_PROBE_MODEL: str = "claude-opus-4-8"
+
+# Master toggle for the quota wait-and-resume feature (issue #234).
+# When True, detect_quota_error is called on each SDK surface and a detected
+# QuotaExhaustedError triggers the wait-and-resume path instead of raising.
+# Operators can disable via DEVBENCH_QUOTA_HANDLING_ENABLED=0 (or false/no/off)
+# in the environment; the integration layer reads this constant as the default
+# when no env override is present.
+QUOTA_HANDLING_DEFAULT_ENABLED: bool = True

@@ -197,6 +197,26 @@ class ReviewResolution:
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
 
+def _effective_local_only(repo: str) -> bool:
+    """Return the effective local_only flag for *repo*.
+
+    Precedence: per-repo ``RepoConfig.local_only`` when the repo is present in
+    ``RUNTIME_CONFIG.repos``; otherwise the top-level ``git_ops.local_only``
+    flag.  This mirrors the resolution in ``cmd_git_ops_finalize`` so that both
+    commands use the same per-repo-then-top-level logic.
+
+    Args:
+        repo: Canonical repo key (e.g. ``caylent/devbench`` or ``workspace-local``).
+
+    Returns:
+        ``True`` when the repo's effective local_only is set; ``False`` otherwise.
+    """
+    repo_cfg = RUNTIME_CONFIG.repos.get(repo) if RUNTIME_CONFIG.repos else None
+    if repo_cfg is not None:
+        return repo_cfg.local_only
+    return RUNTIME_CONFIG.git_ops.local_only
+
+
 class GitOpsService:
     """Handles git commit, push, PR creation, merging, tagging, and CI checks."""
 
@@ -303,7 +323,7 @@ class GitOpsService:
 
         if branch_exists:
             self._git(["checkout", branch], repo_path)
-        elif RUNTIME_CONFIG.git_ops.local_only:
+        elif _effective_local_only(repo):
             default_branch = self._get_default_branch(repo_path, repo=repo)
             self._git(["checkout", "-b", branch, f"refs/heads/{default_branch}"], repo_path)
         else:

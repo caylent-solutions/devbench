@@ -1,0 +1,18 @@
+{
+  "name": "devbench-backlog-assistant",
+  "description": "Operator-phase backlog diagnosis and remediation assistant for the devbench workflow. Ships nine read-only diagnosis skills and payload skills that print mutating commands but never run them without CONFIRM. Use when work units are blocked, backlogs drift, or review is stuck. Pairs with devbench-orchestrate (execution) and devbench-authoring (planning).",
+  "version": "0.1.0",
+  "keywords": [
+    "devbench",
+    "backlog",
+    "triage",
+    "blocked",
+    "diagnosis",
+    "remediation",
+    "assistant",
+    "operator"
+  ],
+  "repository": "https://github.com/caylent-solutions/devbench",
+  "license": "MIT",
+  "homepage": "https://github.com/caylent-solutions/devbench"
+}

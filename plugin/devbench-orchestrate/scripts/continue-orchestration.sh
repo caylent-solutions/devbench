@@ -7,6 +7,18 @@ set -euo pipefail
 # this hook blocks the Stop event and injects a continuation
 # instruction so Claude re-enters the loop without human intervention.
 #
+# Timing limitation -- "decision: block" cannot resurrect a committed turn:
+#   The Claude agent model commits a turn when the assistant response is
+#   finalised. The Stop hook fires AFTER the turn has already wound down,
+#   so emitting "decision: block" here is a best-effort nudge to the NEXT
+#   turn; it cannot un-commit or roll back the turn that just ended.
+#   The real in-process recovery is provided by E10-F1 (pre-tool-call
+#   resumption guard) and E10-F2 (post-result continuation check), both of
+#   which run INSIDE the active turn and can re-enter the loop before the
+#   turn commits. This hook is therefore a safety net for cases where the
+#   in-process guards did not fire (e.g., the process was interrupted
+#   externally), not the primary recovery mechanism.
+#
 # Features:
 #   - Circuit breaker: allows stop after max_blocks within window_seconds
 #   - Task ID + file path extraction for context recovery
@@ -231,6 +243,9 @@ if command -v uv >/dev/null 2>&1; then
 fi
 
 # --- Build block response JSON ---
+# Note: this "decision: block" response is delivered to the NEXT turn, not
+# the one that just ended. See the timing limitation note at the top of this
+# script -- the in-process resume (E10-F1/E10-F2) is the real recovery path.
 
 REASON_TEXT="Orchestration loop active. Task ${TASK_ID} is in-progress (file: ${FILE_PATH}). Last action: ${LAST_ACTION}.${EXTRA_IDS_SUFFIX} ${NEXT_STEP} Circuit breaker: ${NEW_COUNT}/${MAX_BLOCKS} blocks in ${ELAPSED}s window.${STALE_WARNING} Never stop between tasks."
 

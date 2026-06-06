@@ -1,0 +1,100 @@
+---
+name: Release Acceptance Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: release-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-ruff:
+    name: Lint (ruff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make lint-ruff
+        shell: bash
+
+  lint-bandit:
+    name: Lint (bandit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make lint-bandit
+        shell: bash
+
+  lint-no-duplicates:
+    name: Lint (no duplicates)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: make lint-no-duplicates
+        shell: bash
+
+  format-check:
+    name: Format check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make format-check
+        shell: bash
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make typecheck
+        shell: bash
+
+  test-coverage:
+    name: Tests + coverage (>=98%)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make test-coverage
+        shell: bash
+
+  release-acceptance:
+    name: Release acceptance gate (a)-(h)
+    runs-on: ubuntu-24.04
+    needs:
+      - lint-ruff
+      - lint-bandit
+      - lint-no-duplicates
+      - format-check
+      - typecheck
+      - test-coverage
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dependencies
+        run: uv sync --all-extras
+        shell: bash
+      - name: Run release-acceptance gate
+        run: |
+          set -euo pipefail
+          uv run python infra/scripts/release_acceptance.py
+        shell: bash

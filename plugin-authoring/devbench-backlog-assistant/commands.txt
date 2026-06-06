@@ -1,0 +1,17 @@
+# devbench-backlog-assistant operator index
+# Each line lists a skill name and its primary usage.
+# This file is an index only -- NOT a load-bearing manifest.
+# Skill discovery is via SKILL.md frontmatter in each skills/<name>/ subdirectory.
+#
+# Safety model: every skill prints the mutating command and STOPS.
+# No mutating verb is ever run without an explicit operator CONFIRM.
+
+triage-blocked-task          -- Classify a blocked WU by bucket and print the remediation command
+audit-backlog-impossibilities -- Wrap validate-backlog and group findings by WU and severity
+rewrite-impossibility        -- Offer in-place operator-mode amend or decline+recreate for an impossible WU
+cascade-status               -- Emit a leaves-first ordered list of set-status commands for a WU subtree
+backlog-health-check         -- Classify every blocked WU and print a bucket histogram with batch suggestions
+reconcile-backlog-md         -- Detect BACKLOG.md drift and print manual corrections or a --force suggestion
+amend-manifest-offline       -- Build a Layer-1 pre-filter offline amendment proposal without --operator-mode
+refactor-target-repository   -- Find old-repo references and assemble a target_repository patch amendment
+diagnose-review-stuck        -- Distinguish functionally-complete-but-misattributed from genuinely-incomplete WUs

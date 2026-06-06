@@ -339,6 +339,14 @@ task_factory:
 #   #               preserves backwards compatibility for existing workspaces
 #   #               that do not set this key (AC-189-9).
 #   default_status_for_new_work_units: in-queue
+#
+#   # Maximum times cmd_reconcile_cascade will re-queue a blocked task with
+#   # the same signature (open markers + unsatisfied deps unchanged) before
+#   # tripping the circuit breaker and writing a [CASCADE_CIRCUIT_BREAKER]
+#   # audit + [BLOCKED] row. The task is added to the 'escalated' envelope
+#   # array so operators can identify stuck tasks. Must be >= 1. Default 3.
+#   # Issue #248b, AC-248-2.
+#   cascade_requeue_max_cycles: 3
 
 # ---------------------------------------------------------------------------
 # validate-backlog rule toggles. Existing rules (1-19) run unconditionally;

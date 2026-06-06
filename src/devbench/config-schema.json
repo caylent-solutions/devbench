@@ -445,6 +445,10 @@
         "bulk_update_audit_path": {
           "type": "string",
           "description": "Workspace-relative path to the file where bulk-update audit rows are appended. Default: 'logs/bulk-updates.log'. AC-194-7."
+        },
+        "cascade_requeue_max_cycles": {
+          "type": "integer",
+          "description": "Maximum times cmd_reconcile_cascade re-queues a blocked task with the same signature before the circuit breaker trips and the task is escalated. Must be >= 1. Default: 3. Issue #248b, AC-248-2."
         }
       }
     },

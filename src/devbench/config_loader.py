@@ -91,6 +91,7 @@ _BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
 _VALID_DEFAULT_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
 _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD: int = 10
 _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
+_BACKLOG_DEFAULT_CASCADE_REQUEUE_MAX_CYCLES: int = 3
 
 # Skills plugin configuration defaults (issue #221 E1-E10).
 _SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
@@ -580,11 +581,16 @@ class BacklogConfig:
             ``devbench set-status`` with selector flags writes one
             ``[BULK_STATUS_UPDATE]`` row. Defaults to
             ``'logs/bulk-updates.log'`` (AC-194-7).
+        cascade_requeue_max_cycles: Maximum number of times
+            ``cmd_reconcile_cascade`` re-queues a blocked task with the same
+            signature before tripping the circuit breaker. Must be >= 1.
+            Defaults to 3 (issue #248b, AC-248-2).
     """
 
     default_status_for_new_work_units: str = _BACKLOG_DEFAULT_STATUS
     bulk_update_confirm_threshold: int = _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD
     bulk_update_audit_path: str = _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH
+    cascade_requeue_max_cycles: int = _BACKLOG_DEFAULT_CASCADE_REQUEUE_MAX_CYCLES
 
 
 @dataclass
@@ -811,6 +817,7 @@ def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
         ValueError: If ``default_status_for_new_work_units`` is set to a
             value that is not in ``_VALID_DEFAULT_STATUSES``.
         ValueError: If ``bulk_update_confirm_threshold`` is negative.
+        ValueError: If ``cascade_requeue_max_cycles`` is below 1.
     """
     raw_status = backlog_raw.get(
         "default_status_for_new_work_units",
@@ -840,10 +847,23 @@ def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
         "bulk_update_audit_path",
         _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH,
     )
+    raw_cascade_cycles = backlog_raw.get(
+        "cascade_requeue_max_cycles",
+        _BACKLOG_DEFAULT_CASCADE_REQUEUE_MAX_CYCLES,
+    )
+    cascade_cycles = int(raw_cascade_cycles)
+    if cascade_cycles < 1:
+        raise ValueError(
+            f"Config file '{path}': backlog.cascade_requeue_max_cycles must be >= 1; "
+            f"got {cascade_cycles!r}. "
+            "Set to 1 or higher to limit re-queue attempts before the cascade circuit "
+            "breaker trips (issue #248b, AC-248-2)."
+        )
     return BacklogConfig(
         default_status_for_new_work_units=raw_status,
         bulk_update_confirm_threshold=threshold,
         bulk_update_audit_path=str(raw_audit_path),
+        cascade_requeue_max_cycles=cascade_cycles,
     )
 
 

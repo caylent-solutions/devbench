@@ -59,6 +59,7 @@ import asyncio
 import contextlib
 import functools
 import getpass
+import hashlib
 import json
 import logging
 import os
@@ -2021,7 +2022,18 @@ def cmd_reconcile_cascade() -> int:
     Tasks left blocked are reported with the reason (open marker, unknown
     marker target, unsatisfied dep) so the operator can decide what to do.
 
-    Returns 0 always; output is a JSON envelope listing flips + skips.
+    Issue #248b: a per-task signature counter under
+    ``<workspace>/.devbench/cascade-cycles/<id>.json`` gates infinite re-queue
+    loops. When a task's count exceeds
+    ``RUNTIME_CONFIG.backlog.cascade_requeue_max_cycles`` for the same
+    signature (markers + unsatisfied deps unchanged), the circuit breaker
+    writes a ``[CASCADE_CIRCUIT_BREAKER]`` audit and a ``[BLOCKED]`` row,
+    adds the task to the ``escalated`` list in the output envelope, and
+    continues (rc stays 0). The counter resets whenever the signature changes
+    (i.e. genuine progress was made).
+
+    Returns 0 always; output is a JSON envelope listing flips + skips +
+    escalated.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -2030,8 +2042,10 @@ def cmd_reconcile_cascade() -> int:
 
     flipped: list[dict[str, str | list[str]]] = []
     skipped: list[dict[str, str]] = []
+    escalated: list[str] = []
 
     terminal_statuses = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    max_cycles: int = RUNTIME_CONFIG.backlog.cascade_requeue_max_cycles
 
     for unit in units:
         if unit.unit_type is not WorkUnitType.TASK:
@@ -2048,24 +2062,55 @@ def cmd_reconcile_cascade() -> int:
         marker_ids = sorted(set(_BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)))
 
         # Marker evaluation: every target must be terminal AND known.
+        open_markers: list[str] = []
         unresolved_marker = ""
         for marker in marker_ids:
             target = units_by_id.get(marker)
             if target is None:
                 unresolved_marker = f"unknown marker target {marker}"
+                open_markers.append(marker)
                 break
             if target.status not in terminal_statuses:
                 unresolved_marker = f"open marker {marker} ({target.status.value})"
+                open_markers.append(marker)
                 break
         if unresolved_marker:
-            skipped.append({"unit_id": unit.id, "reason": unresolved_marker})
+            unsatisfied_deps = _all_unsatisfied_deps(unit, units_by_id)
+            _cascade_check_and_track(
+                WORKSPACE_ROOT,
+                manager,
+                wu_file,
+                unit.id,
+                open_markers,
+                unsatisfied_deps,
+                unresolved_marker,
+                max_cycles,
+                skipped,
+                escalated,
+            )
             continue
 
         # Regular-dep evaluation.
         if not BacklogParser._deps_satisfied(unit, units_by_id):
-            unsatisfied = _first_unsatisfied_dep(unit, units_by_id)
-            reason = f"regular dep not yet terminal: {unsatisfied}" if unsatisfied else "regular deps unsatisfied"
-            skipped.append({"unit_id": unit.id, "reason": reason})
+            unsatisfied_dep_id = _first_unsatisfied_dep(unit, units_by_id)
+            reason = (
+                f"regular dep not yet terminal: {unsatisfied_dep_id}"
+                if unsatisfied_dep_id
+                else "regular deps unsatisfied"
+            )
+            unsatisfied_deps = _all_unsatisfied_deps(unit, units_by_id)
+            _cascade_check_and_track(
+                WORKSPACE_ROOT,
+                manager,
+                wu_file,
+                unit.id,
+                [],
+                unsatisfied_deps,
+                reason,
+                max_cycles,
+                skipped,
+                escalated,
+            )
             continue
 
         manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
@@ -2083,9 +2128,14 @@ def cmd_reconcile_cascade() -> int:
     # Slack ping.  Cache-backed, idempotent across repeated invocations.
     _notify_blocked_classification_transitions(units)
 
-    output = {"flipped": flipped, "skipped": skipped}
+    output: dict[str, object] = {"flipped": flipped, "skipped": skipped, "escalated": escalated}
     print(json.dumps(output))
-    logger.info("reconcile-cascade: %d flipped, %d skipped", len(flipped), len(skipped))
+    logger.info(
+        "reconcile-cascade: %d flipped, %d skipped, %d escalated",
+        len(flipped),
+        len(skipped),
+        len(escalated),
+    )
     return 0
 
 
@@ -2120,6 +2170,167 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
 
 
 _BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+
+
+def _cascade_cycle_signature(marker_ids: list[str], unsatisfied_dep_ids: list[str]) -> str:
+    """Compute the 12-char circuit-breaker signature for a blocked task.
+
+    The signature is the first 12 hex characters of the SHA-256 digest of
+    the pipe-joined sorted marker IDs, a ``#`` separator, and the pipe-joined
+    sorted unsatisfied dependency IDs (issue #248b, AC-248b-1).
+
+    Args:
+        marker_ids: All ``[BLOCKED_PENDING_PROPOSAL]`` marker targets found in
+            the work-unit file (resolved to sorted, deduplicated IDs).
+        unsatisfied_dep_ids: Dep IDs that are not yet terminal per
+            ``_first_unsatisfied_dep`` (may be empty).
+
+    Returns:
+        A 12-character lower-hex string.
+    """
+    payload = "|".join(sorted(marker_ids)) + "#" + "|".join(sorted(unsatisfied_dep_ids))
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def _cascade_cycle_file(workspace_root: Path, task_id: str) -> Path:
+    """Return the path to the per-task cascade-cycle counter JSON file.
+
+    Creates parent directories on first access.
+    """
+    cycles_dir = workspace_root / ".devbench" / "cascade-cycles"
+    cycles_dir.mkdir(parents=True, exist_ok=True)
+    return cycles_dir / f"{task_id}.json"
+
+
+def _read_cascade_cycle(counter_file: Path) -> tuple[str, int]:
+    """Read the persisted signature and count from *counter_file*.
+
+    Returns ``("", 0)`` when the file does not exist or is unreadable.
+    """
+    if not counter_file.exists():
+        return "", 0
+    data = json.loads(counter_file.read_text(encoding="utf-8"))
+    return str(data.get("signature", "")), int(data.get("count", 0))
+
+
+def _write_cascade_cycle(counter_file: Path, signature: str, count: int) -> None:
+    """Persist the signature and count to *counter_file*."""
+    counter_file.write_text(
+        json.dumps({"signature": signature, "count": count}),
+        encoding="utf-8",
+    )
+
+
+def _all_unsatisfied_deps(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> list[str]:
+    """Return all dep IDs in ``unit.dependencies`` that are NOT terminal.
+
+    Used by the cascade circuit breaker to build the per-task signature.
+    Unlike ``_first_unsatisfied_dep``, this collects every unsatisfied dep
+    so that partial progress (one dep going terminal while others stay open)
+    changes the signature and resets the counter.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    result: list[str] = []
+    for dep_id in unit.dependencies:
+        dep = units_by_id.get(dep_id)
+        if dep is None:
+            continue
+        if dep.unit_type is WorkUnitType.TASK:
+            if dep.status not in terminal:
+                result.append(dep_id)
+            continue
+        # Non-task dep: scan descendant tasks.
+        for descendant in units_by_id.values():
+            if (
+                descendant.id != dep_id
+                and descendant.id.startswith(dep_id + "-")
+                and descendant.unit_type is WorkUnitType.TASK
+                and descendant.status not in terminal
+            ):
+                result.append(dep_id)
+                break
+    return sorted(result)
+
+
+def _cascade_check_and_track(
+    workspace_root: Path,
+    manager: BacklogManager,
+    wu_file: Path,
+    task_id: str,
+    open_markers: list[str],
+    unsatisfied_deps: list[str],
+    reason: str,
+    max_cycles: int,
+    skipped: list[dict[str, str]],
+    escalated: list[str],
+) -> None:
+    """Update the per-task cycle counter and fire the breaker when over the cap.
+
+    Called for every task that remains blocked (either due to an unresolved
+    marker or an unsatisfied dep). Increments the counter when the signature
+    is stable; resets it when the signature changes (genuine progress).  When
+    ``count > max_cycles`` the circuit breaker fires and the task joins
+    *escalated*; otherwise the task joins *skipped*.
+
+    Args:
+        workspace_root: Workspace root path for the counter-file directory.
+        manager: Active ``BacklogManager`` for writing audit comments.
+        wu_file: Work-unit Markdown file path.
+        task_id: Work-unit identifier.
+        open_markers: Open ``[BLOCKED_PENDING_PROPOSAL]`` marker IDs.
+        unsatisfied_deps: Unsatisfied dependency IDs.
+        reason: Human-readable skip reason (used when breaker does NOT fire).
+        max_cycles: Cap from ``backlog.cascade_requeue_max_cycles``.
+        skipped: Mutable list of skip records (appended to when no breaker).
+        escalated: Mutable list of escalated task IDs (appended to on trip).
+    """
+    signature = _cascade_cycle_signature(open_markers, unsatisfied_deps)
+    counter_file = _cascade_cycle_file(workspace_root, task_id)
+    stored_sig, count = _read_cascade_cycle(counter_file)
+    if stored_sig != signature:
+        count = 0
+    count += 1
+    if count > max_cycles:
+        _cascade_circuit_breaker_fire(manager, wu_file, task_id, signature, count)
+        escalated.append(task_id)
+    else:
+        _write_cascade_cycle(counter_file, signature, count)
+        skipped.append({"unit_id": task_id, "reason": reason})
+
+
+def _cascade_circuit_breaker_fire(
+    manager: BacklogManager,
+    wu_file: Path,
+    task_id: str,
+    signature: str,
+    count: int,
+) -> None:
+    """Write the verbatim circuit-breaker audit marker and a ``[BLOCKED]`` row.
+
+    Called by ``cmd_reconcile_cascade`` when the per-task cycle counter
+    exceeds ``cascade_requeue_max_cycles`` for the same signature.
+
+    Args:
+        manager: The active ``BacklogManager`` instance.
+        wu_file: Work-unit Markdown file path.
+        task_id: Work-unit identifier (e.g. ``E2-F1-S2-T1``).
+        signature: 12-char hex signature for the current stale cycle.
+        count: Current cycle count (already exceeds the cap).
+    """
+    breaker_msg = (
+        f"[CASCADE_CIRCUIT_BREAKER] task={task_id} signature={signature} "
+        f"cycles={count} escalated=OPERATOR_ACTION_REQUIRED"
+    )
+    blocked_msg = f"[BLOCKED] cascade circuit breaker tripped for {task_id} -- operator review required"
+    manager._append_agent_comment(wu_file, "backlog_manager", breaker_msg)
+    manager._append_agent_comment(wu_file, "backlog_manager", blocked_msg)
+    logger.warning(
+        "cascade circuit breaker tripped: task=%s signature=%s cycles=%d",
+        task_id,
+        signature,
+        count,
+    )
+
 
 # Captures the audit-comment classifier tag (``[BLOCKED]`` / ``[UNBLOCKED]`` /
 # ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk

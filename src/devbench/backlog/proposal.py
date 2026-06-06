@@ -1959,6 +1959,13 @@ def add_dep(
             f"(status={blocker_unit.status.value}); wiring a dep on a terminal task is a no-op."
         )
 
+    # Reverse-edge cycle guard (issue #253b): fail fast when the blocker's file
+    # already declares a dependency on the blocked task -- either via a dep-table
+    # row or a [BLOCKED_PENDING_PROPOSAL] marker.  Wiring the edge would produce
+    # a direct cycle: blocked -> blocker -> blocked.
+    if _dep_row_has_task(blocker_file, blocked_task_id) or _comments_have_marker(blocker_file, blocked_task_id):
+        raise ProposalError(f"add-dep would create a cycle: {blocker_task_id} already depends on {blocked_task_id}")
+
     wrote_row = False
     if not _dep_row_has_task(blocked_file, blocker_task_id):
         _append_dependency_to_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)

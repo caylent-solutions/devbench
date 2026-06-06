@@ -1322,6 +1322,7 @@ Fail-fast:
 - `<blocker-task-id>` must NOT be in a terminal state (`done` / `declined`); wiring a dep on terminal work is a no-op and almost always a mistake.
 - `<blocked-task-id>` must exist in the backlog index.
 - `<blocked-task-id>` and `<blocker-task-id>` cannot be the same.
+- `<blocker-task-id>` must not already depend on `<blocked-task-id>` (via a dep row or a `[BLOCKED_PENDING_PROPOSAL]` marker); wiring the reverse edge would create a direct cycle.
 
 Warns (does not refuse) when `<blocked-task-id>` is not currently in `blocked` status -- the ADR-07 cascade only fires on blocked tasks, so wiring a marker on an in-queue task is harmless metadata; the operator almost certainly meant to flip to blocked first.
 

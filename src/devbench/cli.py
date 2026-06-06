@@ -9575,6 +9575,7 @@ def cmd_add_dep(*argv: str) -> int:
       - Blocker must not be in a terminal state (``done`` / ``declined``).
       - Blocked must exist in the backlog index.
       - Blocked and blocker cannot be the same.
+      - Wiring a reverse edge (blocker already depends on blocked via dep row or marker) is rejected as a cycle.
 
     Warns (but does not refuse) when the blocked task is not currently in
     ``blocked`` status. The cascade only fires on blocked tasks, so wiring a

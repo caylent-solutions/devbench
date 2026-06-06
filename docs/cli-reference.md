@@ -1200,7 +1200,7 @@ Persist a structured review-judge rejection JSON. `<judge>` is one of `code_revi
 
 ## Proposal workflow (task factory)
 
-See [task-factory.md](task-factory.md) and ADRs [03](adr/03-task-factory.md), [06](adr/06-validation-gate-bug-escalation.md), [07](adr/07-auto-requeue-on-proposal-completion.md), [08](adr/08-proposal-lifecycle-observability.md), [09](adr/09-idempotent-materialise-proposal.md) for the full design. This workflow is opt-in: enable with `task_factory.enabled: true` in `backlog/config/devbench.yaml`.
+See [task-factory.md](task-factory.md) and ADRs [03](adr/03-task-factory.md), [06](adr/06-validation-gate-bug-escalation.md), [07](adr/07-auto-requeue-on-proposal-completion.md), [08](adr/08-proposal-lifecycle-observability.md), [09](adr/09-idempotent-materialise-proposal.md) for the full design. Task-factory is enabled by default (`task_factory.enabled: true` in `backlog/config/devbench.yaml`); set `task_factory.enabled: false` to disable.
 
 ### `write-proposal`
 

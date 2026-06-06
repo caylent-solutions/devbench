@@ -415,10 +415,9 @@ class TaskFactoryConfig:
     out-of-scope production fixes the amender surfaced.
 
     Attributes:
-        enabled: Whether the task-factory loop runs. Defaults to ``False``
-            so existing backlogs see no behavior change. Requires
-            ``manifest_amendment.enabled: true`` (task-factory runs from
-            the amendment-reject path).
+        enabled: Whether the task-factory loop runs. Defaults to ``True``.
+            Requires ``manifest_amendment.enabled: true`` (task-factory runs
+            from the amendment-reject path).
         auto_accept_proposals: When ``True``, ``devbench sweep-proposals``
             auto-promotes every task-factory-produced draft to ``in-queue``
             immediately, skipping the human review step. Default ``True``
@@ -426,7 +425,7 @@ class TaskFactoryConfig:
             the operator). Only takes effect when ``enabled`` is true. See ADR-11.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     auto_accept_proposals: bool = True
 
 

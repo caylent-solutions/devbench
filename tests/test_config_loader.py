@@ -1394,7 +1394,7 @@ class TestTaskFactoryConfig:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.task_factory.enabled is False
+        assert result.task_factory.enabled is True
         assert result.task_factory.auto_accept_proposals is True
 
     def test_task_factory_enabled_without_manifest_amendment_raises(self, tmp_path: Path) -> None:

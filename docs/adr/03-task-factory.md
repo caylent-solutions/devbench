@@ -28,7 +28,7 @@ Add a two-agent, two-CLI-command workflow that generates draft work-unit `.md` f
 
 Drafts are inert. `proposed` is a new `WorkUnitStatus` value; `devbench next` only considers `in-queue` and `in-progress` tasks, so the generator cannot silently poison the actionable queue. The operator promotes drafts via `devbench promote-proposal <id>` (flips to `in-queue`, wires the source task's dependency automatically) or rejects them via `devbench reject-proposal <id> --reason "..."` (archives the draft, removes the row, audits on the source task). The source task unblocks when every promoted dependency completes.
 
-The feature is opt-in per backlog via `task_factory.enabled: true`, which requires `manifest_amendment.enabled: true` (because task-factory runs from the amendment-reject path).
+Task-factory is enabled by default (`task_factory.enabled: true`). It requires `manifest_amendment.enabled: true` (because task-factory runs from the amendment-reject path). Disable by setting `task_factory.enabled: false` in `backlog/config/devbench.yaml`.
 
 ## Consequences
 

@@ -236,11 +236,11 @@ manifest_amendment:
 
 ---
 
-## `task_factory:` -- opt-in task-factory loop
+## `task_factory:` -- task-factory loop
 
 ```yaml
 task_factory:
-  enabled: false                   # opt-in; requires manifest_amendment.enabled: true
+  enabled: true                    # default true; requires manifest_amendment.enabled: true; set false to disable
   auto_accept_proposals: true      # default; only applies when enabled: true
 ```
 

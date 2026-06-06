@@ -319,7 +319,7 @@ manifest_amendment:
 # Task factory loop (requires manifest_amendment.enabled: true)
 # ---------------------------------------------------------------------------
 task_factory:
-  enabled: false
+  enabled: true  # default true -- set false to disable task-factory runs
   # When true (the default), sweep-proposals auto-promotes every produced
   # draft at the next loop tick. Set false to make a human review every
   # proposal. Only takes effect when task_factory.enabled is true.

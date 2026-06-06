@@ -89,7 +89,7 @@ Three possible causes:
 
 1. **The amender never executed `reject-amendment`.** The old prompt treated the CLI block as reference; the current prompt requires the amender to run it AND verify the archive file exists before logging the verdict. If you see a rejection comment on the work unit but no file at `<workspace>/.devbench/rejected-requests/<id>-*.json`, the amender hit this pre-tightening bug. Manually recreate the archive from the rejection comment's content, then re-run `devbench:blocker-resolver` for that task.
 2. **The blocker-resolver classified the issue as `escalated` instead of `proposed`.** Step 4c in the orchestrate SKILL now branches on `.devbench/proposals/<id>.json` FILE EXISTENCE (not the verdict word), and the blocker-resolver prompt mandates emitting a proposal JSON whenever a rejected-requests archive exists. If the proposal file is missing, task-factory doesn't fire -- by design. Check whether an archive existed when the resolver ran.
-3. **`task_factory.enabled` is false.** The whole loop is opt-in. Confirm `backlog/config/devbench.yaml` has `task_factory.enabled: true` AND `manifest_amendment.enabled: true`.
+3. **`task_factory.enabled` is false.** The loop is enabled by default but can be disabled. Confirm `backlog/config/devbench.yaml` has `task_factory.enabled: true` (or omit the key to use the default) AND `manifest_amendment.enabled: true`.
 
 ### Why did the orchestrator halt instead of continuing?
 

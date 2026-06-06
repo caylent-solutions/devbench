@@ -454,12 +454,12 @@
     },
     "task_factory": {
       "type": "object",
-      "description": "Opt-in configuration for the task-factory loop. When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to generate new `proposed` work units for the out-of-scope production fixes the amender surfaced. Requires manifest_amendment.enabled: true.",
+      "description": "Configuration for the task-factory loop. When enabled (the default), the orchestrator invokes blocker-resolver + task-factory after an amendment reject to generate new `proposed` work units for the out-of-scope production fixes the amender surfaced. Requires manifest_amendment.enabled: true.",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Whether the task-factory loop runs after amendment rejects. Default false (opt-in). Requires manifest_amendment.enabled: true."
+          "description": "Whether the task-factory loop runs after amendment rejects. Default true. Requires manifest_amendment.enabled: true. Set false to disable."
         },
         "auto_accept_proposals": {
           "type": "boolean",

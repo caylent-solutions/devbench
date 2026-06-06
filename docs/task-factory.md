@@ -20,14 +20,11 @@ Two independent triggers fire task-factory. Both land a proposal JSON at `<works
 | No amendment request + executor emits proposal JSON + `task_factory.enabled: false` | No factory run; audit comment notes the pending proposal for operator review. |
 | No amendment request + executor emits proposal JSON + `task_factory.enabled: true` | Task-factory materialises drafts directly; source task's own reviews continue (it is NOT auto-blocked -- validation gates can still pass their own ACs even when they surface out-of-scope bugs). |
 
-The feature is opt-in per backlog via `backlog/config/devbench.yaml`:
+Task-factory is enabled by default. Both `task_factory.enabled` and `manifest_amendment.enabled` default to `true` in `backlog/config/devbench.yaml`. To disable, set `enabled: false`:
 
 ```yaml
-manifest_amendment:
-  enabled: true           # prerequisite
-
 task_factory:
-  enabled: true           # runs after amender rejects
+  enabled: false  # disable task-factory runs
 ```
 
 `task_factory.enabled: true` requires `manifest_amendment.enabled: true`. Config validation fails loud otherwise.

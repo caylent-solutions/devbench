@@ -1,0 +1,117 @@
+# ADR-24: Quota Wait-and-Resume
+
+**Status:** Accepted
+**Date:** 2026-06-06
+**Issue:** #236
+
+## Context
+
+Anthropic subscription accounts have token-rate limits that reset on a fixed
+UTC schedule (typically every six hours). When the orchestrate loop hits this
+limit mid-session, the Claude Agent SDK surfaces an HTTP 429 with a
+`reset_at` timestamp in the response body (or a CLI-level "You've hit your
+limit" text line). Before this ADR, the error propagated directly, causing
+`devbench start` to exit non-zero and requiring manual operator intervention
+to restart after the window reset.
+
+This ADR formalises the decision to detect these errors and pause the
+orchestrate loop automatically, waiting for the window to reset before
+resuming -- rather than exiting and requiring a manual restart.
+
+## Decision
+
+1. **Detect per-message.** The inner SDK message loop in `cmd_start._run`
+   calls `detect_quota_error(message)` for every SDK-emitted message. On a
+   non-None result, `_run` raises a `_QuotaDetected(quota_exc)` sentinel
+   (a `BaseException` subclass so it crosses the `asyncio.run` boundary
+   without being caught by generic `except Exception` handlers).
+
+2. **Checkpoint before sleeping.** Before waiting, `_handle_quota_pause`
+   writes a `QuotaCheckpoint` to
+   `<workspace>/.devbench/quota_pause.json`. This allows:
+   - `devbench quota-watcher --once` to report current pause state to the
+     operator.
+   - An interrupted wait (SIGTERM) to leave evidence on disk rather than
+     silently disappearing.
+
+3. **Wait with jittered exponential backoff (no shield).** `wait_for_reset`
+   performs an initial sleep until `reset_at` (if known), then polls with
+   jittered exponential backoff. `asyncio.shield` is deliberately NOT used:
+   a SIGTERM during the wait propagates naturally, allowing the SIGTERM
+   handler to force-block the in-flight work unit and exit cleanly.
+
+4. **Emit structured audit markers.** Two markers are emitted to the
+   orchestrator log:
+   - `[QUOTA_WAITING] reason=<source> reset_at=<ISO|unknown>` when the wait
+     begins.
+   - `[QUOTA_RESUMED] waited_seconds=<N>` when recovery is confirmed.
+
+5. **Configurable via `quota_handling:` block.** All behaviour is opt-in at
+   the config level. The `enabled` flag defaults to `true` (D-Q-1:
+   default-on opt-out); set `enabled: false` to restore the legacy non-zero
+   exit.
+
+6. **Config schema validated at load time.** Enum fields (`on_exhaustion`,
+   `on_exhaustion_timeout`, `resume_strategy`) and range fields
+   (`poll_interval_seconds`, `max_wait_seconds`) are validated at
+   `load_runtime_config` time with a clear `ValueError` on violation -- not
+   at first use.
+
+## Consequences
+
+### Positive
+
+- Subscription-tier users no longer need to monitor and manually restart the
+  orchestrator after quota exhaustion -- the loop resumes automatically.
+- The checkpoint provides operator-visible state via `quota-watcher --once`.
+- The `enabled: false` escape hatch preserves full backward compatibility for
+  operators who prefer the explicit exit.
+- The structured markers integrate cleanly with the existing audit-comment
+  and log infrastructure.
+
+### Negative
+
+- A long pause (up to `max_wait_seconds`, default 5 hours) may not be
+  apparent to operators who do not monitor logs. The `audit_comment_on_wait`
+  flag (default `true`) mitigates this by writing to the active work unit's
+  Comments section.
+- `wait_for_reset` uses `asyncio.sleep`, which means the process is alive
+  but idle during the wait. The PID file and the checkpoint together make this
+  state observable, but an operator who kills the process expecting a clean
+  stop will find the work unit in `in-progress` (the SIGTERM handler
+  force-blocks it before exit, so this is recoverable).
+
+## Alternatives considered
+
+### asyncio.shield
+
+Using `asyncio.shield(wait_for_reset(...))` would prevent a SIGTERM from
+interrupting the wait. This was rejected because it would make the process
+unresponsive to `devbench stop --session <name>` during a long quota wait,
+and because the checkpoint already provides the durable state needed for a
+clean restart.
+
+### External watcher process
+
+Spinning off a separate background process to monitor quota state was
+considered but rejected as over-engineered for the common case (single
+orchestrator session). The `quota-watcher --once` advisory command covers
+the operator's inspection need without adding process-lifecycle complexity.
+
+### Retry via Makefile loop only
+
+Relying entirely on the existing `make start` retry loop (which re-invokes
+`devbench start` on exit code 42) was rejected because:
+- It requires the operator to have configured the retry loop.
+- The retry loop does not know about `reset_at` and would re-attempt
+  immediately, hitting the same 429 repeatedly until the window resets.
+- The in-process wait avoids the overhead of re-initialising the SDK,
+  re-reading the backlog, and re-establishing session state.
+
+## References
+
+- Issue #236: Quota wait-and-resume
+- Issue #234: Quota detection module (`detect_quota_error`)
+- Spec Section 4 E1.F2 / E1.F3
+- Appendix A QW-1..QW-10
+- `docs/quota-handling.md`

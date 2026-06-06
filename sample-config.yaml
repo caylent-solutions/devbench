@@ -67,6 +67,46 @@ allowed_orgs: []
 log_file: logs/orchestrator.log
 
 # ---------------------------------------------------------------------------
+# Quota wait-and-resume (Issue #236, AC-236-1, D-Q-1).
+# Controls how the orchestrate loop handles Anthropic subscription rate-limit
+# errors (HTTP 429 / CLI "You've hit your limit" signal).
+#
+# enabled: true (default) -- the orchestrator pauses and waits for the quota
+#   window to reset rather than exiting with a non-zero code. Set to false to
+#   restore the legacy behaviour (propagate the error, non-zero exit).
+# on_exhaustion: what to do when a quota error is detected.
+#   "wait"  -- pause and poll until reset_at (default).
+#   "fail"  -- re-raise immediately (non-zero exit, same as enabled:false).
+#   "drain" -- trigger a graceful drain then exit.
+# poll_interval_seconds: base cadence for the recovery probe loop (30-3600).
+# max_wait_seconds: cap on total wait time; returns False/drain if exceeded.
+# on_exhaustion_timeout: what to do when max_wait_seconds is exceeded.
+#   "drain"        -- trigger a graceful drain (default).
+#   "fail"         -- re-raise the quota error.
+#   "keep_waiting" -- ignore the cap and keep polling.
+# resume_strategy: how to re-enter the orchestrate loop after recovery.
+#   "continue_current_wu" -- resume where we left off (default).
+#   "restart_wu"          -- force the current WU back to in-queue.
+#   "drain_and_resume"    -- drain and let the Makefile restart loop do it.
+# audit_comment_on_wait: write a [QUOTA_WAITING] audit comment to the active
+#   work unit when pausing. Defaults to true.
+# audit_comment_on_resume: write a [QUOTA_RESUMED] audit comment when the
+#   wait ends. Defaults to true.
+# log_structured_events: emit JSON-structured events alongside the text
+#   markers. Defaults to true.
+# ---------------------------------------------------------------------------
+quota_handling:
+  enabled: true
+  on_exhaustion: wait
+  poll_interval_seconds: 60
+  max_wait_seconds: 18000
+  on_exhaustion_timeout: drain
+  resume_strategy: continue_current_wu
+  audit_comment_on_wait: true
+  audit_comment_on_resume: true
+  log_structured_events: true
+
+# ---------------------------------------------------------------------------
 # Timeouts (seconds)
 # ---------------------------------------------------------------------------
 timeouts:

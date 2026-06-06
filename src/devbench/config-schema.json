@@ -606,6 +606,55 @@
           }
         }
       }
+    },
+    "quota_handling": {
+      "type": "object",
+      "description": "Quota wait-and-resume configuration (issue #236, Appendix A QW-6). Default: enabled=true (D-Q-1).",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master toggle. true (default, D-Q-1) enables wait-and-resume. false restores the legacy non-zero exit."
+        },
+        "on_exhaustion": {
+          "type": "string",
+          "enum": ["wait", "fail", "drain"],
+          "description": "Action when a quota signal is detected. Default: 'wait'."
+        },
+        "poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600,
+          "description": "Recovery probe cadence in seconds. Default: 60."
+        },
+        "max_wait_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum total wait in seconds before on_exhaustion_timeout fires. Default: 18000 (5 hours)."
+        },
+        "on_exhaustion_timeout": {
+          "type": "string",
+          "enum": ["drain", "fail", "keep_waiting"],
+          "description": "Action when max_wait_seconds elapses without recovery. Default: 'drain'."
+        },
+        "resume_strategy": {
+          "type": "string",
+          "enum": ["continue_current_wu", "restart_wu", "drain_and_resume"],
+          "description": "How to resume after successful recovery. Default: 'continue_current_wu'."
+        },
+        "audit_comment_on_wait": {
+          "type": "boolean",
+          "description": "Append [QUOTA_WAITING] audit comment to the in-progress WU. Default: true."
+        },
+        "audit_comment_on_resume": {
+          "type": "boolean",
+          "description": "Append [QUOTA_RESUMED] audit comment after recovery. Default: true."
+        },
+        "log_structured_events": {
+          "type": "boolean",
+          "description": "Emit structured log events on quota transitions. Default: true."
+        }
+      }
     }
   }
 }

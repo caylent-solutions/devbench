@@ -1,5 +1,6 @@
 """Tests for devbench.quota -- exception hierarchy, detect_quota_error,
-_has_quota_marker, and _parse_reset_at_from_text.
+_has_quota_marker, _parse_reset_at_from_text, wait_for_reset, checkpoint,
+recovery_probe, and _apply_resume_strategy.
 
 Covers: QuotaExhaustedError and its four LSP subclasses (SubscriptionRateLimitError,
 SdkCreditExhaustedError, ApiBillingError, BedrockThrottleError).
@@ -13,28 +14,45 @@ CLI bytes.
 Also covers: _parse_reset_at_from_text(text) which returns the next-future UTC
 datetime or None.
 
+Also covers: wait_for_reset, save_checkpoint, load_checkpoint, remove_checkpoint,
+recovery_probe, _apply_resume_strategy (issue #236, Appendix A QW-3..QW-5).
+
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
-AC-234-1, AC-234a-1.
+Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
+AC-234-1, AC-234a-1, AC-236-1.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from devbench.quota import (
     ApiBillingError,
     BedrockThrottleError,
+    QuotaCheckpoint,
     QuotaExhaustedError,
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
+    _apply_resume_strategy,
+    _force_status_in_queue,
     _has_quota_marker,
     _parse_reset_at_from_text,
+    _probe_api_call,
     detect_quota_error,
+    load_checkpoint,
+    recovery_probe,
+    remove_checkpoint,
+    save_checkpoint,
+    wait_for_reset,
 )
 
 # ---------------------------------------------------------------------------
@@ -863,3 +881,647 @@ class TestInternalHelperBranchCoverage:
         assert isinstance(result, SubscriptionRateLimitError)
         assert result.reset_at is not None
         assert result.reset_at.hour == 16
+
+
+# ---------------------------------------------------------------------------
+# QuotaCheckpoint dataclass
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestQuotaCheckpoint:
+    """QuotaCheckpoint stores quota pause state for persistence."""
+
+    def test_fields_stored(self) -> None:
+        ts = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
+        cp = QuotaCheckpoint(
+            reason="subscription_rate_limit",
+            reset_at=ts,
+            saved_at=datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+            session_name="default",
+        )
+        assert cp.reason == "subscription_rate_limit"
+        assert cp.reset_at == ts
+        assert cp.session_name == "default"
+
+    def test_reset_at_none_allowed(self) -> None:
+        cp = QuotaCheckpoint(
+            reason="subscription_rate_limit",
+            reset_at=None,
+            saved_at=datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+            session_name="default",
+        )
+        assert cp.reset_at is None
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint / load_checkpoint / remove_checkpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCheckpointRoundTrip:
+    """Checkpoint persists to and loads from disk."""
+
+    def test_save_and_load_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ts = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=ts,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            save_checkpoint(cp, root)
+            loaded = load_checkpoint(root)
+            assert loaded is not None
+            assert loaded.reason == "subscription_rate_limit"
+            assert loaded.reset_at == ts
+            assert loaded.session_name == "default"
+
+    def test_save_and_load_with_reset_at_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="bedrock_throttle",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            save_checkpoint(cp, root)
+            loaded = load_checkpoint(root)
+            assert loaded is not None
+            assert loaded.reset_at is None
+            assert loaded.reason == "bedrock_throttle"
+
+    def test_load_returns_none_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = load_checkpoint(root)
+            assert result is None
+
+    def test_load_raises_on_bad_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cp_dir = root / ".devbench"
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            (cp_dir / "quota_pause.json").write_text("not valid json", encoding="utf-8")
+            with pytest.raises(ValueError, match=r"quota_pause\.json"):
+                load_checkpoint(root)
+
+    def test_load_raises_on_missing_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cp_dir = root / ".devbench"
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            (cp_dir / "quota_pause.json").write_text(json.dumps({"reason": "x"}), encoding="utf-8")
+            with pytest.raises(ValueError, match=r"quota_pause\.json"):
+                load_checkpoint(root)
+
+    def test_load_raises_on_bad_datetime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cp_dir = root / ".devbench"
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            data = {
+                "reason": "x",
+                "reset_at": "not-a-datetime",
+                "saved_at": "not-a-datetime",
+                "session_name": "default",
+            }
+            (cp_dir / "quota_pause.json").write_text(json.dumps(data), encoding="utf-8")
+            with pytest.raises(ValueError, match=r"quota_pause\.json"):
+                load_checkpoint(root)
+
+    def test_save_is_atomic(self) -> None:
+        """save_checkpoint uses atomic temp+replace, not direct write."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            save_checkpoint(cp, root)
+            path = root / ".devbench" / "quota_pause.json"
+            assert path.exists()
+            content = json.loads(path.read_text(encoding="utf-8"))
+            assert content["reason"] == "subscription_rate_limit"
+
+    def test_remove_checkpoint_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            # Remove when no checkpoint exists -- should not raise.
+            remove_checkpoint(root)
+            # Save and remove.
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="x",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            save_checkpoint(cp, root)
+            assert (root / ".devbench" / "quota_pause.json").exists()
+            remove_checkpoint(root)
+            assert not (root / ".devbench" / "quota_pause.json").exists()
+            # Second remove is idempotent.
+            remove_checkpoint(root)
+
+    def test_save_fails_fast_on_empty_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            with pytest.raises(ValueError, match="reason"):
+                save_checkpoint(cp, root)
+
+    def test_save_fails_fast_on_naive_saved_at(self) -> None:
+        """save_checkpoint rejects naive datetimes (no tzinfo) for saved_at."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            # Intentionally naive (no tzinfo) to test validation.
+            naive_dt = datetime.fromisoformat("2026-01-01T10:00:00")
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=None,
+                saved_at=naive_dt,
+                session_name="default",
+            )
+            with pytest.raises(ValueError, match="timezone"):
+                save_checkpoint(cp, root)
+
+    def test_save_fails_fast_on_naive_reset_at(self) -> None:
+        """save_checkpoint rejects naive datetimes for reset_at."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            # Intentionally naive (no tzinfo) to test validation.
+            naive_dt = datetime.fromisoformat("2026-01-01T16:10:00")
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=naive_dt,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            with pytest.raises(ValueError, match="timezone"):
+                save_checkpoint(cp, root)
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestWaitForReset:
+    """wait_for_reset probes for quota recovery with backoff."""
+
+    def test_first_probe_success_returns_true(self) -> None:
+        """When the probe succeeds immediately after initial sleep, returns True."""
+        probe = MagicMock(return_value=True)
+        reset_at = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                    result = await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                    )
+                    # Initial sleep must be <= max_wait_seconds
+                    if mock_sleep.call_args_list:
+                        assert mock_sleep.call_args_list[0].args[0] <= 18000
+            return result
+
+        result = asyncio.run(run())
+        assert result is True
+        probe.assert_called_once()
+
+    def test_past_reset_initial_sleep_zero(self) -> None:
+        """When reset_at is in the past, initial sleep = 0, probe fires immediately."""
+        probe = MagicMock(return_value=True)
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)  # clock after reset_at
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                    result = await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                    )
+                    # Initial sleep is capped at max(0, reset_at-now) = 0
+                    if mock_sleep.call_args_list:
+                        assert mock_sleep.call_args_list[0].args[0] == 0
+            return result
+
+        result = asyncio.run(run())
+        assert result is True
+
+    def test_max_wait_zero_returns_false(self) -> None:
+        """When max_wait_seconds=0, immediately returns False."""
+        probe = MagicMock(return_value=True)
+        reset_at = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    result = await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=0,
+                        probe_fn=probe,
+                    )
+            return result
+
+        result = asyncio.run(run())
+        assert result is False
+
+    def test_initial_sleep_capped_at_max_wait(self) -> None:
+        """Initial sleep is capped at max_wait_seconds when reset_at is far in future."""
+        probe = MagicMock(return_value=True)
+        reset_at = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        max_wait = 60  # small max_wait but reset is 6+ hours away
+
+        async def run() -> list[float]:
+            sleep_calls: list[float] = []
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+
+                async def fake_sleep(seconds: float) -> None:
+                    sleep_calls.append(seconds)
+                    # Don't actually sleep
+
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=max_wait,
+                        probe_fn=probe,
+                    )
+            return sleep_calls
+
+        sleep_calls = asyncio.run(run())
+        # Initial sleep must be <= max_wait
+        if sleep_calls:
+            assert sleep_calls[0] <= max_wait
+
+    def test_probe_raises_propagates(self) -> None:
+        """When probe_fn raises a non-quota exception, it propagates out."""
+        probe = MagicMock(side_effect=RuntimeError("network error"))
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past -> initial sleep 0
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+
+        async def run() -> None:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                    )
+
+        with pytest.raises(RuntimeError, match="network error"):
+            asyncio.run(run())
+
+    def test_conflict_guard_raises_value_error(self) -> None:
+        """backoff_config.initial_seconds != poll_interval_seconds raises ValueError."""
+        from devbench.quota import BackoffConfig
+
+        probe = MagicMock(return_value=True)
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        backoff = BackoffConfig(initial_seconds=45, max_seconds=600, multiplier=2.0, jitter=0.2)
+
+        async def run() -> None:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval_seconds=60,  # != backoff.initial_seconds=45
+                    max_wait_seconds=18000,
+                    probe_fn=probe,
+                    backoff_config=backoff,
+                )
+
+        with pytest.raises(ValueError, match="initial_seconds"):
+            asyncio.run(run())
+
+    def test_backoff_sequence_stays_within_bounds(self) -> None:
+        """Backoff delay stays within [initial, max] bounds after jitter."""
+        from devbench.quota import BackoffConfig
+
+        delays: list[float] = []
+        call_count = 0
+
+        def probe() -> bool:
+            nonlocal call_count
+            call_count += 1
+            # Only succeed on the 4th call
+            return call_count >= 4
+
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        backoff = BackoffConfig(initial_seconds=30, max_seconds=600, multiplier=2.0, jitter=0.2)
+
+        async def run() -> None:
+            async def fake_sleep(seconds: float) -> None:
+                delays.append(seconds)
+
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=30,  # matches backoff.initial_seconds
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                        backoff_config=backoff,
+                    )
+
+        asyncio.run(run())
+        # All delays (excluding the initial sleep of 0) must be <= max_seconds
+        backoff_delays = delays[1:]  # skip initial sleep
+        for delay in backoff_delays:
+            assert delay <= 600, f"delay {delay} exceeds max_seconds=600"
+
+    def test_max_wait_timeout_returns_false(self) -> None:
+        """When max_wait is exceeded before probe succeeds, returns False."""
+        probe = MagicMock(return_value=False)
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
+        # Simulate clock advancing past max_wait by returning increasing times
+        clock_calls: list[datetime] = [
+            datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+            datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),  # initial
+            datetime(2026, 1, 1, 15, 0, 0, tzinfo=UTC),  # after max_wait elapsed
+        ]
+        clock_iter = iter(clock_calls)
+
+        def fake_clock() -> datetime:
+            try:
+                return next(clock_iter)
+            except StopIteration:
+                return datetime(2026, 1, 1, 15, 0, 0, tzinfo=UTC)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", side_effect=fake_clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    return await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=3600,  # 1 hour
+                        probe_fn=probe,
+                    )
+
+        result = asyncio.run(run())
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRecoveryProbe:
+    """recovery_probe returns True on success, False on quota/transient, raises on bad args."""
+
+    def test_raises_on_non_positive_request_size(self) -> None:
+        with pytest.raises(ValueError, match="request_size_tokens"):
+            recovery_probe(timeout_seconds=10, request_size_tokens=0)
+
+    def test_raises_on_non_positive_timeout(self) -> None:
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            recovery_probe(timeout_seconds=0, request_size_tokens=1)
+
+    def test_raises_on_negative_timeout(self) -> None:
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            recovery_probe(timeout_seconds=-1, request_size_tokens=1)
+
+    def test_success_returns_true(self) -> None:
+        """When the probe API call succeeds, returns True."""
+        mock_response = MagicMock()
+        with patch("devbench.quota._probe_api_call", return_value=mock_response):
+            result = recovery_probe(timeout_seconds=10, request_size_tokens=1)
+        assert result is True
+
+    def test_quota_error_returns_false(self) -> None:
+        """When the probe hits a quota error, returns False (still exhausted)."""
+        quota_exc = SubscriptionRateLimitError(reset_at=None, raw_error="x", source="anthropic-api")
+        with patch("devbench.quota._probe_api_call", side_effect=quota_exc):
+            result = recovery_probe(timeout_seconds=10, request_size_tokens=1)
+        assert result is False
+
+    def test_transient_network_error_returns_false(self) -> None:
+        """Transient non-quota error -> False (still exhausted, don't crash)."""
+        with patch("devbench.quota._probe_api_call", side_effect=ConnectionError("timeout")):
+            result = recovery_probe(timeout_seconds=10, request_size_tokens=1)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _apply_resume_strategy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestApplyResumeStrategy:
+    """_apply_resume_strategy dispatches to the correct resume action."""
+
+    @pytest.mark.parametrize(
+        "strategy",
+        ["continue_current_wu", "restart_wu", "drain_and_resume"],
+    )
+    def test_known_strategies_do_not_raise(self, strategy: str) -> None:
+        """All known strategy names are accepted without raising."""
+        # We verify dispatch by confirming no ValueError is raised.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            save_checkpoint(cp, root)
+            with (
+                patch("devbench.quota.remove_checkpoint"),
+                patch("devbench.quota._force_status_in_queue"),
+                patch("devbench.quota.request_drain"),
+            ):
+                _apply_resume_strategy(strategy, root)
+
+    def test_unknown_strategy_raises_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with pytest.raises(ValueError, match=r"unknown.*resume.*strategy"):
+                _apply_resume_strategy("nonexistent_strategy", root)
+
+    def test_continue_calls_remove_checkpoint(self) -> None:
+        """continue_current_wu removes the checkpoint."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            save_checkpoint(cp, root)
+            with patch("devbench.quota._force_status_in_queue"):
+                _apply_resume_strategy("continue_current_wu", root)
+            assert not (root / ".devbench" / "quota_pause.json").exists()
+
+    def test_drain_and_resume_calls_request_drain(self) -> None:
+        """drain_and_resume removes checkpoint and calls request_drain."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patch("devbench.quota.remove_checkpoint") as mock_remove:
+                with patch("devbench.quota.request_drain") as mock_drain:
+                    _apply_resume_strategy("drain_and_resume", root)
+            mock_remove.assert_called_once_with(root)
+            mock_drain.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint -- exception cleanup branch (lines 538-541)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSaveCheckpointExceptionCleanup:
+    """save_checkpoint cleans up temp file and re-raises on write failure."""
+
+    def test_fdopen_raises_oserror_cleans_up_and_reraises(self) -> None:
+        """When os.fdopen raises OSError, the temp file is removed and the error propagates."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+            cp = QuotaCheckpoint(
+                reason="subscription_rate_limit",
+                reset_at=None,
+                saved_at=saved_at,
+                session_name="default",
+            )
+            # Ensure destination parent exists so mkstemp succeeds.
+            dest_dir = root / ".devbench"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            os_error = OSError("simulated write failure")
+            # _os is a local alias for the standard os module inside save_checkpoint.
+            with patch("os.fdopen", side_effect=os_error):
+                with pytest.raises(OSError, match="simulated write failure"):
+                    save_checkpoint(cp, root)
+            # The .tmp file must have been cleaned up.
+            tmp_files = list(dest_dir.glob("*.tmp"))
+            assert tmp_files == [], f"Temp file not cleaned up: {tmp_files}"
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint -- invalid reset_at datetime branch (lines 583-584)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLoadCheckpointInvalidResetAt:
+    """load_checkpoint raises ValueError when reset_at is present but not ISO 8601."""
+
+    def test_valid_saved_at_but_invalid_reset_at_raises_value_error(self) -> None:
+        """A checkpoint with valid saved_at but non-ISO reset_at must raise ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cp_dir = root / ".devbench"
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            data = {
+                "reason": "subscription_rate_limit",
+                "reset_at": "not-a-valid-iso-datetime",
+                "saved_at": "2026-01-01T10:00:00+00:00",
+                "session_name": "default",
+            }
+            (cp_dir / "quota_pause.json").write_text(json.dumps(data), encoding="utf-8")
+            with pytest.raises(ValueError, match=r"reset_at"):
+                load_checkpoint(root)
+
+
+# ---------------------------------------------------------------------------
+# _probe_api_call -- direct invocation with mocked anthropic (lines 625-632)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestProbeApiCallBody:
+    """_probe_api_call calls anthropic.Anthropic and messages.create with correct args."""
+
+    def test_calls_messages_create_with_correct_model_and_max_tokens(self) -> None:
+        """_probe_api_call passes RECOVERY_PROBE_MODEL and max_tokens=1 to the SDK."""
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        mock_client = MagicMock()
+        mock_anthropic_cls = MagicMock(return_value=mock_client)
+        # anthropic is imported inside the function body, so patch at the source module.
+        with patch("anthropic.Anthropic", mock_anthropic_cls):
+            _probe_api_call(timeout_seconds=5.0, request_size_tokens=3)
+
+        mock_anthropic_cls.assert_called_once_with(timeout=5.0)
+        call_kwargs = mock_client.messages.create.call_args
+        assert call_kwargs is not None, "messages.create was not called"
+        assert call_kwargs.kwargs.get("model") == RECOVERY_PROBE_MODEL, (
+            f"Expected model={RECOVERY_PROBE_MODEL!r}, got call: {call_kwargs}"
+        )
+        assert call_kwargs.kwargs.get("max_tokens") == 1
+
+
+# ---------------------------------------------------------------------------
+# _force_status_in_queue -- mocked BacklogManager/BacklogParser (lines 684-693)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestForceStatusInQueue:
+    """_force_status_in_queue resets all in-progress units to in-queue."""
+
+    def test_force_status_called_for_each_in_progress_unit(self) -> None:
+        """All in-progress work units have force_status called with 'in-queue'."""
+        from types import SimpleNamespace
+
+        unit_a = SimpleNamespace(id="T1", status="in-progress", file_path="/backlog/T1.md")
+        unit_b = SimpleNamespace(id="T2", status="in-queue", file_path="/backlog/T2.md")
+        unit_c = SimpleNamespace(id="T3", status="in-progress", file_path="/backlog/T3.md")
+
+        mock_parser_instance = MagicMock()
+        mock_parser_instance.parse_index.return_value = [unit_a, unit_b, unit_c]
+        mock_parser_cls = MagicMock(return_value=mock_parser_instance)
+
+        mock_manager_instance = MagicMock()
+        mock_manager_cls = MagicMock(return_value=mock_manager_instance)
+
+        with (
+            patch("devbench.backlog.parser.BacklogParser", mock_parser_cls),
+            patch("devbench.backlog.manager.BacklogManager", mock_manager_cls),
+        ):
+            _force_status_in_queue(Path("/fake/workspace"))
+
+        # Only in-progress units should have force_status called.
+        assert mock_manager_instance.force_status.call_count == 2
+        call_args_list = mock_manager_instance.force_status.call_args_list
+        called_ids = {call.args[2] for call in call_args_list}
+        assert called_ids == {"T1", "T3"}
+        for call in call_args_list:
+            assert call.args[3] == "in-queue"

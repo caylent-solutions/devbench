@@ -1,19 +1,35 @@
-"""Quota detection module for devbench.
+"""Quota detection, wait-and-resume, and checkpoint module for devbench.
 
-Provides the ``QuotaExhaustedError`` exception hierarchy (base + four LSP
-subclasses), the ``detect_quota_error`` dispatcher (ten ordered rules, never
-raises), the ``_has_quota_marker`` CLI-byte substring scanner, and the
-``_parse_reset_at_from_text`` reset-time parser.
+Provides:
+- ``QuotaExhaustedError`` exception hierarchy (base + four LSP subclasses).
+- ``detect_quota_error`` dispatcher (ten ordered rules, never raises).
+- ``_has_quota_marker`` CLI-byte substring scanner.
+- ``_parse_reset_at_from_text`` reset-time parser.
+- ``wait_for_reset`` async poller with jittered backoff (no shield).
+- ``QuotaCheckpoint``, ``save_checkpoint``, ``load_checkpoint``, ``remove_checkpoint``
+  for persisting pause state across SIGTERM.
+- ``recovery_probe`` thin API probe to confirm quota has recovered.
+- ``_apply_resume_strategy`` dispatcher for post-wait resume behaviour.
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
-AC-234-1, AC-234a-1.
+Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
+AC-234-1, AC-234a-1, AC-236-1.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import secrets
+import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+from devbench.drain import request_drain
 
 # ---------------------------------------------------------------------------
 # Exception hierarchy
@@ -323,3 +339,379 @@ def detect_quota_error(obj: object) -> QuotaExhaustedError | None:
         return _detect_quota_error_inner(obj)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# BackoffConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BackoffConfig:
+    """Jittered exponential backoff configuration for ``wait_for_reset``.
+
+    Attributes:
+        initial_seconds: Starting backoff delay (must equal ``poll_interval_seconds``
+            passed to ``wait_for_reset`` to avoid a conflict guard error).
+        max_seconds: Upper bound for any single backoff delay after jitter.
+        multiplier: Factor by which the raw delay grows each iteration.
+            Must be >= 1.0.
+        jitter: Fractional jitter range applied as ``+/- (delay * jitter)``
+            via a cryptographically secure RNG. Must be in [0, 1].
+    """
+
+    initial_seconds: int = 30
+    max_seconds: int = 600
+    multiplier: float = 2.0
+    jitter: float = 0.2
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset
+# ---------------------------------------------------------------------------
+
+_DEFAULT_BACKOFF: BackoffConfig = BackoffConfig()
+
+
+async def wait_for_reset(
+    *,
+    reset_at: datetime | None,
+    poll_interval_seconds: int,
+    max_wait_seconds: int,
+    probe_fn: Callable[[], bool],
+    backoff_config: BackoffConfig | None = None,
+) -> bool:
+    """Async poller that waits until the quota resets and a probe confirms recovery.
+
+    Algorithm:
+    1. Compute ``initial_sleep = max(0, min(max_wait, (reset_at - now)))``.
+       When ``reset_at`` is ``None`` or in the past, ``initial_sleep = 0``.
+    2. If ``max_wait_seconds == 0`` return ``False`` immediately.
+    3. ``await asyncio.sleep(initial_sleep)``.
+    4. Loop: check elapsed >= max_wait -> return False; call probe_fn() ->
+       True on success; jittered backoff up to max_seconds; sleep; repeat.
+
+    The ``backoff_config.initial_seconds`` must equal ``poll_interval_seconds``
+    to avoid conflating two different cadence parameters. A mismatch raises
+    ``ValueError`` before any I/O.
+
+    Args:
+        reset_at: Expected UTC reset time (or ``None`` when unknown).
+        poll_interval_seconds: Base polling cadence in seconds (must equal
+            ``backoff_config.initial_seconds`` when a custom ``backoff_config``
+            is supplied).
+        max_wait_seconds: Maximum total wait in seconds. 0 means no wait.
+        probe_fn: Callable returning ``True`` when the quota has recovered,
+            ``False`` when still exhausted. Non-quota exceptions propagate.
+        backoff_config: Optional backoff configuration. When ``None`` the
+            function uses a default aligned with ``poll_interval_seconds``.
+
+    Returns:
+        ``True`` when the probe confirmed recovery before ``max_wait_seconds``
+        elapsed; ``False`` when the timeout was hit.
+
+    Raises:
+        ValueError: When ``backoff_config.initial_seconds != poll_interval_seconds``.
+        Any exception raised by ``probe_fn``.
+    """
+    if backoff_config is None:
+        backoff_config = BackoffConfig(
+            initial_seconds=poll_interval_seconds,
+            max_seconds=_DEFAULT_BACKOFF.max_seconds,
+            multiplier=_DEFAULT_BACKOFF.multiplier,
+            jitter=_DEFAULT_BACKOFF.jitter,
+        )
+    if backoff_config.initial_seconds != poll_interval_seconds:
+        raise ValueError(
+            f"wait_for_reset: backoff_config.initial_seconds ({backoff_config.initial_seconds}) "
+            f"must equal poll_interval_seconds ({poll_interval_seconds}) to avoid ambiguous cadence."
+        )
+
+    if max_wait_seconds == 0:
+        return False
+
+    now = _get_current_utc()
+    start_time = now
+
+    if reset_at is not None and reset_at > now:
+        gap_seconds = (reset_at - now).total_seconds()
+        initial_sleep = min(float(max_wait_seconds), gap_seconds)
+    else:
+        initial_sleep = 0.0
+
+    await asyncio.sleep(initial_sleep)
+
+    raw_delay = float(backoff_config.initial_seconds)
+    rng = secrets.SystemRandom()
+
+    while True:
+        now = _get_current_utc()
+        elapsed = (now - start_time).total_seconds()
+        if elapsed >= max_wait_seconds:
+            return False
+
+        if probe_fn():
+            return True
+
+        # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.
+        jitter_factor = 1.0 + rng.uniform(-backoff_config.jitter, backoff_config.jitter)
+        delay = min(raw_delay * jitter_factor, float(backoff_config.max_seconds))
+        await asyncio.sleep(delay)
+        raw_delay = min(raw_delay * backoff_config.multiplier, float(backoff_config.max_seconds))
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint -- persist pause state across SIGTERM
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_DIR: str = ".devbench"
+_CHECKPOINT_FILENAME: str = "quota_pause.json"
+
+
+@dataclass
+class QuotaCheckpoint:
+    """Persisted state for a quota pause.
+
+    Written to ``<workspace_root>/.devbench/quota_pause.json`` atomically.
+
+    Attributes:
+        reason: Short string from the ``QuotaExhaustedError.source`` field.
+        reset_at: Expected UTC reset time, or ``None`` when unknown.
+        saved_at: UTC datetime when the checkpoint was written (timezone-aware).
+        session_name: Name of the devbench session that wrote the checkpoint.
+    """
+
+    reason: str
+    reset_at: datetime | None
+    saved_at: datetime
+    session_name: str
+
+
+def _checkpoint_path(workspace_root: Path) -> Path:
+    """Return the absolute path to the quota checkpoint file."""
+    return workspace_root / _CHECKPOINT_DIR / _CHECKPOINT_FILENAME
+
+
+def save_checkpoint(checkpoint: QuotaCheckpoint, workspace_root: Path) -> None:
+    """Atomically write *checkpoint* to the quota pause file.
+
+    Uses a sibling temp file + ``Path.replace`` so a mid-write crash leaves
+    the previous checkpoint intact.
+
+    Args:
+        checkpoint: The checkpoint to persist.
+        workspace_root: Workspace root directory.
+
+    Raises:
+        ValueError: If ``checkpoint.reason`` is empty or either datetime is
+            naive (no ``tzinfo``).
+        OSError: On filesystem write errors.
+    """
+    if not checkpoint.reason:
+        raise ValueError("QuotaCheckpoint.reason must be a non-empty string.")
+    if checkpoint.saved_at.tzinfo is None:
+        raise ValueError(
+            f"QuotaCheckpoint.saved_at must be timezone-aware; got a naive datetime: {checkpoint.saved_at!r}. "
+            "Use datetime.now(tz=UTC) or equivalent."
+        )
+    if checkpoint.reset_at is not None and checkpoint.reset_at.tzinfo is None:
+        raise ValueError(
+            f"QuotaCheckpoint.reset_at must be timezone-aware when set; got a naive datetime: {checkpoint.reset_at!r}. "
+            "Use a UTC-aware datetime or None."
+        )
+    dest = _checkpoint_path(workspace_root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    data: dict[str, Any] = {
+        "reason": checkpoint.reason,
+        "reset_at": checkpoint.reset_at.isoformat() if checkpoint.reset_at is not None else None,
+        "saved_at": checkpoint.saved_at.isoformat(),
+        "session_name": checkpoint.session_name,
+    }
+    import contextlib
+    import os as _os
+
+    tmp_fd, tmp_path_str = tempfile.mkstemp(dir=str(dest.parent), suffix=".tmp")
+    try:
+        with _os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        Path(tmp_path_str).replace(dest)
+    except Exception:
+        with contextlib.suppress(OSError):
+            Path(tmp_path_str).unlink(missing_ok=True)
+        raise
+
+
+def load_checkpoint(workspace_root: Path) -> QuotaCheckpoint | None:
+    """Load the quota pause checkpoint, or return ``None`` if absent.
+
+    Args:
+        workspace_root: Workspace root directory.
+
+    Returns:
+        ``QuotaCheckpoint`` when the checkpoint file exists and is valid.
+        ``None`` when the file is absent.
+
+    Raises:
+        ValueError: When the file exists but is malformed (bad JSON, missing
+            key, or unparseable datetime). The error message names the file path.
+    """
+    path = _checkpoint_path(workspace_root)
+    if not path.exists():
+        return None
+    path_str = str(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"quota_pause.json at '{path_str}' contains invalid JSON: {exc}.") from exc
+    required = {"reason", "saved_at", "session_name"}
+    missing = required - set(data.keys())
+    if "reset_at" not in data:
+        missing.add("reset_at")
+    if missing:
+        raise ValueError(f"quota_pause.json at '{path_str}' is missing required fields: {sorted(missing)}.")
+    try:
+        saved_at = datetime.fromisoformat(data["saved_at"])
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"quota_pause.json at '{path_str}': saved_at value {data['saved_at']!r} "
+            f"is not a valid ISO 8601 datetime: {exc}."
+        ) from exc
+    reset_at: datetime | None = None
+    if data["reset_at"] is not None:
+        try:
+            reset_at = datetime.fromisoformat(data["reset_at"])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"quota_pause.json at '{path_str}': reset_at value {data['reset_at']!r} "
+                f"is not a valid ISO 8601 datetime: {exc}."
+            ) from exc
+    return QuotaCheckpoint(
+        reason=str(data["reason"]),
+        reset_at=reset_at,
+        saved_at=saved_at,
+        session_name=str(data["session_name"]),
+    )
+
+
+def remove_checkpoint(workspace_root: Path) -> None:
+    """Remove the quota pause checkpoint file if it exists. Idempotent.
+
+    Args:
+        workspace_root: Workspace root directory.
+    """
+    path = _checkpoint_path(workspace_root)
+    path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe -- thin API probe to confirm quota has cleared
+# ---------------------------------------------------------------------------
+
+
+def _probe_api_call(timeout_seconds: float, request_size_tokens: int) -> object:
+    """Issue a minimal Anthropic messages.create call for quota probing.
+
+    This thin shim is isolated so tests can patch it without importing
+    the full SDK at test-collection time.
+
+    Args:
+        timeout_seconds: HTTP timeout for the probe call.
+        request_size_tokens: Approximate input token count (affects prompt size).
+
+    Returns:
+        The API response object (opaque; callers check for success by
+        absence of a raised exception).
+    """
+    import anthropic
+
+    from devbench.constants import RECOVERY_PROBE_MODEL
+
+    client = anthropic.Anthropic(timeout=timeout_seconds)
+    # Minimal prompt -- we only care whether the call succeeds.
+    prompt = "x" * max(1, request_size_tokens)
+    return client.messages.create(
+        model=RECOVERY_PROBE_MODEL,
+        max_tokens=1,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+    """Issue a minimal probe API call to check whether the quota has recovered.
+
+    Args:
+        timeout_seconds: HTTP timeout. Must be > 0.
+        request_size_tokens: Input token count for the probe. Must be >= 1.
+
+    Returns:
+        ``True`` when the probe call succeeded (quota has cleared).
+        ``False`` when the probe hit a quota error or a transient network
+        error (quota may still be exhausted or network is temporarily down;
+        treat as "not yet recovered" without crashing).
+
+    Raises:
+        ValueError: When ``timeout_seconds <= 0`` or ``request_size_tokens < 1``
+            (fail-fast before any I/O).
+    """
+    if timeout_seconds <= 0:
+        raise ValueError(f"recovery_probe: timeout_seconds must be > 0; got {timeout_seconds!r}.")
+    if request_size_tokens < 1:
+        raise ValueError(f"recovery_probe: request_size_tokens must be >= 1; got {request_size_tokens!r}.")
+    try:
+        _probe_api_call(timeout_seconds, request_size_tokens)
+        return True
+    except QuotaExhaustedError:
+        return False
+    except Exception:
+        # Transient network error -- treat as "still exhausted"; do not crash.
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Resume strategy dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _force_status_in_queue(_workspace_root: Path) -> None:
+    """Reset the in-progress work unit to in-queue for restart_wu strategy.
+
+    Isolated for testability.
+
+    Args:
+        _workspace_root: Reserved for future use; currently the backlog root is
+            resolved from the module-level ``BACKLOG_ROOT`` constant.
+    """
+    from devbench.backlog.manager import BacklogManager
+    from devbench.backlog.parser import BacklogParser
+    from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    manager = BacklogManager()
+    in_progress = [u for u in units if u.status == "in-progress"]
+    for wu in in_progress:
+        manager.force_status(wu.file_path, BACKLOG_INDEX, wu.id, "in-queue")
+
+
+def _apply_resume_strategy(strategy: str, workspace_root: Path) -> None:
+    """Dispatch the post-wait resume action for *strategy*.
+
+    Args:
+        strategy: One of ``"continue_current_wu"``, ``"restart_wu"``,
+            ``"drain_and_resume"``.
+        workspace_root: Workspace root directory (used by checkpoint and drain ops).
+
+    Raises:
+        ValueError: When *strategy* is not a recognised value.
+    """
+    known_strategies = frozenset({"continue_current_wu", "restart_wu", "drain_and_resume"})
+    if strategy not in known_strategies:
+        raise ValueError(f"unknown resume strategy {strategy!r}. Allowed values: {sorted(known_strategies)}.")
+    if strategy == "continue_current_wu":
+        remove_checkpoint(workspace_root)
+    elif strategy == "restart_wu":
+        _force_status_in_queue(workspace_root)
+        remove_checkpoint(workspace_root)
+    else:  # strategy == "drain_and_resume" (guard above ensures only valid values reach here)
+        remove_checkpoint(workspace_root)
+        request_drain(workspace_root)

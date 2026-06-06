@@ -57,6 +57,7 @@ for easy parsing by Claude Code or other automation.
 
 import asyncio
 import contextlib
+import functools
 import getpass
 import json
 import logging
@@ -152,7 +153,7 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import RepoConfig, get_configured_default_branch
+from devbench.config_loader import QuotaHandlingConfig, RepoConfig, get_configured_default_branch
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
@@ -193,6 +194,16 @@ from devbench.plugin_shadow import (
     materialise_shadow_plugin,
     shadow_plugin_path,
     write_pid_sentinel,
+)
+from devbench.quota import (
+    QuotaCheckpoint,
+    QuotaExhaustedError,
+    _apply_resume_strategy,
+    detect_quota_error,
+    load_checkpoint,
+    recovery_probe,
+    save_checkpoint,
+    wait_for_reset,
 )
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
@@ -5787,6 +5798,23 @@ def _should_auto_restart_after_no_actionable() -> tuple[bool, list[str]]:
 #: ``[ORCHESTRATOR_DRAIN_ENFORCED] reason=<text-or-none>``.
 _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX: str = "[ORCHESTRATOR_DRAIN_ENFORCED] reason="
 
+#: Audit marker emitted when quota wait begins (AC-236-1, Appendix A QW-7).
+#: Format: ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>``
+_QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
+
+#: Audit marker emitted when quota wait ends in recovery (AC-236-1, Appendix A QW-7).
+#: Format: ``[QUOTA_RESUMED] waited_seconds=<int>``
+_QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
+
+#: HTTP timeout in seconds for the ``recovery_probe`` API call issued during
+#: quota wait polling.  A short timeout avoids blocking the orchestrator for
+#: more than one poll cycle on a transient network hang.
+_RECOVERY_PROBE_TIMEOUT_SECONDS: float = 30.0
+
+#: Minimum token count for the ``recovery_probe`` prompt.  A single token is
+#: sufficient to confirm the quota window has cleared without incurring cost.
+_RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
+
 
 class _DrainRequested(BaseException):
     """Sentinel raised inside ``cmd_start._run`` when a drain is pending at claim time.
@@ -5811,6 +5839,30 @@ class _DrainRequested(BaseException):
     def __init__(self, reason: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class _QuotaDetected(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when a quota error is detected per-message.
+
+    Raised as a :class:`BaseException` subclass (not :class:`Exception`) so that
+    ``asyncio.run`` propagates it through the event loop without it being caught
+    by broad ``except Exception`` handlers.  ``cmd_start`` catches it outside
+    ``asyncio.run`` and dispatches to :func:`_handle_quota_pause` when
+    ``quota_handling.enabled`` is true, or re-raises the wrapped
+    :class:`~devbench.quota.QuotaExhaustedError` for the legacy non-zero exit
+    when ``enabled`` is false (AC-236-1).
+
+    Args:
+        quota_exc: The :class:`~devbench.quota.QuotaExhaustedError` produced by
+            :func:`~devbench.quota.detect_quota_error`.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, quota_exc: QuotaExhaustedError) -> None:
+        super().__init__(str(quota_exc))
+        self.quota_exc = quota_exc
 
 
 def _is_claim_tool_use(message: object) -> bool:
@@ -6312,6 +6364,149 @@ def _write_last_restart_marker(workspace_root: Path) -> None:
         print(f"[WARN] failed to write orchestrator restart marker: {exc}", file=sys.stderr)
 
 
+def _should_handle_quota(
+    _exc: QuotaExhaustedError,
+    qh_cfg: QuotaHandlingConfig,
+) -> bool:
+    """Return True when the quota error should be handled by wait-and-resume.
+
+    Returns False when ``qh_cfg.enabled`` is False, meaning the caller should
+    re-raise the exception to restore the legacy non-zero exit behaviour.
+
+    Args:
+        _exc: The detected quota exception (reserved for future per-source filtering).
+        qh_cfg: Loaded ``QuotaHandlingConfig`` from the YAML config.
+
+    Returns:
+        ``True`` when wait-and-resume should proceed; ``False`` for legacy exit.
+    """
+    return qh_cfg.enabled
+
+
+async def _handle_quota_pause(
+    *,
+    exc: QuotaExhaustedError,
+    qh_cfg: QuotaHandlingConfig,
+    workspace_root: Path,
+    session_name: str,
+) -> bool:
+    """Handle a quota exhaustion signal with wait-and-resume.
+
+    1. Saves a checkpoint so SIGTERM does not lose pause state.
+    2. Emits ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>`` to the log.
+    3. Awaits ``wait_for_reset`` (no shield -- SIGTERM propagates naturally).
+    4. On recovery: emits ``[QUOTA_RESUMED] waited_seconds=<N>``,
+       applies the resume strategy, returns ``True``.
+    5. On timeout: returns ``False`` (caller applies ``on_exhaustion_timeout``).
+
+    Args:
+        exc: The detected ``QuotaExhaustedError``.
+        qh_cfg: Quota handling configuration.
+        workspace_root: Workspace root for checkpoint storage.
+        session_name: Current session name (stored in checkpoint).
+
+    Returns:
+        ``True`` when recovery was confirmed; ``False`` when timed out.
+    """
+    from devbench.quota import BackoffConfig
+
+    now = datetime.now(tz=UTC)
+    checkpoint = QuotaCheckpoint(
+        reason=exc.source,
+        reset_at=exc.reset_at,
+        saved_at=now,
+        session_name=session_name,
+    )
+    save_checkpoint(checkpoint, workspace_root)
+
+    reset_at_str = exc.reset_at.isoformat() if exc.reset_at is not None else "unknown"
+    logger.info(
+        "%s reason=%s reset_at=%s",
+        _QUOTA_WAITING_AUDIT_PREFIX,
+        exc.source,
+        reset_at_str,
+    )
+
+    wait_start = datetime.now(tz=UTC)
+
+    backoff = BackoffConfig(initial_seconds=qh_cfg.poll_interval_seconds)
+
+    recovered = await wait_for_reset(
+        reset_at=exc.reset_at,
+        poll_interval_seconds=qh_cfg.poll_interval_seconds,
+        max_wait_seconds=qh_cfg.max_wait_seconds,
+        probe_fn=functools.partial(
+            recovery_probe,
+            timeout_seconds=_RECOVERY_PROBE_TIMEOUT_SECONDS,
+            request_size_tokens=_RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+        ),
+        backoff_config=backoff,
+    )
+
+    if recovered:
+        waited_seconds = int((datetime.now(tz=UTC) - wait_start).total_seconds())
+        logger.info(
+            "%s waited_seconds=%d",
+            _QUOTA_RESUMED_AUDIT_PREFIX,
+            waited_seconds,
+        )
+        _apply_resume_strategy(qh_cfg.resume_strategy, workspace_root)
+        return True
+    return False
+
+
+def _restore_session_env_name(prev: str | None) -> None:
+    """Restore ``DEVBENCH_SESSION_NAME`` to its value before a ``cmd_start`` run.
+
+    Extracted from ``cmd_start``'s ``finally`` block to keep that function under
+    ruff's PLR0912 12-branch limit.
+
+    Args:
+        prev: The value of ``os.environ.get("DEVBENCH_SESSION_NAME")`` captured
+            before the SDK run.  ``None`` means the variable was absent; the
+            variable is removed rather than set to ``"None"``.
+    """
+    if prev is None:
+        os.environ.pop("DEVBENCH_SESSION_NAME", None)
+    else:
+        os.environ["DEVBENCH_SESSION_NAME"] = prev
+
+
+def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> str:
+    """Handle a detected quota signal from ``cmd_start._run``.
+
+    Dispatches to :func:`_handle_quota_pause` when ``quota_handling.enabled``
+    is true, or re-raises the wrapped :class:`~devbench.quota.QuotaExhaustedError`
+    for the legacy non-zero exit when ``enabled`` is false (AC-236-1).
+
+    Extracted from ``cmd_start`` to keep that function under ruff's PLR0912
+    12-branch limit.
+
+    Args:
+        detected: The :class:`_QuotaDetected` sentinel raised by ``_run``.
+        session_name: Current session name (passed to :func:`_handle_quota_pause`).
+
+    Returns:
+        A descriptive ``_stop_reason`` string for the ``cmd_start`` audit trail.
+
+    Raises:
+        :class:`~devbench.quota.QuotaExhaustedError`: When ``enabled`` is false
+            (legacy exit path).
+    """
+    qh_cfg = RUNTIME_CONFIG.quota_handling
+    if not _should_handle_quota(detected.quota_exc, qh_cfg):
+        raise detected.quota_exc from detected
+    recovered = asyncio.run(
+        _handle_quota_pause(
+            exc=detected.quota_exc,
+            qh_cfg=qh_cfg,
+            workspace_root=WORKSPACE_ROOT,
+            session_name=session_name,
+        )
+    )
+    return "quota-wait-recovered" if recovered else "quota-wait-timeout"
+
+
 def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -6508,6 +6703,12 @@ def cmd_start(*argv: str) -> int:
             _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
             if _log_terminal_exit_if_applicable(_sdk_result_text):
                 return
+            # Issue #236: per-message quota detection (AC-236-1). Check
+            # before the drain-on-claim path so a quota hit is not masked
+            # by an unrelated claim check.
+            _qe = detect_quota_error(message)
+            if _qe is not None:
+                raise _QuotaDetected(_qe)
             # Issue #188 + #212: drain-on-claim short-circuit. Combined
             # condition (rather than nested ifs) keeps ``_run`` under
             # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
@@ -6536,6 +6737,10 @@ def cmd_start(*argv: str) -> int:
                 logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
                 _stop_reason = f"drain enforced: {reason_text}"
                 return 0
+            except _QuotaDetected as exc:
+                # Issue #236 (AC-236-1): quota wait-and-resume dispatch.
+                _stop_reason = _dispatch_quota_detection(exc, parsed.name)
+                return 0
         finally:
             # Issue #212: drop the drain signal on any exit from the SDK run so
             # the next start does not inherit a stale request.  Run while
@@ -6548,10 +6753,7 @@ def cmd_start(*argv: str) -> int:
                 cancel_drain(WORKSPACE_ROOT)
             # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
             # maintained when cmd_start is invoked multiple times in the same process.
-            if _prev_session_name is None:
-                os.environ.pop("DEVBENCH_SESSION_NAME", None)
-            else:
-                os.environ["DEVBENCH_SESSION_NAME"] = _prev_session_name
+            _restore_session_env_name(_prev_session_name)
             # Restore the previous SIGTERM handler so test isolation is maintained.
             signal.signal(signal.SIGTERM, _prev_sigterm_handler)
 
@@ -6613,6 +6815,60 @@ def cmd_prepare_plugin_shadow() -> int:
     """
     plugin_path = _resolve_plugin_path()
     print(str(plugin_path))
+    return 0
+
+
+def cmd_quota_watcher(*argv: str) -> int:
+    """Inspect or monitor the quota pause checkpoint.
+
+    Usage::
+
+        devbench quota-watcher --once    # print current pause status then exit
+        devbench quota-watcher --daemon  # reserved for future background monitor
+
+    When called with ``--once``, reads the checkpoint file at
+    ``<workspace>/.devbench/quota_pause.json`` and prints the current quota
+    pause status to stdout. Returns 0 when a checkpoint is found, 1 when absent
+    or the flag is missing/unknown.
+
+    The watcher is advisory: when a running orchestrator owns the session, its
+    in-loop wait is authoritative. The watcher simply surfaces the checkpoint
+    data for operator visibility.
+
+    Args:
+        *argv: Optional flags (``--once``, ``--daemon``).
+
+    Returns:
+        0 when ``--once`` is given and a checkpoint exists.
+        1 on parse errors, absent checkpoint, or unsupported flag.
+    """
+    if not argv or argv[0] not in ("--once", "--daemon"):
+        print(
+            "ERROR: quota-watcher requires --once or --daemon.\nUsage: devbench quota-watcher [--once|--daemon]",
+            file=sys.stderr,
+        )
+        return 1
+
+    flag = argv[0]
+
+    if flag == "--daemon":
+        print(
+            "ERROR: quota-watcher --daemon is not yet implemented. Use --once.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # --once: read the checkpoint and print status.
+    checkpoint = load_checkpoint(WORKSPACE_ROOT)
+    if checkpoint is None:
+        print("No quota pause checkpoint found -- orchestrator is not waiting.", file=sys.stdout)
+        return 1
+
+    reset_at_str = checkpoint.reset_at.isoformat() if checkpoint.reset_at is not None else "unknown"
+    print(
+        f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={checkpoint.reason} reset_at={reset_at_str}",
+        file=sys.stdout,
+    )
     return 0
 
 
@@ -9561,6 +9817,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             'use for interactive launchers (claude --plugin-dir "$(devbench prepare-plugin-shadow)")'
         ),
     ),
+    "quota-watcher": (
+        cmd_quota_watcher,
+        0,
+        "Inspect the quota pause checkpoint: quota-watcher [--once|--daemon]",
+    ),
     "watch": (
         cmd_watch,
         0,
@@ -9705,6 +9966,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "sessions",
         # Issue #192 E4-F5-S1-T2: stop --session <name> flag
         "stop",
+        # Issue #236: quota wait-and-resume -- optional --once/--daemon flag
+        "quota-watcher",
     }
 )
 

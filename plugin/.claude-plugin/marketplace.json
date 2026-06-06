@@ -5,14 +5,14 @@
     "url": "https://www.caylent.com"
   },
   "metadata": {
-    "description": "DevBench orchestrate marketplace -- ships the devbench-orchestrate plugin (autonomous execution phase). The companion devbench-authoring marketplace lives at plugin-authoring/ in the same repo (issue #224).",
-    "version": "0.3.0"
+    "description": "DevBench orchestrate marketplace -- ships the devbench-orchestrate plugin (autonomous execution phase) with quota wait-and-resume on by default, done-integrity guards, and operator-mode amendment support. The companion devbench-authoring marketplace (backlog-assistant included) lives at plugin-authoring/ in the same repo (issue #224).",
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "devbench-orchestrate",
       "source": "./devbench-orchestrate/",
-      "description": "Autonomous backlog execution with LLM-as-judge review, guarded hooks, and the orchestrate skill. Use during the execution phase.",
+      "description": "Autonomous backlog execution with LLM-as-judge review, guarded hooks, and the orchestrate skill. Includes quota wait-and-resume on by default, done-integrity guards, and operator-mode amendment. Use during the execution phase.",
       "version": "0.4.0"
     }
   ]

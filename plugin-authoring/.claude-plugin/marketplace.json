@@ -5,21 +5,21 @@
     "url": "https://www.caylent.com"
   },
   "metadata": {
-    "description": "DevBench authoring marketplace -- ships the devbench-authoring plugin (spec authoring + backlog materialization phase) and the devbench-backlog-assistant plugin (operator-phase diagnosis and remediation). The companion devbench-orchestrate marketplace lives at plugin/ in the same repo (issue #224).",
-    "version": "0.3.0"
+    "description": "DevBench authoring marketplace -- ships the devbench-authoring plugin (spec authoring + backlog materialization phase) and the devbench-backlog-assistant plugin (operator-phase diagnosis and remediation). Adds operator-mode amendment and backlog-assistant capabilities. The companion devbench-orchestrate marketplace lives at plugin/ in the same repo (issue #224).",
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "devbench-authoring",
       "source": "./devbench-authoring/",
-      "description": "Spec authoring + backlog materialization skills (spec-to-backlog, create-spec, configure-devbench, bootstrap-environment). No hooks; safe to enable in any workspace where authoring happens. Use during the planning phase.",
-      "version": "0.2.0"
+      "description": "Spec authoring + backlog materialization skills (spec-to-backlog, create-spec, configure-devbench, bootstrap-environment) with operator-mode amendment support. No hooks; safe to enable in any workspace where authoring happens. Use during the planning phase.",
+      "version": "0.4.0"
     },
     {
       "name": "devbench-backlog-assistant",
       "source": "./devbench-backlog-assistant/",
-      "description": "Operator-phase backlog diagnosis and remediation assistant. Ships nine read-only diagnosis skills and payload skills that print mutating commands but never run them without CONFIRM. Use when work units are blocked, backlogs drift, or review is stuck.",
-      "version": "0.1.0"
+      "description": "Operator-phase backlog-assistant for diagnosis and remediation. Ships nine read-only diagnosis skills and payload skills that print mutating commands but never run them without CONFIRM. Use when work units are blocked, backlogs drift, or review is stuck.",
+      "version": "0.4.0"
     }
   ]
 }

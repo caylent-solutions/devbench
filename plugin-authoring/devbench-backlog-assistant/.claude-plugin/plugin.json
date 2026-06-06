@@ -1,7 +1,7 @@
 {
   "name": "devbench-backlog-assistant",
-  "description": "Operator-phase backlog diagnosis and remediation assistant for the devbench workflow. Ships nine read-only diagnosis skills and payload skills that print mutating commands but never run them without CONFIRM. Use when work units are blocked, backlogs drift, or review is stuck. Pairs with devbench-orchestrate (execution) and devbench-authoring (planning).",
-  "version": "0.1.0",
+  "description": "Operator-phase backlog-assistant for diagnosis and remediation in the devbench workflow. Ships nine read-only diagnosis skills and payload skills that print mutating commands but never run them without CONFIRM. Supports done-integrity guards and operator-mode amendment review. Use when work units are blocked, backlogs drift, or review is stuck. Pairs with devbench-orchestrate (execution) and devbench-authoring (planning).",
+  "version": "0.4.0",
   "keywords": [
     "devbench",
     "backlog",

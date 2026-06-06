@@ -940,6 +940,95 @@ def _build_scope_for_next(
         return None, f"ERROR: scope.json is corrupt and cannot be read: {exc}"
 
 
+_DEP_TERMINAL_STATUSES_FOR_STALL: frozenset[WorkUnitStatus] = frozenset({WorkUnitStatus.DONE, WorkUnitStatus.DECLINED})
+
+
+def _unmet_dep_ids(task: WorkUnit, units_by_id: dict[str, WorkUnit]) -> list[str]:
+    """Return dependency IDs of ``task`` that are not in a terminal status."""
+    return [
+        dep_id
+        for dep_id in task.dependencies
+        if dep_id in units_by_id and units_by_id[dep_id].status not in _DEP_TERMINAL_STATUSES_FOR_STALL
+    ]
+
+
+def _held_blocking_ids(in_queue_tasks: list[WorkUnit], units_by_id: dict[str, WorkUnit]) -> list[str]:
+    """Return IDs of HOLD-status units that block in-queue tasks (deduped, ordered)."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for task in in_queue_tasks:
+        for dep_id in _unmet_dep_ids(task, units_by_id):
+            dep = units_by_id.get(dep_id)
+            if dep is not None and dep.status is WorkUnitStatus.HOLD and dep_id not in seen:
+                seen.add(dep_id)
+                result.append(dep_id)
+    return result
+
+
+def _cyclic_task_ids(in_queue_tasks: list[WorkUnit], units_by_id: dict[str, WorkUnit]) -> list[str]:
+    """Return IDs of in-queue tasks whose unmet deps are all also in-queue (forming a cycle)."""
+    in_queue_ids = {t.id for t in in_queue_tasks}
+    seen: set[str] = set()
+    result: list[str] = []
+    for task in in_queue_tasks:
+        unmet = _unmet_dep_ids(task, units_by_id)
+        if unmet and all(dep_id in in_queue_ids for dep_id in unmet) and task.id not in seen:
+            seen.add(task.id)
+            result.append(task.id)
+    return result
+
+
+def _classify_next_stall(
+    units: list[WorkUnit],
+) -> tuple[int, str, list[str]]:
+    """Classify why no in-queue task is actionable.
+
+    Inspects in-queue TASK units and their unsatisfied dependencies to produce
+    a three-tuple describing the stall:
+
+    - ``in_queue_count``: number of TASK units with status ``IN_QUEUE``.
+    - ``label``: one of ``"held-blocking"``, ``"cyclic"``, or ``"awaiting-dep"``.
+    - ``ids``: the IDs most directly responsible for the stall.
+
+    Priority of labels (highest wins):
+
+    1. ``held-blocking`` -- at least one in-queue task has a dependency whose
+       status is ``HOLD``.
+    2. ``cyclic`` -- every in-queue task's unmet dependencies are also in-queue
+       (closed set with no external progress possible).
+    3. ``awaiting-dep`` -- remaining cases where a non-terminal, non-HOLD dep
+       is blocking progress.
+
+    Args:
+        units: All work units from the parsed backlog.
+
+    Returns:
+        ``(in_queue_count, label, ids)`` describing the dominant stall reason.
+    """
+    units_by_id = {u.id: u for u in units}
+
+    in_queue_tasks = [u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.IN_QUEUE]
+    in_queue_count = len(in_queue_tasks)
+
+    held_ids = _held_blocking_ids(in_queue_tasks, units_by_id)
+    if held_ids:
+        return in_queue_count, "held-blocking", held_ids
+
+    cyclic_ids = _cyclic_task_ids(in_queue_tasks, units_by_id)
+    if cyclic_ids:
+        return in_queue_count, "cyclic", cyclic_ids
+
+    # Remaining case: awaiting-dep (dep not done, not hold, not cyclic).
+    seen: set[str] = set()
+    awaiting_ids: list[str] = []
+    for task in in_queue_tasks:
+        for dep_id in _unmet_dep_ids(task, units_by_id):
+            if dep_id not in seen:
+                seen.add(dep_id)
+                awaiting_ids.append(dep_id)
+    return in_queue_count, "awaiting-dep", awaiting_ids
+
+
 def _parse_next_argv(argv: tuple[str, ...]) -> tuple[str, str, int]:
     """Parse ``--include`` / ``--exclude`` flags for ``cmd_next``.
 
@@ -1009,7 +1098,10 @@ def cmd_next(*argv: str) -> int:
         elif backlog_parser.all_done(units):
             print("ALL_DONE")
         else:
+            in_queue_count, stall_label, stall_ids = _classify_next_stall(units)
             print("NO_ACTIONABLE")
+            ids_str = ", ".join(stall_ids)
+            print(f"  reason: {in_queue_count} in-queue, 0 actionable; {stall_label}: {ids_str}")
         return 0
 
     unit = candidates[0]

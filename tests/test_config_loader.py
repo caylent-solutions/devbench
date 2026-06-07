@@ -3456,3 +3456,76 @@ class TestSkillsConfig:
         rt = load_runtime_config(cfg, {})
         assert rt.skills.exemplar_backlog_path is None
         assert rt.skills.exemplar_spec_path is None
+
+
+@pytest.mark.unit
+class TestAutoResolveConfigDataclass:
+    """E11-F1-S1-T1: AutoResolveConfig dataclass fields and YAML loading."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_auto_resolve_config_importable(self) -> None:
+        from devbench.config_loader import AutoResolveConfig
+
+        cfg = AutoResolveConfig(enabled=False, max_attempts=3)
+        assert cfg.enabled is False
+        assert cfg.max_attempts == 3
+
+    def test_auto_resolve_config_defaults_to_disabled(self) -> None:
+        from devbench.config_loader import AutoResolveConfig
+
+        cfg = AutoResolveConfig()
+        assert cfg.enabled is False
+
+    def test_auto_resolve_config_max_attempts_default(self) -> None:
+        from devbench.config_loader import AutoResolveConfig
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+        cfg = AutoResolveConfig()
+        assert cfg.max_attempts == DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+    def test_runtime_config_has_auto_resolve_field(self, tmp_path: Path) -> None:
+        from devbench.config_loader import AutoResolveConfig
+
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg_path, {})
+        assert hasattr(rt, "auto_resolve")
+        assert isinstance(rt.auto_resolve, AutoResolveConfig)
+
+    def test_auto_resolve_enabled_loaded_from_yaml(self, tmp_path: Path) -> None:
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            auto_resolve:
+              enabled: true
+              max_attempts: 5
+            """,
+        )
+        rt = load_runtime_config(cfg_path, {})
+        assert rt.auto_resolve.enabled is True
+        assert rt.auto_resolve.max_attempts == 5
+
+    def test_auto_resolve_absent_yields_defaults(self, tmp_path: Path) -> None:
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg_path, {})
+        assert rt.auto_resolve.enabled is False
+        assert rt.auto_resolve.max_attempts == DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS

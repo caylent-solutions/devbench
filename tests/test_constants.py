@@ -733,3 +733,51 @@ class TestInactivityTimeoutConstants:
             f"Audit prefix must equal '[ORCHESTRATOR_INACTIVITY_TIMEOUT]'; "
             f"got {ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX!r}"
         )
+
+
+@pytest.mark.unit
+class TestAutoResolveConstants:
+    """E11-F1-S1-T1: auto-resolve engine constants (spec Section 4 E11-F1-S1)."""
+
+    def test_env_var_name_is_importable(self) -> None:
+        from devbench.constants import DEVBENCH_AUTO_RESOLVE_ENABLED_ENV
+
+        assert DEVBENCH_AUTO_RESOLVE_ENABLED_ENV == "DEVBENCH_AUTO_RESOLVE_ENABLED"
+
+    def test_default_enabled_is_false(self) -> None:
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_ENABLED
+
+        assert DEFAULT_AUTO_RESOLVE_ENABLED is False
+
+    def test_audit_string_is_correct(self) -> None:
+        from devbench.constants import AUTO_RESOLVE_AUDIT_STRING
+
+        assert AUTO_RESOLVE_AUDIT_STRING == "[AUTO_RESOLVED]"
+
+    def test_whitelist_is_frozenset_of_strings(self) -> None:
+        from devbench.constants import AUTO_RESOLVE_WHITELIST
+
+        assert isinstance(AUTO_RESOLVE_WHITELIST, frozenset)
+        assert all(isinstance(v, str) for v in AUTO_RESOLVE_WHITELIST)
+
+    def test_whitelist_only_contains_non_destructive_verbs(self) -> None:
+        from devbench.constants import AUTO_RESOLVE_DESTRUCTIVE_VERBS, AUTO_RESOLVE_WHITELIST
+
+        assert not AUTO_RESOLVE_WHITELIST & AUTO_RESOLVE_DESTRUCTIVE_VERBS
+
+    def test_destructive_verbs_is_frozenset_of_strings(self) -> None:
+        from devbench.constants import AUTO_RESOLVE_DESTRUCTIVE_VERBS
+
+        assert isinstance(AUTO_RESOLVE_DESTRUCTIVE_VERBS, frozenset)
+        assert all(isinstance(v, str) for v in AUTO_RESOLVE_DESTRUCTIVE_VERBS)
+
+    def test_default_max_attempts_is_positive_int(self) -> None:
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+        assert isinstance(DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS, int)
+        assert DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS > 0
+
+    def test_max_attempts_env_var_name_is_correct(self) -> None:
+        from devbench.constants import DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV
+
+        assert DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV == "DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS"

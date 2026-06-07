@@ -499,6 +499,18 @@ skills:
 #     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)
 
 # ---------------------------------------------------------------------------
+# Auto-resolve engine (issue #263, E11-F1-S1).
+# When enabled, the engine auto-applies a whitelisted non-destructive
+# remediation (re-queue / set-status in-queue, reconcile-cascade,
+# restart-signal) without operator intervention.
+# Default: disabled -- advise-only mode is preserved by default (opt-in).
+# Override via DEVBENCH_AUTO_RESOLVE_ENABLED env var (true/false/1/0).
+# ---------------------------------------------------------------------------
+# auto_resolve:
+#   enabled: false            # set true to activate auto-apply (opt-in)
+#   max_attempts: 3           # max auto-apply attempts before operator escalation (E11-F1-S2)
+
+# ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence
 # problem; production workspaces leave this section absent).
 # ---------------------------------------------------------------------------

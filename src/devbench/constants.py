@@ -900,3 +900,48 @@ RECOVERY_PROBE_MODEL: str = "claude-opus-4-8"
 # in the environment; the integration layer reads this constant as the default
 # when no env override is present.
 QUOTA_HANDLING_DEFAULT_ENABLED: bool = True
+
+# ---------------------------------------------------------------------------
+# Auto-resolve engine constants (issue #263, E11-F1-S1)
+# ---------------------------------------------------------------------------
+# Environment variable name for the auto-resolve enabled flag.
+# Resolution: env var > YAML > DEFAULT_AUTO_RESOLVE_ENABLED (false).
+DEVBENCH_AUTO_RESOLVE_ENABLED_ENV: str = "DEVBENCH_AUTO_RESOLVE_ENABLED"
+
+# Environment variable name for the auto-resolve max-attempts override.
+# Resolution: env var > YAML > DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS.
+DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV: str = "DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS"
+
+# Unset-safe default: advise-only mode is preserved by default (opt-in).
+DEFAULT_AUTO_RESOLVE_ENABLED: bool = False
+
+# Maximum number of auto-apply attempts before the engine escalates to the
+# operator. Consumed by E11-F1-S2 (bounded auto-apply with escalation).
+DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS: int = 3
+
+# Verbatim audit string logged on every successful auto-apply (spec Section 7).
+# Field order: [AUTO_RESOLVED] task_id=<id> signature=<sig> remediation=<verb>.
+AUTO_RESOLVE_AUDIT_STRING: str = "[AUTO_RESOLVED]"
+
+# Non-destructive whitelist: only these remediation verbs may be auto-applied.
+# Derived from the E7-F3 seven-bucket remediation matrix (spec Section 4 E11-F1-S1 AC-2).
+# re-queue and set-status in-queue are semantically equivalent paths for the same action.
+AUTO_RESOLVE_WHITELIST: frozenset[str] = frozenset(
+    {
+        "re-queue",
+        "set-status in-queue",
+        "reconcile-cascade",
+        "restart-signal",
+    }
+)
+
+# Hard-excluded destructive verbs that MUST NEVER be auto-applied (spec Section 4 E11-F1-S1 AC-2).
+# This set is enforced independently of the whitelist so a whitelist expansion
+# cannot accidentally admit a destructive verb.
+AUTO_RESOLVE_DESTRUCTIVE_VERBS: frozenset[str] = frozenset(
+    {
+        "decline",
+        "mark-done",
+        "force-status",
+    }
+)

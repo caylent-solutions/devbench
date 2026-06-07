@@ -79,6 +79,8 @@ from devbench.constants import (
     ALLOWED_AGENT_MODEL_SHORT_NAMES,
     ANTHROPIC_AGENT_MODEL_PATTERN,
     BEDROCK_AGENT_MODEL_PATTERN,
+    DEFAULT_AUTO_RESOLVE_ENABLED,
+    DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
     DEFAULT_FALLBACK_MODEL_RATES,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
@@ -705,6 +707,27 @@ def _parse_default_model_rates(raw: object, source: str) -> ModelRates:
     return _parse_model_rates("<default_model>", raw, source)
 
 
+@dataclass
+class AutoResolveConfig:
+    """Auto-resolve engine configuration (issue #263, E11-F1-S1).
+
+    Controls the config-gated auto-apply engine that can automatically apply
+    a whitelisted, non-destructive remediation without operator intervention.
+
+    Attributes:
+        enabled: Master toggle. When ``False`` (the default), the engine
+            returns the current advise-only output byte-for-byte and no
+            auto-apply occurs. Enable via ``auto_resolve.enabled: true`` in
+            the YAML or the ``DEVBENCH_AUTO_RESOLVE_ENABLED`` env var.
+        max_attempts: Maximum number of auto-apply attempts before the engine
+            escalates to the operator (consumed by E11-F1-S2). Defaults to
+            ``DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS``.
+    """
+
+    enabled: bool = DEFAULT_AUTO_RESOLVE_ENABLED
+    max_attempts: int = DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+
 def _parse_quota_handling_config(path: Path, raw: dict) -> QuotaHandlingConfig:
     """Parse and validate the ``quota_handling:`` YAML section.
 
@@ -1317,6 +1340,7 @@ class RuntimeConfig:
     debug: DebugConfig = field(default_factory=DebugConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
+    auto_resolve: AutoResolveConfig = field(default_factory=AutoResolveConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     use_bedrock: bool = False
     bedrock_region: str | None = None
@@ -1853,6 +1877,15 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     quota_handling_raw = raw.get("quota_handling") or {}
     quota_handling = _parse_quota_handling_config(path, quota_handling_raw)
 
+    # Populate AutoResolveConfig from YAML auto_resolve block (issue #263, E11-F1-S1).
+    # Schema enforces correct types; absent fields yield the unset-safe defaults.
+    auto_resolve_raw = raw.get("auto_resolve") or {}
+    default_auto_resolve = AutoResolveConfig()
+    auto_resolve = AutoResolveConfig(
+        enabled=bool(auto_resolve_raw.get("enabled", default_auto_resolve.enabled)),
+        max_attempts=int(auto_resolve_raw.get("max_attempts", default_auto_resolve.max_attempts)),
+    )
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -1871,6 +1904,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         debug=debug,
         notifications=notifications,
         quota_handling=quota_handling,
+        auto_resolve=auto_resolve,
         allowed_orgs=allowed_orgs,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,

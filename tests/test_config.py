@@ -778,3 +778,73 @@ class TestOrchestratorInactivityTimeoutConfig:
         with patch.dict(os.environ, {self._ENV_VAR: "-1.0"}, clear=False):
             result = config._resolve_float(self._ENV_VAR, None, 300.0)
         assert result == -1.0, f"Expected -1.0 (disable sentinel); got {result}"
+
+
+@pytest.mark.unit
+class TestAutoResolveEnabledConfig:
+    """E11-F1-S1-T1: AUTO_RESOLVE_ENABLED resolved via _resolve_bool with env precedence."""
+
+    _ENV_VAR = "DEVBENCH_AUTO_RESOLVE_ENABLED"
+
+    def test_env_true_overrides_yaml_false(self) -> None:
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_ENABLED
+
+        with patch.dict(os.environ, {self._ENV_VAR: "true"}, clear=False):
+            result = config._resolve_bool(self._ENV_VAR, False, DEFAULT_AUTO_RESOLVE_ENABLED)
+        assert result is True
+
+    def test_env_false_overrides_yaml_true(self) -> None:
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_ENABLED
+
+        with patch.dict(os.environ, {self._ENV_VAR: "false"}, clear=False):
+            result = config._resolve_bool(self._ENV_VAR, True, DEFAULT_AUTO_RESOLVE_ENABLED)
+        assert result is False
+
+    def test_yaml_true_used_when_env_absent(self) -> None:
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_ENABLED
+
+        env_copy = {k: v for k, v in os.environ.items() if k != self._ENV_VAR}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_bool(self._ENV_VAR, True, DEFAULT_AUTO_RESOLVE_ENABLED)
+        assert result is True
+
+    def test_default_false_when_both_absent(self) -> None:
+        """Unset-safe default is False when env var is absent and YAML value is None."""
+        from devbench.constants import DEFAULT_AUTO_RESOLVE_ENABLED
+
+        env_copy = {k: v for k, v in os.environ.items() if k != self._ENV_VAR}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_bool(self._ENV_VAR, None, DEFAULT_AUTO_RESOLVE_ENABLED)
+        assert result is False
+
+
+@pytest.mark.unit
+class TestAutoResolveMaxAttemptsConfig:
+    """E11-F1-S1-T1: AUTO_RESOLVE_MAX_ATTEMPTS resolved via DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV constant."""
+
+    def test_env_var_name_constant_used_for_max_attempts(self) -> None:
+        """config.py must use DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV constant, not a hardcoded string."""
+        from devbench.constants import (
+            DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
+            DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV,
+        )
+
+        env_copy = {k: v for k, v in os.environ.items() if k != DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int(
+                DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV, None, DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+            )
+        assert result == DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+    def test_env_override_max_attempts(self) -> None:
+        """Env var overrides the default max_attempts when set."""
+        from devbench.constants import (
+            DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
+            DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV,
+        )
+
+        with patch.dict(os.environ, {DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV: "7"}, clear=False):
+            result = config._resolve_int(
+                DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV, None, DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+            )
+        assert result == 7

@@ -21,6 +21,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from devbench.config_loader import (
+    AutoResolveConfig,
     RuntimeConfig,
     get_effective_merge_strategy,
     get_repo_local_path,
@@ -31,6 +32,8 @@ from devbench.config_loader import (
 from devbench.constants import (
     BACKLOG_SUBDIR,
     DEFAULT_ALERT_SUMMARY_LIMIT,
+    DEFAULT_AUTO_RESOLVE_ENABLED,
+    DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
     DEFAULT_BEDROCK_REGION,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     DEFAULT_CACHE_READ_MULTIPLIER,
@@ -72,6 +75,8 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
+    DEVBENCH_AUTO_RESOLVE_ENABLED_ENV,
+    DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV,
     ModelRates,
 )
 
@@ -733,6 +738,31 @@ def get_anthropic_api_key() -> str:
         )
 
     return token
+
+
+# ---------------------------------------------------------------------------
+# Auto-resolve engine (issue #263, E11-F1-S1)
+# ---------------------------------------------------------------------------
+# Resolve auto_resolve.enabled via _resolve_bool with env precedence:
+#   DEVBENCH_AUTO_RESOLVE_ENABLED env var > YAML auto_resolve.enabled > DEFAULT_AUTO_RESOLVE_ENABLED (false).
+# The YAML value (RUNTIME_CONFIG.auto_resolve.enabled) was already loaded from YAML above.
+# config.py re-resolves it here so the env-var override layer is applied consistently
+# with every other boolean knob in this module.
+AUTO_RESOLVE_ENABLED: bool = _resolve_bool(
+    DEVBENCH_AUTO_RESOLVE_ENABLED_ENV,
+    RUNTIME_CONFIG.auto_resolve.enabled,
+    DEFAULT_AUTO_RESOLVE_ENABLED,
+)
+AUTO_RESOLVE_MAX_ATTEMPTS: int = _resolve_int(
+    DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV,
+    RUNTIME_CONFIG.auto_resolve.max_attempts,
+    DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
+)
+# Resolved AutoResolveConfig for consumption by the auto-resolve engine module.
+AUTO_RESOLVE_CONFIG: AutoResolveConfig = AutoResolveConfig(
+    enabled=AUTO_RESOLVE_ENABLED,
+    max_attempts=AUTO_RESOLVE_MAX_ATTEMPTS,
+)
 
 
 def get_gh_token() -> str:

@@ -667,6 +667,22 @@
           "description": "Emit structured log events on quota transitions. Default: true."
         }
       }
+    },
+    "auto_resolve": {
+      "type": "object",
+      "description": "Auto-resolve engine configuration (issue #263, E11-F1-S1). When enabled, the engine auto-applies a whitelisted non-destructive remediation without operator intervention. Default: disabled (advise-only mode preserved). Override enabled via DEVBENCH_AUTO_RESOLVE_ENABLED.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master toggle. When false (the default), the engine returns the advise-only payload unchanged. When true and the remediation is whitelisted, it is applied and [AUTO_RESOLVED] is logged. Override via DEVBENCH_AUTO_RESOLVE_ENABLED env var."
+        },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum auto-apply attempts before the engine escalates to the operator (consumed by E11-F1-S2). Default: 3."
+        }
+      }
     }
   }
 }

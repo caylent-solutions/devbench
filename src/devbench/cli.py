@@ -1465,6 +1465,34 @@ def cmd_set_status(*argv: str) -> int:
     if "--include" in args:
         return _cmd_set_status_bulk(args)
 
+    # Cascade mode: <id> <status> --cascade
+    if "--cascade" in args:
+        cascade_args = [a for a in args if a != "--cascade"]
+        if len(cascade_args) != 2:
+            print(
+                "ERROR: set-status cascade usage: set-status <id> <status> --cascade",
+                file=sys.stderr,
+            )
+            return 1
+        unit_id, new_status = cascade_args[0], cascade_args[1]
+        from devbench.backlog.manager import VALID_STATUSES
+
+        if new_status.lower() not in VALID_STATUSES:
+            print(
+                f"ERROR: Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}",
+                file=sys.stderr,
+            )
+            return 1
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+        return cascade_status_mutation(
+            unit_id,
+            f"set-status:{new_status.lower()}",
+            "",
+            units,
+            BacklogManager(),
+        )
+
     # Single-ID form: exactly 2 positional args.
     if len(args) != 2:
         print(
@@ -1934,42 +1962,30 @@ def cmd_decline(*argv: str) -> int:
 
     Usage::
 
-        decline <id> --reason "<message>"
+        decline <id> --reason "<message>" [--cascade]
 
     Declined is a deliberate final-decision status, distinct from Blocked
     (waiting on something) and Done (completed). Declined children count
     as terminal-complete for parent rollup. The ``--reason`` is REQUIRED
     because the decision must leave an audit trail; em-dashes are
     rejected at the input boundary for backlog hygiene.
+
+    When ``--cascade`` is supplied, all eligible descendants of ``<id>``
+    are also declined in depth-desc order (Tasks first, then Stories,
+    then Features, then the root itself).  Descendants already in
+    ``done`` or ``declined`` are skipped with a SKIP line on stdout.
     """
-    task_id = ""
-    reason = ""
-    args = list(argv)
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if not arg:
-            i += 1
-            continue
-        if arg == "--reason":
-            if i + 1 >= len(args) or not args[i + 1]:
-                print("ERROR: --reason requires a value", file=sys.stderr)
-                return 1
-            reason = args[i + 1]
-            i += 2
-            continue
-        if not task_id:
-            task_id = arg
-        i += 1
-    if not task_id or not reason:
-        print("ERROR: decline requires <id> --reason <message>", file=sys.stderr)
-        return 1
-    rc = _reject_em_dash("reason", reason)
-    if rc is not None:
-        return rc
+    parsed = _parse_id_and_reason_cascade(argv, "decline", reason_required=True)
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason, cascade = parsed
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
+
+    if cascade:
+        return cascade_status_mutation(task_id, "decline", reason, units, BacklogManager())
+
     target = _find_unit(units, task_id)
     if target is None:
         print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
@@ -2720,12 +2736,210 @@ def _parse_id_and_reason(argv: tuple[str, ...] | list[str], command_name: str) -
     return task_id, reason
 
 
+def _parse_id_and_reason_cascade(
+    argv: tuple[str, ...] | list[str],
+    command_name: str,
+    reason_required: bool,
+) -> tuple[str, str, bool] | int:
+    """Parse ``<id> [--reason <message>] [--cascade]`` for hold/unhold/decline cascade variants.
+
+    Args:
+        argv: Raw CLI tokens.
+        command_name: Human-readable command name for error messages.
+        reason_required: When ``True``, ``--reason`` is mandatory and its
+            absence returns rc=1.  Pass ``False`` for commands like
+            ``unhold`` where reason is accepted but not enforced.
+
+    Returns:
+        ``(task_id, reason, cascade)`` on success, or an integer exit code
+        on parse error (message already written to stderr).
+    """
+    task_id = ""
+    reason = ""
+    cascade = False
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--cascade":
+            cascade = True
+            i += 1
+            continue
+        if arg == "--reason":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --reason requires a value", file=sys.stderr)
+                return 1
+            reason = args[i + 1]
+            i += 2
+            continue
+        if not task_id:
+            task_id = arg
+        i += 1
+    if not task_id:
+        print(f"ERROR: {command_name} requires <id> [--reason <message>]", file=sys.stderr)
+        return 1
+    if reason_required and not reason:
+        print(f"ERROR: {command_name} requires <id> --reason <message>", file=sys.stderr)
+        return 1
+    if reason:
+        em_dash_rc = _reject_em_dash("reason", reason)
+        if em_dash_rc is not None:
+            return em_dash_rc
+    return task_id, reason, cascade
+
+
+# ---------------------------------------------------------------------------
+# Shared cascade traversal engine (issue #245)
+# ---------------------------------------------------------------------------
+
+#: Statuses ineligible for ``hold``: already held or terminal.
+_HOLD_INELIGIBLE: frozenset[WorkUnitStatus] = frozenset(
+    {WorkUnitStatus.HOLD, WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+)
+
+#: Statuses ineligible for ``decline``: already terminal.
+_DECLINE_INELIGIBLE: frozenset[WorkUnitStatus] = frozenset({WorkUnitStatus.DONE, WorkUnitStatus.DECLINED})
+
+#: Statuses ineligible for ``unhold``: all statuses except hold.
+#: (unhold eligibility = IS hold; ineligible = is NOT hold)
+
+
+def _cascade_depth_key(unit_id: str) -> int:
+    """Return the depth of a work-unit ID as a non-negative integer.
+
+    Depth equals the number of hyphens, so Tasks (deepest) have the
+    highest depth value.  Used for descending-depth sort so Tasks are
+    processed before Stories, Stories before Features, Features before Epics.
+
+    Args:
+        unit_id: A canonical work-unit ID such as ``E3-F1-S1-T1``.
+
+    Returns:
+        Number of hyphen-separated segments minus one (0 for an Epic with
+        no hyphens, 3 for a Task like ``E3-F1-S1-T1``).
+    """
+    return unit_id.count("-")
+
+
+def cascade_status_mutation(
+    root_id: str,
+    op: str,
+    reason: str,
+    units: list[WorkUnit],
+    mgr: BacklogManager,
+) -> int:
+    """Apply a status mutation to all descendants of ``root_id`` in depth-desc order.
+
+    Traversal visits descendants sorted by depth descending (Tasks first,
+    then Stories, then Features, then the root Epic itself) using
+    :func:`~devbench.scope._expand_prefix` for discovery.  The root unit
+    itself is also mutated.
+
+    For each descendant, eligibility is evaluated:
+
+    - ``hold``: ineligible when current status is ``hold``, ``done``, or
+      ``declined``.
+    - ``unhold``: ineligible when current status is anything other than
+      ``hold``.
+    - ``decline``: ineligible when current status is ``done`` or
+      ``declined``.
+    - ``set-status:<target>``: ineligible when current status is ``done``
+      or ``declined``.
+
+    Ineligible descendants receive a SKIP line on stdout:
+    ``SKIP <id>: <current-status> not eligible for <op>``.
+
+    Eligible descendants are mutated via the appropriate ``BacklogManager``
+    method.  The audit reason passed to each mutator is prefixed with
+    ``[CASCADE_FROM <root_id>]`` so the per-WU comment reads:
+    ``[<OP>] [CASCADE_FROM <root_id>] <reason>`` (spec Section 2 G6,
+    Section 5).
+
+    Args:
+        root_id: The ancestor scope to expand (e.g. ``E3``).
+        op: One of ``"hold"``, ``"unhold"``, ``"decline"``, or
+            ``"set-status:<target_status>"``.
+        reason: Human-readable rationale appended to each audit comment.
+        units: All work units from the parsed index.
+        mgr: :class:`~devbench.backlog.manager.BacklogManager` instance.
+
+    Returns:
+        0 on success (even when some descendants are skipped).  1 when
+        the root ID is not found in the index or a descendant file cannot
+        be resolved.
+
+    Raises:
+        Nothing -- all errors are reported to stderr and return rc=1.
+    """
+    all_ids = [u.id for u in units]
+    descendant_ids = _expand_prefix(root_id, all_ids)
+    if not descendant_ids:
+        print(f"ERROR: Work unit '{root_id}' not found", file=sys.stderr)
+        return 1
+
+    units_by_id = {u.id: u for u in units}
+
+    # Sort depth-descending: Tasks (most hyphens) first, Epics last.
+    sorted_ids = sorted(descendant_ids, key=_cascade_depth_key, reverse=True)
+
+    cascade_reason = f"[CASCADE_FROM {root_id}] {reason}"
+
+    for unit_id in sorted_ids:
+        unit = units_by_id[unit_id]
+        current_status = unit.status.value.lower().replace(" ", "-")
+
+        # Evaluate eligibility for the requested operation.
+        if op == "hold":
+            eligible = unit.status not in _HOLD_INELIGIBLE
+        elif op == "unhold":
+            eligible = unit.status is WorkUnitStatus.HOLD
+        elif op == "decline":
+            eligible = unit.status not in _DECLINE_INELIGIBLE
+        else:
+            # set-status:<target>: skip terminal descendants.
+            eligible = unit.status not in _DECLINE_INELIGIBLE
+
+        if not eligible:
+            print(f"SKIP {unit_id}: {current_status} not eligible for {op}")
+            continue
+
+        wu_file = _resolve_unit_file(unit)
+        if wu_file is None:
+            print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+            return 1
+
+        if op == "hold":
+            mgr.mark_held(wu_file, BACKLOG_INDEX, unit_id, cascade_reason)
+            logger.info("Cascade held %s from %s: %s", unit_id, root_id, reason)
+        elif op == "unhold":
+            mgr.unmark_held(wu_file, BACKLOG_INDEX, unit_id, cascade_reason)
+            logger.info("Cascade unheld %s from %s: %s", unit_id, root_id, reason)
+        elif op == "decline":
+            mgr.mark_declined(wu_file, BACKLOG_INDEX, unit_id, cascade_reason)
+            logger.info("Cascade declined %s from %s: %s", unit_id, root_id, reason)
+        else:
+            # set-status:<target>
+            target_status = op[len("set-status:") :]
+            mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, target_status)
+            mgr._append_agent_comment(
+                wu_file,
+                "backlog_manager",
+                f"[SET-STATUS:{target_status}] [CASCADE_FROM {root_id}] {reason}",
+            )
+            logger.info("Cascade set-status %s -> %s from %s", unit_id, target_status, root_id)
+
+    return 0
+
+
 def cmd_hold(*argv: str) -> int:
     """Mark a work unit as ``hold`` (deferred / under debate).
 
     Usage::
 
-        hold <id> --reason "<message>"
+        hold <id> --reason "<message>" [--cascade]
 
     ``hold`` is a deferred-decision lifecycle status: the unit stops
     being considered actionable by the orchestrator's ``next`` query
@@ -2734,14 +2948,23 @@ def cmd_hold(*argv: str) -> int:
     does NOT count toward a parent's auto-rollup to ``done``. The
     ``--reason`` is REQUIRED so the deferral leaves an audit trail;
     em-dashes are rejected at the input boundary for backlog hygiene.
+
+    When ``--cascade`` is supplied, all eligible descendants of ``<id>``
+    are also held in depth-desc order (Tasks first, then Stories, then
+    Features, then the root itself).  Descendants already in ``hold``,
+    ``done``, or ``declined`` are skipped with a SKIP line on stdout.
     """
-    parsed = _parse_id_and_reason(argv, "hold")
+    parsed = _parse_id_and_reason_cascade(argv, "hold", reason_required=True)
     if isinstance(parsed, int):
         return parsed
-    task_id, reason = parsed
+    task_id, reason, cascade = parsed
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
+
+    if cascade:
+        return cascade_status_mutation(task_id, "hold", reason, units, BacklogManager())
+
     target = _find_unit(units, task_id)
     if target is None:
         print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
@@ -2757,25 +2980,19 @@ def cmd_hold(*argv: str) -> int:
     return 0
 
 
-def cmd_unhold(*argv: str) -> int:
-    """Return a held work unit to ``in-queue`` with a captured rationale.
+def _cmd_unhold_single(task_id: str, reason: str) -> int:
+    """Unhold a single work unit by ID.
 
-    Usage::
+    Args:
+        task_id: The work-unit identifier.
+        reason: Human-readable rationale for the release.
 
-        unhold <id> --reason "<message>"
+    Returns:
+        0 on success, 1 on any error.
 
-    The unit's status flips from ``hold`` back to ``in-queue`` so the
-    orchestrator's ``next``/parallel-candidate scan picks it up again.
-    The ``--reason`` is REQUIRED so the release leaves an audit trail;
-    em-dashes are rejected at the input boundary. ``unhold`` refuses
-    units whose current status is anything other than ``hold`` --
-    fail-fast keeps the lifecycle linear.
+    Raises:
+        Nothing -- all errors reported to stderr and return rc=1.
     """
-    parsed = _parse_id_and_reason(argv, "unhold")
-    if isinstance(parsed, int):
-        return parsed
-    task_id, reason = parsed
-
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     target = _find_unit(units, task_id)
@@ -2792,11 +3009,46 @@ def cmd_unhold(*argv: str) -> int:
     if wu_file is None:
         print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
         return 1
-
     BacklogManager().unmark_held(wu_file, BACKLOG_INDEX, task_id, reason)
     logger.info("Unheld %s: %s", task_id, reason)
     print(json.dumps({"task_id": task_id, "status": "in-queue", "reason": reason}))
     return 0
+
+
+def cmd_unhold(*argv: str) -> int:
+    """Return a held work unit to ``in-queue`` with a captured rationale.
+
+    Usage::
+
+        unhold <id> --reason "<message>" [--cascade]
+
+    The unit's status flips from ``hold`` back to ``in-queue`` so the
+    orchestrator's ``next``/parallel-candidate scan picks it up again.
+    The ``--reason`` is REQUIRED so the release leaves an audit trail;
+    em-dashes are rejected at the input boundary. ``unhold`` refuses
+    units whose current status is anything other than ``hold`` --
+    fail-fast keeps the lifecycle linear.
+
+    When ``--cascade`` is supplied, all descendants currently in ``hold``
+    are returned to ``in-queue`` in depth-desc order.  Descendants not
+    in ``hold`` are skipped with a SKIP line on stdout.
+    """
+    parsed = _parse_id_and_reason_cascade(argv, "unhold", reason_required=False)
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason, cascade = parsed
+
+    # Non-cascade path requires --reason (existing behaviour preserved).
+    if not cascade and not reason:
+        print("ERROR: unhold requires <id> --reason <message>", file=sys.stderr)
+        return 1
+
+    if cascade:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+        return cascade_status_mutation(task_id, "unhold", reason, units, BacklogManager())
+
+    return _cmd_unhold_single(task_id, reason)
 
 
 def cmd_promote(*argv: str) -> int:

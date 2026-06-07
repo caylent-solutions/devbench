@@ -93,7 +93,13 @@ Process the backlog using the steps below, repeating until all work units are do
     c. If the proposal JSON exists: invoke `devbench-orchestrate:task-factory` with the same source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
     d. After task-factory returns: log a blocker comment on the source task summarising the N proposed tasks created, then return to step 2. The source task remains `blocked` until the operator reviews and promotes the proposed tasks (via `uv run devbench promote-proposal <id>`) and they complete; promotion automatically wires the source task's dependencies so the orchestrator picks the source task back up only after the fixes land.
 
-5. Invoke `review-supervisor` with the unit ID.
+5. Invoke `review-supervisor` with the unit ID. Before invoking, generate a per-round token
+   and inject it as `DEVBENCH_REVIEW_ROUND_TOKEN` into the sub-agent environment (H3 guard
+   requirement). The token value is an opaque string unique to this review round; use a UUID
+   or the combination of the unit ID and a monotonic counter. The guard-verdict-format.sh hook
+   requires this token to be set for any canonical reviewer verdict (code_review, test_review,
+   doc_review, changes_manifest, security_review); a canonical verdict emitted without the token
+   is blocked at the hook level, preventing rogue sub-agents from writing review-team verdicts.
    - If result is REVIEW_FAIL: go to step 6.
    - If result is REVIEW_PASS: go to step 7.
 
@@ -105,7 +111,10 @@ Process the backlog using the steps below, repeating until all work units are do
 
 7. On review team REVIEW_PASS:
    - **CRITICAL (issue #128)**: REVIEW_PASS is a terminal signal. After ALL judges return REVIEW_PASS, branch SOLELY on pass-vs-fail -- do NOT inspect verdict bodies, summary text, findings, or comments looking for improvement opportunities. Informational content in PASS verdicts (MEDIUM severity notes, refactor suggestions, "consider also..." remarks) MUST NOT trigger additional executor work cycles. The executor is invoked only when a judge returns REVIEW_FAIL (step 6). Surfacing informational PASS-verdict content in the PR description or a comment is fine; re-running the executor against PASS-verdict content is a violation of this rule and will be regression-tested in `tests/test_integration/test_executor_review_pass_terminality.py`.
-   - Invoke `devbench-orchestrate:security-reviewer` with the unit ID.
+   - Invoke `devbench-orchestrate:security-reviewer` with the unit ID. Inject the same
+     `DEVBENCH_REVIEW_ROUND_TOKEN` that was used in step 5 (same review round) into the
+     security-reviewer sub-agent environment. The guard-verdict-format.sh hook requires the
+     token for the security_review canonical judge name.
    - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
    - If security FAIL: log a blocker comment and return to step 2.
 

@@ -10,14 +10,19 @@
 #   - verdict must be 'pass' or 'fail'
 #   - judge name must be a known identifier
 #   - feedback must be non-empty when verdict is 'fail'
+#   - canonical reviewer judges require agent_type to be one of the two allowed
+#     reviewer agent types: devbench-orchestrate:review-supervisor or
+#     devbench-orchestrate:security-reviewer (default-deny H3)
+#   - canonical reviewer judges also require DEVBENCH_REVIEW_ROUND_TOKEN to be
+#     set and non-empty, even for the allowed reviewer agent types (H3)
 #
 # Passthroughs (exit 0 without validating):
-#   - any '--help' / '-h' anywhere after 'log-verdict' → let the CLI print help
+#   - any '--help' / '-h' anywhere after 'log-verdict' -- let the CLI print help
 #   - shell meta-tokens (|, >, 2>&1, etc.) end the positional-arg window so
 #     redirections and pipes are not mistaken for judge/unit_id/verdict args
 #
-# Exit 0  → allowed (Claude proceeds)
-# Exit 2  → blocked (stderr becomes Claude's feedback)
+# Exit 0  -- allowed (Claude proceeds)
+# Exit 2  -- blocked (stderr becomes Claude's feedback)
 
 set -euo pipefail
 
@@ -35,9 +40,9 @@ KNOWN_JUDGES=(
 
 # Canonical reviewer judges -- only these 5 names satisfy the done-gate
 # in BacklogManager._last_round_all_passed. Mirrors REVIEW_JUDGE_NAMES |
-# SECURITY_JUDGE_NAMES in src/devbench/constants.py. Used to scope the
-# executor restriction below (the executor is an authoring agent, not a
-# reviewer; it must not write canonical reviewer verdicts).
+# SECURITY_JUDGE_NAMES in src/devbench/constants.py. Only the two designated
+# reviewer agent types (review-supervisor, security-reviewer) may write these
+# verdicts, and only when DEVBENCH_REVIEW_ROUND_TOKEN is set (H3 default-deny).
 CANONICAL_REVIEWER_JUDGES=(
   "code_review"
   "test_review"
@@ -193,26 +198,61 @@ if [[ "$VERDICT_LOWER" == "fail" && -z "${FEEDBACK// /}" ]]; then
   exit 2
 fi
 
-# --- Scope: executor must not write canonical reviewer verdicts ---
-# The executor is an authoring agent, not a reviewer. Review-team
-# verdicts (code_review, test_review, doc_review, changes_manifest,
-# security_review) are written by review-supervisor and
-# security-reviewer; the executor self-attesting them confuses the
-# audit trail and risks racing the actual reviewers' verdicts in the
-# done-gate's "most recent round" bookkeeping. The audit-only
-# ``executor`` judge name remains allowed (logs progress + signals
-# completion) -- the restriction is specifically about the executor
-# claiming to BE a reviewer.
-if [[ "$AGENT_TYPE" == "devbench-orchestrate:executor" ]]; then
-  for canonical in "${CANONICAL_REVIEWER_JUDGES[@]}"; do
-    if [[ "$JUDGE" == "$canonical" ]]; then
-      echo "guard-verdict-format: BLOCKED -- the executor agent must not write canonical reviewer verdicts." >&2
-      echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
-      echo "Reason: review-team verdicts belong to review-supervisor / security-reviewer." >&2
-      echo "Fix: write a 'log-comment' for narrative status, or a 'log-verdict executor <id> <pass|fail> <feedback>' for audit-only progress (the 'executor' judge is on the allowlist but does NOT satisfy the done-gate)." >&2
-      exit 2
+# --- Default-deny: canonical reviewer judges require an allowed reviewer agent type ---
+# H3: The five canonical review-team judges (code_review, test_review, doc_review,
+# changes_manifest, security_review) may ONLY be written by the two designated
+# reviewer agent types:
+#   - devbench-orchestrate:review-supervisor
+#   - devbench-orchestrate:security-reviewer
+# Every other agent type -- including the executor, manifest-amender, and any
+# absent or spoofed agent_type -- is blocked from canonical verdicts. The
+# audit-only non-canonical judge names (executor, blocker_resolver,
+# manifest_amender, task_factory) remain available to any agent type.
+#
+# H3 also requires the per-round DEVBENCH_REVIEW_ROUND_TOKEN env var to be
+# set and non-empty for a canonical verdict. A spoofed agent_type alone is
+# insufficient -- the injected token provides a second factor that a rogue
+# subagent cannot forge without the orchestrator's cooperation.
+IS_CANONICAL_JUDGE=0
+for canonical in "${CANONICAL_REVIEWER_JUDGES[@]}"; do
+  if [[ "$JUDGE" == "$canonical" ]]; then
+    IS_CANONICAL_JUDGE=1
+    break
+  fi
+done
+
+if (( IS_CANONICAL_JUDGE == 1 )); then
+  # Check agent_type is an allowed reviewer.
+  ALLOWED_REVIEWER_AGENT_TYPES=(
+    "devbench-orchestrate:review-supervisor"
+    "devbench-orchestrate:security-reviewer"
+  )
+  IS_ALLOWED_REVIEWER=0
+  for allowed in "${ALLOWED_REVIEWER_AGENT_TYPES[@]}"; do
+    if [[ "$AGENT_TYPE" == "$allowed" ]]; then
+      IS_ALLOWED_REVIEWER=1
+      break
     fi
   done
+
+  if (( IS_ALLOWED_REVIEWER == 0 )); then
+    echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires an allowed reviewer agent type." >&2
+    echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
+    echo "Agent type presented: '${AGENT_TYPE:-<absent>}'." >&2
+    echo "Allowed agent types for canonical verdicts: devbench-orchestrate:review-supervisor, devbench-orchestrate:security-reviewer." >&2
+    echo "Fix: only the review-supervisor and security-reviewer agents may write canonical reviewer verdicts." >&2
+    exit 2
+  fi
+
+  # Check the per-round token is set and non-empty.
+  if [[ -z "${DEVBENCH_REVIEW_ROUND_TOKEN:-}" ]]; then
+    echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires DEVBENCH_REVIEW_ROUND_TOKEN to be set." >&2
+    echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
+    echo "Agent type: '${AGENT_TYPE}'." >&2
+    echo "Reason: the orchestrator injects DEVBENCH_REVIEW_ROUND_TOKEN into reviewer sub-agents each round; its absence indicates the verdict is not originating from an orchestrated review round." >&2
+    echo "Fix: ensure the orchestrate skill injects DEVBENCH_REVIEW_ROUND_TOKEN before invoking the reviewer sub-agent." >&2
+    exit 2
+  fi
 fi
 
 exit 0

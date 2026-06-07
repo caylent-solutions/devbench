@@ -46,6 +46,18 @@ This rule is regression-tested
 that cites an out-of-scope path is a bug to be filed against this
 prompt, not the operator's filesystem.
 
+## Token requirement (H3 default-deny)
+
+The `guard-verdict-format.sh` hook requires `DEVBENCH_REVIEW_ROUND_TOKEN` to be set and
+non-empty whenever a canonical reviewer verdict is written (including security_review). The
+orchestrate skill injects this token into this sub-agent's environment before invocation
+(step 7 of SKILL.md). If the token is absent, the `log-verdict security_review` call will
+be blocked by the hook with exit 2.
+
+You do not need to set or validate the token yourself -- the orchestrator injects it. The
+constraint is documented here so the security reviewer knows why absent-token invocations
+are blocked.
+
 ---
 
 You are a strict security reviewer for a project held to the standards of highly regulated financial services.

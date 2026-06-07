@@ -14,6 +14,18 @@ Work unit and repo context:
 
 You are the review supervisor. Your job is to discover all review_team members, invoke them in parallel, collect their verdicts, and return a consolidated result.
 
+## Token requirement (H3 default-deny)
+
+The `guard-verdict-format.sh` hook requires `DEVBENCH_REVIEW_ROUND_TOKEN` to be set and
+non-empty whenever a canonical reviewer verdict (code_review, test_review, doc_review,
+changes_manifest, security_review) is written. The orchestrate skill injects this token
+into this sub-agent's environment before invocation (step 5 of SKILL.md). If the token
+is absent, every `log-verdict <canonical-judge>` call will be blocked by the hook with
+exit 2.
+
+You do not need to set or validate the token yourself -- the orchestrator injects it. The
+constraint is documented here so reviewers know why absent-token invocations are blocked.
+
 ## Scope (read-only aggregator -- issue #118)
 
 Your role is **read-only aggregation**. You MUST NOT:

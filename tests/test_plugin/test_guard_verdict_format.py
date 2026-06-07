@@ -19,26 +19,51 @@ HOOK_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 ).resolve()
 
+# H3: reviewer agent type and round token needed for canonical verdicts.
+_REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
+_ROUND_TOKEN = "test-round-token"
+
 
 def _clean_env() -> dict[str, str]:
     """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
 
     _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
     _hook_lib.sh must not inherit those vars from the pytest process environment.
+    Also strips DEVBENCH_REVIEW_ROUND_TOKEN so tests that omit it start clean.
     """
-    return {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_REVIEW_ROUND_TOKEN")
+    }
 
 
-def _run(command: str) -> subprocess.CompletedProcess[str]:
-    """Invoke the hook with a crafted Bash tool-input command string."""
-    stdin = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+def _run(
+    command: str,
+    agent_type: str | None = None,
+    round_token: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the hook with a crafted Bash tool-input command string.
+
+    Args:
+        command: The bash command string to embed in the hook payload.
+        agent_type: When set, adds agent_type field to the JSON payload.
+        round_token: When set, injects DEVBENCH_REVIEW_ROUND_TOKEN env var.
+    """
+    payload: dict[str, object] = {"tool_name": "Bash", "tool_input": {"command": command}}
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+    env = _clean_env()
+    if round_token is not None:
+        env["DEVBENCH_REVIEW_ROUND_TOKEN"] = round_token
+    stdin = json.dumps(payload)
     return subprocess.run(
         ["bash", str(HOOK_PATH)],
         input=stdin,
         capture_output=True,
         text=True,
         check=False,
-        env=_clean_env(),
+        env=env,
     )
 
 
@@ -92,12 +117,22 @@ class TestGuardVerdictFormat:
         assert "feedback is required" in result.stderr
 
     def test_happy_path_pass_allows(self) -> None:
-        result = _run('uv run devbench log-verdict code_review E0-F8 pass "all good"')
+        """Reviewer agent with round token writing a canonical pass verdict is allowed (H3)."""
+        result = _run(
+            'uv run devbench log-verdict code_review E0-F8 pass "all good"',
+            agent_type=_REVIEWER_AGENT_TYPE,
+            round_token=_ROUND_TOKEN,
+        )
         assert result.returncode == 0
         assert result.stderr == ""
 
     def test_happy_path_fail_with_feedback_allows(self) -> None:
-        result = _run('uv run devbench log-verdict code_review E0-F8 fail "one issue"')
+        """Reviewer agent with round token writing a canonical fail verdict with feedback is allowed (H3)."""
+        result = _run(
+            'uv run devbench log-verdict code_review E0-F8 fail "one issue"',
+            agent_type=_REVIEWER_AGENT_TYPE,
+            round_token=_ROUND_TOKEN,
+        )
         assert result.returncode == 0
         assert result.stderr == ""
 

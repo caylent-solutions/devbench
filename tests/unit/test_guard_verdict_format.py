@@ -13,33 +13,59 @@ SCRIPT_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 )
 
+# H3: the two agent types permitted to write canonical reviewer verdicts.
+_REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
+# A token value injected by the orchestrator each review round (H3 second factor).
+_ROUND_TOKEN = "test-round-token"
+
 
 def _clean_env() -> dict[str, str]:
     """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
 
     _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
     _hook_lib.sh must not inherit those vars from the pytest process environment.
+    Also strips DEVBENCH_REVIEW_ROUND_TOKEN so tests that omit it start clean.
     """
-    return {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_REVIEW_ROUND_TOKEN")
+    }
 
 
-def _run_hook(payload: dict) -> subprocess.CompletedProcess:
-    """Invoke the hook script with the given JSON payload on stdin."""
+def _run_hook(payload: dict, round_token: str | None = None) -> subprocess.CompletedProcess:
+    """Invoke the hook script with the given JSON payload on stdin.
+
+    Args:
+        payload: The JSON payload to pass on stdin.
+        round_token: When set, inject DEVBENCH_REVIEW_ROUND_TOKEN into the env.
+    """
+    env = _clean_env()
+    if round_token is not None:
+        env["DEVBENCH_REVIEW_ROUND_TOKEN"] = round_token
     return subprocess.run(
         ["bash", str(SCRIPT_PATH)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
-        env=_clean_env(),
+        env=env,
     )
 
 
-def _make_payload(command: str) -> dict:
-    """Build a minimal PreToolUse Bash hook payload."""
-    return {
+def _make_payload(command: str, agent_type: str | None = None) -> dict:
+    """Build a minimal PreToolUse Bash hook payload.
+
+    Args:
+        command: The bash command string.
+        agent_type: When provided, adds the agent_type field to the payload.
+    """
+    payload: dict = {
         "tool_name": "Bash",
         "tool_input": {"command": command},
     }
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+    return payload
 
 
 @pytest.mark.unit
@@ -106,15 +132,29 @@ class TestGuardVerdictFormatHook:
             "test_review",
             "doc_review",
             "changes_manifest",
-            "executor",
             "security_review",
+        ],
+    )
+    def test_canonical_judge_names_accepted_for_reviewer_with_token(self, judge_name: str) -> None:
+        """AC-2/H3: Canonical reviewer judge identifiers are accepted for reviewer agent with round token."""
+        payload = _make_payload(
+            f"uv run devbench log-verdict {judge_name} E201-F1-S2-T1 pass",
+            agent_type=_REVIEWER_AGENT_TYPE,
+        )
+        result = _run_hook(payload, round_token=_ROUND_TOKEN)
+        assert result.returncode == 0, f"judge '{judge_name}' was incorrectly rejected: {result.stderr}"
+
+    @pytest.mark.parametrize(
+        "judge_name",
+        [
+            "executor",
             "blocker_resolver",
             "manifest_amender",
             "task_factory",
         ],
     )
-    def test_known_judge_names_are_accepted(self, judge_name: str) -> None:
-        """AC-2: All known judge identifiers are accepted."""
+    def test_non_canonical_judge_names_accepted_without_agent_type(self, judge_name: str) -> None:
+        """AC-2: Non-canonical (audit-only) judge identifiers are accepted without an agent type."""
         payload = _make_payload(f"uv run devbench log-verdict {judge_name} E201-F1-S2-T1 pass")
         result = _run_hook(payload)
         assert result.returncode == 0, f"judge '{judge_name}' was incorrectly rejected: {result.stderr}"

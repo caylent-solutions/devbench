@@ -24,6 +24,18 @@ Optional: `--config <path>` (or `DEVBENCH_CONFIG_PATH` env var) overrides the de
 
 Commands that run a blocking external process (git, tests, judges) propagate the process exit code through, subject to the 0/1/2 contract above.
 
+### Devbench-specific exit codes
+
+The following non-zero codes are reserved for specific orchestrator states and MUST NOT be confused with each other by the wrapping `make start` loop:
+
+| rc | Constant | Command | Meaning |
+|----|----------|---------|---------|
+| 42 | `ORCHESTRATOR_RESTART_EXIT_CODE` | `start` | Auto-restart signal: the SDK exited via `NO_ACTIONABLE` with only `RUNTIME_DEGRADATION` blockers. The wrapping loop restarts up to `DEVBENCH_MAX_AUTO_RESTARTS` times. |
+| 43 | `ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE` | `start` | Continuation budget exhausted: the in-session resume loop issued `DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS` consecutive non-terminal continuations without progress. Logged as `[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]`. Distinct from rc=42 so the wrapping loop never misclassifies fail-fast as auto-restart. |
+| 44 | `CLAIM_BLOCKED_PRECLAIM` | `claim` | Target repo unresolvable: the repo declared in the work-unit file is unknown. Work unit is set to `blocked` with a `[BLOCKED_TARGET_REPO_UNRESOLVED]` marker. |
+| 45 | `GET_DIFF_NO_ATTRIBUTABLE` | `get-diff` | No task-attributed commit found in defer-PR mode: staged and unstaged changes are both empty and no commit matches the work-unit ID. |
+| 127 | `SUBPROCESS_ERROR_EXIT_CODE` | various | Subprocess command not found or timed out (Unix convention). |
+
 ## Contents
 
 - [Backlog read](#backlog-read)

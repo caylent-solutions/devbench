@@ -174,6 +174,7 @@ from devbench.constants import (
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
@@ -182,6 +183,8 @@ from devbench.constants import (
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX,
+    ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -7282,6 +7285,25 @@ async def _handle_result_message(message: object, client: Any) -> bool:
     return True
 
 
+def _resolve_max_turn_end_continuations() -> int:
+    """Return the effective continuation-budget cap (env > default).
+
+    Reads ``DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS`` from the
+    process environment.  When the variable is absent or empty the constant
+    ``DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS`` is returned so the
+    caller is never left without a bound (unset-safe, Issue #262 E10-F1-S3).
+
+    Returns:
+        The maximum number of consecutive non-terminal ResultMessage
+        continuations ``_run`` will issue before aborting with
+        ``ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE``.
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "").strip()
+    if raw:
+        return int(raw)
+    return DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS
+
+
 def _label_stop_reason(exc: BaseException) -> str:
     """Return a human-readable label for the orchestrator's exit (#213).
 
@@ -7730,6 +7752,11 @@ def cmd_start(*argv: str) -> int:
     # legacy bare ``"clean"`` that hid whether the backlog was finished.
     _sdk_result_text: str | None = None
 
+    # Issue #262 (E10-F1-S3): set to True by ``_run`` when the per-stall
+    # continuation counter exhausts its budget so the outer handler can
+    # return the distinct exit code without raising an exception.
+    _continuation_exhausted: bool = False
+
     async def _run() -> None:
         """Drive a stateful ClaudeSDKClient session with drain enforcement.
 
@@ -7739,6 +7766,14 @@ def cmd_start(*argv: str) -> int:
         which either logs the terminal exit (breaking out) or issues an
         in-session continuation query (keeping the same session alive).
 
+        A per-stall counter ``stall_count`` increments on every non-terminal
+        ResultMessage and resets to zero on any non-ResultMessage (tool-call
+        or genuine progress).  When ``stall_count`` reaches the cap resolved
+        by :func:`_resolve_max_turn_end_continuations`, ``_run`` logs
+        ``ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX`` and
+        returns, signalling the outer handler via ``_continuation_exhausted``
+        (Issue #262 E10-F1-S3).
+
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
         Raises:
@@ -7746,14 +7781,16 @@ def cmd_start(*argv: str) -> int:
                 tool-use is observed.
             _QuotaDetected: A quota error is detected in the SDK message stream.
         """
-        nonlocal _sdk_result_text
+        nonlocal _sdk_result_text, _continuation_exhausted
         options = ClaudeAgentOptions(
             plugins=[{"type": "local", "path": str(plugin_path)}],
             permission_mode="bypassPermissions",
         )
         _orchestrate_prompt = "Run the devbench-orchestrate:orchestrate skill to process the backlog until complete"
+        _continuation_budget = _resolve_max_turn_end_continuations()
         async with ClaudeSDKClient(options=options) as client:
             await client.query(_orchestrate_prompt)
+            stall_count: int = 0
             while True:
                 async for message in client.receive_response():
                     logger.info("sdk message: %s", message)
@@ -7762,11 +7799,19 @@ def cmd_start(*argv: str) -> int:
                     # carries result text; break immediately to avoid re-invoking.
                     if _log_terminal_exit_if_applicable(_sdk_result_text):
                         return
-                    # Issue #262 (E10-F1-S2): handle ResultMessage turn boundary.
-                    # Delegates to _handle_result_message; terminal case already
-                    # returned above, so True here means continuation was issued.
+                    # Issue #262 (E10-F1-S2 + E10-F1-S3): handle ResultMessage
+                    # turn boundary.  True means a non-terminal continuation was
+                    # issued; increment the stall counter and enforce the budget.
+                    # Falls through (no break) when False, meaning a non-ResultMessage
+                    # (genuine tool-call / progress) was received: reset the counter.
                     if await _handle_result_message(message, client):
+                        stall_count += 1
+                        if stall_count >= _continuation_budget:
+                            logger.info(ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX)
+                            _continuation_exhausted = True
+                            return
                         break
+                    stall_count = 0
                     # Issue #236: per-message quota detection (AC-236-1). Check
                     # before the drain-on-claim path so a quota hit is not masked
                     # by an unrelated claim check.
@@ -7828,16 +7873,17 @@ def cmd_start(*argv: str) -> int:
         # operator inspection.
         ScopeFilter.clear(WORKSPACE_ROOT)
 
-        # Issue #217: bubble the SDK's final ResultMessage text into the
-        # Slack reason so ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` and
-        # similar end-of-run summaries reach the operator.  Without this,
-        # the reason stayed at the literal ``"clean"`` initial value,
-        # masking whether the backlog actually finished or just ran out of
-        # actionable work mid-cascade.  Ternary form (rather than an
-        # ``if`` block) keeps the branch count under ruff's PLR0912 cap.
-        _stop_reason = f"clean exit: {_sdk_result_text}" if _sdk_result_text else _stop_reason
-
-        restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
+        # Issue #262 (E10-F1-S3): fail-fast on continuation-budget exhaustion.
+        # Issue #217: bubble the SDK's final ResultMessage text into the Slack reason.
+        # Both branches produce a ``(rc, stop_reason)`` tuple so the always-fire
+        # notification receives the correct label regardless of which path ran.
+        # Ternary form keeps cmd_start's return-statement count under PLR0911's cap.
+        if _continuation_exhausted:
+            _stop_reason = "continuation budget exhausted"
+            restart_rc = ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
+        else:
+            _stop_reason = f"clean exit: {_sdk_result_text}" if _sdk_result_text else _stop_reason
+            restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
         return restart_rc
     except BaseException as exc:
         # Capture the exit reason for the always-fire notification before

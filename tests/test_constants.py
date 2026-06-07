@@ -593,3 +593,94 @@ class TestQuotaHandlingConstants:
         assert QUOTA_HANDLING_DEFAULT_ENABLED is True, (
             "QUOTA_HANDLING_DEFAULT_ENABLED must be True so quota wait-and-resume is active by default (issue #234)"
         )
+
+
+class TestContinuationBudgetConstants:
+    """Issue #262 (E10-F1-S3): bounded continuation budget constants.
+
+    AC-1: DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS is an int with a
+          positive unset-safe default value.
+    AC-2: ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX is the
+          verbatim audit string.
+    AC-2: ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE is a
+          distinct non-zero int differing from ORCHESTRATOR_RESTART_EXIT_CODE.
+    """
+
+    @pytest.mark.unit
+    def test_default_max_turn_end_continuations_is_importable(self) -> None:
+        """DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS is importable from devbench.constants."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS")
+
+    @pytest.mark.unit
+    def test_default_max_turn_end_continuations_is_positive_int(self) -> None:
+        """DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS is a positive int."""
+        from devbench.constants import DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS
+
+        assert isinstance(DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS, int)
+        assert DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS > 0
+
+    @pytest.mark.unit
+    def test_exhausted_audit_prefix_is_importable(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX is importable."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX")
+
+    @pytest.mark.unit
+    def test_exhausted_audit_prefix_is_verbatim_string(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX equals the verbatim audit tag."""
+        from devbench.constants import ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX
+
+        assert ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX == (
+            "[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]"
+        )
+
+    @pytest.mark.unit
+    def test_exhausted_exit_code_is_importable(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE is importable."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE")
+
+    @pytest.mark.unit
+    def test_exhausted_exit_code_is_nonzero_int(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE is a non-zero int."""
+        from devbench.constants import ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
+
+        assert isinstance(ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, int)
+        assert ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE != 0
+
+    @pytest.mark.unit
+    def test_exhausted_exit_code_differs_from_restart_exit_code(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE must differ from ORCHESTRATOR_RESTART_EXIT_CODE."""
+        from devbench.constants import (
+            ORCHESTRATOR_RESTART_EXIT_CODE,
+            ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+        )
+
+        assert ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE != ORCHESTRATOR_RESTART_EXIT_CODE, (
+            "Exhaustion exit code must differ from auto-restart exit code so the wrapping loop "
+            "never misclassifies fail-fast as auto-restart"
+        )
+
+    @pytest.mark.unit
+    def test_exhausted_exit_code_differs_from_claim_blocked_preclaim(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE must differ from CLAIM_BLOCKED_PRECLAIM."""
+        from devbench.constants import (
+            CLAIM_BLOCKED_PRECLAIM,
+            ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+        )
+
+        assert ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE != CLAIM_BLOCKED_PRECLAIM
+
+    @pytest.mark.unit
+    def test_exhausted_exit_code_differs_from_get_diff_no_attributable(self) -> None:
+        """ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE must differ from GET_DIFF_NO_ATTRIBUTABLE."""
+        from devbench.constants import (
+            GET_DIFF_NO_ATTRIBUTABLE,
+            ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+        )
+
+        assert ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE != GET_DIFF_NO_ATTRIBUTABLE

@@ -630,6 +630,35 @@ GET_DIFF_NO_ATTRIBUTABLE: int = 45
 # reason=runtime_degradation tasks=<id1,id2,...>``.
 ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
 
+# Issue #262 (E10-F1-S3): bounded in-session continuation budget.
+#
+# ``cmd_start._run`` increments a per-stall counter each time a non-terminal
+# ResultMessage is observed and resets it to zero on any non-ResultMessage
+# (i.e. genuine tool-call / progress).  When the counter reaches this cap,
+# ``cmd_start`` logs ``ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX``
+# and exits with ``ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE``
+# rather than looping forever.
+#
+# Override via env ``DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS`` (int).
+# Unset-safe: the constant is the default when the env var is absent.
+DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS: int = 5
+
+# Verbatim audit-log prefix emitted by ``cmd_start`` when the per-stall
+# continuation counter is exhausted (spec Section 2 Goal 3, Section 7).
+# Consumed by operators and automation via ``grep`` on the orchestrator log.
+ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]"
+
+# Exit code emitted by ``cmd_start`` when the in-session continuation budget
+# is exhausted (spec Section 4 E10-F1-S3 AC-2, Section 14).  Value 43 is
+# distinct from all other devbench exit codes:
+#   42 = ORCHESTRATOR_RESTART_EXIT_CODE  (auto-restart signal)
+#   44 = CLAIM_BLOCKED_PRECLAIM          (unresolvable target repo)
+#   45 = GET_DIFF_NO_ATTRIBUTABLE        (no task-attributed commit)
+#  127 = SUBPROCESS_ERROR_EXIT_CODE      (command-not-found / timeout)
+# The wrapping ``make start`` loop must NOT treat this as an auto-restart
+# because the distinct value (43 != 42) prevents misclassification.
+ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE: int = 43
+
 # ---------------------------------------------------------------------------
 # Token arithmetic
 # ---------------------------------------------------------------------------

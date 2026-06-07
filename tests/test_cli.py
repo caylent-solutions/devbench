@@ -20443,3 +20443,311 @@ class TestCmdStartStatefulClient:
         assert "tool" in text or "devbench next" in text, (
             f"Continuation prompt must instruct a tool call; got: {ORCHESTRATOR_CONTINUATION_PROMPT!r}"
         )
+
+
+class TestContinuationBudgetExhaustion:
+    """Issue #262 (E10-F1-S3): bounded continuation budget with fail-fast on exhaustion.
+
+    AC-1: per-stall counter is bounded by DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS;
+          a successful tool-call / progress resets the counter.
+    AC-2: on exhaustion the daemon logs [ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]
+          and exits with the distinct documented non-zero exit code.
+    AC-3: tests assert the budget is honored, the audit fires, and the exit code is returned.
+    """
+
+    @staticmethod
+    def _result_msg(text: str) -> Any:
+        """Build a fake non-terminal ResultMessage."""
+
+        class _Msg:
+            result = text
+            subtype = "success"
+            num_turns = 1
+
+        return _Msg()
+
+    @staticmethod
+    def _non_result_msg() -> Any:
+        """Build a fake non-ResultMessage (e.g. AssistantMessage with tool call)."""
+
+        class _Msg:
+            pass
+
+        return _Msg()
+
+    @staticmethod
+    def _build_infinite_stall_sdk(
+        query_calls: list[str],
+        non_terminal_text: str = "orchestrator turn done -- no sentinel",
+    ) -> Any:
+        """Build a fake SDK whose receive_response always yields a non-terminal ResultMessage.
+
+        The client never emits a terminal sentinel (ALL_DONE / NO_ACTIONABLE),
+        so the continuation budget is the only mechanism that breaks the loop.
+
+        Args:
+            query_calls: Mutable list; each client.query(prompt) call appends
+                the prompt so tests can count continuation attempts.
+            non_terminal_text: The result text for every non-terminal message.
+
+        Returns:
+            A fake claude_agent_sdk module with ClaudeAgentOptions and
+            ClaudeSDKClient attributes.
+        """
+
+        class _Msg:
+            result = non_terminal_text
+            subtype = "success"
+            num_turns = 1
+
+        class _InfiniteStallClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _InfiniteStallClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                query_calls.append(prompt)
+
+            async def receive_response(self) -> Any:
+                yield _Msg()
+
+        stall_sdk: Any = types.ModuleType("claude_agent_sdk")
+        stall_sdk.ClaudeAgentOptions = MagicMock()
+        stall_sdk.ClaudeSDKClient = _InfiniteStallClient
+        return stall_sdk
+
+    @staticmethod
+    def _build_mixed_sdk(
+        sequences: list[list[Any]],
+        query_calls: list[str],
+    ) -> Any:
+        """Build a fake SDK that cycles through provided message sequences.
+
+        Args:
+            sequences: Per-receive_response call message lists.
+            query_calls: Appended to on each query() call.
+
+        Returns:
+            A fake claude_agent_sdk module.
+        """
+        call_index: list[int] = [0]
+
+        class _MixedClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _MixedClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                query_calls.append(prompt)
+
+            async def receive_response(self) -> Any:
+                idx = call_index[0]
+                call_index[0] += 1
+                msgs = sequences[idx] if idx < len(sequences) else []
+                for msg in msgs:
+                    yield msg
+
+        mixed_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mixed_sdk.ClaudeAgentOptions = MagicMock()
+        mixed_sdk.ClaudeSDKClient = _MixedClient
+        return mixed_sdk
+
+    @pytest.mark.functional
+    def test_budget_exhaustion_returns_distinct_exit_code(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-2 + AC-3: when continuation budget is exhausted the CLI returns
+        ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE and logs the audit string.
+        """
+        import logging
+        import os
+        import sys
+
+        from devbench.constants import (
+            ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+        )
+
+        query_calls: list[str] = []
+        budget = 3
+        fake_sdk = self._build_infinite_stall_sdk(query_calls)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch.dict(os.environ, {"DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS": str(budget)}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, (
+            f"Expected exit code {ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE} "
+            f"on budget exhaustion; got {rc}"
+        )
+
+    @pytest.mark.functional
+    def test_budget_exhaustion_logs_audit_string(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-2: on exhaustion the [ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED] audit fires."""
+        import logging
+        import os
+        import sys
+
+        query_calls: list[str] = []
+        budget = 2
+        fake_sdk = self._build_infinite_stall_sdk(query_calls)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch.dict(os.environ, {"DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS": str(budget)}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]" in log_text, (
+            f"Exhaustion audit string missing from log; recorded: {log_text!r}"
+        )
+
+    @pytest.mark.functional
+    def test_budget_is_honored_exactly(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-1 + AC-3: the per-stall counter honors the budget exactly.
+
+        With budget=N, exactly N continuation queries are issued (plus the
+        initial orchestrate prompt), then the loop exits.
+        """
+        import os
+        import sys
+
+        query_calls: list[str] = []
+        budget = 4
+        fake_sdk = self._build_infinite_stall_sdk(query_calls)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch.dict(os.environ, {"DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS": str(budget)}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            cli.cmd_start()
+
+        # query_calls[0] is the initial orchestrate prompt; [1..budget] are continuations.
+        assert len(query_calls) == budget + 1, (
+            f"Expected {budget + 1} total query calls (1 initial + {budget} continuations); "
+            f"got {len(query_calls)}: {query_calls}"
+        )
+
+    @pytest.mark.functional
+    def test_counter_resets_on_progress(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-1: the stall counter resets when the session makes progress (non-ResultMessage received).
+
+        Scenario: budget=2. The counter increments on each non-terminal ResultMessage
+        and resets to zero when a non-ResultMessage (progress / tool call) is observed.
+        With interleaved progress messages, more total continuations are issued than
+        the budget alone would allow in a single uninterrupted stall sequence.
+        """
+        import logging
+        import os
+        import sys
+
+        from devbench.constants import (
+            ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+        )
+
+        query_calls: list[str] = []
+        budget = 2
+
+        class _NonResultMsg:
+            pass
+
+        class _NonTerminalMsg:
+            result = "non-terminal turn"
+            subtype = "success"
+            num_turns = 1
+
+        # Sequence:
+        # Trace with budget=2:
+        #   recv #1: [non-result (reset -> stall_count=0), non-terminal (stall_count=1, 1<2)]
+        #     -> break -> issue continuation #1
+        #   recv #2: [non-result (reset -> stall_count=0), non-terminal (stall_count=1, 1<2)]
+        #     -> break -> issue continuation #2
+        #   recv #3: [non-terminal (stall_count=2, 2>=2 -> EXHAUSTED)] -> return
+        # Total: 2 continuations issued (budget=2); recv #4 is never reached.
+        sequences: list[list[Any]] = [
+            [_NonResultMsg(), _NonTerminalMsg()],
+            [_NonResultMsg(), _NonTerminalMsg()],
+            [_NonTerminalMsg()],
+            [_NonTerminalMsg()],  # safety padding; never consumed
+        ]
+
+        fake_sdk = self._build_mixed_sdk(sequences, query_calls)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch.dict(os.environ, {"DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS": str(budget)}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, f"Expected exhaustion exit code; got {rc}"
+        # With budget=2 and no progress resets, a pure stall would exhaust after
+        # budget-1=1 continuation (stall_count: 0->1 on recv#1 issues cont, then
+        # 1->2 on recv#2 exhausts -- so only 1 continuation is issued).
+        # With progress resets (interleaved non-result messages), each reset zeroes
+        # the counter, allowing a fresh stall cycle.  The sequences above yield
+        # budget=2 continuations before exhaustion -- more than the no-reset baseline.
+        continuation_count = len(query_calls) - 1  # subtract initial prompt
+        assert continuation_count >= budget, (
+            f"Counter reset should have allowed at least {budget} continuations before exhaustion "
+            f"(more than the no-reset baseline of {budget - 1}); got {continuation_count}"
+        )
+
+    @pytest.mark.functional
+    def test_default_budget_used_when_env_var_absent(self, tmp_path: Path) -> None:
+        """AC-1: when DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS is not set,
+        the default from constants.py is used (unset-safe).
+        """
+        import os
+        import sys
+
+        from devbench.constants import (
+            DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
+            ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+        )
+
+        query_calls: list[str] = []
+        fake_sdk = self._build_infinite_stall_sdk(query_calls)
+
+        env_without_budget = {
+            k: v for k, v in os.environ.items() if k != "DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS"
+        }
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.os.environ", env_without_budget),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
+        # The loop runs exactly DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS
+        # continuations plus the initial prompt.
+        assert len(query_calls) == DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS + 1, (
+            f"Expected default budget of {DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS} "
+            f"continuations + 1 initial prompt = {DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS + 1} "
+            f"total; got {len(query_calls)}"
+        )

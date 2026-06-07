@@ -7147,13 +7147,19 @@ def _extract_sdk_result_text(message: object) -> str | None:
     ping so the operator can tell at a glance whether the backlog finished
     or stalled.
 
-    Returns the ``result`` string when ``message`` is a SDK ResultMessage
-    carrying a non-empty string ``result``; ``None`` otherwise.  Duck-typed
-    so unit tests can yield bare ``object`` instances with a ``result``
-    attribute without importing the SDK.
+    Issue #262: an empty-string ``result`` is a real, explicit turn boundary
+    and must be returned as ``''`` (not ``None``) so callers can distinguish
+    "the SDK emitted a ResultMessage with an empty result" from "the message
+    carried no result attribute at all".
+
+    Returns the ``result`` string (including ``''``) when ``message`` is a
+    SDK ResultMessage carrying a string ``result``; ``None`` when the
+    attribute is absent or not a string.  Duck-typed so unit tests can yield
+    bare ``object`` instances with a ``result`` attribute without importing
+    the SDK.
     """
     candidate = getattr(message, "result", None)
-    if isinstance(candidate, str) and candidate:
+    if isinstance(candidate, str):
         return candidate
     return None
 
@@ -7181,6 +7187,23 @@ def _is_terminal_orchestrate_result(text: str | None) -> bool:
     if not text:
         return False
     return any(marker in text for marker in _TERMINAL_ORCHESTRATE_MARKERS)
+
+
+def _is_sdk_result_message(message: object) -> bool:
+    """Issue #262: True iff ``message`` looks like an SDK ``ResultMessage``.
+
+    Identification uses duck typing only -- no SDK import -- so the
+    orchestrate loop remains decoupled from the SDK class hierarchy.  A
+    ``ResultMessage`` carries a ``subtype`` attribute plus at least one of
+    ``num_turns`` or ``duration_ms``; ordinary assistant/tool messages lack
+    the turn-accounting attributes.
+
+    Returns False (never raises) when ``message`` lacks the expected
+    attribute surface so the SDK-iterator loop can keep iterating safely.
+    """
+    if not hasattr(message, "subtype"):
+        return False
+    return hasattr(message, "num_turns") or hasattr(message, "duration_ms")
 
 
 def _log_terminal_exit_if_applicable(text: str | None) -> bool:

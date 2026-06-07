@@ -17413,6 +17413,158 @@ class TestIsTerminalOrchestrateResult:
         assert _is_terminal_orchestrate_result("NO_ACT") is False
 
 
+class TestExtractSdkResultText:
+    """Issue #262: ``_extract_sdk_result_text`` must treat an empty-string
+    result as a real, explicit turn boundary (return ``''``) rather than
+    collapsing it into ``None``.  A non-empty result is returned unchanged;
+    a missing ``result`` attribute still returns ``None``.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "result_value,expected",
+        [
+            ("", ""),
+            ("ALL_DONE", "ALL_DONE"),
+            (
+                "Orchestration complete: NO_ACTIONABLE -- 5/10 done",
+                "Orchestration complete: NO_ACTIONABLE -- 5/10 done",
+            ),
+        ],
+    )
+    def test_string_result_returned_unchanged(self, result_value: str, expected: str | None) -> None:
+        from devbench.cli import _extract_sdk_result_text
+
+        class _Msg:
+            result = result_value
+
+        assert _extract_sdk_result_text(_Msg()) == expected
+
+    @pytest.mark.unit
+    def test_empty_string_result_returns_empty_string_not_none(self) -> None:
+        """Empty-string result is a real turn boundary -- must not collapse to None."""
+        from devbench.cli import _extract_sdk_result_text
+
+        class _Msg:
+            result = ""
+
+        assert _extract_sdk_result_text(_Msg()) == ""
+        assert _extract_sdk_result_text(_Msg()) is not None
+
+    @pytest.mark.unit
+    def test_none_result_attribute_returns_none(self) -> None:
+        from devbench.cli import _extract_sdk_result_text
+
+        class _Msg:
+            result = None
+
+        assert _extract_sdk_result_text(_Msg()) is None
+
+    @pytest.mark.unit
+    def test_missing_result_attribute_returns_none(self) -> None:
+        from devbench.cli import _extract_sdk_result_text
+
+        class _Msg:
+            pass
+
+        assert _extract_sdk_result_text(_Msg()) is None
+
+    @pytest.mark.unit
+    def test_non_string_result_attribute_returns_none(self) -> None:
+        from devbench.cli import _extract_sdk_result_text
+
+        class _Msg:
+            result = 42
+
+        assert _extract_sdk_result_text(_Msg()) is None
+
+
+class TestIsSdkResultMessage:
+    """Issue #262: ``_is_sdk_result_message`` must identify a ResultMessage by
+    duck-typing (``subtype`` plus ``num_turns``/``duration_ms`` presence) without
+    importing the SDK class.  Returns False for non-ResultMessage shapes.
+    """
+
+    @staticmethod
+    def _make_assistant_msg() -> object:
+        class _AssistantMsg:
+            subtype = "assistant"
+            content = "some text"
+
+        return _AssistantMsg()
+
+    @pytest.mark.unit
+    def test_result_message_with_num_turns_and_duration_ms_is_true(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        class _ResultMsg:
+            subtype = "success"
+            num_turns = 3
+            duration_ms = 1200
+
+        assert _is_sdk_result_message(_ResultMsg()) is True
+
+    @pytest.mark.unit
+    def test_result_message_with_num_turns_only_is_true(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        class _ResultMsg:
+            subtype = "end_turn"
+            num_turns = 1
+
+        assert _is_sdk_result_message(_ResultMsg()) is True
+
+    @pytest.mark.unit
+    def test_result_message_with_duration_ms_only_is_true(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        class _ResultMsg:
+            subtype = "success"
+            duration_ms = 500
+
+        assert _is_sdk_result_message(_ResultMsg()) is True
+
+    @pytest.mark.unit
+    def test_assistant_message_without_num_turns_or_duration_ms_is_false(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        assert _is_sdk_result_message(self._make_assistant_msg()) is False
+
+    @pytest.mark.unit
+    def test_plain_object_without_subtype_is_false(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        class _Plain:
+            pass
+
+        assert _is_sdk_result_message(_Plain()) is False
+
+    @pytest.mark.unit
+    def test_object_without_subtype_but_with_num_turns_is_false(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        class _NoSubtype:
+            num_turns = 3
+            duration_ms = 100
+
+        assert _is_sdk_result_message(_NoSubtype()) is False
+
+    @pytest.mark.unit
+    def test_non_object_string_is_false(self) -> None:
+        from devbench.cli import _is_sdk_result_message
+
+        assert _is_sdk_result_message("plain string") is False
+
+    @pytest.mark.unit
+    def test_returns_false_without_raising_on_unusual_input(self) -> None:
+        """Must return False rather than raise for any non-ResultMessage input."""
+        from devbench.cli import _is_sdk_result_message
+
+        assert _is_sdk_result_message(None) is False
+        assert _is_sdk_result_message(42) is False
+        assert _is_sdk_result_message([]) is False
+
+
 class TestCmdStartTerminalExit:
     """Issue #218: ``cmd_start``'s ``_run`` must break out of the SDK
     ``async for`` loop the first time it observes a terminal-marker

@@ -27,7 +27,9 @@ Behaviour:
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
+from devbench.backlog.operator_resolution_catalog import lookup_entry, record_outcome
 from devbench.backlog.proposal import BlockedTaskState
 from devbench.config_loader import AutoResolveConfig
 from devbench.constants import (
@@ -154,6 +156,8 @@ def apply_auto_resolve(
     config: AutoResolveConfig,
     primary_blocker_state: BlockedTaskState | None = None,
     structural_blocker_state: BlockedTaskState | None = None,
+    catalog_path: Path | None = None,
+    classification: str | None = None,
 ) -> str:
     """Apply auto-resolve logic and return the (possibly unchanged) output.
 
@@ -164,18 +168,26 @@ def apply_auto_resolve(
     (the payload is advisory text, not a command that needs re-writing --
     the actual remediation dispatch is the caller's responsibility).
 
+    When *catalog_path* and *classification* are both supplied, the engine
+    consults the agnostic resolution catalog (E11-F2-S1) to recognize
+    recurring signatures and records every actionable outcome:
+    ``"applied"`` on the apply path, ``"escalated"`` on budget exhaustion,
+    ``"failed"`` when a whitelisted apply attempt fails at the call site.
+
     Decision order (first match wins):
 
     1. Destructive-verb guard (``ValueError`` unconditionally).
-    2. Disabled gate: return advise-only unchanged.
+    2. Disabled gate: return advise-only unchanged (no catalog write).
     3. Composite-block gate: when primary_blocker_state is
        RUNTIME_DEGRADATION AND structural_blocker_state is not None,
-       return advise-only without consuming budget.
+       return advise-only without consuming budget (no catalog write).
     4. Whitelist gate: unknown non-destructive verb logs a warning and
-       returns advise-only.
+       returns advise-only (no catalog write).
     5. Budget gate: if per-(task_id, signature) count is at max_attempts,
-       log ``[AUTO_RESOLVE_ESCALATED]`` and return advise-only.
-    6. Apply path: increment counter, log ``[AUTO_RESOLVED]``, return payload.
+       log ``[AUTO_RESOLVE_ESCALATED]``, record ``"escalated"`` in catalog,
+       and return advise-only.
+    6. Apply path: increment counter, log ``[AUTO_RESOLVED]``, record
+       ``"applied"`` in catalog, return payload.
 
     Args:
         task_id: Canonical task identifier (e.g. ``"E11-F1-S1-T1"``).
@@ -192,6 +204,12 @@ def apply_auto_resolve(
             ``classify_blocked_task_excluding_degradation``. Used only when
             ``primary_blocker_state`` is ``RUNTIME_DEGRADATION`` to detect
             composite blocks.
+        catalog_path: Optional workspace root ``Path`` for the resolution
+            catalog. When ``None``, catalog consultation and recording are
+            skipped silently (backward-compatible default).
+        classification: Optional block-classifier bucket string (e.g.
+            ``"RUNTIME_DEGRADATION"``). Required to write a catalog entry;
+            ignored when *catalog_path* is ``None``.
 
     Returns:
         The advise-only payload, unchanged in all cases (the caller is
@@ -231,12 +249,73 @@ def apply_auto_resolve(
             f"{AUTO_RESOLVE_ESCALATED_STRING} task_id={task_id} signature={signature} attempts={attempt_count}",
             file=sys.stderr,
         )
+        _record_catalog_outcome(catalog_path, classification, signature, remediation, "escalated")
         return advise_only_payload
 
-    # Apply path: increment counter and emit audit log (AC-4 from E11-F1-S1).
+    # Apply path: consult catalog to recognize recurring signatures (AC-2 from E11-F2-S1).
+    # lookup_entry reads the persisted catalog; a non-None result means the pattern
+    # has been seen before and the engine recognises it as recurring.
+    prior_record = _lookup_catalog_entry(catalog_path, classification, signature)
+    recurring = prior_record is not None
+
     _increment_budget(task_id, signature)
     print(
-        f"{AUTO_RESOLVE_AUDIT_STRING} task_id={task_id} signature={signature} remediation={remediation}",
+        f"{AUTO_RESOLVE_AUDIT_STRING} task_id={task_id} signature={signature} "
+        f"remediation={remediation} recurring={recurring}",
         file=sys.stderr,
     )
+    _record_catalog_outcome(catalog_path, classification, signature, remediation, "applied")
     return advise_only_payload
+
+
+def _lookup_catalog_entry(
+    workspace_root: Path | None,
+    classification: str | None,
+    normalized_signature: str,
+) -> object:
+    """Return the catalog record for a classification + signature pair, or None.
+
+    Silently returns None when *workspace_root* is ``None`` or *classification*
+    is ``None`` (backward-compatible defaults).
+
+    Args:
+        workspace_root: Workspace root for the catalog, or ``None`` to skip.
+        classification: Block-classifier bucket, or ``None`` to skip.
+        normalized_signature: Agnostic blocker signature.
+
+    Returns:
+        The matching ``CatalogRecord`` if found, otherwise ``None``.
+    """
+    if workspace_root is None or classification is None:
+        return None
+    return lookup_entry(workspace_root, classification, normalized_signature)
+
+
+def _record_catalog_outcome(
+    workspace_root: Path | None,
+    classification: str | None,
+    normalized_signature: str,
+    remediation: str,
+    outcome: str,
+) -> None:
+    """Write an outcome to the resolution catalog when the catalog is configured.
+
+    Silently no-ops when *workspace_root* is ``None`` or *classification* is
+    ``None`` (backward-compatible defaults).
+
+    Args:
+        workspace_root: Workspace root for the catalog, or ``None`` to skip.
+        classification: Block-classifier bucket, or ``None`` to skip.
+        normalized_signature: Agnostic blocker signature.
+        remediation: Remediation verb.
+        outcome: One of ``"applied"``, ``"escalated"``, or ``"failed"``.
+    """
+    if workspace_root is None or classification is None:
+        return
+    record_outcome(
+        workspace_root,
+        classification=classification,
+        normalized_signature=normalized_signature,
+        remediation=remediation,
+        outcome=outcome,
+    )

@@ -662,3 +662,247 @@ class TestAutoResolveCompositeBlockDetection:
         captured = capsys.readouterr()
         combined = captured.out + captured.err
         assert AUTO_RESOLVE_AUDIT_STRING in combined
+
+
+@pytest.mark.unit
+class TestAutoResolveCatalogConsult:
+    """Engine consults catalog for recurring signatures and records outcomes."""
+
+    def setup_method(self) -> None:
+        """Reset the module-level apply-count dict before each test."""
+        from devbench.backlog import auto_resolve
+
+        auto_resolve._apply_counts.clear()
+
+    def test_apply_path_records_applied_outcome(self) -> None:
+        """A successful auto-apply records 'applied' outcome in the catalog."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=3)
+            apply_auto_resolve(
+                task_id="CAT-T1",
+                signature="cat-sig-apply",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "cat-sig-apply")
+            assert result is not None
+            assert result.success_count == 1
+            assert result.failure_count == 0
+
+    def test_escalated_path_records_escalated_outcome(self) -> None:
+        """Budget exhaustion records 'escalated' outcome in the catalog."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=1)
+            # Exhaust the budget
+            apply_auto_resolve(
+                task_id="CAT-ESC",
+                signature="esc-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            # Trigger escalation on budget exhaustion
+            apply_auto_resolve(
+                task_id="CAT-ESC",
+                signature="esc-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "esc-sig")
+            assert result is not None
+            # The escalated path does not increment success or failure
+            assert result.success_count == 1  # from the first (applied) call
+            assert result.failure_count == 0
+
+    def test_disabled_path_does_not_record_to_catalog(self) -> None:
+        """When disabled, no catalog entry is written."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=False, max_attempts=3)
+            apply_auto_resolve(
+                task_id="CAT-DISABLED",
+                signature="dis-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "dis-sig")
+            assert result is None
+
+    def test_catalog_consult_recognizes_recurring_signature(self) -> None:
+        """Engine recognizes a recurring signature in the catalog."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            # Record the signature 3 times
+            for _ in range(3):
+                apply_auto_resolve(
+                    task_id="RECUR-T1",
+                    signature="recur-sig",
+                    remediation="re-queue",
+                    advise_only_payload="payload",
+                    config=cfg,
+                    catalog_path=root,
+                    classification="AWAITING_DEPENDENCY",
+                )
+            result = lookup_entry(root, "AWAITING_DEPENDENCY", "recur-sig")
+            assert result is not None
+            assert result.success_count == 3
+
+    def test_catalog_consult_logs_recurring_true_on_second_apply(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Engine logs recurring=True when the signature was seen before."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            # First call: signature is novel (recurring=False)
+            apply_auto_resolve(
+                task_id="RECUR-LOG-T1",
+                signature="recur-log-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            capsys.readouterr()  # discard first call output
+
+            # Second call: signature is now in catalog (recurring=True)
+            apply_auto_resolve(
+                task_id="RECUR-LOG-T1",
+                signature="recur-log-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            captured = capsys.readouterr()
+            combined = captured.out + captured.err
+            assert "recurring=True" in combined
+
+    def test_catalog_consult_logs_recurring_false_on_first_apply(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Engine logs recurring=False when the signature is novel (first apply)."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            apply_auto_resolve(
+                task_id="NOVEL-T1",
+                signature="novel-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            captured = capsys.readouterr()
+            combined = captured.out + captured.err
+            assert "recurring=False" in combined
+
+    def test_no_catalog_path_skips_catalog_silently(self) -> None:
+        """When catalog_path is None, catalog consultation is skipped silently."""
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        cfg = AutoResolveConfig(enabled=True, max_attempts=3)
+        # Must not raise when no catalog_path is given (backward compat)
+        result = apply_auto_resolve(
+            task_id="NO-CAT",
+            signature="no-cat-sig",
+            remediation="re-queue",
+            advise_only_payload="payload",
+            config=cfg,
+        )
+        assert result == "payload"
+
+    def test_whitelist_miss_does_not_record_to_catalog(self) -> None:
+        """Unknown non-destructive verbs do not create catalog entries."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=3)
+            apply_auto_resolve(
+                task_id="WL-MISS",
+                signature="wl-sig",
+                remediation="unknown-verb",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "wl-sig")
+            assert result is None
+
+    def test_composite_block_does_not_record_to_catalog(self) -> None:
+        """Composite RUNTIME_DEGRADATION + structural blocker does not record catalog entry."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            apply_auto_resolve(
+                task_id="COMP-CAT",
+                signature="comp-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+                primary_blocker_state=BlockedTaskState.RUNTIME_DEGRADATION,
+                structural_blocker_state=BlockedTaskState.AWAITING_DEPENDENCY,
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "comp-sig")
+            assert result is None

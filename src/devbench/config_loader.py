@@ -82,6 +82,9 @@ from devbench.constants import (
     DEFAULT_AUTO_RESOLVE_ENABLED,
     DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
     DEFAULT_FALLBACK_MODEL_RATES,
+    DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+    DEFAULT_SKILLS_USE_WORKFLOW,
+    DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
@@ -603,7 +606,8 @@ class SkillsConfig:
     """Plugin-skill configuration loaded from the ``skills:`` YAML section.
 
     Controls how the bundled spec-to-backlog and create-spec skills resolve
-    operator-facing knobs (exemplar paths, fan-out and iteration budgets).
+    operator-facing knobs (exemplar paths, fan-out and iteration budgets,
+    Workflow fan-out, and adversarial-review gating).
     Every field is optional; when a workspace omits the section entirely
     each skill falls back to defaults baked into its SKILL.md prompt.
 
@@ -625,12 +629,27 @@ class SkillsConfig:
         max_iterations: Maximum self-critique iterations per skill
             invocation before emitting a ``[SKILL_MAX_ITERATIONS_REACHED]``
             audit comment with the unresolved rubric items. Defaults to 5.
+        use_workflow: When ``True``, both skills detect the Claude Code
+            Workflow tool and fan out through it above the fan-out
+            threshold. When ``False`` (the default, unset-safe) behavior
+            is byte-for-byte identical to today (issue #266 E12-F1-S1).
+        workflow_chunk_size: Maximum number of tasks per Workflow chunk.
+            Kept small (default 3) to stay under provider rate limits
+            observed near 15 concurrent agents (spec Section 1). Must be
+            >= 1; zero or negative is rejected at config-load time.
+        adversarial_review_threshold: Size/complexity gate consumed by
+            E12-F2. When the generated spec yields more than this many
+            work units the adversarial-review hardening pass is triggered.
+            Must be >= 1.
     """
 
     exemplar_backlog_path: str | None = None
     exemplar_spec_path: str | None = None
     fan_out_threshold: int = _SKILLS_DEFAULT_FAN_OUT_THRESHOLD
     max_iterations: int = _SKILLS_DEFAULT_MAX_ITERATIONS
+    use_workflow: bool = DEFAULT_SKILLS_USE_WORKFLOW
+    workflow_chunk_size: int = DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+    adversarial_review_threshold: int = DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD
 
 
 def _parse_model_rates(model_id: str, raw: object, source: str) -> ModelRates:
@@ -806,10 +825,12 @@ def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
         ``SkillsConfig`` populated from *skills_raw*.
 
     Raises:
-        ValueError: If ``fan_out_threshold`` or ``max_iterations`` is
-            present but not a positive integer (the schema enforces
+        ValueError: If ``fan_out_threshold``, ``max_iterations``,
+            ``workflow_chunk_size``, or ``adversarial_review_threshold``
+            is present but not a positive integer (the schema enforces
             ``minimum: 1``; this is the defensive runtime re-check).
     """
+    defaults = SkillsConfig()
     exemplar_backlog = skills_raw.get("exemplar_backlog_path") or None
     exemplar_spec = skills_raw.get("exemplar_spec_path") or None
     fan_out_raw = skills_raw.get("fan_out_threshold", _SKILLS_DEFAULT_FAN_OUT_THRESHOLD)
@@ -820,11 +841,28 @@ def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
     max_iter = int(max_iter_raw)
     if max_iter < 1:
         raise ValueError(f"Config file '{path}': skills.max_iterations must be >= 1; got {max_iter_raw!r}.")
+    use_workflow = bool(skills_raw.get("use_workflow", defaults.use_workflow))
+    chunk_size_raw = skills_raw.get("workflow_chunk_size", defaults.workflow_chunk_size)
+    chunk_size = int(chunk_size_raw)
+    if chunk_size < 1:
+        raise ValueError(
+            f"Config file '{path}': skills.workflow_chunk_size must be >= 1; got {chunk_size_raw!r}. "
+            "Set to 3 or 4 to stay under provider rate limits."
+        )
+    adv_threshold_raw = skills_raw.get("adversarial_review_threshold", defaults.adversarial_review_threshold)
+    adv_threshold = int(adv_threshold_raw)
+    if adv_threshold < 1:
+        raise ValueError(
+            f"Config file '{path}': skills.adversarial_review_threshold must be >= 1; got {adv_threshold_raw!r}."
+        )
     return SkillsConfig(
         exemplar_backlog_path=str(exemplar_backlog) if exemplar_backlog else None,
         exemplar_spec_path=str(exemplar_spec) if exemplar_spec else None,
         fan_out_threshold=fan_out,
         max_iterations=max_iter,
+        use_workflow=use_workflow,
+        workflow_chunk_size=chunk_size,
+        adversarial_review_threshold=adv_threshold,
     )
 
 

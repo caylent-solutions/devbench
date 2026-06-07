@@ -788,3 +788,51 @@ class TestAutoResolveConstants:
         assert AUTO_RESOLVE_ESCALATED_STRING == "[AUTO_RESOLVE_ESCALATED]", (
             f"Escalation audit string must equal '[AUTO_RESOLVE_ESCALATED]'; got {AUTO_RESOLVE_ESCALATED_STRING!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Skills workflow constants -- E12-F1-S1-T1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSkillsWorkflowConstants:
+    """E12-F1-S1-T1: env var names and unset-safe defaults for Workflow fan-out."""
+
+    def test_use_workflow_env_var_name(self) -> None:
+        """DEVBENCH_SKILLS_USE_WORKFLOW_ENV must equal the documented env var name."""
+        from devbench.constants import DEVBENCH_SKILLS_USE_WORKFLOW_ENV
+
+        assert DEVBENCH_SKILLS_USE_WORKFLOW_ENV == "DEVBENCH_SKILLS_USE_WORKFLOW"
+
+    def test_workflow_chunk_size_env_var_name(self) -> None:
+        """DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV must equal the documented env var name."""
+        from devbench.constants import DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV
+
+        assert DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV == "DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE"
+
+    def test_adversarial_review_threshold_env_var_name(self) -> None:
+        """DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV must equal documented env var name."""
+        from devbench.constants import DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV
+
+        assert DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV == "DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD"
+
+    def test_use_workflow_default_is_false(self) -> None:
+        """DEFAULT_SKILLS_USE_WORKFLOW is False (unset-safe; opt-in only)."""
+        from devbench.constants import DEFAULT_SKILLS_USE_WORKFLOW
+
+        assert DEFAULT_SKILLS_USE_WORKFLOW is False
+
+    def test_workflow_chunk_size_default_is_positive_and_small(self) -> None:
+        """DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE is a positive integer <= 4 to stay under rate limits."""
+        from devbench.constants import DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+
+        assert isinstance(DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE, int)
+        assert 1 <= DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE <= 4
+
+    def test_adversarial_review_threshold_default_is_positive_int(self) -> None:
+        """DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD is a positive integer."""
+        from devbench.constants import DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD
+
+        assert isinstance(DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD, int)
+        assert DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD >= 1

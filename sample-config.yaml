@@ -401,6 +401,23 @@ skills:
   # Maximum self-critique iterations per skill invocation before
   # emitting a [SKILL_MAX_ITERATIONS_REACHED] audit comment. Default 5.
   max_iterations: 5
+  #
+  # When true, both create-spec and spec-to-backlog detect the Claude Code
+  # Workflow tool and fan out through it above fan_out_threshold. Default
+  # false (unset-safe opt-in). When absent or false, behavior is identical
+  # to today -- Agent fan-out for spec-to-backlog, single-agent for
+  # create-spec. Issue #266 E12-F1-S1.
+  # use_workflow: false
+  #
+  # Maximum tasks per Workflow chunk when use_workflow is true. Keep small
+  # (default 3, max recommended 4) to stay under the provider rate limit
+  # observed near 15 concurrent agents. Must be >= 1. Issue #266 spec S1.
+  # workflow_chunk_size: 3
+  #
+  # Size/complexity gate consumed by E12-F2. When the generated spec
+  # yields more than this many work units the adversarial-review hardening
+  # pass is triggered. Default 10. Must be >= 1. Issue #266 spec S7.
+  # adversarial_review_threshold: 10
 
 # ---------------------------------------------------------------------------
 # Per-agent model overrides (ADR-25). Every field defaults to null -- the

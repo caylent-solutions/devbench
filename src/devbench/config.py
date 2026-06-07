@@ -71,12 +71,18 @@ from devbench.constants import (
     DEFAULT_PR_REVIEW_SETTLE_SECONDS,
     DEFAULT_RECENT_PACE_TASKS,
     DEFAULT_SECURITY_FETCH_TIMEOUT,
+    DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+    DEFAULT_SKILLS_USE_WORKFLOW,
+    DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
     DEVBENCH_AUTO_RESOLVE_ENABLED_ENV,
     DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV,
+    DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
+    DEVBENCH_SKILLS_USE_WORKFLOW_ENV,
+    DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV,
     ModelRates,
 )
 
@@ -762,6 +768,32 @@ AUTO_RESOLVE_MAX_ATTEMPTS: int = _resolve_int(
 AUTO_RESOLVE_CONFIG: AutoResolveConfig = AutoResolveConfig(
     enabled=AUTO_RESOLVE_ENABLED,
     max_attempts=AUTO_RESOLVE_MAX_ATTEMPTS,
+)
+
+# ---------------------------------------------------------------------------
+# Skills Workflow fan-out (issue #266, E12-F1-S1-T1)
+# ---------------------------------------------------------------------------
+# Resolve skills.use_workflow via _resolve_bool with env precedence:
+#   DEVBENCH_SKILLS_USE_WORKFLOW env var > YAML skills.use_workflow > DEFAULT_SKILLS_USE_WORKFLOW (false).
+# Unset-safe: absent env and YAML yields False (opt-in only).
+SKILLS_USE_WORKFLOW: bool = _resolve_bool(
+    DEVBENCH_SKILLS_USE_WORKFLOW_ENV,
+    RUNTIME_CONFIG.skills.use_workflow,
+    DEFAULT_SKILLS_USE_WORKFLOW,
+)
+# Resolve skills.workflow_chunk_size via _resolve_int with env precedence.
+# Provider rate-limiting is observed near 15 concurrent agents; default 3.
+SKILLS_WORKFLOW_CHUNK_SIZE: int = _resolve_int(
+    DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV,
+    RUNTIME_CONFIG.skills.workflow_chunk_size,
+    DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
+)
+# Resolve skills.adversarial_review_threshold via _resolve_int with env precedence.
+# Consumed by E12-F2 to gate the adversarial-review hardening pass.
+SKILLS_ADVERSARIAL_REVIEW_THRESHOLD: int = _resolve_int(
+    DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
+    RUNTIME_CONFIG.skills.adversarial_review_threshold,
+    DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
 )
 
 

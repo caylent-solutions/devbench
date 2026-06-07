@@ -3529,3 +3529,115 @@ class TestAutoResolveConfigDataclass:
         rt = load_runtime_config(cfg_path, {})
         assert rt.auto_resolve.enabled is False
         assert rt.auto_resolve.max_attempts == DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# SkillsConfig -- workflow fields (E12-F1-S1-T1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSkillsWorkflowConfig:
+    """E12-F1-S1-T1: SkillsConfig exposes use_workflow, workflow_chunk_size,
+    and adversarial_review_threshold with unset-safe defaults."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_skills_config_defaults_for_new_workflow_fields(self) -> None:
+        """SkillsConfig default values: use_workflow=False, small chunk_size, positive threshold."""
+        from devbench.config_loader import SkillsConfig
+        from devbench.constants import (
+            DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+            DEFAULT_SKILLS_USE_WORKFLOW,
+            DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
+        )
+
+        cfg = SkillsConfig()
+        assert cfg.use_workflow is DEFAULT_SKILLS_USE_WORKFLOW
+        assert cfg.workflow_chunk_size == DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+        assert cfg.adversarial_review_threshold == DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD
+
+    def test_absent_skills_section_yields_workflow_defaults(self, tmp_path: Path) -> None:
+        """When skills: is absent, workflow fields fall back to unset-safe defaults."""
+        from devbench.constants import (
+            DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+            DEFAULT_SKILLS_USE_WORKFLOW,
+            DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
+        )
+
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg_path, {})
+        assert rt.skills.use_workflow is DEFAULT_SKILLS_USE_WORKFLOW
+        assert rt.skills.workflow_chunk_size == DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+        assert rt.skills.adversarial_review_threshold == DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD
+
+    def test_skills_workflow_fields_round_trip_from_yaml(self, tmp_path: Path) -> None:
+        """All three workflow fields load correctly from YAML."""
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              use_workflow: true
+              workflow_chunk_size: 2
+              adversarial_review_threshold: 15
+            """,
+        )
+        rt = load_runtime_config(cfg_path, {})
+        assert rt.skills.use_workflow is True
+        assert rt.skills.workflow_chunk_size == 2
+        assert rt.skills.adversarial_review_threshold == 15
+
+    def test_skills_workflow_chunk_size_zero_raises(self, tmp_path: Path) -> None:
+        """workflow_chunk_size must be >= 1; zero raises ValueError."""
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              workflow_chunk_size: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg_path, {})
+
+    def test_skills_adversarial_review_threshold_zero_raises(self, tmp_path: Path) -> None:
+        """adversarial_review_threshold must be >= 1; zero raises ValueError."""
+        cfg_path = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              adversarial_review_threshold: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg_path, {})
+
+    def test_parse_skills_config_rejects_zero_chunk_size_direct(self, tmp_path: Path) -> None:
+        """_parse_skills_config defensive guard fires for workflow_chunk_size < 1."""
+        from devbench.config_loader import _parse_skills_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"skills.workflow_chunk_size must be >= 1"):
+            _parse_skills_config(fake_path, {"workflow_chunk_size": 0})
+
+    def test_parse_skills_config_rejects_zero_adversarial_threshold_direct(self, tmp_path: Path) -> None:
+        """_parse_skills_config defensive guard fires for adversarial_review_threshold < 1."""
+        from devbench.config_loader import _parse_skills_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"skills.adversarial_review_threshold must be >= 1"):
+            _parse_skills_config(fake_path, {"adversarial_review_threshold": 0})

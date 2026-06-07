@@ -902,6 +902,36 @@ RECOVERY_PROBE_MODEL: str = "claude-opus-4-8"
 QUOTA_HANDLING_DEFAULT_ENABLED: bool = True
 
 # ---------------------------------------------------------------------------
+# Skills Workflow fan-out constants (issue #266, E12-F1-S1-T1)
+# ---------------------------------------------------------------------------
+# Environment variable name for the Workflow-tool fan-out master toggle.
+# Resolution: env var > YAML skills.use_workflow > DEFAULT_SKILLS_USE_WORKFLOW (false).
+# When false (the default) both skills fall back to the existing Agent / single-agent
+# path byte-for-byte; no behavior change is required from the operator to upgrade.
+DEVBENCH_SKILLS_USE_WORKFLOW_ENV: str = "DEVBENCH_SKILLS_USE_WORKFLOW"
+
+# Environment variable name for the Workflow chunk size.
+# Resolution: env var > YAML skills.workflow_chunk_size > DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE.
+# Provider rate-limiting has been observed near 15 concurrent agents (spec Section 1);
+# 3-4 is the recommended mitigation chunk size.
+DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV: str = "DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE"
+
+# Environment variable name for the adversarial-review size/complexity gate (E12-F2).
+# Resolution: env var > YAML skills.adversarial_review_threshold > DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD.
+DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV: str = "DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD"
+
+# Unset-safe default: Workflow fan-out is opt-in; absent env and YAML defaults to false.
+DEFAULT_SKILLS_USE_WORKFLOW: bool = False
+
+# Default chunk size chosen to stay well under the ~15-concurrent-agent rate limit
+# observed from the provider (spec Section 1).
+DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE: int = 3
+
+# Default adversarial-review threshold consumed by E12-F2.
+# When the spec produces more than this many work units the adversarial pass is triggered.
+DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD: int = 10
+
+# ---------------------------------------------------------------------------
 # Auto-resolve engine constants (issue #263, E11-F1-S1)
 # ---------------------------------------------------------------------------
 # Environment variable name for the auto-resolve enabled flag.

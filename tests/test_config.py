@@ -848,3 +848,100 @@ class TestAutoResolveMaxAttemptsConfig:
                 DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV, None, DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
             )
         assert result == 7
+
+
+# ---------------------------------------------------------------------------
+# Skills workflow config resolution -- E12-F1-S1-T1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSkillsUseWorkflowConfig:
+    """E12-F1-S1-T1: SKILLS_USE_WORKFLOW resolved via _resolve_bool with env precedence."""
+
+    def test_env_true_overrides_yaml_false(self) -> None:
+        from devbench.constants import DEFAULT_SKILLS_USE_WORKFLOW, DEVBENCH_SKILLS_USE_WORKFLOW_ENV
+
+        with patch.dict(os.environ, {DEVBENCH_SKILLS_USE_WORKFLOW_ENV: "true"}, clear=False):
+            result = config._resolve_bool(DEVBENCH_SKILLS_USE_WORKFLOW_ENV, False, DEFAULT_SKILLS_USE_WORKFLOW)
+        assert result is True
+
+    def test_env_false_overrides_yaml_true(self) -> None:
+        from devbench.constants import DEFAULT_SKILLS_USE_WORKFLOW, DEVBENCH_SKILLS_USE_WORKFLOW_ENV
+
+        with patch.dict(os.environ, {DEVBENCH_SKILLS_USE_WORKFLOW_ENV: "false"}, clear=False):
+            result = config._resolve_bool(DEVBENCH_SKILLS_USE_WORKFLOW_ENV, True, DEFAULT_SKILLS_USE_WORKFLOW)
+        assert result is False
+
+    def test_default_false_when_both_absent(self) -> None:
+        """Unset-safe default is False when env is absent and YAML value is None."""
+        from devbench.constants import DEFAULT_SKILLS_USE_WORKFLOW, DEVBENCH_SKILLS_USE_WORKFLOW_ENV
+
+        env_copy = {k: v for k, v in os.environ.items() if k != DEVBENCH_SKILLS_USE_WORKFLOW_ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_bool(DEVBENCH_SKILLS_USE_WORKFLOW_ENV, None, DEFAULT_SKILLS_USE_WORKFLOW)
+        assert result is False
+
+
+@pytest.mark.unit
+class TestSkillsWorkflowChunkSizeConfig:
+    """E12-F1-S1-T1: SKILLS_WORKFLOW_CHUNK_SIZE resolved via _resolve_int with env precedence."""
+
+    def test_env_overrides_default(self) -> None:
+        from devbench.constants import (
+            DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
+            DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV,
+        )
+
+        with patch.dict(os.environ, {DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV: "2"}, clear=False):
+            result = config._resolve_int(
+                DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV, None, DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+            )
+        assert result == 2
+
+    def test_default_used_when_env_absent(self) -> None:
+        from devbench.constants import (
+            DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
+            DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV,
+        )
+
+        env_copy = {k: v for k, v in os.environ.items() if k != DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int(
+                DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV, None, DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+            )
+        assert result == DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE
+
+
+@pytest.mark.unit
+class TestSkillsAdversarialReviewThresholdConfig:
+    """E12-F1-S1-T1: SKILLS_ADVERSARIAL_REVIEW_THRESHOLD resolved via _resolve_int."""
+
+    def test_env_overrides_default(self) -> None:
+        from devbench.constants import (
+            DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+            DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
+        )
+
+        with patch.dict(os.environ, {DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV: "20"}, clear=False):
+            result = config._resolve_int(
+                DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
+                None,
+                DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+            )
+        assert result == 20
+
+    def test_default_used_when_env_absent(self) -> None:
+        from devbench.constants import (
+            DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+            DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
+        )
+
+        env_copy = {k: v for k, v in os.environ.items() if k != DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int(
+                DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
+                None,
+                DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
+            )
+        assert result == DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD

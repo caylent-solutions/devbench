@@ -508,6 +508,20 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum self-critique iterations per skill invocation. When exceeded, the skill emits a [SKILL_MAX_ITERATIONS_REACHED] audit comment with the unresolved rubric items instead of silently shipping a sub-quality artefact. Default 5."
+        },
+        "use_workflow": {
+          "type": "boolean",
+          "description": "When true, both create-spec and spec-to-backlog detect the Claude Code Workflow tool and fan out through it above the fan_out_threshold. Default false (unset-safe opt-in). When absent or false, behavior is identical to today -- Agent fan-out for spec-to-backlog, single-agent for create-spec. Issue #266 E12-F1-S1."
+        },
+        "workflow_chunk_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum tasks per Workflow chunk when use_workflow is true. Keep this value small (default 3, max recommended 4) to stay under the provider rate limit observed near 15 concurrent agents. Issue #266 E12-F1-S1 spec Section 1."
+        },
+        "adversarial_review_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Size/complexity gate consumed by E12-F2. When the generated spec yields more than this many work units, the adversarial-review hardening pass is triggered. Default 10. Issue #266 E12-F2 spec Section 7."
         }
       }
     },

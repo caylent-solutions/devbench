@@ -5282,19 +5282,8 @@ class TestCmdStart:
     def test_cmd_start_invokes_agent_sdk(self, tmp_path: Path) -> None:
         """Lines 868-885: cmd_start creates an async runner and returns 0."""
         import sys
-        import types
 
-        # Create a mock claude_agent_sdk module
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-
-        mock_options_cls = MagicMock()
-        mock_sdk.ClaudeAgentOptions = mock_options_cls
-
-        async def mock_query(**kwargs: object) -> object:
-            # Async generator that yields a message to cover line 882
-            yield "test message"
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module(["test message"])
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -5313,15 +5302,63 @@ class _FakeSdkModule(types.ModuleType):
     """Typed fake claude_agent_sdk module for tests.
 
     Subclasses :class:`types.ModuleType` and declares ``ClaudeAgentOptions``
-    and ``query`` as typed attributes so mypy can verify attribute access
-    without suppression annotations.
+    and ``ClaudeSDKClient`` as typed attributes so mypy can verify attribute
+    access without suppression annotations.
     """
 
     ClaudeAgentOptions: object
-    query: object
+    ClaudeSDKClient: object
 
     def __init__(self) -> None:
         super().__init__("claude_agent_sdk")
+
+
+def _make_fake_sdk_module(messages: list[Any]) -> Any:
+    """Build a minimal fake claude_agent_sdk module for cmd_start tests.
+
+    Returns a module-like object whose ``ClaudeSDKClient`` is an async
+    context manager that yields ``messages`` exactly once from
+    ``receive_response()`` and then exhausts, causing the ``_run`` while-loop
+    to exit cleanly.
+
+    This factory replaces the old pattern of setting ``mock_sdk.query = mock_query``
+    after the refactor to ``ClaudeSDKClient`` in E10-F1-S2-T1 (issue #262).
+
+    Args:
+        messages: Sequence of SDK message objects to yield from
+            ``receive_response()``.  Pass the same values that the old
+            ``mock_query`` async generator would have yielded.
+
+    Returns:
+        A fake claude_agent_sdk module with ``ClaudeAgentOptions`` and
+        ``ClaudeSDKClient`` attributes.
+    """
+    received: list[bool] = [False]
+
+    class _FakeClient:
+        def __init__(self, options: Any = None, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> _FakeClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> bool:
+            return False
+
+        async def query(self, prompt: str, session_id: str = "default") -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            if received[0]:
+                return
+            received[0] = True
+            for msg in messages:
+                yield msg
+
+    fake_sdk: Any = types.ModuleType("claude_agent_sdk")
+    fake_sdk.ClaudeAgentOptions = MagicMock()
+    fake_sdk.ClaudeSDKClient = _FakeClient
+    return fake_sdk
 
 
 class TestCmdStartNameFlag:
@@ -5332,22 +5369,15 @@ class TestCmdStartNameFlag:
     AC-192-2: --name defaults to 'default' when omitted.
     """
 
-    def _make_mock_sdk(self) -> _FakeSdkModule:
+    def _make_mock_sdk(self) -> Any:
         """Return a minimal fake claude_agent_sdk module.
 
         Returns:
-            A :class:`_FakeSdkModule` instance with ``ClaudeAgentOptions`` set
-            to a :class:`~unittest.mock.MagicMock` and ``query`` set to an
-            async generator that yields a single test message.
+            A fake module with ``ClaudeAgentOptions`` and ``ClaudeSDKClient``
+            attributes; the client yields a single test message via
+            ``receive_response()`` then exhausts.
         """
-        mock_sdk = _FakeSdkModule()
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "test message"
-
-        mock_sdk.query = mock_query
-        return mock_sdk
+        return _make_fake_sdk_module(["test message"])
 
     @pytest.mark.unit
     def test_default_name_creates_default_session_dir(self, tmp_path: Path) -> None:
@@ -5495,16 +5525,29 @@ class TestCmdStartNameFlag:
         import sys
 
         captured_env: dict[str, str] = {}
+
+        class _EnvCapturingClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _EnvCapturingClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                pass
+
+            async def receive_response(self) -> Any:
+                import os as _os
+
+                captured_env.update(_os.environ.copy())
+                yield "test message"
+
         mock_sdk_capture = _FakeSdkModule()
         mock_sdk_capture.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query_capture(**kwargs: object) -> object:
-            import os as _os
-
-            captured_env.update(_os.environ.copy())
-            yield "test message"
-
-        mock_sdk_capture.query = mock_query_capture
+        mock_sdk_capture.ClaudeSDKClient = _EnvCapturingClient
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk_capture}),
@@ -5549,16 +5592,9 @@ class TestCmdStartScopeOverlap:
               unless --allow-overlap is passed (warn but proceed).
     """
 
-    def _make_mock_sdk(self) -> _FakeSdkModule:
+    def _make_mock_sdk(self) -> Any:
         """Return a minimal fake claude_agent_sdk module."""
-        mock_sdk = _FakeSdkModule()
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "test message"
-
-        mock_sdk.query = mock_query
-        return mock_sdk
+        return _make_fake_sdk_module(["test message"])
 
     def _seed_registry(self, workspace_root: Path, session_name: str, scope: list[str]) -> None:
         """Write a registry.json entry for an already-running session."""
@@ -14095,20 +14131,29 @@ class TestCmdPreparePluginShadow:
 class TestCmdStartUsesShadow:
     """cmd_start passes the resolved (shadow-or-canonical) path to ClaudeAgentOptions."""
 
+    @staticmethod
+    def _make_tracking_sdk(mock_options_cls: MagicMock) -> Any:
+        """Build a fake SDK with a custom ClaudeAgentOptions mock for call tracking.
+
+        Args:
+            mock_options_cls: The MagicMock to install as ClaudeAgentOptions so
+                call_args can be inspected after cmd_start runs.
+
+        Returns:
+            A fake claude_agent_sdk module with the given ClaudeAgentOptions and
+            a functional ClaudeSDKClient.
+        """
+        base_sdk = _make_fake_sdk_module(["test message"])
+        base_sdk.ClaudeAgentOptions = mock_options_cls
+        return base_sdk
+
     def test_cmd_start_with_override_uses_shadow_path(self, tmp_path: Path) -> None:
         import sys
-        import types
 
         from devbench.config_loader import AgentModelsConfig
 
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_options_cls = MagicMock()
-        mock_sdk.ClaudeAgentOptions = mock_options_cls
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "test message"
-
-        mock_sdk.query = mock_query
+        mock_sdk = self._make_tracking_sdk(mock_options_cls)
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -14140,18 +14185,11 @@ class TestCmdStartUsesShadow:
         # When no overrides are configured, _resolve_plugin_path returns the
         # canonical path -- no shadow exists, so no sentinel must be written.
         import sys
-        import types
 
         from devbench.config_loader import AgentModelsConfig
 
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_options_cls = MagicMock()
-        mock_sdk.ClaudeAgentOptions = mock_options_cls
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "test message"
-
-        mock_sdk.query = mock_query
+        mock_sdk = self._make_tracking_sdk(mock_options_cls)
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -14179,16 +14217,7 @@ class TestCmdStartAutoRestartPostMortem:
     """
 
     def _mocked_sdk(self) -> object:
-        import types
-
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "msg"
-
-        mock_sdk.query = mock_query
-        return mock_sdk
+        return _make_fake_sdk_module(["msg"])
 
     def test_returns_42_when_only_blockers_are_runtime_degradation(
         self,
@@ -14253,16 +14282,7 @@ class _CmdStartScopeTestBase:
     # ------------------------------------------------------------------
 
     def _make_sdk_mock(self) -> object:
-        import types
-
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def _query(**kwargs: object) -> object:
-            yield "msg"
-
-        mock_sdk.query = _query
-        return mock_sdk
+        return _make_fake_sdk_module(["msg"])
 
     # ------------------------------------------------------------------
     # Fixture-level backlog IDs used across tests
@@ -14354,19 +14374,35 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
                 recorded inside the SDK mock while the file is present.
 
         Returns:
-            A fake claude_agent_sdk module whose ``query`` coroutine reads the
-            scope.json content on invocation.
+            A fake claude_agent_sdk module whose ``ClaudeSDKClient`` reads the
+            scope.json content when receive_response() is first called.
         """
-        import types
+        received: list[bool] = [False]
 
-        async def _capturing_query(**kwargs: object) -> object:
-            if scope_path.exists():
-                captured.append(json.loads(scope_path.read_text()))
-            yield "msg"
+        class _CapturingClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _CapturingClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                pass
+
+            async def receive_response(self) -> Any:
+                if received[0]:
+                    return
+                received[0] = True
+                if scope_path.exists():
+                    captured.append(json.loads(scope_path.read_text()))
+                yield "msg"
 
         capturing_sdk: Any = types.ModuleType("claude_agent_sdk")
         capturing_sdk.ClaudeAgentOptions = MagicMock()
-        capturing_sdk.query = _capturing_query
+        capturing_sdk.ClaudeSDKClient = _CapturingClient
         return capturing_sdk
 
     def test_include_flag_writes_scope_json(self, tmp_path: Path) -> None:
@@ -14462,19 +14498,30 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
 
     def test_devbench_scope_file_env_var_set(self, tmp_path: Path) -> None:
         """cmd_start --include must set DEVBENCH_SCOPE_FILE in the process env."""
-        import types
-
         captured_env: dict[str, str] = {}
 
-        async def _capturing_query(**kwargs: object) -> object:
-            import os
+        class _EnvCapturingClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
 
-            captured_env.update(os.environ)
-            yield "msg"
+            async def __aenter__(self) -> _EnvCapturingClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                pass
+
+            async def receive_response(self) -> Any:
+                import os
+
+                captured_env.update(os.environ)
+                yield "msg"
 
         custom_sdk: Any = types.ModuleType("claude_agent_sdk")
         custom_sdk.ClaudeAgentOptions = MagicMock()
-        custom_sdk.query = _capturing_query
+        custom_sdk.ClaudeSDKClient = _EnvCapturingClient
 
         with self._patch_cli(tmp_path, mock_sdk=custom_sdk):
             rc = cli.cmd_start("--include", "E1")
@@ -14571,19 +14618,30 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
 
     def test_sdk_crash_preserves_scope_json(self, tmp_path: Path) -> None:
         """AC-190-13: scope.json must persist when the SDK raises (crash path)."""
-        import types
 
         class _SDKError(RuntimeError):
             pass
 
+        class _CrashClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _CrashClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                pass
+
+            async def receive_response(self) -> Any:
+                raise _SDKError("simulated SDK crash")
+                yield  # make it an async generator
+
         crash_sdk: Any = types.ModuleType("claude_agent_sdk")
         crash_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def _crash_query(**kwargs: object) -> object:
-            raise _SDKError("simulated SDK crash")
-            yield  # make it a generator
-
-        crash_sdk.query = _crash_query
+        crash_sdk.ClaudeSDKClient = _CrashClient
 
         with self._patch_cli(tmp_path, mock_sdk=crash_sdk):
             with pytest.raises(_SDKError):
@@ -17097,27 +17155,19 @@ def _make_sdk_with_claim_message() -> object:
 
     Shared by TestCmdStartDrainEnforcement and TestCmdStartCancelDrainPreventsExit.
     """
-    import types
-
     from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
 
-    mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-    mock_sdk.ClaudeAgentOptions = MagicMock()
-
-    async def mock_query(**kwargs: object) -> object:
-        yield AssistantMessage(
-            content=[
-                ToolUseBlock(
-                    id="tu-claim",
-                    name="Bash",
-                    input={"command": "uv run devbench claim E1-F2-S1-T1"},
-                )
-            ],
-            model="claude-opus-4-5",
-        )
-
-    mock_sdk.query = mock_query
-    return mock_sdk
+    claim_msg = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="tu-claim",
+                name="Bash",
+                input={"command": "uv run devbench claim E1-F2-S1-T1"},
+            )
+        ],
+        model="claude-opus-4-5",
+    )
+    return _make_fake_sdk_module([claim_msg])
 
 
 @pytest.fixture
@@ -17146,16 +17196,7 @@ class TestCmdStartDrainEnforcement:
 
     def _make_sdk_with_non_claim_messages(self) -> object:
         """Return a fake SDK module that yields only non-claim messages."""
-        import types
-
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "plain string message"
-
-        mock_sdk.query = mock_query
-        return mock_sdk
+        return _make_fake_sdk_module(["plain string message"])
 
     @pytest.mark.unit
     def test_claim_while_drain_pending_returns_rc0(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -17326,17 +17367,10 @@ class TestCmdStartWritesRestartMarker:
     @pytest.mark.unit
     def test_restart_marker_is_written_on_start(self, tmp_path: Path) -> None:
         import sys
-        import types
 
         from devbench.constants import LAST_RESTART_MARKER_PATH
 
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "plain string"
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module(["plain string"])
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -17576,21 +17610,36 @@ class TestCmdStartTerminalExit:
 
     @staticmethod
     def _build_counting_sdk(messages: list[Any], counter: list[int]) -> Any:
-        """Construct a fake SDK module whose ``query()`` async iterator
+        """Construct a fake SDK module whose ``ClaudeSDKClient.receive_response()``
         yields ``messages`` in order while incrementing ``counter[0]``
         once per yield.  After the loop breaks the counter records how
         many messages the loop actually consumed."""
-        import types
+        received: list[bool] = [False]
+
+        class _CountingClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _CountingClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                pass
+
+            async def receive_response(self) -> Any:
+                if received[0]:
+                    return
+                received[0] = True
+                for msg in messages:
+                    counter[0] += 1
+                    yield msg
 
         mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            for msg in messages:
-                counter[0] += 1
-                yield msg
-
-        mock_sdk.query = mock_query
+        mock_sdk.ClaudeSDKClient = _CountingClient
         return mock_sdk
 
     @staticmethod
@@ -17737,21 +17786,14 @@ class TestCmdStartSlackPingResultText:
     @pytest.mark.unit
     def test_slack_ping_includes_sdk_result_text_on_clean_exit(self, tmp_path: Path) -> None:
         import sys
-        import types
 
         # SDK yields one ResultMessage with the NO_ACTIONABLE summary text the
         # orchestrate skill emits at end-of-backlog.
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
         class _FakeResultMessage:
             subtype = "success"
-            result = "Orchestration complete: NO_ACTIONABLE — 190/212 done, 11 blocked."
+            result = "Orchestration complete: NO_ACTIONABLE -- 190/212 done, 11 blocked."
 
-        async def mock_query(**kwargs: object) -> object:
-            yield _FakeResultMessage()
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module([_FakeResultMessage()])
 
         captured_reason: list[str] = []
 
@@ -17785,15 +17827,8 @@ class TestCmdStartSlackPingResultText:
         behaviour is a strict superset of the pre-fix implementation.
         """
         import sys
-        import types
 
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "plain string"  # not a ResultMessage
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module(["plain string"])  # not a ResultMessage
 
         captured_reason: list[str] = []
 
@@ -17840,15 +17875,7 @@ class TestCmdStartCancelDrainOnExit:
             encoding="utf-8",
         )
 
-        import types
-
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "plain string"
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module(["plain string"])
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -17869,7 +17896,6 @@ class TestCmdStartCancelDrainOnExit:
     def test_session_path_signal_cleared_on_clean_exit(self, tmp_path: Path) -> None:
         """drain.signal at per-session path is removed by finally clause on exit (#212)."""
         import sys
-        import types
 
         # Per-session path -- cmd_start sets DEVBENCH_SESSION_NAME=default
         signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
@@ -17879,13 +17905,7 @@ class TestCmdStartCancelDrainOnExit:
             encoding="utf-8",
         )
 
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "plain string"
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module(["plain string"])
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -17906,15 +17926,8 @@ class TestCmdStartCancelDrainOnExit:
     def test_no_drain_signal_present_no_error(self, tmp_path: Path) -> None:
         """cancel_drain in finally is idempotent: no signal present must not raise (#212)."""
         import sys
-        import types
 
-        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query(**kwargs: object) -> object:
-            yield "plain string"
-
-        mock_sdk.query = mock_query
+        mock_sdk = _make_fake_sdk_module(["plain string"])
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -18070,25 +18083,20 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
     tool-use for WU2).  When drain is pre-armed, enforcement fires at the
     WU2 claim and cmd_start must return 0 without proceeding to WU2.
     """
-    import types
-
     from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
 
-    mock_sdk: Any = types.ModuleType("claude_agent_sdk")
-    mock_sdk.ClaudeAgentOptions = MagicMock()
-
-    async def mock_query(**kwargs: object) -> object:
+    messages = [
         # Non-claim messages representing WU1 processing (text output, sub-tool calls, etc.)
-        yield AssistantMessage(
+        AssistantMessage(
             content=[TextBlock(text="Running devbench:orchestrate skill...")],
             model="claude-opus-4-5",
-        )
-        yield AssistantMessage(
+        ),
+        AssistantMessage(
             content=[TextBlock(text="WU1 executor complete; marking done...")],
             model="claude-opus-4-5",
-        )
+        ),
         # Claim message representing the WU2 attempt -- drain fires here.
-        yield AssistantMessage(
+        AssistantMessage(
             content=[
                 ToolUseBlock(
                     id="tu-wu2-claim",
@@ -18097,10 +18105,9 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
                 )
             ],
             model="claude-opus-4-5",
-        )
-
-    mock_sdk.query = mock_query
-    return mock_sdk
+        ),
+    ]
+    return _make_fake_sdk_module(messages)
 
 
 @pytest.fixture
@@ -18214,7 +18221,6 @@ class TestCmdStartPreArmDrain:
         which requires defining the generator inline.
         """
         import sys
-        import types
 
         from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
 
@@ -18228,36 +18234,49 @@ class TestCmdStartPreArmDrain:
 
         messages_seen: list[str] = []
 
+        msg1 = AssistantMessage(
+            content=[TextBlock(text="wu1-processing-message")],
+            model="claude-opus-4-5",
+        )
+        msg2 = AssistantMessage(
+            content=[TextBlock(text="wu1-done-message")],
+            model="claude-opus-4-5",
+        )
+        msg3 = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-wu2-claim",
+                    name="Bash",
+                    input={"command": "uv run devbench claim E1-F2-S1-T2"},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+
+        class _TrackingClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _TrackingClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                pass
+
+            async def receive_response(self) -> Any:
+                yield msg1
+                messages_seen.append("wu1-processing-message")
+                yield msg2
+                messages_seen.append("wu1-done-message")
+                yield msg3
+                messages_seen.append("wu2-claim-message")
+
         mock_sdk_counting: Any = types.ModuleType("claude_agent_sdk")
         mock_sdk_counting.ClaudeAgentOptions = MagicMock()
-
-        async def mock_query_counting(**kwargs: object) -> object:
-            msg1 = AssistantMessage(
-                content=[TextBlock(text="wu1-processing-message")],
-                model="claude-opus-4-5",
-            )
-            msg2 = AssistantMessage(
-                content=[TextBlock(text="wu1-done-message")],
-                model="claude-opus-4-5",
-            )
-            msg3 = AssistantMessage(
-                content=[
-                    ToolUseBlock(
-                        id="tu-wu2-claim",
-                        name="Bash",
-                        input={"command": "uv run devbench claim E1-F2-S1-T2"},
-                    )
-                ],
-                model="claude-opus-4-5",
-            )
-            yield msg1
-            messages_seen.append("wu1-processing-message")
-            yield msg2
-            messages_seen.append("wu1-done-message")
-            yield msg3
-            messages_seen.append("wu2-claim-message")
-
-        mock_sdk_counting.query = mock_query_counting
+        mock_sdk_counting.ClaudeSDKClient = _TrackingClient
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk_counting}),
@@ -20238,3 +20257,189 @@ class TestDaemonizeGuard:
         with patch("devbench.cli.os.name", "nt"):
             with pytest.raises(RuntimeError, match="--daemon requires POSIX"):
                 cli._daemonize_to_background(tmp_path)
+
+
+class TestCmdStartStatefulClient:
+    """Issue #262 (E10-F1-S2): cmd_start._run must use ClaudeSDKClient for stateful
+    in-session turn resumption.
+
+    AC-1: _run uses async with ClaudeSDKClient(options=...) as client, sends prompt via
+          client.query(), and iterates client.receive_response().
+    AC-2: a terminal ResultMessage (ALL_DONE / NO_ACTIONABLE) logs terminal exit and returns.
+    AC-3: a non-terminal ResultMessage logs [ORCHESTRATOR_TURN_END_NO_SENTINEL] and issues
+          client.query(continuation_prompt) into the same session with no process restart.
+    AC-5: continuation prompt is a verbatim constant with no em-dash.
+    AC-6: functional test drives _run() with a fake client, asserts continuation sent,
+          confirms loop does not hang via bounded counter pattern.
+    """
+
+    @staticmethod
+    def _result_msg(text: str) -> Any:
+        """Build a fake ResultMessage with the given result text."""
+
+        class _Msg:
+            result = text
+            subtype = "success"
+            num_turns = 1
+
+        return _Msg()
+
+    @staticmethod
+    def _non_result_msg() -> Any:
+        """Build a fake non-ResultMessage (e.g. AssistantMessage)."""
+
+        class _Msg:
+            pass
+
+        return _Msg()
+
+    @staticmethod
+    def _build_fake_sdk(
+        receive_sequences: list[list[Any]],
+        query_calls: list[str],
+    ) -> Any:
+        """Build a fake claude_agent_sdk module with a stateful ClaudeSDKClient.
+
+        The fake client yields message sequences from ``receive_sequences`` in
+        order -- one sequence per receive_response() call.  Each call to
+        ``client.query(prompt)`` appends ``prompt`` to ``query_calls`` so the
+        test can assert what was sent.
+
+        Args:
+            receive_sequences: List of message sequences; the i-th call to
+                receive_response() yields the i-th sequence.  If more calls
+                are made than sequences provided the iterator returns empty to
+                prevent the test from hanging.
+            query_calls: Mutable list; each client.query(prompt) call appends
+                ``prompt`` so assertions can verify the continuation.
+
+        Returns:
+            A fake claude_agent_sdk module with ClaudeAgentOptions and
+            ClaudeSDKClient attributes suitable for injection via
+            patch.dict(sys.modules, ...).
+        """
+        call_index: list[int] = [0]
+
+        class _FakeClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                query_calls.append(prompt)
+
+            async def receive_response(self) -> Any:
+                idx = call_index[0]
+                call_index[0] += 1
+                sequence = receive_sequences[idx] if idx < len(receive_sequences) else []
+                for msg in sequence:
+                    yield msg
+
+        fake_sdk: Any = types.ModuleType("claude_agent_sdk")
+        fake_sdk.ClaudeAgentOptions = MagicMock()
+        fake_sdk.ClaudeSDKClient = _FakeClient
+        return fake_sdk
+
+    @pytest.mark.functional
+    def test_terminal_result_message_logs_exit_and_returns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-2: a terminal ResultMessage (ALL_DONE) causes _run to log terminal exit
+        and return without sending a continuation prompt.
+        """
+        import logging
+        import sys
+
+        query_calls: list[str] = []
+        terminal_msg = self._result_msg("ALL_DONE")
+        non_result = self._non_result_msg()
+        fake_sdk = self._build_fake_sdk(
+            receive_sequences=[[non_result, terminal_msg]],
+            query_calls=query_calls,
+        )
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_TERMINAL_EXIT]" in log_text, f"terminal exit audit line missing; log: {log_text!r}"
+        assert "ALL_DONE" in log_text
+        # Only the initial orchestrate prompt was sent; no continuation after terminal.
+        assert len(query_calls) == 1, (
+            f"Expected exactly 1 query call (initial prompt only), got {len(query_calls)}: {query_calls}"
+        )
+
+    @pytest.mark.functional
+    def test_non_terminal_result_message_sends_continuation(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-3 + AC-6: a non-terminal ResultMessage triggers a continuation query
+        into the same client session; the loop does not hang (bounded counter pattern).
+        """
+        import logging
+        import sys
+
+        query_calls: list[str] = []
+        non_terminal = self._result_msg("orchestrator turn done -- non-terminal")
+        terminal = self._result_msg("ALL_DONE")
+        # First receive_response: yields non-terminal; second: yields terminal.
+        fake_sdk = self._build_fake_sdk(
+            receive_sequences=[[non_terminal], [terminal]],
+            query_calls=query_calls,
+        )
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_TURN_END_NO_SENTINEL]" in log_text, f"turn-end audit line missing; log: {log_text!r}"
+        # Initial prompt + exactly one continuation prompt.
+        assert len(query_calls) == 2, (
+            f"Expected 2 query calls (initial + continuation), got {len(query_calls)}: {query_calls}"
+        )
+        # Continuation must not contain em-dash (U+2014).
+        continuation = query_calls[1]
+        assert "\u2014" not in continuation, f"Continuation prompt must not contain em-dash; got: {continuation!r}"
+        # Continuation must instruct a tool call (check canonical keywords).
+        assert "tool" in continuation.lower() or "devbench next" in continuation, (
+            f"Continuation prompt must instruct a tool call; got: {continuation!r}"
+        )
+
+    @pytest.mark.functional
+    def test_continuation_prompt_constant_has_no_em_dash(self) -> None:
+        """AC-5: the ORCHESTRATOR_CONTINUATION_PROMPT constant must not contain an em-dash."""
+        from devbench.cli import ORCHESTRATOR_CONTINUATION_PROMPT
+
+        assert "\u2014" not in ORCHESTRATOR_CONTINUATION_PROMPT, (
+            f"ORCHESTRATOR_CONTINUATION_PROMPT must not contain em-dash (U+2014); "
+            f"got: {ORCHESTRATOR_CONTINUATION_PROMPT!r}"
+        )
+        assert len(ORCHESTRATOR_CONTINUATION_PROMPT) > 0, "ORCHESTRATOR_CONTINUATION_PROMPT must not be empty"
+
+    @pytest.mark.functional
+    def test_continuation_prompt_constant_instructs_tool_call(self) -> None:
+        """AC-5: the continuation prompt must instruct the agent to make a tool call."""
+        from devbench.cli import ORCHESTRATOR_CONTINUATION_PROMPT
+
+        text = ORCHESTRATOR_CONTINUATION_PROMPT.lower()
+        assert "tool" in text or "devbench next" in text, (
+            f"Continuation prompt must instruct a tool call; got: {ORCHESTRATOR_CONTINUATION_PROMPT!r}"
+        )

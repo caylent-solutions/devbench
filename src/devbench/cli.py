@@ -6820,9 +6820,10 @@ def _is_claim_tool_use(message: object) -> bool:
     are supported without a hard import of ``claude_agent_sdk.types``.
 
     Args:
-        message: Any object emitted by the :func:`claude_agent_sdk.query` async
-            generator.  Objects without a ``content`` list attribute always
-            return ``False``.
+        message: Any object emitted by the
+            ``ClaudeSDKClient.receive_response()`` async iterator.
+            Objects without a ``content`` list attribute always return
+            ``False``.
 
     Returns:
         ``True`` if *message* is a Bash claim tool use; ``False`` otherwise.
@@ -7176,6 +7177,22 @@ _TERMINAL_ORCHESTRATE_MARKERS: tuple[str, ...] = ("ALL_DONE", "NO_ACTIONABLE")
 #: shape of ``_ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX``.  Issue #218.
 _ORCHESTRATOR_TERMINAL_EXIT_AUDIT_PREFIX: str = "[ORCHESTRATOR_TERMINAL_EXIT] reason="
 
+#: Issue #262 (E10-F1-S2): audit prefix emitted when a non-terminal ResultMessage
+#: is detected and the orchestrator issues an in-session continuation query.
+_ORCHESTRATOR_TURN_END_NO_SENTINEL_AUDIT: str = "[ORCHESTRATOR_TURN_END_NO_SENTINEL]"
+
+#: Issue #262 (E10-F1-S2): verbatim continuation prompt sent to the same
+#: ClaudeSDKClient session when a non-terminal ResultMessage is observed.
+#: Must not contain an em-dash (U+2014) per code standards; uses -- (double
+#: hyphen) for any separators.  Instructs the agent that its next action
+#: must be a tool call -- specifically running devbench next and acting on
+#: the dispatch result -- rather than generating a summary.
+ORCHESTRATOR_CONTINUATION_PROMPT: str = (
+    "Your previous turn ended without a terminal sentinel (ALL_DONE / NO_ACTIONABLE). "
+    "Your next action MUST be a tool call -- run `uv run devbench next` and act on its "
+    "dispatch. Do not summarise; do not output plain text. Invoke the tool now."
+)
+
 
 def _is_terminal_orchestrate_result(text: str | None) -> bool:
     """Issue #218: True iff ``text`` carries one of the orchestrate
@@ -7216,6 +7233,52 @@ def _log_terminal_exit_if_applicable(text: str | None) -> bool:
     if not _is_terminal_orchestrate_result(text):
         return False
     logger.info("%s%s", _ORCHESTRATOR_TERMINAL_EXIT_AUDIT_PREFIX, text)
+    return True
+
+
+async def _handle_result_message(message: object, client: Any) -> bool:
+    """Issue #262 (E10-F1-S2): handle a non-terminal ResultMessage turn boundary.
+
+    When ``message`` is a ResultMessage (detected by :func:`_is_sdk_result_message`)
+    and its result text is NOT a terminal sentinel, logs
+    ``[ORCHESTRATOR_TURN_END_NO_SENTINEL]`` and issues
+    ``client.query(ORCHESTRATOR_CONTINUATION_PROMPT)`` into the same session,
+    then returns ``True`` so the caller breaks the ``async for`` and continues
+    the outer ``while True`` to iterate ``receive_response()`` again.
+
+    Returns ``False`` in all other cases:
+
+    - ``message`` is not a ResultMessage (not detected by ``_is_sdk_result_message``).
+    - ``message`` IS a ResultMessage but carries a terminal sentinel -- the caller's
+      ``_log_terminal_exit_if_applicable`` check fires first and returns before this
+      function is reached, so this case never occurs in practice.
+
+    Extracted from ``_run`` so the receive-loop branch count stays under
+    ruff PLR0912's 12-branch cap.
+
+    Args:
+        message: The SDK message to inspect.
+        client: The live ``ClaudeSDKClient`` instance (typed as ``Any`` for
+            duck-typing); its ``query`` coroutine is awaited on a non-terminal
+            turn boundary.
+
+    Returns:
+        ``True`` when a non-terminal turn boundary was detected and a
+        continuation query was issued (caller should break the async for).
+        ``False`` otherwise (caller should continue iterating).
+    """
+    if not _is_sdk_result_message(message):
+        return False
+    # At this point the message IS a ResultMessage.  The terminal-sentinel
+    # check already ran in the caller (via _log_terminal_exit_if_applicable);
+    # if we arrive here the result is non-terminal: issue the continuation.
+    result_text = _extract_sdk_result_text(message)
+    logger.info(
+        "%s result=%r",
+        _ORCHESTRATOR_TURN_END_NO_SENTINEL_AUDIT,
+        result_text,
+    )
+    await client.query(ORCHESTRATOR_CONTINUATION_PROMPT)
     return True
 
 
@@ -7566,7 +7629,7 @@ def cmd_start(*argv: str) -> int:
         as-is through the asyncio boundary; :class:`_DrainRequested` is
         caught here and handled as a clean exit.
     """
-    from claude_agent_sdk import ClaudeAgentOptions, query
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
     from devbench.instances import remove_pid_file
 
@@ -7668,43 +7731,57 @@ def cmd_start(*argv: str) -> int:
     _sdk_result_text: str | None = None
 
     async def _run() -> None:
-        """Iterate SDK messages with drain enforcement.
+        """Drive a stateful ClaudeSDKClient session with drain enforcement.
 
-        Processes SDK messages and raises :class:`_DrainRequested` when a
-        ``devbench claim`` tool-use is detected while a drain is pending.
+        Opens a single ``ClaudeSDKClient`` context, sends the orchestrate
+        prompt, and iterates ``client.receive_response()``.  On each turn
+        boundary (ResultMessage), delegates to :func:`_handle_result_message`
+        which either logs the terminal exit (breaking out) or issues an
+        in-session continuation query (keeping the same session alive).
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
         Raises:
             _DrainRequested: A drain signal is present when a ``cmd_claim``
                 tool-use is observed.
+            _QuotaDetected: A quota error is detected in the SDK message stream.
         """
         nonlocal _sdk_result_text
-        async for message in query(
-            prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-            options=ClaudeAgentOptions(
-                plugins=[{"type": "local", "path": str(plugin_path)}],
-                permission_mode="bypassPermissions",
-            ),
-        ):
-            logger.info("sdk message: %s", message)
-            _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-            if _log_terminal_exit_if_applicable(_sdk_result_text):
-                return
-            # Issue #236: per-message quota detection (AC-236-1). Check
-            # before the drain-on-claim path so a quota hit is not masked
-            # by an unrelated claim check.
-            _qe = detect_quota_error(message)
-            if _qe is not None:
-                raise _QuotaDetected(_qe)
-            # Issue #188 + #212: drain-on-claim short-circuit. Combined
-            # condition (rather than nested ifs) keeps ``_run`` under
-            # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
-            # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
-            if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
-                raise _DrainRequested(drain_state.reason)
-        # Clean exit from the SDK loop -- done.
-        return
+        options = ClaudeAgentOptions(
+            plugins=[{"type": "local", "path": str(plugin_path)}],
+            permission_mode="bypassPermissions",
+        )
+        _orchestrate_prompt = "Run the devbench-orchestrate:orchestrate skill to process the backlog until complete"
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(_orchestrate_prompt)
+            while True:
+                async for message in client.receive_response():
+                    logger.info("sdk message: %s", message)
+                    _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+                    # Issue #218: check terminal sentinel on every message that
+                    # carries result text; break immediately to avoid re-invoking.
+                    if _log_terminal_exit_if_applicable(_sdk_result_text):
+                        return
+                    # Issue #262 (E10-F1-S2): handle ResultMessage turn boundary.
+                    # Delegates to _handle_result_message; terminal case already
+                    # returned above, so True here means continuation was issued.
+                    if await _handle_result_message(message, client):
+                        break
+                    # Issue #236: per-message quota detection (AC-236-1). Check
+                    # before the drain-on-claim path so a quota hit is not masked
+                    # by an unrelated claim check.
+                    _qe = detect_quota_error(message)
+                    if _qe is not None:
+                        raise _QuotaDetected(_qe)
+                    # Issue #188 + #212: drain-on-claim short-circuit. Combined
+                    # condition (rather than nested ifs) keeps ``_run`` under
+                    # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
+                    # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
+                    if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
+                        raise _DrainRequested(drain_state.reason)
+                else:
+                    # receive_response exhausted without a turn-boundary: loop is done.
+                    return
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop

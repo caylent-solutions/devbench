@@ -781,3 +781,10 @@ class TestAutoResolveConstants:
         from devbench.constants import DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV
 
         assert DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV == "DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS"
+
+    def test_escalated_string_is_correct(self) -> None:
+        from devbench.constants import AUTO_RESOLVE_ESCALATED_STRING
+
+        assert AUTO_RESOLVE_ESCALATED_STRING == "[AUTO_RESOLVE_ESCALATED]", (
+            f"Escalation audit string must equal '[AUTO_RESOLVE_ESCALATED]'; got {AUTO_RESOLVE_ESCALATED_STRING!r}"
+        )

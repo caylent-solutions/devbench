@@ -923,6 +923,10 @@ DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS: int = 3
 # Field order: [AUTO_RESOLVED] task_id=<id> signature=<sig> remediation=<verb>.
 AUTO_RESOLVE_AUDIT_STRING: str = "[AUTO_RESOLVED]"
 
+# Verbatim audit string logged when the per-(task_id, signature) budget is
+# exhausted and the engine escalates to operator advise-only mode (E11-F1-S2, spec Section 7).
+AUTO_RESOLVE_ESCALATED_STRING: str = "[AUTO_RESOLVE_ESCALATED]"
+
 # Non-destructive whitelist: only these remediation verbs may be auto-applied.
 # Derived from the E7-F3 seven-bucket remediation matrix (spec Section 4 E11-F1-S1 AC-2).
 # re-queue and set-status in-queue are semantically equivalent paths for the same action.

@@ -1712,6 +1712,24 @@ since the last release. PR #119 carries every change.
   + `tests/test_config_loader.py::TestHookTailConfig` cover global-
   only / full-override / partial-override / schema rejection of
   non-positive caps and unknown keys.
+- **Turn-end resilience: two-layer liveness model** (issue #262). The
+  orchestrator now has an in-process inactivity-timeout net that detects model
+  silence within a running session and issues bounded in-session continuation
+  prompts (Layer 1 -- auto-recovery), operating independently from the existing
+  external `devbench watchdog` detect-only flag writer (Layer 2). The two layers
+  share no code and use separate, independently configurable thresholds:
+  `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS` (float; default 300.0;
+  `<= 0` disables) governs the per-message inactivity timer; and
+  `DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS` (int; default 5) caps the
+  consecutive non-terminal continuation budget before the process exits rc=43
+  (`ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE`). rc=43 is distinct
+  from the auto-restart rc=42 so the wrapping loop never misclassifies fail-fast
+  as a safe restart. The external watchdog (`devbench watchdog`) remains unchanged
+  -- it polls log quiescence after the process exits and writes
+  `needs-restart.flag` for operator action. See `docs/cli-reference.md` section
+  "Liveness / turn-end recovery -- two-layer model" for the full operator
+  reference.
+
 - **Data-residency and fast-mode multipliers applied per-call**
   (issue #124). `_compute_cost` now accepts
   `data_residency_multiplier` (default 1.10 from

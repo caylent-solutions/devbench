@@ -264,6 +264,32 @@ watch -n 60 'uv run devbench watchdog --print-if-stuck'
 
 The watchdog never attempts to restart orchestration itself. Restarts remain under operator control because they may overlap with manual edits and affect billing.
 
+#### Liveness / turn-end recovery -- two-layer model
+
+Devbench uses two independent, non-overlapping layers to detect and respond to orchestrator stalls. The layers share no code and use separate, independently configurable thresholds.
+
+**Layer 1 -- In-process auto-recovery net (inactivity timeout + bounded in-session continuation)**
+
+This layer runs inside the `devbench start` process. It monitors the time elapsed since the last meaningful orchestrator message within a single SDK session. When the elapsed time exceeds `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS`, the orchestrator issues an in-session continuation prompt to nudge the model back into action. These continuations are bounded: once the in-session resume loop has issued `DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS` consecutive non-terminal continuations without progress, the process exits with rc=43 (`ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE`) and logs `[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]`. The wrapping `make start` loop detects rc=43 (distinct from rc=42) and does NOT apply the auto-restart path -- fail-fast is intentional once the budget is exhausted.
+
+Config keys for Layer 1:
+
+| Environment variable | Type | Default | Notes |
+|----------------------|------|---------|-------|
+| `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS` | float | `300.0` | Seconds of silence before an in-session continuation is issued. A value `<= 0` disables the inactivity check entirely (the continuation budget is never consumed). |
+| `DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS` | int | `5` | Maximum number of consecutive non-terminal continuations allowed before the process exits rc=43. Must be a positive integer when the inactivity check is active. |
+
+**Layer 2 -- External detect-only watchdog (`devbench watchdog`)**
+
+This layer runs outside the `devbench start` process -- as a cron job, a shell-prompt hook, or a terminal watcher (see typical integrations above). It polls the orchestrator log and the BACKLOG state, writes a `needs-restart.flag` file when a stall is detected, and then exits. It does NOT attempt to restart orchestration, issue continuations, or modify any in-process state. Its idle threshold (`--idle-minutes`, default 5 minutes) is a wall-clock check on log quiescence -- completely independent of Layer 1's per-message inactivity timer.
+
+**When each layer fires:**
+
+- Layer 1 fires entirely within the running session when the SDK model goes quiet for `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS` seconds. If the model recovers (emits a tool call) before the budget is exhausted, no external action is needed and the session continues normally.
+- Layer 2 fires after the external poll interval (typically 5 minutes of log quiescence) regardless of whether Layer 1 already recovered. If Layer 1 exited rc=43 and the wrapping loop did not restart, Layer 2 will eventually detect the stale `in-progress` marker and write the flag file.
+
+**The two layers are complementary, not redundant.** Layer 1 auto-recovers transient model stalls in-session without operator involvement. Layer 2 provides an operator-visible signal for cases where the entire process has exited or the wrapping loop itself is absent. Neither layer replaces the other.
+
 ### `cost-calibrate`
 
 ```

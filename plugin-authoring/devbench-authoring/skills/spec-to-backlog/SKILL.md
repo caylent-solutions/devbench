@@ -453,3 +453,17 @@ or when the iteration budget is exhausted (escalation). Use the helpers in
 The audit tags `[SKILL_MAX_ITERATIONS_REACHED]` and
 `[SKILL_QUALITY_THRESHOLD_REACHED]` flow through the existing report and
 hook-tail pipelines without any new infrastructure.
+
+---
+
+## Reusable Workflow Authoring Patterns
+
+For Workflow-mode invocations that apply multi-round authoring with fan-out,
+adversarial verification, decisions-ledger tie-breaking, deterministic gates,
+file-partitioned parallel repair, or file-based agent output, consult the
+shared patterns reference rather than implementing the patterns inline:
+
+`docs/workflow-authoring-patterns.md`
+
+Each pattern is defined once in that document with a generic form that applies
+to any spec or backlog domain. Do not restate pattern bodies in this SKILL.md.

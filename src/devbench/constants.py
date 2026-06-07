@@ -518,6 +518,13 @@ DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
 # is the operator-pain failure mode #223 is filed against.
 DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)
 
+# Marker written idempotently by ``cmd_claim`` when the target repo declared
+# in a work-unit file cannot be resolved. The classifier in
+# ``backlog/proposal.py`` detects this marker at OPERATOR_ACTION_REQUIRED
+# priority so the operator sees the block without automation attempting a
+# recovery cycle. Format: ``[BLOCKED_TARGET_REPO_UNRESOLVED] <repo-name>``.
+BLOCKED_TARGET_REPO_UNRESOLVED_MARKER: str = "[BLOCKED_TARGET_REPO_UNRESOLVED]"
+
 # Em-dash (U+2014). Prohibited in work-unit markdown files by the
 # validate-backlog Check 10 (manager.py). Any CLI writer that accepts
 # free-form agent text must reject em-dash at the input boundary so the
@@ -599,6 +606,14 @@ SUBPROCESS_ERROR_EXIT_CODE: int = 127
 # times. Any other exit (0 = clean, anything-else = real failure) is
 # passed through unchanged.
 ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
+
+# Exit code emitted by ``cmd_claim`` when the target repo declared in a
+# work-unit file cannot be resolved by ``resolve_repo`` (unknown org/name or
+# short-name alias). The claim aborts before any lock is acquired; the
+# work-unit is set to ``blocked`` with a ``[BLOCKED_TARGET_REPO_UNRESOLVED]``
+# marker. Value 44 is distinct from all other devbench exit codes.
+CLAIM_BLOCKED_PRECLAIM: int = 44
+assert CLAIM_BLOCKED_PRECLAIM == 44, "CLAIM_BLOCKED_PRECLAIM must equal 44 (spec Section 5)"
 
 # Exit code emitted by ``cmd_get_diff`` in defer-PR mode when staged and
 # unstaged changes are both empty AND no task-attributed commit exists on the

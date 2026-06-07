@@ -165,6 +165,8 @@ from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
     BACKLOG_STATUS_RE,
+    BLOCKED_TARGET_REPO_UNRESOLVED_MARKER,
+    CLAIM_BLOCKED_PRECLAIM,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
@@ -191,6 +193,7 @@ from devbench.constants import (
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
+    STATUS_LINE_RE,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
     VALID_TDD_PHASES,
@@ -1291,6 +1294,20 @@ def cmd_claim(unit_id: str) -> int:
         )
         return 1
 
+    # Pre-claim target-repo guard (issue #241). Resolve the repo before
+    # acquiring any lock. On failure: write the idempotent marker, set
+    # blocked, and return CLAIM_BLOCKED_PRECLAIM (44) without a lock.
+    try:
+        resolve_repo(unit.repo)
+    except ValueError:
+        _claim_write_unresolved_repo_marker(wu_file, unit_id, unit.repo)
+        print(
+            f"ERROR: cannot claim {unit_id!r}: target repo {unit.repo!r} is not in the allowed "
+            f"repos list. {BLOCKED_TARGET_REPO_UNRESOLVED_MARKER} {unit.repo}",
+            file=sys.stderr,
+        )
+        return CLAIM_BLOCKED_PRECLAIM
+
     session_name: str | None = os.environ.get("DEVBENCH_SESSION_NAME", "").strip() or None
     error_message = _claim_under_lock(wu_file, unit_id, session_name)
     if error_message is not None:
@@ -1300,6 +1317,56 @@ def cmd_claim(unit_id: str) -> int:
     logger.info("Claimed %s (set to in-progress)", unit_id)
     print(f"Claimed {unit_id}")
     return 0
+
+
+def _claim_write_unresolved_repo_marker(wu_file: Path, unit_id: str, repo: str) -> None:
+    """Idempotently write the [BLOCKED_TARGET_REPO_UNRESOLVED] marker to wu_file.
+
+    Reads wu_file to check whether the marker is already present. If so,
+    returns immediately (no duplicate write). Otherwise:
+
+    1. Rewrites the ``## Status:`` line to ``blocked`` directly in wu_file.
+    2. Appends a timestamped audit comment embedding the marker tag.
+    3. Calls ``BacklogManager().mark_blocked`` to synchronise BACKLOG_INDEX
+       (the index row must also reflect ``blocked``). The mark_blocked call
+       will find the status line already set to ``blocked`` in wu_file and
+       write only the BACKLOG_INDEX row.
+
+    The marker is written directly to wu_file (steps 1-2) before the
+    BacklogManager call so that the idempotency guard is file-based:
+    a repeat invocation after a partial failure (e.g. BACKLOG_INDEX write
+    fails) will not duplicate the WU-file comment.
+
+    Args:
+        wu_file: Absolute path to the work-unit ``.md`` file.
+        unit_id: Work-unit identifier used in the mark_blocked call.
+        repo: The unresolvable repo name embedded in the marker tag.
+    """
+    from datetime import UTC, datetime
+
+    marker_tag = f"{BLOCKED_TARGET_REPO_UNRESOLVED_MARKER} {repo}"
+    content = wu_file.read_text(encoding="utf-8")
+    if marker_tag in content:
+        return
+
+    # Rewrite the status line to blocked in the WU file.
+    updated = STATUS_LINE_RE.sub(r"\g<1>blocked", content)
+    # Append the audit comment embedding the marker tag.
+    timestamp = datetime.now(UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    entry = f"[{timestamp}] [backlog_manager] [BLOCKED] target repo unresolvable: {marker_tag}\n"
+    if COMMENTS_SECTION_HEADER in updated:
+        updated = updated.rstrip("\n") + "\n\n" + entry
+    else:
+        updated = updated.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+    wu_file.write_text(updated, encoding="utf-8")
+
+    # Synchronise the BACKLOG_INDEX row to ``blocked``. ``force_status`` updates
+    # both the WU file status line and the index row without appending a second
+    # audit comment (unlike ``mark_blocked`` which would append a duplicate).
+    # The WU file status is already ``blocked`` from the direct write above;
+    # ``_set_status`` rewrites it to the same value (idempotent on the WU file)
+    # while correctly updating the index row.
+    BacklogManager().force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_BLOCKED)
 
 
 def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:

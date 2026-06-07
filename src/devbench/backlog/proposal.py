@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.constants import (
+    BLOCKED_TARGET_REPO_UNRESOLVED_MARKER,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
@@ -274,6 +275,15 @@ _RUNTIME_DEGRADATION_BODY_RE: re.Pattern[str] = re.compile(
 # matches the default review cycle; a longer-lived degradation marker
 # implies the operator already saw the alert and (perhaps) is debugging.
 _RUNTIME_DEGRADATION_WINDOW_SECONDS: int = 24 * 60 * 60
+
+# Issue #241: marker written by ``cmd_claim`` when the target repo cannot
+# be resolved. A work unit carrying this marker requires operator action
+# (fix the repo name in the WU file); no automated recovery is possible.
+# Pattern matches the bracketed tag appearing anywhere in the Comments
+# section content. Case-sensitive: the tag is always upper-case.
+_TARGET_REPO_UNRESOLVED_RE: re.Pattern[str] = re.compile(
+    re.escape(BLOCKED_TARGET_REPO_UNRESOLVED_MARKER),
+)
 
 
 def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
@@ -561,6 +571,9 @@ def _classify_structural_bucket(
     ``classify_blocked_task_excluding_degradation``. Decision priority:
 
     1. ``HELD`` -- the task's own status in the backlog index is ``hold``.
+    1a. ``OPERATOR_ACTION_REQUIRED`` -- the WU file carries the
+       ``[BLOCKED_TARGET_REPO_UNRESOLVED]`` marker (issue #241). Operator
+       must correct the repo name before any automation can proceed.
     2. ``BLOCKED_ON_HELD`` / ``AUTO_CLEARING_VIA_PROPOSAL`` -- via
        ``[BLOCKED_PENDING_PROPOSAL]`` markers (``_classify_with_markers``).
     3. ``AWAITING_DEPENDENCY`` -- regular Dependencies-table row points at a
@@ -575,6 +588,13 @@ def _classify_structural_bucket(
         return BlockedTaskState.HELD
 
     if source_file is None:
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    # Priority 1a: OPERATOR_ACTION_REQUIRED -- the WU file carries the
+    # [BLOCKED_TARGET_REPO_UNRESOLVED] marker (issue #241). The target repo
+    # is not in the allowed-repos list; no automated recovery can proceed
+    # until the operator corrects the repo name in the WU file.
+    if _has_unresolved_repo_marker(source_file):
         return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
     mgr = BacklogManager()
@@ -605,6 +625,24 @@ def _classify_structural_bucket(
         recovery_window_seconds=recovery_window_seconds,
         all_markers_terminal=all_markers_terminal,
     )
+
+
+def _has_unresolved_repo_marker(source_file: Path) -> bool:
+    """Return ``True`` iff the WU file contains the [BLOCKED_TARGET_REPO_UNRESOLVED] marker.
+
+    Used by ``_classify_structural_bucket`` at priority 1a (after HELD, before
+    the [BLOCKED_PENDING_PROPOSAL] check) to short-circuit to
+    ``OPERATOR_ACTION_REQUIRED``. A unresolvable-repo block cannot be
+    auto-recovered; the operator must fix the repo name in the WU file.
+
+    Falls back to ``False`` on read error so the classifier never masks an
+    otherwise detectable blocked state.
+    """
+    try:
+        content = source_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(_TARGET_REPO_UNRESOLVED_RE.search(content))
 
 
 def _task_status_is_hold(backlog_root: Path, backlog_index: Path, task_id: str) -> bool:

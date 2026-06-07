@@ -128,6 +128,62 @@ class TestCascadeDepthConstant:
         assert DEFAULT_MAX_CASCADE_DEPTH == 2
 
 
+class TestClaimBlockedPreclaim:
+    """CLAIM_BLOCKED_PRECLAIM exit code constant (issue #241)."""
+
+    @pytest.mark.unit
+    def test_claim_blocked_preclaim_equals_44(self) -> None:
+        """CLAIM_BLOCKED_PRECLAIM is defined as integer 44 (spec Section 5)."""
+        from devbench.constants import CLAIM_BLOCKED_PRECLAIM
+
+        assert CLAIM_BLOCKED_PRECLAIM == 44
+
+    @pytest.mark.unit
+    def test_claim_blocked_preclaim_is_int(self) -> None:
+        """CLAIM_BLOCKED_PRECLAIM is an int, not a float or string."""
+        from devbench.constants import CLAIM_BLOCKED_PRECLAIM
+
+        assert isinstance(CLAIM_BLOCKED_PRECLAIM, int)
+
+    @pytest.mark.unit
+    def test_claim_blocked_preclaim_distinct_from_other_exit_codes(self) -> None:
+        """CLAIM_BLOCKED_PRECLAIM is distinct from all other named exit codes."""
+        from devbench.constants import (
+            CLAIM_BLOCKED_PRECLAIM,
+            GET_DIFF_NO_ATTRIBUTABLE,
+            ORCHESTRATOR_RESTART_EXIT_CODE,
+            SUBPROCESS_ERROR_EXIT_CODE,
+        )
+
+        assert CLAIM_BLOCKED_PRECLAIM != ORCHESTRATOR_RESTART_EXIT_CODE
+        assert CLAIM_BLOCKED_PRECLAIM != SUBPROCESS_ERROR_EXIT_CODE
+        assert CLAIM_BLOCKED_PRECLAIM != GET_DIFF_NO_ATTRIBUTABLE
+        assert CLAIM_BLOCKED_PRECLAIM != 0
+        assert CLAIM_BLOCKED_PRECLAIM != 1
+
+    @pytest.mark.unit
+    def test_blocked_target_repo_unresolved_marker_is_importable(self) -> None:
+        """BLOCKED_TARGET_REPO_UNRESOLVED_MARKER is importable from devbench.constants."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "BLOCKED_TARGET_REPO_UNRESOLVED_MARKER")
+
+    @pytest.mark.unit
+    def test_blocked_target_repo_unresolved_marker_is_str(self) -> None:
+        """BLOCKED_TARGET_REPO_UNRESOLVED_MARKER is a non-empty str."""
+        from devbench.constants import BLOCKED_TARGET_REPO_UNRESOLVED_MARKER
+
+        assert isinstance(BLOCKED_TARGET_REPO_UNRESOLVED_MARKER, str)
+        assert len(BLOCKED_TARGET_REPO_UNRESOLVED_MARKER) > 0
+
+    @pytest.mark.unit
+    def test_blocked_target_repo_unresolved_marker_value(self) -> None:
+        """BLOCKED_TARGET_REPO_UNRESOLVED_MARKER equals the verbatim tag string."""
+        from devbench.constants import BLOCKED_TARGET_REPO_UNRESOLVED_MARKER
+
+        assert BLOCKED_TARGET_REPO_UNRESOLVED_MARKER == "[BLOCKED_TARGET_REPO_UNRESOLVED]"
+
+
 class TestGetDiffNoAttributableConstant:
     """GET_DIFF_NO_ATTRIBUTABLE exit code constant (issue #247)."""
 

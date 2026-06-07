@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import re
 import types
@@ -5238,6 +5239,210 @@ class TestCmdGitOpsFinalizeHappyPath:
             result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
 
         assert result == 2
+
+
+class TestClassifyNormalExitReason:
+    """E14-F1-S1-T1: _classify_normal_exit_reason maps each normal-exit class
+    to the correct stop-reason token (issue #271).
+
+    Exit classes covered:
+    - premature-turn-end: no terminal sentinel in sdk_result_text
+    - completion (ALL_DONE): sdk_result_text contains ALL_DONE
+    - completion (NO_ACTIONABLE): sdk_result_text contains NO_ACTIONABLE
+    - completion (NO_ACTIONABLE_IN_SCOPE): sdk_result_text contains NO_ACTIONABLE_IN_SCOPE
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("sdk_result_text", "expected"),
+        [
+            (None, "premature-turn-end"),
+            ("", "premature-turn-end"),
+            ("ALL_DONE", "clean exit: ALL_DONE"),
+            ("NO_ACTIONABLE -- 5/10 done, 2 blocked", "clean exit: NO_ACTIONABLE -- 5/10 done, 2 blocked"),
+            ("NO_ACTIONABLE_IN_SCOPE -- scope exhausted", "clean exit: NO_ACTIONABLE_IN_SCOPE -- scope exhausted"),
+        ],
+    )
+    def test_classify_normal_exit_reason(self, sdk_result_text: str | None, expected: str) -> None:
+        """Each sdk_result_text value maps to the correct stop-reason token."""
+        from devbench.cli import _classify_normal_exit_reason
+
+        result = _classify_normal_exit_reason(sdk_result_text)
+        assert result == expected, (
+            f"_classify_normal_exit_reason({sdk_result_text!r}) returned {result!r}; expected {expected!r}"
+        )
+
+    @pytest.mark.unit
+    def test_classify_normal_exit_reason_never_returns_clean(self) -> None:
+        """The literal token 'clean' must never be returned by _classify_normal_exit_reason.
+
+        AC-1: a normal loop return caused by a non-terminal ResultMessage must
+        yield 'premature-turn-end', never the literal 'clean'.
+        """
+        from devbench.cli import _classify_normal_exit_reason
+
+        result = _classify_normal_exit_reason(None)
+        assert result != "clean", f"_classify_normal_exit_reason(None) must not return 'clean'; got {result!r}"
+
+
+class TestCmdStartStopReasonClassification:
+    """E14-F1-S1-T1: cmd_start exit-class classification for each exit type.
+
+    AC-1: premature-turn-end via non-terminal ResultMessage(end_turn, result='')
+          yields 'premature-turn-end', never 'clean'.
+    AC-2: ALL_DONE / NO_ACTIONABLE yield completion reason; drain, interrupt,
+          crash, quota-exhausted keep their existing labels.
+    AC-3: the reason is written to the audit log and to the notification.
+    AC-4: parametrized test for each exit class.
+    """
+
+    @staticmethod
+    def _make_result_message(result: str) -> Any:
+        """Build a duck-typed ResultMessage-like object."""
+
+        @dataclasses.dataclass
+        class _FakeResultMsg:
+            subtype: str = "success"
+            num_turns: int = 1
+            result: str = ""
+
+        return _FakeResultMsg(result=result)
+
+    @pytest.mark.unit
+    def test_premature_turn_end_yields_premature_token(self, tmp_path: Path) -> None:
+        """AC-1: non-terminal ResultMessage(end_turn, result='') => 'premature-turn-end', not 'clean'."""
+        import sys
+
+        # A ResultMessage with empty result triggers a continuation; after
+        # the budget is exhausted the loop ends.  Build a fake SDK that yields
+        # exactly one non-terminal ResultMessage (empty result) and then
+        # exhausts, causing a premature turn-end.
+        premature_msg = self._make_result_message("")
+        mock_sdk = _make_fake_sdk_module([premature_msg])
+
+        captured_reason: list[str] = []
+
+        def _capture(reason: str) -> None:
+            captured_reason.append(reason)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._fire_orchestrator_stop_notification", _capture),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_reason, "orchestrator_stop notification was not fired"
+        reason = captured_reason[-1]
+        assert reason == "premature-turn-end", (
+            f"non-terminal ResultMessage(result='') must yield 'premature-turn-end'; got {reason!r}"
+        )
+        assert reason != "clean", (
+            f"AC-1 violated: stop reason must not be 'clean' for premature turn-end; got {reason!r}"
+        )
+
+    @pytest.mark.unit
+    def test_all_done_yields_completion_reason(self, tmp_path: Path) -> None:
+        """AC-2: ALL_DONE sentinel => completion reason containing 'ALL_DONE'."""
+        import sys
+
+        terminal_msg = self._make_result_message("ALL_DONE")
+        mock_sdk = _make_fake_sdk_module([terminal_msg])
+
+        captured_reason: list[str] = []
+
+        def _capture(reason: str) -> None:
+            captured_reason.append(reason)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._fire_orchestrator_stop_notification", _capture),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_reason, "orchestrator_stop notification was not fired"
+        reason = captured_reason[-1]
+        assert "ALL_DONE" in reason, f"ALL_DONE terminal sentinel must appear in stop reason; got {reason!r}"
+
+    @pytest.mark.unit
+    def test_no_actionable_yields_completion_reason(self, tmp_path: Path) -> None:
+        """AC-2: NO_ACTIONABLE sentinel => completion reason containing 'NO_ACTIONABLE'."""
+        import sys
+
+        terminal_msg = self._make_result_message("NO_ACTIONABLE -- 5/10 done, 2 blocked")
+        mock_sdk = _make_fake_sdk_module([terminal_msg])
+
+        captured_reason: list[str] = []
+
+        def _capture(reason: str) -> None:
+            captured_reason.append(reason)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._fire_orchestrator_stop_notification", _capture),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_reason, "orchestrator_stop notification was not fired"
+        reason = captured_reason[-1]
+        assert "NO_ACTIONABLE" in reason, f"NO_ACTIONABLE terminal sentinel must appear in stop reason; got {reason!r}"
+
+    @pytest.mark.unit
+    def test_stop_reason_written_to_audit_log(self, tmp_path: Path, caplog: Any) -> None:
+        """AC-3: stop reason is written verbatim to the audit log."""
+        import logging
+        import sys
+
+        premature_msg = self._make_result_message("")
+        mock_sdk = _make_fake_sdk_module([premature_msg])
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_STOP_REASON]" in log_text, (
+            f"AC-3: stop reason must be written to audit log with [ORCHESTRATOR_STOP_REASON] prefix; "
+            f"got log_text={log_text!r}"
+        )
+        assert "premature-turn-end" in log_text, (
+            f"AC-3: 'premature-turn-end' must appear in audit log; got log_text={log_text!r}"
+        )
+
+    @pytest.mark.unit
+    def test_completion_reason_written_to_audit_log(self, tmp_path: Path, caplog: Any) -> None:
+        """AC-3: completion reason is written verbatim to the audit log for terminal exits."""
+        import logging
+        import sys
+
+        terminal_msg = self._make_result_message("ALL_DONE")
+        mock_sdk = _make_fake_sdk_module([terminal_msg])
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_STOP_REASON]" in log_text, (
+            f"AC-3: audit log must contain [ORCHESTRATOR_STOP_REASON] prefix; got {log_text!r}"
+        )
+        assert "ALL_DONE" in log_text, f"AC-3: 'ALL_DONE' must appear in audit log; got {log_text!r}"
 
 
 class TestLabelStopReason:
@@ -17821,10 +18026,12 @@ class TestCmdStartSlackPingResultText:
         assert reason != "clean", "Slack reason 'clean' alone is insufficient -- must carry the SDK result text (#217)"
 
     @pytest.mark.unit
-    def test_slack_ping_falls_back_to_clean_when_no_result_message(self, tmp_path: Path) -> None:
-        """When the SDK never emits a ResultMessage (degenerate / mock test
-        scenario), the legacy ``"clean"`` reason is preserved so existing
-        behaviour is a strict superset of the pre-fix implementation.
+    def test_slack_ping_yields_premature_turn_end_when_no_terminal_sentinel(self, tmp_path: Path) -> None:
+        """When the SDK never emits a terminal-sentinel ResultMessage, the stop
+        reason must be 'premature-turn-end' (not the legacy bare 'clean').
+
+        E14-F1-S1-T1 AC-1: the literal 'clean' must never appear when no
+        terminal sentinel was seen.
         """
         import sys
 
@@ -17848,8 +18055,8 @@ class TestCmdStartSlackPingResultText:
 
         assert rc == 0
         assert captured_reason
-        assert captured_reason[-1] == "clean", (
-            f"With no ResultMessage emitted, reason must remain 'clean'; got {captured_reason[-1]!r}"
+        assert captured_reason[-1] == "premature-turn-end", (
+            f"Without a terminal sentinel, reason must be 'premature-turn-end'; got {captured_reason[-1]!r}"
         )
 
 

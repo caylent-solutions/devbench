@@ -7197,6 +7197,17 @@ _ORCHESTRATOR_TERMINAL_EXIT_AUDIT_PREFIX: str = "[ORCHESTRATOR_TERMINAL_EXIT] re
 #: is detected and the orchestrator issues an in-session continuation query.
 _ORCHESTRATOR_TURN_END_NO_SENTINEL_AUDIT: str = "[ORCHESTRATOR_TURN_END_NO_SENTINEL]"
 
+#: Issue #271 (E14-F1-S1-T1): audit prefix emitted at the point the final
+#: stop reason is determined, so the reason is visible in the orchestrator log
+#: as well as in the Slack notification.  Format:
+#: ``[ORCHESTRATOR_STOP_REASON] reason=<token>``
+_ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX: str = "[ORCHESTRATOR_STOP_REASON] reason="
+
+#: Issue #271 (E14-F1-S1-T1): distinct stop-reason token emitted when the
+#: SDK loop returns normally without producing a terminal sentinel.  Never
+#: equals the legacy bare ``"clean"`` token.
+_STOP_REASON_PREMATURE_TURN_END: str = "premature-turn-end"
+
 #: Issue #262 (E10-F1-S2): verbatim continuation prompt sent to the same
 #: ClaudeSDKClient session when a non-terminal ResultMessage is observed.
 #: Must not contain an em-dash (U+2014) per code standards; uses -- (double
@@ -7220,6 +7231,39 @@ def _is_terminal_orchestrate_result(text: str | None) -> bool:
     if not text:
         return False
     return any(marker in text for marker in _TERMINAL_ORCHESTRATE_MARKERS)
+
+
+def _classify_normal_exit_reason(sdk_result_text: str | None) -> str:
+    """Issue #271 (E14-F1-S1-T1): classify a normal (non-exception) loop exit.
+
+    Maps the final ``_sdk_result_text`` captured during the SDK run to
+    the canonical stop-reason token.  Called from ``cmd_start`` whenever
+    the SDK loop returns without raising (i.e., the ``else``-branch of the
+    ``if _continuation_exhausted`` check).
+
+    Rules (single-sourced; no duplicated reason literals):
+
+    - ``sdk_result_text`` contains a terminal sentinel (``ALL_DONE`` /
+      ``NO_ACTIONABLE`` / ``NO_ACTIONABLE_IN_SCOPE``) -- completion:
+      ``f"clean exit: {sdk_result_text}"``.
+    - ``sdk_result_text`` is ``None`` or empty-string (no terminal sentinel
+      was ever captured) -- premature turn-end:
+      ``_STOP_REASON_PREMATURE_TURN_END`` (``"premature-turn-end"``).
+
+    The function NEVER returns the bare literal ``"clean"``.  Best-effort
+    guarantee: any unexpected input falls through to the premature-turn-end
+    branch rather than silently returning ``"clean"``.
+
+    Args:
+        sdk_result_text: The last ``ResultMessage.result`` text captured
+            by ``_run``, or ``None`` when no ResultMessage was seen.
+
+    Returns:
+        A non-empty, non-``"clean"`` stop-reason token.
+    """
+    if _is_terminal_orchestrate_result(sdk_result_text):
+        return f"clean exit: {sdk_result_text}"
+    return _STOP_REASON_PREMATURE_TURN_END
 
 
 def _is_sdk_result_message(message: object) -> bool:
@@ -7385,12 +7429,18 @@ def _label_stop_reason(exc: BaseException) -> str:
 def _fire_orchestrator_stop_notification(reason: str) -> None:
     """Best-effort always-fire of the ``orchestrator_stop`` notification.
 
+    Issue #271 (E14-F1-S1-T1): writes the stop reason to the audit log via
+    ``logger.info`` BEFORE dispatching the Slack notification so the reason
+    is always present in the orchestrator log regardless of whether the
+    notification itself succeeds.
+
     Wraps the lookup + dispatch in a broad try/except so a buggy
     notification import or a transient backlog-parser failure during
     cmd_start's outer try/finally cannot mask the real exit reason.
     Extracted from ``cmd_start`` body so the branch-count of that
     function stays under the project's ruff PLR0912 ceiling (12).
     """
+    logger.info("%s%s", _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX, reason)
     try:
         from devbench.notifications import notify_orchestrator_stop
 
@@ -7953,6 +8003,8 @@ def cmd_start(*argv: str) -> int:
 
         # Issue #262 (E10-F1-S3): fail-fast on continuation-budget exhaustion.
         # Issue #217: bubble the SDK's final ResultMessage text into the Slack reason.
+        # Issue #271 (E14-F1-S1-T1): distinguish premature turn-end from genuine
+        # completion so the stop reason is never the bare literal "clean".
         # Both branches produce a ``(rc, stop_reason)`` tuple so the always-fire
         # notification receives the correct label regardless of which path ran.
         # Ternary form keeps cmd_start's return-statement count under PLR0911's cap.
@@ -7960,7 +8012,7 @@ def cmd_start(*argv: str) -> int:
             _stop_reason = "continuation budget exhausted"
             restart_rc = ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
         else:
-            _stop_reason = f"clean exit: {_sdk_result_text}" if _sdk_result_text else _stop_reason
+            _stop_reason = _classify_normal_exit_reason(_sdk_result_text)
             restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
         return restart_rc
     except BaseException as exc:

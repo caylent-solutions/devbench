@@ -15,6 +15,9 @@
 #   Rule 10: rejects content containing an em-dash (U+2014).
 #   Rule 11: rejects content whose Changes Manifest table rows or Source: lines
 #            are prefixed with a known checkout_directory from devbench.yaml.
+#   Rule 12: rejects content containing verdict tokens ([REVIEW_PASS],
+#            [REVIEW_REJECTED], [judge/<canonical>]). Verdicts may only be
+#            written via log-verdict (validated by guard-verdict-format.sh).
 #
 # Work unit .md files are managed exclusively by the orchestrate skill.
 # Executor agents must not modify them directly.
@@ -114,6 +117,34 @@ PYEOF
         fi
       done
     fi
+  fi
+
+  # Rule 12: reject content containing verdict tokens. Verdict tokens
+  # ([REVIEW_PASS], [REVIEW_REJECTED], [judge/<canonical>]) must not appear in
+  # non-verdict writes. Verdicts may only be written via log-verdict (validated
+  # by guard-verdict-format.sh). Canonical judge names mirror
+  # CANONICAL_REVIEWER_JUDGES in guard-verdict-format.sh and
+  # _CANONICAL_VERDICT_RE in manager.py.
+  if [[ -n "$CONTENT" ]]; then
+    VERDICT_TOKENS=("[REVIEW_PASS]" "[REVIEW_REJECTED]")
+    CANONICAL_JUDGE_NAMES=("code_review" "test_review" "doc_review" "changes_manifest" "security_review")
+    for token in "${VERDICT_TOKENS[@]}"; do
+      if printf '%s' "$CONTENT" | grep -qF "$token"; then
+        echo "guard-work-unit-write: rule 12: forbidden verdict token '${token}' in proposed content for ${FILE_PATH}" >&2
+        echo "Verdict tokens may only be written via 'uv run devbench log-verdict' (guard-verdict-format.sh)." >&2
+        echo "Fix: remove '${token}' from the content. Verdicts are managed exclusively by the review agents." >&2
+        exit 2
+      fi
+    done
+    for judge in "${CANONICAL_JUDGE_NAMES[@]}"; do
+      JUDGE_TOKEN="[judge/${judge}]"
+      if printf '%s' "$CONTENT" | grep -qF "$JUDGE_TOKEN"; then
+        echo "guard-work-unit-write: rule 12: forbidden verdict token '${JUDGE_TOKEN}' in proposed content for ${FILE_PATH}" >&2
+        echo "Verdict tokens may only be written via 'uv run devbench log-verdict' (guard-verdict-format.sh)." >&2
+        echo "Fix: remove '${JUDGE_TOKEN}' from the content. Verdicts are managed exclusively by the review agents." >&2
+        exit 2
+      fi
+    done
   fi
 
   # Issue #160: orchestrator-tier callers (DEVBENCH_AGENT_ROLE=orchestrator)

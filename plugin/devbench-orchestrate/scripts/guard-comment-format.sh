@@ -7,10 +7,14 @@
 # Only intercepts commands matching: uv run devbench log-comment <agent> <id> <message>
 #
 # Validation rules:
-#   - message body MUST NOT contain control-language imperatives directed at the
-#     orchestrator's loop (halt, stop the loop, operator action required, etc.).
-#     Subagent prose is diagnostic narration; loop control is owned by the
-#     orchestrator + `devbench next` per SKILL halt-discipline.
+#   Rule 11 (control-language): message body MUST NOT contain control-language
+#     imperatives directed at the orchestrator's loop (halt, stop the loop,
+#     operator action required, etc.). Subagent prose is diagnostic narration;
+#     loop control is owned by the orchestrator + `devbench next` per SKILL
+#     halt-discipline.
+#   Rule 12 (verdict-token injection): message body MUST NOT contain verdict
+#     tokens ([REVIEW_PASS], [REVIEW_REJECTED], [judge/<canonical>]). Verdicts
+#     may only be written via log-verdict (validated by guard-verdict-format.sh).
 #
 # Passthroughs (exit 0 without validating):
 #   - any '--help' / '-h' anywhere after 'log-comment' -> let the CLI print help
@@ -21,6 +25,22 @@
 # Exit 2  -> blocked (stderr becomes Claude's feedback)
 
 set -euo pipefail
+
+# Rule 12: forbidden verdict tokens. A log-comment message body must not carry
+# these tokens -- verdicts flow only through log-verdict / guard-verdict-format.sh.
+# Canonical reviewer judge names mirror CANONICAL_REVIEWER_JUDGES in
+# guard-verdict-format.sh and _CANONICAL_VERDICT_RE in manager.py.
+VERDICT_TOKENS=(
+  "[REVIEW_PASS]"
+  "[REVIEW_REJECTED]"
+)
+CANONICAL_JUDGE_NAMES=(
+  "code_review"
+  "test_review"
+  "doc_review"
+  "changes_manifest"
+  "security_review"
+)
 
 # Single source of truth for forbidden phrases. Mirrored in:
 #   - plugin/devbench-orchestrate/agents/executor.md (Comment language discipline section)
@@ -148,6 +168,28 @@ for phrase in "${FORBIDDEN_PHRASES[@]}"; do
     echo "  - 'Halting orchestration: <X>'    -> '<X> detected: ...'" >&2
     echo "  - 'Operator action required: <Y>' -> 'Recommended fix: <Y>'" >&2
     echo "  - 'Resume orchestration once <Z>' -> 'Source task remains blocked until <Z>'" >&2
+    exit 2
+  fi
+done
+
+# --- Rule 12: Reject verdict-token injection in non-verdict writes ---
+# Verdict tokens ([REVIEW_PASS], [REVIEW_REJECTED], [judge/<canonical>]) must
+# never appear in log-comment message bodies. Verdicts may only be written via
+# log-verdict, which is validated by guard-verdict-format.sh.
+for token in "${VERDICT_TOKENS[@]}"; do
+  if [[ "$MESSAGE" == *"$token"* ]]; then
+    echo "guard-comment-format: rule 12: forbidden verdict token '${token}' in log-comment body." >&2
+    echo "Verdict tokens may only be written via 'uv run devbench log-verdict' (guard-verdict-format.sh)." >&2
+    echo "Fix: remove '${token}' from the message body. Log-comment text is diagnostic narration only." >&2
+    exit 2
+  fi
+done
+for judge in "${CANONICAL_JUDGE_NAMES[@]}"; do
+  JUDGE_TOKEN="[judge/${judge}]"
+  if [[ "$MESSAGE" == *"$JUDGE_TOKEN"* ]]; then
+    echo "guard-comment-format: rule 12: forbidden verdict token '${JUDGE_TOKEN}' in log-comment body." >&2
+    echo "Verdict tokens may only be written via 'uv run devbench log-verdict' (guard-verdict-format.sh)." >&2
+    echo "Fix: remove '${JUDGE_TOKEN}' from the message body. Log-comment text is diagnostic narration only." >&2
     exit 2
   fi
 done

@@ -6646,6 +6646,43 @@ def _resolve_plugin_path() -> Path:
     return shadow if shadow is not None else canonical
 
 
+#: Fail-closed error message emitted by ``cmd_start`` when guard hooks are absent.
+#: Verbatim string required by spec AC-H4-1 (E8.F4.S1).
+_GUARD_HOOKS_ABSENT_ERROR: str = (
+    "ERROR: devbench guard hooks not loaded; refusing to run"
+    " (done-integrity cannot be enforced)."
+    " Launch via the devbench-orchestrate plugin."
+)
+
+
+def _check_guard_hooks_registered(plugin_path: Path) -> int | None:
+    """Check that the guard hooks are registered in the resolved plugin path.
+
+    The guard hooks are registered when the plugin's ``hooks/hooks.json`` file
+    exists.  This file is the mechanism by which the ``devbench-orchestrate``
+    plugin registers its PreToolUse/PostToolUse guard scripts with Claude Code.
+    When it is absent, no guard scripts will run during the SDK session --
+    done-integrity cannot be enforced at the hook layer (though the library-level
+    gates in ``force_status`` and ``mark_done`` still hold regardless).
+
+    This is a startup pre-flight check (spec AC-H4-1, E8.F4.S1).  The check is
+    intentionally strict: if the hooks file is missing, refuse to start rather
+    than run unguarded.
+
+    Args:
+        plugin_path: The resolved plugin directory path (canonical or shadow).
+
+    Returns:
+        ``1`` when ``hooks/hooks.json`` is absent (after printing the verbatim
+        fail-closed error to stderr), or ``None`` when the hooks are present.
+    """
+    hooks_json = plugin_path / "hooks" / "hooks.json"
+    if not hooks_json.exists():
+        print(_GUARD_HOOKS_ABSENT_ERROR, file=sys.stderr)
+        return 1
+    return None
+
+
 def _should_auto_restart_after_no_actionable() -> tuple[bool, list[str]]:
     """Post-mortem inspection: should the wrapping launcher auto-restart?
 
@@ -7408,6 +7445,43 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
     return "quota-wait-recovered" if recovered else "quota-wait-timeout"
 
 
+def _resolve_scope_ids_or_error(parsed: _CmdStartArgs) -> tuple[list[str], int | None]:
+    """Build the session scope ID list and check for overlaps.
+
+    Extracted from ``cmd_start`` to keep that function's return-statement count
+    under ruff PLR0911's ceiling.  Combines the scope-token parsing step and the
+    overlap-detection step so the caller only needs a single early-exit check.
+
+    Args:
+        parsed: Parsed ``cmd_start`` arguments produced by ``_parse_start_args``.
+
+    Returns:
+        ``(scope_ids, None)`` on success.  ``([], error_rc)`` when the scope
+        token is invalid (error_rc=1) or when overlap is detected without
+        ``--allow-overlap`` (error_rc=1).
+    """
+    scope_ids: list[str] = []
+    if parsed.include:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+        backlog_ids = [u.id for u in units]
+        try:
+            scope = ScopeFilter.parse(parsed.include, parsed.exclude, backlog_ids)
+        except InvalidScopeError as exc:
+            print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
+            return [], 1
+        scope_file = scope.to_file(WORKSPACE_ROOT)
+        os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
+        scope_ids = sorted(scope.expanded_ids)
+
+    if scope_ids:
+        overlap_rc = _check_scope_overlap(WORKSPACE_ROOT, scope_ids, parsed.allow_overlap)
+        if overlap_rc is not None:
+            return [], overlap_rc
+
+    return scope_ids, None
+
+
 def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -7490,30 +7564,14 @@ def cmd_start(*argv: str) -> int:
     # instance MUST not keep the new instance's tasks bucketed there.
     _write_last_restart_marker(WORKSPACE_ROOT)
 
-    # Determine the scope IDs for this session (empty when no --include).
-    scope_ids: list[str] = []
-
-    # When --include is supplied and non-empty, build + persist a ScopeFilter.
-    if parsed.include:
-        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-        units = parser.parse_index()
-        backlog_ids = [u.id for u in units]
-        try:
-            scope = ScopeFilter.parse(parsed.include, parsed.exclude, backlog_ids)
-        except InvalidScopeError as exc:
-            print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
-            return 1
-        scope_file = scope.to_file(WORKSPACE_ROOT)
-        os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
-        scope_ids = sorted(scope.expanded_ids)
-
-    # AC-192-4: Scope-overlap detection -- before claiming the registry slot,
-    # consult active sessions.  When scope_ids is empty (no --include) there
-    # is nothing to overlap, so skip the check entirely.
-    if scope_ids:
-        overlap_rc = _check_scope_overlap(WORKSPACE_ROOT, scope_ids, parsed.allow_overlap)
-        if overlap_rc is not None:
-            return overlap_rc
+    # Determine the scope IDs for this session and detect any overlap.
+    # AC-192-4: build + persist the ScopeFilter when --include is supplied, then
+    # consult active sessions for scope overlap.  Both the invalid-token and
+    # overlap-detected error paths are handled inside the helper to keep
+    # cmd_start's return-statement count under ruff PLR0911's ceiling.
+    scope_ids, scope_rc = _resolve_scope_ids_or_error(parsed)
+    if scope_rc is not None:
+        return scope_rc
 
     # AC-192-1/2: Create the per-session state directory and register the session.
     # This must happen before the SDK run so that concurrent sessions can detect
@@ -7521,6 +7579,12 @@ def cmd_start(*argv: str) -> int:
     _write_session_state_files(WORKSPACE_ROOT, parsed.name, os.getpid(), scope_ids)
 
     plugin_path = _resolve_plugin_path()
+
+    # H4 (spec AC-H4-1, E8.F4.S1): fail closed when guard hooks are not loaded.
+    # The check runs immediately after the plugin path is resolved so the error
+    # surfaces before any SDK subprocess is spawned.
+    if (hook_check_rc := _check_guard_hooks_registered(plugin_path)) is not None:
+        return hook_check_rc
 
     # When the resolver returned the shadow path (overrides configured),
     # record this orchestrator's PID inside the shadow tree. The sentinel

@@ -3871,6 +3871,75 @@ def _render_untracked_hunks(repo_path: Path) -> list[str]:
     return hunks
 
 
+def _get_diff_defer_empty(
+    unit_id: str,
+    repo_path: "Path",
+    no_attributable_exit_code: int,
+) -> "tuple[list[str], int]":
+    """Look up task-attributed commits when staged+unstaged are empty in defer-PR mode.
+
+    Runs ``git log --grep '^<unit_id>:'`` on the current branch to find commits
+    attributed to this task (using the standard ``<task-id>: <summary>`` prefix
+    convention). For each matching commit SHA, runs ``git show --format=`` to
+    emit the diff. Fails fast if ``git show`` fails on a known SHA.
+
+    When no attributable commit is found, returns exit code ``no_attributable_exit_code``
+    (GET_DIFF_NO_ATTRIBUTABLE = 45) with a verbatim diagnostic on stderr.
+
+    Non-defer empty path remains unchanged (rc 0, "(no changes)"); this helper
+    is only called in defer-PR mode.
+
+    Args:
+        unit_id: Work unit ID (e.g. "E4-F1-S1-T1").
+        repo_path: Absolute path to the target repository working tree.
+        no_attributable_exit_code: Exit code to return when no commit found (45).
+
+    Returns:
+        Tuple of (diff_parts, exit_code). When exit_code is non-zero, diff_parts
+        is empty and the caller should return exit_code immediately without printing.
+    """
+    rc_branch, branch_stdout, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+    if rc_branch != 0:
+        print(
+            "WARNING: git rev-parse --abbrev-ref HEAD failed; falling back to HEAD as branch ref",
+            file=sys.stderr,
+        )
+        branch = "HEAD"
+    else:
+        branch = branch_stdout.strip() or "HEAD"
+
+    grep_pattern = f"^{unit_id}:"
+    rc_log, log_stdout, _ = run_command(
+        ["git", "log", "--grep", grep_pattern, "--format=%H", branch],
+        cwd=repo_path,
+    )
+    shas = [s.strip() for s in log_stdout.splitlines() if s.strip()] if rc_log == 0 else []
+
+    if not shas:
+        print(
+            f"ERROR: no task-attributable changes for {unit_id} on {branch}; "
+            f'staged+unstaged empty and no commit matches "{grep_pattern}"; '
+            f'investigate with: git log --grep "{grep_pattern}" {branch}',
+            file=sys.stderr,
+        )
+        return [], no_attributable_exit_code
+
+    parts: list[str] = []
+    for sha in shas:
+        rc_show, show_stdout, _ = run_command(["git", "show", "--format=", sha], cwd=repo_path)
+        if rc_show != 0:
+            print(
+                f"ERROR: git show failed for commit {sha} (rc={rc_show}); "
+                "repository may be corrupt or the object missing",
+                file=sys.stderr,
+            )
+            return [], rc_show
+        if show_stdout.strip():
+            parts.append(show_stdout)
+
+    return parts, 0
+
+
 def cmd_get_diff(unit_id: str) -> int:
     """Return the combined git diff for the work unit's target repo.
 
@@ -3878,14 +3947,20 @@ def cmd_get_diff(unit_id: str) -> int:
     staged + unstaged + branch-vs-default + untracked hunks. In defer_pr
     mode (single_branch + defer_pr: true), the branch-vs-default hunk is
     omitted because it accumulates every prior task's commits on the
-    shared branch; instead the function emits staged + unstaged +
-    untracked, and substitutes `git show HEAD` when staged/unstaged are
-    both empty (a post-commit judge invocation).
+    shared branch; instead the function emits staged + unstaged + untracked.
+
+    When staged, unstaged, and untracked are all empty in defer-PR mode,
+    performs a task-attributed commit lookup via ``git log --grep '^<unit_id>:'``
+    and emits those diffs. If no attributable commit exists, exits with
+    GET_DIFF_NO_ATTRIBUTABLE (45) and a verbatim diagnostic to stderr.
+
+    Non-defer empty still prints "(no changes)" with rc 0 (unchanged).
 
     Used by plugin agents instead of running raw git commands so they do
     not need to know the repo path or the mode.
     """
     from devbench.config import DEFER_PR
+    from devbench.constants import GET_DIFF_NO_ATTRIBUTABLE
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -3911,11 +3986,14 @@ def cmd_get_diff(unit_id: str) -> int:
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 
+    parts.extend(_render_untracked_hunks(repo_path))
+
     if DEFER_PR:
         if not parts:
-            rc, stdout, _ = run_command(["git", "show", "--format=", "HEAD"], cwd=repo_path)
-            if rc == 0 and stdout.strip():
-                parts.append(stdout)
+            attributed, attr_rc = _get_diff_defer_empty(unit_id, repo_path, GET_DIFF_NO_ATTRIBUTABLE)
+            if attr_rc != 0:
+                return attr_rc
+            parts.extend(attributed)
     else:
         default_branch = _resolve_default_branch(canonical_repo, repo_path)
         if default_branch is None:
@@ -3928,8 +4006,6 @@ def cmd_get_diff(unit_id: str) -> int:
         rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}"], cwd=repo_path)
         if rc == 0 and stdout.strip():
             parts.append(stdout)
-
-    parts.extend(_render_untracked_hunks(repo_path))
 
     print("\n".join(parts) if parts else "(no changes)")
     return 0

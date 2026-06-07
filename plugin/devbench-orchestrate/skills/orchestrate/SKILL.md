@@ -53,6 +53,19 @@ Process the backlog using the steps below, repeating until all work units are do
     e. If no staged files AND reviews are not all present: proceed to step 4 (executor
        did not stage its output -- recovery run).
 
+3b.d. **get-diff exit-45 guard (issue #247, defer-PR mode only):** When `git_ops.defer_pr: true` is
+   set and the review agents run `uv run devbench get-diff <id>`, the command may return exit
+   code 45 (`GET_DIFF_NO_ATTRIBUTABLE`) when staged and unstaged are both empty AND no
+   commit on the current branch matches the prefix `^<id>:`. This is a diagnosable blocker --
+   not a generic failure -- and requires operator investigation:
+   - Exit 45 means the review agents received no diff to evaluate; any review verdict on an
+     empty diff is vacuous and must not count toward the done-gate.
+   - The verbatim diagnostic on stderr names the branch and the grep pattern so the operator
+     can confirm the commit prefix and re-commit with the correct `<id>: <summary>` prefix.
+   - When a review agent reports an empty diff with exit 45: log a `[BLOCKED]` audit comment
+     on the task naming the exit code and quoting the diagnostic, then return to step 2. Do
+     NOT proceed to mark-done; the task must be re-executed once the commit prefix is corrected.
+
 4. Invoke `devbench-orchestrate:executor` with the unit ID.
 
 4a. Validation-gate bug-escalation check -- handles proposal JSONs that the executor wrote directly via `uv run devbench write-proposal` because the task is a validation gate (empty Changes Manifest / Approach forbids production fixes) that surfaced out-of-scope production bugs. This is a separate trigger from the amendment-reject loop at step 4c:

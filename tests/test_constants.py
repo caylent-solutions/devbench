@@ -128,6 +128,35 @@ class TestCascadeDepthConstant:
         assert DEFAULT_MAX_CASCADE_DEPTH == 2
 
 
+class TestGetDiffNoAttributableConstant:
+    """GET_DIFF_NO_ATTRIBUTABLE exit code constant (issue #247)."""
+
+    def test_get_diff_no_attributable_equals_45(self) -> None:
+        """GET_DIFF_NO_ATTRIBUTABLE is defined as integer 45."""
+        from devbench.constants import GET_DIFF_NO_ATTRIBUTABLE
+
+        assert GET_DIFF_NO_ATTRIBUTABLE == 45
+
+    def test_get_diff_no_attributable_is_int(self) -> None:
+        """GET_DIFF_NO_ATTRIBUTABLE is an int, not a float or string."""
+        from devbench.constants import GET_DIFF_NO_ATTRIBUTABLE
+
+        assert isinstance(GET_DIFF_NO_ATTRIBUTABLE, int)
+
+    def test_get_diff_no_attributable_distinct_from_other_exit_codes(self) -> None:
+        """GET_DIFF_NO_ATTRIBUTABLE is distinct from all other named exit codes."""
+        from devbench.constants import (
+            GET_DIFF_NO_ATTRIBUTABLE,
+            ORCHESTRATOR_RESTART_EXIT_CODE,
+            SUBPROCESS_ERROR_EXIT_CODE,
+        )
+
+        assert GET_DIFF_NO_ATTRIBUTABLE != ORCHESTRATOR_RESTART_EXIT_CODE
+        assert GET_DIFF_NO_ATTRIBUTABLE != SUBPROCESS_ERROR_EXIT_CODE
+        assert GET_DIFF_NO_ATTRIBUTABLE != 0
+        assert GET_DIFF_NO_ATTRIBUTABLE != 1
+
+
 class TestSessionConstants:
     """AC-T6-2: SESSION_* constants in constants.py have correct types and spec-mandated values (spec 4.4.1)."""
 

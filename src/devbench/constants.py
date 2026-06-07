@@ -600,6 +600,14 @@ SUBPROCESS_ERROR_EXIT_CODE: int = 127
 # passed through unchanged.
 ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
 
+# Exit code emitted by ``cmd_get_diff`` in defer-PR mode when staged and
+# unstaged changes are both empty AND no task-attributed commit exists on the
+# current branch (i.e. ``git log --grep '^<task-id>:'`` returns no results).
+# Caller responsibilities: surface this as a diagnosable blocker with the
+# verbatim diagnostic message; do NOT treat as success (rc 0) or generic
+# failure (rc 1). Value 45 is distinct from all other devbench exit codes.
+GET_DIFF_NO_ATTRIBUTABLE: int = 45
+
 # Audit-log template written to ``logs/orchestrator.log`` when
 # ``cmd_start`` triggers an auto-restart. The token + task-id list let
 # operators grep history for restart frequency without parsing

@@ -4516,21 +4516,28 @@ class TestCmdGetDiffModeAware:
             "git show HEAD should only be called when staged/unstaged are empty"
         )
 
-    def test_defer_pr_mode_post_commit_returns_git_show_head(
+    def test_defer_pr_mode_post_commit_returns_task_attributed_diff(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Post-commit: staged and unstaged are empty; git show HEAD is
-        emitted so the post-commit security review sees this task's commit."""
+        """Post-commit: staged and unstaged are empty; task-attributed commit
+        is found via git log --grep and its diff is emitted (AC-247-1)."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        sha = "cafebabe0001"
+        task_diff = "diff --git a/impl.py b/impl.py\n+code change\n"
+
+        responses: dict[tuple[str, ...], tuple[int, str, str]] = {
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): (0, "feat/improvements\n", ""),
+            ("git", "show", "--format=", sha): (0, task_diff, ""),
+        }
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "show", "--format=", "HEAD"]:
-                return (0, "GIT-SHOW-HEAD-HUNK\n", "")
-            return (0, "", "")
+            if cmd[:4] == ["git", "log", "--grep", "^E0-F1-S1-T1:"]:
+                return (0, sha + "\n", "")
+            return responses.get(tuple(cmd), (0, "", ""))
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
@@ -4543,7 +4550,7 @@ class TestCmdGetDiffModeAware:
 
         assert result == 0
         output = capsys.readouterr().out
-        assert "GIT-SHOW-HEAD-HUNK" in output
+        assert task_diff.strip() in output
 
     def test_defer_pr_mode_with_accumulated_prior_commits_scopes_correctly(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4613,18 +4620,23 @@ class TestCmdGetDiffModeAware:
         assert "brand_new.py" in output
         assert "+print('hi')" in output
 
-    def test_defer_pr_mode_returns_no_changes_when_all_states_empty(
+    def test_defer_pr_mode_exits_45_when_no_attributable_commit_found(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """When staged, unstaged, HEAD, and untracked are all empty, the
-        '(no changes)' sentinel is emitted as before."""
+        """When staged, unstaged, and git log --grep are all empty,
+        exit GET_DIFF_NO_ATTRIBUTABLE (45) with verbatim diagnostic on stderr (AC-247-1)."""
+        from devbench.constants import GET_DIFF_NO_ATTRIBUTABLE
+
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        branch = "feat/improvements"
 
-        def fake_run_command(_cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, branch + "\n", "")
             return (0, "", "")
 
         with (
@@ -4636,8 +4648,11 @@ class TestCmdGetDiffModeAware:
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
-        assert result == 0
-        assert capsys.readouterr().out.strip() == "(no changes)"
+        assert result == GET_DIFF_NO_ATTRIBUTABLE
+        err = capsys.readouterr().err
+        assert "no task-attributable changes" in err
+        assert "E0-F1-S1-T1" in err
+        assert branch in err
 
 
 class TestCmdLogVerdictFileResolution:

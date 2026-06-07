@@ -432,10 +432,12 @@ class TestAffectedTaskIdsLifecycle:
         for tid in result.wired_targets:
             assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in (story / f"{tid}.md").read_text()
 
-        # Transition the fix to done; cascade should flip all three blocked peers.
+        # Transition the fix to done via _set_status (the internal path used by
+        # mark_done and _rollup_parent_status; force_status refuses done per AC-H1-1).
+        # cascade should flip all three blocked peers.
         mgr = BacklogManager()
         t2 = story / "E0-F1-S1-T2.md"
-        mgr.force_status(t2, tmp_path / "BACKLOG.md", "E0-F1-S1-T2", "done")
+        mgr._set_status(t2, tmp_path / "BACKLOG.md", "E0-F1-S1-T2", "done")
 
         # The cascade runs inside force_status / _set_status. All three peers
         # must now be in-queue with [AUTO_UNBLOCKED] audit.

@@ -1528,6 +1528,14 @@ def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
         )
         return 1
 
+    if new_status.lower() == STATUS_DONE:
+        print(
+            "ERROR: 'set-status done' is not allowed; completion must go through"
+            " 'mark-done' (enforces the done-gate: all required judges passed)",
+            file=sys.stderr,
+        )
+        return 1
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
 
@@ -1664,6 +1672,14 @@ def _resolve_bulk_matched_units(
     if new_status.lower() not in VALID_STATUSES:
         print(
             f"ERROR: Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}",
+            file=sys.stderr,
+        )
+        return None
+
+    if new_status.lower() == STATUS_DONE:
+        print(
+            "ERROR: 'set-status done' is not allowed; completion must go through"
+            " 'mark-done' (enforces the done-gate: all required judges passed)",
             file=sys.stderr,
         )
         return None

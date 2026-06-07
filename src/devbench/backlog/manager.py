@@ -175,9 +175,13 @@ class BacklogManager:
 
         Raises:
             FileNotFoundError: If either file does not exist.
-            ValueError: If the status is invalid, the ``## Status:`` line
-                is missing, or the unit is not found in the backlog index.
+            ValueError: If the status is invalid, the resolved status is
+                ``done`` (use ``mark_done`` for gated completion), the
+                ``## Status:`` line is missing, or the unit is not found
+                in the backlog index.
         """
+        if new_status.lower() == STATUS_DONE:
+            raise ValueError("force_status must not write 'done'; use mark_done (done-gate enforced)")
         self._set_status(work_unit_path, backlog_index, unit_id, new_status, session_name=session_name)
 
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:

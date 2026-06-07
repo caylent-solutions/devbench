@@ -106,12 +106,14 @@ class TestForceStatus:
         else:
             pytest.fail("E0-F1-S1-T1 not found in BACKLOG.md")
 
-    def test_allows_done_without_judge_comments(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
-        """force_status bypasses the done-gate -- no judge comments required."""
+    def test_rejects_done_status(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
+        """force_status raises ValueError when the resolved status is done (AC-H1-1)."""
         judge = BacklogManager()
-        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "done")
-
-        assert "## Status: done" in tmp_work_unit_file.read_text()
+        with pytest.raises(
+            ValueError,
+            match=r"force_status must not write 'done'; use mark_done \(done-gate enforced\)",
+        ):
+            judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "done")
 
     def test_updates_lowercase_statuses_in_backlog(
         self,
@@ -119,19 +121,24 @@ class TestForceStatus:
         backlog_index_lowercase: Path,
     ) -> None:
         judge = BacklogManager()
-        judge.force_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
+        judge.force_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "in-review")
 
         index_content = backlog_index_lowercase.read_text()
         for line in index_content.splitlines():
             if "E0-F1-S1-T1" in line:
-                assert "done" in line
+                assert "in-review" in line
                 break
         else:
             pytest.fail("E0-F1-S1-T1 not found in BACKLOG.md")
 
-    def test_accepts_all_valid_statuses(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
+    def test_accepts_all_non_done_valid_statuses(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
+        """force_status accepts every valid status except done (done raises ValueError)."""
+        from devbench.constants import STATUS_DONE
+
         judge = BacklogManager()
         for cli_status, canonical in VALID_STATUSES.items():
+            if cli_status == STATUS_DONE:
+                continue  # done is refused by force_status; tested in test_manager_force_status.py
             backlog_index_titlecase.write_text(
                 backlog_index_titlecase.read_text()
                 .replace("in-progress", "In Queue")
@@ -163,12 +170,12 @@ class TestForceStatus:
     def test_raises_file_not_found_for_work_unit(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManager()
         with pytest.raises(FileNotFoundError):
-            judge.force_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "done")
+            judge.force_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
 
     def test_raises_file_not_found_for_backlog(self, tmp_work_unit_file: Path, tmp_path: Path) -> None:
         judge = BacklogManager()
         with pytest.raises(FileNotFoundError):
-            judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
+            judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "in-progress")
 
     def test_force_status_with_session_name_stamps_wu_claimed_comment(
         self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
@@ -328,8 +335,9 @@ class TestRollupParentStatus:
         index_path, t2_file, story_file, feature_file = backlog_with_hierarchy
 
         judge = BacklogManager()
-        # T1 is already Done in the fixture. Mark T2 Done -- should roll up S1.
-        judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "done")
+        # T1 is already Done in the fixture. Mark T2 Done via _set_status (the internal
+        # path that rollup and mark_done both use) -- should roll up S1.
+        judge._set_status(t2_file, index_path, "E0-F1-S1-T2", "done")
 
         # Story should now be done in both files
         story_content = story_file.read_text()
@@ -379,9 +387,10 @@ class TestRollupParentStatus:
         story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
 
         judge = BacklogManager()
-        # Mark the final in-queue task Done. The other sibling is Declined.
+        # Mark the final in-queue task Done via _set_status (internal path used by
+        # rollup and mark_done). The other sibling is Declined.
         # Rollup should succeed because declined children are terminal-complete.
-        judge.force_status(t3_file, index_path, "E0-F1-S1-T3", "done")
+        judge._set_status(t3_file, index_path, "E0-F1-S1-T3", "done")
 
         assert "## Status: done" in story_file.read_text()
 
@@ -410,8 +419,9 @@ class TestRollupParentStatus:
         feature_file.write_text("# E0-F1\n\n## Status: in-queue\n")
 
         judge = BacklogManager()
-        # Mark last task Done → story rolls up → feature rolls up
-        judge.force_status(t_file, index_path, "E0-F1-S2-T1", "done")
+        # Mark last task Done via _set_status (internal path used by rollup and
+        # mark_done) -- story rolls up, then feature rolls up.
+        judge._set_status(t_file, index_path, "E0-F1-S2-T1", "done")
 
         # S2 should be done
         assert "## Status: done" in s2_file.read_text()
@@ -1671,8 +1681,9 @@ class TestSetStatusCallsUpdateStatusSummary:
         # Prime the summary by calling it once
         mgr._update_status_summary(index_path)
 
-        # Now change T3 from in-queue to done via force_status
-        mgr.force_status(files["E1-F1-S1-T3"], index_path, "E1-F1-S1-T3", "done")
+        # Now change T3 from in-queue to done via _set_status (internal path used by
+        # mark_done and rollup; force_status no longer accepts done).
+        mgr._set_status(files["E1-F1-S1-T3"], index_path, "E1-F1-S1-T3", "done")
 
         result = index_path.read_text(encoding="utf-8")
         summary_rows = _extract_summary_lines(result)
@@ -4601,10 +4612,14 @@ class TestAutoRequeueOnDeclineTransition:
         assert "## Status: in-queue" in src
         assert "[CASCADE_RESOLVED]" in src
 
-    def test_force_status_to_done_cascades(self, tmp_path: Path) -> None:
-        """``force_status -> done`` (legacy path) must continue to cascade."""
+    def test_set_status_to_done_cascades(self, tmp_path: Path) -> None:
+        """``_set_status -> done`` (internal path used by mark_done and rollup) cascades.
+
+        force_status no longer accepts done (raises ValueError); cascade behavior
+        is preserved via _set_status which mark_done and _rollup_parent_status call.
+        """
         index, dep_path = self._build(tmp_path, "in-queue")
-        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "done")
+        BacklogManager()._set_status(dep_path, index, "E0-F1-S1-T2", "done")
 
         src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
         assert "## Status: in-queue" in src

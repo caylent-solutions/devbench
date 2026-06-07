@@ -103,6 +103,7 @@ from devbench.backlog.amendment import (
     AmendmentError,
     AmendmentRequest,
     apply_amendment,
+    apply_operator_amendment,
     read_review_failure_files,
     reject_amendment,
     write_request,
@@ -8933,23 +8934,63 @@ def cmd_stop(*argv: str) -> int:
     return rc
 
 
-def cmd_request_amendment(unit_id: str) -> int:
-    """Register an amendment request for ``unit_id``.
+def cmd_request_amendment(*argv: str) -> int:
+    """Register an amendment request for a work unit.
+
+    Usage::
+
+        request-amendment <id> [--operator-mode]
 
     Reads the request payload as JSON on stdin. Expected fields:
     ``reason``, ``justification``, ``files_to_add`` (list of ``{path, change}``),
     ``linked_acs`` (list of AC IDs). The ``task_id`` and ``requested_at``
     fields are filled in by this command -- the caller does not provide them.
 
-    On success, writes the request to
-    ``<DEVBENCH_WORKSPACE_ROOT>/.devbench/amendments/<unit_id>.json`` and prints
-    a one-line JSON summary. Fails fast on schema errors, duplicate pending
-    requests, or unknown reasons.
+    Without ``--operator-mode`` (default): validates the Layer-1 pre-filter, writes
+    the request to ``<DEVBENCH_WORKSPACE_ROOT>/.devbench/amendments/<id>.json``, and
+    prints a one-line JSON summary. The orchestrator's manifest-amender agent then
+    decides whether to apply or reject.
+
+    With ``--operator-mode``: bypasses the in-progress status gate and the LLM
+    judge; applies the amendment synchronously in this call with Layer-3 post-check
+    (restores on failure); writes the operator-amendment audit entry to the work-unit
+    ``## Comments`` section; prints a one-line JSON summary.
+
+    Fails fast on schema errors, duplicate pending requests (without operator mode),
+    or unknown reasons.
     """
+    unit_id, operator_mode = _parse_request_amendment_argv(argv)
+    if unit_id is None:
+        return 1
+
     try:
         request = _build_amendment_request_from_stdin(unit_id)
+    except _AmendmentRequestInputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if operator_mode:
+        try:
+            apply_operator_amendment(BACKLOG_INDEX, unit_id, request)
+        except AmendmentError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "task_id": unit_id,
+                    "status": "applied",
+                    "operator_mode": True,
+                    "files_to_add": [f.path for f in request.files_to_add],
+                    "reason": request.reason,
+                }
+            )
+        )
+        return 0
+
+    try:
         written_path = write_request(WORKSPACE_ROOT, request)
-    except (_AmendmentRequestInputError, AmendmentError) as exc:
+    except AmendmentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -8964,6 +9005,37 @@ def cmd_request_amendment(unit_id: str) -> int:
         )
     )
     return 0
+
+
+def _parse_request_amendment_argv(argv: tuple[str, ...]) -> tuple[str | None, bool]:
+    """Parse the request-amendment flag grammar.
+
+    Returns ``(unit_id, operator_mode)``.  Returns ``(None, False)`` after
+    printing a usage error to stderr so the caller can ``return 1``.
+
+    Grammar::
+
+        request-amendment <id> [--operator-mode]
+    """
+    positional: list[str] = []
+    operator_mode = False
+    for arg in argv:
+        if not arg:
+            continue
+        if arg == "--operator-mode":
+            operator_mode = True
+        elif arg.startswith("-"):
+            print(f"ERROR: request-amendment: unknown flag: {arg!r}", file=sys.stderr)
+            return None, False
+        else:
+            positional.append(arg)
+    if len(positional) != 1:
+        print(
+            f"ERROR: request-amendment requires exactly one positional argument (task id), got {positional!r}",
+            file=sys.stderr,
+        )
+        return None, False
+    return positional[0], operator_mode
 
 
 class _AmendmentRequestInputError(ValueError):
@@ -10756,7 +10828,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "request-amendment": (
         cmd_request_amendment,
         1,
-        "Register an amendment request (JSON on stdin): request-amendment <id>",
+        "Register an amendment request (JSON on stdin): request-amendment <id> [--operator-mode]",
     ),
     "apply-amendment": (
         cmd_apply_amendment,
@@ -10844,6 +10916,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "rebuild-window-stats",
         # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
         "archive-session",
+        # Issue #242 E7-F1-S1-T1: --operator-mode bypass flag
+        "request-amendment",
         # Issue #194 E7-F1-S1-T1: --include / --exclude scope selectors for bulk status update
         "set-status",
         # Issue #189 E1-F4-S1-T2: bulk selectors --epic/--feature/--story

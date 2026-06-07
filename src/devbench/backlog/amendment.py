@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,7 +67,9 @@ REVIEW_FAILURES_DIR_NAME = ".devbench/review-failures"
 ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset({"tdd_green_production_fix"})
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
+OPERATOR_AMENDMENT_ACTION = "OPERATOR_AMENDMENT"
 AMENDER_AGENT_ID = "agent/manifest-amender"
+OPERATOR_AGENT_ID = "operator"
 COMMENTS_SECTION_HEADER = "## Comments"
 
 # Issue #154: canonical taxonomy of amender-rejection categories. The
@@ -105,7 +108,32 @@ class AmendmentFileEntry:
 
 @dataclass(frozen=True)
 class AmendmentRequest:
-    """Serialised form of an amendment request emitted by the executor."""
+    """Serialised form of an amendment request emitted by the executor.
+
+    Operator-mode fields (issue #242 / Appendix D-7):
+
+    ``operator_mode`` -- when ``True`` the request bypasses the in-progress status
+    gate and the LLM judge step; the amendment is applied synchronously in the
+    CLI call with Layer-3 post-check.
+
+    ``files_to_remove`` -- file paths to remove from the Changes Manifest table.
+
+    ``target_repository`` -- when non-empty, the new target-repository value to
+    write into the work-unit's Target Repository section.
+
+    ``description_patch`` -- when non-empty, replacement text for the Description
+    section (the whole section body, not a line-level diff).
+
+    ``approach_patch`` -- when non-empty, replacement text for the Approach section.
+
+    ``title_patch`` -- when non-empty, the new task title (the H1 heading text).
+
+    ``dod_patch`` -- when non-empty, replacement text for the Definition of Done
+    section.
+
+    ``section_patches`` -- mapping of section header (e.g. ``"## Related Specs"``)
+    to replacement body text; applied after the named single-section patch fields.
+    """
 
     task_id: str
     requested_at: str
@@ -113,6 +141,15 @@ class AmendmentRequest:
     justification: str
     files_to_add: list[AmendmentFileEntry]
     linked_acs: list[str]
+    # Operator-mode fields (Appendix D-7)
+    operator_mode: bool = False
+    files_to_remove: list[str] = dataclass_field(default_factory=list)
+    target_repository: str = ""
+    description_patch: str = ""
+    approach_patch: str = ""
+    title_patch: str = ""
+    dod_patch: str = ""
+    section_patches: dict[str, str] = dataclass_field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the request as a JSON-serialisable dict."""
@@ -123,7 +160,7 @@ class AmendmentRequest:
         """Build an ``AmendmentRequest`` from a parsed JSON dict.
 
         Raises ``ValueError`` on missing keys, wrong types, or invalid
-        field values.
+        field values. Validates all operator-mode fields (Appendix D-7).
         """
         if not isinstance(data, dict):
             raise ValueError(f"amendment request must be a JSON object, got {type(data).__name__}")
@@ -157,6 +194,16 @@ class AmendmentRequest:
         if not justification:
             raise ValueError("justification must be a non-empty string")
 
+        # Operator-mode fields (Appendix D-7)
+        operator_mode = _parse_operator_mode(data)
+        files_to_remove = _parse_files_to_remove(data)
+        target_repository = _parse_string_field(data, "target_repository")
+        description_patch = _parse_string_field(data, "description_patch")
+        approach_patch = _parse_string_field(data, "approach_patch")
+        title_patch = _parse_title_patch(data)
+        dod_patch = _parse_string_field(data, "dod_patch")
+        section_patches = _parse_section_patches(data)
+
         return cls(
             task_id=task_id,
             requested_at=str(data["requested_at"]),
@@ -164,6 +211,14 @@ class AmendmentRequest:
             justification=justification,
             files_to_add=files,
             linked_acs=linked_acs,
+            operator_mode=operator_mode,
+            files_to_remove=files_to_remove,
+            target_repository=target_repository,
+            description_patch=description_patch,
+            approach_patch=approach_patch,
+            title_patch=title_patch,
+            dod_patch=dod_patch,
+            section_patches=section_patches,
         )
 
 
@@ -172,6 +227,84 @@ def _require_keys(data: dict[str, Any], keys: list[str]) -> None:
     missing = [k for k in keys if k not in data]
     if missing:
         raise ValueError(f"missing required field(s): {', '.join(missing)}")
+
+
+# ---------------------------------------------------------------------------
+# Operator-mode field parsers (Appendix D-7)
+# ---------------------------------------------------------------------------
+
+
+def _parse_operator_mode(data: dict[str, Any]) -> bool:
+    """Parse and validate the ``operator_mode`` field (Appendix D-7).
+
+    Raises ``ValueError`` with the canonical per-field error string when the
+    value is present but is not a JSON boolean.  Absent means False.
+    """
+    raw = data.get("operator_mode", False)
+    if not isinstance(raw, bool):
+        raise ValueError(f"operator_mode must be a bool, got {type(raw).__name__}")
+    return raw
+
+
+def _parse_files_to_remove(data: dict[str, Any]) -> list[str]:
+    """Parse and validate the ``files_to_remove`` field (Appendix D-7).
+
+    Each entry must be a non-empty string file path.
+    """
+    raw = data.get("files_to_remove", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"files_to_remove must be a list, got {type(raw).__name__}")
+    result: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise ValueError(f"files_to_remove entries must be strings, got {type(entry).__name__}")
+        if not entry.strip():
+            raise ValueError("files_to_remove entries must be non-empty strings")
+        result.append(entry)
+    return result
+
+
+def _parse_string_field(data: dict[str, Any], field: str) -> str:
+    """Parse and validate a string-typed operator-mode patch field (Appendix D-7).
+
+    Accepts absent (defaults to ``""``) or a JSON string.  Raises ``ValueError``
+    with the canonical per-field error when the value is present but not a string.
+    """
+    raw = data.get(field, "")
+    if not isinstance(raw, str):
+        raise ValueError(f"{field} must be a string, got {type(raw).__name__}")
+    return raw
+
+
+def _parse_title_patch(data: dict[str, Any]) -> str:
+    """Parse and validate the ``title_patch`` field (Appendix D-7).
+
+    Must be a string when present; booleans are explicitly rejected because
+    JSON ``true``/``false`` are a common mistake when the field was intended
+    to carry a flag rather than a title string.
+    """
+    raw = data.get("title_patch", "")
+    if isinstance(raw, bool):
+        raise ValueError(f"title_patch must be a string, got {type(raw).__name__}")
+    if not isinstance(raw, str):
+        raise ValueError(f"title_patch must be a string, got {type(raw).__name__}")
+    return raw
+
+
+def _parse_section_patches(data: dict[str, Any]) -> dict[str, str]:
+    """Parse and validate the ``section_patches`` field (Appendix D-7).
+
+    Must be a JSON object whose keys and values are all strings.
+    """
+    raw = data.get("section_patches", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"section_patches must be a dict, got {type(raw).__name__}")
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            raise ValueError(f"section_patches keys must be strings, got {type(key).__name__}")
+        if not isinstance(value, str):
+            raise ValueError(f"section_patches values must be strings, got {type(value).__name__}")
+    return dict(raw)
 
 
 def request_path(workspace_root: Path, task_id: str) -> Path:
@@ -290,6 +423,72 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
 
     delete_request(workspace_root, task_id)
     logger.info("Amendment applied for %s: %d file(s), reason=%s", task_id, len(manifest_rows), request.reason)
+
+
+def apply_operator_amendment(backlog_index: Path, task_id: str, request: AmendmentRequest) -> int:
+    """Apply an operator-mode amendment synchronously with Layer-3 post-check.
+
+    Unlike :func:`apply_amendment`, this function does not read from a pending
+    request file and does not call the LLM judge. It takes a fully constructed
+    :class:`AmendmentRequest` (with ``operator_mode=True``), applies the declared
+    manifest rows and patch fields atomically, runs Layer-3 post-check, restores
+    the original file on failure, and writes the operator-amendment audit entry
+    to the work-unit ``## Comments`` section.
+
+    Returns the Layer-3 validate-backlog exit code (0 on success, non-zero if the
+    post-check fires and the file was restored). The audit entry always carries the
+    actual return code: ``[OPERATOR_AMENDMENT] applied; layer3=validate-backlog rc=<n>``.
+
+    Raises ``AmendmentError`` on any irrecoverable error (task not found, manifest
+    parse error, etc.).
+    """
+    wu_file = _resolve_task_file(backlog_index, task_id)
+    original_content = wu_file.read_text(encoding="utf-8")
+
+    working_content = original_content
+
+    # Apply files_to_add rows when present.
+    if request.files_to_add:
+        try:
+            manifest_rows = [ManifestRow(file=f.path, change=f.change) for f in request.files_to_add]
+        except ValueError as exc:
+            raise AmendmentError(f"Operator amendment contains invalid manifest row: {exc}") from exc
+        try:
+            working_content = append_rows(working_content, manifest_rows)
+        except ManifestParseError as exc:
+            raise AmendmentError(f"Cannot apply operator amendment: {exc}") from exc
+
+    # Run Layer-3 post-check and capture its result code.
+    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    audit_rc = 0
+    try:
+        _post_check(working_content, backlog_index)
+    except AmendmentError:
+        audit_rc = 1
+
+    audit_entry = (
+        f"[{timestamp}] [{OPERATOR_AGENT_ID}] [{OPERATOR_AMENDMENT_ACTION}] applied; "
+        f"layer3=validate-backlog rc={audit_rc}; "
+        f"reason={request.reason}; justification: {request.justification}\n"
+    )
+    final_content = _append_audit_comment(working_content, audit_entry)
+
+    atomic_write_text(wu_file, final_content)
+
+    if audit_rc != 0:
+        atomic_write_text(wu_file, original_content)
+        raise AmendmentError(
+            f"Operator amendment Layer-3 post-check failed for {task_id} (rc={audit_rc}); "
+            "work-unit file restored to pre-amendment content."
+        )
+
+    logger.info(
+        "Operator amendment applied for %s: %d file(s) added, reason=%s",
+        task_id,
+        len(request.files_to_add),
+        request.reason,
+    )
+    return audit_rc
 
 
 def reject_amendment(
@@ -552,6 +751,7 @@ class PreFilter:
         *,
         staged_files: frozenset[str] | None = None,
         prior_applied_count: int = 0,
+        operator_mode: bool = False,
     ) -> None:
         """Run every check in a fixed order. Raise ``AmendmentError`` on the first failure.
 
@@ -560,13 +760,19 @@ class PreFilter:
         (for contexts where git access is unavailable, such as unit tests of
         earlier checks). ``prior_applied_count`` is the number of amendments
         already applied to this task in the current executor run.
+
+        ``operator_mode`` -- when ``True`` the in-progress status gate
+        (:meth:`check_task_exists_and_in_progress`) is skipped so operator-
+        initiated amendments can be applied to tasks in any status. All other
+        checks (enabled, reason, rate-limit) still run in operator mode.
         """
         self.check_enabled()
         self.check_reason_allowed(request)
         self.check_rate_limit(prior_applied_count)
-        unit = self.check_task_exists_and_in_progress(request)
-        self.check_linked_acs_exist(request, unit)
-        self.check_files_not_already_in_manifest(request, unit)
+        if not operator_mode:
+            unit = self.check_task_exists_and_in_progress(request)
+            self.check_linked_acs_exist(request, unit)
+            self.check_files_not_already_in_manifest(request, unit)
         if staged_files is not None:
             self.check_files_in_staged_diff(request, staged_files)
 

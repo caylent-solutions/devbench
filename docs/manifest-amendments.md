@@ -26,11 +26,11 @@ Implemented in `src/devbench/backlog/amendment.py::PreFilter`. Every rule below 
 
 - The backlog config has `manifest_amendment.enabled: true`.
 - The request JSON parses and matches the amendment schema (see below).
-- The task ID exists in the backlog and its current status is `in-progress`.
+- The task ID exists in the backlog and its current status is `in-progress`. **Skipped in operator mode** (`--operator-mode`) so the operator can amend tasks in any status.
 - The request's `reason` appears in the backlog's configured `allowed_reasons`.
 - Every path in `files_to_add` appears in the task branch's staged diff against base (no unrelated files smuggled in).
-- No path in `files_to_add` is already present in the Changes Manifest (no silent duplicates).
-- Every entry in `linked_acs` appears verbatim in the task's `## Acceptance Criteria` section.
+- No path in `files_to_add` is already present in the Changes Manifest (no silent duplicates). **Skipped in operator mode.**
+- Every entry in `linked_acs` appears verbatim in the task's `## Acceptance Criteria` section. **Skipped in operator mode.**
 - The count of amendments applied to this task in the current executor run is below `max_requests_per_execution`.
 
 ### Layer 2 -- LLM semantic judge
@@ -54,6 +54,8 @@ If any post-check fails, the atomic rename is reversed and the work-unit file is
 
 ## Flow
 
+### Standard (executor) flow
+
 1. Executor hits TDD GREEN and discovers a production fix not in the Changes Manifest.
 2. Executor stages the fix in git and invokes `uv run devbench request-amendment <task-id>` with a JSON payload on stdin.
 3. `request-amendment` runs the Layer 1 schema checks and persists the request to `$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<task-id>.json`.
@@ -62,6 +64,16 @@ If any post-check fails, the atomic rename is reversed and the work-unit file is
 6. On `apply`: the agent runs `uv run devbench apply-amendment <task-id>`. CLI appends rows, writes audit, atomically commits to disk, runs Layer 3 post-check. On success the request file is deleted; on failure the write is rolled back and the agent logs REVIEW_FAIL.
 7. On `reject`: the agent (a) first reverts every file listed in the pending request from the target repo (`git restore --staged`, `checkout --`, `clean -f --`) so stale staged edits do not leak into subsequent tasks, then (b) runs `uv run devbench reject-amendment <task-id> "<reason>"`. CLI writes a rejection audit comment, transitions the task to `blocked`, and **archives** the pending request to `<workspace>/.devbench/rejected-requests/<task-id>-<timestamp>.json` so `blocker-resolver` + `task-factory` (enabled by default, see [ADR-03](adr/03-task-factory.md)) can read it afterwards. The agent MUST verify the archive exists on disk before logging its verdict -- the manifest-amender prompt has a numbered execute-and-verify recipe with a final `test -f .devbench/rejected-requests/...` assertion that aborts the verdict if the side-effect did not land.
 8. On post-Layer-3 success the standard review-supervisor runs against the updated manifest; the rest of the pipeline is unchanged.
+
+### Operator flow (issue #242)
+
+Use `request-amendment <task-id> --operator-mode` when a human operator needs to amend a work unit directly, bypassing the in-progress gate and the LLM judge. This is the recommended path for the `devbench-backlog-assistant` skills (rewrite-impossibility, refactor-target-repository, etc.).
+
+1. Operator invokes `uv run devbench request-amendment <task-id> --operator-mode` with the full payload JSON (including `"operator_mode": true`) on stdin.
+2. The CLI validates the payload schema (all eight operator-mode fields; see Appendix D-7 table above).
+3. `request-amendment` applies the amendment **synchronously**: appends `files_to_add` rows, writes the operator-amendment audit entry, runs Layer-3 post-check.
+4. On Layer-3 success: the work-unit file is updated and the audit `[OPERATOR_AMENDMENT] applied; layer3=validate-backlog rc=0` appears in `## Comments`. No pending request file is written.
+5. On Layer-3 failure: the work-unit file is restored to its pre-amendment content and the command exits with rc=1.
 
 ## Amendment request JSON schema
 
@@ -78,14 +90,49 @@ The executor writes JSON with these fields. `request-amendment` fills in `task_i
 }
 ```
 
+### Operator-mode fields (issue #242 / Appendix D-7)
+
+When `request-amendment` is invoked with `--operator-mode`, the JSON payload may include seven additional optional patch fields. All fields default to their zero value when absent and are validated by `AmendmentRequest.from_dict`.
+
+```json
+{
+  "reason": "tdd_green_production_fix",
+  "justification": "<operator rationale>",
+  "files_to_add": [],
+  "linked_acs": [],
+  "operator_mode": true,
+  "files_to_remove": ["path/to/stale/file.py"],
+  "target_repository": "new-org/new-repo",
+  "description_patch": "<replacement description section text>",
+  "approach_patch": "<replacement approach section text>",
+  "title_patch": "New Task Title",
+  "dod_patch": "<replacement definition-of-done text>",
+  "section_patches": {
+    "## Related Specifications": "<replacement body>"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `operator_mode` | `bool` | `false` | When `true`, bypasses the in-progress status gate and the LLM judge; applies synchronously. |
+| `files_to_remove` | `list[str]` | `[]` | File paths to remove from the Changes Manifest table. |
+| `target_repository` | `str` | `""` | When non-empty, replaces the work-unit's Target Repository value. |
+| `description_patch` | `str` | `""` | When non-empty, replaces the entire Description section body. |
+| `approach_patch` | `str` | `""` | When non-empty, replaces the entire Approach section body. |
+| `title_patch` | `str` | `""` | When non-empty, replaces the work-unit title (the H1 heading). |
+| `dod_patch` | `str` | `""` | When non-empty, replaces the entire Definition of Done section. |
+| `section_patches` | `dict[str, str]` | `{}` | Maps arbitrary section headers to replacement body text. |
+
 ## Audit trail
 
 Every amendment action leaves a timestamped entry in the work-unit `## Comments` section:
 
 - On apply: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_APPLIED] <reason>; added N file(s); justification: <...>`
 - On reject: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_REJECTED] <reason>; rejected: <...>`
+- On operator-mode apply: `[YYYY-MM-DD HH:MM UTC] [operator] [OPERATOR_AMENDMENT] applied; layer3=validate-backlog rc=<n>; reason=<...>; justification: <...>`
 
-The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent.
+The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent. Operator-mode amendments do not go through the amender agent and therefore do not log a judge verdict.
 
 ### Rejection feedback persistence (issue #154)
 
@@ -126,11 +173,11 @@ The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_han
 ## Related code and tests
 
 - `src/devbench/backlog/manifest.py` -- Changes Manifest parser and writer (Layer 3 mechanics).
-- `src/devbench/backlog/amendment.py` -- amendment request schema, PreFilter, apply/reject lifecycle, post-check.
-- `src/devbench/cli.py` -- `cmd_request_amendment`, `cmd_apply_amendment`, `cmd_reject_amendment`.
+- `src/devbench/backlog/amendment.py` -- amendment request schema, PreFilter, apply/reject/operator lifecycle, post-check.
+- `src/devbench/cli.py` -- `cmd_request_amendment` (variadic, `--operator-mode`), `cmd_apply_amendment`, `cmd_reject_amendment`.
 - `plugin/devbench-orchestrate/agents/manifest-amender.md` -- Layer 2 judge prompt.
 - `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` -- step 4b of the main loop.
-- `tests/test_backlog/test_manifest.py`, `tests/test_backlog/test_amendment.py`, `tests/test_backlog/test_amendment_prefilter.py`, `tests/test_integration/test_amendment_lifecycle.py` -- unit + integration coverage.
+- `tests/test_backlog/test_manifest.py`, `tests/test_backlog/test_amendment.py`, `tests/test_backlog/test_amendment_prefilter.py`, `tests/test_backlog/test_amendment_operator_mode.py`, `tests/test_cli_request_amendment.py`, `tests/test_integration/test_amendment_lifecycle.py` -- unit + integration coverage.
 
 ## Pre-conflict check (issue #137)
 

@@ -426,6 +426,23 @@ class BacklogManager:
             work-unit ``## Comments`` sections must not form cycles. 2-node cycles
             are reported as ``marker cycle: <id-a> <-> <id-b>``; N-node cycles as
             ``marker cycle: a -> b -> c -> a``.
+        22. C1 -- Target repo resolves: every work-unit's ``## Target Repository``
+            repo key must appear in the configured ``repos`` section of ``devbench.yaml``
+            (``_check_target_repo_resolves``). Distinct from check 11 which silently
+            skips unknown repos because the checkout-directory rule does not apply
+            to them.
+        23. C3 -- Manifest multi-repo prefixes resolve: every
+            `` `<repo>` -- `<path>` `` row in a Changes Manifest must reference a
+            recognised repo key (``_check_manifest_multi_repo_prefixes``).
+        24. C4 -- Dep file exists: every dep ID in ``## Dependencies`` must resolve
+            to a work-unit file on disk, not just in the BACKLOG.md index
+            (``_check_dep_file_exists``).
+        25. C6 -- Title matches index: the work-unit file heading title (after the
+            ID prefix) must equal the BACKLOG.md row title exactly after stripping
+            whitespace (``_check_title_matches_index``).
+        26. C7 -- Canonical path shape: the file path in the BACKLOG.md index must
+            end with ``/<ID>.md`` where the basename matches the unit type's regex
+            (``_check_canonical_path_shape``).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -467,6 +484,11 @@ class BacklogManager:
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
+        self._check_target_repo_resolves(rows, workspace_root, errors)
+        self._check_manifest_multi_repo_prefixes(rows, workspace_root, errors)
+        self._check_dep_file_exists(rows, workspace_root, errors)
+        self._check_title_matches_index(backlog_index, rows, workspace_root, errors)
+        self._check_canonical_path_shape(rows, errors)
         return errors
 
     def reconcile_backlog_md(self, repo_root: Path, *, force: bool, check_only: bool) -> tuple[int, str]:
@@ -2501,6 +2523,31 @@ class BacklogManager:
     # adding the optional Feature/Story/Task suffixes.
     _DEP_ID_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?$")
 
+    # C7: canonical path-shape regexes for each unit type.
+    # A BACKLOG.md file-path cell must end with ``/<ID>.md`` where the
+    # basename matches the regex for the row's unit type.
+    # The patterns are anchored to match anywhere in the path so both
+    # flat (``backlog/E1-F1-S1-T1.md``) and nested
+    # (``backlog/.../E1-F1-S1-T1.md``) layouts are accepted.
+    # ``E[A-Z0-9]+`` (not ``E\d+``) mirrors ``_DEP_ID_PATTERN`` so
+    # test-harness IDs like ``EX-F1-S1-T1`` satisfy the regex.
+    _EPIC_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+\.md$")
+    _FEATURE_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+-F\d+\.md$")
+    _STORY_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+-F\d+-S\d+\.md$")
+    _TASK_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+-F\d+-S\d+-T\d+\.md$")
+
+    # Regex to detect a multi-repo prefix in a manifest row file cell.
+    # Format: ``\`<repo>\` -- \`<path>\``` (the prefix is the first backtick group).
+    _MANIFEST_REPO_PREFIX_RE: ClassVar[re.Pattern[str]] = re.compile(r"^`([^`]+)`\s+--\s+`[^`]+`$")
+
+    # Regex to extract the body of the ``## Changes Manifest`` section.
+    # Mirrors ``devbench.backlog.manifest._SECTION_RE`` but kept here so
+    # C3 can access it without importing a private symbol.
+    _MANIFEST_SECTION_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"^(##\s+Changes Manifest\s*\n)(.*?)(?=^##\s|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+
     def _check_required_sections(
         self,
         rows: list[tuple[str, str, str]],
@@ -2932,6 +2979,287 @@ class BacklogManager:
                     f"token with ' (ref)' to declare it a read-only "
                     f"reference. See docs/backlog-contract.md "
                     f"'No Orphan Path Tokens Rule'."
+                )
+
+    # ------------------------------------------------------------------
+    # C1/C3/C4/C6/C7: impossibility checks (issue #240a / AC-240-1)
+    # ------------------------------------------------------------------
+
+    def _check_target_repo_resolves(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """C1: every work-unit's target repo must appear in the configured repos.
+
+        This is a NEW check distinct from ``_check_manifest_path_prefixes``
+        (check 11). Check 11 silently ``continue``s when the repo is
+        unknown because the checkout-directory prefix rule simply does not
+        apply there. C1 actively reports the unknown repo so the operator
+        can add it to ``devbench.yaml`` before any executor cycle spends
+        work on an unresolvable target.
+
+        Only work units that contain a ``## Target Repository`` section
+        with a parseable ``**Repo:** `...``` value are checked; units with
+        no section are skipped (the check does not apply).
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue  # already reported by _check_files_and_statuses
+            content = wu_path.read_text(encoding="utf-8")
+            repo = self._extract_repo(content)
+            if repo is None:
+                continue  # no Target Repository section; check does not apply
+            if repo not in RUNTIME_CONFIG.repos:
+                errors.append(
+                    f"{row_id}: target repo {repo!r} is not recognised; "
+                    f"add it to the repos section of devbench.yaml. "
+                    f"Allowed repos: {sorted(RUNTIME_CONFIG.repos)}."
+                )
+
+    def _check_manifest_multi_repo_prefixes(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """C3: every repo prefix in a multi-repo manifest row must resolve.
+
+        A multi-repo manifest row uses the format
+        ``| `<repo>` -- `<path>` | <change> |``.  The ``<repo>`` prefix
+        must be a recognised repo key (full or short name) so the executor
+        can locate the checkout. An unknown prefix means the staged file
+        would be invisible to ``git-ops``.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue  # already reported by _check_files_and_statuses
+
+            content = wu_path.read_text(encoding="utf-8")
+            match = self._MANIFEST_SECTION_RE.search(content)
+            if not match:
+                continue
+            body = match.group(2)
+
+            self._check_manifest_body_repo_prefixes(row_id, body, errors)
+
+    def _check_manifest_body_repo_prefixes(
+        self,
+        row_id: str,
+        body: str,
+        errors: list[str],
+    ) -> None:
+        """Check each manifest table line for unrecognised multi-repo prefixes.
+
+        Extracted from ``_check_manifest_multi_repo_prefixes`` to keep
+        branch count within the PLR0912 limit.
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        repos = RUNTIME_CONFIG.repos
+        short_to_full = {r.split("/", maxsplit=1)[-1]: r for r in repos}
+
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line or not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if not cells:
+                continue
+            raw_file = cells[0]
+            if "` -- `" not in raw_file:
+                continue
+            repo_part = raw_file.split("` -- `", 1)[0].strip("`").strip()
+            if not repo_part:
+                continue
+            if repo_part not in repos and repo_part not in short_to_full:
+                errors.append(
+                    f"{row_id}: Changes Manifest repo prefix {repo_part!r} is not "
+                    f"recognised; add it to the repos section of devbench.yaml. "
+                    f"Allowed repos: {sorted(repos)}."
+                )
+
+    def _check_dep_file_exists(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """C4: every dep ID in ## Dependencies must have a real work-unit file on disk.
+
+        The existing ``_check_dependencies`` (check 4) validates that dep
+        IDs appear in the BACKLOG.md index.  C4 adds a second layer: the
+        dep ID must also resolve to a real file on disk via the index's
+        ``File Path`` column, so the executor can read its content.
+
+        Skips dep IDs that are not in the index at all (already reported by
+        check 4) to avoid duplicate noise.
+        """
+        # Build a map from id -> file_path for fast lookup
+        id_to_path: dict[str, str] = {}
+        for row_id, _, file_path_str in rows:
+            if row_id and not row_id.startswith("-") and row_id.lower() != "id" and file_path_str:
+                id_to_path[row_id] = file_path_str
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue  # already reported by _check_files_and_statuses
+
+            content = wu_path.read_text(encoding="utf-8")
+            for dep_id in self._iter_dep_ids(content):
+                if dep_id not in id_to_path:
+                    continue  # already reported by _check_dependencies (check 4)
+                dep_file_path = id_to_path[dep_id]
+                dep_wu_path = workspace_root / dep_file_path
+                if not dep_wu_path.is_file():
+                    errors.append(
+                        f"{row_id}: dependency {dep_id!r} has no work-unit file on disk "
+                        f"(expected at '{dep_file_path}'). "
+                        f"Ensure the file is committed or remove the dependency row."
+                    )
+
+    def _parse_index_titles(self, backlog_index: Path) -> dict[str, str]:
+        """Parse BACKLOG.md Full Work Unit Index rows into an ``{id: title}`` map.
+
+        Only rows inside ``## Full Work Unit Index`` with the canonical
+        9-cell count are included. Returns an empty dict when the file is
+        absent or contains no parseable data rows.
+        """
+        titles: dict[str, str] = {}
+        if not backlog_index.exists():
+            return titles
+        content = backlog_index.read_text(encoding="utf-8")
+        in_full_index = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_full_index = "Full Work Unit Index" in stripped
+                continue
+            if not in_full_index or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) != BACKLOG_INDEX_CELL_COUNT:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            titles[row_id] = cells[2]
+        return titles
+
+    def _check_title_matches_index(
+        self,
+        backlog_index: Path,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """C6: the work-unit file heading title must match the BACKLOG.md row title.
+
+        Every work-unit file begins with a heading ``# <id>: <title>``.
+        The ``<title>`` portion (after stripping whitespace) must equal the
+        ``Title`` column in the BACKLOG.md Full Work Unit Index row for the
+        same ID.  Drift between the two is a documentation defect that the
+        operator must resolve before the executor begins work.
+
+        The comparison is an exact string comparison after stripping leading
+        and trailing whitespace from both sides.
+        """
+        index_titles = self._parse_index_titles(backlog_index)
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            if row_id not in index_titles:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue  # already reported by _check_files_and_statuses
+
+            content = wu_path.read_text(encoding="utf-8")
+            wu_title: str | None = None
+            heading_match = re.search(
+                r"^#\s+" + re.escape(row_id) + r":\s*(.+?)\s*$",
+                content,
+                re.MULTILINE,
+            )
+            if heading_match:
+                wu_title = heading_match.group(1).strip()
+
+            if wu_title is None:
+                continue  # no parseable heading; not a C6 violation
+
+            index_title = index_titles[row_id].strip()
+            if wu_title != index_title:
+                errors.append(
+                    f"{row_id}: title mismatch -- index has {index_title!r}, "
+                    f"work-unit file has {wu_title!r}. "
+                    f"Update one to match the other."
+                )
+
+    def _check_canonical_path_shape(
+        self,
+        rows: list[tuple[str, str, str]],
+        errors: list[str],
+    ) -> None:
+        """C7: every file path in the BACKLOG.md index must match the canonical shape.
+
+        The four canonical shapes (one per unit type) are:
+        - Epic    ``E<n>``:             ``backlog/.../<E<n>>.md``
+        - Feature ``E<n>-F<n>``:       ``backlog/.../<E<n>-F<n>>.md``
+        - Story   ``E<n>-F<n>-S<n>``:  ``backlog/.../<E<n>-F<n>-S<n>>.md``
+        - Task    ``E<n>-F<n>-S<n>-T<n>``: ``backlog/.../<E<n>-F<n>-S<n>-T<n>>.md``
+
+        The check requires that the path starts with ``backlog/`` and that
+        the basename (without ``.md``) matches the row ID. This catches
+        accidental copy-paste errors where a file path lists the wrong
+        level's filename.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+
+            # Select the appropriate regex for the unit type
+            if self._is_task_id(row_id):
+                expected_re = self._TASK_PATH_RE
+                unit_type_label = "Task"
+            elif any(p.startswith("S") and p[1:].isdigit() for p in row_id.split("-")):
+                expected_re = self._STORY_PATH_RE
+                unit_type_label = "Story"
+            elif any(p.startswith("F") and p[1:].isdigit() for p in row_id.split("-")):
+                expected_re = self._FEATURE_PATH_RE
+                unit_type_label = "Feature"
+            else:
+                expected_re = self._EPIC_PATH_RE
+                unit_type_label = "Epic"
+
+            if not expected_re.match(file_path_str):
+                errors.append(
+                    f"{row_id}: file path {file_path_str!r} does not match the canonical "
+                    f"shape for a {unit_type_label} "
+                    f"(expected backlog/.../{row_id}.md). "
+                    f"Correct the 'File Path' column in BACKLOG.md."
                 )
 
     @staticmethod

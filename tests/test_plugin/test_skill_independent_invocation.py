@@ -24,7 +24,9 @@ import pytest
 import yaml
 
 from devbench import cli
-from devbench.config_loader import load_runtime_config
+from devbench.config_loader import RepoConfig, RuntimeConfig, load_runtime_config
+
+_EXAMPLE_RT_CFG = RuntimeConfig(repos={"example-org/example-repo": RepoConfig()})
 
 # Absolute path to the repo root so tests are portable regardless of cwd.
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -509,7 +511,10 @@ class TestSpecToBacklogIndependentInvocation:
         _write_valid_backlog_input(tmp_path, self._REPO_SLUG)
 
         backlog_index = tmp_path / "BACKLOG.md"
-        with patch("devbench.cli.BACKLOG_INDEX", backlog_index):
+        with (
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", _EXAMPLE_RT_CFG),
+        ):
             rc = cli.cmd_validate_backlog()
         assert rc == 0, (
             f"validate-backlog must return 0 when spec-to-backlog runs standalone. "

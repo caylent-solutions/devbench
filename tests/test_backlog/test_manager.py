@@ -659,7 +659,7 @@ class TestValidate:
         content = (
             f"# {unit_id}\n\n"
             f"## Status: {status}\n\n"
-            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Target Repository\n\n- **Repo:** `caylent-solutions/devbench`\n\n"
             "## Description\n\nTest work unit.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
@@ -904,8 +904,8 @@ class TestValidateContent:
         self._make_task(
             backlog_dir,
             "E0-F1-S1-T1",
-            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
-            "- **Repo:** `org/repo`\n\n## Description\n\nDo something real.\n\n"
+            "# E0-F1-S1-T1: Task\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/devbench`\n\n## Description\n\nDo something real.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Something testable\n\n"
             "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
@@ -914,7 +914,7 @@ class TestValidateContent:
         )
         idx = self._make_index(
             tmp_path,
-            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | caylent-solutions/devbench | `backlog/E0-F1-S1-T1.md` |\n",
         )
         errors = BacklogManager().validate(idx, tmp_path)
         assert errors == []
@@ -2021,7 +2021,7 @@ class TestAppendTddEntry:
         wu_content = (
             f"# {unit_id}: Roundtrip Test\n\n"
             f"## Status: in-progress\n\n"
-            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Target Repository\n\n- **Repo:** `caylent-solutions/devbench`\n\n"
             "## Description\n\nRoundtrip fixture.\n\n"
             "## Dependencies\n\n"
             "| ID | Title | Status |\n"
@@ -2047,8 +2047,10 @@ class TestAppendTddEntry:
             "## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
             "|-----|-------|------|--------|-------------|------|-----------|\n"
-            "| E0 | Example | Epic | in-queue | None | org/repo | `backlog/E0.md` |\n"
-            f"| {unit_id} | Roundtrip Test | Task | in-progress | none | org/repo | `backlog/{unit_id}.md` |\n"
+            "| E0 | Example | Epic | in-queue | None | caylent-solutions/devbench"
+            " | `backlog/E0.md` |\n"
+            f"| {unit_id} | Roundtrip Test | Task | in-progress | none | caylent-solutions/devbench"
+            f" | `backlog/{unit_id}.md` |\n"
         )
         index_path = tmp_path / "BACKLOG.md"
         index_path.write_text(index_content, encoding="utf-8")

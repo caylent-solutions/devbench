@@ -14,7 +14,10 @@ from unittest.mock import patch
 import pytest
 
 from devbench import cli
+from devbench.config_loader import RepoConfig, RuntimeConfig
 from devbench.constants import STATUS_DRAFT
+
+_EXAMPLE_RT_CFG = RuntimeConfig(repos={"example-org/example-repo": RepoConfig()})
 
 BACKLOG_INDEX_EPIC_DRAFT = """\
 # Backlog
@@ -121,7 +124,10 @@ class TestValidateBacklogDraftStatusFunctional:
         """A Task with STATUS_DRAFT must NOT cause cmd_validate_backlog to produce a
         draft-restriction error; the command exits 0 and prints the pass message."""
         workspace = _build_task_draft_workspace(tmp_path)
-        with patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"):
+        with (
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.config.RUNTIME_CONFIG", _EXAMPLE_RT_CFG),
+        ):
             rc = cli.cmd_validate_backlog()
 
         assert rc == 0

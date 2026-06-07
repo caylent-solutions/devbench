@@ -2487,8 +2487,8 @@ class TestCmdValidateBacklogPathResolution:
         backlog_dir.mkdir(parents=True, exist_ok=True)
         wu = backlog_dir / "E0-F1-S1-T1.md"
         wu.write_text(
-            "# E0-F1-S1-T1: Task\n\n## Status: in-queue\n\n"
-            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "# E0-F1-S1-T1: Task 1\n\n## Status: in-queue\n\n"
+            "## Target Repository\n\n- **Repo:** `caylent-solutions/devbench`\n\n"
             "## Description\n\nTest task.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
@@ -2507,7 +2507,8 @@ class TestCmdValidateBacklogPathResolution:
             "## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
             "|-----|-------|------|--------|-------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | caylent-solutions/devbench"
+            " | `backlog/E0-F1-S1-T1.md` |\n",
             encoding="utf-8",
         )
         return idx, backlog_dir

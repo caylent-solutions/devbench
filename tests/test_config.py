@@ -945,3 +945,95 @@ class TestSkillsAdversarialReviewThresholdConfig:
                 DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
             )
         assert result == DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# E14-F2-S1-T1: Configurable stop-class to mention-level mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrchestratorStopMentionMapConfig:
+    """ORCHESTRATOR_STOP_MENTION_MAP resolved via env vars, unset-safe with a noise-reducing default."""
+
+    def test_map_exported_from_config(self) -> None:
+        """config.py must export ORCHESTRATOR_STOP_MENTION_MAP."""
+        from devbench import config as _cfg
+        from devbench import notifications
+
+        assert hasattr(_cfg, "ORCHESTRATOR_STOP_MENTION_MAP"), (
+            "devbench.config must export ORCHESTRATOR_STOP_MENTION_MAP"
+        )
+        m = _cfg.ORCHESTRATOR_STOP_MENTION_MAP
+        assert isinstance(m, dict)
+        for cls in notifications.ALL_STOP_CLASSES:
+            assert cls in m, f"stop class {cls!r} missing from ORCHESTRATOR_STOP_MENTION_MAP"
+
+    def test_unset_env_yields_noise_reducing_default(self) -> None:
+        """When all env vars are absent, the default map reduces noise (completion/drain -> none)."""
+        from devbench import notifications
+
+        env_keys = [f"DEVBENCH_STOP_MENTION_{cls.upper().replace('-', '_')}" for cls in notifications.ALL_STOP_CLASSES]
+        env_copy = {k: v for k, v in os.environ.items() if k not in env_keys}
+        with patch.dict(os.environ, env_copy, clear=True):
+            m = config.resolve_orchestrator_stop_mention_map(None)
+        assert m[notifications.STOP_CLASS_COMPLETION] == notifications.MENTION_LEVEL_NONE
+        assert m[notifications.STOP_CLASS_DRAIN] == notifications.MENTION_LEVEL_NONE
+        assert m[notifications.STOP_CLASS_PREMATURE_TURN_END] == notifications.MENTION_LEVEL_HERE
+        assert m[notifications.STOP_CLASS_CRASH] == notifications.MENTION_LEVEL_HERE
+        assert m[notifications.STOP_CLASS_OPERATOR_INTERRUPT] == notifications.MENTION_LEVEL_HERE
+        assert m[notifications.STOP_CLASS_QUOTA_EXHAUSTED] == notifications.MENTION_LEVEL_HERE
+
+    def test_env_var_overrides_default_for_stop_class(self) -> None:
+        """An env var for a specific stop class overrides the default for that class only."""
+        from devbench import notifications
+
+        env_var = f"DEVBENCH_STOP_MENTION_{notifications.STOP_CLASS_CRASH.upper().replace('-', '_')}"
+        with patch.dict(os.environ, {env_var: notifications.MENTION_LEVEL_NONE}, clear=False):
+            m = config.resolve_orchestrator_stop_mention_map(None)
+        assert m[notifications.STOP_CLASS_CRASH] == notifications.MENTION_LEVEL_NONE
+
+    def test_yaml_map_overrides_default(self) -> None:
+        """A yaml_map dict overrides the default for the keys it supplies."""
+        from devbench import notifications
+
+        env_keys = [f"DEVBENCH_STOP_MENTION_{cls.upper().replace('-', '_')}" for cls in notifications.ALL_STOP_CLASSES]
+        env_copy = {k: v for k, v in os.environ.items() if k not in env_keys}
+        with patch.dict(os.environ, env_copy, clear=True):
+            m = config.resolve_orchestrator_stop_mention_map(
+                {notifications.STOP_CLASS_COMPLETION: notifications.MENTION_LEVEL_HERE}
+            )
+        assert m[notifications.STOP_CLASS_COMPLETION] == notifications.MENTION_LEVEL_HERE
+        # Other classes still default.
+        assert m[notifications.STOP_CLASS_DRAIN] == notifications.MENTION_LEVEL_NONE
+
+    def test_env_wins_over_yaml(self) -> None:
+        """Env var takes precedence over yaml_map value."""
+        from devbench import notifications
+
+        cls = notifications.STOP_CLASS_COMPLETION
+        env_var = f"DEVBENCH_STOP_MENTION_{cls.upper().replace('-', '_')}"
+        with patch.dict(os.environ, {env_var: notifications.MENTION_LEVEL_HERE}, clear=False):
+            m = config.resolve_orchestrator_stop_mention_map({cls: notifications.MENTION_LEVEL_NONE})
+        assert m[cls] == notifications.MENTION_LEVEL_HERE
+
+    def test_invalid_mention_level_in_env_fails_fast(self) -> None:
+        """An invalid mention level in an env var raises ValueError at resolution time."""
+        from devbench import notifications
+
+        env_var = f"DEVBENCH_STOP_MENTION_{notifications.STOP_CLASS_CRASH.upper().replace('-', '_')}"
+        with patch.dict(os.environ, {env_var: "loud"}, clear=False):
+            with pytest.raises(ValueError, match="mention level"):
+                config.resolve_orchestrator_stop_mention_map(None)
+
+    def test_invalid_stop_class_key_in_yaml_map_fails_fast(self) -> None:
+        """An unknown stop-class key in the yaml map raises ValueError at resolution time."""
+        with pytest.raises(ValueError, match="stop-class"):
+            config.resolve_orchestrator_stop_mention_map({"not-a-class": "here"})
+
+    def test_invalid_mention_level_in_yaml_map_fails_fast(self) -> None:
+        """An invalid mention level in a yaml map value raises ValueError."""
+        from devbench import notifications
+
+        with pytest.raises(ValueError, match="mention level"):
+            config.resolve_orchestrator_stop_mention_map({notifications.STOP_CLASS_COMPLETION: "loud"})

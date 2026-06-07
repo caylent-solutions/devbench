@@ -111,6 +111,134 @@ SLACK_HERE_MENTION: str = "<!here>"
 
 
 # ---------------------------------------------------------------------------
+# Orchestrator stop-class tokens (E14-F2-S1-T1, issue #271)
+# ---------------------------------------------------------------------------
+# Single-sourced enumeration of the orchestrator stop classes.  These tokens
+# are the keys for the configurable mention-level mapping; the dispatch path
+# and config resolution both import from here so no literal is duplicated.
+
+STOP_CLASS_PREMATURE_TURN_END: str = "premature-turn-end"
+STOP_CLASS_COMPLETION: str = "completion"
+STOP_CLASS_DRAIN: str = "drain"
+STOP_CLASS_OPERATOR_INTERRUPT: str = "operator-interrupt"
+STOP_CLASS_CRASH: str = "crash"
+STOP_CLASS_QUOTA_EXHAUSTED: str = "quota-exhausted"
+
+ALL_STOP_CLASSES: tuple[str, ...] = (
+    STOP_CLASS_PREMATURE_TURN_END,
+    STOP_CLASS_COMPLETION,
+    STOP_CLASS_DRAIN,
+    STOP_CLASS_OPERATOR_INTERRUPT,
+    STOP_CLASS_CRASH,
+    STOP_CLASS_QUOTA_EXHAUSTED,
+)
+
+# ---------------------------------------------------------------------------
+# Mention-level tokens (E14-F2-S1-T1)
+# ---------------------------------------------------------------------------
+# Allowed values for the per-stop-class mention level.
+# ``here`` -- emit ``<!here>`` so Slack pushes a notification to every online
+#     channel member (the existing behaviour for all stops).
+# ``none`` -- omit the broadcast mention; the message still lands in the
+#     channel but no push notification fires.
+
+MENTION_LEVEL_HERE: str = "here"
+MENTION_LEVEL_NONE: str = "none"
+
+ALL_MENTION_LEVELS: tuple[str, ...] = (MENTION_LEVEL_HERE, MENTION_LEVEL_NONE)
+
+# Default noise-reducing mapping.  Attention-worthy stops (premature exit,
+# operator interrupt, crash, quota) get ``<!here>``; genuine completion and
+# clean drain get no broadcast mention.  Declared once here so config.py and
+# the dispatch path share the same default without copying literals.
+DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP: dict[str, str] = {
+    STOP_CLASS_PREMATURE_TURN_END: MENTION_LEVEL_HERE,
+    STOP_CLASS_COMPLETION: MENTION_LEVEL_NONE,
+    STOP_CLASS_DRAIN: MENTION_LEVEL_NONE,
+    STOP_CLASS_OPERATOR_INTERRUPT: MENTION_LEVEL_HERE,
+    STOP_CLASS_CRASH: MENTION_LEVEL_HERE,
+    STOP_CLASS_QUOTA_EXHAUSTED: MENTION_LEVEL_HERE,
+}
+
+
+def validate_stop_mention_map(candidate: dict[str, str]) -> None:
+    """Validate a stop-class to mention-level mapping.
+
+    Raises ``ValueError`` when any key is not a recognised stop-class or any
+    value is not an allowed mention level.  Called at config-load time and in
+    tests so invalid operator configuration surfaces immediately.
+
+    Args:
+        candidate: Mapping from stop-class token to mention-level token to
+            validate.
+
+    Raises:
+        ValueError: When an unknown stop-class key or invalid mention level is
+            found.  The error message names the offending key and the allowed
+            values so the operator can fix the config without reading source.
+    """
+    for cls, level in candidate.items():
+        if cls not in ALL_STOP_CLASSES:
+            raise ValueError(
+                f"unknown stop-class key {cls!r} in mention map; allowed stop-class keys: {sorted(ALL_STOP_CLASSES)}"
+            )
+        if level not in ALL_MENTION_LEVELS:
+            raise ValueError(
+                f"invalid mention level {level!r} for stop-class {cls!r}; "
+                f"allowed mention levels: {sorted(ALL_MENTION_LEVELS)}"
+            )
+
+
+def classify_stop_class(reason: str) -> str:
+    """Map a stop-reason string to the canonical stop-class token.
+
+    Used by ``notify_orchestrator_stop`` so the mention-level is resolved by
+    stop class, not by the free-form reason string.  Classification is
+    prefix-based and ordered from most specific to least specific.
+
+    Args:
+        reason: The stop-reason string from ``_fire_orchestrator_stop_notification``
+            (e.g. ``"clean exit: ALL_DONE"`` or ``"premature-turn-end"``).
+
+    Returns:
+        One of the ``STOP_CLASS_*`` constants.  Unrecognised reasons fall
+        through to :data:`STOP_CLASS_CRASH` (fail-visible, never silent).
+    """
+    if reason == STOP_CLASS_PREMATURE_TURN_END:
+        return STOP_CLASS_PREMATURE_TURN_END
+    if reason.startswith("clean"):
+        return STOP_CLASS_COMPLETION
+    if reason.startswith("drain"):
+        return STOP_CLASS_DRAIN
+    if reason.startswith("interrupted by operator"):
+        return STOP_CLASS_OPERATOR_INTERRUPT
+    if reason.startswith("quota"):
+        return STOP_CLASS_QUOTA_EXHAUSTED
+    # crash:, continuation budget exhausted, and any unrecognised reason
+    return STOP_CLASS_CRASH
+
+
+def resolve_mention_text(mention_level: str) -> str:
+    """Convert a mention-level token to the Slack mention string.
+
+    Args:
+        mention_level: One of the ``MENTION_LEVEL_*`` constants.
+
+    Returns:
+        The Slack mention string (``<!here>`` for ``"here"``, ``""`` for
+        ``"none"``).
+
+    Raises:
+        ValueError: When *mention_level* is not a recognised token.
+    """
+    if mention_level == MENTION_LEVEL_HERE:
+        return SLACK_HERE_MENTION
+    if mention_level == MENTION_LEVEL_NONE:
+        return ""
+    raise ValueError(f"unknown mention level {mention_level!r}; allowed mention levels: {sorted(ALL_MENTION_LEVELS)}")
+
+
+# ---------------------------------------------------------------------------
 # Classification-transition cache (#207)
 # ---------------------------------------------------------------------------
 #
@@ -233,15 +361,16 @@ def _build_slack_payload(
     summary: str,
     fields: list[tuple[str, str]],
     context: str | None,
+    mention: str = SLACK_HERE_MENTION,
 ) -> dict[str, Any]:
     """Build a Slack block-kit payload.
 
-    Every payload is prefixed with the literal ``<!here>`` mention so the
+    By default every payload is prefixed with the ``<!here>`` mention so the
     message triggers a desktop + mobile push for every online member of
-    the channel the webhook posts to.  In a one-person private channel
-    (the recommended DM-yourself pattern) that's just the operator; in
-    a shared channel the whole online team gets pinged.  Single payload,
-    both routings.
+    the channel the webhook posts to.  Pass an explicit *mention* string
+    (resolved from the per-stop-class mention-level config) to override the
+    mention for a specific event.  Pass an empty string to omit the broadcast
+    mention entirely (the message still lands in the channel).
 
     Every payload also carries a ``Backlog`` field as the first row of
     the fields block so operators monitoring multiple workspaces can
@@ -259,8 +388,11 @@ def _build_slack_payload(
             ``Backlog`` row is prepended automatically.
         context: Optional muted footer line (block-kit ``context``
             element).  ``None`` skips the footer block.
+        mention: Broadcast mention prefix injected before *summary*.
+            Defaults to ``SLACK_HERE_MENTION`` (``<!here>``).  Supply
+            an empty string to omit the mention for quieter events.
     """
-    prefix = f"{SLACK_HERE_MENTION} "
+    prefix = f"{mention} " if mention else ""
     text_line = f"{prefix}{summary}"
     enriched_fields: list[tuple[str, str]] = [("Backlog", _resolve_backlog_label())] + list(fields)
     blocks: list[dict[str, Any]] = [
@@ -419,6 +551,7 @@ def _dispatch(
     slack_summary: str,
     slack_fields: list[tuple[str, str]],
     slack_context: str | None,
+    slack_mention: str = SLACK_HERE_MENTION,
 ) -> None:
     """POST the payload to every enabled endpoint; never raise.
 
@@ -428,6 +561,11 @@ def _dispatch(
     endpoint is Slack; future endpoints (Discord, Teams, generic raw
     JSON) plug in as additional branches without touching event
     callers.
+
+    The *slack_mention* parameter controls the broadcast mention prefix
+    injected into the payload (``<!here>`` by default).  Pass an empty
+    string to suppress the mention for quieter events (e.g. clean
+    completion or drain).
 
     Outer try / except guards against catastrophic failures
     (config-read errors, payload-build bugs) so a notification bug
@@ -444,7 +582,7 @@ def _dispatch(
         slack_url = cfg.slack.webhook_url if (cfg.slack is not None and cfg.slack.enabled) else None
 
         if slack_url:
-            slack_payload = _build_slack_payload(slack_summary, slack_fields, slack_context)
+            slack_payload = _build_slack_payload(slack_summary, slack_fields, slack_context, slack_mention)
             try:
                 post_webhook(slack_url, slack_payload, timeout)
             except Exception as exc:
@@ -781,7 +919,24 @@ def notify_ci_pass(unit_id: str, repo: str, pr_url: str) -> None:
 
 
 def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None:
-    """The orchestrator loop is exiting (clean, drain, or SIGTERM)."""
+    """The orchestrator loop is exiting (clean, drain, or SIGTERM).
+
+    The broadcast mention is resolved from the configurable stop-class to
+    mention-level mapping (``ORCHESTRATOR_STOP_MENTION_MAP`` in
+    ``devbench.config``).  Attention-worthy stop classes (premature turn end,
+    operator interrupt, crash, quota exhausted) default to
+    ``MENTION_LEVEL_HERE``; clean completion and drain default to
+    ``MENTION_LEVEL_NONE`` so operators are not interrupted for routine exits.
+    The mapping is fully configurable via env vars or YAML; see
+    ``docs/slack-notifications.md`` for details.
+
+    The mention string is resolved dynamically -- no literal broadcast mention
+    string is embedded in this function.  If the config module is unavailable,
+    the function falls back to the default noise-reducing map so notifications
+    remain functional even during early bootstrap.
+    """
+    stop_class = classify_stop_class(reason)
+    mention_text = _resolve_stop_mention(stop_class)
     fields: list[tuple[str, str]] = [("Reason", reason)]
     if in_flight_unit_id:
         fields.append(("In-flight", f"`{in_flight_unit_id}`"))
@@ -790,7 +945,35 @@ def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None
         slack_summary=f":octagonal_sign: Orchestrator stopped: {reason}",
         slack_fields=fields,
         slack_context=None,
+        slack_mention=mention_text,
     )
+
+
+def _resolve_stop_mention(stop_class: str) -> str:
+    """Resolve the mention text for *stop_class* from config.
+
+    Reads ``ORCHESTRATOR_STOP_MENTION_MAP`` from ``devbench.config`` when
+    the module is importable; falls back to
+    :data:`DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP` on ``ImportError`` only.
+    Any other exception (e.g. ``KeyError`` for an unknown stop class) is
+    allowed to propagate so real config bugs surface immediately.
+
+    Args:
+        stop_class: One of the ``STOP_CLASS_*`` constants.
+
+    Returns:
+        The Slack mention string for the resolved mention level.
+
+    Raises:
+        KeyError: If *stop_class* is not present in the resolved map.
+    """
+    try:
+        from devbench.config import ORCHESTRATOR_STOP_MENTION_MAP
+
+        level = ORCHESTRATOR_STOP_MENTION_MAP[stop_class]
+    except ImportError:
+        level = DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP[stop_class]
+    return resolve_mention_text(level)
 
 
 def notify_orchestrator_auto_restart(blocked_task_ids: list[str]) -> None:

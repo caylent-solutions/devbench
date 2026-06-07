@@ -616,6 +616,86 @@ def _apply_notifications_env_overrides() -> None:
 _apply_notifications_env_overrides()
 NOTIFICATIONS = RUNTIME_CONFIG.notifications
 
+
+# ---------------------------------------------------------------------------
+# Orchestrator stop-class mention-level mapping (E14-F2-S1-T1, issue #271)
+# ---------------------------------------------------------------------------
+
+
+def resolve_orchestrator_stop_mention_map(yaml_map: dict[str, str] | None) -> dict[str, str]:
+    """Resolve the stop-class to mention-level mapping.
+
+    Precedence per stop class: env var > *yaml_map* value > default.
+
+    The default (``DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP`` in
+    ``devbench.notifications``) is noise-reducing: attention-worthy stops
+    (premature turn end, operator interrupt, crash, quota exhausted) map to
+    ``"here"``; clean completion and drain map to ``"none"``.
+
+    Env var naming: ``DEVBENCH_STOP_MENTION_<CLASS_UPPER>`` where
+    ``<CLASS_UPPER>`` is the stop-class token uppercased with hyphens replaced
+    by underscores (e.g. ``DEVBENCH_STOP_MENTION_PREMATURE_TURN_END``).
+
+    Validation:
+        - Unknown stop-class keys in *yaml_map* raise ``ValueError`` immediately
+          (fail-fast at config-load time).
+        - Invalid mention-level values -- whether from an env var or *yaml_map*
+          -- raise ``ValueError`` naming the offending key and the allowed levels.
+
+    Args:
+        yaml_map: Mapping from the ``notifications.orchestrator_stop_mention_map``
+            YAML block, or ``None`` when the block is absent.
+
+    Returns:
+        A complete ``dict[stop_class, mention_level]`` covering all
+        ``ALL_STOP_CLASSES`` entries.
+
+    Raises:
+        ValueError: When any key in *yaml_map* is not a recognised stop class,
+            or when any resolved mention level is not a recognised level.
+    """
+    from devbench.notifications import (
+        ALL_MENTION_LEVELS,
+        ALL_STOP_CLASSES,
+        DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP,
+    )
+
+    # Validate yaml_map keys before merging so the error names the bad key.
+    if yaml_map:
+        for cls in yaml_map:
+            if cls not in ALL_STOP_CLASSES:
+                raise ValueError(
+                    f"unknown stop-class key {cls!r} in orchestrator_stop_mention_map; "
+                    f"allowed stop-class keys: {sorted(ALL_STOP_CLASSES)}"
+                )
+
+    resolved: dict[str, str] = {}
+    for cls in ALL_STOP_CLASSES:
+        env_var = f"DEVBENCH_STOP_MENTION_{cls.upper().replace('-', '_')}"
+        env_val = _read_env(env_var)
+        if env_val is not None:
+            if env_val not in ALL_MENTION_LEVELS:
+                raise ValueError(
+                    f"{env_var}: invalid mention level {env_val!r}; "
+                    f"allowed mention levels: {sorted(ALL_MENTION_LEVELS)}"
+                )
+            resolved[cls] = env_val
+        elif yaml_map and cls in yaml_map:
+            yaml_val = yaml_map[cls]
+            if yaml_val not in ALL_MENTION_LEVELS:
+                raise ValueError(
+                    f"orchestrator_stop_mention_map.{cls}: invalid mention level {yaml_val!r}; "
+                    f"allowed mention levels: {sorted(ALL_MENTION_LEVELS)}"
+                )
+            resolved[cls] = yaml_val
+        else:
+            resolved[cls] = DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP[cls]
+    return resolved
+
+
+ORCHESTRATOR_STOP_MENTION_MAP: dict[str, str] = resolve_orchestrator_stop_mention_map(None)
+
+
 # ---------------------------------------------------------------------------
 # Timeouts -- all values in seconds
 # ---------------------------------------------------------------------------

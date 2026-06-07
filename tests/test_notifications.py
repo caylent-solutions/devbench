@@ -876,3 +876,212 @@ class TestHttpPostInternals:
             )
 
         conn.close.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# E14-F2-S1-T1: Stop-class to mention-level mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestStopClassConstants:
+    """Stop-class and mention-level constants are single-sourced in notifications.py."""
+
+    def test_all_stop_classes_exported(self) -> None:
+        assert hasattr(notifications, "STOP_CLASS_PREMATURE_TURN_END")
+        assert hasattr(notifications, "STOP_CLASS_COMPLETION")
+        assert hasattr(notifications, "STOP_CLASS_DRAIN")
+        assert hasattr(notifications, "STOP_CLASS_OPERATOR_INTERRUPT")
+        assert hasattr(notifications, "STOP_CLASS_CRASH")
+        assert hasattr(notifications, "STOP_CLASS_QUOTA_EXHAUSTED")
+
+    def test_all_mention_levels_exported(self) -> None:
+        assert hasattr(notifications, "MENTION_LEVEL_HERE")
+        assert hasattr(notifications, "MENTION_LEVEL_NONE")
+
+    def test_all_stop_classes_tuple_exported(self) -> None:
+        assert hasattr(notifications, "ALL_STOP_CLASSES")
+        sc = notifications.ALL_STOP_CLASSES
+        assert isinstance(sc, tuple)
+        assert notifications.STOP_CLASS_PREMATURE_TURN_END in sc
+        assert notifications.STOP_CLASS_COMPLETION in sc
+        assert notifications.STOP_CLASS_DRAIN in sc
+        assert notifications.STOP_CLASS_OPERATOR_INTERRUPT in sc
+        assert notifications.STOP_CLASS_CRASH in sc
+        assert notifications.STOP_CLASS_QUOTA_EXHAUSTED in sc
+
+    def test_all_mention_levels_tuple_exported(self) -> None:
+        assert hasattr(notifications, "ALL_MENTION_LEVELS")
+        ml = notifications.ALL_MENTION_LEVELS
+        assert isinstance(ml, tuple)
+        assert notifications.MENTION_LEVEL_HERE in ml
+        assert notifications.MENTION_LEVEL_NONE in ml
+
+
+@pytest.mark.unit
+class TestClassifyStopClass:
+    """classify_stop_class maps reason strings to stop-class tokens."""
+
+    @pytest.mark.parametrize(
+        "reason,expected_class",
+        [
+            ("premature-turn-end", notifications.STOP_CLASS_PREMATURE_TURN_END),
+            ("clean exit: ALL_DONE", notifications.STOP_CLASS_COMPLETION),
+            ("clean exit: NO_ACTIONABLE -- 5 done", notifications.STOP_CLASS_COMPLETION),
+            ("clean exit (SystemExit 0)", notifications.STOP_CLASS_COMPLETION),
+            ("drain enforced: operator requested", notifications.STOP_CLASS_DRAIN),
+            ("drain enforced: ", notifications.STOP_CLASS_DRAIN),
+            ("interrupted by operator (Ctrl+C / SIGINT)", notifications.STOP_CLASS_OPERATOR_INTERRUPT),
+            ("crash: RuntimeError: something bad", notifications.STOP_CLASS_CRASH),
+            ("crash: ValueError: oops", notifications.STOP_CLASS_CRASH),
+            ("quota-wait-recovered", notifications.STOP_CLASS_QUOTA_EXHAUSTED),
+            ("quota-wait-timeout", notifications.STOP_CLASS_QUOTA_EXHAUSTED),
+            ("continuation budget exhausted", notifications.STOP_CLASS_CRASH),
+        ],
+    )
+    def test_reason_maps_to_class(self, reason: str, expected_class: str) -> None:
+        assert notifications.classify_stop_class(reason) == expected_class
+
+    def test_unknown_reason_maps_to_crash(self) -> None:
+        """Unrecognized reason strings are classified as crash (fail-safe, not silent)."""
+        assert notifications.classify_stop_class("something-totally-unknown") == notifications.STOP_CLASS_CRASH
+
+
+@pytest.mark.unit
+class TestResolveMentionText:
+    """resolve_mention_text converts a mention-level token to the Slack mention string."""
+
+    def test_here_level_returns_here_string(self) -> None:
+        text = notifications.resolve_mention_text(notifications.MENTION_LEVEL_HERE)
+        assert text == "<!here>"
+
+    def test_none_level_returns_empty_string(self) -> None:
+        text = notifications.resolve_mention_text(notifications.MENTION_LEVEL_NONE)
+        assert text == ""
+
+    def test_unknown_level_raises(self) -> None:
+        with pytest.raises(ValueError, match="mention level"):
+            notifications.resolve_mention_text("invalid-level")
+
+
+@pytest.mark.unit
+class TestDefaultMentionMap:
+    """DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP is noise-reducing: attention-worthy -> here, quiet -> none."""
+
+    def test_attention_worthy_classes_default_to_here(self) -> None:
+        m = notifications.DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP
+        for cls in (
+            notifications.STOP_CLASS_PREMATURE_TURN_END,
+            notifications.STOP_CLASS_OPERATOR_INTERRUPT,
+            notifications.STOP_CLASS_CRASH,
+            notifications.STOP_CLASS_QUOTA_EXHAUSTED,
+        ):
+            assert m[cls] == notifications.MENTION_LEVEL_HERE, f"{cls} should default to 'here'"
+
+    def test_quiet_classes_default_to_none(self) -> None:
+        m = notifications.DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP
+        for cls in (notifications.STOP_CLASS_COMPLETION, notifications.STOP_CLASS_DRAIN):
+            assert m[cls] == notifications.MENTION_LEVEL_NONE, f"{cls} should default to 'none'"
+
+    def test_map_covers_all_stop_classes(self) -> None:
+        m = notifications.DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP
+        for cls in notifications.ALL_STOP_CLASSES:
+            assert cls in m, f"stop class {cls!r} missing from DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP"
+
+
+@pytest.mark.unit
+class TestOrchestratorStopMentionDispatch:
+    """notify_orchestrator_stop emits a mention matching the resolved mention level per stop class."""
+
+    def _capture_payload(self, reason: str) -> dict[str, Any]:
+        """Call notify_orchestrator_stop with the given reason and capture the posted payload."""
+        cfg = _make_config(enabled=True, events={"orchestrator_stop": True})
+        captured: list[dict[str, Any]] = []
+
+        def _grab(_url: str, payload: dict[str, Any], _timeout: float) -> None:
+            captured.append(payload)
+
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook", side_effect=_grab),
+        ):
+            notifications.notify_orchestrator_stop(reason, None)
+        assert captured, "expected at least one POST"
+        return captured[0]
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "premature-turn-end",
+            "interrupted by operator (Ctrl+C / SIGINT)",
+            "crash: RuntimeError: bang",
+            "quota-wait-timeout",
+        ],
+    )
+    def test_attention_worthy_stop_emits_here_mention(self, reason: str) -> None:
+        """Attention-worthy stop classes include <!here> in the payload."""
+        payload = self._capture_payload(reason)
+        assert "<!here>" in payload["text"], f"expected <!here> for reason {reason!r}"
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "clean exit: ALL_DONE",
+            "drain enforced: manual request",
+        ],
+    )
+    def test_quiet_stop_omits_here_mention(self, reason: str) -> None:
+        """Quiet stop classes (completion, drain) do NOT include <!here> in the payload."""
+        payload = self._capture_payload(reason)
+        assert "<!here>" not in payload["text"], f"expected no <!here> for reason {reason!r}"
+
+    def test_no_hardcoded_mention_literal_in_dispatch_path(self) -> None:
+        """The dispatch path must resolve mention from config, not embed a literal string."""
+        import ast
+        import inspect
+
+        source = inspect.getsource(notifications.notify_orchestrator_stop)
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert "<!here>" not in node.value, (
+                    "notify_orchestrator_stop must not contain a hard-coded '<!here>' literal"
+                )
+
+    def test_unknown_stop_class_in_map_raises(self) -> None:
+        """A map with an unknown stop-class key raises ValueError at validation time."""
+        from devbench.notifications import validate_stop_mention_map
+
+        with pytest.raises(ValueError, match="stop-class"):
+            validate_stop_mention_map({"not-a-class": "here"})
+
+    def test_invalid_mention_level_in_map_raises(self) -> None:
+        """A map with an invalid mention level raises ValueError at validation time."""
+        from devbench.notifications import validate_stop_mention_map
+
+        with pytest.raises(ValueError, match="mention level"):
+            validate_stop_mention_map({notifications.STOP_CLASS_COMPLETION: "loud"})
+
+    def test_config_import_error_falls_back_to_default_map(self) -> None:
+        """When devbench.config cannot be imported, _resolve_stop_mention uses the default map."""
+        from devbench.notifications import _resolve_stop_mention
+
+        with patch.dict("sys.modules", {"devbench.config": None}):
+            # STOP_CLASS_CRASH -> MENTION_LEVEL_HERE by default map -> "<!here>"
+            text = _resolve_stop_mention(notifications.STOP_CLASS_CRASH)
+        assert text == "<!here>"
+
+    def test_config_missing_attr_falls_back_to_default_map(self) -> None:
+        """When ORCHESTRATOR_STOP_MENTION_MAP is absent from the config module, ImportError is raised
+        by the from-import and _resolve_stop_mention falls back to the default map."""
+        import types
+
+        from devbench.notifications import _resolve_stop_mention
+
+        fake_config = types.ModuleType("devbench.config")
+        # fake_config has no ORCHESTRATOR_STOP_MENTION_MAP attribute;
+        # 'from devbench.config import ORCHESTRATOR_STOP_MENTION_MAP' raises ImportError
+        with patch.dict("sys.modules", {"devbench.config": fake_config}):
+            text = _resolve_stop_mention(notifications.STOP_CLASS_DRAIN)
+        # STOP_CLASS_DRAIN -> MENTION_LEVEL_NONE -> ""
+        assert text == ""

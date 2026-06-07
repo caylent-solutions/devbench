@@ -103,12 +103,9 @@ class TestValidateBacklogTaskTypeHeader:
 
     @pytest.mark.parametrize(
         "bad_value",
-        ["behavior-fix", "unknown", "TEST-ONLY", "coverage_only", ""],
+        ["behavior-fix", "unknown", "TEST-ONLY", "coverage_only"],
     )
     def test_error_for_various_invalid_task_type_values(self, tmp_path: Path, bad_value: str) -> None:
-        if not bad_value:
-            # Empty value: skip, header with empty value is pathological
-            pytest.skip("Empty task type value is not a realistic case")
         task_id = "E0-F1-S1-T1"
         index = _make_backlog_index(tmp_path, task_id)
         _make_minimal_task_file(tmp_path, task_id, task_type_line=bad_value)
@@ -139,3 +136,26 @@ class TestValidateBacklogTaskTypeHeader:
         errors = mgr.validate(index, tmp_path)
         task_type_errors = [e for e in errors if "Task Type" in e or "unknown" in e]
         assert task_type_errors == [], f"Task Type check should be silent for missing file, got: {task_type_errors}"
+
+    def test_skips_non_task_rows_silently(self, tmp_path: Path) -> None:
+        """Non-Task rows (Epics, Features, Stories) are skipped without error."""
+        # Call _check_task_type_header directly with a non-Task row to exercise
+        # the 'if not self._is_task_id(row_id): continue' branch.
+        mgr = BacklogManager()
+        errors: list[str] = []
+        # E0 is an Epic ID (no -F or -T segment) -- not a Task
+        non_task_rows: list[tuple[str, str, str]] = [
+            ("E0", "Sample Epic", "backlog/E0.md"),
+        ]
+        mgr._check_task_type_header(non_task_rows, tmp_path, errors)
+        assert errors == [], f"Non-task rows must not produce Task Type errors, got: {errors}"
+
+    def test_skips_row_with_empty_file_path(self, tmp_path: Path) -> None:
+        """Rows with an empty file_path string are skipped without error."""
+        mgr = BacklogManager()
+        errors: list[str] = []
+        rows_with_empty_path: list[tuple[str, str, str]] = [
+            ("E0-F1-S1-T1", "Sample Task", ""),
+        ]
+        mgr._check_task_type_header(rows_with_empty_path, tmp_path, errors)
+        assert errors == [], f"Row with empty file path must not produce errors, got: {errors}"

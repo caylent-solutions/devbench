@@ -72,6 +72,7 @@ from devbench.constants import (
     VALID_STATUSES,
 )
 from devbench.session import flock_backlog
+from devbench.tdd_gate import extract_task_type
 from devbench.utils.io import atomic_write_text
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
@@ -443,6 +444,11 @@ class BacklogManager:
         26. C7 -- Canonical path shape: the file path in the BACKLOG.md index must
             end with ``/<ID>.md`` where the basename matches the unit type's regex
             (``_check_canonical_path_shape``).
+        27. Task Type header (rule 21, spec Section 4 E6.F2.S1, AC-257a-1): when a
+            Task work-unit carries an optional ``## Task Type:`` header, the value
+            must be one of the recognised values (``test-only``, ``coverage-only``).
+            Unknown values are rejected with an error that names the task ID and the
+            bad value (``_check_task_type_header``).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -489,6 +495,7 @@ class BacklogManager:
         self._check_dep_file_exists(rows, workspace_root, errors)
         self._check_title_matches_index(backlog_index, rows, workspace_root, errors)
         self._check_canonical_path_shape(rows, errors)
+        self._check_task_type_header(rows, workspace_root, errors)
         return errors
 
     def reconcile_backlog_md(self, repo_root: Path, *, force: bool, check_only: bool) -> tuple[int, str]:
@@ -3260,6 +3267,48 @@ class BacklogManager:
                     f"shape for a {unit_type_label} "
                     f"(expected backlog/.../{row_id}.md). "
                     f"Correct the 'File Path' column in BACKLOG.md."
+                )
+
+    def _check_task_type_header(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Rule 21 (spec Section 4 E6.F2.S1, AC-257a-1): validate the optional Task Type header.
+
+        When a Task work-unit file carries an optional ``## Task Type: <value>``
+        header, the value must be one of the recognised values (``test-only``,
+        ``coverage-only``).  An unknown value is rejected with an error that names
+        the task ID and the bad value so the author knows exactly what to correct.
+
+        Files that are absent on disk are skipped without error -- the missing-file
+        violation is already reported by ``_check_files_and_statuses``.  Non-Task
+        rows (Epics, Features, Stories) are also skipped because the Task Type
+        header is a Task-only concept.
+
+        Args:
+            rows: Parsed BACKLOG.md rows as ``(id, title, file_path)`` triples.
+            workspace_root: Workspace root containing the ``backlog/`` subdirectory.
+            errors: Mutable list to which error strings are appended.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                extract_task_type(content)
+            except ValueError as exc:
+                errors.append(
+                    f"{row_id}: invalid ## Task Type header -- {exc} "
+                    f"Update the header in {file_path_str} to use a supported value."
                 )
 
     @staticmethod

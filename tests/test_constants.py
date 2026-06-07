@@ -684,3 +684,52 @@ class TestContinuationBudgetConstants:
         )
 
         assert ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE != GET_DIFF_NO_ATTRIBUTABLE
+
+
+class TestInactivityTimeoutConstants:
+    """Issue #262 (E10-F2-S1): per-message inactivity timeout constants.
+
+    AC-2: DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS is a positive float
+          serving as the unset-safe default when neither env nor YAML supplies a value.
+    AC-3: ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX is the verbatim audit tag.
+    """
+
+    @pytest.mark.unit
+    def test_default_inactivity_timeout_is_importable(self) -> None:
+        """DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS is importable from devbench.constants."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS"), (
+            "DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS must be defined in devbench.constants"
+        )
+
+    @pytest.mark.unit
+    def test_default_inactivity_timeout_is_positive_float(self) -> None:
+        """DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS is a positive float."""
+        from devbench.constants import DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS
+
+        assert isinstance(DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS, float), (
+            f"Expected float, got {type(DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS).__name__}"
+        )
+        assert DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS > 0.0, (
+            f"Expected a positive float; got {DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS}"
+        )
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_audit_prefix_is_importable(self) -> None:
+        """ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX is importable from devbench.constants."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX"), (
+            "ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX must be defined in devbench.constants"
+        )
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_audit_prefix_is_verbatim_string(self) -> None:
+        """ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX equals the verbatim audit tag."""
+        from devbench.constants import ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX
+
+        assert ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX == "[ORCHESTRATOR_INACTIVITY_TIMEOUT]", (
+            f"Audit prefix must equal '[ORCHESTRATOR_INACTIVITY_TIMEOUT]'; "
+            f"got {ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX!r}"
+        )

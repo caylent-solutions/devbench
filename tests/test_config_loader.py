@@ -602,6 +602,75 @@ class TestTimeoutConfigDefaults:
             f"Expected orchestrator_poll_interval=None, got {tc.orchestrator_poll_interval!r}"
         )
         assert tc.github_check is None, f"Expected github_check=None, got {tc.github_check!r}"
+        assert tc.orchestrator_inactivity_timeout is None, (
+            f"Expected orchestrator_inactivity_timeout=None, got {tc.orchestrator_inactivity_timeout!r}"
+        )
+
+
+@pytest.mark.unit
+class TestInactivityTimeoutConfigLoader:
+    """Issue #262 (E10-F2-S1): TimeoutConfig.orchestrator_inactivity_timeout loaded from YAML.
+
+    AC-2: orchestrator_inactivity_timeout is a float | None field on TimeoutConfig;
+          absent YAML yields None; present YAML key is passed through as-is to config.py.
+    """
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_field_exists_and_defaults_none(self) -> None:
+        """orchestrator_inactivity_timeout field is None on a default-constructed TimeoutConfig."""
+        tc = TimeoutConfig()
+        assert hasattr(tc, "orchestrator_inactivity_timeout"), (
+            "TimeoutConfig must have an orchestrator_inactivity_timeout field"
+        )
+        assert tc.orchestrator_inactivity_timeout is None
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_field_accepts_float(self) -> None:
+        """orchestrator_inactivity_timeout field accepts a float value."""
+        tc = TimeoutConfig(orchestrator_inactivity_timeout=120.0)
+        assert tc.orchestrator_inactivity_timeout == 120.0
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_loaded_from_yaml(self, tmp_path: Path) -> None:
+        """When YAML sets orchestrator_inactivity_timeout the loader passes it through."""
+        import textwrap
+
+        from devbench.config_loader import load_runtime_config
+
+        cfg_file = tmp_path / "devbench.yaml"
+        cfg_file.write_text(
+            textwrap.dedent("""\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity_timeout: 42.5
+            """)
+        )
+        rt = load_runtime_config(cfg_file, {})
+        assert rt.timeouts.orchestrator_inactivity_timeout == 42.5, (
+            f"Expected 42.5 from YAML; got {rt.timeouts.orchestrator_inactivity_timeout!r}"
+        )
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_absent_in_yaml_yields_none(self, tmp_path: Path) -> None:
+        """When orchestrator_inactivity_timeout is absent from YAML the field stays None."""
+        import textwrap
+
+        from devbench.config_loader import load_runtime_config
+
+        cfg_file = tmp_path / "devbench.yaml"
+        cfg_file.write_text(
+            textwrap.dedent("""\
+            repos:
+              org/repo:
+                default_branch: main
+            """)
+        )
+        rt = load_runtime_config(cfg_file, {})
+        assert rt.timeouts.orchestrator_inactivity_timeout is None, (
+            f"Expected None when key absent; got {rt.timeouts.orchestrator_inactivity_timeout!r}"
+        )
 
 
 @pytest.mark.unit

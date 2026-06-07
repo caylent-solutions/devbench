@@ -38,6 +38,7 @@ YAML schema::
       command: <integer>
       orchestrator_poll_interval: <integer>
       github_check: <integer>
+      orchestrator_inactivity_timeout: <float>   # per-message inactivity timeout; <= 0 disables
 
     limits:                              # optional -- threshold values; env var overrides applied by config.py
       alert_summary: <integer>
@@ -167,6 +168,8 @@ class TimeoutConfig:
         command: Shell command execution timeout.
         orchestrator_poll_interval: Orchestrator polling interval.
         github_check: GitHub check status polling timeout.
+        orchestrator_inactivity_timeout: Per-message inactivity timeout in seconds
+            (float). A value <= 0 disables the timeout. Issue #262 (E10-F2-S1).
     """
 
     gh_api: int | None = None
@@ -176,6 +179,7 @@ class TimeoutConfig:
     command: int | None = None
     orchestrator_poll_interval: int | None = None
     github_check: int | None = None
+    orchestrator_inactivity_timeout: float | None = None
 
 
 @dataclass
@@ -1602,6 +1606,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         command=timeouts_raw.get("command"),
         orchestrator_poll_interval=timeouts_raw.get("orchestrator_poll_interval"),
         github_check=timeouts_raw.get("github_check"),
+        orchestrator_inactivity_timeout=timeouts_raw.get("orchestrator_inactivity_timeout"),
     )
 
     # Populate LimitConfig from YAML limits block (absent keys yield None).

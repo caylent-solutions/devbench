@@ -117,6 +117,14 @@ timeouts:
   command: 120
   orchestrator_poll_interval: 10
   github_check: 600
+  # Per-message inactivity timeout in seconds (float). Each await for the next
+  # SDK message is wrapped in asyncio.wait_for with this timeout; the timer
+  # resets on every received message so long legitimate turns never trip it.
+  # On expiry logs [ORCHESTRATOR_INACTIVITY_TIMEOUT] and triggers an in-session
+  # continuation (counting against the E10-F1-S3 budget). A value <= 0 disables
+  # the timeout. Override via DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS.
+  # Default: 300.0 (5 minutes). Issue #262 (E10-F2-S1).
+  orchestrator_inactivity_timeout: 300.0
 
 # ---------------------------------------------------------------------------
 # Limits / thresholds

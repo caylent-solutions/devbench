@@ -630,6 +630,23 @@ GET_DIFF_NO_ATTRIBUTABLE: int = 45
 # reason=runtime_degradation tasks=<id1,id2,...>``.
 ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
 
+# Issue #262 (E10-F2-S1): per-message inactivity timeout.
+#
+# ``cmd_start._run`` wraps each ``receive_response()`` iteration in
+# ``asyncio.wait_for(..., timeout=ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS)``
+# and resets the timer on every received message.  On ``TimeoutError`` it logs
+# ``ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX`` and issues an in-session
+# continuation (counting against the E10-F1-S3 stall budget).
+#
+# Override via env ``DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS`` (float).
+# Unset-safe: the constant is the default when the env var is absent.
+# A value <= 0 disables the wrap entirely.
+DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS: float = 300.0
+
+# Verbatim audit-log prefix emitted by ``cmd_start`` when the per-message
+# inactivity timeout fires (spec Section 2 Goal 2, Section 7).
+ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX: str = "[ORCHESTRATOR_INACTIVITY_TIMEOUT]"
+
 # Issue #262 (E10-F1-S3): bounded in-session continuation budget.
 #
 # ``cmd_start._run`` increments a per-stall counter each time a non-terminal

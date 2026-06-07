@@ -20751,3 +20751,239 @@ class TestContinuationBudgetExhaustion:
             f"continuations + 1 initial prompt = {DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS + 1} "
             f"total; got {len(query_calls)}"
         )
+
+
+class TestInactivityTimeout:
+    """Issue #262 (E10-F2-S1): per-message inactivity timeout.
+
+    AC-1: each await for the next SDK message is wrapped in asyncio.wait_for;
+          timer resets on every received message so active sessions never trip it.
+    AC-3: on TimeoutError the loop logs [ORCHESTRATOR_INACTIVITY_TIMEOUT] and
+          triggers the continuation path, counting against the stall budget.
+    AC-5: fires on stall, never trips while messages flow, no-op when <= 0.
+    """
+
+    @staticmethod
+    def _result_msg(text: str) -> Any:
+        """Build a fake ResultMessage with the given result text."""
+
+        class _Msg:
+            result = text
+            subtype = "success"
+            num_turns = 1
+
+        return _Msg()
+
+    @staticmethod
+    def _non_result_msg() -> Any:
+        """Build a fake non-ResultMessage (tool call / progress)."""
+
+        class _Msg:
+            pass
+
+        return _Msg()
+
+    @staticmethod
+    def _build_fake_sdk(
+        receive_sequences: list[list[Any]],
+        query_calls: list[str],
+    ) -> Any:
+        """Build a fake SDK that cycles through message sequences."""
+        call_index: list[int] = [0]
+
+        class _FakeClient:
+            def __init__(self, options: Any = None, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                query_calls.append(prompt)
+
+            async def receive_response(self) -> Any:
+                idx = call_index[0]
+                call_index[0] += 1
+                msgs = receive_sequences[idx] if idx < len(receive_sequences) else []
+                for msg in msgs:
+                    yield msg
+
+        fake_sdk: Any = types.ModuleType("claude_agent_sdk")
+        fake_sdk.ClaudeAgentOptions = MagicMock()
+        fake_sdk.ClaudeSDKClient = _FakeClient
+        return fake_sdk
+
+    @pytest.mark.functional
+    def test_inactivity_timeout_fires_on_stall_logs_audit_and_continues(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-3 + AC-5: when asyncio.wait_for raises TimeoutError the loop logs
+        [ORCHESTRATOR_INACTIVITY_TIMEOUT] and issues a continuation query.
+        The timeout fires once, then the next receive_response yields ALL_DONE.
+        """
+        import logging
+        import sys
+
+        query_calls: list[str] = []
+        terminal_msg = self._result_msg("ALL_DONE")
+
+        # The stalled client: first call raises TimeoutError (mocked), second returns terminal.
+        fake_sdk = self._build_fake_sdk(
+            receive_sequences=[[], [terminal_msg]],
+            query_calls=query_calls,
+        )
+
+        timeout_side_effects: list[Any] = [TimeoutError(), None]
+
+        async def _fake_wait_for(coro: Any, timeout: float) -> Any:
+            effect = timeout_side_effects.pop(0)
+            if isinstance(effect, BaseException):
+                # Must still consume the coroutine to avoid ResourceWarning.
+                coro.close()
+                raise effect
+            return await coro
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli.asyncio.wait_for", side_effect=_fake_wait_for),
+            patch("devbench.cli.ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS", 30.0),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_INACTIVITY_TIMEOUT]" in log_text, (
+            f"Expected [ORCHESTRATOR_INACTIVITY_TIMEOUT] audit in log; got: {log_text!r}"
+        )
+        assert rc == 0, f"Expected rc=0 after recovery via continuation; got {rc}"
+
+    @pytest.mark.functional
+    def test_inactivity_timeout_counts_against_stall_budget(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-3: each inactivity timeout increments the stall counter; when the
+        budget is exhausted [ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED] is logged.
+        """
+        import logging
+        import os
+        import sys
+
+        from devbench.constants import ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
+
+        query_calls: list[str] = []
+        budget = 2
+
+        # All receives stall forever (TimeoutError each call).
+        call_count: list[int] = [0]
+
+        async def _always_timeout(coro: Any, timeout: float) -> Any:
+            call_count[0] += 1
+            coro.close()
+            raise TimeoutError()
+
+        fake_sdk = self._build_fake_sdk(
+            receive_sequences=[],
+            query_calls=query_calls,
+        )
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli.asyncio.wait_for", side_effect=_always_timeout),
+            patch("devbench.cli.ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS", 30.0),
+            patch.dict(
+                os.environ,
+                {"DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS": str(budget)},
+                clear=False,
+            ),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, f"Expected exhaustion exit code; got {rc}"
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]" in log_text, (
+            f"Expected exhaustion audit; got: {log_text!r}"
+        )
+
+    @pytest.mark.functional
+    def test_inactivity_timeout_never_trips_while_messages_flow(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-1 + AC-5: when messages flow normally the timeout does not fire.
+        asyncio.wait_for is patched to pass through without raising so the test
+        confirms no [ORCHESTRATOR_INACTIVITY_TIMEOUT] appears in the log.
+        """
+        import logging
+        import sys
+
+        query_calls: list[str] = []
+        non_result = self._non_result_msg()
+        terminal_msg = self._result_msg("ALL_DONE")
+        fake_sdk = self._build_fake_sdk(
+            receive_sequences=[[non_result, terminal_msg]],
+            query_calls=query_calls,
+        )
+
+        async def _passthrough(coro: Any, timeout: float) -> Any:
+            return await coro
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli.asyncio.wait_for", side_effect=_passthrough),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_INACTIVITY_TIMEOUT]" not in log_text, (
+            f"Inactivity audit must not appear when messages flow; got: {log_text!r}"
+        )
+        assert rc == 0
+
+    @pytest.mark.functional
+    def test_inactivity_timeout_disabled_when_zero_or_negative(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-2 + AC-5: a <= 0 value disables the timeout; asyncio.wait_for is NOT called."""
+        import logging
+        import sys
+
+        query_calls: list[str] = []
+        terminal_msg = self._result_msg("ALL_DONE")
+        fake_sdk = self._build_fake_sdk(
+            receive_sequences=[[terminal_msg]],
+            query_calls=query_calls,
+        )
+
+        wait_for_calls: list[Any] = []
+
+        async def _spy_wait_for(coro: Any, timeout: float) -> Any:
+            wait_for_calls.append(timeout)
+            return await coro
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli.asyncio.wait_for", side_effect=_spy_wait_for),
+            # Patch the module-level constant directly; env var alone cannot override
+            # the already-imported module value.
+            patch("devbench.cli.ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS", 0.0),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        # asyncio.wait_for must NOT have been called when timeout <= 0.
+        assert len(wait_for_calls) == 0, (
+            f"asyncio.wait_for must not be called when timeout=0 (disabled); got {len(wait_for_calls)} call(s)"
+        )
+        assert rc == 0

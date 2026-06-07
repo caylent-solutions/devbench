@@ -122,6 +122,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "GitHub check status polling timeout in seconds."
+        },
+        "orchestrator_inactivity_timeout": {
+          "type": "number",
+          "description": "Per-message inactivity timeout in seconds (float). Each await for the next SDK message is wrapped in asyncio.wait_for with this timeout; the timer resets on every received message. On expiry logs [ORCHESTRATOR_INACTIVITY_TIMEOUT] and triggers an in-session continuation. A value <= 0 disables the timeout. Issue #262 (E10-F2-S1). Override via DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS."
         }
       }
     },

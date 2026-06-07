@@ -57,6 +57,7 @@ from devbench.constants import (
     DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_MODEL_RATES,
+    DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
     DEFAULT_PAUSE_BEFORE_MERGE,
@@ -659,6 +660,15 @@ ORCHESTRATOR_POLL_INTERVAL: int = _resolve_int(
     "DEVBENCH_ORCHESTRATOR_POLL_INTERVAL",
     RUNTIME_CONFIG.timeouts.orchestrator_poll_interval,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
+)
+
+# Issue #262 (E10-F2-S1): per-message inactivity timeout.
+# env var > YAML > DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS.
+# A value <= 0 disables the asyncio.wait_for wrap in cmd_start._run.
+ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS: float = _resolve_float(
+    "DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS",
+    RUNTIME_CONFIG.timeouts.orchestrator_inactivity_timeout,
+    DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS,
 )
 
 # ---------------------------------------------------------------------------

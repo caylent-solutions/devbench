@@ -148,6 +148,7 @@ from devbench.config import (
     BACKLOG_ROOT,
     BLOCKED_RECOVERY_WINDOW_SECONDS,
     MAX_CASCADE_DEPTH,
+    ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
@@ -182,6 +183,7 @@ from devbench.constants import (
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
@@ -7285,6 +7287,45 @@ async def _handle_result_message(message: object, client: Any) -> bool:
     return True
 
 
+async def _iter_messages_with_inactivity_timeout(
+    agen: Any,
+    timeout_seconds: float,
+) -> Any:
+    """Issue #262 (E10-F2-S1): yield messages from an async generator with per-message timeout.
+
+    When *timeout_seconds* is positive, each message is fetched via
+    ``asyncio.wait_for(agen.__anext__(), timeout=timeout_seconds)`` so the
+    timer resets on every received message.  When *timeout_seconds* is <= 0
+    the wrap is skipped and the generator is iterated directly.
+
+    Raises ``asyncio.TimeoutError`` when the per-message inactivity timeout
+    fires.  The caller is responsible for handling that exception.
+
+    Args:
+        agen: The async generator returned by ``client.receive_response()``.
+        timeout_seconds: Timeout in seconds.  A value <= 0 disables the wrap.
+
+    Yields:
+        Each message from *agen* in order.
+
+    Raises:
+        asyncio.TimeoutError: When *timeout_seconds* > 0 and no message
+            arrives within the timeout window.
+        StopAsyncIteration: When the generator is exhausted (normal path).
+    """
+    if timeout_seconds <= 0:
+        async for message in agen:
+            yield message
+        return
+    aiter_obj = agen.__aiter__()
+    while True:
+        try:
+            message = await asyncio.wait_for(aiter_obj.__anext__(), timeout=timeout_seconds)
+        except StopAsyncIteration:
+            return
+        yield message
+
+
 def _resolve_max_turn_end_continuations() -> int:
     """Return the effective continuation-budget cap (env > default).
 
@@ -7767,12 +7808,18 @@ def cmd_start(*argv: str) -> int:
         in-session continuation query (keeping the same session alive).
 
         A per-stall counter ``stall_count`` increments on every non-terminal
-        ResultMessage and resets to zero on any non-ResultMessage (tool-call
-        or genuine progress).  When ``stall_count`` reaches the cap resolved
-        by :func:`_resolve_max_turn_end_continuations`, ``_run`` logs
+        ResultMessage (or per-message inactivity timeout) and resets to zero
+        on any non-ResultMessage (tool-call or genuine progress).  When
+        ``stall_count`` reaches the cap resolved by
+        :func:`_resolve_max_turn_end_continuations`, ``_run`` logs
         ``ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX`` and
         returns, signalling the outer handler via ``_continuation_exhausted``
         (Issue #262 E10-F1-S3).
+
+        Each await for the next SDK message is wrapped in
+        ``asyncio.wait_for(..., timeout=ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS)``
+        via :func:`_iter_messages_with_inactivity_timeout` so long legitimate
+        turns never trip it (Issue #262 E10-F2-S1).  A value <= 0 disables the wrap.
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
@@ -7788,44 +7835,64 @@ def cmd_start(*argv: str) -> int:
         )
         _orchestrate_prompt = "Run the devbench-orchestrate:orchestrate skill to process the backlog until complete"
         _continuation_budget = _resolve_max_turn_end_continuations()
+        _inactivity_timeout = ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS
         async with ClaudeSDKClient(options=options) as client:
             await client.query(_orchestrate_prompt)
             stall_count: int = 0
             while True:
-                async for message in client.receive_response():
-                    logger.info("sdk message: %s", message)
-                    _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                    # Issue #218: check terminal sentinel on every message that
-                    # carries result text; break immediately to avoid re-invoking.
-                    if _log_terminal_exit_if_applicable(_sdk_result_text):
-                        return
-                    # Issue #262 (E10-F1-S2 + E10-F1-S3): handle ResultMessage
-                    # turn boundary.  True means a non-terminal continuation was
-                    # issued; increment the stall counter and enforce the budget.
-                    # Falls through (no break) when False, meaning a non-ResultMessage
-                    # (genuine tool-call / progress) was received: reset the counter.
-                    if await _handle_result_message(message, client):
-                        stall_count += 1
-                        if stall_count >= _continuation_budget:
-                            logger.info(ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX)
-                            _continuation_exhausted = True
+                _exhausted = False
+                try:
+                    async for message in _iter_messages_with_inactivity_timeout(
+                        client.receive_response(), _inactivity_timeout
+                    ):
+                        logger.info("sdk message: %s", message)
+                        _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+                        # Issue #218: check terminal sentinel on every message that
+                        # carries result text; break immediately to avoid re-invoking.
+                        if _log_terminal_exit_if_applicable(_sdk_result_text):
                             return
-                        break
-                    stall_count = 0
-                    # Issue #236: per-message quota detection (AC-236-1). Check
-                    # before the drain-on-claim path so a quota hit is not masked
-                    # by an unrelated claim check.
-                    _qe = detect_quota_error(message)
-                    if _qe is not None:
-                        raise _QuotaDetected(_qe)
-                    # Issue #188 + #212: drain-on-claim short-circuit. Combined
-                    # condition (rather than nested ifs) keeps ``_run`` under
-                    # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
-                    # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
-                    if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
-                        raise _DrainRequested(drain_state.reason)
-                else:
-                    # receive_response exhausted without a turn-boundary: loop is done.
+                        # Issue #262 (E10-F1-S2 + E10-F1-S3): handle ResultMessage
+                        # turn boundary.  True means a non-terminal continuation was
+                        # issued; increment the stall counter and enforce the budget.
+                        # Falls through (no break) when False, meaning a non-ResultMessage
+                        # (genuine tool-call / progress) was received: reset the counter.
+                        if await _handle_result_message(message, client):
+                            stall_count += 1
+                            if stall_count >= _continuation_budget:
+                                logger.info(ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX)
+                                _continuation_exhausted = True
+                                return
+                            break
+                        stall_count = 0
+                        # Issue #236: per-message quota detection (AC-236-1). Check
+                        # before the drain-on-claim path so a quota hit is not masked
+                        # by an unrelated claim check.
+                        _qe = detect_quota_error(message)
+                        if _qe is not None:
+                            raise _QuotaDetected(_qe)
+                        # Issue #188 + #212: drain-on-claim short-circuit. Combined
+                        # condition (rather than nested ifs) keeps ``_run`` under
+                        # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
+                        # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
+                        _drain = read_drain_state(WORKSPACE_ROOT)
+                        if _is_claim_tool_use(message) and _drain is not None:
+                            drain_state = _drain
+                            raise _DrainRequested(drain_state.reason)
+                    else:
+                        # receive_response exhausted without a turn-boundary: loop is done.
+                        _exhausted = True
+                except TimeoutError:
+                    # Issue #262 (E10-F2-S1): per-message inactivity timeout fired.
+                    # Log the audit prefix and issue an in-session continuation,
+                    # counting against the same stall budget (E10-F1-S3).
+                    logger.info(ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX)
+                    stall_count += 1
+                    if stall_count >= _continuation_budget:
+                        logger.info(ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX)
+                        _continuation_exhausted = True
+                        return
+                    await client.query(ORCHESTRATOR_CONTINUATION_PROMPT)
+                if _exhausted:
                     return
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration

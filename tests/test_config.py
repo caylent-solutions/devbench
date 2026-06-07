@@ -718,3 +718,63 @@ class TestNotificationsSlackEnvOverride:
         importlib.reload(config)
         # The pre-test value is restored after reload-without-env.
         assert config.RUNTIME_CONFIG.notifications.slack.webhook_url == original
+
+
+@pytest.mark.unit
+class TestOrchestratorInactivityTimeoutConfig:
+    """Issue #262 (E10-F2-S1): ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS config resolution.
+
+    AC-2: env var DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS takes precedence
+          over YAML; YAML takes precedence over the unset-safe default; a missing env
+          var and absent YAML key yield the constant default.
+    """
+
+    _ENV_VAR: str = "DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS"
+
+    def test_inactivity_timeout_exported_from_config(self) -> None:
+        """ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS is exported from devbench.config."""
+        from devbench import config as _cfg
+
+        assert hasattr(_cfg, "ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS"), (
+            "devbench.config must export ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS"
+        )
+
+    def test_inactivity_timeout_is_float(self) -> None:
+        """ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS is a float."""
+        from devbench.config import ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS
+
+        assert isinstance(ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS, float), (
+            f"Expected float; got {type(ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS).__name__}"
+        )
+
+    def test_env_var_wins_over_default(self) -> None:
+        """Env var DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS overrides the default."""
+        with patch.dict(os.environ, {self._ENV_VAR: "999.9"}, clear=False):
+            result = config._resolve_float(self._ENV_VAR, None, 300.0)
+        assert result == 999.9, f"Expected 999.9 from env; got {result}"
+
+    def test_yaml_wins_over_default_when_env_absent(self) -> None:
+        """YAML value takes precedence over the constant default when env is absent."""
+        env_copy = {k: v for k, v in os.environ.items() if k != self._ENV_VAR}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_float(self._ENV_VAR, 77.5, 300.0)
+        assert result == 77.5, f"Expected 77.5 from yaml; got {result}"
+
+    def test_default_used_when_both_absent(self) -> None:
+        """Unset-safe default is returned when env var is absent and YAML key is None."""
+        env_copy = {k: v for k, v in os.environ.items() if k != self._ENV_VAR}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_float(self._ENV_VAR, None, 300.0)
+        assert result == 300.0, f"Expected 300.0 default; got {result}"
+
+    def test_zero_value_disables_timeout(self) -> None:
+        """A value <= 0 resolves correctly and can be used to disable the timeout."""
+        with patch.dict(os.environ, {self._ENV_VAR: "0"}, clear=False):
+            result = config._resolve_float(self._ENV_VAR, None, 300.0)
+        assert result == 0.0, f"Expected 0.0 (disable sentinel); got {result}"
+
+    def test_negative_value_disables_timeout(self) -> None:
+        """A negative value resolves correctly and signals timeout disabled."""
+        with patch.dict(os.environ, {self._ENV_VAR: "-1.0"}, clear=False):
+            result = config._resolve_float(self._ENV_VAR, None, 300.0)
+        assert result == -1.0, f"Expected -1.0 (disable sentinel); got {result}"

@@ -107,6 +107,22 @@ _BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
 _WU_TITLE_RE: re.Pattern[str] = re.compile(r"^#\s+\S+:\s*(.+?)\s*$", re.MULTILINE)
 
 
+# Canonical verdict line shape emitted by ``cmd_log_verdict``.
+#
+# Shape: ``[YYYY-MM-DD HH:MM UTC] [judge/<name>] [<action>] <feedback>``
+#
+# Anchored at start-of-line (``^``) so an indented or mid-line occurrence
+# cannot be counted.  Requires ``[judge/`` (not ``[agent/``) so audit-only
+# entries written by workflow agents are structurally excluded.  The ``<action>``
+# group captures the token inside the third bracket pair; callers inspect it to
+# discriminate ``REVIEW_PASS``, ``REVIEW_REJECTED``, and ``REVIEW_FAIL``.
+#
+# Private to this module -- do NOT export via constants.py (source-test-atomicity).
+_CANONICAL_VERDICT_RE: re.Pattern[str] = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\] \[judge/(?P<judge>[^\]]+)\] \[(?P<action>[^\]]+)\]"
+)
+
+
 def _extract_wu_title(work_unit_path: Path, fallback: str) -> str:
     """Return the human-readable title from a work-unit MD file.
 
@@ -1284,22 +1300,33 @@ class BacklogManager:
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.
 
-        Reads the work-unit file's comment history in reverse. Collects
-        ``[REVIEW_PASS]`` entries per judge; stops and resets if a
-        ``[REVIEW_REJECTED]`` line is encountered (prior round boundary).
+        Reads the work-unit file's comment history in reverse. Counts only lines
+        that match the canonical verdict shape produced by ``cmd_log_verdict``
+        (``_CANONICAL_VERDICT_RE``): anchored at the start of the line with a
+        ``[judge/<name>]`` prefix -- never ``[agent/<name>]``.
+
+        Collects ``[REVIEW_PASS]`` entries per judge; stops and resets if a
+        canonical ``[REVIEW_REJECTED]`` line is encountered (prior round boundary).
+        Free-text comments that merely contain the verdict tokens are not counted.
 
         Returns:
-            True if every judge in ``ALL_REQUIRED_JUDGE_NAMES`` has a ``[REVIEW_PASS]``
-            entry in the most recent round; False otherwise.
+            True if every judge in ``ALL_REQUIRED_JUDGE_NAMES`` has a canonical
+            ``[REVIEW_PASS]`` entry in the most recent round; False otherwise.
         """
         content = work_unit_path.read_text(encoding="utf-8")
         passed: set[str] = set()
         for line in reversed(content.splitlines()):
-            if "[REVIEW_REJECTED]" in line:
-                break  # everything before this belongs to a prior round
-            for judge in ALL_REQUIRED_JUDGE_NAMES:
-                if f"[judge/{judge}]" in line and "[REVIEW_PASS]" in line:
+            m = _CANONICAL_VERDICT_RE.match(line)
+            if m is None:
+                continue  # not a canonical verdict line -- skip entirely
+            action = m.group("action")
+            if action == "REVIEW_REJECTED":
+                break  # canonical round boundary -- prior round; stop
+            if action == "REVIEW_PASS":
+                judge = m.group("judge")
+                if judge in ALL_REQUIRED_JUDGE_NAMES:
                     passed.add(judge)
+            # REVIEW_FAIL (or any other canonical action) -- do not count, do not reset
         return passed >= ALL_REQUIRED_JUDGE_NAMES
 
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:

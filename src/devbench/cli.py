@@ -3325,6 +3325,54 @@ def cmd_validate_backlog(*argv: str) -> int:
     return 1
 
 
+def cmd_reconcile_backlog_md(*argv: str) -> int:
+    """Reconcile the Status Summary region in BACKLOG.md against the Full Work Unit Index.
+
+    Flag semantics:
+
+    - No flags: print a mismatch report and return 0 (read-only; no writes).
+    - ``--check-only``: return 1 on drift, 0 on no drift, no writes.
+    - ``--force``: atomically rewrite the Status Summary region on drift; return 0
+      on success, 2 on write error.
+    - ``--check-only --force``: ERROR -- mutually exclusive; return 2.
+    """
+    flags = set(argv)
+    check_only = "--check-only" in flags
+    force = "--force" in flags
+
+    if check_only and force:
+        print("ERROR: --check-only and --force are mutually exclusive", file=sys.stderr)
+        return 2
+
+    mgr = BacklogManager()
+
+    if not force:
+        # No-flag and --check-only both need a drift report without writing.
+        # Delegate to reconcile_backlog_md to detect drift and obtain the
+        # reconciled content for reporting (avoids re-implementing the derivation).
+        rc, reconciled = mgr.reconcile_backlog_md(WORKSPACE_ROOT, force=False, check_only=check_only)
+        if rc == 1:
+            # check_only mode: drift detected
+            return 1
+        if not check_only:
+            # No-flag mode: print a mismatch report using the reconciled content
+            # returned by the manager; no write occurs.
+            content = BACKLOG_INDEX.read_text(encoding="utf-8")
+            if reconciled != content:
+                print("Status Summary drift detected -- run 'devbench reconcile-backlog-md --force' to fix.")
+            else:
+                print("Status Summary is consistent with the Full Work Unit Index.")
+        return 0
+
+    # --force path
+    rc, _reconciled = mgr.reconcile_backlog_md(WORKSPACE_ROOT, force=True, check_only=False)
+    if rc == 2:
+        print("ERROR: failed to rewrite BACKLOG.md -- check file permissions.", file=sys.stderr)
+        return 2
+    print("Status Summary reconciled successfully.")
+    return 0
+
+
 def _check_repo_symlink(repo_name: str, symlink_path: Path) -> tuple[bool, str | None]:
     """Return ``(symlink_ok, error_or_None)`` for the configured symlink path."""
     if symlink_path.exists():
@@ -10531,6 +10579,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         ),
     ),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity [--fix: auto-correct rule-10/11]"),
+    "reconcile-backlog-md": (
+        cmd_reconcile_backlog_md,
+        0,
+        (
+            "Reconcile Status Summary in BACKLOG.md against the Full Work Unit Index: "
+            "no flag prints mismatch report rc 0; --check-only returns rc 1 on drift; "
+            "--force atomically rewrites the index region; --check-only --force errors rc 2."
+        ),
+    ),
     "check": (
         cmd_check,
         0,

@@ -469,6 +469,75 @@ class BacklogManager:
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         return errors
 
+    def reconcile_backlog_md(self, repo_root: Path, *, force: bool, check_only: bool) -> tuple[int, str]:
+        """Reconcile the Status Summary region in BACKLOG.md against the Full Work Unit Index.
+
+        Reuses the existing region-detection and summary-building helpers so the
+        drift test is always consistent with ``_update_status_summary``.
+
+        Args:
+            repo_root: Workspace root containing ``BACKLOG.md``.
+            force: When ``True``, atomically rewrite the Status Summary region on
+                drift via temp-then-replace.  Mutually exclusive with ``check_only``.
+            check_only: When ``True``, return 1 on drift with no writes.  Mutually
+                exclusive with ``force``.
+
+        Returns:
+            A ``(rc, reconciled_content)`` tuple where ``rc`` is:
+
+            - 0 -- no drift detected (or no-flag report-only mode).
+            - 1 -- drift detected when ``check_only=True``.
+            - 2 -- write error (``force=True`` but atomic rewrite failed).
+
+            ``reconciled_content`` is the full text of what BACKLOG.md would
+            contain after reconciliation, which the caller may use for reporting.
+
+        Raises:
+            ValueError: When both ``force`` and ``check_only`` are ``True``.
+        """
+        if force and check_only:
+            raise ValueError("force and check_only are mutually exclusive")
+
+        backlog_index = repo_root / "BACKLOG.md"
+        rows = self._parse_backlog_rows(backlog_index)
+        epic_titles = self._parse_epic_titles(backlog_index)
+        epic_counts = self._compute_epic_counts(rows)
+        expected_block = self._build_summary_block(epic_counts, epic_titles)
+
+        content = backlog_index.read_text(encoding="utf-8")
+        # Derive what the Status Summary section would look like after reconciliation.
+        stripped = self._strip_summary_section(content)
+        full_index_marker = "## Full Work Unit Index"
+        if full_index_marker in stripped:
+            reconciled = stripped.replace(
+                full_index_marker,
+                expected_block + full_index_marker,
+                1,
+            )
+        else:
+            reconciled = stripped.rstrip("\n") + "\n\n" + expected_block
+
+        drift = reconciled != content
+
+        if not drift:
+            return 0, reconciled
+
+        # Drift was detected.
+        if check_only:
+            return 1, reconciled
+
+        if not force:
+            # No-flag mode: report drift only, no write.
+            return 0, reconciled
+
+        # --force: atomic rewrite of the index region only.
+        try:
+            atomic_write_text(backlog_index, reconciled)
+        except OSError:
+            return 2, reconciled
+
+        return 0, reconciled
+
     _CANONICAL_FULL_INDEX_HEADER_CELLS: tuple[str, ...] = (
         "",
         "ID",

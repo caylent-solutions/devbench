@@ -75,9 +75,39 @@ Process the backlog using the steps below, repeating until all work units are do
     d. When enabled: invoke `devbench-orchestrate:task-factory` with the source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
     e. After task-factory returns: log an audit comment on the source task summarising the N proposed tasks created, then proceed to step 4b. The source task is NOT automatically blocked by validation-gate escalation; its own review pipeline runs at step 5 and determines pass / fail independently. The proposed tasks track the out-of-scope production fixes as separate `proposed` drafts the operator reviews and promotes.
 
+4a-quota. **Quota wait-and-resume integration (issue #236)**: When the executor sub-agent returns
+   a result that includes a quota exhaustion signal (`[QUOTA_EXHAUSTED]` in its response or an
+   audit comment on the work unit), the orchestrator consults the `quota_handling` section of
+   `backlog/config/devbench.yaml` to determine the response strategy:
+   - `on_exhaustion: wait` (default per D-Q-1): pause execution and poll `uv run devbench quota-status`
+     at `poll_interval_seconds` intervals until the quota resets or `max_wait_seconds` elapses.
+     Append a `[QUOTA_WAITING]` audit comment to the in-progress work unit when
+     `quota_handling.audit_comment_on_wait: true` (default). On recovery, append a
+     `[QUOTA_RESUMED]` comment when `quota_handling.audit_comment_on_resume: true` (default),
+     then continue based on `resume_strategy`:
+       - `continue_current_wu` (default): re-invoke the executor with the same work unit.
+       - `restart_wu`: un-claim the unit and return to step 2 to re-claim it fresh.
+       - `drain_and_resume`: run `uv run devbench drain --pending` and exit; a subsequent
+         `make start` will resume from this unit.
+   - `on_exhaustion: fail`: log a `[BLOCKED]` audit comment and return to step 2 (legacy behaviour).
+   - `on_exhaustion: drain`: invoke `uv run devbench drain --pending` and exit cleanly.
+   When `max_wait_seconds` elapses without quota recovery, the `on_exhaustion_timeout` field governs:
+   `drain` (default), `fail`, or `keep_waiting`.
+   Quota handling is enabled by default (`quota_handling.enabled: true`); operators may set
+   `quota_handling.enabled: false` to restore legacy non-zero exit on any quota signal.
+
 4b. Amendment check -- handles TDD GREEN production fixes that were not pre-declared in the Changes Manifest:
     a. Check whether the file `$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<id>.json` exists. Use `test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<id>.json"` in Bash.
     b. If absent: proceed to step 5 unchanged. The executor did not request an amendment; the standard review pipeline applies.
+    b-operator. **Operator-mode amendment handoff (issue #242)**: Operators may submit an amendment
+       request directly via `uv run devbench request-amendment <id> --operator-mode`. An
+       operator-mode request carries `"operator_mode": true` in its JSON body. The manifest-amender
+       agent detects this flag and bypasses the in-progress status gate and the LLM
+       justification-coherence check; it applies the declared patch directly (subject to Layer 3
+       deterministic post-check). This path is reserved for human operators who have already
+       reviewed the diff and need to add an out-of-scope file to the Manifest without waiting for
+       an executor retry cycle. The amender still runs the Layer 3 post-check (manifest re-parse,
+       em-dash scan, `validate-backlog`) and blocks on failure.
     c. If present: invoke `devbench-orchestrate:manifest-amender` with the unit ID.
        - The agent reads the pending request, the work unit, and the staged diff; decides `apply` or `reject` on three semantic questions (Approach authorisation, scope minimality, justification coherence).
        - On `apply`: the agent invokes `uv run devbench apply-amendment <id>`, which appends rows to the Changes Manifest and runs the Layer 3 deterministic post-check (manifest re-parse, em-dash scan, full `validate-backlog`). If post-check fails, `apply-amendment` atomically rolls back the write and the task is blocked via an audit comment.
@@ -130,7 +160,20 @@ Process the backlog using the steps below, repeating until all work units are do
 
    Then `uv run devbench write-snapshot` to persist a fresh `devbench report` snapshot to `<workspace>/.devbench/report-snapshot.json`. Issue #162 Phase 6 (ADR-20). Subsequent `devbench report --once` invocations serve from the snapshot in single-digit milliseconds when the orchestrator log is unchanged; the snapshot is self-healing (deletion is always safe; the next iteration writes a fresh one) and idempotent (no work-unit mutations).
 
-9a. **Drain check** (issue #188, spec section 4.3.4): Run `uv run devbench drain --status`. If the output indicates a drain is pending, log an `[ORCHESTRATOR_DRAIN]` audit comment on the last work unit (the one just marked done) and exit cleanly with rc=0. If no drain is pending, continue to step 10 immediately.
+9a. **Drain check** (issue #188, spec section 4.3.4): Run `uv run devbench drain --status`. If the output indicates a drain is pending, log an `[ORCHESTRATOR_DRAIN]` audit comment on the last work unit (the one just marked done) and exit cleanly with rc=0. If no drain is pending, continue to step 9b immediately.
+
+9b. **Backlog-assistant handoff (issue #246)**: After marking a task done, check whether the
+   operator has configured a backlog-assistant skill (`backlog_assistant` in the agents section
+   of `backlog/config/devbench.yaml`). When configured and the backlog-assistant skill is
+   available in the active plugin set, invoke the backlog-assistant with the just-completed unit
+   ID. The backlog-assistant reviews the completed unit's output in the context of the remaining
+   backlog and may:
+   - Promote `draft` tasks to `in-queue` when their prerequisites are now satisfied.
+   - File amendment requests on behalf of the operator for related tasks.
+   - Emit a summary of what the completed task unlocked in the remaining work queue.
+   The backlog-assistant does NOT modify work-unit files directly; it uses the standard devbench
+   CLI (`set-status`, `request-amendment`, `log-comment`) to perform its actions so the audit
+   trail is preserved. When `backlog_assistant` is not configured, skip this step silently.
 
 10. Return to step 1.
 
@@ -157,6 +200,25 @@ Process the backlog using the steps below, repeating until all work units are do
 - Security review runs exactly once per work unit -- after review-supervisor passes. If security passes, go directly to step 8.
 - The retry loop (step 6) re-runs only review-supervisor, never security-reviewer.
 - Log all significant actions and decisions to the work unit Comments via `log-verdict`.
+
+## H4 fail-closed self-check
+
+Before step 5 (invoking review-supervisor), the orchestrator must confirm that the executor
+staged at least the files listed in the work unit's Changes Manifest (excluding sentinel rows).
+This is the H4 fail-closed guard: if no files are staged and the executor did not emit a
+NEEDS_ESCALATION comment, the task is in an ambiguous state. In that case:
+
+1. Run `git -C <repo_path> diff --staged --name-only` and compare to the Changes Manifest.
+2. If the staged set is empty AND no `[NEEDS_ESCALATION]` or `[BLOCKED]` audit comment exists
+   on the task from the current executor run: log a `[BLOCKED]` audit comment naming the empty
+   staged set, then return to step 2. Do NOT invoke review-supervisor on an empty diff --
+   a review of nothing would produce a spurious PASS and the task would be incorrectly marked done.
+3. If the staged set is non-empty (or the executor logged a NEEDS_ESCALATION): proceed to step 5
+   normally. The H4 guard does NOT fire when review-supervisor already has evidence to evaluate.
+
+The H4 guard is a fail-closed safety net only. It runs once per review cycle, immediately before
+step 5. It does NOT run between step 6 (REVIEW_FAIL) and step 5 retry -- the executor is expected
+to re-stage its amended files and the guard would produce a false positive.
 
 ## Halt discipline
 

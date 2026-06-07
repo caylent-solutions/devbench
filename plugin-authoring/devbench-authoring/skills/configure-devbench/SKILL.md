@@ -169,7 +169,7 @@ Validate each provided value is a positive integer.
 
 ## Step 6 -- agents section: judge_model and executor_model overrides
 
-The `agents:` section (mapped to `agent_models` in `RuntimeConfig`) lets operators pin each devbench agent to a specific model. When `use_bedrock: true`, values must be Bedrock ARNs; otherwise use short names (`opus`, `sonnet`, `haiku`) or full Anthropic API IDs (e.g. `claude-opus-4-7`).
+The `agents:` section (mapped to `agent_models` in `RuntimeConfig`) lets operators pin each devbench agent to a specific model. When `use_bedrock: true`, values must be Bedrock ARNs; otherwise use short names (`opus`, `sonnet`, `haiku`) or full Anthropic API IDs (e.g. `claude-opus-4-8`).
 
 Ask the operator:
 
@@ -241,7 +241,7 @@ Ask the operator:
 >   enabled               -- Run the blocker-resolver + task-factory loop after amendment rejects.
 >                            Requires manifest_amendment.enabled: true. [true/false, default: true]
 >   auto_accept_proposals -- Auto-promote task-factory drafts to in-queue without operator review.
->                            [true/false, default: true]; set false for the 'proposed' draft review step.
+>                            [default: true]; set false for the 'proposed' draft review step.
 >                            Only takes effect when enabled: true."
 
 ---
@@ -471,7 +471,55 @@ Validate the provided value (when not blank) is an integer >= 1. Reject with:
 
 ---
 
-## Step 19 -- skills section
+## Step 19 -- quota_handling section (issue #236)
+
+The `quota_handling:` section configures the orchestrator's quota wait-and-resume behaviour.
+When enabled (the default), the orchestrator waits for the API quota to recover rather than
+exiting non-zero. All fields are optional; absent values fall through to built-in defaults.
+
+Ask the operator:
+
+> "Section: quota_handling (leave blank to use built-in defaults; defaults are on per D-Q-1)
+>
+>   enabled                 -- Master toggle for quota wait-and-resume. [true/false, default: true]
+>                              Set to false to restore legacy non-zero exit on quota exhaustion.
+>   on_exhaustion           -- What to do when a quota signal is detected.
+>                              One of: wait (default), fail, drain.
+>                              'wait' pauses execution and polls until the quota resets.
+>                              'fail' exits non-zero immediately.
+>                              'drain' requests a graceful drain and returns.
+>   poll_interval_seconds   -- Polling cadence (seconds) between recovery probes.
+>                              Must be in [30, 3600]. [default: 60]
+>   max_wait_seconds        -- Maximum total wait in seconds before on_exhaustion_timeout fires.
+>                              Must be >= 1. [default: 18000 (5 hours)]
+>   on_exhaustion_timeout   -- Action when max_wait_seconds elapses without recovery.
+>                              One of: drain (default), fail, keep_waiting.
+>   resume_strategy         -- How to resume execution after quota recovery.
+>                              One of: continue_current_wu (default), restart_wu, drain_and_resume.
+>   audit_comment_on_wait   -- Append a [QUOTA_WAITING] comment to the in-progress work unit.
+>                              [true/false, default: true]
+>   audit_comment_on_resume -- Append a [QUOTA_RESUMED] comment after recovery.
+>                              [true/false, default: true]
+>   log_structured_events   -- Emit structured log events on quota transitions.
+>                              [true/false, default: true]"
+
+Validate each field:
+- `enabled`, `audit_comment_on_wait`, `audit_comment_on_resume`, `log_structured_events`: must be boolean. Reject with:
+  > "[INVALID] quota_handling.<field> must be true or false. Re-enter."
+- `on_exhaustion`: must be one of `wait`, `fail`, `drain`. Reject with:
+  > "[INVALID] quota_handling.on_exhaustion must be one of: wait, fail, drain. Re-enter."
+- `poll_interval_seconds`: must be an integer in [30, 3600]. Reject with:
+  > "[INVALID] quota_handling.poll_interval_seconds must be an integer between 30 and 3600. Re-enter."
+- `max_wait_seconds`: must be an integer >= 1. Reject with:
+  > "[INVALID] quota_handling.max_wait_seconds must be an integer >= 1. Re-enter."
+- `on_exhaustion_timeout`: must be one of `drain`, `fail`, `keep_waiting`. Reject with:
+  > "[INVALID] quota_handling.on_exhaustion_timeout must be one of: drain, fail, keep_waiting. Re-enter."
+- `resume_strategy`: must be one of `continue_current_wu`, `restart_wu`, `drain_and_resume`. Reject with:
+  > "[INVALID] quota_handling.resume_strategy must be one of: continue_current_wu, restart_wu, drain_and_resume. Re-enter."
+
+---
+
+## Step 20a -- skills section
 
 The `skills:` section configures the bundled `spec-to-backlog` and `create-spec` authoring skills. Every field is optional; absent values fall through to skill-side defaults.
 
@@ -510,7 +558,7 @@ Reject any `exemplar_backlog_path` or `exemplar_spec_path` that contains `..` co
 
 ---
 
-## Step 20 -- Final validation and write
+## Step 21 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. Every section must be
 present in the emitted file regardless of whether the operator changed its

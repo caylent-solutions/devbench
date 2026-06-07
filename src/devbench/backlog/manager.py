@@ -80,6 +80,10 @@ from devbench.utils.io import atomic_write_text
 # module level so tests can import and assert the exact set.
 _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLINED})
 
+# Statuses evaluated by the draft/hold manifest-conflict check (Check 12-draft).
+# Kept at module level so the constant is defined once and easy to assert on.
+_DRAFT_HOLD_STATUSES: frozenset[str] = frozenset({STATUS_DRAFT, STATUS_HOLD})
+
 # Marker written by ``promote-proposal`` to the source task's Comments section
 # whenever a proposed draft is wired as a dependency. The auto-requeue scan
 # (``_auto_requeue_marker_dependents``) reads these to discriminate blocks
@@ -416,6 +420,69 @@ class BacklogManager:
         )
         return count
 
+    def validate_with_warnings(
+        self,
+        backlog_index: Path,
+        workspace_root: Path,
+        fix: bool = False,
+        strict: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Run backlog integrity checks and return ``(errors, warnings)``.
+
+        Identical to :meth:`validate` except that findings that are only
+        emitted as warnings in the default mode (e.g. draft/hold manifest
+        conflicts) are placed in the second return value rather than the first.
+        When *strict* is ``True``, those same findings are promoted to errors
+        (second list stays empty for that category).
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            workspace_root: Workspace root containing ``BACKLOG.md``.
+            fix: Same semantics as :meth:`validate`.
+            strict: When ``True``, escalate draft/hold manifest conflicts
+                from WARNING to ERROR so the caller can return a non-zero exit.
+
+        Returns:
+            A 2-tuple ``(errors, warnings)`` where both are lists of strings.
+            Empty lists mean no findings for that severity tier.
+        """
+        rows = self._parse_backlog_rows(backlog_index)
+        known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
+
+        errors: list[str] = []
+        warnings: list[str] = []
+        self._check_full_index_has_rows(backlog_index, errors)
+        indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
+        self._check_orphans(workspace_root, indexed_files, errors)
+        self._check_dependencies(backlog_index, known_ids, errors)
+        self._check_dep_cycles(backlog_index, errors)
+        errors.extend(self._check_marker_cycles(backlog_index, workspace_root))
+        self._check_status_summary(backlog_index, rows, errors)
+        if fix:
+            fix_count, fix_files = self._apply_fixes(rows, workspace_root)
+            self._fix_summary = (fix_count, fix_files)
+            rows = self._parse_backlog_rows(backlog_index)
+        self._check_task_content(rows, workspace_root, errors)
+        self._check_manifest_path_prefixes(rows, workspace_root, errors)
+        self._check_no_glob_in_manifest(rows, workspace_root, errors)
+        self._check_manifest_conflicts(rows, workspace_root, errors)
+        self._check_manifest_conflicts_draft_hold(rows, workspace_root, errors, warnings, strict=strict)
+        self._check_language_ac_alignment(rows, workspace_root, errors)
+        self._check_source_test_pairs(rows, workspace_root, errors)
+        self._check_required_sections(rows, workspace_root, errors)
+        self._check_status_enum(rows, workspace_root, errors)
+        self._check_dep_id_format(rows, workspace_root, errors)
+        self._check_branch_uniqueness(rows, workspace_root, errors)
+        self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
+        self._check_no_orphan_path_tokens(rows, workspace_root, errors)
+        self._check_target_repo_resolves(rows, workspace_root, errors)
+        self._check_manifest_multi_repo_prefixes(rows, workspace_root, errors)
+        self._check_dep_file_exists(rows, workspace_root, errors)
+        self._check_title_matches_index(backlog_index, rows, workspace_root, errors)
+        self._check_canonical_path_shape(rows, errors)
+        self._check_task_type_header(rows, workspace_root, errors)
+        return errors, warnings
+
     def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
@@ -483,39 +550,7 @@ class BacklogManager:
             A list of error strings. Empty list means the backlog is valid (or
             all fixable violations were corrected when ``fix=True``).
         """
-        rows = self._parse_backlog_rows(backlog_index)
-        known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
-
-        errors: list[str] = []
-        self._check_full_index_has_rows(backlog_index, errors)
-        indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
-        self._check_orphans(workspace_root, indexed_files, errors)
-        self._check_dependencies(backlog_index, known_ids, errors)
-        self._check_dep_cycles(backlog_index, errors)
-        errors.extend(self._check_marker_cycles(backlog_index, workspace_root))
-        self._check_status_summary(backlog_index, rows, errors)
-        if fix:
-            fix_count, fix_files = self._apply_fixes(rows, workspace_root)
-            self._fix_summary = (fix_count, fix_files)
-            rows = self._parse_backlog_rows(backlog_index)
-        self._check_task_content(rows, workspace_root, errors)
-        self._check_manifest_path_prefixes(rows, workspace_root, errors)
-        self._check_no_glob_in_manifest(rows, workspace_root, errors)
-        self._check_manifest_conflicts(rows, workspace_root, errors)
-        self._check_language_ac_alignment(rows, workspace_root, errors)
-        self._check_source_test_pairs(rows, workspace_root, errors)
-        self._check_required_sections(rows, workspace_root, errors)
-        self._check_status_enum(rows, workspace_root, errors)
-        self._check_dep_id_format(rows, workspace_root, errors)
-        self._check_branch_uniqueness(rows, workspace_root, errors)
-        self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
-        self._check_no_orphan_path_tokens(rows, workspace_root, errors)
-        self._check_target_repo_resolves(rows, workspace_root, errors)
-        self._check_manifest_multi_repo_prefixes(rows, workspace_root, errors)
-        self._check_dep_file_exists(rows, workspace_root, errors)
-        self._check_title_matches_index(backlog_index, rows, workspace_root, errors)
-        self._check_canonical_path_shape(rows, errors)
-        self._check_task_type_header(rows, workspace_root, errors)
+        errors, _warnings = self.validate_with_warnings(backlog_index, workspace_root, fix=fix)
         return errors
 
     def reconcile_backlog_md(self, repo_root: Path, *, force: bool, check_only: bool) -> tuple[int, str]:
@@ -2265,34 +2300,7 @@ class BacklogManager:
         same path (e.g., ``.devcontainer/devcontainer.json`` exists in both
         caylent-telemetry and the kanon repo's per-repo edits).
         """
-        from devbench.backlog.manifest import ManifestParseError, parse_manifest
-
-        # Map: (repo, path) -> list of (task_id, status)
-        ownership: dict[tuple[str, str], list[tuple[str, str]]] = {}
-        deps_by_task: dict[str, set[str]] = {}
-
-        for row_id, status, file_path_str in rows:
-            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
-                continue
-            if not file_path_str or not self._is_task_id(row_id):
-                continue
-            wu_path = workspace_root / file_path_str
-            if not wu_path.exists():
-                continue
-            content = wu_path.read_text(encoding="utf-8")
-            repo = self._extract_repo(content) or ""
-            try:
-                manifest_rows = parse_manifest(content)
-            except ManifestParseError:
-                # Other validate rules (TestValidateContent) emit the missing
-                # Manifest error; conflict detection treats unparseable
-                # Manifests as having zero entries to avoid duplicate noise.
-                manifest_rows = []
-            for manifest_row in manifest_rows:
-                if not self._is_real_manifest_path(manifest_row.file):
-                    continue
-                ownership.setdefault((repo, manifest_row.file), []).append((row_id, status))
-            deps_by_task[row_id] = self._extract_dep_ids(content)
+        ownership, deps_by_task = self._build_manifest_ownership(rows, workspace_root)
 
         for (repo, path), owners in ownership.items():
             if len(owners) < 2:
@@ -2319,6 +2327,99 @@ class BacklogManager:
                 f"  -- or any other DAG that totally orders the set. See "
                 f"docs/backlog-contract.md 'Manifest Conflict Rule'."
             )
+
+    def _check_manifest_conflicts_draft_hold(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+        warnings: list[str],
+        strict: bool = False,
+    ) -> None:
+        """Check 12-draft: flag draft/hold tasks with unordered (repo, path) ownership.
+
+        Evaluates the same ``(repo, path)`` keying and ``_tasks_form_dep_chain``
+        exemption as :meth:`_check_manifest_conflicts`, but scoped to the
+        ``draft`` and ``hold`` statuses only.  Findings are routed to
+        *warnings* (default mode) or *errors* (when *strict* is ``True``).
+
+        ``done``/``declined``/``in-progress`` remain out of scope; the existing
+        ``in-queue``/``proposed``/``blocked`` ERROR path is handled by
+        :meth:`_check_manifest_conflicts` and is unaffected.
+        """
+        ownership, deps_by_task = self._build_manifest_ownership(rows, workspace_root)
+
+        for (repo, path), owners in ownership.items():
+            if len(owners) < 2:
+                continue
+            relevant = [(tid, st) for tid, st in owners if st in _DRAFT_HOLD_STATUSES]
+            if len(relevant) < 2:
+                continue
+            ids = [tid for tid, _ in relevant]
+            if self._tasks_form_dep_chain(ids, deps_by_task):
+                continue
+            sorted_ids = sorted(ids)
+            chain_hint = "\n".join(
+                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+            )
+            message = (
+                f"draft/hold conflict on {path!r} in repo {repo or '(unknown)'}: "
+                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+                f"{chain_hint}\n"
+                f"  -- or any other DAG that totally orders the set. See "
+                f"docs/backlog-contract.md 'Manifest Conflict Rule'."
+            )
+            if strict:
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+    def _build_manifest_ownership(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> tuple[dict[tuple[str, str], list[tuple[str, str]]], dict[str, set[str]]]:
+        """Build manifest-ownership and dep maps from backlog rows.
+
+        Returns a 2-tuple:
+        - ``ownership``: maps ``(repo, path)`` to a list of ``(task_id, status)``
+          pairs for every task that lists that path in its Changes Manifest.
+        - ``deps_by_task``: maps each task id to the set of dep IDs parsed from
+          its ``## Dependencies`` table.
+
+        Both :meth:`_check_manifest_conflicts` and
+        :meth:`_check_manifest_conflicts_draft_hold` use the same ownership map;
+        this helper builds it once so the I/O is not duplicated.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        ownership: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        deps_by_task: dict[str, set[str]] = {}
+
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            repo = self._extract_repo(content) or ""
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                # Other validate rules (TestValidateContent) emit the missing
+                # Manifest error; conflict detection treats unparseable
+                # Manifests as having zero entries to avoid duplicate noise.
+                manifest_rows = []
+            for manifest_row in manifest_rows:
+                if not self._is_real_manifest_path(manifest_row.file):
+                    continue
+                ownership.setdefault((repo, manifest_row.file), []).append((row_id, status))
+            deps_by_task[row_id] = self._extract_dep_ids(content)
+
+        return ownership, deps_by_task
 
     @staticmethod
     def _extract_dep_ids(content: str) -> set[str]:

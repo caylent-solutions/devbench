@@ -1,0 +1,278 @@
+"""Tests for _check_manifest_conflicts with draft/hold status scoping.
+
+Verifies that:
+- Two draft tasks owning the same (repo, path) without a serial dep emit
+  a WARNING (default) or escalate to ERROR when strict=True.
+- The existing in-queue/proposed/blocked ERROR path is unchanged.
+- Tasks wired with a serial dep are exempt regardless of status.
+- done/declined/in-progress remain out of scope (never flagged).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from devbench.backlog.manager import BacklogManager
+
+# ---------------------------------------------------------------------------
+# Harness (mirrors _ValidateRuleHarness in test_manager.py)
+# ---------------------------------------------------------------------------
+
+INDEX_HEADER: str = (
+    "# Backlog\n\n"
+    "## Status Summary\n\n"
+    "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+    "|------|-------|------|-------------|----------|---------|\n"
+    "\n"
+    "## Full Work Unit Index\n\n"
+    "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+    "|-----|-------|------|--------|-------------|------|-----------|\n"
+)
+
+
+def _make_index(tmp_path: Path, rows: str) -> Path:
+    idx = tmp_path / "BACKLOG.md"
+    idx.write_text(INDEX_HEADER + rows, encoding="utf-8")
+    return idx
+
+
+def _make_task(
+    backlog_dir: Path,
+    unit_id: str,
+    repo: str,
+    manifest_rows: str,
+    deps_rows: str = "| none | | |",
+    status: str = "in-queue",
+) -> Path:
+    wu = backlog_dir / f"{unit_id}.md"
+    wu.write_text(
+        f"# {unit_id}\n\n"
+        f"## Status: {status}\n\n"
+        f"## Target Repository\n\n"
+        f"- **Repo:** `{repo}`\n\n"
+        f"## Description\n\nTest task.\n\n"
+        f"## Dependencies\n\n"
+        f"| ID | Title | Status |\n"
+        f"|----|-------|--------|\n"
+        f"{deps_rows}\n\n"
+        f"## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+        f"## Changes Manifest\n\n"
+        f"| File | Change |\n"
+        f"|------|--------|\n"
+        f"{manifest_rows}\n"
+        f"## Definition of Done\n\n- [ ] Done\n",
+        encoding="utf-8",
+    )
+    return wu
+
+
+# ---------------------------------------------------------------------------
+# Draft-only conflict: warning vs strict-error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task_status", ["draft", "hold"])
+def test_two_draft_or_hold_no_dep_emits_warning(
+    tmp_path: Path,
+    backlog_dir: Path,
+    task_status: str,
+) -> None:
+    """Two draft/hold tasks sharing (repo, path) with no dep -> WARNING (default)."""
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E1-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=task_status)
+    _make_task(backlog_dir, "E1-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status=task_status)
+    _make_index(
+        tmp_path,
+        f"| E1-F1-S1-T1 | T1 | Task | {task_status} | none | {repo} | `backlog/E1-F1-S1-T1.md` |\n"
+        f"| E1-F1-S1-T2 | T2 | Task | {task_status} | none | {repo} | `backlog/E1-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    # No errors in default (non-strict) mode
+    conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 0, f"Unexpected error in default mode: {conflict_errors}"
+    # A warning should be present
+    conflict_warnings = [w for w in warnings if "draft/hold conflict" in w and "shared.yaml" in w]
+    assert len(conflict_warnings) == 1
+    assert "E1-F1-S1-T1" in conflict_warnings[0]
+    assert "E1-F1-S1-T2" in conflict_warnings[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task_status", ["draft", "hold"])
+def test_two_draft_or_hold_no_dep_strict_emits_error(
+    tmp_path: Path,
+    backlog_dir: Path,
+    task_status: str,
+) -> None:
+    """Two draft/hold tasks sharing (repo, path) with no dep -> ERROR under strict."""
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E1-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=task_status)
+    _make_task(backlog_dir, "E1-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status=task_status)
+    _make_index(
+        tmp_path,
+        f"| E1-F1-S1-T1 | T1 | Task | {task_status} | none | {repo} | `backlog/E1-F1-S1-T1.md` |\n"
+        f"| E1-F1-S1-T2 | T2 | Task | {task_status} | none | {repo} | `backlog/E1-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+    # Under strict mode the draft/hold conflict escalates to ERROR
+    conflict_errors = [e for e in errors if "draft/hold conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1
+    assert "E1-F1-S1-T1" in conflict_errors[0]
+    assert "E1-F1-S1-T2" in conflict_errors[0]
+    # No warning because it was promoted to error
+    conflict_warnings = [w for w in warnings if "draft/hold conflict" in w and "shared.yaml" in w]
+    assert len(conflict_warnings) == 0
+
+
+# ---------------------------------------------------------------------------
+# In-flight conflict: error path unchanged
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("inflight_status", ["in-queue", "proposed", "blocked"])
+def test_inflight_conflict_always_error_strict_false(
+    tmp_path: Path,
+    backlog_dir: Path,
+    inflight_status: str,
+) -> None:
+    """in-queue/proposed/blocked conflict -> ERROR even without strict flag (unchanged behavior)."""
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E2-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=inflight_status)
+    _make_task(backlog_dir, "E2-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status=inflight_status)
+    _make_index(
+        tmp_path,
+        f"| E2-F1-S1-T1 | T1 | Task | {inflight_status} | none | {repo} | `backlog/E2-F1-S1-T1.md` |\n"
+        f"| E2-F1-S1-T2 | T2 | Task | {inflight_status} | none | {repo} | `backlog/E2-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, _warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1
+    assert "E2-F1-S1-T1" in conflict_errors[0]
+    assert "E2-F1-S1-T2" in conflict_errors[0]
+    assert "docs/backlog-contract.md" in conflict_errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Serial dep present: no finding for draft/hold
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task_status", ["draft", "hold"])
+def test_draft_or_hold_with_serial_dep_no_finding(
+    tmp_path: Path,
+    backlog_dir: Path,
+    task_status: str,
+) -> None:
+    """Draft/hold tasks wired with a serial dep are exempt (no conflict)."""
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E3-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=task_status)
+    _make_task(
+        backlog_dir,
+        "E3-F1-S1-T2",
+        repo,
+        "| `shared.yaml` | edit |\n",
+        deps_rows="| E3-F1-S1-T1 | dep | draft |",
+        status=task_status,
+    )
+    _make_index(
+        tmp_path,
+        f"| E3-F1-S1-T1 | T1 | Task | {task_status} | none | {repo} | `backlog/E3-F1-S1-T1.md` |\n"
+        f"| E3-F1-S1-T2 | T2 | Task | {task_status} | E3-F1-S1-T1 | {repo} | `backlog/E3-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    conflict_errors = [e for e in errors if "conflict" in e.lower() and "shared.yaml" in e]
+    conflict_warnings = [w for w in warnings if "conflict" in w.lower() and "shared.yaml" in w]
+    assert len(conflict_errors) == 0, f"Unexpected error: {conflict_errors}"
+    assert len(conflict_warnings) == 0, f"Unexpected warning: {conflict_warnings}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task_status", ["draft", "hold"])
+def test_draft_or_hold_with_serial_dep_strict_no_finding(
+    tmp_path: Path,
+    backlog_dir: Path,
+    task_status: str,
+) -> None:
+    """Draft/hold tasks wired with serial dep are exempt even under strict mode."""
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E3-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=task_status)
+    _make_task(
+        backlog_dir,
+        "E3-F1-S1-T2",
+        repo,
+        "| `shared.yaml` | edit |\n",
+        deps_rows="| E3-F1-S1-T1 | dep | draft |",
+        status=task_status,
+    )
+    _make_index(
+        tmp_path,
+        f"| E3-F1-S1-T1 | T1 | Task | {task_status} | none | {repo} | `backlog/E3-F1-S1-T1.md` |\n"
+        f"| E3-F1-S1-T2 | T2 | Task | {task_status} | E3-F1-S1-T1 | {repo} | `backlog/E3-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+    conflict_errors = [e for e in errors if "conflict" in e.lower() and "shared.yaml" in e]
+    conflict_warnings = [w for w in warnings if "conflict" in w.lower() and "shared.yaml" in w]
+    assert len(conflict_errors) == 0, f"Unexpected error under strict: {conflict_errors}"
+    assert len(conflict_warnings) == 0, f"Unexpected warning under strict: {conflict_warnings}"
+
+
+# ---------------------------------------------------------------------------
+# Out-of-scope statuses: never flagged
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task_status", ["done", "declined", "in-progress"])
+def test_out_of_scope_statuses_never_flagged(
+    tmp_path: Path,
+    backlog_dir: Path,
+    task_status: str,
+) -> None:
+    """done/declined/in-progress owners are never flagged for manifest conflicts."""
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E4-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=task_status)
+    _make_task(backlog_dir, "E4-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status=task_status)
+    _make_index(
+        tmp_path,
+        f"| E4-F1-S1-T1 | T1 | Task | {task_status} | none | {repo} | `backlog/E4-F1-S1-T1.md` |\n"
+        f"| E4-F1-S1-T2 | T2 | Task | {task_status} | none | {repo} | `backlog/E4-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+    conflict_errors = [e for e in errors if "conflict" in e.lower() and "shared.yaml" in e]
+    conflict_warnings = [w for w in warnings if "conflict" in w.lower() and "shared.yaml" in w]
+    assert len(conflict_errors) == 0, f"Unexpected error for {task_status}: {conflict_errors}"
+    assert len(conflict_warnings) == 0, f"Unexpected warning for {task_status}: {conflict_warnings}"
+
+
+# ---------------------------------------------------------------------------
+# (repo, path) scoping preserved: different repos with same path -> no finding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_draft_tasks_different_repos_same_path_no_finding(tmp_path: Path, backlog_dir: Path) -> None:
+    """Two draft tasks in different repos with same path are not in conflict."""
+    _make_task(backlog_dir, "E5-F1-S1-T1", "ex/repo-a", "| `shared.yaml` | new |\n", status="draft")
+    _make_task(backlog_dir, "E5-F1-S1-T2", "ex/repo-b", "| `shared.yaml` | new |\n", status="draft")
+    _make_index(
+        tmp_path,
+        "| E5-F1-S1-T1 | T1 | Task | draft | none | ex/repo-a | `backlog/E5-F1-S1-T1.md` |\n"
+        "| E5-F1-S1-T2 | T2 | Task | draft | none | ex/repo-b | `backlog/E5-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    conflict_errors = [e for e in errors if "conflict" in e.lower() and "shared.yaml" in e]
+    conflict_warnings = [w for w in warnings if "conflict" in w.lower() and "shared.yaml" in w]
+    assert len(conflict_errors) == 0
+    assert len(conflict_warnings) == 0

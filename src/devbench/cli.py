@@ -3324,20 +3324,31 @@ def cmd_validate_backlog(*argv: str) -> int:
     - All dependency IDs reference real work unit IDs.
     - Status Summary table exists and counts match the Full Work Unit Index.
 
-    Optional flag:
+    Optional flags:
     - ``--fix``: Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory
       prefix) violations in place and append an audit comment to each corrected
       file's ``## Comments`` section. Prints a summary of corrections made.
+    - ``--strict`` / ``--include-draft``: Escalate draft/hold manifest conflicts
+      from WARNING to ERROR so the command returns a non-zero exit code.
+      The strict default is ``False``; the current activation path is this
+      CLI flag only. The implementation uses ``getattr`` on the config object
+      so that a future ``validate.strict_manifest_conflicts`` YAML key can
+      be wired in without changing this call site.
 
     Exits 0 if the backlog is consistent (or all violations were fixed); 1 with
     actionable error messages if any inconsistencies remain.
     """
     fix = "--fix" in argv
+    # Resolve strict mode: CLI flag overrides config default.
+    config_strict = getattr(RUNTIME_CONFIG.validate, "strict_manifest_conflicts", False)
+    strict = config_strict or ("--strict" in argv) or ("--include-draft" in argv)
     mgr = BacklogManager()
-    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix)
+    errors, warnings = mgr.validate_with_warnings(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix, strict=strict)
     if fix:
         fix_count, files_fixed = mgr._fix_summary
         print(f"Fixed {fix_count} violation(s) across {files_fixed} file(s).")
+    for warning in warnings:
+        print(f"  WARNING: {warning}")
     if not errors:
         print("Backlog integrity check passed.")
         return 0

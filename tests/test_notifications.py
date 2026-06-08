@@ -1085,3 +1085,116 @@ class TestOrchestratorStopMentionDispatch:
             text = _resolve_stop_mention(notifications.STOP_CLASS_DRAIN)
         # STOP_CLASS_DRAIN -> MENTION_LEVEL_NONE -> ""
         assert text == ""
+
+
+@pytest.mark.unit
+class TestOrchestratorStopProgressContext:
+    """E14-F2-S2-T1: notify_orchestrator_stop renders done/total progress context.
+
+    AC-1: the stop notification includes done/total work-unit counts and the
+    in-flight unit id when applicable, read best-effort from the backlog parser.
+    """
+
+    def _capture_stop_payload(
+        self,
+        reason: str,
+        in_flight_unit_id: str | None,
+        done_count: int | None,
+        total_count: int | None,
+    ) -> dict[str, Any]:
+        """Call notify_orchestrator_stop with progress context and capture the Slack payload."""
+        cfg = _make_config(enabled=True, events={"orchestrator_stop": True})
+        captured: list[dict[str, Any]] = []
+
+        def _grab(_url: str, payload: dict[str, Any], _timeout: float) -> None:
+            captured.append(payload)
+
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook", side_effect=_grab),
+        ):
+            notifications.notify_orchestrator_stop(reason, in_flight_unit_id, done_count, total_count)
+        assert captured, "expected at least one POST"
+        return captured[0]
+
+    def test_progress_string_contains_done_and_total(self) -> None:
+        """The payload blocks contain the done/total counts as a progress string."""
+        payload = self._capture_stop_payload(
+            reason="clean exit: ALL_DONE",
+            in_flight_unit_id=None,
+            done_count=7,
+            total_count=10,
+        )
+        all_text = " ".join(
+            str(v)
+            for block in payload["blocks"]
+            for v in ([block.get("text", {}).get("text", "")] + [f.get("text", "") for f in block.get("fields", [])])
+        ) + payload.get("text", "")
+        assert "7" in all_text, "done count 7 must appear in the payload"
+        assert "10" in all_text, "total count 10 must appear in the payload"
+
+    def test_progress_string_contains_inflight_unit_id(self) -> None:
+        """The payload includes the in-flight unit id when provided alongside progress counts."""
+        payload = self._capture_stop_payload(
+            reason="premature-turn-end",
+            in_flight_unit_id="E5-F1-S1-T3",
+            done_count=3,
+            total_count=8,
+        )
+        all_text = " ".join(
+            str(v)
+            for block in payload["blocks"]
+            for v in ([block.get("text", {}).get("text", "")] + [f.get("text", "") for f in block.get("fields", [])])
+        ) + payload.get("text", "")
+        assert "E5-F1-S1-T3" in all_text, "in-flight unit id must appear in the payload"
+        assert "3" in all_text, "done count 3 must appear in the payload"
+        assert "8" in all_text, "total count 8 must appear in the payload"
+
+    def test_progress_string_contains_no_em_dash(self) -> None:
+        """The rendered progress string must not contain the em-dash character (U+2014)."""
+        payload = self._capture_stop_payload(
+            reason="clean exit: ALL_DONE",
+            in_flight_unit_id="E1-F1-S1-T1",
+            done_count=5,
+            total_count=5,
+        )
+        full_text = str(payload)
+        assert "\u2014" not in full_text, "em-dash must not appear anywhere in the stop notification payload"
+
+    def test_progress_omitted_when_counts_are_none(self) -> None:
+        """When done_count and total_count are None, no progress field is added."""
+        payload = self._capture_stop_payload(
+            reason="clean exit: ALL_DONE",
+            in_flight_unit_id=None,
+            done_count=None,
+            total_count=None,
+        )
+        all_fields_text = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "Progress" not in all_fields_text, "Progress field must be absent when counts are None"
+
+    @pytest.mark.parametrize(
+        ("reason", "in_flight_id", "done_count", "total_count"),
+        [
+            ("clean exit: ALL_DONE", None, 10, 10),
+            ("premature-turn-end", "E1-F1-S1-T2", 4, 12),
+            ("drain enforced: manual", None, 0, 5),
+        ],
+    )
+    def test_progress_parametrized_scenarios(
+        self,
+        reason: str,
+        in_flight_id: str | None,
+        done_count: int,
+        total_count: int,
+    ) -> None:
+        """Multiple progress scenarios all include done/total counts without em-dashes."""
+        payload = self._capture_stop_payload(
+            reason=reason,
+            in_flight_unit_id=in_flight_id,
+            done_count=done_count,
+            total_count=total_count,
+        )
+        full_text = str(payload)
+        assert "\u2014" not in full_text, f"em-dash in payload for reason={reason!r}"
+        assert str(done_count) in full_text, f"done count {done_count} missing from payload"
+        assert str(total_count) in full_text, f"total count {total_count} missing from payload"

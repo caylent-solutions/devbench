@@ -5481,6 +5481,117 @@ class TestLabelStopReason:
         assert _label_stop_reason(ValueError("")) == "crash: ValueError: "
 
 
+@pytest.mark.unit
+class TestFireOrchestratorStopProgressContext:
+    """E14-F2-S2-T1: _fire_orchestrator_stop_notification reads done/total progress context.
+
+    AC-1: the stop notification carries done/total work-unit counts read from
+    the backlog parser; a parser failure still fires the notification (best-effort).
+    """
+
+    def _make_units(self, done: int, total: int, in_progress_id: str | None = None) -> list[Any]:
+        """Build a list of WorkUnit-like mocks with the given done/total distribution.
+
+        The first slot is assigned *in_progress_id* (IN_PROGRESS status) when provided.
+        The next *done* slots (after the in-progress slot) are given DONE status.
+        Remaining slots are IN_QUEUE.
+        """
+        units_list = []
+        for i in range(total):
+            u = MagicMock()
+            if in_progress_id and i == 0:
+                u.status = WorkUnitStatus.IN_PROGRESS
+                u.id = in_progress_id
+            elif i < done:
+                u.status = WorkUnitStatus.DONE
+                u.id = f"E0-F1-S1-T{i + 1}"
+            else:
+                u.status = WorkUnitStatus.IN_QUEUE
+                u.id = f"E0-F1-S1-T{i + 1}"
+            units_list.append(u)
+        return units_list
+
+    def _capture_notify_args(
+        self,
+        import_notif: Any,
+        parser_side_effect: Any,
+        reason: str,
+    ) -> list[Any]:
+        """Drive _fire_orchestrator_stop_notification and return the captured call args list.
+
+        Patches BacklogParser and notify_orchestrator_stop, then calls
+        cli._fire_orchestrator_stop_notification with the given *reason*.
+        Returns the list of (reason, in_flight_id, done_count, total_count) tuples captured.
+        """
+        captured_args: list[Any] = []
+
+        def _capture(r: str, in_flight_id: str | None, done_count: int | None, total_count: int | None) -> None:
+            captured_args.append((r, in_flight_id, done_count, total_count))
+
+        with (
+            patch("devbench.cli.BacklogParser", **parser_side_effect),
+            patch.object(import_notif, "notify_orchestrator_stop", _capture),
+        ):
+            cli._fire_orchestrator_stop_notification(reason)
+        return captured_args
+
+    @pytest.mark.unit
+    def test_notification_carries_progress_context(self, tmp_path: Path) -> None:
+        """The stop notification is called with done/total counts from the backlog parser.
+
+        _make_units(done=3, total=7, in_progress_id=...) reserves slot 0 for IN_PROGRESS,
+        then marks slots 1 and 2 as DONE (indices < 3 but index 0 is taken), yielding
+        exactly 2 DONE units.  The assertion verifies the exact count.
+        """
+        import devbench.notifications as _notif
+
+        units = self._make_units(done=3, total=7, in_progress_id="E0-F1-S1-T1")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+
+        captured_args = self._capture_notify_args(
+            _notif,
+            {"return_value": mock_parser},
+            "premature-turn-end",
+        )
+
+        assert captured_args, "notify_orchestrator_stop must be called"
+        _reason, _in_flight, done_count, total_count = captured_args[0]
+        assert done_count == 2, f"done_count must equal 2 (slot 0 is IN_PROGRESS); got {done_count}"
+        assert total_count == 7, f"total_count must equal number of units; got {total_count}"
+
+    @pytest.mark.unit
+    def test_parser_failure_still_fires_notification(self, tmp_path: Path) -> None:
+        """A backlog-parser failure during progress read must not mask the stop notification."""
+        import devbench.notifications as _notif
+
+        captured_args = self._capture_notify_args(
+            _notif,
+            {"side_effect": OSError("backlog parser exploded")},
+            "premature-turn-end",
+        )
+
+        assert captured_args, "stop notification must fire even when parser raises"
+        _reason, _in_flight, done_count, total_count = captured_args[0]
+        assert done_count is None, "done_count must be None when parser fails"
+        assert total_count is None, "total_count must be None when parser fails"
+
+    @pytest.mark.unit
+    def test_notification_reason_survives_parser_failure(self) -> None:
+        """The classified reason is preserved in the notification even when parser fails."""
+        import devbench.notifications as _notif
+
+        captured_args = self._capture_notify_args(
+            _notif,
+            {"side_effect": ValueError("bad backlog")},
+            "clean exit: ALL_DONE",
+        )
+
+        assert captured_args, "stop notification must fire"
+        reason = captured_args[0][0]
+        assert reason == "clean exit: ALL_DONE", f"reason must survive parser failure; got {reason!r}"
+
+
 class TestCmdStart:
     """Test cmd_start command by mocking claude_agent_sdk."""
 

@@ -396,6 +396,17 @@ since the last release. PR #119 carries every change.
     ``docs/skills/exemplar-reference.md`` documents the
     resolution-order and provenance contract.
 
+- **Orchestrator stop notification progress context** (issue #271).
+  The `orchestrator_stop` Slack notification now includes a **Progress**
+  field showing `done/total done` (e.g. `7/10 done`) read best-effort from
+  the backlog parser at stop time.  When the parser is unavailable the
+  Progress field is omitted -- the notification still fires with the
+  classified reason and the resolved mention level intact.
+  The stop-reason taxonomy (`premature-turn-end`, `completion`, `drain`,
+  `operator-interrupt`, `quota-exhausted`, `crash`) and the configurable
+  stop-class to mention-level mapping (`orchestrator_stop_mention_map` in
+  `devbench.yaml`) are now documented in `docs/slack-notifications.md`.
+
 ### Fixed
 
 - **SDK teardown race downgraded to WARNING with tracking-issue link**

@@ -7426,6 +7426,25 @@ def _label_stop_reason(exc: BaseException) -> str:
     return f"crash: {type(exc).__name__}: {exc}"
 
 
+def _read_stop_progress(
+    units: list[WorkUnit],
+) -> tuple[int, int]:
+    """Return (done_count, total_count) from a parsed backlog unit list.
+
+    Counts units whose status is :data:`~devbench.backlog.work_unit.WorkUnitStatus.DONE`
+    and returns the total list length alongside it.  Single-sourced so the
+    counting logic is not duplicated across callers.
+
+    Args:
+        units: List of :class:`~devbench.backlog.work_unit.WorkUnit` objects.
+
+    Returns:
+        ``(done_count, total_count)`` tuple.
+    """
+    done = sum(1 for u in units if u.status is WorkUnitStatus.DONE)
+    return done, len(units)
+
+
 def _fire_orchestrator_stop_notification(reason: str) -> None:
     """Best-effort always-fire of the ``orchestrator_stop`` notification.
 
@@ -7433,6 +7452,12 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
     ``logger.info`` BEFORE dispatching the Slack notification so the reason
     is always present in the orchestrator log regardless of whether the
     notification itself succeeds.
+
+    Issue #271 (E14-F2-S2-T1): reads done/total work-unit counts and the
+    in-flight unit id via the existing backlog parser, guarded best-effort so
+    a parser failure never masks the stop notification.  The progress context
+    is passed to ``notify_orchestrator_stop``; when the parser fails, both
+    counts are ``None`` and the Progress field is omitted from the payload.
 
     Wraps the lookup + dispatch in a broad try/except so a buggy
     notification import or a transient backlog-parser failure during
@@ -7445,14 +7470,19 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
         from devbench.notifications import notify_orchestrator_stop
 
         in_flight_id: str | None = None
+        done_count: int | None = None
+        total_count: int | None = None
         try:
             stop_parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
             stop_units = stop_parser.parse_index()
             stop_wu = _find_in_flight_wu(stop_units)
             in_flight_id = stop_wu.id if stop_wu is not None else None
+            done_count, total_count = _read_stop_progress(stop_units)
         except (OSError, ValueError):
             in_flight_id = None
-        notify_orchestrator_stop(reason, in_flight_id)
+            done_count = None
+            total_count = None
+        notify_orchestrator_stop(reason, in_flight_id, done_count, total_count)
     except Exception as exc:  # broad guard: notification must never mask real exit
         print(
             f"[WARN] orchestrator-stop notification failed: {exc!r}",

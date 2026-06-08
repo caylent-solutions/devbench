@@ -918,7 +918,29 @@ def notify_ci_pass(unit_id: str, repo: str, pr_url: str) -> None:
     )
 
 
-def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None:
+def _format_stop_progress(done_count: int, total_count: int) -> str:
+    """Format the done/total progress string for a stop notification.
+
+    Returns a plain-text progress string of the form ``N/M done`` with no
+    em-dash.  Single-sourced helper so the format is consistent across all
+    call sites.
+
+    Args:
+        done_count: Number of work units whose status is ``done``.
+        total_count: Total number of work units in the backlog index.
+
+    Returns:
+        A progress string such as ``"3/10 done"``.
+    """
+    return f"{done_count}/{total_count} done"
+
+
+def notify_orchestrator_stop(
+    reason: str,
+    in_flight_unit_id: str | None,
+    done_count: int | None = None,
+    total_count: int | None = None,
+) -> None:
     """The orchestrator loop is exiting (clean, drain, or SIGTERM).
 
     The broadcast mention is resolved from the configurable stop-class to
@@ -934,12 +956,28 @@ def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None
     string is embedded in this function.  If the config module is unavailable,
     the function falls back to the default noise-reducing map so notifications
     remain functional even during early bootstrap.
+
+    Progress context (done_count / total_count) is read best-effort by the
+    caller (``_fire_orchestrator_stop_notification`` in ``devbench.cli``).
+    When the backlog parser is unavailable, both values are ``None`` and the
+    Progress field is omitted from the payload -- the notification still fires.
+
+    Args:
+        reason: The stop-reason string (free-form, from ``_label_stop_reason``).
+        in_flight_unit_id: The id of the in-progress work unit at stop time,
+            or ``None`` when no unit was in-flight.
+        done_count: Number of done work units, or ``None`` when the parser
+            could not be reached (best-effort).
+        total_count: Total number of work units in the backlog index, or
+            ``None`` when the parser could not be reached (best-effort).
     """
     stop_class = classify_stop_class(reason)
     mention_text = _resolve_stop_mention(stop_class)
     fields: list[tuple[str, str]] = [("Reason", reason)]
     if in_flight_unit_id:
         fields.append(("In-flight", f"`{in_flight_unit_id}`"))
+    if done_count is not None and total_count is not None:
+        fields.append(("Progress", _format_stop_progress(done_count, total_count)))
     _dispatch(
         EVENT_ORCHESTRATOR_STOP,
         slack_summary=f":octagonal_sign: Orchestrator stopped: {reason}",

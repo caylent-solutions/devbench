@@ -3,7 +3,7 @@
 The gate exits 0 only when all eight conditions (a)-(h) hold:
   (a) make validate green
   (b) full CI matrix green
-  (c) 100 percent branch coverage on new/changed modules
+  (c) coverage meets the repo's enforced standard (98 percent)
   (d) zero-orphan and zero-stale grep ACs pass
   (e) mirrored-list sync pairs match
   (f) validate-backlog rc 0
@@ -131,7 +131,7 @@ class TestConditionBCIMatrix:
 
 @pytest.mark.unit
 class TestConditionCBranchCoverage:
-    """Condition (c): branch coverage on new/changed modules must meet the threshold."""
+    """Condition (c): coverage must meet the repo's enforced standard."""
 
     def test_passes_when_coverage_at_100_percent(self, gate: Any) -> None:
         with patch("subprocess.run") as mock_run:

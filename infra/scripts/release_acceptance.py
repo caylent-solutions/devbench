@@ -5,7 +5,7 @@ eligible for human merge:
 
   (a) make validate green
   (b) full CI matrix green (make validate covers the full CI suite locally)
-  (c) branch coverage meets the repo's enforced standard (98 percent)
+  (c) coverage meets the repo's enforced standard (98 percent)
   (d) zero-orphan and zero-stale grep ACs pass
   (e) mirrored-list sync pairs match (judge lists and marketplace versions)
   (f) validate-backlog exits 0
@@ -135,16 +135,18 @@ def check_branch_coverage(
     cov_source: str = "devbench",
     cov_fail_under: int = 98,
 ) -> ConditionResult:
-    """Condition (c): branch coverage must meet the repo's enforced standard.
+    """Condition (c): coverage must meet the repo's enforced standard.
 
-    The threshold mirrors the repo's documented coverage gate
-    (``make test-coverage`` uses ``--cov-fail-under=98``); the release gate
-    must not invent a stricter bar than the standard the repo enforces.
+    Mirrors the repo's documented, enforced coverage gate exactly
+    (``make test-coverage`` runs ``pytest --cov=devbench --cov-fail-under=98
+    --cov-precision=2`` -- line coverage, no ``--cov-branch``). The release
+    gate must enforce the same metric and threshold the repo enforces, not a
+    stricter/different one (branch coverage is not a repo standard).
 
     Args:
         repo_root: Absolute path to the repository root.
         cov_source: The coverage source module or path (default: "devbench").
-        cov_fail_under: Minimum required branch coverage percentage (default: 98,
+        cov_fail_under: Minimum required coverage percentage (default: 98,
             matching the repo's enforced standard).
     """
     result = _run(
@@ -154,7 +156,6 @@ def check_branch_coverage(
             "pytest",
             "tests/",
             f"--cov={cov_source}",
-            "--cov-branch",
             "--cov-report=term-missing",
             f"--cov-fail-under={cov_fail_under}",
             "--cov-precision=2",

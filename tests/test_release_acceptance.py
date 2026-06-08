@@ -174,18 +174,31 @@ class TestConditionDZeroOrphanStale:
     """Condition (d): zero-orphan and zero-stale grep ACs pass."""
 
     def test_passes_when_no_orphans_and_no_stale(self, gate: Any) -> None:
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch.object(gate, "_has_workspace_config", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = gate.check_zero_orphan_stale(REPO_ROOT)
         assert result.passed is True
         assert result.label == "zero_orphan_stale"
 
     def test_fails_when_orphans_found(self, gate: Any) -> None:
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch.object(gate, "_has_workspace_config", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=1, stdout="orphan found", stderr="")
             result = gate.check_zero_orphan_stale(REPO_ROOT)
         assert result.passed is False
         assert result.label == "zero_orphan_stale"
+
+    def test_skipped_when_no_workspace_config(self, gate: Any) -> None:
+        with patch.object(gate, "_has_workspace_config", return_value=False):
+            result = gate.check_zero_orphan_stale(REPO_ROOT)
+        assert result.passed is True
+        assert result.label == "zero_orphan_stale"
+        assert "skipped" in result.message
 
 
 @pytest.mark.unit
@@ -267,15 +280,28 @@ class TestConditionEMirroredLists:
 class TestConditionFValidateBacklog:
     """Condition (f): validate-backlog must exit 0."""
 
+    def test_skipped_when_no_workspace_config(self, gate: Any) -> None:
+        with patch.object(gate, "_has_workspace_config", return_value=False):
+            result = gate.check_validate_backlog(REPO_ROOT)
+        assert result.passed is True
+        assert result.label == "validate_backlog"
+        assert "skipped" in result.message
+
     def test_passes_when_validate_backlog_exits_zero(self, gate: Any) -> None:
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch.object(gate, "_has_workspace_config", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = gate.check_validate_backlog(REPO_ROOT)
         assert result.passed is True
         assert result.label == "validate_backlog"
 
     def test_fails_when_validate_backlog_exits_nonzero(self, gate: Any) -> None:
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch.object(gate, "_has_workspace_config", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="backlog error")
             result = gate.check_validate_backlog(REPO_ROOT)
         assert result.passed is False
@@ -287,15 +313,28 @@ class TestConditionFValidateBacklog:
 class TestConditionGDevbenchCheck:
     """Condition (g): devbench check must exit 0."""
 
+    def test_skipped_when_no_workspace_config(self, gate: Any) -> None:
+        with patch.object(gate, "_has_workspace_config", return_value=False):
+            result = gate.check_devbench_check(REPO_ROOT)
+        assert result.passed is True
+        assert result.label == "devbench_check"
+        assert "skipped" in result.message
+
     def test_passes_when_check_exits_zero(self, gate: Any) -> None:
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch.object(gate, "_has_workspace_config", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = gate.check_devbench_check(REPO_ROOT)
         assert result.passed is True
         assert result.label == "devbench_check"
 
     def test_fails_when_check_exits_nonzero(self, gate: Any) -> None:
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch.object(gate, "_has_workspace_config", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="check error")
             result = gate.check_devbench_check(REPO_ROOT)
         assert result.passed is False

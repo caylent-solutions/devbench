@@ -334,6 +334,58 @@ or does not contain the cited item, the skeptic returns CONFIRMED for the
 citation finding (i.e., the un-verifiable citation is a confirmed problem, not
 a false positive).
 
+### Resolved-decisions ledger (Step 4b contract)
+
+During the adversarial hardening loop, every confirmed cross-section or
+cross-file contradiction that requires a resolution MUST be recorded in the
+companion artifact ``spec/<name>-resolved-decisions.md`` as a ``D<N>`` entry.
+
+**Maintaining the ledger**
+
+Use ``devbench.plugin_helpers.resolved_decisions_ledger.append_decision`` to
+append each new resolution:
+
+```python
+from devbench.plugin_helpers.resolved_decisions_ledger import (
+    DecisionEntry,
+    DuplicateResolutionError,
+    append_decision,
+    read_ledger,
+)
+
+decision = DecisionEntry(
+    index=0,  # assigned automatically
+    contradiction="<description of the cross-section conflict>",
+    resolution="<the chosen resolution, verbatim>",
+    rationale="<why this resolution was preferred>",
+)
+try:
+    entry = append_decision(ledger_path, decision)
+    # entry.index holds the assigned D<N> integer
+except DuplicateResolutionError as err:
+    # The contradiction was already recorded -- defer to the existing entry.
+    # Do NOT append a conflicting second entry.
+    pass
+```
+
+**Deferring in later rounds**
+
+Before resolving any contradiction in a subsequent review round, call
+``read_ledger(ledger_path)`` and check whether the contradiction is already
+recorded.  When a match is found, use the existing ``**Resolution:**`` text
+verbatim rather than re-litigating the decision.  ``append_decision`` enforces
+this contract automatically by raising ``DuplicateResolutionError`` on an
+attempt to re-record an existing contradiction.
+
+**Emitting the ledger as a companion artifact**
+
+The ledger file is written alongside the spec file and consumed by
+``spec-to-backlog`` as the contradiction tie-breaker (wired in E12-F3-S2).
+When the spec is written in Step 6, confirm that the ledger file exists at
+``spec/<name>-resolved-decisions.md``; if no contradictions were encountered
+during the adversarial loop, the ledger file may be absent or empty -- that
+is acceptable.
+
 ---
 
 ## Step 5 -- Final operator review before writing

@@ -181,7 +181,37 @@ Using the operator's answers, author `spec/<project-name>.md` following the cano
 - The error-handling semantics (what error, what message, what exit code or exception)
 - At least one worked operator example
 
+Every functional requirement MUST be written as a numbered `FR-N:` line (e.g., `FR-1: The system shall ...`). These lines form the machine-readable FR list consumed by `spec-to-backlog` and the backlog-readiness self-check.
+
 **Per-AC discipline**: acceptance criteria are numbered (`AC-N`), reference the spec section that justifies them, and are testable from the spec text alone without asking the implementer to infer intent.
+
+**AC-N section marker**: the AC-N list MUST be preceded by the stable machine-locatable marker line:
+
+```
+<!-- AC-SECTION-START -->
+```
+
+Place this marker on its own line immediately before the first `AC-N` entry (or before the heading that introduces the AC list). This marker allows `spec-to-backlog` to locate the AC section deterministically without relying on section numbers that change across specs.
+
+**Target Repository block**: every spec MUST include a `## Target Repository` section with exactly these two fields:
+
+```markdown
+## Target Repository
+
+- **Repo:** `<org/repo>`
+- **Branch:** `<target-branch>`
+```
+
+**Unit Inventory (multi-unit specs only)**: when a spec covers more than one work unit, add a `## Unit Inventory` section that lists each unit:
+
+```markdown
+## Unit Inventory
+
+- unit-1: <title>
+- unit-2: <title>
+```
+
+Single-unit specs do NOT require a Unit Inventory section.
 
 ---
 
@@ -208,6 +238,12 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 **Design record (items 7-8)**
 7. **Resolved decisions**: Section 13 (Resolved decisions / interview record) captures every "we decided X because Y" call made during spec authoring, with alternatives considered. FAIL if any design call made during authoring is not recorded.
 8. **Out-of-scope section**: Section 12 (Out of scope) names every plausible adjacent ask not covered by this spec. FAIL if the section is absent or names fewer adjacent asks than were discussed during the operator question block.
+
+**Backlog contract (items 9-12)**
+9. **FR-N lines present**: every functional requirement is written as a numbered `FR-N:` line. FAIL if any FR is stated in prose without a `FR-N:` prefix.
+10. **AC-SECTION-START marker**: the literal line `<!-- AC-SECTION-START -->` appears immediately before the AC-N list. FAIL if the marker is absent.
+11. **Target Repository block**: a `## Target Repository` section with `Repo:` and `Branch:` fields is present. FAIL if either field is missing.
+12. **Unit Inventory (multi-unit)**: when the spec covers more than one work unit, a `## Unit Inventory` section listing each unit is present. FAIL if the spec is multi-unit and the inventory is absent. (Single-unit specs are exempt.)
 
 **Convergence protocol**: If the rubric score after revision is still > 0 and the loop count equals `skills.max_iterations`, emit a [BLOCKED] comment:
 
@@ -237,7 +273,29 @@ Ask: "Does this look good to write to `spec/<project-name>.md`? Or do you have f
 
 ## Step 6 -- Write the spec and offer handoff
 
-Once the operator approves, write the spec:
+Once the operator approves, run the backlog-readiness self-check against the
+approved spec text **before writing the file**, so decomposition failures
+surface here rather than inside `spec-to-backlog`.
+
+When the Workflow tool is available (i.e., ``skills.use_workflow`` is ``true``
+in ``backlog/config/devbench.yaml`` and the Workflow tool is present), run
+the self-check as a single decomposability-audit agent invocation:
+
+```python
+from devbench.plugin_helpers.spec_backlog_contract import check_backlog_readiness
+spec_text = <the full approved spec text as a string>
+is_multi = <True when the spec covers more than one work unit, False otherwise>
+check_backlog_readiness(spec_text, is_multi_unit=is_multi)
+```
+
+When the Workflow tool is absent, run the same call as a direct single-agent
+self-check (no sub-agent spawning required; the call is synchronous and pure).
+
+If ``check_backlog_readiness`` raises ``ReadinessError``, emit the error
+message verbatim to the operator, do NOT write the spec, and exit non-zero.
+The error message names the missing element and the required fix.
+
+Once the self-check passes (returns without raising), write the spec:
 
 ```
 Write spec/<project-name>.md
@@ -271,6 +329,11 @@ Then offer the spec-to-backlog handoff:
 - **Output file**: `spec/<project-name>.md`
 - **Target size**: 1000+ lines for non-trivial programs; smaller for minor features (a 200-line spec is appropriate for a single-feature change; a 50-line spec is always insufficient for a new subsystem)
 - **Quality gate**: rubric score must be zero unresolved items before the spec is written
+- **FR list**: at least one `FR-N:` line is present in the spec
+- **AC-N marker**: the literal line `<!-- AC-SECTION-START -->` appears immediately before the AC-N list
+- **Target Repository**: `Repo:` and `Branch:` fields are present
+- **Unit Inventory**: present for multi-unit specs; absent is acceptable for single-unit specs
+- **Readiness self-check**: `check_backlog_readiness` from `devbench.plugin_helpers.spec_backlog_contract` returns without raising before the spec is written
 - **Handoff**: on operator consent, invoke the `spec-to-backlog` skill with this spec as input
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 

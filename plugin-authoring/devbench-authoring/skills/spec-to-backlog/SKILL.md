@@ -110,9 +110,40 @@ Read <spec-path>
 
 Extract:
 - The project name and all functional requirements (FRs)
-- All acceptance criteria (AC-N identifiers from the spec's Section 6 or equivalent)
+- All acceptance criteria (AC-N identifiers; use the marker-based resolver below)
 - All constraints, NFRs, and implementation notes
 - The target repository and branch
+
+**FR list extraction**: use `extract_fr_list` from
+`devbench.plugin_helpers.spec_backlog_contract` to pull every `FR-N:` line:
+
+```python
+from devbench.plugin_helpers.spec_backlog_contract import extract_fr_list
+spec_text = open("<spec-path>").read()
+frs = extract_fr_list(spec_text)
+```
+
+**AC-N section resolution -- marker first, positional fallback**: use
+`extract_ac_section` from `devbench.plugin_helpers.spec_backlog_contract` to
+locate the AC-N block deterministically:
+
+```python
+from devbench.plugin_helpers.spec_backlog_contract import extract_ac_section
+ac_text = extract_ac_section(spec_text)
+```
+
+Resolution order (implemented inside `extract_ac_section`):
+
+1. **Marker path**: if the stable marker `<!-- AC-SECTION-START -->` appears
+   in the spec, return the text block that follows the marker up to the next
+   `##`-level heading.
+2. **Legacy fallback**: if no marker is found, locate the positional
+   `## Section 6` heading (case-insensitive) and return its content.  This
+   preserves byte-for-byte backward compatibility with specs authored before
+   E12-F1-S3.
+3. **Fail fast**: when neither anchor is found, `extract_ac_section` raises
+   `ReadinessError` -- propagate this error to the operator; do NOT silently
+   skip AC coverage.
 
 Record the FR list for coverage validation in the iterate-until-perfect loop.
 

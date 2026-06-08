@@ -12,4 +12,6 @@ Modules:
 - :mod:`devbench.plugin_helpers.backlog_post_processor` -- per-WU-file
   post-processing passes the spec-to-backlog skill runs after Step 5
   authoring and before Step 5d's ``validate-backlog`` invocation.
+- :mod:`devbench.plugin_helpers.spec_gates` -- deterministic gates for the
+  create-spec adversarial hardening loop.
 """

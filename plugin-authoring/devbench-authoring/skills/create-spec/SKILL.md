@@ -388,6 +388,117 @@ is acceptable.
 
 ---
 
+## Step 4c -- Deterministic gates and iterate-until-converged hardening loop
+
+This step runs **after** Step 4b (adversarial review phase). It applies cheap
+programmatic invariants to the full spec file set, then drives a bounded
+find -> verify -> file-partitioned repair -> re-gate loop until all confirmed
+blockers are resolved or `skills.max_iterations` is reached.
+
+When the Workflow tool is absent, this step runs in single-agent mode: the
+agent calls `run_gates` directly, applies all repairs itself, and re-runs the
+gates -- the loop shape is the same but without spawning sub-agents.
+
+### Gate invocation
+
+Call `run_gates` from `devbench.plugin_helpers.spec_gates` with the full spec
+file set and the declared dependency graph:
+
+```python
+from devbench.plugin_helpers.spec_gates import run_gates
+
+# files: {file_path: content} -- every spec file in the set
+# dep_graph: {node_id: [dep_id, ...]} -- declared dep graph, or {} if absent
+blockers = run_gates(files=files, dep_graph=dep_graph)
+```
+
+The four invariants checked by `run_gates` are:
+
+1. **Balanced fenced/mermaid blocks** -- every triple-backtick block must be
+   closed. An odd number of fence markers in any file is a confirmed blocker.
+2. **Banned glyphs** -- the em-dash character U+2014 is banned. Use `--`
+   (double hyphen) instead. Each line containing an em-dash is a confirmed
+   blocker.
+3. **Cross-file version/identifier consistency** -- `key: value` pairs that
+   appear in more than one spec file must have the same value everywhere.
+   A key with differing values across files (or within a single file) is a
+   confirmed blocker.
+4. **Acyclic declared dependency graph** -- the spec's declared dependency
+   graph must be a DAG. Any cycle is a confirmed blocker.
+
+### Loop shape
+
+The convergence loop repeats until `blockers` is empty or
+`skills.max_iterations` is reached. At each iteration:
+
+1. **Find** -- call `run_gates(files=..., dep_graph=...)` to collect the
+   confirmed-blocker list for the current round.
+
+2. **Verify** -- if `blockers` is empty, exit the loop immediately (success).
+
+3. **Repair** -- when the Workflow tool is available, spawn one repair agent
+   per spec file that has at least one confirmed blocker. Each repair agent:
+   - Receives the list of confirmed blockers for its assigned file.
+   - Reads the current resolved-decisions ledger via
+     `read_ledger(ledger_path)` and copies the existing `**Resolution:**`
+     text verbatim for any contradiction already recorded, rather than
+     re-litigating it.
+   - Applies the minimum edit needed to clear its assigned blockers.
+   - Writes the repaired file using the Write tool.
+   When the Workflow tool is absent, the single agent performs all repairs
+   sequentially across all files.
+
+4. **Re-gate** -- after all repairs are applied, reload the file contents and
+   call `run_gates` again to check whether the blockers have been cleared.
+   Only blockers that survive this re-gate are carried to the next iteration.
+
+### Directory-spec fan-out (AC-3)
+
+When the spec is a directory (multiple `.md` files rather than a single file):
+
+- Pass the full ``{file_path: content}`` mapping to `run_gates` so the
+  version-consistency gate operates across the whole set.
+- Repair agents are partitioned by file -- each agent owns exactly one spec
+  file and reads the shared resolved-decisions ledger to copy contract text
+  verbatim.
+- The dependency graph is assembled from all declared dependencies across the
+  full file set before each gate invocation.
+
+### Convergence or [BLOCKED] escalation (AC-2, spec Section 7)
+
+When the loop exits with zero blockers, proceed to Step 5.
+
+When the iteration count reaches `skills.max_iterations` (from
+`backlog/config/devbench.yaml`, falling back to `SKILL_MAX_ITERATIONS`) and
+confirmed blockers remain, emit the verbatim `[BLOCKED]` escalation and exit
+non-zero. Do NOT silently ship a spec that fails any gate:
+
+```
+[BLOCKED] create-spec deterministic-gates loop reached max_iterations=<N> without converging.
+Unresolved blockers:
+- <blocker.kind>: <blocker.detail>
+...
+Please fix the above issues and re-run the skill.
+```
+
+This escalation uses the same bounded-loop infrastructure as the
+iterate-until-perfect loop (Step 4): `read_checkpoint`, `write_checkpoint`,
+and `emit_audit` from `src/devbench/skill_state.py` track the iteration
+counter; `emit_audit` with `SKILL_AUDIT_MAX_ITERATIONS_REACHED` fires when the
+budget is exhausted.
+
+### Single-agent fallback contract (AC-4)
+
+When the Workflow tool is absent (`skills.use_workflow` is `false` or the
+Workflow tool is not present in the session), the Step-4 single-agent
+self-critique rubric (Step 4) runs unchanged as the sole review pass. The
+deterministic gates in Step 4c still run via direct `run_gates` calls in the
+same agent process -- no sub-agents are spawned. The loop shape (find ->
+verify -> repair -> re-gate) is identical; only the repair execution mode
+differs (single-agent sequential versus Workflow parallel).
+
+---
+
 ## Step 5 -- Final operator review before writing
 
 Present the full spec to the operator with a summary of:

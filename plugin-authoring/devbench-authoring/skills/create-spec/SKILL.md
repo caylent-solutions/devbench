@@ -217,7 +217,7 @@ Single-unit specs do NOT require a Unit Inventory section.
 
 ## Step 4 -- Run the iterate-until-perfect self-critique loop
 
-After drafting the full spec, run the self-critique rubric below. Generate a finding list (each finding: criteria-group + detail + suggested-fix). Then revise one finding at a time. Re-run the full rubric after each revision batch. Repeat until the rubric score is zero unresolved items or `skills.max_iterations` is reached.
+After drafting the full spec, run the self-critique rubric below (single-agent self-critique -- the Step-4 fallback path, which runs unchanged when the Workflow tool is absent). Generate a finding list (each finding: criteria-group + detail + suggested-fix). Then revise one finding at a time. Re-run the full rubric after each revision batch. Repeat until the rubric score is zero unresolved items or `skills.max_iterations` is reached.
 
 ### Self-critique rubric for create-spec
 
@@ -254,6 +254,85 @@ Unresolved rubric items:
 ...
 Please clarify the above items and re-run the skill.
 ```
+
+---
+
+## Step 4b -- Adversarial review phase (Workflow mode only)
+
+This phase runs **only** when both conditions are met:
+
+1. The Workflow tool is available (i.e., `skills.use_workflow` is `true` in
+   `backlog/config/devbench.yaml` and the Workflow tool is present).
+2. The spec exceeds `skills.adversarial_review_threshold` (the word count or
+   section count configured in `backlog/config/devbench.yaml`).
+
+When the Workflow tool is absent, skip this step entirely. The single-agent
+Step-4 self-critique runs unchanged as the sole review pass. This preserves
+the existing behavior without regression.
+
+### Dimension fan-out
+
+Using the dimension fan-out pattern from `docs/workflow-authoring-patterns.md`
+(Pattern 1), spawn one independent reviewer agent per generic dimension. The
+five generic dimensions are fixed; finer-grained checks within each dimension
+are derived from the spec's own content, never from a pre-baked domain
+taxonomy:
+
+1. **Implementability** -- Can every FR be implemented given the primitives
+   cited in Section 3? Are any FRs under-specified to the point where a
+   developer cannot proceed without guessing?
+2. **Internal consistency** -- Do the ACs, FRs, and Sections 0-15 agree with
+   each other? Do resolved decisions (Section 13) align with Section 4
+   functional requirements?
+3. **Completeness/gaps** -- Are there implied behaviors that the spec leaves
+   unspecified? Does each FR have error-handling semantics?
+4. **Claims-grounding** -- Are there unmeasured performance claims (e.g.,
+   "reduces latency by X%")? Any claim with a specific number but no cited
+   measurement is flagged by this dimension.
+5. **Citation/standards verification** -- Every external module, flag, version,
+   or standard the spec cites must be checked against its named source. Any
+   cited external item that cannot be verified against the named source is
+   flagged by this dimension.
+
+Each reviewer agent writes its findings to a separate output file (Pattern 6:
+file-based agent output from `docs/workflow-authoring-patterns.md`). No
+dimension-specific findings are restated here; see the shared patterns doc for
+the generic fan-out and file-output contracts.
+
+### Per-finding skeptic re-verification
+
+After collecting all per-dimension findings, apply Pattern 2 (per-finding
+adversarial verification, default-reject) from
+`docs/workflow-authoring-patterns.md`:
+
+For each finding, an independent skeptic agent attempts to falsify it. The
+skeptic returns exactly one of three verdicts:
+
+- **CONFIRMED** -- the finding is verifiable; it must be addressed before
+  the spec is written.
+- **REJECTED** -- the finding is not verifiable or is a false positive; it
+  does not drive an edit.
+- **severity-adjusted** -- the finding is real but less severe than the
+  reviewer claimed; the adjusted severity governs what action (if any) is
+  taken.
+
+Findings that the skeptic cannot verify default to **REJECTED**. An
+unverifiable finding must never silently drive an edit; it must be surfaced to
+the operator as unverified and left for manual review.
+
+Only CONFIRMED and severity-adjusted (where the adjusted severity still
+requires action) findings advance to the revision step. REJECTED findings are
+reported in a summary but do not trigger spec edits.
+
+### Citation dimension error contract
+
+A cited external module, flag, or version that cannot be checked against its
+named source MUST be flagged by the citation dimension, never assumed valid.
+The skeptic agent that re-checks a citation finding must attempt to verify the
+cited item against the source the spec names. If the source is not accessible
+or does not contain the cited item, the skeptic returns CONFIRMED for the
+citation finding (i.e., the un-verifiable citation is a confirmed problem, not
+a false positive).
 
 ---
 

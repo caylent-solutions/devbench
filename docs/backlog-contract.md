@@ -618,6 +618,28 @@ For N claimants of the same path, the validator accepts **any DAG that totally o
 
 The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
 
+### Status scoping
+
+The conflict check is scoped to specific status sets. Not every status triggers the same severity:
+
+**Default in-flight ERROR set** (`in-queue` / `proposed` / `blocked`): Two Tasks in any of these statuses that share the same `(repo, path)` pair with no serial dependency between them are a hard ERROR. `validate-backlog` exits non-zero and names both Task IDs. These statuses represent work that the orchestrator may pick up at any time, so an unresolved overlap is a guaranteed git-ops collision.
+
+**Authoring-time WARNING set** (`draft` / `hold`): Two Tasks in `draft` or `hold` that share the same `(repo, path)` pair with no serial dependency are reported as a WARNING by default. `validate-backlog` prints the warning but still exits 0. These statuses represent work that is not yet actionable, so the conflict is a planning concern rather than an immediate runtime hazard.
+
+**Out-of-scope statuses** (`done` / `declined` / `in-progress`): Tasks in terminal states (`done`, `declined`) have already landed or been cancelled; their Manifest entries no longer compete. Tasks `in-progress` are actively being executed by an agent; the conflict rule does not retroactively fire on them.
+
+### Authoring-time strict check
+
+To promote the `draft`/`hold` WARNING to a non-zero ERROR -- useful in CI or authoring gates where you want to catch planning conflicts before they become runtime conflicts -- run:
+
+```bash
+devbench validate-backlog --strict
+# or equivalently:
+devbench validate-backlog --include-draft
+```
+
+Both `--strict` and `--include-draft` are accepted as aliases. In strict mode `validate-backlog` exits 1 when any `draft`/`hold` conflict is found, exactly as it does for the in-flight ERROR set. The in-flight ERROR set is unaffected -- it always exits 1 regardless of the strict flag.
+
 ---
 
 ## Orphan-Pattern Rule (git-ops self-defense)

@@ -150,6 +150,17 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Authoring-time draft/hold manifest conflict detection and `--strict` flag**
+  (issue #267). `validate-backlog` now runs a second conflict pass (`_check_manifest_conflicts_draft_hold`,
+  Check 12-draft) scoped to `draft` and `hold` tasks. Two `draft`/`hold` tasks that claim the same
+  `(repo, path)` pair with no serial dep between them are reported as a WARNING in the default mode --
+  `validate-backlog` prints the conflict but exits 0 so pre-queue authoring workflows are not blocked.
+  Pass `--strict` (or the alias `--include-draft`) to promote the WARNING to a non-zero ERROR, enabling
+  CI or authoring gates to enforce ownership discipline before tasks are promoted to `in-queue`. The
+  existing `in-queue`/`proposed`/`blocked` hard-ERROR path (Check 12) is unaffected. See the new
+  "Status scoping" and "Authoring-time strict check" subsections under "Manifest Conflict Rule" in
+  `docs/backlog-contract.md`.
+
 - **Opt-in auto-resolve engine for non-destructive whitelisted remediations**
   (issue #263). When `auto_resolve.enabled: true` is set in
   `backlog/config/devbench.yaml`, the `triage-blocked-task` skill automatically

@@ -488,6 +488,100 @@ only produces the verified gap list.
 
 ---
 
+## Step 7c -- Gap-fill and re-validate loop
+
+Consume the verified gap list produced by Step 7b-3 and close every confirmed gap.
+Repeat until zero confirmed gaps remain AND ``validate-backlog`` returns rc=0, or
+until the iteration budget is exhausted.
+
+### 7c-1 -- Route each gap to the correct authoring path
+
+For each ``GapReport`` in the verified gap list:
+
+- **NEW TASK** (``fix == "NEW TASK"``): author a brand-new task file using the
+  existing Step-5 authoring path -- all 15 canonical sections, the canonical Code
+  Standards block (via the helper in Step 5a), full dep wiring (``## Dependencies``
+  and ``### Depends On This``), and an index row in ``BACKLOG.md``.  Copy the
+  substance of the gap's ``spec_requirement_quote`` into the new task's
+  ``## Description`` and ``## Acceptance Criteria`` sections.
+
+- **ENHANCE** (``fix == "ENHANCE <task-id>"``): use file-partitioned fan-out --
+  one agent per task file -- to add the missing content to the identified task.
+  Each fan-out agent receives:
+  - The task file path and its current content.
+  - The gap's ``spec_requirement_quote`` from the cited spec section.
+  - The E12-F2-S2 resolved-decisions ledger as the contradiction tie-breaker: when
+    the cited spec section conflicts with a ledger entry, the ledger entry wins.
+  The agent must add whichever of the following are absent from the task: ACs,
+  Approach steps, Changes Manifest rows, and DoD items.  It must not duplicate
+  content that is already present.
+
+### 7c-2 -- Re-integrate: regenerate index, run post-processor, run validate-backlog
+
+After all gaps in a round have been authored or enhanced, re-integrate the changes
+using the same sequence as Step 5d (reuse those invocations -- do NOT duplicate them):
+
+1. Regenerate the backlog index by running ``run_all`` with the relevant
+   ``scope_paths`` and ``workspace_root`` kwargs (appends new rows, preserves
+   existing ones).
+2. Run the post-processor passes (``run_all``) to fix mechanical issues in the
+   newly authored or enhanced files.
+3. Run ``validate-backlog``:
+
+   ```bash
+   uv run devbench validate-backlog
+   ```
+
+   If ``validate-backlog`` returns non-zero, fix each reported error (same loop as
+   Step 5d) before proceeding to the re-audit in Step 7c-3.
+
+### 7c-3 -- Re-audit and loop
+
+Re-run the five-dimension coverage audit (Steps 7b-1 through 7b-3) to produce a
+fresh verified gap list.
+
+**Success gate (both conditions must hold simultaneously)**:
+
+- Zero confirmed gaps remain (the verified gap list is empty).
+- ``validate-backlog`` returns rc=0.
+
+When both conditions are satisfied, proceed to Step 8.
+
+When either condition fails, increment the iteration counter and return to Step 7c-1
+for the next round.
+
+**Convergence failure**: when the iteration counter reaches ``skills.max_iterations``
+(from ``backlog/config/devbench.yaml``; config-driven, falls back to
+``SKILL_MAX_ITERATIONS`` from ``src/devbench/constants.py``) and confirmed gaps
+remain OR ``validate-backlog`` is non-zero, emit the ``[BLOCKED]`` escalation and
+exit non-zero -- do NOT silently declare success:
+
+```
+[BLOCKED] spec-to-backlog gap-fill reached max_iterations=<N>.
+Unresolved gaps:
+- severity=<high|medium|low> element=<name> fix=<NEW TASK|ENHANCE <id>>
+  missing: <what_is_missing>
+...
+validate-backlog rc=<rc>
+Please resolve the above items and re-run the skill.
+```
+
+Only partial success -- zero confirmed gaps but non-zero ``validate-backlog`` rc, or
+rc=0 but remaining gaps -- must also emit the ``[BLOCKED]`` escalation. The success
+gate requires both conditions.
+
+### 7c-4 -- Workflow-absent single-agent fallback
+
+When the Workflow tool is unavailable, the gap-fill loop runs in single-agent mode:
+the same agent that authored the backlog in Steps 4-7 performs each NEW TASK authoring
+and each ENHANCE edit sequentially, applying the FR/AC citation rubric unchanged
+(cite every spec FR identifier and AC-N identifier that the new or enhanced task
+addresses).  The loop bounds (max_iterations), severity thresholds, and round counts
+are config-driven via ``skills.max_iterations`` in ``backlog/config/devbench.yaml``
+regardless of whether Workflow fan-out is active.
+
+---
+
 ## Step 8 -- Emit the quality-reference audit comment and success message
 
 After all three exit conditions pass, emit a provenance audit comment naming the exemplar consulted in Step 1a. When `skills.exemplar_backlog_path` was set, emit the resolved path; when it was absent, emit the literal token `<embedded-canonical-sections>` so the audit trail records that no external exemplar was consulted:

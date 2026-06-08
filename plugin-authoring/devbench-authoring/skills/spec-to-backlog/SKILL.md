@@ -582,6 +582,80 @@ regardless of whether Workflow fan-out is active.
 
 ---
 
+## Step 7d -- Authoring-time strict manifest-conflict check
+
+After Step 7c confirms zero confirmed gaps and ``validate-backlog`` rc=0, run
+the authoring-time strict manifest-conflict check on the all-draft output before
+declaring success.  Because every generated task file carries ``## Status: draft``,
+the default (non-strict) ``validate-backlog`` treats same-``(repo, path)`` ownership
+by two draft tasks as a WARNING, not an ERROR -- this step promotes those findings
+to errors so a missed serial-dep chain is caught at generation time rather than at
+executor time (spec Section 4 E13-F2-S1 AC-1; GitHub issue #267).
+
+### 7d-1 -- Run the strict check
+
+```bash
+uv run devbench validate-backlog --strict
+```
+
+**Interpretation**:
+
+- ``rc=0``: No draft/hold manifest conflicts remain.  Proceed to Step 8.
+- ``rc!=0``: One or more draft tasks claim the same ``(repo, path)`` with no
+  serial-dep chain ordering them.  Proceed to Step 7d-2 to wire the missing dep
+  chain; do NOT declare success while any conflict remains.
+
+### 7d-2 -- Wire the serial-dep chain for each conflict
+
+For each conflict reported by the strict check (the error message names the
+conflicting task IDs and the shared path), add the required serial dependency so
+that the later task in topological order depends on the earlier one.
+
+Reuse the existing dep-wiring step from Step 5 (``Dependency wiring --
+fully resolved at generation time``): for each conflicting pair ``(earlier_id,
+later_id)`` sharing the same ``(repo, path)``:
+
+1. Add ``earlier_id`` to the ``## Dependencies`` table of ``later_id``'s work-unit
+   file (or vice-versa when the conflict message specifies a different ordering).
+2. Add ``later_id`` to the ``### Depends On This`` table of ``earlier_id``'s
+   work-unit file.
+3. Run the post-processor with ``scope_paths`` limited to the two affected files
+   so the dep-format post-processing pass normalises the IDs.
+
+Do NOT invent new wiring logic -- the serial-dep auto-injection in Step 5
+(``Manifest-conflict serial-dep chains auto-injected``) is the canonical reference;
+this step applies the same pattern to the all-draft output that Step 5 was supposed
+to wire at authoring time.
+
+### 7d-3 -- Re-run the strict check
+
+After wiring every reported conflict, re-run:
+
+```bash
+uv run devbench validate-backlog --strict
+```
+
+Repeat Steps 7d-2 and 7d-3 until the strict check returns ``rc=0``.
+
+If the strict check still returns non-zero after ``skills.max_iterations`` rounds
+of wiring, emit a ``[BLOCKED]`` escalation and exit non-zero -- do NOT declare
+success:
+
+```
+[BLOCKED] spec-to-backlog strict manifest-conflict check still failing after
+max_iterations=<N> rounds of dep wiring.
+Unresolved conflicts:
+- <path> in repo <repo>: claimed by <id1>, <id2>
+...
+Wire the serial-dep chain manually and re-run the skill.
+```
+
+**Success gate**: the strict check returns ``rc=0`` (zero errors, no draft/hold
+conflicts remain).  Only when this condition is met may the skill proceed to
+Step 8.
+
+---
+
 ## Step 8 -- Emit the quality-reference audit comment and success message
 
 After all three exit conditions pass, emit a provenance audit comment naming the exemplar consulted in Step 1a. When `skills.exemplar_backlog_path` was set, emit the resolved path; when it was absent, emit the literal token `<embedded-canonical-sections>` so the audit trail records that no external exemplar was consulted:

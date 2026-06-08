@@ -54,9 +54,13 @@ __all__ = [
 CATALOG_SCHEMA_VERSION: int = 1
 
 # Valid outcome literals accepted by record_outcome().
-OutcomeLiteral = Literal["applied", "escalated", "failed"]
+# "novel" records an unrecognized signature for operator review; it does not
+# increment success or failure counts.  The engine routes novel signatures to
+# advise-only and never auto-applies them until the operator confirms the
+# pattern (spec Section 4 E11-F2-S2 AC-1).
+OutcomeLiteral = Literal["applied", "escalated", "failed", "novel"]
 
-_VALID_OUTCOMES: frozenset[str] = frozenset({"applied", "escalated", "failed"})
+_VALID_OUTCOMES: frozenset[str] = frozenset({"applied", "escalated", "failed", "novel"})
 
 # Filename of the catalog inside the .devbench state directory.
 _CATALOG_FILENAME: str = "operator-resolution-catalog.json"
@@ -299,13 +303,18 @@ def record_outcome(
     - ``"applied"``   -- increments ``success_count`` and updates ``last_applied``.
     - ``"failed"``    -- increments ``failure_count`` and updates ``last_applied``.
     - ``"escalated"`` -- updates ``last_applied`` only (no count change).
+    - ``"novel"``     -- records the signature for operator review; updates
+                         ``last_applied`` only (no count change).  The engine
+                         uses this to mark unrecognized signatures so the
+                         operator can confirm them before auto-apply proceeds
+                         (spec Section 4 E11-F2-S2 AC-1).
 
     Args:
         workspace_root: Absolute path to the devbench workspace root.
         classification: The block-classifier bucket.
         normalized_signature: The agnostic blocker signature.
         remediation: The remediation verb that was applied.
-        outcome: One of ``"applied"``, ``"escalated"``, or ``"failed"``.
+        outcome: One of ``"applied"``, ``"escalated"``, ``"failed"``, or ``"novel"``.
 
     Raises:
         ValueError: When ``outcome`` is not a recognised value.
@@ -330,7 +339,7 @@ def record_outcome(
         success_count += 1
     elif outcome == "failed":
         failure_count += 1
-    # "escalated" leaves both counts unchanged
+    # "escalated" and "novel" leave both counts unchanged
 
     entries[key] = CatalogRecord(
         classification=classification,

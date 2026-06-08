@@ -1,6 +1,6 @@
 """Auto-resolve engine for non-destructive whitelisted remediations.
 
-Issue #263, spec Section 4 E11-F1-S1 and E11-F1-S2.
+Issue #263, spec Section 4 E11-F1-S1, E11-F1-S2, and E11-F2-S2.
 
 This module exposes the engine entry point ``apply_auto_resolve`` and a
 reusable whitelist membership predicate ``is_whitelisted``.
@@ -10,18 +10,30 @@ Behaviour:
   ``advise_only_payload`` byte-for-byte unchanged (AC-3).
 - When a destructive verb is supplied, a ``ValueError`` is raised
   immediately -- the guard fires before the enabled check so the
-  invariant holds regardless of configuration (AC-2, error-handling
-  contract from the work-unit spec).
+  invariant holds regardless of configuration (E11-F2-S2 AC-2,
+  error-handling contract from the work-unit spec).  A destructive
+  verb is NEVER auto-applied even when the resolution catalog shows
+  prior learned outcomes.
 - When ``config.enabled`` is ``True`` and the remediation passes the
-  whitelist guard, the engine enforces a per-(task_id, signature)
-  budget from ``config.max_attempts`` (E11-F1-S2 AC-1):
-  - If the budget is not yet exhausted, the engine logs the verbatim
-    ``[AUTO_RESOLVED]`` audit string and increments the counter.
-  - If the budget is exhausted, the engine logs ``[AUTO_RESOLVE_ESCALATED]``
-    and returns advise-only without incrementing further (AC-2).
+  whitelist guard, the engine checks whether the signature is known
+  (E11-F2-S2 AC-1):
+  - Novel (unrecognized) signature: when *catalog_path* and
+    *classification* are both supplied and no prior entry exists in
+    the catalog, the engine records the signature with outcome
+    ``"novel"`` and returns advise-only without consuming budget.
+    The operator must confirm the pattern before auto-apply proceeds.
+  - Learned signature: the engine enforces a per-(task_id, signature)
+    budget from ``config.max_attempts`` (E11-F1-S2 AC-1):
+    - If the budget is not yet exhausted, the engine logs the verbatim
+      ``[AUTO_RESOLVED]`` audit string and increments the counter.
+    - If the budget is exhausted, the engine logs
+      ``[AUTO_RESOLVE_ESCALATED]`` and returns advise-only without
+      incrementing further (E11-F1-S2 AC-2).
 - When the caller supplies a composite classification (primary_blocker_state
   is RUNTIME_DEGRADATION AND structural_blocker_state is not None), the
-  engine short-circuits to advise-only without consuming budget (AC-3).
+  engine short-circuits to advise-only without consuming budget (E11-F1-S2 AC-3).
+- When *catalog_path* is ``None``, the novel-signature gate is skipped
+  (backward-compatible default).
 """
 
 from __future__ import annotations
@@ -29,7 +41,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from devbench.backlog.operator_resolution_catalog import lookup_entry, record_outcome
+from devbench.backlog.operator_resolution_catalog import CatalogRecord, lookup_entry, record_outcome
 from devbench.backlog.proposal import BlockedTaskState
 from devbench.config_loader import AutoResolveConfig
 from devbench.constants import (
@@ -183,10 +195,14 @@ def apply_auto_resolve(
        return advise-only without consuming budget (no catalog write).
     4. Whitelist gate: unknown non-destructive verb logs a warning and
        returns advise-only (no catalog write).
-    5. Budget gate: if per-(task_id, signature) count is at max_attempts,
+    5. Novel-signature gate: when *catalog_path* and *classification*
+       are both supplied and the signature is NOT in the catalog,
+       record ``"novel"`` and return advise-only without consuming
+       budget (E11-F2-S2 AC-1).
+    6. Budget gate: if per-(task_id, signature) count is at max_attempts,
        log ``[AUTO_RESOLVE_ESCALATED]``, record ``"escalated"`` in catalog,
        and return advise-only.
-    6. Apply path: increment counter, log ``[AUTO_RESOLVED]``, record
+    7. Apply path: increment counter, log ``[AUTO_RESOLVED]``, record
        ``"applied"`` in catalog, return payload.
 
     Args:
@@ -241,6 +257,17 @@ def apply_auto_resolve(
         )
         return advise_only_payload
 
+    # Novel-signature gate: when the catalog is configured and the signature is either
+    # absent (never seen) or has only been recorded as "novel" (success_count == 0,
+    # meaning no operator-confirmed apply has ever succeeded), this is an unrecognized
+    # pattern.  Record it for operator review and route to advise-only without
+    # consuming budget (E11-F2-S2 AC-1).
+    prior_record = _lookup_catalog_entry(catalog_path, classification, signature)
+    is_novel = prior_record is None or prior_record.success_count == 0
+    if catalog_path is not None and classification is not None and is_novel:
+        _record_catalog_outcome(catalog_path, classification, signature, remediation, "novel")
+        return advise_only_payload
+
     # Budget gate: if the per-(task_id, signature) count is at max_attempts,
     # log escalation and return advise-only (E11-F1-S2 AC-1, AC-2).
     if _budget_exhausted(task_id, signature, config.max_attempts):
@@ -252,10 +279,8 @@ def apply_auto_resolve(
         _record_catalog_outcome(catalog_path, classification, signature, remediation, "escalated")
         return advise_only_payload
 
-    # Apply path: consult catalog to recognize recurring signatures (AC-2 from E11-F2-S1).
-    # lookup_entry reads the persisted catalog; a non-None result means the pattern
-    # has been seen before and the engine recognises it as recurring.
-    prior_record = _lookup_catalog_entry(catalog_path, classification, signature)
+    # Apply path: the signature is either learned (in catalog) or no catalog is configured.
+    # recurring=True when the catalog is configured and the prior record was found.
     recurring = prior_record is not None
 
     _increment_budget(task_id, signature)
@@ -272,7 +297,7 @@ def _lookup_catalog_entry(
     workspace_root: Path | None,
     classification: str | None,
     normalized_signature: str,
-) -> object:
+) -> CatalogRecord | None:
     """Return the catalog record for a classification + signature pair, or None.
 
     Silently returns None when *workspace_root* is ``None`` or *classification*
@@ -308,7 +333,7 @@ def _record_catalog_outcome(
         classification: Block-classifier bucket, or ``None`` to skip.
         normalized_signature: Agnostic blocker signature.
         remediation: Remediation verb.
-        outcome: One of ``"applied"``, ``"escalated"``, or ``"failed"``.
+        outcome: One of ``"applied"``, ``"escalated"``, ``"failed"``, or ``"novel"``.
     """
     if workspace_root is None or classification is None:
         return

@@ -675,15 +675,23 @@ class TestAutoResolveCatalogConsult:
         auto_resolve._apply_counts.clear()
 
     def test_apply_path_records_applied_outcome(self) -> None:
-        """A successful auto-apply records 'applied' outcome in the catalog."""
+        """A learned (already-in-catalog) signature auto-applies and records 'applied'."""
         import pathlib
         import tempfile
 
         from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
-        from devbench.backlog.operator_resolution_catalog import lookup_entry
+        from devbench.backlog.operator_resolution_catalog import lookup_entry, record_outcome
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
+            # Pre-seed the catalog so the signature is already learned
+            record_outcome(
+                root,
+                classification="RUNTIME_DEGRADATION",
+                normalized_signature="cat-sig-apply",
+                remediation="re-queue",
+                outcome="applied",
+            )
             cfg = AutoResolveConfig(enabled=True, max_attempts=3)
             apply_auto_resolve(
                 task_id="CAT-T1",
@@ -696,7 +704,7 @@ class TestAutoResolveCatalogConsult:
             )
             result = lookup_entry(root, "RUNTIME_DEGRADATION", "cat-sig-apply")
             assert result is not None
-            assert result.success_count == 1
+            assert result.success_count == 2
             assert result.failure_count == 0
 
     def test_escalated_path_records_escalated_outcome(self) -> None:
@@ -705,12 +713,20 @@ class TestAutoResolveCatalogConsult:
         import tempfile
 
         from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
-        from devbench.backlog.operator_resolution_catalog import lookup_entry
+        from devbench.backlog.operator_resolution_catalog import lookup_entry, record_outcome
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
+            # Pre-seed the catalog so the signature is already learned (max_attempts=1)
+            record_outcome(
+                root,
+                classification="RUNTIME_DEGRADATION",
+                normalized_signature="esc-sig",
+                remediation="re-queue",
+                outcome="applied",
+            )
             cfg = AutoResolveConfig(enabled=True, max_attempts=1)
-            # Exhaust the budget
+            # Exhaust the budget (1 learned apply)
             apply_auto_resolve(
                 task_id="CAT-ESC",
                 signature="esc-sig",
@@ -732,8 +748,8 @@ class TestAutoResolveCatalogConsult:
             )
             result = lookup_entry(root, "RUNTIME_DEGRADATION", "esc-sig")
             assert result is not None
-            # The escalated path does not increment success or failure
-            assert result.success_count == 1  # from the first (applied) call
+            # success_count is 2: the pre-seeded apply + the budget-exhausting apply
+            assert result.success_count == 2
             assert result.failure_count == 0
 
     def test_disabled_path_does_not_record_to_catalog(self) -> None:
@@ -760,17 +776,25 @@ class TestAutoResolveCatalogConsult:
             assert result is None
 
     def test_catalog_consult_recognizes_recurring_signature(self) -> None:
-        """Engine recognizes a recurring signature in the catalog."""
+        """Engine recognizes a recurring (learned) signature and auto-applies it."""
         import pathlib
         import tempfile
 
         from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
-        from devbench.backlog.operator_resolution_catalog import lookup_entry
+        from devbench.backlog.operator_resolution_catalog import lookup_entry, record_outcome
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
+            # Pre-seed the catalog so the signature is already learned
+            record_outcome(
+                root,
+                classification="AWAITING_DEPENDENCY",
+                normalized_signature="recur-sig",
+                remediation="re-queue",
+                outcome="applied",
+            )
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            # Record the signature 3 times
+            # Apply 3 times on top of the seed
             for _ in range(3):
                 apply_auto_resolve(
                     task_id="RECUR-T1",
@@ -783,31 +807,29 @@ class TestAutoResolveCatalogConsult:
                 )
             result = lookup_entry(root, "AWAITING_DEPENDENCY", "recur-sig")
             assert result is not None
-            assert result.success_count == 3
+            assert result.success_count == 4  # 1 seed + 3 auto-applied
 
     def test_catalog_consult_logs_recurring_true_on_second_apply(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Engine logs recurring=True when the signature was seen before."""
+        """Engine logs recurring=True when the signature was seen before (learned)."""
         import pathlib
         import tempfile
 
         from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import record_outcome
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            # First call: signature is novel (recurring=False)
-            apply_auto_resolve(
-                task_id="RECUR-LOG-T1",
-                signature="recur-log-sig",
-                remediation="re-queue",
-                advise_only_payload="payload",
-                config=cfg,
-                catalog_path=root,
+            # Pre-seed so signature is already learned
+            record_outcome(
+                root,
                 classification="RUNTIME_DEGRADATION",
+                normalized_signature="recur-log-sig",
+                remediation="re-queue",
+                outcome="applied",
             )
-            capsys.readouterr()  # discard first call output
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
 
-            # Second call: signature is now in catalog (recurring=True)
+            # This call should auto-apply (recurring=True) since it is already in catalog
             apply_auto_resolve(
                 task_id="RECUR-LOG-T1",
                 signature="recur-log-sig",
@@ -820,29 +842,6 @@ class TestAutoResolveCatalogConsult:
             captured = capsys.readouterr()
             combined = captured.out + captured.err
             assert "recurring=True" in combined
-
-    def test_catalog_consult_logs_recurring_false_on_first_apply(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Engine logs recurring=False when the signature is novel (first apply)."""
-        import pathlib
-        import tempfile
-
-        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = pathlib.Path(tmpdir)
-            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            apply_auto_resolve(
-                task_id="NOVEL-T1",
-                signature="novel-sig",
-                remediation="re-queue",
-                advise_only_payload="payload",
-                config=cfg,
-                catalog_path=root,
-                classification="RUNTIME_DEGRADATION",
-            )
-            captured = capsys.readouterr()
-            combined = captured.out + captured.err
-            assert "recurring=False" in combined
 
     def test_no_catalog_path_skips_catalog_silently(self) -> None:
         """When catalog_path is None, catalog consultation is skipped silently."""
@@ -906,3 +905,275 @@ class TestAutoResolveCatalogConsult:
             )
             result = lookup_entry(root, "RUNTIME_DEGRADATION", "comp-sig")
             assert result is None
+
+    def test_novel_signature_routes_to_advise_only(self) -> None:
+        """A novel (unrecognized) signature with catalog configured routes to advise-only."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            payload = "advise-only payload"
+            result = apply_auto_resolve(
+                task_id="NOVEL-ADVISE",
+                signature="novel-unrecognized-sig",
+                remediation="re-queue",
+                advise_only_payload=payload,
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            assert result == payload
+
+    def test_novel_signature_does_not_log_auto_resolved(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A novel signature must NOT log [AUTO_RESOLVED] -- it was routed to advise."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            apply_auto_resolve(
+                task_id="NOVEL-NOLOG",
+                signature="novel-nolog-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            captured = capsys.readouterr()
+            combined = captured.out + captured.err
+            assert AUTO_RESOLVE_AUDIT_STRING not in combined
+
+    def test_novel_signature_records_novel_entry_in_catalog(self) -> None:
+        """A novel signature is recorded in the catalog so the operator can confirm it."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import lookup_entry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            apply_auto_resolve(
+                task_id="NOVEL-REC",
+                signature="novel-rec-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "novel-rec-sig")
+            assert result is not None
+
+    def test_learned_signature_proceeds_to_auto_apply(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A signature already in the catalog (learned) is auto-applied normally."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import record_outcome
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            # Pre-populate the catalog to simulate a learned signature
+            record_outcome(
+                root,
+                classification="RUNTIME_DEGRADATION",
+                normalized_signature="learned-sig",
+                remediation="re-queue",
+                outcome="applied",
+            )
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            apply_auto_resolve(
+                task_id="LEARNED-T1",
+                signature="learned-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            captured = capsys.readouterr()
+            combined = captured.out + captured.err
+            assert AUTO_RESOLVE_AUDIT_STRING in combined
+
+    def test_novel_signature_does_not_consume_budget(self) -> None:
+        """Novel signature must not increment the per-(task, sig) apply counter."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog import auto_resolve
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=2)
+            apply_auto_resolve(
+                task_id="NOVEL-BUDGET",
+                signature="novel-budget-sig",
+                remediation="re-queue",
+                advise_only_payload="payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
+            key = ("NOVEL-BUDGET", "novel-budget-sig")
+            assert auto_resolve._apply_counts.get(key, 0) == 0
+
+    def test_novel_signature_without_catalog_still_auto_applies(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When no catalog_path is given, there is no novel-signature gate (backward compat)."""
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+        apply_auto_resolve(
+            task_id="NO-CAT-APPLY",
+            signature="any-sig",
+            remediation="re-queue",
+            advise_only_payload="payload",
+            config=cfg,
+        )
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert AUTO_RESOLVE_AUDIT_STRING in combined
+
+    def test_novel_signature_second_call_still_advise_only(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A signature recorded as 'novel' on first call must still route to advise-only on second call.
+
+        After the first encounter records a novel entry (success_count == 0), the
+        second call must NOT auto-apply just because the entry exists in the catalog.
+        Only entries with success_count > 0 (operator-confirmed learned patterns) are
+        eligible for auto-apply (AC-1).
+        """
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            common_kwargs = {
+                "task_id": "NOVEL-SECOND",
+                "signature": "novel-second-call-sig",
+                "remediation": "re-queue",
+                "advise_only_payload": "advise-payload",
+                "config": cfg,
+                "catalog_path": root,
+                "classification": "RUNTIME_DEGRADATION",
+            }
+            # First call -- records novel entry and returns advise-only.
+            result_first = apply_auto_resolve(**common_kwargs)
+            assert result_first == "advise-payload"
+            captured = capsys.readouterr()
+            assert AUTO_RESOLVE_AUDIT_STRING not in (captured.out + captured.err)
+
+            # Second call -- novel entry exists in catalog but success_count == 0.
+            # Must still return advise-only, never auto-apply.
+            result_second = apply_auto_resolve(**common_kwargs)
+            assert result_second == "advise-payload"
+            captured = capsys.readouterr()
+            assert AUTO_RESOLVE_AUDIT_STRING not in (captured.out + captured.err)
+
+
+@pytest.mark.unit
+class TestAutoResolveDestructiveNeverAutoInvariant:
+    """Destructive remediations MUST never be auto-applied even when catalog marks them learned."""
+
+    def setup_method(self) -> None:
+        """Reset the module-level apply-count dict before each test."""
+        from devbench.backlog import auto_resolve
+
+        auto_resolve._apply_counts.clear()
+
+    @pytest.mark.parametrize("destructive_verb", ["decline", "mark-done", "force-status"])
+    def test_destructive_verb_with_catalog_entry_still_advises(self, destructive_verb: str) -> None:
+        """Destructive verb is never auto-applied even when the catalog has a learned entry."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import record_outcome
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            # Manually inject a "learned" entry for the destructive verb into the catalog
+            record_outcome(
+                root,
+                classification="RUNTIME_DEGRADATION",
+                normalized_signature="destructive-sig",
+                remediation=destructive_verb,
+                outcome="applied",
+            )
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            # Even with a learned catalog entry, a destructive verb must raise
+            with pytest.raises(ValueError, match=destructive_verb):
+                apply_auto_resolve(
+                    task_id="DESTR-LEARNED",
+                    signature="destructive-sig",
+                    remediation=destructive_verb,
+                    advise_only_payload="payload",
+                    config=cfg,
+                    catalog_path=root,
+                    classification="RUNTIME_DEGRADATION",
+                )
+
+    @pytest.mark.parametrize("destructive_verb", ["decline", "mark-done", "force-status"])
+    def test_destructive_verb_guard_precedes_catalog_lookup(self, destructive_verb: str) -> None:
+        """Destructive guard fires before catalog consultation -- catalog is never consulted."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            cfg = AutoResolveConfig(enabled=True, max_attempts=5)
+            # The catalog is empty -- yet a destructive verb still raises
+            with pytest.raises(ValueError, match=destructive_verb):
+                apply_auto_resolve(
+                    task_id="DESTR-GUARD",
+                    signature="destr-guard-sig",
+                    remediation=destructive_verb,
+                    advise_only_payload="payload",
+                    config=cfg,
+                    catalog_path=root,
+                    classification="RUNTIME_DEGRADATION",
+                )
+
+    def test_destructive_guard_is_unconditional_regardless_of_config(self) -> None:
+        """Destructive guard fires even when config.enabled is False."""
+        import pathlib
+        import tempfile
+
+        from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import record_outcome
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="RUNTIME_DEGRADATION",
+                normalized_signature="destr-disabled-sig",
+                remediation="decline",
+                outcome="applied",
+            )
+            cfg = AutoResolveConfig(enabled=False, max_attempts=5)
+            with pytest.raises(ValueError, match="decline"):
+                apply_auto_resolve(
+                    task_id="DESTR-DISABLED",
+                    signature="destr-disabled-sig",
+                    remediation="decline",
+                    advise_only_payload="payload",
+                    config=cfg,
+                    catalog_path=root,
+                    classification="RUNTIME_DEGRADATION",
+                )

@@ -352,6 +352,25 @@ class TestSelfHealingLoad:
             # The bad entry is skipped, catalog loads as empty
             assert "CLS:sig" not in loaded
 
+    def test_entry_that_is_not_a_dict_is_skipped(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """An entry whose value is not a dict is silently skipped with a WARNING."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            path = catalog_path(root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # An entry whose value is a string (not a dict) must be skipped
+            payload = {
+                "schema_version": CATALOG_SCHEMA_VERSION,
+                "entries": {
+                    "CLS:sig": "this-should-be-a-dict-not-a-string",
+                },
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_catalog(root)
+            assert "CLS:sig" not in loaded
+            captured = capsys.readouterr()
+            assert "WARNING" in captured.err or "skipping" in captured.err.lower()
+
 
 @pytest.mark.unit
 class TestLookupEntry:
@@ -570,3 +589,119 @@ class TestRecordOutcome:
             assert result is not None
             assert result.success_count == 2
             assert result.failure_count == 1
+
+
+@pytest.mark.unit
+class TestNovelSignatureRecord:
+    """record_outcome supports the 'novel' outcome for unrecognized signatures."""
+
+    def test_record_novel_creates_entry(self) -> None:
+        """Recording a novel outcome creates a catalog entry for operator review."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="RUNTIME_DEGRADATION",
+                normalized_signature="novel-pattern",
+                remediation="re-queue",
+                outcome="novel",
+            )
+            result = lookup_entry(root, "RUNTIME_DEGRADATION", "novel-pattern")
+            assert result is not None
+
+    def test_record_novel_does_not_increment_success_count(self) -> None:
+        """Novel outcome does not increment success_count (not yet applied)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="novel-sig",
+                remediation="re-queue",
+                outcome="novel",
+            )
+            result = lookup_entry(root, "CLS", "novel-sig")
+            assert result is not None
+            assert result.success_count == 0
+
+    def test_record_novel_does_not_increment_failure_count(self) -> None:
+        """Novel outcome does not increment failure_count."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="novel-sig",
+                remediation="re-queue",
+                outcome="novel",
+            )
+            result = lookup_entry(root, "CLS", "novel-sig")
+            assert result is not None
+            assert result.failure_count == 0
+
+    def test_record_novel_updates_last_applied(self) -> None:
+        """Novel outcome sets last_applied to a recent UTC timestamp."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="novel-ts-sig",
+                remediation="re-queue",
+                outcome="novel",
+            )
+            result = lookup_entry(root, "CLS", "novel-ts-sig")
+            assert result is not None
+            assert result.last_applied.tzinfo is not None
+            now = datetime.now(UTC)
+            delta = now - result.last_applied
+            assert delta.total_seconds() < 60
+
+    def test_novel_is_a_valid_outcome(self) -> None:
+        """'novel' is accepted as a valid outcome and does not raise."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            # Must not raise
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="sig",
+                remediation="re-queue",
+                outcome="novel",
+            )
+
+    @pytest.mark.parametrize("outcome", ["applied", "escalated", "failed", "novel"])
+    def test_record_outcome_accepts_all_valid_outcomes(self, outcome: str) -> None:
+        """All four valid outcomes are accepted without raising."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="sig",
+                remediation="re-queue",
+                outcome=outcome,
+            )
+
+    def test_novel_entry_is_overwritten_by_subsequent_applied(self) -> None:
+        """A novel entry followed by an apply still records the final state correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="sig",
+                remediation="re-queue",
+                outcome="novel",
+            )
+            record_outcome(
+                root,
+                classification="CLS",
+                normalized_signature="sig",
+                remediation="re-queue",
+                outcome="applied",
+            )
+            result = lookup_entry(root, "CLS", "sig")
+            assert result is not None
+            assert result.success_count == 1
+            assert result.failure_count == 0

@@ -370,6 +370,124 @@ Do NOT silently exit when `max_iterations` is reached -- emitting a `[BLOCKED]` 
 
 ---
 
+## Step 7b -- Coverage audit: name-coverage pre-pass and five-dimension fan-out
+
+Run the coverage audit immediately after Step 7 confirms the first green
+``validate-backlog``. The audit has three sub-steps.
+
+### 7b-1 -- Name-coverage pre-pass
+
+Run the deterministic pre-pass that greps every named
+work-item/module/unit/workflow/app/config element from the spec against
+all task manifest files (spec Section 4 E12-F3-S1 AC-1):
+
+```python
+from devbench.plugin_helpers.name_coverage import run_name_coverage_pre_pass
+from pathlib import Path
+
+spec_text = open("<spec-path>").read()
+results = run_name_coverage_pre_pass(
+    spec_text=spec_text,
+    manifest_dir=Path("backlog"),
+)
+uncovered = [r for r in results if not r.is_covered]
+```
+
+Each ``CoverageResult`` in ``uncovered`` seeds the five-dimension audit
+in 7b-2. Elements whose ``covering_task_id`` is ``None`` are guaranteed
+to enter the gap-report pipeline; elements with a task-id are recorded
+as covered and excluded from the report.
+
+### 7b-2 -- Five-dimension coverage fan-out
+
+For each named element (covered or not), run the five spec-derived
+auditors. Each dimension produces zero or more ``GapReport`` records
+(spec Section 4 E12-F3-S1 AC-2):
+
+1. **Per-work-item contract**: for every enumerated component or
+   deliverable, verify that at least one task's ``## Acceptance Criteria``
+   declares the named element's interface, behaviour, and tests. A gap
+   here means the task cites the element but does not exercise it.
+   Severity: ``high``.
+
+2. **Per-FR**: for every spec ``FR-N`` line, verify that at least one
+   task's ``## Acceptance Criteria`` or ``## Approach`` explicitly
+   references the FR identifier. A gap here means no task covers the
+   functional requirement. Severity: ``high``.
+
+3. **Per-AC substance**: for every spec AC-N identifier, verify that
+   the citing task exercises the AC (runs code or checks behaviour),
+   not merely tags it. A cite-without-substance gap means the task
+   lists the AC in its criteria but its ``## Approach`` does not
+   implement the AC's stated check. Severity: ``medium``.
+
+4. **Per-decision/constraint to work-item**: for every architectural
+   decision or constraint in the spec, verify that a task's Manifest
+   or Approach references the affected work item. A gap here means a
+   decision has no implementing task. Severity: ``medium``.
+
+5. **Cross-cutting / non-artifact requirements**: for every requirement
+   that does not map to a concrete deliverable file (e.g., performance
+   targets, security posture, observability hooks), verify that at
+   least one task's Acceptance Criteria or Definition of Done
+   addresses it. A gap here means the requirement is orphaned. Severity:
+   ``low``.
+
+For each gap identified, emit one ``GapReport`` with shape:
+
+```
+{
+  severity: "high" | "medium" | "low",
+  spec_requirement_quote: <verbatim spec line>,
+  covering_task_id: <task-id> | None,
+  what_is_missing: <human-readable description>,
+  fix: "NEW TASK" | "ENHANCE <task-id>",
+}
+```
+
+### 7b-3 -- Per-gap independent verification
+
+Before forwarding any gap to Step 7b output, independently verify each
+``GapReport`` using ``verify_gap`` (spec Section 4 E12-F3-S1 AC-3):
+
+```python
+from devbench.plugin_helpers.name_coverage import verify_gap, SpecElement
+
+verified_gaps = []
+for gap in candidate_gaps:
+    elem = SpecElement(name=gap_element_name, category=gap_element_category)
+    is_genuine = verify_gap(gap=gap, element=elem, manifest_dir=Path("backlog"))
+    if is_genuine:
+        verified_gaps.append(gap)
+    # Gaps that fail verification are silently dropped as false positives.
+```
+
+A gap that the verifier cannot confirm (``verify_gap`` returns ``False``)
+is dropped as a false positive and never forwarded to gap-fill. Only
+``verified_gaps`` proceeds.
+
+Emit one audit row per verified gap:
+
+```
+[COVERAGE_GAP] severity=<high|medium|low> element=<name> dimension=<1-5>
+  spec: <spec_requirement_quote>
+  task: <covering_task_id or NONE>
+  missing: <what_is_missing>
+  fix: <NEW TASK | ENHANCE <id>>
+```
+
+When the verified gap list is empty, emit:
+
+```
+[COVERAGE_AUDIT] PASS -- 0 verified gaps across all five dimensions
+```
+
+The gap list (E12-F3-S2's input) is the output of this step. E12-F3-S2
+consumes the ``[COVERAGE_GAP]`` audit rows to fill the gaps; this story
+only produces the verified gap list.
+
+---
+
 ## Step 8 -- Emit the quality-reference audit comment and success message
 
 After all three exit conditions pass, emit a provenance audit comment naming the exemplar consulted in Step 1a. When `skills.exemplar_backlog_path` was set, emit the resolved path; when it was absent, emit the literal token `<embedded-canonical-sections>` so the audit trail records that no external exemplar was consulted:

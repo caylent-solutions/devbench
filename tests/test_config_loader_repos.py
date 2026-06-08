@@ -348,7 +348,9 @@ class TestAtMostOneLocalOnly:
 class TestEnsureBranchLocalOnly:
     """ensure_branch must not call git fetch origin for a local_only repo."""
 
-    def test_ensure_branch_skips_fetch_origin_for_local_only(self, tmp_path: Path) -> None:
+    def test_ensure_branch_skips_fetch_origin_for_local_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Per-repo local_only: True causes ensure_branch to skip git fetch origin
         even when git_ops.local_only is False (proving per-repo precedence over
         the top-level fallback via _effective_local_only)."""
@@ -384,14 +386,15 @@ class TestEnsureBranchLocalOnly:
         ):
             ops = GitOpsService.__new__(GitOpsService)
             ops.logger = MagicMock()
-            ops._git = MagicMock(return_value=(0, "main\n", ""))
-            ops._get_default_branch = MagicMock(return_value="main")
+            git_mock = MagicMock(return_value=(0, "main\n", ""))
+            monkeypatch.setattr(ops, "_git", git_mock)
+            monkeypatch.setattr(ops, "_get_default_branch", MagicMock(return_value="main"))
 
             # Should complete without raising the AssertionError above.
             ops.ensure_branch("workspace-local", repo_path, "feat/work")
 
         # After ensure_branch: _git was called but not with git fetch origin.
-        for call in ops._git.call_args_list:
+        for call in git_mock.call_args_list:
             args = call[0][0] if call[0] else []
             assert args[:2] != ["fetch", "origin"], f"Unexpected fetch origin call: {call}"
 

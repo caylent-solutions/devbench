@@ -65,6 +65,27 @@ def _make_clean_sdk(messages: list[object]) -> types.ModuleType:
             yield msg
 
     sdk_any.query = _clean_query
+
+    class _ClaudeSDKClient:
+        """Cleanly-closing fake streaming client matching cmd_start usage."""
+
+        def __init__(self, options: object = None) -> None:
+            self._options = options
+
+        async def __aenter__(self) -> _ClaudeSDKClient:
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+        async def query(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def receive_response(self) -> Any:
+            for msg in messages:
+                yield msg
+
+    sdk_any.ClaudeSDKClient = _ClaudeSDKClient
     return fake_sdk
 
 

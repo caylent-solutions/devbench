@@ -86,21 +86,56 @@ print(d.get('tool_input', {}).get('content', ''))
   if [[ -n "$CONTENT" ]] && [[ -n "${DEVBENCH_WORKSPACE_ROOT:-}" ]]; then
     YAML_PATH="${DEVBENCH_WORKSPACE_ROOT}/backlog/config/devbench.yaml"
     if [[ -f "$YAML_PATH" ]]; then
+      # Extract checkout_directory values using only the Python stdlib. PyYAML is
+      # an optional dependency that is present in devbench-app's uv venv but NOT
+      # in the system /usr/bin/python3 this hook resolves to (see PATH note above
+      # and in tests). Importing yaml here would hard-crash the guard (exit 1,
+      # ModuleNotFoundError) and bypass rule 11. The devbench.yaml `repos:` block
+      # is a fixed shape (top-level `repos:` map; each repo a 2-space-indented
+      # mapping key; `checkout_directory:` a deeper-indented scalar), so a
+      # targeted stdlib scan is robust and removes the optional-import dependency.
       CHECKOUT_DIRS=$(python3 - "$YAML_PATH" <<'PYEOF'
-import sys, yaml
-try:
-    with open(sys.argv[1]) as f:
-        cfg = yaml.safe_load(f) or {}
-    repos = cfg.get('repos') or {}
-    dirs = []
-    for repo_data in repos.values():
-        if isinstance(repo_data, dict):
-            cd = repo_data.get('checkout_directory')
-            if cd:
-                dirs.append(cd)
-    print('\n'.join(dirs))
-except Exception:
-    pass
+import sys
+
+# Fail-fast: a missing/unreadable config is a real error, not a silent skip.
+with open(sys.argv[1], encoding="utf-8") as f:
+    lines = f.readlines()
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def strip_comment(value):
+    # Drop a trailing inline comment. devbench.yaml values are plain scalars
+    # (no quoted '#'), so splitting on an unquoted '#' is sufficient here.
+    return value.split("#", 1)[0].strip()
+
+
+dirs = []
+in_repos = False
+repos_indent = None
+for raw in lines:
+    line = raw.rstrip("\n")
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    cur_indent = indent_of(line)
+    if not in_repos:
+        if cur_indent == 0 and stripped.rstrip() == "repos:":
+            in_repos = True
+            repos_indent = 0
+        continue
+    # Inside the repos: block. A new top-level key (indent <= repos_indent)
+    # ends the block.
+    if cur_indent <= repos_indent:
+        break
+    key = stripped.split(":", 1)[0].strip()
+    if key == "checkout_directory" and ":" in stripped:
+        value = strip_comment(stripped.split(":", 1)[1])
+        if value:
+            dirs.append(value)
+print("\n".join(dirs))
 PYEOF
       )
       for CHECKOUT_DIR in $CHECKOUT_DIRS; do

@@ -1061,24 +1061,31 @@ class TestAutoResolveCatalogConsult:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            common_kwargs = {
-                "task_id": "NOVEL-SECOND",
-                "signature": "novel-second-call-sig",
-                "remediation": "re-queue",
-                "advise_only_payload": "advise-payload",
-                "config": cfg,
-                "catalog_path": root,
-                "classification": "RUNTIME_DEGRADATION",
-            }
             # First call -- records novel entry and returns advise-only.
-            result_first = apply_auto_resolve(**common_kwargs)
+            result_first = apply_auto_resolve(
+                task_id="NOVEL-SECOND",
+                signature="novel-second-call-sig",
+                remediation="re-queue",
+                advise_only_payload="advise-payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
             assert result_first == "advise-payload"
             captured = capsys.readouterr()
             assert AUTO_RESOLVE_AUDIT_STRING not in (captured.out + captured.err)
 
             # Second call -- novel entry exists in catalog but success_count == 0.
             # Must still return advise-only, never auto-apply.
-            result_second = apply_auto_resolve(**common_kwargs)
+            result_second = apply_auto_resolve(
+                task_id="NOVEL-SECOND",
+                signature="novel-second-call-sig",
+                remediation="re-queue",
+                advise_only_payload="advise-payload",
+                config=cfg,
+                catalog_path=root,
+                classification="RUNTIME_DEGRADATION",
+            )
             assert result_second == "advise-payload"
             captured = capsys.readouterr()
             assert AUTO_RESOLVE_AUDIT_STRING not in (captured.out + captured.err)

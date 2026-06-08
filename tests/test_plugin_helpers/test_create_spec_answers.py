@@ -125,11 +125,10 @@ class TestLoadAnswersFile:
 class TestValidateAnswers:
     """validate_answers checks that all required blocks are present."""
 
-    def test_valid_answers_returns_none(self) -> None:
+    def test_valid_answers_does_not_raise(self) -> None:
         data = _minimal_answers()
-        # No exception -- returns None
-        result = validate_answers(data)
-        assert result is None
+        # No exception is raised for valid answers.
+        validate_answers(data)
 
     @pytest.mark.parametrize("missing_block", ["A", "B", "C", "D", "E", "F", "G"])
     def test_missing_block_raises_missing_block_error(self, missing_block: str) -> None:
@@ -152,15 +151,15 @@ class TestValidateAnswers:
         """Unknown keys beyond A-G do not raise."""
         data = _minimal_answers()
         data["Z"] = "extra block"
-        result = validate_answers(data)
-        assert result is None
+        # No exception is raised when extra keys are present.
+        validate_answers(data)
 
     def test_empty_string_value_is_valid(self) -> None:
         """Empty string answers are structurally valid (not a missing block)."""
         data = _minimal_answers()
         data["A"] = ""
-        result = validate_answers(data)
-        assert result is None
+        # An empty string answer is structurally valid and does not raise.
+        validate_answers(data)
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +174,8 @@ class TestRoundTrip:
     def test_valid_file_passes_full_round_trip(self, tmp_path: Path) -> None:
         answers_path = _write_answers(tmp_path / "answers.yaml", _minimal_answers())
         data = load_answers_file(answers_path)
-        result = validate_answers(data)
-        assert result is None
+        # The full round-trip of a valid file does not raise.
+        validate_answers(data)
 
     def test_missing_block_in_file_fails_round_trip(self, tmp_path: Path) -> None:
         partial = _minimal_answers()

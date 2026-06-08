@@ -249,7 +249,7 @@ class TestAppendDecision:
         tmp_existed_during_write: list[bool] = []
         original_replace = Path.replace
 
-        def spy_replace(self: Path, target: Path) -> None:  # type: ignore[override]
+        def spy_replace(self: Path, target: Path) -> Path:
             # Check that the .tmp file exists at the moment of replace.
             tmp_existed_during_write.append(tmp_path_for_ledger.exists())
             return original_replace(self, target)
@@ -273,11 +273,11 @@ class TestAppendDecision:
         # Simulate a write failure by raising OSError during the tmp write_text call.
         original_write_text = Path.write_text
 
-        def failing_write_text(self: Path, data: str, **kwargs: object) -> None:  # type: ignore[override]
+        def failing_write_text(self: Path, data: str, **kwargs: str | None) -> int:
             # Fail only when writing to the .tmp file (the atomic write path).
             if str(self).endswith(".tmp"):
                 raise OSError("Simulated disk error")
-            return original_write_text(self, data, **kwargs)  # type: ignore[arg-type]
+            return original_write_text(self, data, **kwargs)
 
         d2 = DecisionEntry(index=0, contradiction="c2", resolution="r2", rationale="rat2")
         with patch.object(Path, "write_text", failing_write_text):

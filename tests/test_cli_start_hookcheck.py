@@ -31,22 +31,62 @@ _VERBATIM_ERROR: str = (
 def _make_mock_sdk(messages: list[object]) -> types.ModuleType:
     """Return a minimal fake claude_agent_sdk module.
 
+    The fake exposes the surface ``cmd_start._run`` depends on: a
+    ``ClaudeAgentOptions`` placeholder, a module-level ``query`` async
+    generator (retained for any direct reference), and a ``ClaudeSDKClient``
+    streaming client.  ``ClaudeSDKClient`` is an async context manager whose
+    ``receive_response()`` async-yields the test's fake messages and whose
+    ``query()`` is a no-op, matching how ``_run`` drives the live SDK::
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                ...
+
     Args:
-        messages: Sequence of objects the mock ``query`` async generator yields.
+        messages: Sequence of objects the fake ``receive_response`` async
+            generator yields on each call.
 
     Returns:
-        A module-like object with ``ClaudeAgentOptions`` and ``query``
-        attributes suitable for injection via ``sys.modules``.
+        A module-like object with ``ClaudeAgentOptions``, ``query``, and
+        ``ClaudeSDKClient`` attributes suitable for injection via
+        ``sys.modules``.
     """
     mock_sdk: types.ModuleType = types.ModuleType("claude_agent_sdk")
     sdk_any: Any = mock_sdk
     sdk_any.ClaudeAgentOptions = MagicMock()
 
-    async def mock_query(**kwargs: object) -> object:
+    async def mock_query(**kwargs: object) -> Any:
         for msg in messages:
             yield msg
 
     sdk_any.query = mock_query
+
+    class FakeClaudeSDKClient:
+        """Async-context-manager double for ``claude_agent_sdk.ClaudeSDKClient``.
+
+        Yields the captured *messages* from ``receive_response`` and treats
+        ``query`` as a no-op so the orchestrate loop in ``cmd_start`` can be
+        driven to completion under test.
+        """
+
+        def __init__(self, options: object | None = None) -> None:
+            self.options = options
+
+        async def __aenter__(self) -> FakeClaudeSDKClient:
+            return self
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            return False
+
+        async def query(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def receive_response(self) -> Any:
+            for msg in messages:
+                yield msg
+
+    sdk_any.ClaudeSDKClient = FakeClaudeSDKClient
     return mock_sdk
 
 

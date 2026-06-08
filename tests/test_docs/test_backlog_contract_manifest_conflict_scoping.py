@@ -30,9 +30,7 @@ def _get_manifest_conflict_section(text: str) -> str:
     Raises AssertionError if the section is not found.
     """
     start = text.find("## Manifest Conflict Rule")
-    assert start != -1, (
-        "docs/backlog-contract.md must contain a '## Manifest Conflict Rule' section."
-    )
+    assert start != -1, "docs/backlog-contract.md must contain a '## Manifest Conflict Rule' section."
     next_section = text.find("\n## ", start + 1)
     if next_section == -1:
         return text[start:]
@@ -113,8 +111,7 @@ class TestManifestConflictRuleStatusScoping:
         text = BACKLOG_CONTRACT_DOC.read_text(encoding="utf-8")
         manifest_section = _get_manifest_conflict_section(text)
         assert "--strict" in manifest_section, (
-            "Manifest Conflict Rule section must document the '--strict' flag "
-            "for the authoring-time check verbatim."
+            "Manifest Conflict Rule section must document the '--strict' flag for the authoring-time check verbatim."
         )
 
     def test_include_draft_alias_documented(self) -> None:
@@ -141,8 +138,7 @@ class TestManifestConflictRuleStatusScoping:
         section = _get_manifest_conflict_section(text)
         em_dash = "\u2014"
         assert em_dash not in section, (
-            "No em-dash (U+2014) is allowed in docs/backlog-contract.md -- "
-            "use '--' (double hyphen) instead."
+            "No em-dash (U+2014) is allowed in docs/backlog-contract.md -- use '--' (double hyphen) instead."
         )
 
 
@@ -151,15 +147,11 @@ class TestChangelogIssue267Entry:
     """AC-1: CHANGELOG.md has an [Unreleased] entry referencing issue #267."""
 
     def test_changelog_exists(self) -> None:
-        assert CHANGELOG_DOC.is_file(), (
-            "CHANGELOG.md must exist at the repo root."
-        )
+        assert CHANGELOG_DOC.is_file(), "CHANGELOG.md must exist at the repo root."
 
     def test_changelog_has_unreleased_section(self) -> None:
         text = CHANGELOG_DOC.read_text(encoding="utf-8")
-        assert "[Unreleased]" in text, (
-            "CHANGELOG.md must have an [Unreleased] section for in-flight changes."
-        )
+        assert "[Unreleased]" in text, "CHANGELOG.md must have an [Unreleased] section for in-flight changes."
 
     def test_changelog_unreleased_references_issue_267(self) -> None:
         """The [Unreleased] section must reference issue #267."""
@@ -175,9 +167,8 @@ class TestChangelogIssue267Entry:
         text = CHANGELOG_DOC.read_text(encoding="utf-8")
         unreleased_section = _get_unreleased_section(text)
         has_draft_hold = (
-            ("draft" in unreleased_section and "hold" in unreleased_section)
-            or "draft/hold" in unreleased_section
-        )
+            "draft" in unreleased_section and "hold" in unreleased_section
+        ) or "draft/hold" in unreleased_section
         assert has_draft_hold, (
             "CHANGELOG.md [Unreleased] section must mention draft/hold manifest conflict "
             "detection to describe what issue #267 delivered."
@@ -197,21 +188,15 @@ class TestChangelogIssue267Entry:
         text = CHANGELOG_DOC.read_text(encoding="utf-8")
         # Find the bullet point that mentions #267 and verify it has no em-dash.
         entry_start = text.find("#267")
-        assert entry_start != -1, (
-            "CHANGELOG.md must contain a reference to issue #267."
-        )
+        assert entry_start != -1, "CHANGELOG.md must contain a reference to issue #267."
         # Scope to the bullet (find start of bullet line, end at next bullet or blank+bullet).
         # Walk back to the start of the bullet line.
         line_start = text.rfind("\n", 0, entry_start) + 1
         # Walk forward to the end of the bullet block (next line starting with '-' or '##').
         after = text[entry_start:]
         next_bullet = re.search(r"\n(-|\s*##)", after)
-        if next_bullet:
-            entry_text = text[line_start : entry_start + next_bullet.start()]
-        else:
-            entry_text = text[line_start:]
+        entry_text = text[line_start : entry_start + next_bullet.start()] if next_bullet else text[line_start:]
         em_dash = "\u2014"
         assert em_dash not in entry_text, (
-            "No em-dash (U+2014) is allowed in the issue #267 CHANGELOG entry -- "
-            "use '--' (double hyphen) instead."
+            "No em-dash (U+2014) is allowed in the issue #267 CHANGELOG entry -- use '--' (double hyphen) instead."
         )

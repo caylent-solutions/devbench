@@ -21,14 +21,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 
-SKILL_PATH = (
-    REPO_ROOT
-    / "plugin-authoring"
-    / "devbench-authoring"
-    / "skills"
-    / "create-spec"
-    / "SKILL.md"
-)
+SKILL_PATH = REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / "create-spec" / "SKILL.md"
 
 SHARED_DOC_RELATIVE_LINK = "docs/workflow-authoring-patterns.md"
 
@@ -55,16 +48,14 @@ class TestAdversarialPhaseExists:
 
     def test_skill_file_exists(self) -> None:
         """The create-spec SKILL.md must exist."""
-        assert SKILL_PATH.exists(), (
-            f"create-spec SKILL.md not found at {SKILL_PATH}."
-        )
+        assert SKILL_PATH.exists(), f"create-spec SKILL.md not found at {SKILL_PATH}."
 
     def test_adversarial_phase_mentioned(self) -> None:
         """The SKILL.md must describe an adversarial review phase."""
         content = SKILL_PATH.read_text()
         assert "adversarial" in content.lower(), (
-            f"create-spec SKILL.md does not mention an adversarial review phase. "
-            f"Add the adversarial review phase section (E12-F2-S1)."
+            "create-spec SKILL.md does not mention an adversarial review phase. "
+            "Add the adversarial review phase section (E12-F2-S1)."
         )
 
 
@@ -78,17 +69,17 @@ class TestAdversarialPhaseGating:
         content = SKILL_PATH.read_text()
         # Must reference workflow tool availability as a gate condition.
         assert "adversarial_review_threshold" in content, (
-            f"create-spec SKILL.md does not gate the adversarial phase on "
-            f"'skills.adversarial_review_threshold'. "
-            f"Add the threshold gate (spec Section 0 row 0.2)."
+            "create-spec SKILL.md does not gate the adversarial phase on "
+            "'skills.adversarial_review_threshold'. "
+            "Add the threshold gate (spec Section 0 row 0.2)."
         )
 
     def test_gated_on_adversarial_review_threshold(self) -> None:
         """The phase must reference skills.adversarial_review_threshold."""
         content = SKILL_PATH.read_text()
         assert "adversarial_review_threshold" in content, (
-            f"'adversarial_review_threshold' not found in create-spec SKILL.md. "
-            f"The phase must be gated on this config key."
+            "'adversarial_review_threshold' not found in create-spec SKILL.md. "
+            "The phase must be gated on this config key."
         )
 
     def test_workflow_absent_fallback_preserved(self) -> None:
@@ -97,9 +88,9 @@ class TestAdversarialPhaseGating:
         # The SKILL.md must explicitly preserve the Step-4 fallback path.
         lower = content.lower()
         assert "step 4" in lower or "step-4" in lower, (
-            f"create-spec SKILL.md does not reference the Step-4 fallback path. "
-            f"The single-agent self-critique must run unchanged when Workflow is absent "
-            f"(spec Section 0 row 0.2)."
+            "create-spec SKILL.md does not reference the Step-4 fallback path. "
+            "The single-agent self-critique must run unchanged when Workflow is absent "
+            "(spec Section 0 row 0.2)."
         )
 
     def test_fallback_when_workflow_absent_is_explicit(self) -> None:
@@ -115,9 +106,9 @@ class TestAdversarialPhaseGating:
             or "if workflow" in lower
         )
         assert has_absent_clause, (
-            f"create-spec SKILL.md does not explicitly state the fallback behavior "
-            f"when the Workflow tool is absent. Add an explicit conditional clause "
-            f"(spec Section 0 row 0.2, AC-4)."
+            "create-spec SKILL.md does not explicitly state the fallback behavior "
+            "when the Workflow tool is absent. Add an explicit conditional clause "
+            "(spec Section 0 row 0.2, AC-4)."
         )
 
 
@@ -148,9 +139,9 @@ class TestFiveGenericDimensions:
             or "derived from spec" in lower
         )
         assert has_spec_content_clause, (
-            f"create-spec SKILL.md does not state that finer-grained checks are "
-            f"derived from the spec content. "
-            f"The application-agnostic rule must be explicit (spec Section 12, AC-1)."
+            "create-spec SKILL.md does not state that finer-grained checks are "
+            "derived from the spec content. "
+            "The application-agnostic rule must be explicit (spec Section 12, AC-1)."
         )
 
     def test_no_domain_taxonomy(self) -> None:
@@ -161,8 +152,8 @@ class TestFiveGenericDimensions:
         # The spec explicitly forbids a domain taxonomy -- finer checks must
         # come from the spec's own content.
         assert "domain taxonomy" not in lower, (
-            f"create-spec SKILL.md mentions a 'domain taxonomy', which is forbidden. "
-            f"Finer checks must be derived from the spec content (spec Section 12)."
+            "create-spec SKILL.md mentions a 'domain taxonomy', which is forbidden. "
+            "Finer checks must be derived from the spec content (spec Section 12)."
         )
 
 
@@ -188,17 +179,15 @@ class TestSkepticVerification:
         content = SKILL_PATH.read_text()
         lower = content.lower()
         has_default_reject = (
-            "default" in lower and "reject" in lower
-        ) or (
-            "unverifiable" in lower and "rejected" in lower
-        ) or (
-            "cannot be verified" in lower
+            ("default" in lower and "reject" in lower)
+            or ("unverifiable" in lower and "rejected" in lower)
+            or ("cannot be verified" in lower)
         )
         assert has_default_reject, (
-            f"create-spec SKILL.md does not state the default-reject rule for "
-            f"unverifiable findings. Add an explicit statement that findings "
-            f"which cannot be verified default to rejected "
-            f"(spec Section 4 E12-F2-S1 AC-2)."
+            "create-spec SKILL.md does not state the default-reject rule for "
+            "unverifiable findings. Add an explicit statement that findings "
+            "which cannot be verified default to rejected "
+            "(spec Section 4 E12-F2-S1 AC-2)."
         )
 
     def test_skeptic_agent_per_finding(self) -> None:
@@ -207,16 +196,13 @@ class TestSkepticVerification:
         content = SKILL_PATH.read_text()
         lower = content.lower()
         has_per_finding = (
-            "per-finding" in lower
-            or "per finding" in lower
-            or "each finding" in lower
-            or "independently" in lower
+            "per-finding" in lower or "per finding" in lower or "each finding" in lower or "independently" in lower
         )
         assert has_per_finding, (
-            f"create-spec SKILL.md does not describe per-finding independent "
-            f"skeptic re-verification. "
-            f"Each finding must be re-checked independently before action "
-            f"(spec Section 4 E12-F2-S1 AC-2)."
+            "create-spec SKILL.md does not describe per-finding independent "
+            "skeptic re-verification. "
+            "Each finding must be re-checked independently before action "
+            "(spec Section 4 E12-F2-S1 AC-2)."
         )
 
 
@@ -229,14 +215,11 @@ class TestCitationDimension:
         """The citation/standards verification dimension must be named."""
         content = SKILL_PATH.read_text()
         lower = content.lower()
-        has_citation_dim = (
-            "citation" in lower
-            or "citation/standards" in lower
-        )
+        has_citation_dim = "citation" in lower or "citation/standards" in lower
         assert has_citation_dim, (
-            f"The citation dimension is not named in create-spec SKILL.md. "
-            f"The adversarial phase must include a citation/standards verification "
-            f"dimension (spec Section 4 E12-F2-S1 AC-3)."
+            "The citation dimension is not named in create-spec SKILL.md. "
+            "The adversarial phase must include a citation/standards verification "
+            "dimension (spec Section 4 E12-F2-S1 AC-3)."
         )
 
     def test_citation_checks_external_references(self) -> None:
@@ -245,16 +228,11 @@ class TestCitationDimension:
         content = SKILL_PATH.read_text()
         lower = content.lower()
         # Must reference external items being checked (modules, flags, versions).
-        has_external_check = (
-            "external" in lower
-            or "module" in lower
-            or "version" in lower
-            or "named source" in lower
-        )
+        has_external_check = "external" in lower or "module" in lower or "version" in lower or "named source" in lower
         assert has_external_check, (
-            f"create-spec SKILL.md does not describe the citation dimension as "
-            f"checking external modules/flags/versions against their named sources "
-            f"(spec Section 4 E12-F2-S1 AC-3)."
+            "create-spec SKILL.md does not describe the citation dimension as "
+            "checking external modules/flags/versions against their named sources "
+            "(spec Section 4 E12-F2-S1 AC-3)."
         )
 
     def test_citation_flags_unverifiable_references(self) -> None:
@@ -262,15 +240,11 @@ class TestCitationDimension:
         verified."""
         content = SKILL_PATH.read_text()
         lower = content.lower()
-        has_flag_clause = (
-            "flag" in lower
-            or "cannot be verified" in lower
-            or "not verifiable" in lower
-        )
+        has_flag_clause = "flag" in lower or "cannot be verified" in lower or "not verifiable" in lower
         assert has_flag_clause, (
-            f"create-spec SKILL.md does not state that the citation dimension "
-            f"flags unverifiable references. Add an explicit clause for this "
-            f"(spec Section 4 E12-F2-S1 AC-3)."
+            "create-spec SKILL.md does not state that the citation dimension "
+            "flags unverifiable references. Add an explicit clause for this "
+            "(spec Section 4 E12-F2-S1 AC-3)."
         )
 
 
@@ -295,7 +269,4 @@ class TestNoEmDash:
     def test_no_em_dash(self) -> None:
         """create-spec SKILL.md must not contain em-dash (U+2014)."""
         content = SKILL_PATH.read_text()
-        assert "\u2014" not in content, (
-            f"Em-dash (U+2014) found in {SKILL_PATH}. "
-            f"Use '--' (double hyphen) instead."
-        )
+        assert "\u2014" not in content, f"Em-dash (U+2014) found in {SKILL_PATH}. Use '--' (double hyphen) instead."

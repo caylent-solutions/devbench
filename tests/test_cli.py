@@ -2528,10 +2528,10 @@ class TestCmdValidateBacklogPathResolution:
         assert result == 0
 
     def test_validate_called_with_workspace_root_not_backlog_root(self, tmp_path: Path) -> None:
-        """validate() must receive backlog_index.parent (workspace root), not BACKLOG_ROOT."""
+        """validate_with_warnings() must receive backlog_index.parent (workspace root), not BACKLOG_ROOT."""
         idx, backlog_dir = self._make_layout(tmp_path)
         mock_mgr = MagicMock()
-        mock_mgr.validate.return_value = []
+        mock_mgr.validate_with_warnings.return_value = ([], [])
 
         with (
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
@@ -2541,9 +2541,9 @@ class TestCmdValidateBacklogPathResolution:
             cli.cmd_validate_backlog()
 
         # Second arg must be workspace root (idx.parent), not BACKLOG_ROOT (backlog_dir)
-        _, call_kwargs = mock_mgr.validate.call_args
-        positional = mock_mgr.validate.call_args.args
-        workspace_root_arg = positional[1] if len(positional) > 1 else call_kwargs.get("backlog_root")
+        _, call_kwargs = mock_mgr.validate_with_warnings.call_args
+        positional = mock_mgr.validate_with_warnings.call_args.args
+        workspace_root_arg = positional[1] if len(positional) > 1 else call_kwargs.get("workspace_root")
         assert workspace_root_arg == idx.parent
         assert workspace_root_arg != backlog_dir
 
@@ -2553,7 +2553,7 @@ class TestCmdValidateBacklog:
 
     def test_returns_0_when_backlog_is_valid(self, tmp_path: Path) -> None:
         mock_mgr = MagicMock()
-        mock_mgr.validate.return_value = []
+        mock_mgr.validate_with_warnings.return_value = ([], [])
 
         with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
             with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -2564,7 +2564,10 @@ class TestCmdValidateBacklog:
 
     def test_returns_1_and_prints_errors_when_invalid(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         mock_mgr = MagicMock()
-        mock_mgr.validate.return_value = ["E0-T1: work unit file missing", "E0-T2: status mismatch"]
+        mock_mgr.validate_with_warnings.return_value = (
+            ["E0-T1: work unit file missing", "E0-T2: status mismatch"],
+            [],
+        )
 
         with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
             with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):

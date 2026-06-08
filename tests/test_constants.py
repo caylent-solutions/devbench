@@ -836,3 +836,148 @@ class TestSkillsWorkflowConstants:
 
         assert isinstance(DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD, int)
         assert DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD >= 1
+
+
+# ---------------------------------------------------------------------------
+# CANONICAL_VERDICT_RE constant -- E8-F2-S1-T2
+# ---------------------------------------------------------------------------
+
+# Timestamp used in all regex fixture lines (matches the canonical format).
+_CVR_TS = "2026-06-07 17:43 UTC"
+
+# The five required judge names mirror ALL_REQUIRED_JUDGE_NAMES values.
+_CVR_JUDGES = ["code_review", "test_review", "doc_review", "changes_manifest", "security_review"]
+
+# Verdict action tokens to test positive matches.
+_CVR_ACTIONS = ["REVIEW_PASS", "REVIEW_FAIL", "REVIEW_REJECTED"]
+
+
+def _cvr_line(judge: str, action: str, *, ts: str = _CVR_TS) -> str:
+    """Return a canonical verdict audit line for *judge* and *action*."""
+    return f"[{ts}] [judge/{judge}] [{action}] Some feedback body.\n"
+
+
+@pytest.mark.unit
+class TestCanonicalVerdictRe:
+    """E8-F2-S1-T2: CANONICAL_VERDICT_RE is a public compiled Pattern in devbench.constants.
+
+    AC-CVR-1: exported as a compiled re.Pattern.
+    AC-CVR-2: positive-matches all five required judges across three verdict tokens.
+    AC-CVR-3: negative-matches agent lines, orchestrator lines, mid-line occurrences,
+               and lines missing the timestamp bracket.
+    """
+
+    # ------------------------------------------------------------------
+    # AC-CVR-1: exported type check
+    # ------------------------------------------------------------------
+
+    def test_canonical_verdict_re_is_importable(self) -> None:
+        """CANONICAL_VERDICT_RE is importable from devbench.constants without error."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "CANONICAL_VERDICT_RE"), (
+            "CANONICAL_VERDICT_RE must be exported from devbench.constants (AC-CVR-1)"
+        )
+
+    def test_canonical_verdict_re_is_compiled_pattern(self) -> None:
+        """CANONICAL_VERDICT_RE is a compiled re.Pattern instance (AC-CVR-1)."""
+        import re
+
+        from devbench.constants import CANONICAL_VERDICT_RE
+
+        assert isinstance(CANONICAL_VERDICT_RE, re.Pattern), (
+            f"CANONICAL_VERDICT_RE expected re.Pattern; got {type(CANONICAL_VERDICT_RE).__name__!r} (AC-CVR-1)"
+        )
+
+    def test_canonical_verdict_re_pattern_is_str_type(self) -> None:
+        """CANONICAL_VERDICT_RE is a Pattern[str], not Pattern[bytes] (AC-CVR-1)."""
+        from devbench.constants import CANONICAL_VERDICT_RE
+
+        # A compiled str-pattern has no bytes flag; matching a str succeeds.
+        m = CANONICAL_VERDICT_RE.match(_cvr_line("code_review", "REVIEW_PASS"))
+        assert m is not None, "CANONICAL_VERDICT_RE must be a str pattern (AC-CVR-1)"
+
+    # ------------------------------------------------------------------
+    # AC-CVR-2: positive matches -- all five judges x three verdict tokens
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("judge", _CVR_JUDGES)
+    @pytest.mark.parametrize("action", _CVR_ACTIONS)
+    def test_canonical_verdict_re_matches_all_judges_and_actions(self, judge: str, action: str) -> None:
+        """CANONICAL_VERDICT_RE matches a canonical line for every judge/action combo (AC-CVR-2)."""
+        from devbench.constants import CANONICAL_VERDICT_RE
+
+        line = _cvr_line(judge, action)
+        m = CANONICAL_VERDICT_RE.match(line)
+        assert m is not None, (
+            f"CANONICAL_VERDICT_RE must match canonical line for judge={judge!r}, "
+            f"action={action!r}; line={line!r} (AC-CVR-2)"
+        )
+
+    @pytest.mark.parametrize("judge", _CVR_JUDGES)
+    def test_canonical_verdict_re_captures_judge_group(self, judge: str) -> None:
+        """CANONICAL_VERDICT_RE captures the judge name in the 'judge' named group (AC-CVR-2)."""
+        from devbench.constants import CANONICAL_VERDICT_RE
+
+        line = _cvr_line(judge, "REVIEW_PASS")
+        m = CANONICAL_VERDICT_RE.match(line)
+        assert m is not None
+        assert m.group("judge") == judge, (
+            f"Expected 'judge' group to equal {judge!r}; got {m.group('judge')!r} (AC-CVR-2)"
+        )
+
+    @pytest.mark.parametrize("action", _CVR_ACTIONS)
+    def test_canonical_verdict_re_captures_action_group(self, action: str) -> None:
+        """CANONICAL_VERDICT_RE captures the action token in the 'action' named group (AC-CVR-2)."""
+        from devbench.constants import CANONICAL_VERDICT_RE
+
+        line = _cvr_line("code_review", action)
+        m = CANONICAL_VERDICT_RE.match(line)
+        assert m is not None
+        assert m.group("action") == action, (
+            f"Expected 'action' group to equal {action!r}; got {m.group('action')!r} (AC-CVR-2)"
+        )
+
+    # ------------------------------------------------------------------
+    # AC-CVR-3: negative matches
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("label", "non_matching_line"),
+        [
+            (
+                "agent-prefixed line",
+                f"[{_CVR_TS}] [agent/executor] [REVIEW_PASS] Audit-only pass.\n",
+            ),
+            (
+                "orchestrator line",
+                f"[{_CVR_TS}] [agent/orchestrator] Task claimed.\n",
+            ),
+            (
+                "mid-line token -- indented",
+                f"  [{_CVR_TS}] [judge/code_review] [REVIEW_PASS] Indented.\n",
+            ),
+            (
+                "mid-line token -- prefixed text",
+                f"NOTE: [{_CVR_TS}] [judge/code_review] [REVIEW_PASS] Prefixed.\n",
+            ),
+            (
+                "missing timestamp bracket",
+                "[judge/code_review] [REVIEW_PASS] No timestamp.\n",
+            ),
+            (
+                "malformed timestamp -- missing UTC suffix",
+                "[2026-06-07 17:43] [judge/code_review] [REVIEW_PASS] No UTC.\n",
+            ),
+        ],
+    )
+    def test_canonical_verdict_re_does_not_match_non_canonical_lines(self, label: str, non_matching_line: str) -> None:
+        """CANONICAL_VERDICT_RE must NOT match non-canonical lines (AC-CVR-3).
+
+        This covers agent-prefixed lines, orchestrator audit entries, mid-line
+        token occurrences, and lines with a malformed or missing timestamp.
+        """
+        from devbench.constants import CANONICAL_VERDICT_RE
+
+        m = CANONICAL_VERDICT_RE.match(non_matching_line)
+        assert m is None, f"CANONICAL_VERDICT_RE must not match {label}; line={non_matching_line!r} (AC-CVR-3)"

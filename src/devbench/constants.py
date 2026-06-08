@@ -979,3 +979,24 @@ AUTO_RESOLVE_DESTRUCTIVE_VERBS: frozenset[str] = frozenset(
         "force-status",
     }
 )
+
+# ---------------------------------------------------------------------------
+# Canonical verdict audit-line regex (public export, E8-F2-S1-T3)
+# ---------------------------------------------------------------------------
+# Matches a verdict audit entry written by a review-judge agent.  The line
+# shape is anchored at column 0:
+#
+#   [YYYY-MM-DD HH:MM UTC] [judge/<name>] [REVIEW_PASS|REVIEW_FAIL|REVIEW_REJECTED] ...
+#
+# Named groups:
+#   judge  -- the judge name (e.g. "code_review", "security_review")
+#   action -- the verdict token (e.g. "REVIEW_PASS")
+#
+# Lines that start with an agent/ prefix, orchestrator audit entries,
+# indented lines, or lines that omit the timestamp bracket do NOT match.
+#
+# Note: manager.py keeps a private copy (_CANONICAL_VERDICT_RE) for
+# historical reasons; a future DRY extraction may unify them.
+CANONICAL_VERDICT_RE: re.Pattern[str] = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\] \[judge/(?P<judge>[^\]]+)\] \[(?P<action>[^\]]+)\]"
+)

@@ -316,11 +316,10 @@ Pass the workspace root via the `workspace_root` kwarg to `run_all` (Step 5d) so
 ### Status Summary table
 
 ```
-| Epic | Draft | In Queue | In Progress | In Review | Done | Blocked | Total |
-|------|-------|----------|-------------|-----------|------|---------|-------|
-| E1 -- <epic-title> | N | 0 | 0 | 0 | 0 | 0 | N |
+| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |
+|------|-------|------|-------------|----------|---------|----------|-------|
+| E1 | <epic-title> | 0 | 0 | N | 0 | 0 | 0 |
 | ... | ... | ... | ... | ... | ... | ... | ... |
-| **TOTAL** | N | 0 | 0 | 0 | 0 | 0 | N |
 ```
 
 All new tasks default to `Draft`; counts in other columns are 0 at generation time.
@@ -329,12 +328,12 @@ All new tasks default to `Draft`; counts in other columns are 0 at generation ti
 
 ### Full Work Unit Index
 
-One row per leaf task in 7-column format:
+One row per work unit (all levels) in 7-column format:
 
 ```
-| ID | Title | Status | Repo | Branch | Depends On | Changed Files |
-|----|-------|--------|------|--------|------------|---------------|
-| E1-F1-S1-T1 | <title> | Draft | <org/repo> | <branch> | E1-F1-S1-T0 (if any) | <file1>, <file2> |
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E1-F1-S1-T1 | <title> | Task | draft | E1-F1-S1-T0 | <org/repo> | backlog/<epic-slug>/.../<ID>.md |
 ```
 
 The total row count in the Full Work Unit Index MUST equal the TOTAL in the Status Summary table.

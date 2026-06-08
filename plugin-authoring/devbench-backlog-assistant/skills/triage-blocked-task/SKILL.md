@@ -138,6 +138,85 @@ Based on the classified bucket, print the corresponding remediation command:
 
 ---
 
+## Step 4a -- Optionally auto-apply via the auto-resolve engine (E11-F3, issue #263)
+
+Read the `auto_resolve.enabled` flag from `backlog/config/devbench.yaml`:
+
+```bash
+python -c "
+import os
+from pathlib import Path
+from devbench.config_loader import load_config
+
+workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
+cfg = load_config(workspace / 'backlog' / 'config' / 'devbench.yaml')
+print(cfg.auto_resolve.enabled)
+"
+```
+
+**When `auto_resolve.enabled` is false (the default):** skip this step entirely.
+The advise-only output from Step 4 is the final output -- preserved byte-for-byte.
+Proceed directly to Step 5.
+
+**When `auto_resolve.enabled` is true:** invoke `apply_auto_resolve`, passing:
+- The task id and a normalized blocker signature derived from the audit tail
+- The remediation verb from the seven-bucket matrix for the classified bucket
+- The advise-only payload assembled in Step 4
+- The workspace root as `catalog_path` (for catalog consultation and recording)
+- The bucket name as `classification` (for catalog indexing)
+- `primary_blocker_state` and `structural_blocker_state` for composite-block detection
+
+```bash
+python -c "
+import os, sys
+from pathlib import Path
+from devbench.backlog.auto_resolve import apply_auto_resolve
+from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task, classify_blocked_task_excluding_degradation
+from devbench.config_loader import load_config
+
+workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
+cfg = load_config(workspace / 'backlog' / 'config' / 'devbench.yaml')
+
+# Derive primary and structural states for composite-block guard.
+backlog_root = workspace / 'backlog'
+backlog_index = workspace / 'BACKLOG.md'
+primary = classify_blocked_task(backlog_root, backlog_index, '<id>', workspace_root=workspace)
+structural = classify_blocked_task_excluding_degradation(backlog_root, backlog_index, '<id>', workspace_root=workspace)
+
+advise_only = '''<advise_only_payload_from_step4>'''
+result = apply_auto_resolve(
+    task_id='<id>',
+    signature='<normalized_signature>',
+    remediation='<remediation_verb>',
+    advise_only_payload=advise_only,
+    config=cfg.auto_resolve,
+    primary_blocker_state=primary,
+    structural_blocker_state=structural if primary is BlockedTaskState.RUNTIME_DEGRADATION else None,
+    catalog_path=workspace,
+    classification=primary.name,
+)
+print(result)
+"
+```
+
+The engine consults the agnostic resolution catalog at
+`<workspace>/.devbench/operator-resolution-catalog.json` before deciding to auto-apply.
+
+Decision order (the engine enforces this -- do NOT reimplement it):
+
+1. Destructive-verb guard: any destructive verb raises `ValueError` unconditionally.
+2. Disabled gate: when `auto_resolve.enabled` is false, return advise-only unchanged.
+3. Composite-block gate: when primary is `RUNTIME_DEGRADATION` and a structural blocker
+   co-exists, the engine returns advise-only without consuming budget.
+4. Whitelist gate: unknown non-destructive verb stays advisory.
+5. Novel-signature gate: unrecognized signature is recorded for operator review; advise-only returned.
+6. Budget gate: if per-(task_id, signature) count is at `max_attempts`, emit `[AUTO_RESOLVE_ESCALATED]`.
+7. Apply path: emit `[AUTO_RESOLVED]` to stderr, record `"applied"` in the catalog, return advise-only.
+
+Never reimplement this decision tree inline -- always delegate to `apply_auto_resolve`.
+
+---
+
 ## Step 5 -- Output contract (STOP)
 
 End with the universal output contract. STOP after printing -- never run the mutating verb:

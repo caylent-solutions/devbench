@@ -10,12 +10,14 @@ Validates:
 - No mutating verbs run without CONFIRM (static analysis)
 - Fixture WU files are byte-identical after every skill (no mutation)
 - Triage skill reuses classify_blocked_task with no duplication
+- Auto-resolve integration: RUNTIME_DEGRADATION end-to-end with seeded catalog (E11-F3)
 """
 
 from __future__ import annotations
 
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -482,3 +484,242 @@ class TestNoEmDash:
         raw = COMMANDS_TXT.read_text(encoding="utf-8")
         em_dash = "\u2014"
         assert em_dash not in raw, "commands.txt contains em-dash character (U+2014); use '--' instead"
+
+
+# ---------------------------------------------------------------------------
+# E11-F3 integration tests: auto-resolve wired into triage flow (issue #263)
+# ---------------------------------------------------------------------------
+
+AUTO_RESOLVE_FIXTURES_DIR = FIXTURES_DIR / "auto_resolve"
+SEEDED_CATALOG_PATH = AUTO_RESOLVE_FIXTURES_DIR / "seeded-catalog.json"
+
+# Advise-only payload that the triage flow would produce for a RUNTIME_DEGRADATION task.
+# This is the text the disabled path must return byte-for-byte unchanged (AC-1 disabled path).
+_ADVISE_ONLY_PAYLOAD = (
+    "VERDICT: RUNTIME_DEGRADATION -- orchestrator agent-tool-unavailable signal detected.\n"
+    "\n"
+    "SUGGESTED COMMAND:\n"
+    "  make start\n"
+    "\n"
+    "CONFIRM? Run the above command only after reviewing the audit tail above.\n"
+    "This skill STOPS here. No mutating verb has been executed.\n"
+)
+
+
+@pytest.mark.unit
+class TestTriageSkillAutoResolveInstructions:
+    """AC-1, AC-2: triage-blocked-task SKILL.md documents the auto-resolve flow.
+
+    These static-analysis tests verify that the SKILL.md instructions reference
+    the auto-resolve engine entry point (apply_auto_resolve), the config gate
+    (auto_resolve.enabled), the catalog consultation, and preserve the advise-only
+    default when auto_resolve.enabled is false.
+    """
+
+    def test_triage_skill_references_apply_auto_resolve(self, skill_contents: dict[str, str]) -> None:
+        """SKILL.md must instruct the agent to call apply_auto_resolve (AC-1)."""
+        content = skill_contents.get("triage-blocked-task", "")
+        assert "apply_auto_resolve" in content, (
+            "triage-blocked-task SKILL.md must reference 'apply_auto_resolve' to invoke the engine (AC-1)"
+        )
+
+    def test_triage_skill_references_auto_resolve_enabled(self, skill_contents: dict[str, str]) -> None:
+        """SKILL.md must guard the auto-apply path on auto_resolve.enabled (AC-1)."""
+        content = skill_contents.get("triage-blocked-task", "")
+        assert "auto_resolve.enabled" in content or "auto_resolve[" in content or "auto_resolve_enabled" in content, (
+            "triage-blocked-task SKILL.md must reference the 'auto_resolve.enabled' config gate (AC-1)"
+        )
+
+    def test_triage_skill_references_catalog_consultation(self, skill_contents: dict[str, str]) -> None:
+        """SKILL.md must instruct catalog consultation (AC-1, AC-2)."""
+        content = skill_contents.get("triage-blocked-task", "")
+        assert "catalog" in content.lower(), (
+            "triage-blocked-task SKILL.md must reference catalog consultation in the auto-resolve flow (AC-1)"
+        )
+
+    def test_triage_skill_advise_only_default_preserved(self, skill_contents: dict[str, str]) -> None:
+        """SKILL.md must state the advise-only path is preserved when disabled (AC-1)."""
+        content = skill_contents.get("triage-blocked-task", "")
+        # The skill must describe the disabled/advise-only preservation path
+        has_disabled_path = (
+            "advise-only" in content.lower()
+            or "advise_only" in content.lower()
+            or ("disabled" in content.lower() and "auto_resolve" in content.lower())
+        )
+        assert has_disabled_path, (
+            "triage-blocked-task SKILL.md must describe the advise-only default preserved when disabled (AC-1)"
+        )
+
+    def test_triage_skill_no_classifier_duplication(self, skill_contents: dict[str, str]) -> None:
+        """SKILL.md must reuse the existing classifier with no duplication (AC-2)."""
+        content = skill_contents.get("triage-blocked-task", "")
+        # Must reference the classifier -- confirmed by existing test, but also
+        # must NOT embed inline bucket logic (inline if/elif chains duplicating classifier)
+        assert "classify_blocked_task" in content, (
+            "triage-blocked-task SKILL.md must call classify_blocked_task (no reimplementation -- AC-2)"
+        )
+        reimpl_patterns = [
+            r"if.*BLOCKED_ON_HELD.*elif.*AWAITING",
+            r"match.*bucket.*case.*HELD",
+        ]
+        for pattern in reimpl_patterns:
+            assert not re.search(pattern, content), (
+                f"triage-blocked-task appears to reimplement classifier logic "
+                f"(pattern {pattern!r} matched) -- must delegate to classify_blocked_task (AC-2)"
+            )
+
+
+@pytest.mark.unit
+class TestSeededCatalogFixture:
+    """AC-3: seeded-catalog fixture exists and has valid schema for integration tests."""
+
+    def test_seeded_catalog_fixture_exists(self) -> None:
+        """Fixture file must exist so the integration test can load it (AC-3)."""
+        assert SEEDED_CATALOG_PATH.exists(), (
+            f"Seeded-catalog fixture missing at {SEEDED_CATALOG_PATH}; "
+            "required for RUNTIME_DEGRADATION end-to-end integration test (AC-3)"
+        )
+
+    def test_seeded_catalog_is_valid_json(self) -> None:
+        """Fixture must parse as valid JSON (AC-3)."""
+        raw = SEEDED_CATALOG_PATH.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            pytest.fail(f"seeded-catalog.json is not valid JSON: {exc}")
+        assert isinstance(data, dict), "seeded-catalog.json top-level value must be a JSON object"
+
+    def test_seeded_catalog_has_correct_schema_version(self) -> None:
+        """Fixture must declare schema_version matching CATALOG_SCHEMA_VERSION (AC-3)."""
+        from devbench.backlog.operator_resolution_catalog import CATALOG_SCHEMA_VERSION
+
+        raw = SEEDED_CATALOG_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        assert data.get("schema_version") == CATALOG_SCHEMA_VERSION, (
+            f"seeded-catalog.json schema_version must be {CATALOG_SCHEMA_VERSION}; got {data.get('schema_version')!r}"
+        )
+
+    def test_seeded_catalog_has_runtime_degradation_entry(self) -> None:
+        """Fixture must contain a learned RUNTIME_DEGRADATION entry (success_count >= 1) (AC-3)."""
+        raw = SEEDED_CATALOG_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        entries = data.get("entries", {})
+        runtime_keys = [k for k in entries if k.startswith("RUNTIME_DEGRADATION:")]
+        assert runtime_keys, (
+            "seeded-catalog.json must contain at least one RUNTIME_DEGRADATION entry "
+            "so the integration test can exercise the learned-signature apply path (AC-3)"
+        )
+        # At least one entry must have success_count >= 1 (a learned -- not novel -- signature)
+        learned_entries = [entries[k] for k in runtime_keys if entries[k].get("success_count", 0) >= 1]
+        assert learned_entries, (
+            "seeded-catalog.json must have at least one RUNTIME_DEGRADATION entry with "
+            "success_count >= 1 (learned signature) so auto-apply path fires in integration test (AC-3)"
+        )
+
+
+@pytest.mark.unit
+class TestAutoResolveEngineIntegration:
+    """AC-3: end-to-end integration of apply_auto_resolve with seeded catalog and fixture backlog.
+
+    These tests exercise the auto-resolve engine directly (not via the skill instructions)
+    to verify the triage flow produces [AUTO_RESOLVED] for a RUNTIME_DEGRADATION task when
+    enabled, and returns byte-for-byte advise-only when disabled.
+    """
+
+    def test_runtime_degradation_auto_resolve_enabled_emits_audit_string(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When auto_resolve.enabled is true and the catalog has a learned signature,
+        apply_auto_resolve must emit [AUTO_RESOLVED] and return the advise-only payload (AC-3)."""
+        from devbench.backlog.auto_resolve import apply_auto_resolve
+        from devbench.backlog.operator_resolution_catalog import CATALOG_SCHEMA_VERSION
+        from devbench.config_loader import AutoResolveConfig
+
+        # Build a temporary workspace with the seeded catalog.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            # Seed the catalog from the fixture file.
+            fixture_data = json.loads(SEEDED_CATALOG_PATH.read_text(encoding="utf-8"))
+            assert fixture_data.get("schema_version") == CATALOG_SCHEMA_VERSION, (
+                f"seeded-catalog.json must have schema_version={CATALOG_SCHEMA_VERSION}"
+            )
+            # Write the seeded catalog to the temp workspace.
+            devbench_dir = workspace / ".devbench"
+            devbench_dir.mkdir()
+            catalog_file = devbench_dir / "operator-resolution-catalog.json"
+            catalog_file.write_text(SEEDED_CATALOG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+
+            # Extract the signature from the fixture so the test is data-driven.
+            entries = fixture_data.get("entries", {})
+            runtime_entries = {k: v for k, v in entries.items() if k.startswith("RUNTIME_DEGRADATION:")}
+            assert runtime_entries, "seeded catalog must have RUNTIME_DEGRADATION entry"
+            # Use the first learned entry (success_count >= 1).
+            learned_key, learned_entry = next(
+                (k, v) for k, v in runtime_entries.items() if v.get("success_count", 0) >= 1
+            )
+            # The key format is "RUNTIME_DEGRADATION:<normalized_signature>"
+            _, normalized_sig = learned_key.split(":", 1)
+            remediation = learned_entry["remediation"]
+
+            config = AutoResolveConfig(enabled=True, max_attempts=3)
+            result = apply_auto_resolve(
+                task_id="E99-FIXTURE-T1",
+                signature=normalized_sig,
+                remediation=remediation,
+                advise_only_payload=_ADVISE_ONLY_PAYLOAD,
+                config=config,
+                catalog_path=workspace,
+                classification="RUNTIME_DEGRADATION",
+            )
+
+        # The payload is returned unchanged (the engine logs [AUTO_RESOLVED] to stderr).
+        assert result == _ADVISE_ONLY_PAYLOAD, (
+            "apply_auto_resolve must return the advise-only payload unchanged on the apply path"
+        )
+        captured = capsys.readouterr()
+        assert "[AUTO_RESOLVED]" in captured.err, (
+            "apply_auto_resolve must emit [AUTO_RESOLVED] to stderr for a learned RUNTIME_DEGRADATION signature "
+            "when auto_resolve.enabled is true (AC-3)"
+        )
+
+    def test_runtime_degradation_auto_resolve_disabled_returns_advise_only_unchanged(self) -> None:
+        """When auto_resolve.enabled is false, apply_auto_resolve must return
+        the advise-only payload byte-for-byte without any engine side-effects (AC-1 disabled path)."""
+        from devbench.backlog.auto_resolve import apply_auto_resolve
+        from devbench.config_loader import AutoResolveConfig
+
+        config = AutoResolveConfig(enabled=False, max_attempts=3)
+        result = apply_auto_resolve(
+            task_id="E99-FIXTURE-T1",
+            signature="agent-tool-unavailable-sig-abc123",
+            remediation="re-queue",
+            advise_only_payload=_ADVISE_ONLY_PAYLOAD,
+            config=config,
+        )
+        assert result == _ADVISE_ONLY_PAYLOAD, (
+            "apply_auto_resolve with enabled=False must return the advise-only payload "
+            "byte-for-byte unchanged -- no modification, no side-effects (AC-1 disabled path)"
+        )
+
+    def test_runtime_degradation_auto_resolve_disabled_no_catalog_write(self) -> None:
+        """When disabled, the engine must not write to the catalog at all (AC-1 disabled path)."""
+        from devbench.backlog.auto_resolve import apply_auto_resolve
+        from devbench.config_loader import AutoResolveConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            config = AutoResolveConfig(enabled=False, max_attempts=3)
+            apply_auto_resolve(
+                task_id="E99-FIXTURE-T1",
+                signature="agent-tool-unavailable-sig-disabled",
+                remediation="re-queue",
+                advise_only_payload=_ADVISE_ONLY_PAYLOAD,
+                config=config,
+                catalog_path=workspace,
+                classification="RUNTIME_DEGRADATION",
+            )
+            catalog_file = workspace / ".devbench" / "operator-resolution-catalog.json"
+            assert not catalog_file.exists(), (
+                "apply_auto_resolve with enabled=False must NOT write the catalog "
+                "(disabled path must be byte-for-byte advise-only with no side-effects -- AC-1)"
+            )

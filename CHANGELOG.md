@@ -150,6 +150,27 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Opt-in auto-resolve engine for non-destructive whitelisted remediations**
+  (issue #263). When `auto_resolve.enabled: true` is set in
+  `backlog/config/devbench.yaml`, the `triage-blocked-task` skill automatically
+  applies whitelisted remediation verbs (`re-queue`, `set-status in-queue`,
+  `reconcile-cascade`, `restart-signal`) without operator intervention. A
+  per-`(task_id, signature)` budget (`auto_resolve.max_attempts`, default 3)
+  prevents unbounded retries; on exhaustion the engine logs
+  `[AUTO_RESOLVE_ESCALATED]` and reverts to advise-only. Destructive verbs
+  (`decline`, `mark-done`, `force-status`) are hard-excluded regardless of
+  configuration. Novel signatures are recorded in the agnostic learning catalog at
+  `<workspace>/.devbench/operator-resolution-catalog.json` and stay in advise-only
+  until the operator confirms the pattern. Composite `RUNTIME_DEGRADATION` +
+  structural co-blocker scenarios short-circuit to advise-only without consuming
+  budget. Successful auto-applications emit the verbatim audit string
+  `[AUTO_RESOLVED] task_id=<id> signature=<sig> remediation=<verb>` to stderr.
+  Runtime toggle available via `DEVBENCH_AUTO_RESOLVE_ENABLED` and
+  `DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS` environment variables (precedence: env var >
+  YAML > default). `docs/backlog-assistant.md` updated with a full reference
+  section describing the opt-in, whitelist, budget, catalog, and escalation
+  behavior.
+
 - **Composite `RUNTIME_DEGRADATION` + structural blocker classification and report
   rendering** (issue #248a). `classify_blocked_task` previously returned
   `RUNTIME_DEGRADATION` at priority 0, masking any co-existing structural blocker

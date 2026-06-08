@@ -153,6 +153,131 @@ The single source rendered by skills 1 and 5:
 
 No PreToolUse hooks are installed. The plugin is safe to enable in any operator workspace.
 
+## Auto-resolve engine (issue #263, opt-in)
+
+The auto-resolve engine lets the `triage-blocked-task` skill apply a
+whitelisted, non-destructive remediation without operator intervention.
+It is **opt-in**: the default is advise-only mode, preserving the existing
+safety model.
+
+### Opt-in toggle
+
+Enable auto-resolve by setting `auto_resolve.enabled: true` in
+`backlog/config/devbench.yaml`:
+
+```yaml
+auto_resolve:
+  enabled: true        # default: false (advise-only)
+  max_attempts: 3      # default: 3 (per task+signature budget)
+```
+
+You may also override the toggle at runtime via the
+`DEVBENCH_AUTO_RESOLVE_ENABLED` environment variable (any truthy value
+enables; precedence: env var > YAML > default).
+
+When `auto_resolve.enabled` is `false` (the default), the triage skill
+skips the engine entirely and returns the advise-only payload byte-for-byte
+unchanged.
+
+### Non-destructive whitelist
+
+Only the following remediation verbs may ever be auto-applied:
+
+- `re-queue`
+- `set-status in-queue`
+- `reconcile-cascade`
+- `restart-signal`
+
+These verbs are non-destructive: they re-submit or restart a work unit
+without altering its specification, manifest, or status history.
+
+Destructive verbs (`decline`, `mark-done`, `force-status`) are
+**hard-excluded** regardless of configuration. Attempting to auto-apply one
+raises `ValueError` before the enabled check -- the guard fires even when
+`auto_resolve.enabled` is `true`.
+
+### Per-(task, signature) budget
+
+The engine enforces a per-`(task_id, signature)` attempt budget:
+
+- Default: `max_attempts: 3` (override via `DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS`
+  env var or `auto_resolve.max_attempts` in YAML).
+- When the budget is not yet exhausted, the engine auto-applies the
+  remediation and writes the verbatim audit string
+  `[AUTO_RESOLVED] task_id=<id> signature=<sig> remediation=<verb>` to
+  stderr.
+- When the budget is exhausted, the engine writes
+  `[AUTO_RESOLVE_ESCALATED]` to stderr and returns the advise-only payload
+  unchanged -- the operator must intervene manually.
+
+The budget is keyed on `(task_id, signature)`, not on the bucket name, so
+repeated structural changes to the same work unit each get their own fresh
+counter.
+
+### Learning catalog
+
+The engine consults and updates the agnostic resolution catalog at:
+
+```
+<workspace>/.devbench/operator-resolution-catalog.json
+```
+
+Each entry is keyed by `<classification>:<normalized_signature>` and
+records:
+
+- The classification bucket (e.g. `RUNTIME_DEGRADATION`).
+- The normalized signature (stripped of task-id and app-specific content).
+- The remediation verb that was applied.
+- Success count, failure count, and last-applied timestamp (UTC ISO-8601).
+
+The catalog is schema-versioned (`CATALOG_SCHEMA_VERSION = 1`). A malformed
+or legacy catalog (wrong schema version, invalid JSON, unexpected structure)
+is treated as empty and self-heals -- load never raises a fatal error.
+Writes are atomic: the engine writes to `operator-resolution-catalog.json.tmp`
+and renames it into place.
+
+**Novel signatures**: when a normalized signature has no prior catalog entry,
+the engine records it with outcome `"novel"` and returns advise-only without
+consuming budget. The operator must confirm the pattern (by running the
+suggested command once manually) before the engine auto-applies future
+occurrences.
+
+### Escalation behavior
+
+The engine follows this decision order (in priority sequence):
+
+1. Destructive-verb guard: raises `ValueError` unconditionally.
+2. Disabled gate: when `auto_resolve.enabled` is `false`, returns advise-only unchanged.
+3. Composite-block gate: when the classification is `RUNTIME_DEGRADATION`
+   and a structural co-blocker also exists, the engine returns advise-only
+   without consuming budget (a restart alone cannot clear the structural blocker).
+4. Whitelist gate: a non-destructive but unlisted verb stays advisory.
+5. Novel-signature gate: unrecognized signature is recorded for operator review;
+   advise-only returned.
+6. Budget gate: when the per-`(task_id, signature)` count equals
+   `max_attempts`, emits `[AUTO_RESOLVE_ESCALATED]` and returns advise-only.
+7. Apply path: emits `[AUTO_RESOLVED]` to stderr, records `"applied"` in the
+   catalog, returns advise-only payload unchanged as the printed output.
+
+The triage skill delegates this entire decision tree to `apply_auto_resolve`
+and never reimplements it inline.
+
+### Integration with triage-blocked-task
+
+When `auto_resolve.enabled` is `true`, the `triage-blocked-task` skill adds
+Step 4a after generating the advise-only payload:
+
+1. Reads `cfg.auto_resolve.enabled` from `devbench.yaml`.
+2. Derives a normalized blocker signature from the audit tail.
+3. Calls `apply_auto_resolve` with the task id, signature, remediation verb,
+   advise-only payload, config, bucket classification, and workspace path.
+4. Prints the result (which is the advise-only payload regardless of path).
+5. STOPS -- the operator may CONFIRM the printed command.
+
+The `[AUTO_RESOLVED]` or `[AUTO_RESOLVE_ESCALATED]` audit strings appear on
+stderr (visible in the Claude session log) but do not change the printed
+operator-facing output.
+
 ## Configuration knobs
 
 These live under `skills.*` in `backlog/config/devbench.yaml`:
@@ -162,6 +287,22 @@ skills:
   cascade_thrash_threshold: 3   # triage sub-cap 1b: cycles above this warn
   triage_audit_tail: 20         # triage: lines of audit tail to print
 ```
+
+Auto-resolve knobs live under `auto_resolve.*`:
+
+```yaml
+auto_resolve:
+  enabled: false       # master toggle; default false (advise-only)
+  max_attempts: 3      # per-(task, signature) budget before escalation
+```
+
+Environment-variable overrides (both follow env var > YAML > default
+precedence):
+
+| Variable | Effect |
+|----------|--------|
+| `DEVBENCH_AUTO_RESOLVE_ENABLED` | Sets `auto_resolve.enabled` |
+| `DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS` | Sets `auto_resolve.max_attempts` |
 
 ## Graceful degradation
 

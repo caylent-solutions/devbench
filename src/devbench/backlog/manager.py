@@ -39,7 +39,7 @@ import re
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.constants import (
@@ -74,6 +74,11 @@ from devbench.constants import (
 from devbench.session import flock_backlog
 from devbench.tdd_gate import extract_task_type
 from devbench.utils.io import atomic_write_text
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from devbench.verification import EvidenceCompleteness
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
 # "finalised" and does not block its parent from rolling to done. Kept at
@@ -224,6 +229,22 @@ class BacklogManager:
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
             )
+        # Deterministic AC evidence gate (ADR-27): a unit declaring a
+        # ``## Verification`` contract cannot reach done until every executable
+        # Acceptance Criterion has a tool-captured exit-0 record in the latest
+        # ``verify-ac`` evidence ledger. Units with NO ``## Verification``
+        # section are unaffected (pure back-compat for pre-existing units).
+        from devbench import verification
+
+        content = work_unit_path.read_text(encoding="utf-8")
+        if verification.has_verification_section(content):
+            completeness = self._ac_evidence_complete(work_unit_path, backlog_index.parent, unit_id)
+            if not completeness.complete:
+                raise RuntimeError(
+                    f"Cannot mark {unit_id} done: Acceptance-Criteria evidence incomplete -- "
+                    f"{completeness.message()}. Run 'devbench verify-ac {unit_id}' so every "
+                    f"executable AC has a tool-captured exit-0 record."
+                )
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
         # Operator notification (PR #202).  notify_* helpers are best-effort
         # and gated by the per-event toggle in devbench.yaml; safe to call
@@ -475,6 +496,7 @@ class BacklogManager:
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
+        self._check_verification_contract(rows, workspace_root, errors, warnings, strict=strict)
         self._check_target_repo_resolves(rows, workspace_root, errors)
         self._check_manifest_multi_repo_prefixes(rows, workspace_root, errors)
         self._check_dep_file_exists(rows, workspace_root, errors)
@@ -1332,6 +1354,68 @@ class BacklogManager:
             if canonical == STATUS_DONE:
                 self._rollup_parent_status(backlog_index, unit_id)
 
+    @staticmethod
+    def _required_judge_set(content: str) -> frozenset[str]:
+        """Return the set of judges that MUST pass for this unit to reach done.
+
+        Always includes the always-on core 5 (``ALL_REQUIRED_JUDGE_NAMES``).
+        Adds each enabled optional specialty judge that is applicable to THIS
+        unit -- ``iac_review`` is applicable iff the operator enabled it
+        (``RUNTIME_CONFIG.optional_judges['iac_review']``) AND the unit's
+        ``## Verification`` contract contains an infrastructure item
+        (``verification.unit_requires_iac_judge``). When no optional judge is
+        enabled+applicable the result equals ``ALL_REQUIRED_JUDGE_NAMES`` so the
+        gate behaves identically to before this feature.
+
+        Args:
+            content: Full text of the work-unit ``.md`` file.
+
+        Returns:
+            The required judge-name set for the done-gate.
+        """
+        from devbench.config import RUNTIME_CONFIG
+        from devbench.verification import unit_requires_iac_judge
+
+        required = set(ALL_REQUIRED_JUDGE_NAMES)
+        optional_judges = getattr(RUNTIME_CONFIG, "optional_judges", {})
+        if optional_judges.get("iac_review", False) and unit_requires_iac_judge(content):
+            required.add("iac_review")
+        return frozenset(required)
+
+    @staticmethod
+    def _ac_evidence_complete(
+        work_unit_path: Path,
+        workspace_root: Path,
+        unit_id: str,
+    ) -> "EvidenceCompleteness":
+        """Check the unit's latest evidence ledger against its executable ACs.
+
+        Loads the most recent ``verify-ac`` ledger for this unit (resolved via
+        the ``latest.json`` pointer under ``<workspace_root>/.devbench/evidence/
+        <id>/``), parses the unit's ``## Verification`` contract, and asks
+        :func:`verification.evidence_completeness` whether every executable AC
+        has a tool-captured exit-0 record. Deferred ACs block unless the
+        operator opted in via ``done_gate.allow_deferred_evidence``.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            workspace_root: Workspace root the evidence ledger is rooted under
+                (the CLI runner writes under ``WORKSPACE_ROOT``, which equals
+                ``backlog_index.parent`` in ``mark_done``).
+            unit_id: The work-unit identifier the ledger is keyed by.
+
+        Returns:
+            The :class:`verification.EvidenceCompleteness` verdict.
+        """
+        from devbench import verification
+        from devbench.config import RUNTIME_CONFIG
+
+        content = work_unit_path.read_text(encoding="utf-8")
+        items = verification.parse_verification_section(content)
+        records = verification.read_latest_evidence_ledger(workspace_root, unit_id)
+        allow_deferred = RUNTIME_CONFIG.done_gate.allow_deferred_evidence
+        return verification.evidence_completeness(items, records, allow_deferred=allow_deferred)
+
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.
 
@@ -1344,11 +1428,16 @@ class BacklogManager:
         canonical ``[REVIEW_REJECTED]`` line is encountered (prior round boundary).
         Free-text comments that merely contain the verdict tokens are not counted.
 
+        The required judge set is computed per-unit by :meth:`_required_judge_set`:
+        the always-on core 5 plus any enabled optional judge applicable to this
+        unit's ``## Verification`` contract.
+
         Returns:
-            True if every judge in ``ALL_REQUIRED_JUDGE_NAMES`` has a canonical
+            True if every judge in the unit's required set has a canonical
             ``[REVIEW_PASS]`` entry in the most recent round; False otherwise.
         """
         content = work_unit_path.read_text(encoding="utf-8")
+        required = self._required_judge_set(content)
         passed: set[str] = set()
         for line in reversed(content.splitlines()):
             m = _CANONICAL_VERDICT_RE.match(line)
@@ -1359,10 +1448,10 @@ class BacklogManager:
                 break  # canonical round boundary -- prior round; stop
             if action == "REVIEW_PASS":
                 judge = m.group("judge")
-                if judge in ALL_REQUIRED_JUDGE_NAMES:
+                if judge in required:
                     passed.add(judge)
             # REVIEW_FAIL (or any other canonical action) -- do not count, do not reset
-        return passed >= ALL_REQUIRED_JUDGE_NAMES
+        return passed >= required
 
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:
         """If all children of the parent unit are Done, mark the parent Done too.
@@ -3118,6 +3207,125 @@ class BacklogManager:
                     f"token with ' (ref)' to declare it a read-only "
                     f"reference. See docs/backlog-contract.md "
                     f"'No Orphan Path Tokens Rule'."
+                )
+
+    def _check_verification_contract(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+        warnings: list[str],
+        strict: bool = False,
+    ) -> None:
+        """AC verification contract: executable ACs must be VERIFY-covered; DoD must agree with AC.
+
+        Two findings, routed to *warnings* (default) or *errors* (``--strict``):
+
+        1. **Executable-AC coverage:** any Acceptance Criterion whose text asserts a
+           runnable/testable outcome (terraform/terragrunt/tofu/apply/deploy/terratest/
+           pytest/make/... per :func:`verification.text_has_execution_verb`) MUST have a
+           matching ``VERIFY AC-N`` directive of an executable or ``deferred`` type, so the
+           deterministic done-gate can require tool-captured exit-0 proof.
+        2. **DoD/AC agreement:** any Definition-of-Done item that asserts such an outcome
+           MUST reference an existing ``AC-N`` -- no un-AC'd verifiable claim may hide in
+           the DoD (certainty is anchored on AC).
+
+        A malformed ``VERIFY`` directive is always an error (it would make the gate
+        unparseable). Back-compat: findings default to warnings, so pre-existing backlogs
+        are not retroactively broken until they are re-validated with ``--strict`` (which
+        ``spec-to-backlog`` runs at authoring time).
+        """
+
+        def route(message: str) -> None:
+            (errors if strict else warnings).append(message)
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            self._check_unit_verification_contract(row_id, wu_path, errors, route)
+
+    # Compiled once: AC id token and a generic markdown checkbox line.
+    _AC_ID_RE: ClassVar[re.Pattern[str]] = re.compile(r"AC-[A-Za-z0-9-]+")
+    _CHECKBOX_RE: ClassVar[re.Pattern[str]] = re.compile(r"^\s*-\s*\[[^\]]*\]\s*(.+)$")
+
+    def _check_unit_verification_contract(
+        self,
+        row_id: str,
+        wu_path: Path,
+        errors: list[str],
+        route: "Callable[[str], None]",
+    ) -> None:
+        """Apply the two verification-contract findings to a single work unit.
+
+        Extracted from :meth:`_check_verification_contract` so the per-unit logic
+        is a single-responsibility unit (and the outer loop stays simple). A
+        malformed ``## Verification`` directive is always an *error*; the two
+        findings are routed via *route* (warning by default, error under strict).
+        """
+        from devbench.verification import (
+            VerificationType,
+            parse_verification_section,
+            text_has_execution_verb,
+        )
+
+        content = wu_path.read_text(encoding="utf-8")
+        sections = self._extract_sections(content)
+
+        try:
+            items = parse_verification_section(content)
+        except ValueError as exc:
+            errors.append(f"{row_id}: malformed '## Verification' directive: {exc}")
+            return
+
+        # ACs that carry an executable-or-deferred VERIFY directive (i.e. provable
+        # or explicitly deferred). A judge-only directive does NOT cover an
+        # executable AC.
+        covered: set[str] = set()
+        for item in items:
+            if item.is_executable() or item.vtype is VerificationType.DEFERRED:
+                covered.update(item.ac_ids)
+
+        # Finding 1 + collect the set of declared AC ids for Finding 2.
+        existing_ac_ids: set[str] = set()
+        for line in sections.get("Acceptance Criteria", "").splitlines():
+            match = self._CHECKBOX_RE.match(line)
+            if match is None:
+                continue
+            text = match.group(1)
+            ids = self._AC_ID_RE.findall(text)
+            existing_ac_ids.update(ids)
+            if ids and text_has_execution_verb(text):
+                uncovered = [a for a in ids if a not in covered]
+                if uncovered:
+                    route(
+                        f"{row_id}: executable Acceptance Criterion {', '.join(uncovered)} "
+                        f"asserts a runnable outcome but has no matching '## Verification' "
+                        f"directive (e.g. 'VERIFY {uncovered[0]} | type=terratest | "
+                        f"cmd=`...` | expect-exit=0', or 'type=deferred'). Without it the "
+                        f"done-gate cannot require tool-captured proof. See "
+                        f"docs/backlog-contract.md 'Verification Contract'."
+                    )
+
+        # Finding 2: DoD items asserting runnable outcomes must trace to an AC.
+        for line in sections.get("Definition of Done", "").splitlines():
+            match = self._CHECKBOX_RE.match(line)
+            if match is None:
+                continue
+            text = match.group(1)
+            if not text_has_execution_verb(text):
+                continue
+            if not any(a in existing_ac_ids for a in self._AC_ID_RE.findall(text)):
+                route(
+                    f"{row_id}: Definition-of-Done item asserts a runnable outcome but "
+                    f"references no Acceptance Criterion: {text.strip()!r}. DoD must agree "
+                    f"with AC -- move the requirement into an AC (then add its VERIFY "
+                    f"directive) or cite the 'AC-N' it satisfies. See "
+                    f"docs/backlog-contract.md 'Verification Contract'."
                 )
 
     # ------------------------------------------------------------------

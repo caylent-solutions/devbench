@@ -42,9 +42,11 @@ _MINIMAL_REPOS_YAML = textwrap.dedent("""\
 
 # YAML block that mirrors every annotated default shown in configure-devbench
 # SKILL.md for the sections with code-defined defaults: task_factory,
-# manifest_amendment, validate, stop_hook, backlog, skills, quota_handling.
-# Sections whose fields are env-derived (hook_tail, debug, orchestrate) are
-# excluded because their loader fields default to None, not a fixed value.
+# manifest_amendment, validate, stop_hook, backlog, skills, quota_handling,
+# done_gate. Sections whose fields are env-derived (hook_tail, debug,
+# orchestrate) are excluded because their loader fields default to None, not a
+# fixed value. optional_judges is a plain dict (not a dataclass) and is covered
+# by the dedicated loader tests rather than this dataclasses.asdict comparison.
 _GENERATED_DEFAULTS_YAML = textwrap.dedent("""\
     repos:
       example-org/example-repo:
@@ -89,6 +91,9 @@ _GENERATED_DEFAULTS_YAML = textwrap.dedent("""\
       audit_comment_on_wait: true
       audit_comment_on_resume: true
       log_structured_events: true
+
+    done_gate:
+      allow_deferred_evidence: false
 """)
 
 
@@ -123,6 +128,7 @@ class TestConfigLoaderDefaultsEquality:
             "backlog",
             "skills",
             "quota_handling",
+            "done_gate",
         ],
     )
     def test_section_equals_empty_config_load(

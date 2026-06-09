@@ -618,6 +618,60 @@ NOTIFICATIONS = RUNTIME_CONFIG.notifications
 
 
 # ---------------------------------------------------------------------------
+# Optional-judge enablement + done-gate env-override parity
+# ---------------------------------------------------------------------------
+# The done-gate (BacklogManager) reads RUNTIME_CONFIG.optional_judges and
+# RUNTIME_CONFIG.done_gate directly, so env overrides are applied by mutating
+# those fields in place (same pattern as _apply_notifications_env_overrides).
+# Precedence: env var > YAML > default.
+
+# env var -> optional-judge name (must be in OPTIONAL_JUDGE_NAMES).
+_OPTIONAL_JUDGE_ENV_VARS: tuple[tuple[str, str], ...] = (("DEVBENCH_JUDGE_IAC_REVIEW_ENABLED", "iac_review"),)
+
+
+def _apply_optional_judge_env_overrides() -> None:
+    """Merge ``DEVBENCH_JUDGE_<NAME>_ENABLED`` env vars over the YAML optional_judges block.
+
+    Each env var, when set, overrides the YAML-loaded toggle for its optional
+    judge. Empty-string values are ignored (treated as "not set") so a
+    boilerplate ``export DEVBENCH_JUDGE_IAC_REVIEW_ENABLED=`` in a shell-init
+    script does not clobber a YAML-supplied value.
+    """
+    for env_var, judge_name in _OPTIONAL_JUDGE_ENV_VARS:
+        raw = _read_env(env_var)
+        if raw is None or not raw.strip():
+            continue
+        RUNTIME_CONFIG.optional_judges[judge_name] = _resolve_bool(
+            env_var,
+            RUNTIME_CONFIG.optional_judges.get(judge_name, False),
+            False,
+        )
+
+
+def _apply_done_gate_env_overrides() -> None:
+    """Merge the done-gate env vars over the YAML done_gate block.
+
+    ``DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE``, when set, overrides the
+    YAML-loaded ``done_gate.allow_deferred_evidence`` toggle. Empty-string
+    values are ignored (treated as "not set").
+    """
+    raw = _read_env("DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE")
+    if raw is None or not raw.strip():
+        return
+    RUNTIME_CONFIG.done_gate.allow_deferred_evidence = _resolve_bool(
+        "DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE",
+        RUNTIME_CONFIG.done_gate.allow_deferred_evidence,
+        False,
+    )
+
+
+_apply_optional_judge_env_overrides()
+_apply_done_gate_env_overrides()
+OPTIONAL_JUDGES = RUNTIME_CONFIG.optional_judges
+DONE_GATE = RUNTIME_CONFIG.done_gate
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator stop-class mention-level mapping (E14-F2-S1-T1, issue #271)
 # ---------------------------------------------------------------------------
 

@@ -89,11 +89,22 @@ class TestOrchestrateSkillStep6RetryLoop:
 class TestOrchestrateSkillStep7SecurityPass:
     """AC-4 and AC-5: Step 7 handles security PASS with explicit routing."""
 
-    def test_step7_proceed_to_step8_on_pass(self) -> None:
-        """AC-4: Step 7 must say 'proceed immediately to step 8' on security PASS."""
+    def test_step7_proceed_forward_on_pass(self) -> None:
+        """AC-4: On security PASS the orchestrator must proceed forward (toward
+        git-ops) without stalling. Workstream C inserts the optional iac_review
+        judge as step 7b between security-review (7) and git-ops (8); a security
+        PASS now routes 'proceed immediately to step 7b', which itself proceeds
+        to step 8. The forward-progress contract (no loop-back, no stall) is
+        what AC-4 protects."""
         content = SKILL_PATH.read_text()
-        assert "proceed immediately to step 8" in content, (
-            "SKILL.md step 7 must say 'proceed immediately to step 8' on security PASS"
+        assert "proceed immediately to step 7b" in content, (
+            "SKILL.md step 7 must route a security PASS forward to step 7b (the optional "
+            "iac_review dispatch), which in turn proceeds to step 8 (git-ops)."
+        )
+        # The conditional iac step 7b must itself proceed to git-ops (step 8),
+        # so the security-PASS -> ... -> git-ops forward path is unbroken.
+        assert "proceed to step 8" in content, (
+            "SKILL.md step 7b must proceed to step 8 (git-ops) so the security-PASS forward path is unbroken."
         )
 
     def test_step7_no_rerun_review_supervisor(self) -> None:
@@ -458,6 +469,24 @@ class TestCreateSpecSkillRubricCoverage:
             "create-spec/SKILL.md rubric must require numbered and testable acceptance criteria"
         )
 
+    def test_skill_requires_executable_acs_individually_verifiable(self) -> None:
+        """Every executable AC must be individually verifiable (one VERIFY directive each).
+
+        The downstream verification contract (Workstream A) maps each executable AC to a
+        single ``VERIFY`` directive, so create-spec must instruct authors to write each
+        executable AC so a single command can prove it.
+        """
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        lower = content.lower()
+        assert "individually verifiable" in lower, (
+            "create-spec/SKILL.md must instruct that every executable Acceptance Criterion "
+            "be individually verifiable (one VERIFY directive each)"
+        )
+        assert "verify-ac" in lower or "verify ac" in lower, (
+            "create-spec/SKILL.md must reference the deterministic verify-ac done-gate so authors "
+            "understand why each executable AC must be individually verifiable"
+        )
+
     def test_rubric_requires_cross_references_to_primitives(self) -> None:
         """Rubric item 6: cross-references to existing primitives must exist for every reused component."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
@@ -649,13 +678,52 @@ class TestSpecToBacklogSkillKanonExemplarStep:
             "the skill is application-agnostic (issue #221 E1-E10)"
         )
 
-    def test_skill_references_canonical_15_section_skeleton(self) -> None:
-        """Step 1b must enumerate the 15 canonical task-file sections (the embedded quality bar
-        that floors the skill when no workspace exemplar is configured)."""
+    def test_skill_references_canonical_16_section_skeleton(self) -> None:
+        """Step 1b must enumerate the 16 canonical task-file sections (the embedded quality bar
+        that floors the skill when no workspace exemplar is configured).
+
+        The 16th section is ``## Verification`` (the AC verification contract), placed
+        immediately after ``## Definition of Done``.
+        """
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "15 canonical" in content or "15-section" in content or "15 canonical sections" in content, (
-            "spec-to-backlog/SKILL.md must enumerate the 15 canonical task-file sections "
+        assert "16 canonical" in content or "16-section" in content or "16 canonical sections" in content, (
+            "spec-to-backlog/SKILL.md must enumerate the 16 canonical task-file sections "
             "as the embedded quality bar (independent of any external exemplar)"
+        )
+        assert "## Verification" in content, (
+            "spec-to-backlog/SKILL.md must list the '## Verification' section (the AC "
+            "verification contract) as one of the canonical task-file sections"
+        )
+
+    def test_skill_documents_verification_directive_grammar(self) -> None:
+        """Step 1b must teach the VERIFY directive grammar and the executable AC rule."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "VERIFY AC-N" in content, (
+            "spec-to-backlog/SKILL.md must show the 'VERIFY AC-N | type=... | cmd=`...` | "
+            "expect-exit=0' directive grammar"
+        )
+        for token in ("type=deferred", "type=judge", "expect-exit"):
+            assert token in content, f"spec-to-backlog/SKILL.md Verification grammar must document '{token}'"
+
+    def test_skill_requires_dod_ac_agreement(self) -> None:
+        """The skill must state the DoD/AC-agreement rule (no un-AC'd runnable DoD items)."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        lower = content.lower()
+        assert "dod/ac agreement" in lower or "dod/ac-agreement" in lower or "ac agreement" in lower, (
+            "spec-to-backlog/SKILL.md must state the DoD/AC agreement rule (DoD items must not "
+            "assert a runnable outcome that is not also an AC)"
+        )
+
+    def test_skill_validator_rubric_references_strict_contract(self) -> None:
+        """The validator rubric must say validate-backlog --strict enforces the contract."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "validate-backlog --strict" in content, (
+            "spec-to-backlog/SKILL.md must reference 'validate-backlog --strict' as the enforcer "
+            "of the verification contract"
+        )
+        lower = content.lower()
+        assert "_check_verification_contract" in content or "verification contract" in lower, (
+            "spec-to-backlog/SKILL.md validator rubric must name the verification-contract check"
         )
 
 

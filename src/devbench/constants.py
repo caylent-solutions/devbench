@@ -229,10 +229,23 @@ WORKFLOW_AGENT_JUDGE_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Optional specialty judges. These are NOT part of the always-on core 5
+# (``ALL_REQUIRED_JUDGE_NAMES``); each is toggled per-backlog via the YAML
+# ``optional_judges`` block and is auto-required for a unit only when both the
+# toggle is on AND the unit's ``## Verification`` contract makes the judge
+# applicable (deterministically, never authored by hand). ``iac_review`` is the
+# evidence-verifying IaC judge: applicable when
+# ``verification.unit_requires_iac_judge`` is true for the unit. Mirrored in
+# ``plugin/devbench-orchestrate/scripts/guard-verdict-format.sh``'s
+# ``KNOWN_JUDGES`` + ``CANONICAL_REVIEWER_JUDGES`` arrays; all lists must stay
+# in sync (enforced by ``infra/scripts/release_acceptance.py`` condition (e)).
+OPTIONAL_JUDGE_NAMES: frozenset[str] = frozenset({"iac_review"})
+
 # Full allowlist consumed by ``cmd_log_verdict``. Strictly broader than
 # ``ALL_REQUIRED_JUDGE_NAMES`` -- the canonical 5 reviewers satisfy the
-# done-gate; the workflow-agent names are audit-only.
-KNOWN_JUDGE_NAMES: frozenset[str] = ALL_REQUIRED_JUDGE_NAMES | WORKFLOW_AGENT_JUDGE_NAMES
+# done-gate unconditionally; the optional specialty judges satisfy it only when
+# applicable+enabled; the workflow-agent names are audit-only.
+KNOWN_JUDGE_NAMES: frozenset[str] = ALL_REQUIRED_JUDGE_NAMES | WORKFLOW_AGENT_JUDGE_NAMES | OPTIONAL_JUDGE_NAMES
 
 # ---------------------------------------------------------------------------
 # Non-verdict agent comment format template

@@ -148,3 +148,84 @@ class TestAssertTestsPassHook:
         result = _run_hook(payload)
         assert result.returncode == 2
         assert cmd in result.stderr
+
+
+@pytest.mark.unit
+class TestAssertTestsPassIaCMatrix:
+    """ADR-27 backstop: the IaC tool matrix is treated as verification commands.
+
+    A non-zero exit from terraform/tofu/terragrunt/go test/cdk|cdktf|sam deploy/
+    aws cloudformation/make tf-* must block (exit 2); an exit-0 run is allowed.
+    Non-deploy subcommands of the same tools that the matrix does not target
+    (e.g. ``terraform fmt`` is still matched by the bare-tool rule, but a bare
+    ``aws s3 ls`` is NOT) follow the documented matrix.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "terraform apply -auto-approve",
+            "tofu apply",
+            "terragrunt run-all apply",
+            "go test ./...",
+            "make tf-test UNIT=sandbox/000",
+            "make tf-apply",
+            "make tg-apply",
+            "make smoke URL=https://example",
+            "cdk deploy MyStack",
+            "cdktf deploy",
+            "sam deploy --guided",
+            "aws cloudformation deploy --stack-name s",
+        ],
+    )
+    def test_iac_command_failure_blocks(self, command: str) -> None:
+        """A non-zero exit from any matrix command blocks with exit 2."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_result": {"exit_code": 1, "output": "Error: apply failed"},
+        }
+        result = _run_hook(payload)
+        assert result.returncode == 2, f"{command!r} should have been treated as a verification command"
+        assert "assert-tests-pass" in result.stderr
+        assert command in result.stderr
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "terraform apply -auto-approve",
+            "terragrunt apply",
+            "go test ./...",
+            "cdk deploy MyStack",
+            "aws cloudformation deploy --stack-name s",
+        ],
+    )
+    def test_iac_command_success_allowed(self, command: str) -> None:
+        """An exit-0 matrix command is allowed (exit 0)."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_result": {"exit_code": 0, "output": "Apply complete!"},
+        }
+        result = _run_hook(payload)
+        assert result.returncode == 0
+
+    def test_non_matrix_aws_command_allowed(self) -> None:
+        """A bare ``aws s3 ls`` is not in the matrix and is allowed even on failure."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "aws s3 ls"},
+            "tool_result": {"exit_code": 1, "output": "AccessDenied"},
+        }
+        result = _run_hook(payload)
+        assert result.returncode == 0
+
+    def test_chained_terraform_failure_blocks(self) -> None:
+        """A terraform command in a ``&&`` chain is still matched."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "cd infra && terraform apply"},
+            "tool_result": {"exit_code": 1, "output": "Error"},
+        }
+        result = _run_hook(payload)
+        assert result.returncode == 2

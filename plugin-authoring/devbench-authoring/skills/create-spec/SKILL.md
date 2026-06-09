@@ -185,6 +185,8 @@ Every functional requirement MUST be written as a numbered `FR-N:` line (e.g., `
 
 **Per-AC discipline**: acceptance criteria are numbered (`AC-N`), reference the spec section that justifies them, and are testable from the spec text alone without asking the implementer to infer intent.
 
+**Per-AC verifiability**: every **executable** acceptance criterion -- one whose text asserts a runnable/testable outcome (it names a tool or verb such as `terraform` / `terragrunt` / `tofu` / `apply` / `deploy` / `terratest` / `tf-test` / `cdktf` / `cdk` / `cloudformation` / `sam` / `pytest` / `go test` / `make <target>` / `passes` / `succeeds` / `smoke`) -- MUST be **individually verifiable**: write it so a single concrete command can prove it (real, tool-captured exit code), not bundled with other claims into one AC. `spec-to-backlog` maps each such AC to one `- VERIFY AC-N | type=... | cmd=\`...\` | expect-exit=0` directive in the work unit's `## Verification` section, and the deterministic done-gate (`devbench verify-ac`) blocks `mark-done` until every executable AC has exit-0 proof. An AC that bundles several runnable outcomes cannot be cleanly verified -- split it. Operator-only steps (e.g. a prod apply a human must run) are still authored as individual ACs and decompose to `type=deferred` directives.
+
 **AC-N section marker**: the AC-N list MUST be preceded by the stable machine-locatable marker line:
 
 ```
@@ -232,7 +234,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 4. **Non-goals stated**: Every plausible adjacent ask the spec does NOT cover is named in Section 12 (Out of scope). FAIL if the out-of-scope section is absent or empty.
 
 **Acceptance criteria (items 5-6)**
-5. **Numbered and testable ACs**: Every acceptance criterion is numbered (AC-N), cites the spec section that justifies it, and is testable from the spec text alone. FAIL if any AC is unnumbered, ambiguous, or requires inferring intent.
+5. **Numbered and testable ACs**: Every acceptance criterion is numbered (AC-N), cites the spec section that justifies it, and is testable from the spec text alone. Every **executable** AC (one asserting a runnable/testable outcome) is **individually verifiable** -- a single concrete command can prove it, so `spec-to-backlog` can map it to exactly one `VERIFY AC-N` directive. FAIL if any AC is unnumbered, ambiguous, requires inferring intent, or bundles multiple runnable outcomes into one AC that cannot be individually verified.
 6. **Cross-references to primitives**: Every reused existing primitive (function, class, constant, env var) is cited by name in Section 3. FAIL if a reused primitive is mentioned in Section 4+ without a Section 3 cross-reference.
 
 **Design record (items 7-8)**

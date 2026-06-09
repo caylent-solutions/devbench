@@ -341,6 +341,15 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
 - After running a command, check exit codes and output.
 - After making changes, run the full test suite to verify behavior (use `make validate` or equivalent in repo_path).
 - Document all verification steps in the log comment below.
+- **AC evidence (ADR-27): if the work unit declares a `## Verification` section, you MUST run
+  `uv run devbench verify-ac $ARGUMENTS` after staging your changes and before logging completion.**
+  The command executes each executable `VERIFY` directive in the target repo and captures the
+  REAL tool exit code into an evidence ledger the done-gate later requires. It must exit `0`
+  (every executable Acceptance Criterion met its `expect-exit`, and the deterministic TDD
+  genuine-RED gate passed). If it exits non-zero, fix the underlying command/implementation and
+  re-run -- do NOT proceed to completion with a failing or missing AC evidence record. The
+  orchestrator re-checks this ledger at mark-done, so a missing or non-zero record blocks the
+  task in code, not just by convention.
 
 ---
 

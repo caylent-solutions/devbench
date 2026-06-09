@@ -11,7 +11,7 @@ tools:
 
 You are a meticulous backlog architect. Your goal is to transform a `spec/<project-name>.md` into a complete backlog: `BACKLOG.md` plus work-unit `.md` files under `backlog/` -- at the depth and rigour required by `devbench validate-backlog` and the orchestrator's executor / judge pipeline.
 
-**Quality bar (two-source resolution)**: Every leaf task file MUST contain all 15 canonical sections enumerated in Step 1 below (the embedded skeleton is the authoritative source). Optionally, when the workspace points the skill at an in-workspace exemplar via `skills.exemplar_backlog_path` in `backlog/config/devbench.yaml`, also internalise that exemplar's depth as a reference. The embedded section list is the floor; the workspace exemplar (when present) is an additional reference for richer wording and shape.
+**Quality bar (two-source resolution)**: Every leaf task file MUST contain all 16 canonical sections enumerated in Step 1 below (the embedded skeleton is the authoritative source). Optionally, when the workspace points the skill at an in-workspace exemplar via `skills.exemplar_backlog_path` in `backlog/config/devbench.yaml`, also internalise that exemplar's depth as a reference. The embedded section list is the floor; the workspace exemplar (when present) is an additional reference for richer wording and shape.
 
 **Default status for new work units: `draft`** (controlled by `backlog.default_status_for_new_work_units` in `backlog/config/devbench.yaml`; default is `draft` when that key is absent). Every generated task file MUST open with `## Status: draft` unless the operator overrides the config.
 
@@ -34,9 +34,9 @@ Read <a representative leaf task file under it>      # any *-T*.md in a 4-level 
 
 If `skills.exemplar_backlog_path` is absent OR the file does not exist, skip the file read entirely. Do NOT default to any hardcoded path. The 15-section list below is sufficient by itself to author a passing backlog.
 
-**Step 1b -- The 15 canonical task-file sections (authoritative quality bar)**
+**Step 1b -- The 16 canonical task-file sections (authoritative quality bar)**
 
-Every leaf task `.md` file MUST contain these 15 sections, in this order:
+Every leaf task `.md` file MUST contain these 16 sections, in this order:
 
 1. `# {id}: {title}` -- top-level heading with full task ID
 2. `## Status: <value>` where `<value>` is one of `draft`, `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `declined`, `hold`. **CONSTRAINT (issue #229)**: `draft` is ONLY VALID for Task work units. The validator's `_check_status_enum` rule (see `src/devbench/backlog/manager.py`) rejects `draft` on Epic / Feature / Story with `Status "draft" is only valid for Task work units; <ID> is type <Type>.`. For non-Task levels the operator may intend a "not-ready" state -- map that intent to `hold` (the orchestrator's claim sweep promotes `in-queue` -> claimed; `hold` / `draft` / `declined` all keep the WU paused).
@@ -57,8 +57,36 @@ Every leaf task `.md` file MUST contain these 15 sections, in this order:
 11. `## Acceptance Criteria` -- task-specific ACs tied to spec section numbers or AC-N identifiers from spec Section 6; no `AC-XCUT-N` cross-cutting blocks
 12. `## Changes Manifest` -- the canonical 2-column form `| File | Change |`. EXACTLY two columns; the validator's `parse_manifest` rejects any other column count with `ManifestParseError: Manifest row must have exactly 2 columns`. Each row's File cell is a backtick-wrapped relative path (or a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` when the file list is undetermined); the Change cell is one of `add`, `modify`, `delete` (lowercase). Multi-repo work units encode the repo in the File cell as `` `<org/repo>` -- <path> `` (no per-row Repo column). The `## Target Repository` block at the top of the work-unit file is where Repo / Branch live; the Manifest carries paths only. NEVER use glob patterns (``*`` or ``**``) -- use a sentinel instead. See `docs/backlog-contract.md` 'Changes Manifest' section.
 13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`)
-14. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
-15. `## Comments` -- header only (blank at authoring time)
+14. `## Verification` -- one `- VERIFY AC-N | ...` directive per **executable** Acceptance Criterion (see the directive grammar below). This section is placed immediately AFTER `## Definition of Done`. It is the machine-checkable contract the deterministic done-gate and the optional `iac_review` judge consume: each executable AC maps to a command whose **real** exit code is captured by `devbench verify-ac` (never self-reported).
+15. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
+16. `## Comments` -- header only (blank at authoring time)
+
+**Authoring the `## Verification` section (the AC verification contract)**
+
+For EACH Acceptance Criterion, emit exactly one directive. An **executable** AC is one whose text asserts a runnable/testable outcome -- it names a tool or verb such as `terraform` / `terragrunt` / `tofu` / `apply` / `deploy` / `terratest` / `tf-test` / `cdktf` / `cdk deploy|synth|destroy` / `cloudformation` / `sam build|deploy` / `pytest` / `go test` / `make <target>` / `passes` / `succeeds` / `smoke`. Use the exact directive grammar (one per line):
+
+```
+- VERIFY AC-N | type=<terratest|apply|plan|destroy|deploy|smoke|command> | tool=<optional> | cmd=`<command>` | expect-exit=0
+```
+
+- `type` ∈ {`terratest`, `apply`, `plan`, `destroy`, `deploy`, `smoke`, `command`, `deferred`, `judge`}.
+- `cmd` is backtick-wrapped so a literal `|` inside the command does not break field splitting. `expect-exit` defaults to `0`.
+- `tool` is optional (auto-detected from `cmd` when omitted); set it explicitly for clarity (`tool=terragrunt`, `tool=cdk`, ...).
+- For **operator-only / deferred** steps (e.g. a prod apply a human must run) use `type=deferred | owner=operator | reason="..."` -- this blocks `mark-done` by default and surfaces loudly unless the workspace opts in via `done_gate.allow_deferred_evidence: true`.
+- For **non-executable (qualitative)** ACs -- prose criteria with no runnable claim -- use `type=judge`. Judge directives are left to the core review judges and are never gated for tool-captured proof.
+
+Worked example:
+
+```
+## Verification
+
+- VERIFY AC-3 | type=terratest | tool=terragrunt | cmd=`make tf-test UNIT=sandbox/000/data-lake/000` | expect-exit=0
+- VERIFY AC-7 | type=smoke     |                  | cmd=`make smoke URL=$COLLECTOR_URL`            | expect-exit=0
+- VERIFY AC-9 | type=deferred  | owner=operator   | reason="prod apply is operator-only (D30)"
+- VERIFY AC-11 | type=judge
+```
+
+**DoD/AC agreement rule**: a `## Definition of Done` item MUST NOT assert a runnable/testable outcome that is not also an Acceptance Criterion. Certainty is anchored on AC: any verifiable claim belongs in an AC (with its `VERIFY` directive), not hidden in the DoD. A DoD item that names an execution verb must reference the `AC-N` it satisfies. See `docs/backlog-contract.md` 'Verification Contract'.
 
 ---
 
@@ -208,7 +236,7 @@ For each leaf task in the Epic -> Feature -> Story -> Task tree:
 
 ### 5a -- Write the task file
 
-Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<feature-slug>/<story-id>-<story-slug>/<task-id>.md` using the `Write` tool. The file MUST contain all 15 canonical sections listed in Step 1b.
+Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<feature-slug>/<story-id>-<story-slug>/<task-id>.md` using the `Write` tool. The file MUST contain all 16 canonical sections listed in Step 1b.
 
 **Fan-out** (issue #221 A5): if the leaf-task count from Step 4 strictly exceeds `skills.fan_out_threshold` (default 10), spawn one general-purpose sub-Agent per Feature to author that Feature's leaf tasks in parallel rather than writing them serially. The sub-Agent receives the canonical-section list (Step 1b) verbatim plus the Feature's leaf-task IDs and titles. Serial authoring remains the default when the leaf-task count is at or below the threshold.
 
@@ -229,7 +257,7 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
 uv run python -c "from devbench.plugin_helpers.code_standards_template import emit_code_standards_block; from pathlib import Path; print(emit_code_standards_block(Path('<workspace-root>'), task_specific_error_paths=['<unique-to-this-task error 1>', '<error 2>']))"
 ```
 
-The output starts with `### Code Standards` and ends after the `#### Error Handling Contract` subsection -- paste it verbatim into the task file as section 8 of the 15 canonical sections. Workspaces that want a customised canonical body place a `code-standards-canonical.md` file at the workspace root; the helper resolves the override automatically. The `verify_code_standards_canonical` post-processor pass (Step 5d) reports the count of tasks whose Code Standards block has drifted from the canonical body (check-only, no mutation). See `docs/code-standards-canonical.md`.
+The output starts with `### Code Standards` and ends after the `#### Error Handling Contract` subsection -- paste it verbatim into the task file as section 8 of the 16 canonical sections. Workspaces that want a customised canonical body place a `code-standards-canonical.md` file at the workspace root; the helper resolves the override automatically. The `verify_code_standards_canonical` post-processor pass (Step 5d) reports the count of tasks whose Code Standards block has drifted from the canonical body (check-only, no mutation). See `docs/code-standards-canonical.md`.
 
 **Dependency wiring -- fully resolved at generation time**:
 - `## Dependencies` table: every upstream task this task depends on (real WU IDs -- no placeholders).
@@ -244,7 +272,7 @@ The output starts with `### Code Standards` and ends after the `#### Error Handl
 
 Score each item PASS or FAIL:
 
-1. **All 15 canonical sections present and in order** (Status, Target Repository, Description, Definition of Ready, Depends On This, Approach, Code Standards [with all 6 subsections], Related Specifications, Dependencies, Acceptance Criteria, Changes Manifest, Definition of Done, TDD Cycle Log, Comments). FAIL if any section is missing or out of order.
+1. **All 16 canonical sections present and in order** (Status, Target Repository, Description, Definition of Ready, Depends On This, Approach, Code Standards [with all 6 subsections], Related Specifications, Dependencies, Acceptance Criteria, Changes Manifest, Definition of Done, Verification, TDD Cycle Log, Comments). FAIL if any section is missing or out of order.
 2. **AC ties to spec**: every AC in `## Acceptance Criteria` references a spec section number or AC-N identifier from spec Section 6. FAIL if any AC is free-floating.
 3. **Changes Manifest is concrete**: every file path resolves against the target repo checkout; every entry has an explicit `add` / `modify` / `delete` annotation; no glob patterns. FAIL if any path is ambiguous, annotation is missing, or a glob appears.
 4. **Approach is task-specific**: steps reference the exact files and pytest commands for this task -- not a generic template. FAIL if the Approach reads like a copy-paste from another task.
@@ -260,6 +288,7 @@ Score each item PASS or FAIL:
 14. **C3 -- Manifest multi-repo prefixes resolve** (issue #240, AC-240b-1): every `` `<repo>` -- `<path>` `` row in `## Changes Manifest` must reference a recognised repo key (full or short name). FAIL if any prefix is not in the configured repos. Authoring fix: use only repo keys declared in `devbench.yaml`; remove or correct any unrecognised prefix before submitting the backlog.
 15. **C6 -- Title matches index** (issue #240, AC-240b-1): the task file heading (the portion after `# <ID>: `) must match the `Title` column of the BACKLOG.md Full Work Unit Index row for the same ID exactly, after stripping leading and trailing whitespace. FAIL if any title drifts between the heading and the index. Authoring fix: keep the task file heading and the BACKLOG.md row title identical; update both in the same edit.
 16. **C7 -- Canonical path shape** (issue #240, AC-240b-1): the file path in the BACKLOG.md Full Work Unit Index must end with `/<ID>.md` where the basename (without `.md`) equals the row ID and the path starts with `backlog/`. FAIL if the path does not match the canonical shape for its unit type (Epic, Feature, Story, or Task). Authoring fix: use `backlog/<epic-slug>/.../<ID>.md` with an exact `<ID>` basename.
+17. **Verification contract -- executable-AC coverage + DoD/AC agreement**: every executable Acceptance Criterion (one whose text names an execution verb -- terraform/terragrunt/tofu/apply/deploy/terratest/tf-test/cdktf/cdk/cloudformation/sam/pytest/`go test`/`make <target>`/passes/succeeds/smoke) has a matching `- VERIFY AC-N | type=<executable-or-deferred> | ...` directive in `## Verification`; no `## Definition of Done` item asserts a runnable outcome that is not also an AC. FAIL if any executable AC lacks a `VERIFY` directive, any `VERIFY` directive is malformed (no `AC-N` id or unknown `type`), or any DoD item asserts an un-AC'd runnable outcome. This is the contract that `uv run devbench validate-backlog --strict` enforces as ERRORS (see Step 7d / the validator-rubric note below); fix it here at authoring time so the strict pass is green.
 
 **Out-of-authoring-scope checks (C2/C10)**: C2 (`_check_manifest_path_prefixes` -- checkout-directory prefix verification, which requires an on-disk repository checkout to resolve) and C10 (`_check_dep_file_exists` -- verifies that every dependency ID in `## Dependencies` resolves to a real work-unit file on disk, which requires the full backlog tree to be present) are runtime-only invariants enforced by `validate-backlog` at orchestrator time. Do NOT add rubric items for C2 or C10 here; they cannot be caught at authoring time and will be caught by the validator before any executor cycle begins.
 
@@ -351,7 +380,7 @@ uv run devbench validate-backlog
 **Exit conditions** (ALL three must hold simultaneously before the skill exits successfully):
 
 1. `uv run devbench validate-backlog` returns rc=0 with zero errors.
-2. Every leaf task passes the per-task rubric (all 10 items scored PASS in Step 5b).
+2. Every leaf task passes the per-task rubric (all items scored PASS in Step 5b, including item 17 -- the Verification contract).
 3. BACKLOG.md Status Summary total equals the Full Work Unit Index row count.
 
 If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for validate-backlog errors) and re-run Step 7. Repeat until all three conditions pass or `skills.max_iterations` is exhausted.
@@ -499,7 +528,7 @@ until the iteration budget is exhausted.
 For each ``GapReport`` in the verified gap list:
 
 - **NEW TASK** (``fix == "NEW TASK"``): author a brand-new task file using the
-  existing Step-5 authoring path -- all 15 canonical sections, the canonical Code
+  existing Step-5 authoring path -- all 16 canonical sections, the canonical Code
   Standards block (via the helper in Step 5a), full dep wiring (``## Dependencies``
   and ``### Depends On This``), and an index row in ``BACKLOG.md``.  Copy the
   substance of the gap's ``spec_requirement_quote`` into the new task's
@@ -600,10 +629,26 @@ uv run devbench validate-backlog --strict
 
 **Interpretation**:
 
-- ``rc=0``: No draft/hold manifest conflicts remain.  Proceed to Step 8.
+- ``rc=0``: No draft/hold manifest conflicts remain AND the AC **Verification contract**
+  holds (every executable AC has a `VERIFY` directive; no DoD item asserts an un-AC'd
+  runnable outcome; no malformed `VERIFY` directive).  Proceed to Step 8.
 - ``rc!=0``: One or more draft tasks claim the same ``(repo, path)`` with no
-  serial-dep chain ordering them.  Proceed to Step 7d-2 to wire the missing dep
-  chain; do NOT declare success while any conflict remains.
+  serial-dep chain ordering them, **or** the Verification contract is violated.
+  Proceed to Step 7d-2 to wire the missing dep chain; for a Verification-contract
+  error, return to Step 5a and add/fix the offending task's ``## Verification``
+  directives (per-task rubric item 17) before re-running. Do NOT declare success
+  while any error remains.
+
+**Validator-rubric note**: under ``--strict``, ``_check_verification_contract``
+(in ``src/devbench/backlog/manager.py``) promotes the two Verification-contract
+findings -- **executable-AC coverage** and **DoD/AC agreement** -- from warnings
+to ERRORS, and a malformed ``VERIFY`` directive is always an error. The default
+(non-strict) ``validate-backlog`` surfaces these as warnings so pre-existing
+backlogs are not retroactively broken; ``spec-to-backlog`` runs ``--strict`` here
+so a newly authored backlog never ships a missing or malformed Verification
+contract. This is the same contract the deterministic done-gate consumes via
+``devbench verify-ac`` (forward-reference: tool-captured exit-0 evidence is
+required at ``mark-done``).
 
 ### 7d-2 -- Wire the serial-dep chain for each conflict
 
@@ -715,7 +760,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 **Per-task depth (items 3-5)**
 
-3. **All 15 canonical sections present in every task file** (in order). FAIL if any task is missing a section.
+3. **All 16 canonical sections present in every task file** (in order). FAIL if any task is missing a section.
 4. **AC ties to spec section**: every AC in `## Acceptance Criteria` references a spec section number or AC-N from spec Section 6. FAIL if any AC is free-floating.
 5. **Changes Manifest is concrete**: every file path resolves against the target repo checkout; every entry has an `add` / `modify` / `delete` annotation; no glob patterns. FAIL if any manifest entry is ambiguous or contains a glob.
 
@@ -740,7 +785,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 - **Output files**: `BACKLOG.md` + work-unit `.md` files under `backlog/` in canonical 7-column format
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
-- **Per-task depth**: every task contains all 15 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
+- **Per-task depth**: every task contains all 16 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 

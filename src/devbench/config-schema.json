@@ -50,14 +50,37 @@
     },
     "max_executor_retries_per_judge": {
       "type": "object",
-      "description": "Optional per-judge override of max_executor_retries (issue #122). Keys must be in the canonical judge allowlist (REVIEW_JUDGE_NAMES + SECURITY_JUDGE_NAMES). Each value falls back to max_executor_retries when absent.",
+      "description": "Optional per-judge override of max_executor_retries (issue #122). Keys must be in the canonical judge allowlist (REVIEW_JUDGE_NAMES + SECURITY_JUDGE_NAMES) plus the optional specialty judges (OPTIONAL_JUDGE_NAMES). Each value falls back to max_executor_retries when absent.",
       "additionalProperties": false,
       "properties": {
         "code_review": { "type": "integer", "minimum": 1 },
         "test_review": { "type": "integer", "minimum": 1 },
         "doc_review": { "type": "integer", "minimum": 1 },
         "changes_manifest": { "type": "integer", "minimum": 1 },
-        "security_review": { "type": "integer", "minimum": 1 }
+        "security_review": { "type": "integer", "minimum": 1 },
+        "iac_review": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "optional_judges": {
+      "type": "object",
+      "description": "Toggles for the optional specialty review judges (OPTIONAL_JUDGE_NAMES). The always-on core 5 judges (code_review, test_review, doc_review, changes_manifest, security_review) are mandatory and are NOT listed here. Each optional judge defaults to false (disabled). A disabled judge is never dispatched and never required by the done-gate. When enabled, the judge is auto-required for a unit only when the unit's '## Verification' contract makes it applicable -- deterministically, never authored by hand.",
+      "additionalProperties": false,
+      "properties": {
+        "iac_review": {
+          "type": "boolean",
+          "description": "Evidence-verifying IaC judge (no live AWS). When true, iac_review is auto-required for any unit whose '## Verification' contract contains an infrastructure item (verification.unit_requires_iac_judge). When false (the default), it is never dispatched or required. Override via DEVBENCH_JUDGE_IAC_REVIEW_ENABLED env var."
+        }
+      }
+    },
+    "done_gate": {
+      "type": "object",
+      "description": "Deterministic Acceptance-Criteria evidence-gate settings consumed at mark-done.",
+      "additionalProperties": false,
+      "properties": {
+        "allow_deferred_evidence": {
+          "type": "boolean",
+          "description": "When false (the default), a unit with any type=deferred Verification item (operator-only ACs) is blocked from mark-done and surfaced loudly. Set true to allow deferred ACs to pass the gate without tool-captured evidence. Override via DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE env var."
+        }
       }
     },
     "use_bedrock": {

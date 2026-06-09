@@ -2330,6 +2330,213 @@ class TestPerJudgeRetriesConfig:
         with pytest.raises(ValueError, match="positive integer"):
             _load_per_judge_retries({"test_review": True})
 
+    def test_iac_review_retry_override_loaded(self, tmp_path: Path) -> None:
+        """The optional iac_review judge accepts a per-judge retry budget."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries_per_judge:
+              iac_review: 8
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.max_executor_retries_per_judge == {"iac_review": 8}
+
+    def test_loader_helper_accepts_iac_review(self) -> None:
+        """Defense-in-depth: the runtime helper accepts the optional iac_review name."""
+        from devbench.config_loader import _load_per_judge_retries
+
+        assert _load_per_judge_retries({"iac_review": 3}) == {"iac_review": 3}
+
+
+@pytest.mark.unit
+class TestOptionalJudgesConfig:
+    """Workstream D: optional_judges enablement map loader + defaults.
+
+    Optional specialty judges default to disabled so existing configs validate
+    unchanged. Only OPTIONAL_JUDGE_NAMES are accepted as keys; the always-on
+    core judges are never toggleable.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_default_all_optional_judges_disabled(self, tmp_path: Path) -> None:
+        """Absent optional_judges block -> every optional judge is False."""
+        from devbench.constants import OPTIONAL_JUDGE_NAMES
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert set(result.optional_judges) == set(OPTIONAL_JUDGE_NAMES)
+        assert all(value is False for value in result.optional_judges.values())
+
+    def test_iac_review_enabled_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            optional_judges:
+              iac_review: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.optional_judges["iac_review"] is True
+
+    def test_iac_review_explicit_false_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            optional_judges:
+              iac_review: false
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.optional_judges["iac_review"] is False
+
+    def test_schema_rejects_unknown_optional_judge_name(self, tmp_path: Path) -> None:
+        """JSONSchema additionalProperties:false rejects non-optional judge keys.
+
+        A core judge name (e.g. code_review) is not toggleable, so it must be
+        rejected at the schema layer."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            optional_judges:
+              code_review: true
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_loader_helper_returns_all_disabled_when_none(self) -> None:
+        from devbench.config_loader import _load_optional_judges
+        from devbench.constants import OPTIONAL_JUDGE_NAMES
+
+        result = _load_optional_judges(None)
+        assert set(result) == set(OPTIONAL_JUDGE_NAMES)
+        assert all(v is False for v in result.values())
+
+    def test_loader_helper_rejects_non_mapping(self) -> None:
+        from devbench.config_loader import _load_optional_judges
+
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _load_optional_judges(["not", "a", "dict"])
+
+    def test_loader_helper_rejects_unknown_judge(self) -> None:
+        from devbench.config_loader import _load_optional_judges
+
+        with pytest.raises(ValueError, match="unknown judge"):
+            _load_optional_judges({"security_review": True})
+
+    def test_loader_helper_rejects_non_bool_value(self) -> None:
+        from devbench.config_loader import _load_optional_judges
+
+        with pytest.raises(ValueError, match="must be a boolean"):
+            _load_optional_judges({"iac_review": "yes"})
+
+    def test_loader_helper_enables_iac_review(self) -> None:
+        from devbench.config_loader import _load_optional_judges
+
+        assert _load_optional_judges({"iac_review": True})["iac_review"] is True
+
+
+@pytest.mark.unit
+class TestDoneGateConfig:
+    """Workstream D: done_gate config loader + default.
+
+    allow_deferred_evidence defaults to False (deferred ACs block mark-done).
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_default_allow_deferred_evidence_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.done_gate.allow_deferred_evidence is False
+
+    def test_allow_deferred_evidence_true_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            done_gate:
+              allow_deferred_evidence: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.done_gate.allow_deferred_evidence is True
+
+    def test_schema_rejects_unknown_done_gate_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            done_gate:
+              bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_loader_helper_returns_default_when_none(self) -> None:
+        from devbench.config_loader import _load_done_gate
+
+        result = _load_done_gate(None)
+        assert result.allow_deferred_evidence is False
+
+    def test_loader_helper_rejects_non_mapping(self) -> None:
+        from devbench.config_loader import _load_done_gate
+
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _load_done_gate("not-a-dict")
+
+    def test_loader_helper_rejects_non_bool_allow(self) -> None:
+        from devbench.config_loader import _load_done_gate
+
+        with pytest.raises(ValueError, match="must be a boolean"):
+            _load_done_gate({"allow_deferred_evidence": "yes"})
+
+    def test_loader_helper_loads_true(self) -> None:
+        from devbench.config_loader import _load_done_gate
+
+        assert _load_done_gate({"allow_deferred_evidence": True}).allow_deferred_evidence is True
+
 
 class TestHookTailConfig:
     """Issue #134 regression: ``hook_tail:`` YAML block loads into

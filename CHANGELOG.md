@@ -409,6 +409,47 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Quota detection false positive (#236 follow-up).** `detect_quota_error` no
+  longer misclassifies benign sub-agent prose as a rate-limit hit. The bare
+  `"rate limit"` substring marker is replaced with a precise regex requiring an
+  adjacent exhaustion verb (so "implement rate limiting" / "missing rate
+  limiting" -- including the verbatim code-/security-reviewer criteria -- no
+  longer match), and a `ToolResultBlock` is scanned only when its `is_error`
+  field is `True` or unset (defense in depth); a successful tool result never
+  triggers a pause. Structured signals (HTTP 429, `error == 'rate_limit'`) are
+  unaffected.
+- **Quota wait hang (#236 follow-up).** `recovery_probe` now distinguishes a
+  permanently unavailable probe channel (no/invalid Anthropic API credential --
+  common under Claude-Code CLI subscription auth) from transient errors and
+  raises `RecoveryProbeUnavailableError` instead of silently returning "not
+  recovered" for up to `max_wait_seconds` (5h). `wait_for_reset` resumes on the
+  provider-supplied reset time once it has elapsed, or fails fast with a new
+  `[QUOTA_PROBE_UNAVAILABLE]` audit marker when no reset time is known.
+
+- **Quota `on_exhaustion` / `on_exhaustion_timeout` now take effect (#236 follow-up).**
+  Both fields were parsed and validated but never consumed, so a quota hit
+  always waited and a timeout silently returned 0. `on_exhaustion` is now
+  honored at detection time (`fail` re-raises for a non-zero exit; `drain`
+  requests a graceful drain and stops without waiting; `wait` pauses and polls),
+  and `on_exhaustion_timeout` is applied on the wait-cap timeout and on an
+  unrecoverable probe (`drain` default; `fail` re-raises; `keep_waiting` exits
+  cleanly so the `make start` restart loop re-enters — it does not block
+  forever). A drain requested this way survives `cmd_start`'s exit. New audit
+  markers: `[QUOTA_FAIL_FAST]`, `[QUOTA_DRAIN_REQUESTED] phase=<detection|timeout>`,
+  `[QUOTA_TIMEOUT_KEEP_WAITING]`.
+
+- **`scope.json` `[]` corruption on a no-`--include` start (#236 follow-up).**
+  `_write_session_state_files` wrote a bare JSON array to the per-session
+  `scope.json`, which the object-schema readers (`ScopeFilter.from_file`, the
+  scope banner) reject as corrupt; on a no-include start it wrote `[]`. The
+  array write is removed — `scope.json` is now owned solely by
+  `ScopeFilter.to_file`. The per-session path is resolved explicitly (via the
+  new `scope.session_scope_file_path`) so the writer, the clean-exit clear, and
+  the SDK-subprocess readers all agree on one path (this also repairs
+  `--include` runs that were silently unscoped because the object was written to
+  the workspace-root path the subprocess never read). A no-`--include` start is
+  unscoped (no file) and clears any stale scope.
+
 - **SDK teardown race downgraded to WARNING with tracking-issue link**
   (issue #232; tracks upstream #231). `claude-agent-sdk`'s
   `Query.close()` raises

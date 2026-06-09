@@ -9,10 +9,12 @@ branch that is neither a pass nor a round-boundary reset.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from devbench.backlog.manager import BacklogManager
+from devbench.config_loader import RepoConfig, RuntimeConfig
 from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
 
 pytestmark = pytest.mark.unit
@@ -312,3 +314,101 @@ class TestCanonicalReviewFailNotCounted:
 
         # Reversed iteration: fail encountered first, then all five passes -- still True.
         assert manager._last_round_all_passed(wu)
+
+
+# ---------------------------------------------------------------------------
+# Workstream D: optional iac_review judge in the per-unit required set
+# ---------------------------------------------------------------------------
+
+
+def _iac_pass(*, ts: str = _TS) -> str:
+    """Return a canonical REVIEW_PASS line for the optional iac_review judge."""
+    return f"[{ts}] [judge/iac_review] [REVIEW_PASS] IaC evidence verified.\n"
+
+
+_INFRA_VERIFICATION = (
+    "## Verification\n\n"
+    "- VERIFY AC-3 | type=terratest | tool=terragrunt | cmd=`make tf-test UNIT=sandbox/000` | expect-exit=0\n\n"
+)
+_NON_INFRA_VERIFICATION = "## Verification\n\n- VERIFY AC-1 | type=command | cmd=`pytest -q` | expect-exit=0\n\n"
+
+
+def _wu_with_verification(comment_block: str, verification_block: str) -> str:
+    """Wrap a comment block + a ## Verification section in a minimal work-unit."""
+    return f"# E0-F1-S1-T1: Test WU\n\n## Status: in-review\n\n{verification_block}## Comments\n\n{comment_block}"
+
+
+def _cfg(*, iac_enabled: bool) -> RuntimeConfig:
+    """Build a RuntimeConfig whose optional_judges.iac_review matches *iac_enabled*."""
+    return RuntimeConfig(
+        repos={"org/repo": RepoConfig()},
+        optional_judges={"iac_review": iac_enabled},
+    )
+
+
+class TestOptionalIacJudgeRequiredSet:
+    """The required judge set is core 5 UNION applicable+enabled optional judges.
+
+    iac_review is required iff optional_judges['iac_review'] is True AND the
+    unit's ## Verification contract has an infra item. Otherwise behaviour is
+    identical to the core-5-only gate.
+    """
+
+    def test_required_set_is_core_when_iac_disabled_and_inapplicable(self) -> None:
+        """Disabled toggle + non-infra unit -> required set is exactly the core 5."""
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=False)):
+            required = BacklogManager._required_judge_set(_NON_INFRA_VERIFICATION)
+        assert required == ALL_REQUIRED_JUDGE_NAMES
+
+    def test_required_set_is_core_when_iac_enabled_but_inapplicable(self) -> None:
+        """Enabled toggle but non-infra unit -> iac_review NOT required."""
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=True)):
+            required = BacklogManager._required_judge_set(_NON_INFRA_VERIFICATION)
+        assert required == ALL_REQUIRED_JUDGE_NAMES
+        assert "iac_review" not in required
+
+    def test_required_set_is_core_when_iac_disabled_but_applicable(self) -> None:
+        """Infra unit but toggle disabled -> iac_review NOT required (operator opt-in)."""
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=False)):
+            required = BacklogManager._required_judge_set(_INFRA_VERIFICATION)
+        assert required == ALL_REQUIRED_JUDGE_NAMES
+        assert "iac_review" not in required
+
+    def test_required_set_includes_iac_when_enabled_and_applicable(self) -> None:
+        """Enabled toggle + infra unit -> iac_review IS required."""
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=True)):
+            required = BacklogManager._required_judge_set(_INFRA_VERIFICATION)
+        assert "iac_review" in required
+        assert required == ALL_REQUIRED_JUDGE_NAMES | {"iac_review"}
+
+    def test_gate_passes_with_core_only_when_iac_inapplicable(self, manager: BacklogManager, tmp_path: Path) -> None:
+        """A non-infra unit with all 5 core passes is done even with iac enabled."""
+        content = _wu_with_verification(_all_pass_lines(), _NON_INFRA_VERIFICATION)
+        wu = tmp_path / "wu.md"
+        wu.write_text(content, encoding="utf-8")
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=True)):
+            assert manager._last_round_all_passed(wu)
+
+    def test_gate_blocks_when_iac_required_but_missing(self, manager: BacklogManager, tmp_path: Path) -> None:
+        """An infra unit with the 5 core passes but NO iac_review pass must be blocked."""
+        content = _wu_with_verification(_all_pass_lines(), _INFRA_VERIFICATION)
+        wu = tmp_path / "wu.md"
+        wu.write_text(content, encoding="utf-8")
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=True)):
+            assert not manager._last_round_all_passed(wu)
+
+    def test_gate_passes_when_iac_required_and_present(self, manager: BacklogManager, tmp_path: Path) -> None:
+        """An infra unit with the 5 core passes AND an iac_review pass is done."""
+        content = _wu_with_verification(_all_pass_lines() + _iac_pass(), _INFRA_VERIFICATION)
+        wu = tmp_path / "wu.md"
+        wu.write_text(content, encoding="utf-8")
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=True)):
+            assert manager._last_round_all_passed(wu)
+
+    def test_gate_ignores_iac_pass_when_toggle_disabled(self, manager: BacklogManager, tmp_path: Path) -> None:
+        """With iac disabled, an iac_review pass is not required and core 5 suffices."""
+        content = _wu_with_verification(_all_pass_lines(), _INFRA_VERIFICATION)
+        wu = tmp_path / "wu.md"
+        wu.write_text(content, encoding="utf-8")
+        with patch("devbench.config.RUNTIME_CONFIG", _cfg(iac_enabled=False)):
+            assert manager._last_round_all_passed(wu)

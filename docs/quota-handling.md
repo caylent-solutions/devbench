@@ -18,8 +18,22 @@ sentinel from the inner SDK message loop. The outer handler:
    `[QUOTA_WAITING] reason=<source> reset_at=<ISO|unknown>`.
 3. Calls `wait_for_reset`, which sleeps until `reset_at` (if known) then
    polls with jittered exponential backoff until a probe confirms recovery.
+   If the recovery probe is permanently unavailable (no/invalid API
+   credential) it does not poll for the full `max_wait_seconds`: when the
+   provider supplied a `reset_at` and that time has passed it resumes on the
+   reset time itself; when no reset time is known it emits
+   `[QUOTA_PROBE_UNAVAILABLE]` and stops fast.
 4. On recovery, emits `[QUOTA_RESUMED] waited_seconds=<N>` and applies the
    configured `resume_strategy` before returning `rc=0`.
+
+Text detection requires explicit exhaustion phrasing -- the verbatim CLI limit
+lines (e.g. "You've hit your limit") or "rate limit" immediately followed by an
+exhaustion verb ("exceeded", "reached", "exhausted", ...). Benign sub-agent
+prose that merely mentions rate limiting (for example a reviewer noting "API
+endpoints implement rate limiting") is never misclassified as a limit. Tool
+results that complete successfully (`is_error` is `False`) are not scanned at
+all, so a passing tool whose output happens to contain a limit phrase cannot
+trip a false pause.
 
 No `asyncio.shield` is used -- a SIGTERM during the wait propagates naturally,
 allowing the SIGTERM handler to force-block the in-flight work unit and exit
@@ -53,7 +67,7 @@ quota_handling:
 | `on_exhaustion` | `wait` | Action taken when a quota error is detected: `wait` pauses and polls; `fail` re-raises immediately; `drain` triggers a graceful drain. |
 | `poll_interval_seconds` | `60` | Base cadence for the recovery probe loop. Must be 30-3600. |
 | `max_wait_seconds` | `18000` | Maximum total wait time in seconds (5 hours by default). Must be >= 1. |
-| `on_exhaustion_timeout` | `drain` | Action when `max_wait_seconds` is exceeded: `drain` triggers a graceful drain; `fail` re-raises the quota error; `keep_waiting` ignores the cap. |
+| `on_exhaustion_timeout` | `drain` | Action when `max_wait_seconds` is exceeded **or** the recovery probe is permanently unavailable: `drain` requests a graceful drain (the signal survives process exit); `fail` re-raises the quota error (non-zero exit); `keep_waiting` exits cleanly (rc 0) **without** draining or failing — it does NOT block the process indefinitely. With `keep_waiting`, the `make start` restart loop re-invokes `devbench start`, which re-detects the quota signal and re-enters the wait; run directly (not via `make start`) it simply stops. |
 | `resume_strategy` | `continue_current_wu` | How to re-enter the orchestrate loop after recovery. |
 | `audit_comment_on_wait` | `true` | When `true`, a `[QUOTA_WAITING]` audit comment is written to the active work unit. |
 | `audit_comment_on_resume` | `true` | When `true`, a `[QUOTA_RESUMED]` audit comment is written to the active work unit. |
@@ -76,6 +90,10 @@ following structured markers:
 |--------|--------|-------------|
 | `[QUOTA_WAITING]` | `[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>` | Pause begins |
 | `[QUOTA_RESUMED]` | `[QUOTA_RESUMED] waited_seconds=<N>` | Recovery confirmed |
+| `[QUOTA_PROBE_UNAVAILABLE]` | `[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>` | Probe cannot run (no/invalid credential) and no reset time is known; routed through `on_exhaustion_timeout` |
+| `[QUOTA_FAIL_FAST]` | `[QUOTA_FAIL_FAST] reason=<source>` | `on_exhaustion=fail` (detection) or `on_exhaustion_timeout=fail` (timeout) aborts with a non-zero exit |
+| `[QUOTA_DRAIN_REQUESTED]` | `[QUOTA_DRAIN_REQUESTED] reason=<source> phase=<detection\|timeout>` | `on_exhaustion=drain` (detection) or `on_exhaustion_timeout=drain` (timeout) requests a graceful drain |
+| `[QUOTA_TIMEOUT_KEEP_WAITING]` | `[QUOTA_TIMEOUT_KEEP_WAITING] reason=<source>` | `on_exhaustion_timeout=keep_waiting` exits cleanly after the wait cap (restart loop re-enters) |
 
 ## Inspecting the checkpoint
 

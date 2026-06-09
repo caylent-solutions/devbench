@@ -40,6 +40,7 @@ from devbench.quota import (
     BedrockThrottleError,
     QuotaCheckpoint,
     QuotaExhaustedError,
+    RecoveryProbeUnavailableError,
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
     _apply_resume_strategy,
@@ -118,6 +119,39 @@ def _make_assistant_message_rate_limit(reset_text: str | None = None) -> SimpleN
 def _make_result_message_error(result_text: str) -> SimpleNamespace:
     """Build a ResultMessage-shaped object with is_error=True."""
     return SimpleNamespace(is_error=True, result=result_text)
+
+
+# Fake anthropic exception hierarchy for recovery_probe classification tests.
+# Mirrors the real inheritance (AuthenticationError/PermissionDeniedError are
+# APIErrors; APIError is an AnthropicError) so recovery_probe's ordered except
+# clauses resolve exactly as they would against the real SDK types.
+class _FakeAnthropicError(Exception):
+    """Stand-in for anthropic.AnthropicError (base; non-API config errors)."""
+
+
+class _FakeAPIError(_FakeAnthropicError):
+    """Stand-in for anthropic.APIError (transient API/network errors)."""
+
+
+class _FakeAuthError(_FakeAPIError):
+    """Stand-in for anthropic.AuthenticationError (401; permanent)."""
+
+
+class _FakePermissionError(_FakeAPIError):
+    """Stand-in for anthropic.PermissionDeniedError (403; permanent)."""
+
+
+def _patch_fake_anthropic_errors() -> Any:
+    """Patch the anthropic module's exception classes with the fake hierarchy."""
+    import anthropic
+
+    return patch.multiple(
+        anthropic,
+        AnthropicError=_FakeAnthropicError,
+        APIError=_FakeAPIError,
+        AuthenticationError=_FakeAuthError,
+        PermissionDeniedError=_FakePermissionError,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +334,17 @@ class TestHasQuotaMarker:
             "You've hit your limit",
             "you've hit your limit",
             "You have hit your limit",
-            "rate limit",
             # Verbatim line from the CLI (real apostrophe + middle dot separator)
             "You\u2019ve hit your limit \u00b7 resets 4:10pm (UTC)",
+            # Precise "rate limit" phrasing -- exhaustion verb adjacent.
+            "rate limit exceeded",
+            "rate limit reached",
+            "rate limit hit",
+            "rate limit exhausted",
+            "rate-limit exceeded",
+            "rate limits reached",
+            "Rate Limit Exceeded",  # case-insensitive
+            "rate limit resets 4:10pm (UTC)",
         ],
     )
     def test_matches_quota_markers(self, text: str) -> None:
@@ -315,10 +357,29 @@ class TestHasQuotaMarker:
             "you hit your stride",
             "No issues here",
             "",
+            # Bare "rate limit"/"rate limiting" with no adjacent exhaustion verb
+            # must NOT match (the false-positive class this fix removes).
+            "rate limit",
+            "rate limiting",
+            "Implement rate limiting to prevent abuse",
+            "rate limit not exceeded",
+            # Verbatim reviewer-agent criteria that previously tripped detection.
+            "API endpoints implement rate limiting, CORS policies, and required security headers.",
+            "Missing security headers, overly permissive CORS, missing rate limiting.",
         ],
     )
     def test_non_matching_text(self, text: str) -> None:
         assert _has_quota_marker(text) is False
+
+    def test_code_reviewer_prose_is_not_quota(self) -> None:
+        """Regression: the code-reviewer criterion must not be a quota marker.
+
+        Source: plugin/devbench-orchestrate/agents/review_team/code-reviewer.md:63.
+        The bare "rate limit" substring used to match the "rate limiting" in this
+        line, falsely pausing the orchestrator on every security review.
+        """
+        prose = "API endpoints implement rate limiting, CORS policies, and required security headers."
+        assert _has_quota_marker(prose) is False
 
     def test_non_string_returns_false(self) -> None:
         assert _has_quota_marker(None) is False  # type: ignore[arg-type]
@@ -572,6 +633,44 @@ class TestDetectQuotaErrorRules:
         obj = _make_user_message_with_quota_marker("Normal tool output")
         result = detect_quota_error(obj)
         assert result is None
+
+    def test_rule6_reviewer_prose_not_detected(self) -> None:
+        """Regression: a sub-agent reviewer's prose mentioning rate limiting is not a quota hit."""
+        obj = _make_user_message_with_quota_marker(
+            "API endpoints implement rate limiting, CORS policies, and required security headers."
+        )
+        assert detect_quota_error(obj) is None
+
+    def test_rule6_is_error_true_with_marker_detected(self) -> None:
+        """An errored tool result carrying a genuine limit phrase is detected."""
+        block = SimpleNamespace(tool_use_id="t", content="rate limit exceeded", is_error=True)
+        obj = SimpleNamespace(content=[block])
+        result = detect_quota_error(obj)
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert result.source == "claude-code-cli"
+
+    def test_rule6_is_error_none_with_marker_detected(self) -> None:
+        """A tool result with unset is_error still scans (only False is skipped)."""
+        block = SimpleNamespace(tool_use_id="t", content="You've hit your limit", is_error=None)
+        obj = SimpleNamespace(content=[block])
+        result = detect_quota_error(obj)
+        assert isinstance(result, SubscriptionRateLimitError)
+
+    def test_rule6_is_error_false_with_genuine_marker_skipped(self) -> None:
+        """A SUCCESSFUL tool result is never a quota signal, even with genuine phrasing."""
+        block = SimpleNamespace(tool_use_id="t", content="rate limit exceeded", is_error=False)
+        obj = SimpleNamespace(content=[block])
+        assert detect_quota_error(obj) is None
+
+    def test_rule6_is_error_false_with_reviewer_prose_skipped(self) -> None:
+        """A successful tool result carrying benign reviewer prose is skipped."""
+        block = SimpleNamespace(
+            tool_use_id="t",
+            content="API endpoints implement rate limiting, CORS policies, and required security headers.",
+            is_error=False,
+        )
+        obj = SimpleNamespace(content=[block])
+        assert detect_quota_error(obj) is None
 
     # Rule 7: AssistantMessage with error='rate_limit'
     def test_rule7_assistant_message_error_rate_limit(self) -> None:
@@ -1202,6 +1301,42 @@ class TestWaitForReset:
         with pytest.raises(RuntimeError, match="network error"):
             asyncio.run(run())
 
+    def test_probe_unavailable_with_elapsed_reset_returns_true(self) -> None:
+        """Probe unavailable but reset_at has passed -> resume on the provider-stated reset."""
+        probe = MagicMock(side_effect=RecoveryProbeUnavailableError("no credential"))
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    return await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                    )
+
+        assert asyncio.run(run()) is True
+
+    def test_probe_unavailable_with_unknown_reset_propagates(self) -> None:
+        """Probe unavailable AND reset_at unknown -> propagate so the caller fails fast."""
+        probe = MagicMock(side_effect=RecoveryProbeUnavailableError("no credential"))
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+
+        async def run() -> None:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    await wait_for_reset(
+                        reset_at=None,
+                        poll_interval_seconds=60,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                    )
+
+        with pytest.raises(RecoveryProbeUnavailableError):
+            asyncio.run(run())
+
     def test_conflict_guard_raises_value_error(self) -> None:
         """backoff_config.initial_seconds != poll_interval_seconds raises ValueError."""
         from devbench.quota import BackoffConfig
@@ -1332,6 +1467,37 @@ class TestRecoveryProbe:
         """Transient non-quota error -> False (still exhausted, don't crash)."""
         with patch("devbench.quota._probe_api_call", side_effect=ConnectionError("timeout")):
             result = recovery_probe(timeout_seconds=10, request_size_tokens=1)
+        assert result is False
+
+    def test_authentication_error_raises_unavailable(self) -> None:
+        """A rejected credential (401) is permanent -> RecoveryProbeUnavailableError."""
+        with _patch_fake_anthropic_errors():
+            with patch("devbench.quota._probe_api_call", side_effect=_FakeAuthError("401")):
+                with pytest.raises(RecoveryProbeUnavailableError, match="authenticate"):
+                    recovery_probe(timeout_seconds=10, request_size_tokens=1)
+
+    def test_permission_error_raises_unavailable(self) -> None:
+        """A permission denial (403) is permanent -> RecoveryProbeUnavailableError."""
+        with _patch_fake_anthropic_errors():
+            with patch("devbench.quota._probe_api_call", side_effect=_FakePermissionError("403")):
+                with pytest.raises(RecoveryProbeUnavailableError, match="authenticate"):
+                    recovery_probe(timeout_seconds=10, request_size_tokens=1)
+
+    def test_missing_credential_raises_unavailable(self) -> None:
+        """A non-API AnthropicError (e.g. no api_key configured) is permanent."""
+        with _patch_fake_anthropic_errors():
+            with patch(
+                "devbench.quota._probe_api_call",
+                side_effect=_FakeAnthropicError("The api_key client option must be set"),
+            ):
+                with pytest.raises(RecoveryProbeUnavailableError, match="credential"):
+                    recovery_probe(timeout_seconds=10, request_size_tokens=1)
+
+    def test_transient_api_error_returns_false(self) -> None:
+        """A transient APIError (e.g. 429/connection at the API layer) -> False, keep polling."""
+        with _patch_fake_anthropic_errors():
+            with patch("devbench.quota._probe_api_call", side_effect=_FakeAPIError("503")):
+                result = recovery_probe(timeout_seconds=10, request_size_tokens=1)
         assert result is False
 
 

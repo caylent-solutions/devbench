@@ -12,8 +12,11 @@
 # Exit 0  → allowed (Claude proceeds)
 # Exit 2  → blocked (stderr becomes Claude's feedback)
 #
-# Test commands matched: pytest, make test, make test-unit, make test-functional,
-# make validate, uv run pytest.
+# Test/verification commands matched: pytest, make test, make test-unit,
+# make test-functional, make validate, uv run pytest, plus the IaC tool matrix
+# (terraform, tofu, terragrunt, go test, make tf-test|tf-apply|tg-apply|smoke,
+# cdk deploy, cdktf deploy, sam deploy, aws cloudformation). A non-zero exit
+# from any of these is a real failure the orchestrator must not progress past.
 
 set -euo pipefail
 
@@ -54,8 +57,26 @@ if [[ "$COMMAND" =~ (^|[[:space:]])pytest([[:space:]]|$) ]]; then
   IS_TEST_COMMAND=1
 fi
 
-# Match: make test, make test-unit, make test-functional, make validate
-if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)make[[:space:]]+(test|test-unit|test-functional|validate)([[:space:]]|$) ]]; then
+# Match: make test, make test-unit, make test-functional, make validate, and
+# the IaC make targets (tf-test, tf-apply, tg-apply, smoke).
+if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)make[[:space:]]+(test|test-unit|test-functional|validate|tf-test|tf-apply|tg-apply|smoke)([[:space:]]|$) ]]; then
+  IS_TEST_COMMAND=1
+fi
+
+# Match: the IaC tool matrix -- a non-zero exit from a real provision/plan/test
+# is a failure the orchestrator must not silently progress past.
+#   terraform / tofu / terragrunt subcommands, go test, cdk/cdktf/sam deploy,
+#   aws cloudformation.
+if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)(terraform|tofu|terragrunt)([[:space:]]|$) ]]; then
+  IS_TEST_COMMAND=1
+fi
+if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)go[[:space:]]+test([[:space:]]|$) ]]; then
+  IS_TEST_COMMAND=1
+fi
+if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)(cdk|cdktf|sam)[[:space:]]+deploy([[:space:]]|$) ]]; then
+  IS_TEST_COMMAND=1
+fi
+if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)aws[[:space:]]+cloudformation([[:space:]]|$) ]]; then
   IS_TEST_COMMAND=1
 fi
 

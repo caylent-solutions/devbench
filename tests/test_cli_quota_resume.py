@@ -176,6 +176,42 @@ class TestHandleQuotaPause:
         resumed_msgs = [m for m in log_messages if "QUOTA_RESUMED" in m]
         assert len(resumed_msgs) >= 1, f"Expected [QUOTA_RESUMED] in logs. Got: {log_messages}"
 
+    def test_probe_unavailable_emits_marker_and_returns_false(self, tmp_path: Path) -> None:
+        """When wait_for_reset raises RecoveryProbeUnavailableError, emit
+        [QUOTA_PROBE_UNAVAILABLE], skip resume, and return False (no long wait)."""
+        from devbench.cli import _handle_quota_pause
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import RecoveryProbeUnavailableError
+
+        exc = _make_quota_exc()
+        qh_cfg = QuotaHandlingConfig(enabled=True, audit_comment_on_wait=False)
+
+        log_messages: list[str] = []
+
+        async def run() -> bool:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                with patch("devbench.cli.logger") as mock_logger:
+                    mock_logger.info.side_effect = lambda msg, *a, **kw: log_messages.append(msg % a if a else msg)
+                    with patch(
+                        "devbench.cli.wait_for_reset",
+                        new_callable=AsyncMock,
+                        side_effect=RecoveryProbeUnavailableError("no usable Anthropic API credential"),
+                    ):
+                        with patch("devbench.cli._apply_resume_strategy") as mock_resume:
+                            result = await _handle_quota_pause(
+                                exc=exc,
+                                qh_cfg=qh_cfg,
+                                workspace_root=tmp_path,
+                                session_name="default",
+                            )
+                            mock_resume.assert_not_called()
+                            return result
+
+        result = asyncio.run(run())
+        assert result is False
+        unavailable_msgs = [m for m in log_messages if "QUOTA_PROBE_UNAVAILABLE" in m]
+        assert len(unavailable_msgs) >= 1, f"Expected [QUOTA_PROBE_UNAVAILABLE] in logs. Got: {log_messages}"
+
     def test_no_checkpoint_left_when_enabled_false(self, tmp_path: Path) -> None:
         """AC-236-1: enabled:false does not write a checkpoint."""
         # enabled:false path re-raises the quota exception without writing a checkpoint.
@@ -213,3 +249,156 @@ class TestEnabledFalseLegacyExit:
 
         result = _should_handle_quota(exc, qh_cfg)
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# on_exhaustion / on_exhaustion_timeout dispatch (Issue #236 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _quota_detected() -> Any:
+    """Build a _QuotaDetected sentinel wrapping a subscription rate-limit error."""
+    from devbench.cli import _QuotaDetected
+
+    return _QuotaDetected(_make_quota_exc())
+
+
+def _capture_info_logs(log_messages: list[str]) -> Any:
+    """Return a side_effect that records formatted logger.info messages."""
+    return lambda msg, *a, **kw: log_messages.append(msg % a if a else msg)
+
+
+@pytest.mark.unit
+class TestDispatchQuotaOnExhaustion:
+    """on_exhaustion (detection-time) policy in _dispatch_quota_detection."""
+
+    def _dispatch(self, qh_cfg: Any, log_messages: list[str]) -> str:
+        from devbench.cli import _dispatch_quota_detection
+
+        with patch("devbench.cli.RUNTIME_CONFIG", SimpleNamespace(quota_handling=qh_cfg)):
+            with patch("devbench.cli.logger") as mock_logger:
+                mock_logger.info.side_effect = _capture_info_logs(log_messages)
+                return _dispatch_quota_detection(_quota_detected(), "default")
+
+    def test_fail_reraises_and_skips_wait(self) -> None:
+        from devbench.config_loader import QuotaHandlingConfig
+
+        logs: list[str] = []
+        with patch("devbench.cli._handle_quota_pause") as mock_pause:
+            with pytest.raises(SubscriptionRateLimitError):
+                self._dispatch(QuotaHandlingConfig(enabled=True, on_exhaustion="fail"), logs)
+            mock_pause.assert_not_called()
+        assert any("QUOTA_FAIL_FAST" in m for m in logs)
+
+    def test_drain_requests_drain_and_skips_wait(self) -> None:
+        from devbench.config_loader import QuotaHandlingConfig
+
+        logs: list[str] = []
+        with patch("devbench.cli.request_drain") as mock_drain:
+            with patch("devbench.cli._handle_quota_pause") as mock_pause:
+                result = self._dispatch(QuotaHandlingConfig(enabled=True, on_exhaustion="drain"), logs)
+                mock_pause.assert_not_called()
+        assert result == "quota-drain-requested"
+        mock_drain.assert_called_once()
+        assert mock_drain.call_args.kwargs["reason"].startswith("quota-exhaustion:")
+        assert any("QUOTA_DRAIN_REQUESTED" in m and "phase=detection" in m for m in logs)
+
+    def test_wait_recovered_returns_recovered(self) -> None:
+        from devbench.config_loader import QuotaHandlingConfig
+
+        logs: list[str] = []
+        with patch("devbench.cli._handle_quota_pause", new_callable=AsyncMock, return_value=True):
+            result = self._dispatch(QuotaHandlingConfig(enabled=True, on_exhaustion="wait"), logs)
+        assert result == "quota-wait-recovered"
+
+    def test_wait_timeout_funnels_to_timeout_drain(self) -> None:
+        from devbench.config_loader import QuotaHandlingConfig
+
+        logs: list[str] = []
+        with patch("devbench.cli.request_drain") as mock_drain:
+            with patch("devbench.cli._handle_quota_pause", new_callable=AsyncMock, return_value=False):
+                result = self._dispatch(
+                    QuotaHandlingConfig(enabled=True, on_exhaustion="wait", on_exhaustion_timeout="drain"),
+                    logs,
+                )
+        assert result == "quota-wait-timeout-drain"
+        mock_drain.assert_called_once()
+        assert mock_drain.call_args.kwargs["reason"].startswith("quota-timeout:")
+
+    def test_wait_timeout_fail_reraises_through_dispatch(self) -> None:
+        from devbench.config_loader import QuotaHandlingConfig
+
+        logs: list[str] = []
+        with patch("devbench.cli._handle_quota_pause", new_callable=AsyncMock, return_value=False):
+            with pytest.raises(SubscriptionRateLimitError):
+                self._dispatch(
+                    QuotaHandlingConfig(enabled=True, on_exhaustion="wait", on_exhaustion_timeout="fail"),
+                    logs,
+                )
+
+
+@pytest.mark.unit
+class TestDispatchQuotaTimeout:
+    """on_exhaustion_timeout policy in _dispatch_quota_timeout."""
+
+    def _dispatch(self, action: str, log_messages: list[str]) -> str:
+        from devbench.cli import _dispatch_quota_timeout
+
+        with patch("devbench.cli.logger") as mock_logger:
+            mock_logger.info.side_effect = _capture_info_logs(log_messages)
+            return _dispatch_quota_timeout(_quota_detected(), action)
+
+    def test_drain_requests_drain(self) -> None:
+        logs: list[str] = []
+        with patch("devbench.cli.request_drain") as mock_drain:
+            result = self._dispatch("drain", logs)
+        assert result == "quota-wait-timeout-drain"
+        mock_drain.assert_called_once()
+        assert mock_drain.call_args.kwargs["reason"].startswith("quota-timeout:")
+        assert any("QUOTA_DRAIN_REQUESTED" in m and "phase=timeout" in m for m in logs)
+
+    def test_fail_reraises(self) -> None:
+        logs: list[str] = []
+        with patch("devbench.cli.request_drain") as mock_drain:
+            with pytest.raises(SubscriptionRateLimitError):
+                self._dispatch("fail", logs)
+            mock_drain.assert_not_called()
+        assert any("QUOTA_FAIL_FAST" in m for m in logs)
+
+    def test_keep_waiting_returns_soft_stop(self) -> None:
+        logs: list[str] = []
+        with patch("devbench.cli.request_drain") as mock_drain:
+            result = self._dispatch("keep_waiting", logs)
+            mock_drain.assert_not_called()
+        assert result == "quota-wait-timeout-keep-waiting"
+        assert any("QUOTA_TIMEOUT_KEEP_WAITING" in m for m in logs)
+
+    def test_unknown_action_raises_value_error(self) -> None:
+        from devbench.cli import _dispatch_quota_timeout
+
+        with pytest.raises(ValueError, match="unknown on_exhaustion_timeout"):
+            _dispatch_quota_timeout(_quota_detected(), "bogus")
+
+
+@pytest.mark.unit
+class TestCancelDrainUnlessRequested:
+    """R1: a quota-requested drain survives cmd_start's exit finally blocks."""
+
+    def test_cancels_stale_drain_when_not_requested(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.cli import _cancel_drain_unless_requested
+        from devbench.drain import read_drain_state, request_drain
+
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        request_drain(tmp_path, reason="stale")
+        assert read_drain_state(tmp_path) is not None
+        _cancel_drain_unless_requested(tmp_path, quota_drain_requested=False)
+        assert read_drain_state(tmp_path) is None
+
+    def test_preserves_drain_when_requested(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.cli import _cancel_drain_unless_requested
+        from devbench.drain import read_drain_state, request_drain
+
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        request_drain(tmp_path, reason="quota-timeout:anthropic-api")
+        _cancel_drain_unless_requested(tmp_path, quota_drain_requested=True)
+        assert read_drain_state(tmp_path) is not None

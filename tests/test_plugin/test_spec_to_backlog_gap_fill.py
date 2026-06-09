@@ -3,7 +3,7 @@
 Verifies that plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md
 Step 7c correctly describes:
 
-- AC-1: NEW TASK gaps routed through the existing Step-5 authoring path (15 canonical
+- AC-1: NEW TASK gaps routed through the existing Step-5 authoring path (16 canonical
   sections, canonical Code Standards block, dep wiring, index row).
 - AC-1: ENHANCE gaps routed through file-partitioned fan-out (one agent per task file)
   adding missing ACs/Approach/Manifest/DoD from the cited spec section.
@@ -113,15 +113,15 @@ class TestStep7cNewTaskRouting:
             "(spec Section 4 E12-F3-S2 AC-1, issue #265)."
         )
 
-    def test_new_task_step5_includes_15_sections(self) -> None:
-        """Step 7c must confirm NEW TASK authoring uses the 15-section path."""
+    def test_new_task_step5_includes_16_sections(self) -> None:
+        """Step 7c must confirm NEW TASK authoring uses the 16-section path."""
         content = _read_skill()
         section = _extract_step7c(content)
         lower = section.lower()
-        has_15_sections = "15" in section or "fifteen" in lower or "canonical section" in lower
-        assert has_15_sections, (
+        has_16_sections = "16" in section or "sixteen" in lower or "canonical section" in lower
+        assert has_16_sections, (
             "ERROR: spec-to-backlog/SKILL.md Step 7c NEW TASK path must reference "
-            "the 15 canonical sections from Step-5 "
+            "the 16 canonical sections from Step-5 "
             "(spec Section 4 E12-F3-S2 AC-1, issue #265)."
         )
 

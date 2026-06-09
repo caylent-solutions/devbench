@@ -5799,8 +5799,12 @@ class TestCmdStartNameFlag:
         assert started_by_path.read_text(encoding="utf-8").strip() == getpass.getuser()
 
     @pytest.mark.unit
-    def test_scope_json_written_when_no_include(self, tmp_path: Path) -> None:
-        """AC-192-1: scope.json is written to the session dir (empty scope when no --include)."""
+    def test_no_scope_json_when_no_include(self, tmp_path: Path) -> None:
+        """#236 follow-up: a no-include start is UNSCOPED, so NO scope.json is written.
+
+        (Its absence is the unscoped sentinel; the former bare-array write here
+        produced the "scope.json corrupt -- got 'list'" failure on later reads.)
+        """
         import sys
 
         mock_sdk = self._make_mock_sdk()
@@ -5813,7 +5817,7 @@ class TestCmdStartNameFlag:
 
         assert rc == 0
         scope_path = tmp_path / ".devbench" / "sessions" / "epsilon" / "scope.json"
-        assert scope_path.is_file(), f"Expected scope.json at {scope_path}"
+        assert not scope_path.exists(), f"Expected NO scope.json at {scope_path} (unscoped run)"
 
     @pytest.mark.unit
     def test_registry_json_updated(self, tmp_path: Path) -> None:
@@ -5901,6 +5905,70 @@ class TestCmdStartNameFlag:
         """_write_session_state_files raises ValueError when session_name contains '..'."""
         with pytest.raises(ValueError, match=r"invalid path segment '\.\.'"):
             cli._write_session_state_files(tmp_path, "../evil", 12345, [])
+
+    @pytest.mark.unit
+    def test_write_session_state_files_omits_scope_json(self, tmp_path: Path) -> None:
+        """#236 follow-up: _write_session_state_files no longer writes scope.json
+        (the bare-array form that readers reject); the registry still records scope."""
+        from devbench.session import SessionRegistry
+
+        cli._write_session_state_files(tmp_path, "sess", 4242, ["E1-F1-S1-T1", "E1-F1-S1-T2"])
+        state_dir = tmp_path / ".devbench" / "sessions" / "sess"
+        assert (state_dir / "pid").read_text() == "4242"
+        # scope.json is intentionally NOT written here (no bare-array corruption).
+        assert not (state_dir / "scope.json").exists()
+        # The expanded scope is still recorded in the session registry.
+        entry = next(s for s in SessionRegistry(tmp_path).load() if s.name == "sess")
+        assert entry.scope == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
+
+    @pytest.mark.unit
+    def test_resolve_scope_no_include_clears_stale_scope_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#236 follow-up: a no-include start clears any stale scope.json so the
+        run is UNSCOPED (absence of file), never silently re-scoped or corrupt."""
+        from devbench.scope import session_scope_file_path
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        session_scope_path = session_scope_file_path(tmp_path, "sess")
+        session_scope_path.parent.mkdir(parents=True)
+        session_scope_path.write_text('{"include": ["E1"], "exclude": [], "expanded_ids": ["E1"]}')
+
+        parsed = cli._CmdStartArgs(include="", exclude="", name="sess")
+        scope_ids, rc = cli._resolve_scope_ids_or_error(parsed, session_scope_path)
+
+        assert scope_ids == []
+        assert rc is None
+        assert not session_scope_path.exists()
+
+    @pytest.mark.unit
+    def test_resolve_scope_include_writes_object_at_session_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#236 follow-up: an --include start persists the OBJECT-schema scope.json
+        at the per-session path that the SDK-subprocess readers consult (fixes R4
+        silently-unscoped runs)."""
+        from devbench.scope import ScopeFilter, session_scope_file_path
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        fake_parser = MagicMock()
+        fake_parser.parse_index.return_value = [
+            types.SimpleNamespace(id="E1-F1-S1-T1"),
+            types.SimpleNamespace(id="E1-F1-S1-T2"),
+        ]
+        monkeypatch.setattr(cli, "BacklogParser", lambda **kwargs: fake_parser)
+
+        session_scope_path = session_scope_file_path(tmp_path, "sess")
+        parsed = cli._CmdStartArgs(include="E1", exclude="", name="sess")
+        scope_ids, rc = cli._resolve_scope_ids_or_error(parsed, session_scope_path)
+
+        assert rc is None
+        assert scope_ids == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
+        assert session_scope_path.exists()
+        # The object schema round-trips at the per-session path the readers use.
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "sess")
+        loaded = ScopeFilter.from_file(tmp_path)
+        assert set(loaded.expanded_ids) == set(scope_ids)
 
 
 class TestCmdStartScopeOverlap:
@@ -14729,9 +14797,10 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
 
         scope.json is written before the SDK is invoked and cleared on clean
         exit (AC-190-13), so this test captures its content from inside the
-        SDK mock while the file is live.
+        SDK mock while the file is live.  It lives at the per-session path
+        (default session) -- the path the SDK subprocess actually reads.
         """
-        scope_path = tmp_path / ".devbench" / "scope.json"
+        scope_path = tmp_path / ".devbench" / "sessions" / "default" / "scope.json"
         captured: list[dict[str, list[str]]] = []
         mock_sdk = self._make_scope_capturing_sdk(scope_path, captured)
 
@@ -14752,7 +14821,7 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
 
     def test_include_and_exclude_writes_correct_scope_json(self, tmp_path: Path) -> None:
         """AC-190-8: --exclude subtracts from the include set in scope.json during SDK run."""
-        scope_path = tmp_path / ".devbench" / "scope.json"
+        scope_path = tmp_path / ".devbench" / "sessions" / "default" / "scope.json"
         captured: list[dict[str, list[str]]] = []
         mock_sdk = self._make_scope_capturing_sdk(scope_path, captured)
 
@@ -14847,7 +14916,7 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
 
         assert rc == 0
         assert "DEVBENCH_SCOPE_FILE" in captured_env
-        expected_path = str(tmp_path / ".devbench" / "scope.json")
+        expected_path = str(tmp_path / ".devbench" / "sessions" / "default" / "scope.json")
         assert captured_env["DEVBENCH_SCOPE_FILE"] == expected_path
 
     def test_unknown_flag_exits_nonzero(self, tmp_path: Path) -> None:
@@ -14906,7 +14975,7 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
             rc = cli.cmd_start("--include", "E1")
 
         assert rc == 0
-        scope_path = tmp_path / ".devbench" / "scope.json"
+        scope_path = tmp_path / ".devbench" / "sessions" / "default" / "scope.json"
         assert not scope_path.exists(), "scope.json must be deleted on clean cmd_start exit (AC-190-13)"
 
     def test_clean_exit_without_include_no_scope_json_to_clear(self, tmp_path: Path) -> None:
@@ -14923,9 +14992,9 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
 
         When cmd_start is invoked without --include but a scope.json already
         exists (written by a prior --include run or by ``devbench scope set``),
-        a clean SDK exit MUST delete it.
+        a no-include start clears it (unscoped) and a clean SDK exit also clears.
         """
-        scope_path = tmp_path / ".devbench" / "scope.json"
+        scope_path = tmp_path / ".devbench" / "sessions" / "default" / "scope.json"
         scope_path.parent.mkdir(parents=True, exist_ok=True)
         scope_path.write_text('{"include": ["E1"], "exclude": [], "expanded_ids": ["E1-F1-S1-T1"]}')
 
@@ -14966,7 +15035,7 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
             with pytest.raises(_SDKError):
                 cli.cmd_start("--include", "E1")
 
-        scope_path = tmp_path / ".devbench" / "scope.json"
+        scope_path = tmp_path / ".devbench" / "sessions" / "default" / "scope.json"
         assert scope_path.exists(), (
             "scope.json must persist when the SDK crashes so the operator can inspect the active scope"
         )

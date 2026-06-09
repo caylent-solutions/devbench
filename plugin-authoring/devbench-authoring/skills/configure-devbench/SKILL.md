@@ -558,6 +558,44 @@ Reject any `exemplar_backlog_path` or `exemplar_spec_path` that contains `..` co
 
 ---
 
+## Step 20b -- optional_judges and done_gate sections
+
+The five core review judges (`code_review`, `test_review`, `doc_review`,
+`changes_manifest`, `security_review`) are always-on and NOT disableable. Only
+the optional specialty judges are toggleable, and every optional judge defaults
+to **OFF**. The `done_gate` section controls the deterministic
+Acceptance-Criteria evidence gate enforced at `mark-done`.
+
+Ask the operator:
+
+> "Section: optional_judges + done_gate (leave blank to use defaults; defaults are OFF / block)
+>
+>   optional_judges.iac_review -- Enable the evidence-verifying IaC judge
+>                                 (no live AWS). When true, iac_review is
+>                                 auto-required for any unit whose `## Verification`
+>                                 contract contains an infrastructure item --
+>                                 deterministically, never authored by hand.
+>                                 Recommended true on AWS/Terraform/IaC projects.
+>                                 [true|false, default: false]
+>
+>   done_gate.allow_deferred_evidence -- When false (default), a unit with any
+>                                 type=deferred (operator-only) Verification item
+>                                 is BLOCKED from mark-done and surfaced loudly.
+>                                 Set true only to let deferred ACs pass without
+>                                 tool-captured evidence. [true|false, default: false]"
+
+Validate both fields (when provided) are booleans. Reject with:
+
+> "[INVALID] optional_judges.iac_review / done_gate.allow_deferred_evidence must be true or false. Re-enter."
+
+Do NOT accept any core judge name (`code_review`, `test_review`, `doc_review`,
+`changes_manifest`, `security_review`) under `optional_judges` -- they are
+mandatory and the schema rejects them. Reject with:
+
+> "[INVALID] only optional specialty judges are toggleable; the core 5 judges are always-on. Re-enter."
+
+---
+
 ## Step 21 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. Every section must be
@@ -565,8 +603,9 @@ present in the emitted file regardless of whether the operator changed its
 values from the defaults -- include all sections (repos, merge_strategy,
 max_executor_retries, use_bedrock, bedrock_region, log_file, timeouts, limits,
 git_ops, task_factory, manifest_amendment, validate, stop_hook, hook_tail,
-debug, backlog, skills, orchestrate, report, quota_handling, agents,
-notifications) with their collected values or annotated defaults. This ensures
+debug, backlog, skills, optional_judges, done_gate, orchestrate, report,
+quota_handling, agents, notifications) with their collected values or annotated
+defaults. This ensures
 the written file is a complete, self-documenting reference config whose values
 equal the loader defaults field-by-field for every section the operator
 accepted unchanged (AC-260-1).

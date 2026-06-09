@@ -122,6 +122,118 @@ class TestSecurityReviewerNotInReviewTeam:
 
 
 @pytest.mark.unit
+class TestIacDeployReviewerAgent:
+    """Workstream C: the optional iac_review judge agent file.
+
+    ``iac-deploy-reviewer.md`` is the optional evidence-verifying IaC judge. It
+    is placed as a SIBLING of ``security-reviewer.md`` at the ``agents/`` root --
+    deliberately OUTSIDE ``review_team/`` so the review-supervisor's
+    ``ls review_team/*.md`` auto-discovery does NOT make it a mandatory reviewer.
+    Its frontmatter ``name:`` is hyphenated (``iac-deploy-reviewer``) but maps to
+    the canonical underscored done-gate judge name ``iac_review``.
+    """
+
+    _IAC_PATH = AGENTS_DIR / "iac-deploy-reviewer.md"
+
+    def test_iac_deploy_reviewer_file_exists(self) -> None:
+        """iac-deploy-reviewer.md must exist at agents/ root."""
+        assert self._IAC_PATH.exists(), f"iac-deploy-reviewer.md not found at {self._IAC_PATH}"
+
+    def test_iac_deploy_reviewer_not_in_review_team(self) -> None:
+        """The agent must NOT live inside review_team/ -- that would make it a
+        mandatory reviewer via the supervisor's ls auto-discovery."""
+        assert not (REVIEW_TEAM_DIR / "iac-deploy-reviewer.md").exists(), (
+            "iac-deploy-reviewer.md must NOT be placed inside review_team/; "
+            "doing so makes the optional judge mandatory via the supervisor's auto-discovery."
+        )
+
+    def test_iac_deploy_reviewer_frontmatter_valid(self) -> None:
+        """Frontmatter must declare name, model, and Bash tools (mirrors security-reviewer)."""
+        content = self._IAC_PATH.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        assert lines[0].strip() == "---", "iac-deploy-reviewer.md must start with --- frontmatter delimiter"
+        end_idx = next(
+            (i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+            None,
+        )
+        assert end_idx is not None, "iac-deploy-reviewer.md frontmatter closing --- not found"
+        frontmatter = "\n".join(lines[1:end_idx])
+
+        assert "name: iac-deploy-reviewer" in frontmatter, (
+            f"Frontmatter must contain 'name: iac-deploy-reviewer'. Got:\n{frontmatter}"
+        )
+        assert re.search(r"^model:\s*opus\s*$", frontmatter, re.MULTILINE), (
+            f"iac-deploy-reviewer.md must declare 'model: opus' (ADR-25 judge default). Got:\n{frontmatter}"
+        )
+        assert "tools: Bash" in frontmatter, f"Frontmatter tools must be Bash. Got:\n{frontmatter}"
+
+    def test_iac_deploy_reviewer_maps_to_canonical_iac_review_verdict(self) -> None:
+        """The agent must log its verdict under the canonical underscored judge
+        name ``iac_review`` (the done-gate parser only recognises that form),
+        never the hyphenated frontmatter name in a log-verdict call."""
+        content = self._IAC_PATH.read_text(encoding="utf-8")
+        assert re.search(r"log-verdict\s+iac_review\b", content), (
+            "iac-deploy-reviewer.md must call 'log-verdict iac_review ...' -- the canonical "
+            "underscored judge name the done-gate parser recognises."
+        )
+        assert "log-verdict iac-deploy-reviewer" not in content, (
+            "iac-deploy-reviewer.md must NOT pass the hyphenated frontmatter name to log-verdict; "
+            "the done-gate only recognises the underscored 'iac_review'."
+        )
+
+    def test_iac_deploy_reviewer_has_token_requirement_section(self) -> None:
+        """The agent must carry the H3 DEVBENCH_REVIEW_ROUND_TOKEN requirement
+        section (mirrors security-reviewer.md), since iac_review is a canonical
+        reviewer verdict subject to the default-deny token guard."""
+        content = self._IAC_PATH.read_text(encoding="utf-8")
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in content, (
+            "iac-deploy-reviewer.md must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement (H3)."
+        )
+        assert "Token requirement" in content, (
+            "iac-deploy-reviewer.md must include the H3 'Token requirement' section like security-reviewer.md."
+        )
+
+    def test_iac_deploy_reviewer_reads_evidence_ledger(self) -> None:
+        """The judge verifies tool-captured evidence -- it must read the
+        evidence ledger written by verify-ac, not provision anything."""
+        content = self._IAC_PATH.read_text(encoding="utf-8")
+        assert ".devbench/evidence/" in content, (
+            "iac-deploy-reviewer.md must read the .devbench/evidence/<id>/<attempt>/ ledger."
+        )
+        assert "evidence.json" in content, "iac-deploy-reviewer.md must reference the evidence.json ledger file."
+
+    def test_iac_deploy_reviewer_holds_no_aws_credentials(self) -> None:
+        """The judge must explicitly state it holds NO AWS credentials and
+        provisions nothing -- it is evidence-verifying only."""
+        content = self._IAC_PATH.read_text(encoding="utf-8")
+        assert "No AWS credentials" in content or "NO AWS credentials" in content, (
+            "iac-deploy-reviewer.md must explicitly state it holds no AWS credentials."
+        )
+
+    @pytest.mark.parametrize(
+        "tool_token",
+        [
+            "terraform",
+            "tofu",
+            "terragrunt",
+            "terratest",
+            "cdktf",
+            "cdk",
+            "cloudformation",
+            "sam",
+            "smoke",
+        ],
+    )
+    def test_iac_deploy_reviewer_covers_full_tool_matrix(self, tool_token: str) -> None:
+        """The rubric must cover the full common IaC tool matrix so evidence for
+        any supported tool is meaningfully verified."""
+        content = self._IAC_PATH.read_text(encoding="utf-8").lower()
+        assert tool_token in content, (
+            f"iac-deploy-reviewer.md rubric must cover '{tool_token}' from the IaC tool matrix."
+        )
+
+
+@pytest.mark.unit
 class TestNoStaleFlatAgentPaths:
     """AC-9: Old flat paths for the four moved agents must not exist at agents/ root."""
 
@@ -386,6 +498,61 @@ class TestSkillValidationGateEscalationBranch:
         assert ".devbench/amendments/" in content, (
             "SKILL.md step 4a must reference `.devbench/amendments/<id>.json` so it knows to "
             "skip the validation-gate branch when the amendment path is already handling the task."
+        )
+
+
+@pytest.mark.unit
+class TestSkillIacReviewConditionalDispatch:
+    """Workstream C: SKILL.md must dispatch the optional iac_review judge as a
+    solo step (like security-reviewer) gated on BOTH the enablement toggle AND
+    the deterministic per-unit infra-applicability predicate.
+    """
+
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
+
+    def test_skill_has_iac_review_dispatch_step(self) -> None:
+        """SKILL.md must declare a step 7b that invokes the iac-deploy-reviewer agent."""
+        content = self._SKILL_PATH.read_text()
+        assert "7b." in content, "SKILL.md must declare a step 7b for the optional iac_review dispatch."
+        assert "devbench-orchestrate:iac-deploy-reviewer" in content, (
+            "SKILL.md step 7b must invoke the devbench-orchestrate:iac-deploy-reviewer agent."
+        )
+
+    def test_skill_iac_dispatch_gated_on_enablement_toggle(self) -> None:
+        """The dispatch must be gated on the optional_judges.iac_review enablement toggle."""
+        content = self._SKILL_PATH.read_text()
+        assert "optional_judges.iac_review" in content or "optional_judges" in content, (
+            "SKILL.md step 7b must gate the dispatch on optional_judges.iac_review being enabled."
+        )
+
+    def test_skill_iac_dispatch_gated_on_unit_requires_iac_judge(self) -> None:
+        """The dispatch must be gated on the deterministic infra-applicability predicate."""
+        content = self._SKILL_PATH.read_text()
+        assert "unit_requires_iac_judge" in content, (
+            "SKILL.md step 7b must gate the dispatch on verification.unit_requires_iac_judge "
+            "so dispatch agrees with the step-9 done-gate by construction."
+        )
+
+    def test_skill_iac_dispatch_injects_review_round_token(self) -> None:
+        """The solo dispatch must inject DEVBENCH_REVIEW_ROUND_TOKEN like security-reviewer."""
+        content = self._SKILL_PATH.read_text()
+        heading_pos = content.find("7b.")
+        assert heading_pos >= 0
+        # The token must be referenced in the iac dispatch region (between 7b and step 8).
+        next_step_pos = content.find("\n8. ", heading_pos)
+        region = content[heading_pos:next_step_pos] if next_step_pos > heading_pos else content[heading_pos:]
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in region, (
+            "SKILL.md step 7b must inject DEVBENCH_REVIEW_ROUND_TOKEN into the iac-deploy-reviewer environment."
+        )
+
+    def test_skill_supervisor_does_not_dispatch_iac_review(self) -> None:
+        """review-supervisor must NOT dispatch iac_review -- the orchestrate skill does (solo step)."""
+        content = self._SKILL_PATH.read_text()
+        assert "never dispatches `iac_review`" in content or "never dispatch iac_review" in content.lower(), (
+            "SKILL.md Standards must clarify that review-supervisor never dispatches iac_review; "
+            "the orchestrate skill dispatches it as a solo step."
         )
 
 

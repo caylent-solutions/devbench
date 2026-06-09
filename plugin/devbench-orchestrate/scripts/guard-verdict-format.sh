@@ -10,9 +10,10 @@
 #   - verdict must be 'pass' or 'fail'
 #   - judge name must be a known identifier
 #   - feedback must be non-empty when verdict is 'fail'
-#   - canonical reviewer judges require agent_type to be one of the two allowed
-#     reviewer agent types: devbench-orchestrate:review-supervisor or
-#     devbench-orchestrate:security-reviewer (default-deny H3)
+#   - canonical reviewer judges require agent_type to be one of the allowed
+#     reviewer agent types: devbench-orchestrate:review-supervisor,
+#     devbench-orchestrate:security-reviewer, or
+#     devbench-orchestrate:iac-deploy-reviewer (default-deny H3)
 #   - canonical reviewer judges also require DEVBENCH_REVIEW_ROUND_TOKEN to be
 #     set and non-empty, even for the allowed reviewer agent types (H3)
 #
@@ -36,19 +37,26 @@ KNOWN_JUDGES=(
   "blocker_resolver"
   "manifest_amender"
   "task_factory"
+  "iac_review"
 )
 
-# Canonical reviewer judges -- only these 5 names satisfy the done-gate
-# in BacklogManager._last_round_all_passed. Mirrors REVIEW_JUDGE_NAMES |
-# SECURITY_JUDGE_NAMES in src/devbench/constants.py. Only the two designated
-# reviewer agent types (review-supervisor, security-reviewer) may write these
-# verdicts, and only when DEVBENCH_REVIEW_ROUND_TOKEN is set (H3 default-deny).
+# Canonical reviewer judges -- done-gate-satisfying reviewer verdicts. The
+# first 5 (code_review, test_review, doc_review, changes_manifest,
+# security_review) mirror REVIEW_JUDGE_NAMES | SECURITY_JUDGE_NAMES (the
+# always-on core) in src/devbench/constants.py and satisfy the done-gate
+# unconditionally. ``iac_review`` is an optional specialty reviewer
+# (OPTIONAL_JUDGE_NAMES) whose verdict satisfies the done-gate only when the
+# unit's Verification contract makes it applicable AND the judge is enabled;
+# it is still a default-deny canonical verdict, written only by the designated
+# reviewer agent types and only when DEVBENCH_REVIEW_ROUND_TOKEN is set
+# (H3 default-deny).
 CANONICAL_REVIEWER_JUDGES=(
   "code_review"
   "test_review"
   "doc_review"
   "changes_manifest"
   "security_review"
+  "iac_review"
 )
 
 EXPECTED_ORDER="log-verdict <judge> <unit-id> <verdict> [feedback]"
@@ -199,11 +207,13 @@ if [[ "$VERDICT_LOWER" == "fail" && -z "${FEEDBACK// /}" ]]; then
 fi
 
 # --- Default-deny: canonical reviewer judges require an allowed reviewer agent type ---
-# H3: The five canonical review-team judges (code_review, test_review, doc_review,
-# changes_manifest, security_review) may ONLY be written by the two designated
+# H3: The canonical reviewer judges (the always-on core 5 -- code_review,
+# test_review, doc_review, changes_manifest, security_review -- plus the
+# optional specialty judge iac_review) may ONLY be written by the designated
 # reviewer agent types:
 #   - devbench-orchestrate:review-supervisor
 #   - devbench-orchestrate:security-reviewer
+#   - devbench-orchestrate:iac-deploy-reviewer
 # Every other agent type -- including the executor, manifest-amender, and any
 # absent or spoofed agent_type -- is blocked from canonical verdicts. The
 # audit-only non-canonical judge names (executor, blocker_resolver,
@@ -226,6 +236,7 @@ if (( IS_CANONICAL_JUDGE == 1 )); then
   ALLOWED_REVIEWER_AGENT_TYPES=(
     "devbench-orchestrate:review-supervisor"
     "devbench-orchestrate:security-reviewer"
+    "devbench-orchestrate:iac-deploy-reviewer"
   )
   IS_ALLOWED_REVIEWER=0
   for allowed in "${ALLOWED_REVIEWER_AGENT_TYPES[@]}"; do
@@ -237,17 +248,17 @@ if (( IS_CANONICAL_JUDGE == 1 )); then
 
   if (( IS_ALLOWED_REVIEWER == 0 )); then
     echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires an allowed reviewer agent type." >&2
-    echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
+    echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
     echo "Agent type presented: '${AGENT_TYPE:-<absent>}'." >&2
-    echo "Allowed agent types for canonical verdicts: devbench-orchestrate:review-supervisor, devbench-orchestrate:security-reviewer." >&2
-    echo "Fix: only the review-supervisor and security-reviewer agents may write canonical reviewer verdicts." >&2
+    echo "Allowed agent types for canonical verdicts: devbench-orchestrate:review-supervisor, devbench-orchestrate:security-reviewer, devbench-orchestrate:iac-deploy-reviewer." >&2
+    echo "Fix: only the review-supervisor, security-reviewer, and iac-deploy-reviewer agents may write canonical reviewer verdicts." >&2
     exit 2
   fi
 
   # Check the per-round token is set and non-empty.
   if [[ -z "${DEVBENCH_REVIEW_ROUND_TOKEN:-}" ]]; then
     echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires DEVBENCH_REVIEW_ROUND_TOKEN to be set." >&2
-    echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
+    echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
     echo "Agent type: '${AGENT_TYPE}'." >&2
     echo "Reason: the orchestrator injects DEVBENCH_REVIEW_ROUND_TOKEN into reviewer sub-agents each round; its absence indicates the verdict is not originating from an orchestrated review round." >&2
     echo "Fix: ensure the orchestrate skill injects DEVBENCH_REVIEW_ROUND_TOKEN before invoking the reviewer sub-agent." >&2

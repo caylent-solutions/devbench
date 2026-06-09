@@ -123,6 +123,25 @@ Process the backlog using the steps below, repeating until all work units are do
     c. If the proposal JSON exists: invoke `devbench-orchestrate:task-factory` with the same source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
     d. After task-factory returns: log a blocker comment on the source task summarising the N proposed tasks created, then return to step 2. The source task remains `blocked` until the operator reviews and promotes the proposed tasks (via `uv run devbench promote-proposal <id>`) and they complete; promotion automatically wires the source task's dependencies so the orchestrator picks the source task back up only after the fixes land.
 
+4d. **AC evidence gate (ADR-27) -- runs AFTER implementation, BEFORE review.** Once the
+    executor has implemented the work and any amendment has been applied, run the deterministic
+    Acceptance-Criteria verification runner so tool-captured proof exists before mark-done:
+    ```bash
+    uv run devbench verify-ac <id>
+    ```
+    The command parses the unit's `## Verification` section and executes every executable
+    directive (skipping `judge`/`deferred` items) in the target repo, capturing each command's
+    REAL exit code (never self-reported). It writes per-AC artifacts and an evidence ledger under
+    `$DEVBENCH_WORKSPACE_ROOT/.devbench/evidence/<id>/<attempt>/`, then runs the deterministic
+    TDD genuine-RED gate against the tool-captured RED exit code.
+    - Exit `0`: every executable AC met its `expect-exit` and the TDD gate passed -- proceed to step 5.
+    - Non-zero: at least one executable AC verification failed (or the TDD gate rejected). Treat
+      this exactly like a REVIEW_FAIL: re-invoke `devbench-orchestrate:executor` with the failing
+      AC summary (the command prints the ledger path and each failing summary), then return to
+      step 4d. A unit with no `## Verification` section produces an empty ledger and exits `0`
+      (back-compat: nothing to verify). The done-gate at step 9 re-checks this ledger, so a unit
+      cannot reach done unless `verify-ac` last exited `0`.
+
 5. Invoke `review-supervisor` with the unit ID. Before invoking, generate a per-round token
    and inject it as `DEVBENCH_REVIEW_ROUND_TOKEN` into the sub-agent environment (H3 guard
    requirement). The token value is an opaque string unique to this review round; use a UUID
@@ -145,8 +164,30 @@ Process the backlog using the steps below, repeating until all work units are do
      `DEVBENCH_REVIEW_ROUND_TOKEN` that was used in step 5 (same review round) into the
      security-reviewer sub-agent environment. The guard-verdict-format.sh hook requires the
      token for the security_review canonical judge name.
-   - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
+   - If security PASS: proceed immediately to step 7b. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
    - If security FAIL: log a blocker comment and return to step 2.
+
+7b. **Optional IaC evidence review (ADR-27) -- conditional, runs once after security PASS, before git-ops.**
+    This is a solo invocation exactly like the security-reviewer step, but it is **dispatched only when BOTH
+    conditions hold**:
+    a. The optional judge is enabled: `optional_judges.iac_review: true` in `backlog/config/devbench.yaml`
+       (resolve once with `uv run devbench config-resolve optional_judges`; the env override is
+       `DEVBENCH_JUDGE_IAC_REVIEW_ENABLED`). When it is unset / false, SKIP this step entirely and go to step 8.
+    b. The unit's `## Verification` contract contains an infrastructure item. This is decided deterministically by
+       `devbench.verification.unit_requires_iac_judge(<unit content>)` -- never authored by hand, never self-judged.
+       The same predicate gates the done-gate's required-judge set (`BacklogManager._required_judge_set`), so this
+       dispatch and the step-9 gate agree by construction: a unit that requires the iac_review verdict at mark-done is
+       exactly a unit this step dispatches. When the unit has no infra Verification item, SKIP this step and go to step 8.
+    When both conditions hold: invoke `devbench-orchestrate:iac-deploy-reviewer` with the unit ID. Inject the SAME
+    `DEVBENCH_REVIEW_ROUND_TOKEN` used in step 5 (same review round) into the iac-deploy-reviewer sub-agent
+    environment -- the guard-verdict-format.sh hook requires the token for the `iac_review` canonical judge name. The
+    judge reads the `## Verification` contract and the `.devbench/evidence/<id>/<attempt>/evidence.json` ledger that
+    `verify-ac` wrote (step 4d); it holds NO AWS credentials and provisions nothing.
+    - If iac_review PASS: proceed to step 8. Do NOT re-run review-supervisor or security-reviewer. Do NOT re-invoke
+      executor based on the iac_review verdict body's informational content.
+    - If iac_review FAIL: log a blocker comment naming the failing AC and return to step 2. The done-gate at step 9
+      independently re-requires the iac_review PASS for an infra unit, so the task cannot reach done without it.
+    This conditional-dispatch contract is regression-tested in `tests/test_integration/test_iac_review_dispatch.py`.
 
 8. `uv run devbench git-ops <id>` -- In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units. In local-only mode (`git_ops.local_only: true`, which requires `defer_pr: true`): identical to single-branch + defer-PR (commit locally only) but the target repo has no remote -- there is no CI, no PR, and step 11 (`git-ops-finalize`) is skipped permanently.
 
@@ -197,8 +238,9 @@ Process the backlog using the steps below, repeating until all work units are do
 
 - Never modify files under `backlog/` directly -- use `uv run devbench log-verdict` and `mark-done`.
 - Never bypass the done-gate -- review-supervisor must pass before git-ops.
-- Security review runs exactly once per work unit -- after review-supervisor passes. If security passes, go directly to step 8.
-- The retry loop (step 6) re-runs only review-supervisor, never security-reviewer.
+- Security review runs exactly once per work unit -- after review-supervisor passes. If security passes, go to step 7b.
+- The optional `iac_review` judge (step 7b) runs at most once per work unit, only when `optional_judges.iac_review: true` AND the unit's `## Verification` contract has an infrastructure item (`verification.unit_requires_iac_judge`). The five core judges (code_review, test_review, doc_review, changes_manifest, security_review) are always-on and are NOT toggleable; only specialty judges like `iac_review` are conditional. `review-supervisor` dispatches ONLY its four `review_team/` members and never dispatches `iac_review`; the orchestrate skill dispatches `iac_review` as a solo step (7b), exactly like the security-reviewer.
+- The retry loop (step 6) re-runs only review-supervisor, never security-reviewer, never iac-deploy-reviewer.
 - Log all significant actions and decisions to the work unit Comments via `log-verdict`.
 
 ## H4 fail-closed self-check

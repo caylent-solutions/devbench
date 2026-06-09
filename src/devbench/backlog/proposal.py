@@ -1398,10 +1398,46 @@ DRAFT_TEMPLATE: str = """\
 - [ ] Lint and format clean
 - [ ] Only files in Changes Manifest are staged with `git add`
 
+## Verification
+
+<!-- auto-generated stub. For each EXECUTABLE acceptance criterion (one asserting a
+     runnable/testable outcome -- terraform/terragrunt/tofu/apply/deploy/terratest/
+     pytest/make/cdk/sam/...), add one directive (a "- VERIFY" list item) of the form:
+       VERIFY AC-N | type=[terratest|apply|plan|destroy|deploy|smoke|command]
+                   | tool=[optional] | cmd=`[command]` | expect-exit=0
+     Use 'type=deferred | owner=operator | reason="..."' for operator-only steps.
+     Non-executable (qualitative) ACs use 'type=judge'. See
+     docs/backlog-contract.md 'Verification Contract'. -->
+
+- VERIFY {first_ac_id} | type=judge
+
 ## TDD Cycle Log
 
 ## Comments
 """
+
+
+#: AC-id token recogniser shared with the verification parser, used to seed the
+#: auto-generated ``## Verification`` stub with the draft's first AC id.
+_DRAFT_AC_ID_RE: re.Pattern[str] = re.compile(r"AC-[A-Za-z0-9-]+")
+
+#: AC id emitted by the fallback Acceptance Criteria line when no AC is suggested;
+#: the ``## Verification`` stub references the same id so the stub stays consistent.
+_DRAFT_FALLBACK_AC_ID = "AC-TODO-001"
+
+
+def _first_ac_id(suggested_acs: list[str]) -> str:
+    """Return the first ``AC-N`` id in *suggested_acs*, or the fallback placeholder.
+
+    The ``## Verification`` stub references this id with a ``type=judge`` placeholder
+    directive so an auto-generated draft is always a valid (contract-passing)
+    Verification section regardless of whether the proposal carried suggested ACs.
+    """
+    for line in suggested_acs:
+        match = _DRAFT_AC_ID_RE.search(line)
+        if match is not None:
+            return match.group(0)
+    return _DRAFT_FALLBACK_AC_ID
 
 
 def generate_draft_md(
@@ -1419,6 +1455,7 @@ def generate_draft_md(
         if proposed.suggested_acs
         else "- [ ] AC-TODO-001 human must author AC"
     )
+    first_ac_id = _first_ac_id(proposed.suggested_acs)
     manifest_lines = (
         "\n".join(f"| `{path}` | TODO -- describe change |" for path in proposed.files_to_own)
         if proposed.files_to_own
@@ -1436,6 +1473,7 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=manifest_lines,
+        first_ac_id=first_ac_id,
     )
 
 

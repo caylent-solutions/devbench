@@ -31,12 +31,33 @@ max_executor_retries: 10
 # Per-judge override of max_executor_retries (issue #122). Each value falls
 # back to max_executor_retries when absent. Useful when one judge is flakey
 # (more retries) and another is stable (fewer retries to fail-fast on real bugs).
+# iac_review only takes effect when optional_judges.iac_review is true.
 max_executor_retries_per_judge:
   code_review: 10
   test_review: 10
   doc_review: 10
   changes_manifest: 10
   security_review: 10
+  # iac_review: 10
+
+# Optional specialty review judges. The always-on core 5 (code_review,
+# test_review, doc_review, changes_manifest, security_review) are mandatory and
+# NOT listed here. Each optional judge defaults to false (disabled): a disabled
+# judge is never dispatched and never required by the done-gate. When enabled,
+# iac_review (the evidence-verifying IaC judge, no live AWS) is auto-required for
+# a unit only when that unit's `## Verification` contract contains an
+# infrastructure item -- deterministically, never authored by hand. Override via
+# the DEVBENCH_JUDGE_IAC_REVIEW_ENABLED env var. Enable on AWS IaC projects.
+# optional_judges:
+#   iac_review: false
+
+# Deterministic Acceptance-Criteria evidence-gate settings, enforced at
+# mark-done. allow_deferred_evidence: false (the default) blocks a unit that has
+# any type=deferred (operator-only) Verification item from being marked done and
+# surfaces it loudly. Set true to let deferred ACs pass without tool-captured
+# evidence. Override via DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE.
+# done_gate:
+#   allow_deferred_evidence: false
 
 # When true, route LLM calls via AWS Bedrock instead of the Anthropic API.
 use_bedrock: false

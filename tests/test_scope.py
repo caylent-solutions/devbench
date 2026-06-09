@@ -22,6 +22,7 @@ from devbench.scope import (
     _letter_prefix,
     _numeric_suffix,
     resolve_scope_file_path,
+    session_scope_file_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -1117,3 +1118,29 @@ class TestPerSessionScopeRouting:
         expected = tmp_path / ".devbench" / "sessions" / session_name / "scope.json"
         assert written == expected
         assert written.exists()
+
+
+@pytest.mark.unit
+class TestSessionScopeFilePath:
+    """session_scope_file_path resolves the per-session path WITHOUT reading env."""
+
+    def test_returns_per_session_path(self, tmp_path: Path) -> None:
+        result = session_scope_file_path(tmp_path, "my-session")
+        assert result == tmp_path / ".devbench" / "sessions" / "my-session" / "scope.json"
+
+    def test_ignores_session_env(self, tmp_path: Path) -> None:
+        """The explicit session_name wins over DEVBENCH_SESSION_NAME (env-free)."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "other-session"}, clear=False):
+            result = session_scope_file_path(tmp_path, "explicit-name")
+        assert result == tmp_path / ".devbench" / "sessions" / "explicit-name" / "scope.json"
+
+    def test_no_env_set_still_uses_explicit_name(self, tmp_path: Path) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEVBENCH_SESSION_NAME", None)
+            result = session_scope_file_path(tmp_path, "s")
+        assert result == tmp_path / ".devbench" / "sessions" / "s" / "scope.json"
+
+    @pytest.mark.parametrize("bad_name", ["../evil", "a/../b", ".."])
+    def test_rejects_path_traversal(self, tmp_path: Path, bad_name: str) -> None:
+        with pytest.raises(ValueError, match=r"invalid path segment '\.\.'"):
+            session_scope_file_path(tmp_path, bad_name)

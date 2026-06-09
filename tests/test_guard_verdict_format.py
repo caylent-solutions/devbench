@@ -257,10 +257,82 @@ class TestH3ExistingBehaviorPreserved:
         assert "verdict" in result.stderr.lower()
 
     def test_error_message_names_allowed_agent_types(self) -> None:
-        """Block message for canonical verdict must name the two allowed agent types."""
+        """Block message for canonical verdict must name the allowed agent types."""
         cmd = f"uv run devbench log-verdict code_review {SAMPLE_UNIT_ID} pass"
         result = _run_hook(cmd, agent_type="devbench-orchestrate:executor", round_token=ROUND_TOKEN)
         assert result.returncode == 2
         assert "review-supervisor" in result.stderr or "security-reviewer" in result.stderr, (
             f"stderr must name allowed agent types, got: {result.stderr!r}"
+        )
+
+
+# --------------------------------------------------------------------------- Workstream D: iac_review optional judge
+
+
+IAC_REVIEWER_AGENT_TYPE = "devbench-orchestrate:iac-deploy-reviewer"
+
+
+@pytest.mark.unit
+class TestIacReviewOptionalJudge:
+    """Workstream D: iac_review is a known + canonical reviewer judge.
+
+    iac_review is the optional evidence-verifying IaC judge. Its verdict
+    satisfies the done-gate, so it is a canonical reviewer judge subject to the
+    H3 default-deny rules: only allowed reviewer agent types (now including
+    devbench-orchestrate:iac-deploy-reviewer) may write it, and only with the
+    round token.
+    """
+
+    def test_iac_review_is_a_known_judge(self) -> None:
+        """iac_review must be accepted as a known judge name (not 'unknown judge')."""
+        cmd = f"uv run devbench log-verdict iac_review {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=IAC_REVIEWER_AGENT_TYPE, round_token=ROUND_TOKEN)
+        assert "unknown judge" not in result.stderr.lower(), (
+            f"iac_review must be a known judge; stderr: {result.stderr!r}"
+        )
+
+    def test_iac_reviewer_agent_with_token_allowed(self) -> None:
+        """The iac-deploy-reviewer agent WITH the round token may write iac_review."""
+        cmd = f"uv run devbench log-verdict iac_review {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=IAC_REVIEWER_AGENT_TYPE, round_token=ROUND_TOKEN)
+        assert result.returncode == 0, (
+            f"iac-deploy-reviewer with token should write iac_review (exit 0); stderr: {result.stderr!r}"
+        )
+
+    @pytest.mark.parametrize("agent_type", REVIEWER_AGENT_TYPES)
+    def test_existing_reviewer_agents_also_allowed_for_iac_review(self, agent_type: str) -> None:
+        """review-supervisor and security-reviewer may also write iac_review (canonical)."""
+        cmd = f"uv run devbench log-verdict iac_review {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=agent_type, round_token=ROUND_TOKEN)
+        assert result.returncode == 0, (
+            f"agent_type='{agent_type}' should write iac_review (exit 0); stderr: {result.stderr!r}"
+        )
+
+    @pytest.mark.parametrize("agent_type", NON_REVIEWER_AGENT_TYPES)
+    def test_non_reviewer_blocked_from_iac_review(self, agent_type: str) -> None:
+        """Non-reviewer agent types are default-denied from the canonical iac_review verdict."""
+        cmd = f"uv run devbench log-verdict iac_review {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=agent_type, round_token=ROUND_TOKEN)
+        assert result.returncode == 2, (
+            f"agent_type='{agent_type}' must be blocked from iac_review (exit 2); stderr: {result.stderr!r}"
+        )
+
+    def test_iac_reviewer_without_token_blocked(self) -> None:
+        """iac_review still requires the round token (H3 second factor)."""
+        cmd = f"uv run devbench log-verdict iac_review {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=IAC_REVIEWER_AGENT_TYPE, round_token=None)
+        assert result.returncode == 2, (
+            f"iac_review without round token must be blocked (exit 2); stderr: {result.stderr!r}"
+        )
+
+    def test_iac_deploy_reviewer_allowed_for_core_canonical_verdict(self) -> None:
+        """The iac-deploy-reviewer agent is in the allowlist, so it may also write core verdicts.
+
+        The allowlist is per-agent-type, not per-judge; this asserts the
+        allowlist addition is wired through for code_review as well.
+        """
+        cmd = f"uv run devbench log-verdict code_review {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=IAC_REVIEWER_AGENT_TYPE, round_token=ROUND_TOKEN)
+        assert result.returncode == 0, (
+            f"iac-deploy-reviewer is an allowed reviewer agent type; stderr: {result.stderr!r}"
         )

@@ -88,6 +88,7 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
+    OPTIONAL_JUDGE_NAMES,
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
     ModelRates,
@@ -123,6 +124,12 @@ BATCH_PR_CREATED_AUDIT_PREFIX: str = "[BATCH_PR_CREATED]"
 BATCH_PR_MERGED_AUDIT_PREFIX: str = "[BATCH_PR_MERGED]"
 
 
+# Judge names that may appear in ``max_executor_retries_per_judge``: the
+# always-on core 5 plus the optional specialty judges (which still have a
+# retry budget when enabled).
+_PER_JUDGE_RETRY_ALLOWED: frozenset[str] = ALL_REQUIRED_JUDGE_NAMES | OPTIONAL_JUDGE_NAMES
+
+
 def _load_per_judge_retries(raw_value: object) -> dict[str, int]:
     """Validate and return the per-judge retry budget map (issue #122).
 
@@ -140,13 +147,82 @@ def _load_per_judge_retries(raw_value: object) -> dict[str, int]:
         )
     result: dict[str, int] = {}
     for key, value in raw_value.items():
-        if key not in ALL_REQUIRED_JUDGE_NAMES:
-            allowed = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+        if key not in _PER_JUDGE_RETRY_ALLOWED:
+            allowed = ", ".join(sorted(_PER_JUDGE_RETRY_ALLOWED))
             raise ValueError(f"max_executor_retries_per_judge: unknown judge {key!r}. Allowed names: {allowed}.")
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"max_executor_retries_per_judge[{key!r}] must be a positive integer; got {value!r}.")
         result[key] = value
     return result
+
+
+def _load_optional_judges(raw_value: object) -> dict[str, bool]:
+    """Validate and return the optional-judge enablement map.
+
+    Mirrors :func:`_load_per_judge_retries`: the JSONSchema layer already
+    rejects unknown keys (``additionalProperties: false``) and wrong types,
+    but we re-validate at runtime to fail fast with an actionable error if
+    the schema layer drifts or a future config flow bypasses validation.
+
+    Every judge in :data:`OPTIONAL_JUDGE_NAMES` is present in the returned
+    map; absent keys default to ``False`` (disabled). The always-on core 5
+    judges are never toggleable and must not appear here.
+
+    Args:
+        raw_value: Raw ``optional_judges`` value from YAML (may be ``None``).
+
+    Returns:
+        Mapping of every optional-judge name to its resolved boolean toggle.
+
+    Raises:
+        ValueError: When *raw_value* is not a mapping, a key is not an optional
+            judge name, or a value is not a boolean.
+    """
+    result: dict[str, bool] = dict.fromkeys(OPTIONAL_JUDGE_NAMES, False)
+    if raw_value is None:
+        return result
+    if not isinstance(raw_value, dict):
+        raise ValueError(f"optional_judges must be a mapping (judge_name -> bool); got {type(raw_value).__name__}.")
+    for key, value in raw_value.items():
+        if key not in OPTIONAL_JUDGE_NAMES:
+            allowed = ", ".join(sorted(OPTIONAL_JUDGE_NAMES))
+            raise ValueError(
+                f"optional_judges: unknown judge {key!r}. Only optional specialty judges are toggleable; "
+                f"the core judges are always-on. Allowed names: {allowed}."
+            )
+        if not isinstance(value, bool):
+            raise ValueError(f"optional_judges[{key!r}] must be a boolean; got {value!r}.")
+        result[key] = value
+    return result
+
+
+def _load_done_gate(raw_value: object) -> DoneGateConfig:
+    """Validate and return the ``done_gate`` configuration.
+
+    The JSONSchema layer enforces shape + ``additionalProperties: false``;
+    this runtime helper applies the defaults and re-validates the boolean
+    type as defense-in-depth.
+
+    Args:
+        raw_value: Raw ``done_gate`` value from YAML (may be ``None``).
+
+    Returns:
+        ``DoneGateConfig`` populated from *raw_value*; ``allow_deferred_evidence``
+        defaults to ``False`` (deferred ACs block mark-done).
+
+    Raises:
+        ValueError: When *raw_value* is not a mapping or ``allow_deferred_evidence``
+            is not a boolean.
+    """
+    defaults = DoneGateConfig()
+    if raw_value is None:
+        return defaults
+    if not isinstance(raw_value, dict):
+        raise ValueError(f"done_gate must be a mapping; got {type(raw_value).__name__}.")
+    allow = raw_value.get("allow_deferred_evidence", defaults.allow_deferred_evidence)
+    if not isinstance(allow, bool):
+        raise ValueError(f"done_gate.allow_deferred_evidence must be a boolean; got {allow!r}.")
+    return DoneGateConfig(allow_deferred_evidence=allow)
 
 
 # Relative path from WORKSPACE_ROOT to the default config file location.
@@ -747,6 +823,24 @@ class AutoResolveConfig:
     max_attempts: int = DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
 
 
+@dataclass
+class DoneGateConfig:
+    """Deterministic Acceptance-Criteria evidence-gate settings.
+
+    Consumed at ``mark-done`` time. The gate requires every executable AC to
+    carry tool-captured exit-0 evidence before a unit can be marked done.
+
+    Attributes:
+        allow_deferred_evidence: When ``False`` (the default), a unit with any
+            ``type=deferred`` Verification item (operator-only ACs) is blocked
+            from ``mark-done`` and the deferred ACs are surfaced loudly. When
+            ``True``, deferred ACs do not block completion. Override via the
+            ``DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE`` env var.
+    """
+
+    allow_deferred_evidence: bool = False
+
+
 def _parse_quota_handling_config(path: Path, raw: dict) -> QuotaHandlingConfig:
     """Parse and validate the ``quota_handling:`` YAML section.
 
@@ -1344,6 +1438,16 @@ class RuntimeConfig:
         merge_strategy: Default PR merge strategy for all repos.
         max_executor_retries: Maximum executor retry attempts per work unit
             when judge reviews fail.
+        max_executor_retries_per_judge: Per-judge override of the executor
+            retry budget. Keys are core or optional judge names.
+        optional_judges: Enablement map for the optional specialty judges
+            (OPTIONAL_JUDGE_NAMES). Every optional judge name is present;
+            each defaults to ``False``. The always-on core 5 judges are not
+            toggleable and never appear here. An enabled optional judge is
+            required by the done-gate only when the unit's ``## Verification``
+            contract makes it applicable.
+        done_gate: Deterministic AC evidence-gate settings consumed at
+            ``mark-done``.
         display_timezone: IANA timezone name applied by every devbench
             command that renders timestamps (report, hook-tail, watch).
             ``None`` means OS local timezone. Per-command overrides
@@ -1379,12 +1483,14 @@ class RuntimeConfig:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
     auto_resolve: AutoResolveConfig = field(default_factory=AutoResolveConfig)
+    done_gate: DoneGateConfig = field(default_factory=DoneGateConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     use_bedrock: bool = False
     bedrock_region: str | None = None
     merge_strategy: str | None = "squash"
     max_executor_retries: int | None = None
     max_executor_retries_per_judge: dict[str, int] = field(default_factory=dict)
+    optional_judges: dict[str, bool] = field(default_factory=lambda: dict.fromkeys(OPTIONAL_JUDGE_NAMES, False))
     display_timezone: str | None = None
     log_file: str | None = None
 
@@ -1924,6 +2030,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         max_attempts=int(auto_resolve_raw.get("max_attempts", default_auto_resolve.max_attempts)),
     )
 
+    # Populate the optional-judge enablement map + done-gate settings. Both
+    # are optional with defaults so existing configs validate unchanged: every
+    # optional judge defaults to disabled and deferred evidence blocks done.
+    optional_judges = _load_optional_judges(raw.get("optional_judges"))
+    done_gate = _load_done_gate(raw.get("done_gate"))
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -1943,12 +2055,14 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         notifications=notifications,
         quota_handling=quota_handling,
         auto_resolve=auto_resolve,
+        done_gate=done_gate,
         allowed_orgs=allowed_orgs,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or "squash",
         max_executor_retries=raw.get("max_executor_retries") or None,
         max_executor_retries_per_judge=_load_per_judge_retries(raw.get("max_executor_retries_per_judge")),
+        optional_judges=optional_judges,
         display_timezone=raw.get("display_timezone") or None,
         log_file=raw.get("log_file") or None,
     )

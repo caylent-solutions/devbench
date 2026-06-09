@@ -3,7 +3,8 @@
 Provides:
 - ``QuotaExhaustedError`` exception hierarchy (base + four LSP subclasses).
 - ``detect_quota_error`` dispatcher (ten ordered rules, never raises).
-- ``_has_quota_marker`` CLI-byte substring scanner.
+- ``_has_quota_marker`` CLI-text matcher (verbatim limit markers + the precise
+  ``_RATE_LIMIT_RE`` exhaustion-phrasing regex).
 - ``_parse_reset_at_from_text`` reset-time parser.
 - ``wait_for_reset`` async poller with jittered backoff (no shield).
 - ``QuotaCheckpoint``, ``save_checkpoint``, ``load_checkpoint``, ``remove_checkpoint``
@@ -40,7 +41,6 @@ _QUOTA_MARKERS: tuple[str, ...] = (
     "You've hit your limit",
     "you've hit your limit",
     "You have hit your limit",
-    "rate limit",
 )
 
 _BEDROCK_THROTTLE_CODES: frozenset[str] = frozenset(
@@ -55,6 +55,19 @@ _BEDROCK_THROTTLE_CODES: frozenset[str] = frozenset(
 # The (UTC) timezone label is required; any other label returns None.
 _RESET_AT_RE = re.compile(
     r"resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)",
+    re.IGNORECASE,
+)
+
+# Regex: matches "rate limit" / "rate-limit" / "rate limits" ONLY when an
+# exhaustion verb follows immediately. This is the precise replacement for the
+# former bare ``"rate limit"`` substring marker, which falsely matched benign
+# prose such as "implement rate limiting", "missing rate limiting", or
+# "rate limit not exceeded" (the verb is not adjacent in those cases). The
+# genuine CLI limit line is still matched by the verbatim ``_QUOTA_MARKERS``
+# entries above; this regex only adds the non-verbatim "rate limit exceeded"
+# family.
+_RATE_LIMIT_RE = re.compile(
+    r"rate[\s-]?limits?\s+(?:exceeded|reached|hit|exhausted|resets?|try\s+again)",
     re.IGNORECASE,
 )
 
@@ -101,6 +114,18 @@ class BedrockThrottleError(QuotaExhaustedError):
     """Throttle or quota exceeded on AWS Bedrock."""
 
 
+class RecoveryProbeUnavailableError(Exception):
+    """The recovery probe cannot run -- a permanent, non-recoverable condition.
+
+    Distinct from a ``QuotaExhaustedError`` (which means "still rate limited;
+    keep waiting"). This is raised when the probe channel itself is
+    unavailable -- e.g. no API credentials are configured, or the credentials
+    are rejected (authentication / permission error). Waiting longer cannot
+    clear such a condition, so the wait loop must stop fast and surface an
+    actionable diagnostic rather than poll until ``max_wait_seconds`` elapses.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Clock helper (injectable via mock in tests)
 # ---------------------------------------------------------------------------
@@ -119,13 +144,23 @@ def _get_current_utc() -> datetime:
 def _has_quota_marker(text: object) -> bool:
     """Return True when ``text`` is a str containing a known quota marker.
 
-    The scan is a simple substring search over the exact CLI byte sequences
-    enumerated in ``_QUOTA_MARKERS``. Non-string input returns False without
-    raising.
+    Two precise signatures are recognised:
+
+    1. A substring match against the verbatim CLI limit lines enumerated in
+       ``_QUOTA_MARKERS`` (e.g. "You've hit your limit").
+    2. A regex match of ``_RATE_LIMIT_RE`` -- "rate limit" only when an
+       exhaustion verb (exceeded / reached / hit / exhausted / resets /
+       try again) follows immediately.
+
+    Benign prose such as "implement rate limiting", "missing rate limiting",
+    or "rate limit not exceeded" does NOT match by design -- only genuine
+    exhaustion phrasing does. Non-string input returns False without raising.
     """
     if not isinstance(text, str):
         return False
-    return any(marker in text for marker in _QUOTA_MARKERS)
+    if any(marker in text for marker in _QUOTA_MARKERS):
+        return True
+    return _RATE_LIMIT_RE.search(text) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +293,18 @@ def _apply_rules_1_to_5(obj: object, status_code: object) -> QuotaExhaustedError
 
 def _apply_rules_6_to_9(obj: object) -> QuotaExhaustedError | None:
     """Rules 6-9: CLI message surfaces and BaseException with quota marker."""
-    # Rule 6: UserMessage with ToolResultBlock (content blocks with .content field)
+    # Rule 6: UserMessage with ToolResultBlock (content blocks with .content field).
+    # Defense-in-depth gate: scan only error or unknown-status results. A
+    # successful tool result (``is_error is False``) carries benign sub-agent
+    # prose -- e.g. a reviewer echoing "implement rate limiting" -- which must
+    # never trip detection. A genuine sub-agent limit is an error result
+    # (``is_error is True``) but may also arrive with ``is_error`` unset
+    # (``None``), so only the explicit ``False`` case is skipped.
     content = _safe_getattr(obj, "content")
     if isinstance(content, (list, tuple)):
         for block in content:
+            if _safe_getattr(block, "is_error") is False:
+                continue
             block_content = _safe_getattr(block, "content")
             if isinstance(block_content, str) and _has_quota_marker(block_content):
                 return SubscriptionRateLimitError(
@@ -322,7 +365,8 @@ def detect_quota_error(obj: object) -> QuotaExhaustedError | None:
        (source=anthropic-api).
     5. ``response.Error.Code`` in Bedrock throttle set -- ``BedrockThrottleError``
        (source=bedrock).
-    6. UserMessage with ToolResultBlock containing a quota marker
+    6. UserMessage with a ToolResultBlock that is not a successful result
+       (``is_error`` is True or unset) containing a quota marker
        -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
     7. Object with ``error == 'rate_limit'`` (AssistantMessage surface)
        -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
@@ -408,11 +452,17 @@ async def wait_for_reset(
 
     Returns:
         ``True`` when the probe confirmed recovery before ``max_wait_seconds``
-        elapsed; ``False`` when the timeout was hit.
+        elapsed, OR when the probe is unavailable but a known ``reset_at`` has
+        already passed (the provider-stated reset time is the readiness signal);
+        ``False`` when the timeout was hit.
 
     Raises:
         ValueError: When ``backoff_config.initial_seconds != poll_interval_seconds``.
-        Any exception raised by ``probe_fn``.
+        RecoveryProbeUnavailableError: When the probe is permanently unavailable
+            (no/invalid credential) AND no usable ``reset_at`` is known -- the
+            caller must fail fast rather than poll a probe that can never
+            succeed.
+        Any other exception raised by ``probe_fn``.
     """
     if backoff_config is None:
         backoff_config = BackoffConfig(
@@ -450,8 +500,18 @@ async def wait_for_reset(
         if elapsed >= max_wait_seconds:
             return False
 
-        if probe_fn():
-            return True
+        try:
+            if probe_fn():
+                return True
+        except RecoveryProbeUnavailableError:
+            # The probe cannot confirm recovery (no/invalid credential). If the
+            # provider told us when the limit resets and that time has passed,
+            # treat the reset time itself as the readiness signal and resume.
+            # Otherwise (reset time unknown) propagate so the caller fails fast
+            # instead of polling a probe that can never succeed.
+            if reset_at is not None and _get_current_utc() >= reset_at:
+                return True
+            raise
 
         # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.
         jitter_factor = 1.0 + rng.uniform(-backoff_config.jitter, backoff_config.jitter)
@@ -645,25 +705,50 @@ def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
 
     Returns:
         ``True`` when the probe call succeeded (quota has cleared).
-        ``False`` when the probe hit a quota error or a transient network
+        ``False`` when the probe hit a quota error or a transient API/network
         error (quota may still be exhausted or network is temporarily down;
         treat as "not yet recovered" without crashing).
 
     Raises:
         ValueError: When ``timeout_seconds <= 0`` or ``request_size_tokens < 1``
             (fail-fast before any I/O).
+        RecoveryProbeUnavailableError: When the probe channel is permanently
+            unavailable -- no API credential is configured, or the credential
+            is rejected (authentication / permission error). Waiting cannot
+            clear this, so the caller must stop polling and fail fast.
     """
     if timeout_seconds <= 0:
         raise ValueError(f"recovery_probe: timeout_seconds must be > 0; got {timeout_seconds!r}.")
     if request_size_tokens < 1:
         raise ValueError(f"recovery_probe: request_size_tokens must be >= 1; got {request_size_tokens!r}.")
+    import anthropic
+
     try:
         _probe_api_call(timeout_seconds, request_size_tokens)
         return True
     except QuotaExhaustedError:
         return False
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+        # Rejected credentials -- permanent; waiting cannot fix it.
+        raise RecoveryProbeUnavailableError(
+            f"recovery probe could not authenticate to the Anthropic API ({type(exc).__name__}). "
+            "Configure a valid API credential so quota recovery can be confirmed, "
+            "or rely on the provider-supplied reset time."
+        ) from exc
+    except anthropic.APIError:
+        # Other API/network errors (incl. 429, connection, timeout) are
+        # transient -- treat as "still exhausted" and keep polling.
+        return False
+    except anthropic.AnthropicError as exc:
+        # Non-API AnthropicError = client construction/config failure, e.g. no
+        # API credential is configured at all -- permanent, not recoverable.
+        raise RecoveryProbeUnavailableError(
+            "recovery probe has no usable Anthropic API credential configured. "
+            "Quota recovery cannot be probed; configure a credential or rely on "
+            "the provider-supplied reset time."
+        ) from exc
     except Exception:
-        # Transient network error -- treat as "still exhausted"; do not crash.
+        # Any other transient error -- treat as "still exhausted"; do not crash.
         return False
 
 

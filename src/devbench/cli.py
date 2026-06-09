@@ -97,6 +97,7 @@ def _pre_parse_config(argv: list[str]) -> None:
 
 _pre_parse_config(sys.argv)
 
+from devbench import verification
 from devbench.actionability import check_actionability
 from devbench.backlog.amendment import (
     REVIEW_FAILURES_DIR_NAME,
@@ -215,6 +216,7 @@ from devbench.plugin_shadow import (
 from devbench.quota import (
     QuotaCheckpoint,
     QuotaExhaustedError,
+    RecoveryProbeUnavailableError,
     _apply_resume_strategy,
     detect_quota_error,
     load_checkpoint,
@@ -228,7 +230,14 @@ from devbench.quota import (
 # orchestrator-alive banner. Single source of truth lives in report.py because
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
-from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
+from devbench.scope import (
+    InvalidScopeError,
+    ScopeFilter,
+    _expand_prefix,
+    _scope_file_path,
+    _tokenise,
+    session_scope_file_path,
+)
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
@@ -4444,6 +4453,242 @@ def cmd_run_tests(unit_id: str) -> int:
     return rc
 
 
+def _run_verification_item(
+    item: "verification.VerificationItem",
+    repo_path: Path,
+    workspace_root: Path,
+    task_id: str,
+    attempt: int,
+    *,
+    log_bytes: int,
+    timeout: int,
+) -> "verification.EvidenceRecord":
+    """Execute one executable VERIFY directive and capture its REAL exit code.
+
+    Runs ``item.command`` via ``bash -c`` in the target repo working dir (the
+    command grammar legitimately contains ``$VARS`` and pipes, so a shell is
+    required), trims the combined stdout/stderr to *log_bytes*, writes the
+    trimmed text to a per-AC artifact, and returns an
+    :class:`verification.EvidenceRecord` carrying the tool-captured exit code.
+
+    The exit code is never self-reported: it comes straight from the subprocess.
+    An executable directive with no ``cmd=`` is recorded as a hard failure (exit
+    code ``SUBPROCESS_ERROR_EXIT_CODE``) rather than silently passing an empty
+    shell -- a missing command can never be proof of a passing AC.
+    """
+    from devbench.constants import SUBPROCESS_ERROR_EXIT_CODE
+
+    started_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    command = item.command or ""
+    if not command.strip():
+        rc, stdout, stderr = (
+            SUBPROCESS_ERROR_EXIT_CODE,
+            "",
+            f"VERIFY {', '.join(item.ac_ids)} is executable (type={item.vtype.value}) but declares no cmd=`...`.",
+        )
+    else:
+        rc, stdout, stderr = run_command(["bash", "-c", command], cwd=repo_path, timeout=timeout)
+    finished_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+
+    combined = "\n".join(part for part in (stdout, stderr) if part.strip())
+    trimmed = verification.trim_log(combined, log_bytes)
+
+    attempt_dir = verification.evidence_attempt_dir(workspace_root, task_id, attempt)
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = attempt_dir / f"{verification.sanitize_ac_label(item.ac_ids)}.log"
+    atomic_write_text(artifact_path, trimmed if trimmed else "(no output)\n")
+
+    summary = (
+        f"{', '.join(item.ac_ids)} via `{command}` exited {rc} (expected {item.expect_exit}); log at {artifact_path}."
+    )
+    return verification.EvidenceRecord(
+        ac_ids=list(item.ac_ids),
+        vtype=item.vtype.value,
+        command=command,
+        exit_code=rc,
+        tool=item.tool,
+        started_at=started_at,
+        finished_at=finished_at,
+        artifact=str(artifact_path),
+        summary=summary,
+    )
+
+
+def _resolve_unit_file_and_repo_path(unit_id: str) -> tuple[Path, Path] | None:
+    """Return ``(work_unit_path, repo_path)`` for *unit_id*, or ``None`` on error.
+
+    Looks up the unit in the backlog index, resolves its on-disk ``.md`` file and
+    its configured target-repo working directory. Prints an actionable error to
+    stderr and returns ``None`` when any step fails, so the caller can ``return 1``.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    unit = _find_unit(parser.parse_index(), unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return None
+
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+        return None
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return None
+    return wu_file, repo_path
+
+
+def cmd_verify_ac(unit_id: str) -> int:
+    """Execute the work unit's ``## Verification`` contract and record evidence.
+
+    Resolves the unit's target repo (via ``REPO_LOCAL_PATHS``), parses the
+    ``## Verification`` section, and for every *executable* directive (skipping
+    ``judge`` and ``deferred`` items) runs the command in the repo working dir,
+    capturing the REAL tool exit code -- never a self-reported one. Each result
+    is trimmed and written to ``.devbench/evidence/<id>/<attempt>/<ac>.log`` and
+    aggregated into ``.devbench/evidence/<id>/<attempt>/evidence.json`` (the
+    ledger the done-gate and the ``iac_review`` judge load).
+
+    Also runs the deterministic TDD genuine-RED gate, preferring the
+    tool-captured RED exit code from the freshly written evidence ledger over
+    the executor's self-reported ``log-tdd RED`` value.
+
+    Exits ``0`` when every executable item met its ``expect-exit`` and the TDD
+    gate passed; non-zero otherwise (so the orchestrator blocks before review).
+    """
+    from devbench.config import CI_FAILURE_LOG_BYTES, TEST_TIMEOUT
+
+    resolved = _resolve_unit_file_and_repo_path(unit_id)
+    if resolved is None:
+        return 1
+    wu_file, repo_path = resolved
+
+    content = wu_file.read_text(encoding="utf-8")
+    try:
+        items = verification.parse_verification_section(content)
+    except ValueError as exc:
+        print(f"ERROR: malformed '## Verification' directive in {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    executable = verification.executable_items(items)
+    attempt = verification.next_attempt_number(WORKSPACE_ROOT, unit_id)
+
+    records: list[verification.EvidenceRecord] = []
+    for item in executable:
+        records.append(
+            _run_verification_item(
+                item,
+                repo_path,
+                WORKSPACE_ROOT,
+                unit_id,
+                attempt,
+                log_bytes=CI_FAILURE_LOG_BYTES,
+                timeout=TEST_TIMEOUT,
+            )
+        )
+
+    ledger_path = verification.write_evidence_ledger(WORKSPACE_ROOT, unit_id, attempt, records)
+
+    failures = [r for r, item in zip(records, executable, strict=True) if r.exit_code != item.expect_exit]
+    tdd_failed = _run_tdd_gate_with_evidence(content, repo_path, records)
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "attempt": attempt,
+                "ledger": str(ledger_path),
+                "executable_items": len(executable),
+                "failures": [r.summary for r in failures],
+                "records": [r.to_dict() for r in records],
+            },
+            indent=2,
+        )
+    )
+
+    if failures:
+        print(
+            f"ERROR: {len(failures)} executable Acceptance Criterion verification(s) did not "
+            f"meet expect-exit for {unit_id}; see {ledger_path}.",
+            file=sys.stderr,
+        )
+        return 1
+    if tdd_failed is not None:
+        print(f"ERROR: TDD genuine-RED gate rejected {unit_id}: {tdd_failed}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_tdd_gate_with_evidence(
+    content: str,
+    repo_path: Path,
+    records: list["verification.EvidenceRecord"],
+) -> str | None:
+    """Invoke the deterministic TDD genuine-RED gate from a Python code path.
+
+    The gate (``tdd_gate.check_tdd_gate``) was previously dead code with no
+    Python caller and read a self-reported RED exit code. This wires it into
+    ``verify-ac``: when a ``red`` evidence record carries a tool-captured exit
+    code, that code is spliced into the work-unit content (replacing the
+    self-reported ``log-tdd RED`` ``Exit:`` token the gate reads) so the gate
+    judges genuine RED on tool-captured proof. Falls back to the work unit's
+    recorded RED exit code when no tool-captured RED evidence exists.
+
+    Returns the gate's rejection message when it rejects, or ``None`` on pass
+    (including when the unit logged no RED entry at all -- the gate is a no-op
+    there, preserving back-compat for units without a TDD cycle).
+    """
+    from devbench import tdd_gate
+
+    if tdd_gate.extract_red_exit_code(content) is None:
+        return None  # no RED entry recorded -- gate not applicable
+
+    gate_content = content
+    captured = _tool_captured_red_exit(records)
+    if captured is not None:
+        gate_content = _splice_red_exit_code(content, captured)
+
+    rc, diff_stdout, _ = run_command(["git", "diff", "HEAD"], cwd=repo_path)
+    diff_output = diff_stdout if rc == 0 else ""
+    result = tdd_gate.check_tdd_gate(gate_content, diff_output)
+    return None if result.passed else result.message
+
+
+def _tool_captured_red_exit(records: list["verification.EvidenceRecord"]) -> int | None:
+    """Return the exit code of the last RED-type evidence record, or ``None``.
+
+    A verification item authored as ``type=command`` whose AC ids include a
+    ``red`` marker, or a directive explicitly tagged ``tool=red``, is treated as
+    the genuine-RED proof. We accept any record whose ``tool`` equals ``red`` so
+    authors can mark the RED command without a new VerificationType.
+    """
+    captured: int | None = None
+    for rec in records:
+        if rec.tool == "red":
+            captured = rec.exit_code
+    return captured
+
+
+_RED_EXIT_TOKEN_RE: re.Pattern[str] = re.compile(r"(\[RED\][^\n]*?\bExit:\s*)(\d+)")
+
+
+def _splice_red_exit_code(content: str, exit_code: int) -> str:
+    """Replace the ``Exit: <n>`` token in the last RED log entry with *exit_code*.
+
+    Keeps the rest of the work-unit content byte-identical so the TDD gate's
+    other checks (production-file presence, Task Type exemption) operate on the
+    real file. Only the trailing RED entry's exit token is rewritten.
+    """
+    matches = list(_RED_EXIT_TOKEN_RE.finditer(content))
+    if not matches:
+        return content
+    last = matches[-1]
+    return content[: last.start(2)] + str(exit_code) + content[last.end(2) :]
+
+
 def _reject_em_dash(field_name: str, text: str) -> int | None:
     """Reject any agent-supplied text containing U+2014 before it reaches the backlog.
 
@@ -6760,6 +7005,38 @@ _QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
 #: Format: ``[QUOTA_RESUMED] waited_seconds=<int>``
 _QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
 
+#: Audit marker emitted when the recovery probe is permanently unavailable
+#: (no/invalid API credential) and no provider-supplied reset time is known, so
+#: the orchestrator stops the wait immediately instead of polling a probe that
+#: can never succeed.  Format: ``[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>``
+_QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX: str = "[QUOTA_PROBE_UNAVAILABLE]"
+
+#: Audit marker emitted when ``on_exhaustion=fail`` (detection) or
+#: ``on_exhaustion_timeout=fail`` (timeout) aborts the run by re-raising the
+#: quota error for a non-zero exit.  Format: ``[QUOTA_FAIL_FAST] reason=<source>``
+_QUOTA_FAIL_FAST_AUDIT_PREFIX: str = "[QUOTA_FAIL_FAST]"
+
+#: Audit marker emitted when ``on_exhaustion=drain`` (detection) or
+#: ``on_exhaustion_timeout=drain`` (timeout) requests a graceful drain instead
+#: of waiting / instead of failing.
+#: Format: ``[QUOTA_DRAIN_REQUESTED] reason=<source> phase=<detection|timeout>``
+_QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX: str = "[QUOTA_DRAIN_REQUESTED]"
+
+#: Audit marker emitted when ``on_exhaustion_timeout=keep_waiting`` elects not
+#: to escalate after the wait cap elapsed (the Makefile restart loop re-enters).
+#: Format: ``[QUOTA_TIMEOUT_KEEP_WAITING] reason=<source>``
+_QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX: str = "[QUOTA_TIMEOUT_KEEP_WAITING]"
+
+#: ``_stop_reason`` strings returned by the quota dispatch when a graceful drain
+#: was requested.  ``cmd_start`` checks membership to know it must NOT cancel the
+#: drain signal in its exit ``finally`` blocks (the signal must survive so the
+#: restart loop / a peer session drains).
+_QUOTA_STOP_REASON_DRAIN_DETECTION: str = "quota-drain-requested"
+_QUOTA_STOP_REASON_DRAIN_TIMEOUT: str = "quota-wait-timeout-drain"
+_QUOTA_DRAIN_STOP_REASONS: frozenset[str] = frozenset(
+    {_QUOTA_STOP_REASON_DRAIN_DETECTION, _QUOTA_STOP_REASON_DRAIN_TIMEOUT}
+)
+
 #: HTTP timeout in seconds for the ``recovery_probe`` API call issued during
 #: quota wait polling.  A short timeout avoids blocking the orchestrator for
 #: more than one poll cycle on a transient network hang.
@@ -7016,7 +7293,12 @@ def _write_session_state_files(
     - ``pid`` -- the process ID (plain integer text).
     - ``started_at`` -- UTC ISO-8601 timestamp of when the session was created.
     - ``started_by`` -- OS username of the process owner.
-    - ``scope.json`` -- JSON array of work-unit IDs in scope (may be empty).
+
+    The session's scope is persisted to ``scope.json`` separately by
+    :meth:`ScopeFilter.to_file` (object schema) when ``--include`` is supplied;
+    this function does NOT write ``scope.json`` (it formerly wrote a bare JSON
+    array that the object-schema readers reject as corrupt).  The expanded
+    ``scope_ids`` are still recorded in the session registry below.
 
     Also registers the session in the
     ``<workspace_root>/.devbench/sessions/registry.json`` via
@@ -7053,8 +7335,10 @@ def _write_session_state_files(
     # started_by
     (state_dir / SESSION_STARTED_BY_FILENAME).write_text(started_by, encoding="utf-8")
 
-    # scope.json -- written as a JSON array of IDs
-    (state_dir / "scope.json").write_text(json.dumps(scope_ids, indent=2), encoding="utf-8")
+    # NOTE: scope.json is intentionally NOT written here.  It is owned solely by
+    # ScopeFilter.to_file (object schema), which cmd_start invokes only when
+    # --include is supplied.  Writing a bare JSON array here produced the
+    # "scope.json corrupt -- got 'list'" failure on no-include starts.
 
     # registry.json -- add or update this session
     registry = SessionRegistry(workspace_root)
@@ -7576,6 +7860,10 @@ async def _handle_quota_pause(
     4. On recovery: emits ``[QUOTA_RESUMED] waited_seconds=<N>``,
        applies the resume strategy, returns ``True``.
     5. On timeout: returns ``False`` (caller applies ``on_exhaustion_timeout``).
+    6. When the recovery probe is permanently unavailable (no/invalid
+       credential) and no reset time is known: emits
+       ``[QUOTA_PROBE_UNAVAILABLE]`` and returns ``False`` immediately rather
+       than polling for the full ``max_wait_seconds``.
 
     Args:
         exc: The detected ``QuotaExhaustedError``.
@@ -7609,17 +7897,29 @@ async def _handle_quota_pause(
 
     backoff = BackoffConfig(initial_seconds=qh_cfg.poll_interval_seconds)
 
-    recovered = await wait_for_reset(
-        reset_at=exc.reset_at,
-        poll_interval_seconds=qh_cfg.poll_interval_seconds,
-        max_wait_seconds=qh_cfg.max_wait_seconds,
-        probe_fn=functools.partial(
-            recovery_probe,
-            timeout_seconds=_RECOVERY_PROBE_TIMEOUT_SECONDS,
-            request_size_tokens=_RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
-        ),
-        backoff_config=backoff,
-    )
+    try:
+        recovered = await wait_for_reset(
+            reset_at=exc.reset_at,
+            poll_interval_seconds=qh_cfg.poll_interval_seconds,
+            max_wait_seconds=qh_cfg.max_wait_seconds,
+            probe_fn=functools.partial(
+                recovery_probe,
+                timeout_seconds=_RECOVERY_PROBE_TIMEOUT_SECONDS,
+                request_size_tokens=_RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+            ),
+            backoff_config=backoff,
+        )
+    except RecoveryProbeUnavailableError as probe_exc:
+        # The probe cannot confirm recovery (no/invalid credential) and no
+        # provider reset time is known. Stop immediately with an actionable
+        # audit instead of polling for the full ``max_wait_seconds``.
+        logger.info(
+            "%s reason=%s detail=%s",
+            _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX,
+            exc.source,
+            probe_exc,
+        )
+        return False
 
     if recovered:
         waited_seconds = int((datetime.now(tz=UTC) - wait_start).total_seconds())
@@ -7650,12 +7950,37 @@ def _restore_session_env_name(prev: str | None) -> None:
         os.environ["DEVBENCH_SESSION_NAME"] = prev
 
 
+def _cancel_drain_unless_requested(workspace_root: Path, quota_drain_requested: bool) -> None:
+    """Best-effort cancel of a pending drain signal on ``cmd_start`` exit.
+
+    Skips the cancel when the quota dispatch deliberately requested a drain
+    (``on_exhaustion``/``on_exhaustion_timeout`` == ``drain``): that signal MUST
+    survive process exit so the Makefile restart loop / a peer session acts on
+    it (#236 follow-up).  Otherwise cancels any stale drain so the next start
+    does not inherit it.  Idempotent; suppresses filesystem errors.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        quota_drain_requested: True when the quota dispatch requested a drain.
+    """
+    if quota_drain_requested:
+        return
+    with contextlib.suppress(OSError):
+        cancel_drain(workspace_root)
+
+
 def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> str:
     """Handle a detected quota signal from ``cmd_start._run``.
 
-    Dispatches to :func:`_handle_quota_pause` when ``quota_handling.enabled``
-    is true, or re-raises the wrapped :class:`~devbench.quota.QuotaExhaustedError`
-    for the legacy non-zero exit when ``enabled`` is false (AC-236-1).
+    Applies the configured ``quota_handling`` policy:
+
+    - ``enabled: false`` -- re-raise the wrapped
+      :class:`~devbench.quota.QuotaExhaustedError` for the legacy non-zero exit.
+    - ``on_exhaustion`` (detection-time): ``fail`` re-raises immediately;
+      ``drain`` requests a graceful drain and stops without waiting; ``wait``
+      (default) pauses and polls via :func:`_handle_quota_pause`.
+    - On a wait timeout (or an unrecoverable probe), ``on_exhaustion_timeout``
+      is applied via :func:`_dispatch_quota_timeout`.
 
     Extracted from ``cmd_start`` to keep that function under ruff's PLR0912
     12-branch limit.
@@ -7666,14 +7991,31 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
 
     Returns:
         A descriptive ``_stop_reason`` string for the ``cmd_start`` audit trail.
+        When a graceful drain was requested the string is a member of
+        :data:`_QUOTA_DRAIN_STOP_REASONS` so ``cmd_start`` preserves the signal.
 
     Raises:
-        :class:`~devbench.quota.QuotaExhaustedError`: When ``enabled`` is false
-            (legacy exit path).
+        :class:`~devbench.quota.QuotaExhaustedError`: When ``enabled`` is false,
+            or when ``on_exhaustion``/``on_exhaustion_timeout`` is ``fail``.
     """
     qh_cfg = RUNTIME_CONFIG.quota_handling
     if not _should_handle_quota(detected.quota_exc, qh_cfg):
         raise detected.quota_exc from detected
+
+    # on_exhaustion is consulted at DETECTION time, before any wait.
+    if qh_cfg.on_exhaustion == "fail":
+        logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        raise detected.quota_exc from detected
+    if qh_cfg.on_exhaustion == "drain":
+        logger.info(
+            "%s reason=%s phase=detection",
+            _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+            detected.quota_exc.source,
+        )
+        request_drain(WORKSPACE_ROOT, reason=f"quota-exhaustion:{detected.quota_exc.source}")
+        return _QUOTA_STOP_REASON_DRAIN_DETECTION
+
+    # on_exhaustion == "wait" (validated default): pause and poll for recovery.
     recovered = asyncio.run(
         _handle_quota_pause(
             exc=detected.quota_exc,
@@ -7682,18 +8024,75 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
             session_name=session_name,
         )
     )
-    return "quota-wait-recovered" if recovered else "quota-wait-timeout"
+    if recovered:
+        return "quota-wait-recovered"
+
+    # Timeout (max_wait elapsed) or an unrecoverable probe: apply
+    # on_exhaustion_timeout (default "drain").
+    return _dispatch_quota_timeout(detected, qh_cfg.on_exhaustion_timeout)
 
 
-def _resolve_scope_ids_or_error(parsed: _CmdStartArgs) -> tuple[list[str], int | None]:
+def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
+    """Apply ``on_exhaustion_timeout`` after the wait cap elapses or the probe is unavailable.
+
+    Args:
+        detected: The original quota sentinel (holds ``quota_exc`` for re-raise).
+        action: ``on_exhaustion_timeout`` value -- ``"drain"`` (default),
+            ``"fail"``, or ``"keep_waiting"``.
+
+    Returns:
+        A descriptive ``_stop_reason`` string for ``"drain"`` / ``"keep_waiting"``.
+        ``"drain"`` returns :data:`_QUOTA_STOP_REASON_DRAIN_TIMEOUT` so
+        ``cmd_start`` preserves the drain signal.
+
+    Raises:
+        ValueError: When *action* is not a recognised value (defends against
+            config-schema drift; the loader already validates the enum).
+        :class:`~devbench.quota.QuotaExhaustedError`: When ``action == "fail"``
+            (legacy non-zero exit).
+    """
+    if action not in ("drain", "fail", "keep_waiting"):
+        raise ValueError(
+            f"unknown on_exhaustion_timeout action {action!r}. Allowed values: ['drain', 'fail', 'keep_waiting']."
+        )
+    if action == "fail":
+        logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        raise detected.quota_exc from detected
+    if action == "keep_waiting":
+        logger.info(
+            "%s reason=%s",
+            _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX,
+            detected.quota_exc.source,
+        )
+        return "quota-wait-timeout-keep-waiting"
+    # Remaining validated action: drain.
+    logger.info(
+        "%s reason=%s phase=timeout",
+        _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+        detected.quota_exc.source,
+    )
+    request_drain(WORKSPACE_ROOT, reason=f"quota-timeout:{detected.quota_exc.source}")
+    return _QUOTA_STOP_REASON_DRAIN_TIMEOUT
+
+
+def _resolve_scope_ids_or_error(parsed: _CmdStartArgs, session_scope_path: Path) -> tuple[list[str], int | None]:
     """Build the session scope ID list and check for overlaps.
 
     Extracted from ``cmd_start`` to keep that function's return-statement count
     under ruff PLR0911's ceiling.  Combines the scope-token parsing step and the
     overlap-detection step so the caller only needs a single early-exit check.
 
+    Scope persistence is single-sourced through :meth:`ScopeFilter.to_file` at
+    the explicit per-session ``session_scope_path`` (NOT the env-routed default,
+    because ``DEVBENCH_SESSION_NAME`` is not set yet at this point in
+    ``cmd_start``).  When ``--include`` is absent the run is UNSCOPED, which is
+    represented by the ABSENCE of scope.json; any stale file left by a prior
+    ``--include`` run or crash is cleared so this run is not silently re-scoped.
+
     Args:
         parsed: Parsed ``cmd_start`` arguments produced by ``_parse_start_args``.
+        session_scope_path: Explicit per-session scope.json path
+            (from :func:`~devbench.scope.session_scope_file_path`).
 
     Returns:
         ``(scope_ids, None)`` on success.  ``([], error_rc)`` when the scope
@@ -7710,9 +8109,14 @@ def _resolve_scope_ids_or_error(parsed: _CmdStartArgs) -> tuple[list[str], int |
         except InvalidScopeError as exc:
             print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
             return [], 1
-        scope_file = scope.to_file(WORKSPACE_ROOT)
+        scope_file = scope.to_file(WORKSPACE_ROOT, path=session_scope_path)
         os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
         scope_ids = sorted(scope.expanded_ids)
+    else:
+        # No --include => UNSCOPED (all WUs eligible).  Absence of scope.json is
+        # the unscoped sentinel; delete any stale object left by a prior
+        # --include run or crash so this run is not silently re-scoped.
+        ScopeFilter.clear(WORKSPACE_ROOT, path=session_scope_path)
 
     if scope_ids:
         overlap_rc = _check_scope_overlap(WORKSPACE_ROOT, scope_ids, parsed.allow_overlap)
@@ -7804,12 +8208,19 @@ def cmd_start(*argv: str) -> int:
     # instance MUST not keep the new instance's tasks bucketed there.
     _write_last_restart_marker(WORKSPACE_ROOT)
 
+    # Resolve the per-session scope.json path explicitly (env-free): cmd_start
+    # sets DEVBENCH_SESSION_NAME only later, so the env-routed resolver would
+    # otherwise target the workspace-root path while the SDK-subprocess readers
+    # use the per-session path.  Computing it once here keeps the writer, the
+    # clean-exit clear, and the subprocess readers in agreement (#236 follow-up).
+    session_scope_path = session_scope_file_path(WORKSPACE_ROOT, parsed.name)
+
     # Determine the scope IDs for this session and detect any overlap.
     # AC-192-4: build + persist the ScopeFilter when --include is supplied, then
     # consult active sessions for scope overlap.  Both the invalid-token and
     # overlap-detected error paths are handled inside the helper to keep
     # cmd_start's return-statement count under ruff PLR0911's ceiling.
-    scope_ids, scope_rc = _resolve_scope_ids_or_error(parsed)
+    scope_ids, scope_rc = _resolve_scope_ids_or_error(parsed, session_scope_path)
     if scope_rc is not None:
         return scope_rc
 
@@ -7993,6 +8404,11 @@ def cmd_start(*argv: str) -> int:
     # helper is best-effort so a failure here cannot mask the original
     # exit reason.
     _stop_reason: str = "clean"
+    # Issue #236 follow-up: when the quota dispatch requests a graceful drain,
+    # the drain signal MUST survive cmd_start's exit so the restart loop / a
+    # peer session acts on it.  This flag tells the exit finally blocks below to
+    # skip their otherwise-unconditional cancel_drain.
+    _quota_drain_requested: bool = False
     try:
         try:
             try:
@@ -8008,17 +8424,18 @@ def cmd_start(*argv: str) -> int:
             except _QuotaDetected as exc:
                 # Issue #236 (AC-236-1): quota wait-and-resume dispatch.
                 _stop_reason = _dispatch_quota_detection(exc, parsed.name)
+                # A drain requested by on_exhaustion / on_exhaustion_timeout must
+                # outlive this process; signal the finally blocks to preserve it.
+                _quota_drain_requested = _stop_reason in _QUOTA_DRAIN_STOP_REASONS
                 return 0
         finally:
             # Issue #212: drop the drain signal on any exit from the SDK run so
             # the next start does not inherit a stale request.  Run while
             # DEVBENCH_SESSION_NAME is still set (before the restore below) so
             # cancel_drain scans both the per-session and workspace-root
-            # candidate paths.  Idempotent on already-clean state.
-            import contextlib as _contextlib
-
-            with _contextlib.suppress(OSError):
-                cancel_drain(WORKSPACE_ROOT)
+            # candidate paths.  Idempotent on already-clean state.  Preserved when
+            # the quota dispatch deliberately requested a drain (#236 follow-up).
+            _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
             # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
             # maintained when cmd_start is invoked multiple times in the same process.
             _restore_session_env_name(_prev_session_name)
@@ -8028,8 +8445,10 @@ def cmd_start(*argv: str) -> int:
         # AC-190-13: delete scope.json on clean SDK exit so the next run starts
         # without a stale scope.  On crash (SDK raises), the exception propagates
         # before this line runs, intentionally leaving scope.json in place for
-        # operator inspection.
-        ScopeFilter.clear(WORKSPACE_ROOT)
+        # operator inspection.  Use the explicit per-session path: the inner
+        # finally above has already restored DEVBENCH_SESSION_NAME, so the
+        # env-routed default would otherwise target the wrong path (#236 follow-up).
+        ScopeFilter.clear(WORKSPACE_ROOT, path=session_scope_path)
 
         # Issue #262 (E10-F1-S3): fail-fast on continuation-budget exhaustion.
         # Issue #217: bubble the SDK's final ResultMessage text into the Slack reason.
@@ -8066,9 +8485,10 @@ def cmd_start(*argv: str) -> int:
         # per-session and workspace-root candidate paths and is idempotent
         # on already-clean state.  Best-effort: NameError guards a very
         # early exit before WORKSPACE_ROOT was set; OSError covers
-        # permission-denied during unlink.
+        # permission-denied during unlink.  Preserved when the quota dispatch
+        # deliberately requested a drain (#236 follow-up) so it survives exit.
         with contextlib.suppress(OSError, NameError):
-            cancel_drain(WORKSPACE_ROOT)
+            _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
 
 
 def cmd_prepare_plugin_shadow() -> int:
@@ -11208,6 +11628,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
+    "verify-ac": (
+        cmd_verify_ac,
+        1,
+        "Execute the unit's '## Verification' contract, capture tool exit codes, write evidence: verify-ac <id>",
+    ),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
     "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),
     "log-tdd": (cmd_log_tdd, 3, "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message>"),

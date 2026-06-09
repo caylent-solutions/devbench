@@ -154,10 +154,42 @@ docs/authoring-manifests.md for the alternative patterns:
 ## Definition of Done
 
 - [ ] All acceptance criteria checked
-- [ ] `uv run pytest tests/ -v` passes
-- [ ] `uv run ruff check src/ tests/` passes
-- [ ] `uv run ruff format --check src/ tests/` passes
+- [ ] AC-TEST-002 verified -- `uv run pytest tests/ -v` passes
+- [ ] AC-LINT-001 verified -- `uv run ruff check src/ tests/` passes
+- [ ] AC-LINT-002 verified -- `uv run ruff format --check src/ tests/` passes
 - [ ] Only files in Changes Manifest are staged with `git add`
+
+<!--
+The Definition of Done is a PROCESS checklist. It MUST NOT assert a runnable/testable
+outcome that is not also an Acceptance Criterion. Each runnable DoD item above cites the
+AC-N it satisfies (AC-TEST-002 / AC-LINT-001 / AC-LINT-002). validate-backlog --strict
+flags any DoD item that asserts a runnable outcome without referencing an AC.
+-->
+
+## Verification
+
+<!--
+One directive per EXECUTABLE Acceptance Criterion. An executable AC asserts a
+runnable/testable outcome (terraform/terragrunt/tofu/apply/deploy/terratest/pytest/
+make/cdk/sam/... or "passes" / "succeeds" / "smoke"). Each maps to a command whose REAL
+exit code `devbench verify-ac` captures (never self-reported); `mark-done` is blocked
+until every executable AC has a tool-captured exit-0 record. Grammar:
+
+  VERIFY AC-N | type=[terratest|apply|plan|destroy|deploy|smoke|command] | tool=[optional] | cmd=`[command]` | expect-exit=0
+
+Use 'type=deferred | owner=operator | reason="..."' for operator-only steps (these block
+mark-done by default unless done_gate.allow_deferred_evidence is true). Use 'type=judge'
+for qualitative ACs (left to the core review judges; never gated). See
+docs/backlog-contract.md 'Verification Contract'.
+-->
+
+- VERIFY AC-CYCLE-001 | type=terratest | tool=terragrunt | cmd=`make tf-test UNIT={unit_path}`         | expect-exit=0
+- VERIFY AC-TEST-002  | type=command   |                  | cmd=`uv run pytest tests/ -v`             | expect-exit=0
+- VERIFY AC-LINT-001  | type=command   |                  | cmd=`uv run ruff check src/ tests/`       | expect-exit=0
+- VERIFY AC-LINT-002  | type=command   |                  | cmd=`uv run ruff format --check src/ tests/` | expect-exit=0
+- VERIFY AC-FUNC-002  | type=smoke     |                  | cmd=`make smoke URL=$COLLECTOR_URL`       | expect-exit=0
+- VERIFY AC-FUNC-001  | type=deferred  | owner=operator   | reason="prod apply is operator-only -- requires production credentials a human must supply"
+- VERIFY AC-DOC-001   | type=judge
 
 ## TDD Cycle Log
 

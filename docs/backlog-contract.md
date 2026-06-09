@@ -11,6 +11,7 @@ This document defines the required format for all backlog files. `devbench valid
 - [BACKLOG.md Index](#backlogmd-index)
 - [Work Unit File Structure](#work-unit-file-structure)
 - [Required Sections -- Task Files](#required-sections--task-files)
+- [Verification Contract](#verification-contract)
 - [Comments Section Format](#comments-section-format)
 - [Auto-rollup behavior](#auto-rollup-behavior)
 - [Dependency Format](#dependency-format)
@@ -399,8 +400,12 @@ mid-execution if real changes turn out to be required.
 ## Definition of Done
 
 - [ ] All ACs checked
-- [ ] `make validate` passes in target repo
+- [ ] AC-3 verified -- `make validate` passes in target repo
 - [ ] Files staged with `git add`
+
+## Verification
+
+- VERIFY AC-3 | type=command | cmd=`make validate` | expect-exit=0
 
 ## TDD Cycle Log
 
@@ -445,8 +450,70 @@ Status rolls up automatically when all children reach `done`.
 | `## Acceptance Criteria` | Yes | Author at creation |
 | `## Changes Manifest` | Yes | Author at creation |
 | `## Definition of Done` | Yes | Author at creation |
+| `## Verification` | Conditional -- required whenever an AC asserts a runnable/testable outcome (enforced as an ERROR under `validate-backlog --strict`; a warning otherwise). See [Verification Contract](#verification-contract). | Author at creation; evidence captured by `devbench verify-ac` |
 | `## TDD Cycle Log` | Yes (may be empty) | `devbench log-tdd` during implementation |
 | `## Comments` | Yes (may be empty) | `devbench log-verdict` / `devbench log-comment` |
+
+---
+
+## Verification Contract
+
+DevBench anchors deterministic completion proof on **Acceptance Criteria**. The optional `## Verification` section maps each *executable* Acceptance Criterion to a command whose **real** exit code is captured by `devbench verify-ac` (never self-reported) and gated at `mark-done`: a work unit cannot be marked `done` until every executable AC has a tool-captured exit-0 evidence record for the current attempt. This is the deterministic mark-done evidence gate: `devbench verify-ac` runs each executable directive and records the captured exit code, and `devbench mark-done` is blocked in code until every executable AC has an exit-0 record (operator-only `deferred` ACs block by default unless `done_gate.allow_deferred_evidence` is enabled). See ADR-27 (the AC evidence gate) for the full design.
+
+### Directive grammar
+
+The `## Verification` section contains one `- VERIFY` directive per AC, in this exact grammar (one per line):
+
+```
+- VERIFY AC-N | type=<terratest|apply|plan|destroy|deploy|smoke|command> | tool=<optional> | cmd=`<command>` | expect-exit=0
+- VERIFY AC-N | type=deferred | owner=operator | reason="<why a human must run this>"
+- VERIFY AC-N | type=judge
+```
+
+| Field | Meaning |
+|-------|---------|
+| `AC-N` | The Acceptance Criterion this directive verifies (one or more `AC-N` ids before the first `\|`). Required. |
+| `type` | One of `terratest`, `apply`, `plan`, `destroy`, `deploy`, `smoke`, `command` (executable -- must carry exit-code evidence), `deferred` (operator-only -- blocks `mark-done` by default), or `judge` (qualitative -- left to the core review judges, never gated). Required. |
+| `tool` | Optional. Auto-detected from `cmd` when omitted (e.g. `terragrunt`, `cdk`, `aws-cli` via the IaC tool matrix in `src/devbench/verification.py`). |
+| `cmd` | Backtick-wrapped command. A literal `\|` inside the command does not break field splitting because `cmd` is parsed first. Required for executable types. |
+| `expect-exit` | The exit code that counts as success. Defaults to `0`. |
+| `owner` / `reason` | Used by `type=deferred` to record who must run the step and why it cannot be executed in the run. |
+
+A malformed directive (no `AC-N` id, or an unknown `type`) is **always an error** -- it would make the done-gate unparseable.
+
+### The two contract rules
+
+`validate-backlog` checks two findings, routed to **warnings by default** and **errors under `--strict`** (which `spec-to-backlog` runs at authoring time):
+
+1. **Executable-AC coverage.** Any Acceptance Criterion whose text asserts a runnable/testable outcome -- it names a tool or verb from the IaC matrix (`terraform` / `terragrunt` / `tofu` / `terratest` / `tf-test` / `cdktf` / `cdk` / `cloudformation` / `sam`) or `pytest` / `go test` / `make <target>` / `apply` / `deploy` / `provision` / `passes` / `succeeds` / `smoke` -- MUST have a matching `VERIFY AC-N` directive of an executable or `deferred` type. Without it the done-gate cannot require tool-captured proof. A `type=judge` directive does NOT cover an executable AC.
+2. **DoD/AC agreement.** Any `## Definition of Done` item that asserts such a runnable outcome MUST reference an existing `AC-N`. No un-AC'd verifiable claim may hide in the DoD -- certainty is anchored on AC. The DoD remains a *process checklist*; move any verifiable claim into an AC (with its `VERIFY` directive) or cite the `AC-N` it satisfies.
+
+Back-compat: because the two findings default to warnings, pre-existing backlogs are not retroactively broken until they are re-validated with `--strict`.
+
+### Worked example
+
+```markdown
+## Acceptance Criteria
+
+- [ ] AC-3: a real `terragrunt apply` of the data-lake unit succeeds
+- [ ] AC-7: the collector smoke check returns HTTP 200
+- [ ] AC-9: the production apply completes
+- [ ] AC-11: the module follows SOLID and DRY
+
+## Definition of Done
+
+- [ ] AC-3 verified -- `make tf-test` passes in the target repo
+- [ ] Only files in Changes Manifest are staged with `git add`
+
+## Verification
+
+- VERIFY AC-3 | type=terratest | tool=terragrunt | cmd=`make tf-test UNIT=sandbox/000/data-lake/000` | expect-exit=0
+- VERIFY AC-7 | type=smoke     |                  | cmd=`make smoke URL=$COLLECTOR_URL`            | expect-exit=0
+- VERIFY AC-9 | type=deferred  | owner=operator   | reason="prod apply is operator-only (D30)"
+- VERIFY AC-11 | type=judge
+```
+
+Here AC-3 and AC-7 are executable (exit-0 proof required), AC-9 is operator-only (blocks `mark-done` unless `done_gate.allow_deferred_evidence` is enabled), and AC-11 is qualitative (the core judges assess it). The DoD item references AC-3 rather than asserting an un-AC'd outcome.
 
 ---
 
@@ -468,7 +535,9 @@ Events written by the CLI:
 | `[SECURITY_FAIL]` | `devbench log-verdict` | Security review failed |
 | `[comment]` | `devbench log-comment` | Free-form agent observation |
 
-The done-gate (`devbench mark-done`) requires that the four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) each have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line (or after the start of the Comments section if no rejection exists).
+The done-gate (`devbench mark-done`) requires that the five always-on core judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) each have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line (or after the start of the Comments section if no rejection exists). The core five are mandatory and non-disableable.
+
+In addition, an **optional specialty judge** is added to the required set for a unit when (and only when) the operator has enabled it AND it is applicable to that unit. The optional `iac_review` judge (enabled via `optional_judges.iac_review: true`, default off) is auto-required for any unit whose `## Verification` contract contains an infrastructure item (`unit_requires_iac_judge`) -- deterministically, never authored by hand and never self-judged. When no optional judge is enabled+applicable the required set is exactly the core five and behaviour is unchanged. A `type=deferred` (operator-only) Verification item blocks `mark-done` by default; set `done_gate.allow_deferred_evidence: true` to let deferred ACs pass.
 
 ### Example entries
 

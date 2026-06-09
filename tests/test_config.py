@@ -1037,3 +1037,59 @@ class TestOrchestratorStopMentionMapConfig:
 
         with pytest.raises(ValueError, match="mention level"):
             config.resolve_orchestrator_stop_mention_map({notifications.STOP_CLASS_COMPLETION: "loud"})
+
+
+@pytest.mark.unit
+class TestOptionalJudgeAndDoneGateEnvOverrides:
+    """Workstream D: DEVBENCH_JUDGE_IAC_REVIEW_ENABLED + DEVBENCH_DONE_GATE_*
+    env overrides mutate RUNTIME_CONFIG so the done-gate (which reads
+    RUNTIME_CONFIG) sees them. Precedence: env > YAML > default.
+    """
+
+    _IAC_ENV = "DEVBENCH_JUDGE_IAC_REVIEW_ENABLED"
+    _DEFERRED_ENV = "DEVBENCH_DONE_GATE_ALLOW_DEFERRED_EVIDENCE"
+
+    def test_iac_review_default_false_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != self._IAC_ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.OPTIONAL_JUDGES["iac_review"] is False
+            assert config.RUNTIME_CONFIG.optional_judges["iac_review"] is False
+        importlib.reload(config)
+
+    def test_iac_review_env_enables_and_mutates_runtime_config(self) -> None:
+        with patch.dict(os.environ, {self._IAC_ENV: "true"}, clear=False):
+            importlib.reload(config)
+            assert config.OPTIONAL_JUDGES["iac_review"] is True
+            # The done-gate reads RUNTIME_CONFIG directly; the override must land there.
+            assert config.RUNTIME_CONFIG.optional_judges["iac_review"] is True
+        importlib.reload(config)
+
+    def test_iac_review_env_false_disables(self) -> None:
+        with patch.dict(os.environ, {self._IAC_ENV: "0"}, clear=False):
+            importlib.reload(config)
+            assert config.OPTIONAL_JUDGES["iac_review"] is False
+        importlib.reload(config)
+
+    def test_done_gate_default_false_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != self._DEFERRED_ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.DONE_GATE.allow_deferred_evidence is False
+            assert config.RUNTIME_CONFIG.done_gate.allow_deferred_evidence is False
+        importlib.reload(config)
+
+    def test_done_gate_env_enables_and_mutates_runtime_config(self) -> None:
+        with patch.dict(os.environ, {self._DEFERRED_ENV: "yes"}, clear=False):
+            importlib.reload(config)
+            assert config.DONE_GATE.allow_deferred_evidence is True
+            assert config.RUNTIME_CONFIG.done_gate.allow_deferred_evidence is True
+        importlib.reload(config)
+
+    def test_empty_env_value_does_not_clobber(self) -> None:
+        """An empty-string env value is treated as 'not set' (no clobber of YAML/default)."""
+        with patch.dict(os.environ, {self._IAC_ENV: "", self._DEFERRED_ENV: ""}, clear=False):
+            importlib.reload(config)
+            assert config.OPTIONAL_JUDGES["iac_review"] is False
+            assert config.DONE_GATE.allow_deferred_evidence is False
+        importlib.reload(config)

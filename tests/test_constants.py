@@ -90,6 +90,72 @@ class TestStatusStringConstants:
         assert "draft" in VALID_STATUSES
 
 
+@pytest.mark.unit
+class TestOptionalAndKnownJudgeNames:
+    """Workstream D: OPTIONAL_JUDGE_NAMES + KNOWN_JUDGE_NAMES composition.
+
+    The always-on core 5 (ALL_REQUIRED_JUDGE_NAMES) stay non-disableable; only
+    optional specialty judges are toggleable. KNOWN_JUDGE_NAMES is the union of
+    core, workflow-agent, and optional judge names; it must mirror the guard
+    script's KNOWN_JUDGES array (enforced by release_acceptance condition (e)).
+    """
+
+    def test_optional_judge_names_is_frozenset_of_strings(self) -> None:
+        from devbench.constants import OPTIONAL_JUDGE_NAMES
+
+        assert isinstance(OPTIONAL_JUDGE_NAMES, frozenset)
+        assert all(isinstance(n, str) for n in OPTIONAL_JUDGE_NAMES)
+
+    def test_optional_judge_names_contains_iac_review(self) -> None:
+        from devbench.constants import OPTIONAL_JUDGE_NAMES
+
+        assert "iac_review" in OPTIONAL_JUDGE_NAMES
+
+    def test_optional_judge_names_equals_iac_review_only(self) -> None:
+        """OPTIONAL_JUDGE_NAMES is exactly {'iac_review'} for this release."""
+        from devbench.constants import OPTIONAL_JUDGE_NAMES
+
+        assert frozenset({"iac_review"}) == OPTIONAL_JUDGE_NAMES
+
+    def test_core_required_judges_are_not_optional(self) -> None:
+        """The always-on core 5 must NOT appear in OPTIONAL_JUDGE_NAMES."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES, OPTIONAL_JUDGE_NAMES
+
+        assert not (ALL_REQUIRED_JUDGE_NAMES & OPTIONAL_JUDGE_NAMES)
+
+    def test_all_required_judge_names_unchanged_core_five(self) -> None:
+        """ALL_REQUIRED_JUDGE_NAMES stays exactly the core 5 (iac_review excluded)."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        assert (
+            frozenset({"code_review", "test_review", "doc_review", "changes_manifest", "security_review"})
+            == ALL_REQUIRED_JUDGE_NAMES
+        )
+        assert "iac_review" not in ALL_REQUIRED_JUDGE_NAMES
+
+    def test_known_judge_names_includes_optional(self) -> None:
+        """KNOWN_JUDGE_NAMES must include every optional judge name."""
+        from devbench.constants import KNOWN_JUDGE_NAMES, OPTIONAL_JUDGE_NAMES
+
+        assert OPTIONAL_JUDGE_NAMES <= KNOWN_JUDGE_NAMES
+
+    def test_known_judge_names_is_union_of_three_sets(self) -> None:
+        """KNOWN_JUDGE_NAMES == core | workflow-agent | optional."""
+        from devbench.constants import (
+            ALL_REQUIRED_JUDGE_NAMES,
+            KNOWN_JUDGE_NAMES,
+            OPTIONAL_JUDGE_NAMES,
+            WORKFLOW_AGENT_JUDGE_NAMES,
+        )
+
+        assert KNOWN_JUDGE_NAMES == (ALL_REQUIRED_JUDGE_NAMES | WORKFLOW_AGENT_JUDGE_NAMES | OPTIONAL_JUDGE_NAMES)
+
+    def test_iac_review_in_known_judge_names(self) -> None:
+        from devbench.constants import KNOWN_JUDGE_NAMES
+
+        assert "iac_review" in KNOWN_JUDGE_NAMES
+
+
 class TestStatusSummaryTableHeader:
     """STATUS_SUMMARY_TABLE_HEADER constant includes Draft column (AC-189-7)."""
 

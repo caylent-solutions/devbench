@@ -79,6 +79,34 @@ def resolve_scope_file_path(workspace_root: Path) -> Path:
     return workspace_root / SESSION_SESSIONS_BASE_DIR / session_name / _SCOPE_FILENAME
 
 
+def session_scope_file_path(workspace_root: Path, session_name: str) -> Path:
+    """Return the per-session scope.json path for *session_name*, ignoring env.
+
+    Unlike :func:`resolve_scope_file_path`, this does NOT read
+    ``DEVBENCH_SESSION_NAME``; the session name is passed explicitly.  Callers
+    that must resolve the per-session path *before* ``DEVBENCH_SESSION_NAME`` is
+    set in the environment (e.g. ``cmd_start``'s scope pre-flight, which runs
+    before the env var is assigned) use this so the writer, the clean-exit
+    clear, and the SDK-subprocess readers all agree on a single path.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        session_name: Session identifier (the ``--name`` value).
+
+    Returns:
+        ``<workspace_root>/.devbench/sessions/<session_name>/scope.json``.
+
+    Raises:
+        ValueError: If *session_name* contains a ``..`` path segment.
+    """
+    if ".." in Path(session_name).parts:
+        raise ValueError(
+            f"session_name contains invalid path segment '..': {session_name!r}. "
+            "Use a simple alphanumeric name without directory traversal."
+        )
+    return workspace_root / SESSION_SESSIONS_BASE_DIR / session_name / _SCOPE_FILENAME
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

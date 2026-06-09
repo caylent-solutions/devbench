@@ -467,7 +467,7 @@ uv run devbench set-status --include "E2" --exclude "E2-F3" in-queue
 uv run devbench mark-done <id>
 ```
 
-Mark the unit as `done`. Enforces the done-gate: all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) must have logged `[REVIEW_PASS]` in the most recent round (after any intervening `[REVIEW_REJECTED]`). Security review must also have passed. Exits 1 with a clear error naming the missing judge(s) when the gate fails.
+Mark the unit as `done`. Enforces the done-gate: the five always-on core judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) must each have logged `[REVIEW_PASS]` in the most recent round (after any intervening `[REVIEW_REJECTED]`). When an optional specialty judge is enabled and applicable to the unit -- `iac_review` for a unit whose `## Verification` contract has an infrastructure item -- its `[REVIEW_PASS]` is also required. Exits 1 with a clear error naming the missing judge(s) when the gate fails.
 
 ### `decline`
 
@@ -1014,6 +1014,16 @@ uv run devbench run-tests <id>
 
 Run the test suite in the work unit's target repo. Uses the repo's `make test` target when present; falls back to bare `pytest`. Used by `test_review`. Returns the test runner's exit code.
 
+### `verify-ac`
+
+```
+uv run devbench verify-ac <id>
+```
+
+Execute the work unit's `## Verification` contract and record tool-captured evidence (ADR-27). Parses the `## Verification` section, then for every *executable* directive (skipping `type=judge` and `type=deferred`) runs the command in the unit's target repo via `bash -c`, capturing the command's REAL exit code -- never a self-reported one. Each result is trimmed to `limits.ci_failure_log_bytes` and written to a per-AC artifact `.devbench/evidence/<id>/<attempt>/<sanitized-ac>.log`; all results are aggregated into the ledger `.devbench/evidence/<id>/<attempt>/evidence.json` (a JSON list of evidence records), and the attempt is recorded in `.devbench/evidence/<id>/latest.json` so the done-gate loads the latest run. The runner also invokes the deterministic TDD genuine-RED gate, preferring the tool-captured RED exit code from the freshly written ledger over the executor's self-reported `log-tdd RED` value.
+
+Run by the executor after implementation and before review (orchestrate step 4d). Exit `0` when every executable Acceptance Criterion met its `expect-exit` and the TDD gate passed; non-zero otherwise. A unit with no `## Verification` section produces an empty ledger and exits `0`. `mark-done` re-checks this ledger: a unit declaring a `## Verification` section cannot reach done until every executable AC has a tool-captured exit-0 record (deferred ACs block unless `done_gate.allow_deferred_evidence: true`).
+
 ### `log`
 
 ```
@@ -1030,9 +1040,10 @@ uv run devbench log-verdict <judge> <id> <pass|fail> [feedback]
 
 Record a judge verdict as an audit comment on the work-unit file. Writes `[REVIEW_PASS]` or `[REVIEW_FAIL]` (or `[SECURITY_FAIL]` for `security_review`). Feedback is mandatory when the verdict is `fail`; rejected by the `guard-verdict-format.sh` hook otherwise.
 
-`<judge>` must be one of the names in the allowlist defined by `devbench.constants.KNOWN_JUDGE_NAMES`. The allowlist is split into two tiers:
+`<judge>` must be one of the names in the allowlist defined by `devbench.constants.KNOWN_JUDGE_NAMES`. The allowlist is split into three tiers:
 
-- **Canonical reviewers (5)** -- `code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`. Only these names satisfy the done-gate's `BacklogManager._last_round_all_passed` check. They are written by `review-supervisor` and `security-reviewer`.
+- **Core canonical reviewers (5)** -- `code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`. These five are always-on and non-disableable; they always satisfy (and are always required by) the done-gate's `BacklogManager._last_round_all_passed` check. They are written by `review-supervisor` and `security-reviewer`.
+- **Optional specialty reviewer (1)** -- `iac_review`. A canonical (done-gate-satisfying) reviewer verdict written by the `iac-deploy-reviewer` agent. It is required for a unit only when the operator enabled it (`optional_judges.iac_review: true`) AND the unit's `## Verification` contract makes it applicable (`unit_requires_iac_judge`); otherwise it is never dispatched or required.
 - **Audit-only workflow agents (4)** -- `executor`, `blocker_resolver`, `manifest_amender`, `task_factory`. Their verdicts land in the work-unit Comments section as audit metadata but do NOT count toward the done-gate. Workflow agents use these to record progress (for example, the executor logging `executor` verdicts during AC enforcement, or task-factory recording `task_factory` after a successful materialise).
 
 Two enforcement layers prevent malformed audit rows:

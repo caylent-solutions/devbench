@@ -16,13 +16,18 @@ sentinel from the inner SDK message loop. The outer handler:
    a SIGTERM during the wait does not lose the pause state.
 2. Emits a structured audit marker to the orchestrator log:
    `[QUOTA_WAITING] reason=<source> reset_at=<ISO|unknown>`.
-3. Calls `wait_for_reset`, which sleeps until `reset_at` (if known) then
-   polls with jittered exponential backoff until a probe confirms recovery.
-   If the recovery probe is permanently unavailable (no/invalid API
-   credential) it does not poll for the full `max_wait_seconds`: when the
-   provider supplied a `reset_at` and that time has passed it resumes on the
-   reset time itself; when no reset time is known it emits
-   `[QUOTA_PROBE_UNAVAILABLE]` and stops fast.
+3. Calls `wait_for_reset`, which sleeps until `reset_at` (if known). A known,
+   elapsed `reset_at` is the **authoritative** readiness signal: the wait
+   resumes the moment it passes, **without** consulting the recovery probe
+   (TDI-003a). The probe is **best-effort** and only consulted while `reset_at`
+   is unknown -- it issues a direct Anthropic **API** call, which tests a
+   different auth channel than the Claude Code CLI/SDK **subscription** channel
+   the orchestrator runs on, so a probe success does not prove the exhausted
+   subscription quota cleared (and on subscription auth the probe can never
+   succeed). When `reset_at` is unknown the loop polls the probe with jittered
+   exponential backoff; if the probe is permanently unavailable (no/invalid API
+   credential) it emits `[QUOTA_PROBE_UNAVAILABLE]` and stops fast rather than
+   polling for the full `max_wait_seconds`.
 4. On recovery, emits `[QUOTA_RESUMED] waited_seconds=<N>` and applies the
    configured `resume_strategy` before returning `rc=0`.
 

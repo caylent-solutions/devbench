@@ -455,6 +455,17 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Minor hardening (TDI-003).** Three small, independent items: (a) `wait_for_reset`
+  now treats a known, elapsed `reset_at` as the authoritative readiness signal and
+  resumes **without** consulting the recovery probe -- the probe tests the raw
+  Anthropic API channel, not the CLI/SDK subscription channel the orchestrator runs
+  on, so it is best-effort and only used while the reset time is unknown
+  (`docs/quota-handling.md` documents this). (b) The unimplemented
+  `quota-watcher --daemon` stub was removed; `--once` is the only supported flag.
+  (c) The write-only `DEVBENCH_SCOPE_FILE` env var (set by `cmd_start --include`
+  but read by no code path -- scope is resolved from the per-session `scope.json`)
+  was removed so the scope flow carries no misleading dead surface.
+
 - **Shadow-plugin dropped the optional `iac_review` judge (and any agent absent
   from the override maps).** When an `agents:` model override was configured,
   `materialise_shadow_plugin` copied only the overridden agent `.md` files as

@@ -8132,8 +8132,11 @@ def _resolve_scope_ids_or_error(parsed: _CmdStartArgs, session_scope_path: Path)
         except InvalidScopeError as exc:
             print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
             return [], 1
-        scope_file = scope.to_file(WORKSPACE_ROOT, path=session_scope_path)
-        os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
+        # TDI-003c: scope is resolved from the per-session scope.json path (via
+        # session_scope_file_path), not from an env var. The former
+        # DEVBENCH_SCOPE_FILE write was write-only (no reader) and is removed so
+        # the scope flow carries no misleading dead surface.
+        scope.to_file(WORKSPACE_ROOT, path=session_scope_path)
         scope_ids = sorted(scope.expanded_ids)
     else:
         # No --include => UNSCOPED (all WUs eligible).  Absence of scope.json is
@@ -8159,9 +8162,9 @@ def cmd_start(*argv: str) -> int:
     Accepts optional scope-filter flags (spec section 4.2.2, AC-190-8, AC-190-9):
 
     - ``--include "<tokens>"`` -- comma-separated printer-pages-style tokens.
-      When supplied, ``ScopeFilter`` is built from the current backlog's WU IDs,
-      persisted to ``<workspace>/.devbench/scope.json``, and the
-      ``DEVBENCH_SCOPE_FILE`` env var is set to that path before the SDK run.
+      When supplied, ``ScopeFilter`` is built from the current backlog's WU IDs
+      and persisted to the per-session ``scope.json`` path, which the SDK
+      subprocess readers resolve via ``session_scope_file_path``.
     - ``--exclude "<tokens>"`` -- comma-separated tokens subtracted from the
       include set.  Only meaningful together with ``--include``.
 
@@ -8533,41 +8536,31 @@ def cmd_prepare_plugin_shadow() -> int:
 
 
 def cmd_quota_watcher(*argv: str) -> int:
-    """Inspect or monitor the quota pause checkpoint.
+    """Inspect the quota pause checkpoint.
 
     Usage::
 
         devbench quota-watcher --once    # print current pause status then exit
-        devbench quota-watcher --daemon  # reserved for future background monitor
 
-    When called with ``--once``, reads the checkpoint file at
-    ``<workspace>/.devbench/quota_pause.json`` and prints the current quota
-    pause status to stdout. Returns 0 when a checkpoint is found, 1 when absent
-    or the flag is missing/unknown.
+    Reads the checkpoint file at ``<workspace>/.devbench/quota_pause.json`` and
+    prints the current quota pause status to stdout. Returns 0 when a checkpoint
+    is found, 1 when absent or the flag is missing/unknown.
 
     The watcher is advisory: when a running orchestrator owns the session, its
     in-loop wait is authoritative. The watcher simply surfaces the checkpoint
-    data for operator visibility.
+    data for operator visibility. (TDI-003b: the unimplemented ``--daemon``
+    background-monitor stub was removed; ``--once`` is the only supported flag.)
 
     Args:
-        *argv: Optional flags (``--once``, ``--daemon``).
+        *argv: The ``--once`` flag.
 
     Returns:
         0 when ``--once`` is given and a checkpoint exists.
         1 on parse errors, absent checkpoint, or unsupported flag.
     """
-    if not argv or argv[0] not in ("--once", "--daemon"):
+    if not argv or argv[0] != "--once":
         print(
-            "ERROR: quota-watcher requires --once or --daemon.\nUsage: devbench quota-watcher [--once|--daemon]",
-            file=sys.stderr,
-        )
-        return 1
-
-    flag = argv[0]
-
-    if flag == "--daemon":
-        print(
-            "ERROR: quota-watcher --daemon is not yet implemented. Use --once.",
+            "ERROR: quota-watcher requires --once.\nUsage: devbench quota-watcher --once",
             file=sys.stderr,
         )
         return 1
@@ -11622,7 +11615,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "quota-watcher": (
         cmd_quota_watcher,
         0,
-        "Inspect the quota pause checkpoint: quota-watcher [--once|--daemon]",
+        "Inspect the quota pause checkpoint: quota-watcher --once",
     ),
     "watch": (
         cmd_watch,

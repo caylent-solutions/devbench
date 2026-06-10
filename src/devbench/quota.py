@@ -451,17 +451,18 @@ async def wait_for_reset(
             function uses a default aligned with ``poll_interval_seconds``.
 
     Returns:
-        ``True`` when the probe confirmed recovery before ``max_wait_seconds``
-        elapsed, OR when the probe is unavailable but a known ``reset_at`` has
-        already passed (the provider-stated reset time is the readiness signal);
-        ``False`` when the timeout was hit.
+        ``True`` when a known ``reset_at`` has elapsed (the provider-stated
+        reset time is the authoritative readiness signal -- no probe needed;
+        TDI-003a), OR when the probe confirmed recovery before
+        ``max_wait_seconds`` elapsed; ``False`` when the timeout was hit. The
+        probe is best-effort and only consulted while ``reset_at`` is unknown.
 
     Raises:
         ValueError: When ``backoff_config.initial_seconds != poll_interval_seconds``.
         RecoveryProbeUnavailableError: When the probe is permanently unavailable
-            (no/invalid credential) AND no usable ``reset_at`` is known -- the
-            caller must fail fast rather than poll a probe that can never
-            succeed.
+            (no/invalid credential) AND no usable ``reset_at`` is known (unknown
+            or not yet reached) -- the caller must fail fast rather than poll a
+            probe that can never succeed.
         Any other exception raised by ``probe_fn``.
     """
     if backoff_config is None:
@@ -500,17 +501,23 @@ async def wait_for_reset(
         if elapsed >= max_wait_seconds:
             return False
 
+        # TDI-003a: a known, elapsed reset time is the authoritative readiness
+        # signal -- resume without probing. The recovery probe tests the raw
+        # Anthropic API channel, not the CLI/SDK subscription channel the
+        # orchestrator runs on, so once the provider-stated reset has passed the
+        # probe adds nothing (and on subscription auth can never succeed). The
+        # probe is best-effort and only consulted when reset_at is unknown.
+        if reset_at is not None and now >= reset_at:
+            return True
+
         try:
             if probe_fn():
                 return True
         except RecoveryProbeUnavailableError:
-            # The probe cannot confirm recovery (no/invalid credential). If the
-            # provider told us when the limit resets and that time has passed,
-            # treat the reset time itself as the readiness signal and resume.
-            # Otherwise (reset time unknown) propagate so the caller fails fast
-            # instead of polling a probe that can never succeed.
-            if reset_at is not None and _get_current_utc() >= reset_at:
-                return True
+            # The probe cannot confirm recovery (no/invalid credential) and no
+            # usable reset time is known (unknown, or not yet reached) -- fail
+            # fast rather than poll a probe that can never succeed. A known,
+            # elapsed reset time is handled by the short-circuit above.
             raise
 
         # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.

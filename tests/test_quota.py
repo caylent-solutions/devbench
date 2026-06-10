@@ -1210,8 +1210,8 @@ class TestWaitForReset:
         assert result is True
         probe.assert_called_once()
 
-    def test_past_reset_initial_sleep_zero(self) -> None:
-        """When reset_at is in the past, initial sleep = 0, probe fires immediately."""
+    def test_past_reset_resumes_without_probing(self) -> None:
+        """TDI-003a: when reset_at has elapsed, resume immediately without calling the probe."""
         probe = MagicMock(return_value=True)
         reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past
         clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)  # clock after reset_at
@@ -1232,6 +1232,8 @@ class TestWaitForReset:
 
         result = asyncio.run(run())
         assert result is True
+        # The elapsed reset time is authoritative -- the probe must NOT be consulted.
+        probe.assert_not_called()
 
     def test_max_wait_zero_returns_false(self) -> None:
         """When max_wait_seconds=0, immediately returns False."""
@@ -1283,16 +1285,19 @@ class TestWaitForReset:
             assert sleep_calls[0] <= max_wait
 
     def test_probe_raises_propagates(self) -> None:
-        """When probe_fn raises a non-quota exception, it propagates out."""
+        """When probe_fn raises a non-quota exception, it propagates out.
+
+        Uses ``reset_at=None`` so the probe loop runs (a known, elapsed reset
+        time would short-circuit before the probe is ever called -- TDI-003a).
+        """
         probe = MagicMock(side_effect=RuntimeError("network error"))
-        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past -> initial sleep 0
         clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
 
         async def run() -> None:
             with patch("devbench.quota._get_current_utc", return_value=clock):
                 with patch("asyncio.sleep", new_callable=AsyncMock):
                     await wait_for_reset(
-                        reset_at=reset_at,
+                        reset_at=None,
                         poll_interval_seconds=60,
                         max_wait_seconds=18000,
                         probe_fn=probe,
@@ -1372,7 +1377,8 @@ class TestWaitForReset:
             # Only succeed on the 4th call
             return call_count >= 4
 
-        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
+        # reset_at=None so the probe/backoff loop runs (a known elapsed reset
+        # would short-circuit before any probe -- TDI-003a).
         clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
         backoff = BackoffConfig(initial_seconds=30, max_seconds=600, multiplier=2.0, jitter=0.2)
 
@@ -1383,7 +1389,7 @@ class TestWaitForReset:
             with patch("devbench.quota._get_current_utc", return_value=clock):
                 with patch("asyncio.sleep", side_effect=fake_sleep):
                     await wait_for_reset(
-                        reset_at=reset_at,
+                        reset_at=None,
                         poll_interval_seconds=30,  # matches backoff.initial_seconds
                         max_wait_seconds=18000,
                         probe_fn=probe,
@@ -1397,9 +1403,14 @@ class TestWaitForReset:
             assert delay <= 600, f"delay {delay} exceeds max_seconds=600"
 
     def test_max_wait_timeout_returns_false(self) -> None:
-        """When max_wait is exceeded before probe succeeds, returns False."""
+        """When max_wait is exceeded before the probe succeeds, returns False.
+
+        Uses ``reset_at=None``: with a known reset time the wait resumes the
+        moment it elapses (TDI-003a), so the timeout path is reached only while
+        the reset time is unknown and the probe keeps reporting not-recovered.
+        """
         probe = MagicMock(return_value=False)
-        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
+        reset_at = None
         # Simulate clock advancing past max_wait by returning increasing times
         clock_calls: list[datetime] = [
             datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),

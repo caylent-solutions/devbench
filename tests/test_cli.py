@@ -14913,15 +14913,19 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
 
         assert rc == 1
 
-    def test_devbench_scope_file_env_var_set(self, tmp_path: Path) -> None:
-        """cmd_start --include must set DEVBENCH_SCOPE_FILE in the process env."""
-        captured_env: dict[str, str] = {}
+    def test_include_writes_scope_json_at_session_path(self, tmp_path: Path) -> None:
+        """TDI-003c: cmd_start --include persists scope.json at the per-session path.
 
-        class _EnvCapturingClient:
+        Scope is resolved from that file (via session_scope_file_path), not from
+        the removed write-only DEVBENCH_SCOPE_FILE env var.
+        """
+        scope_path = tmp_path / ".devbench" / "sessions" / "default" / "scope.json"
+
+        class _ScopeCapturingClient:
             def __init__(self, options: Any = None, **kwargs: Any) -> None:
                 pass
 
-            async def __aenter__(self) -> _EnvCapturingClient:
+            async def __aenter__(self) -> _ScopeCapturingClient:
                 return self
 
             async def __aexit__(self, *args: object) -> bool:
@@ -14931,22 +14935,21 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
                 pass
 
             async def receive_response(self) -> Any:
-                import os
-
-                captured_env.update(os.environ)
+                # scope.json must exist on disk while the SDK run is active.
+                assert scope_path.is_file(), "scope.json must be written at the session path during the run"
                 yield "msg"
 
         custom_sdk: Any = types.ModuleType("claude_agent_sdk")
         custom_sdk.ClaudeAgentOptions = MagicMock()
-        custom_sdk.ClaudeSDKClient = _EnvCapturingClient
+        custom_sdk.ClaudeSDKClient = _ScopeCapturingClient
 
         with self._patch_cli(tmp_path, mock_sdk=custom_sdk):
             rc = cli.cmd_start("--include", "E1")
 
         assert rc == 0
-        assert "DEVBENCH_SCOPE_FILE" in captured_env
-        expected_path = str(tmp_path / ".devbench" / "sessions" / "default" / "scope.json")
-        assert captured_env["DEVBENCH_SCOPE_FILE"] == expected_path
+        # scope.json is intentionally left on disk after a clean run only when the
+        # SDK crashes; on clean return it is cleared. The in-run assertion above is
+        # the contract that matters: scope was persisted at the session path.
 
     def test_unknown_flag_exits_nonzero(self, tmp_path: Path) -> None:
         """Unknown flags must cause cmd_start to exit with rc=1 (fail-fast)."""

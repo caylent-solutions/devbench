@@ -2,7 +2,7 @@
 
 Covers: pause->wait->resume integration with mocked executor + clock;
 enabled:false legacy-exit path; [QUOTA_WAITING] and [QUOTA_RESUMED] markers;
-cmd_quota_watcher --once and --daemon.
+cmd_quota_watcher --once.
 
 Issue #236 (Appendix A QW-5, QW-8).
 AC-236-1.

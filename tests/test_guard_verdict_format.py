@@ -53,12 +53,26 @@ ROUND_TOKEN = "test-round-token-abc123"
 
 
 def _clean_env() -> dict[str, str]:
-    """Return process env stripped of DEVBENCH vars that interfere with hooks."""
-    return {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_REVIEW_ROUND_TOKEN")
+    """Return process env stripped of DEVBENCH vars that interfere with hooks.
+
+    ``BASH_ENV`` (and the POSIX ``ENV``) are stripped too: the devcontainer sets
+    ``BASH_ENV=/workspaces/telemetry/shell.env``, which makes a non-interactive
+    ``bash <hook>`` re-source ``shell.env`` on startup. The orchestrate skill
+    writes a per-round ``export DEVBENCH_REVIEW_ROUND_TOKEN=...`` line into that
+    file, so without stripping ``BASH_ENV`` the hook subprocess would re-acquire
+    the very vars this helper removes -- making these tests non-hermetic (they
+    would pass or fail depending on whether a review round happened to leave a
+    token in ``shell.env``). Stripping it guarantees the subprocess sees exactly
+    the env this helper constructs.
+    """
+    excluded = {
+        "DEVBENCH_WORKSPACE_ROOT",
+        "DEVBENCH_LOG_FILE",
+        "DEVBENCH_REVIEW_ROUND_TOKEN",
+        "BASH_ENV",
+        "ENV",
     }
+    return {k: v for k, v in os.environ.items() if k not in excluded}
 
 
 def _run_hook(

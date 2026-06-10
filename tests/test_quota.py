@@ -46,6 +46,7 @@ from devbench.quota import (
     _apply_resume_strategy,
     _force_status_in_queue,
     _has_quota_marker,
+    _has_verbatim_quota_marker,
     _parse_reset_at_from_text,
     _probe_api_call,
     detect_quota_error,
@@ -98,10 +99,16 @@ def _make_bedrock_exc(error_code: str, message: str = "throttled") -> MagicMock:
 
 
 def _make_user_message_with_quota_marker(marker_text: str) -> SimpleNamespace:
-    """Build a UserMessage-shaped object with a ToolResultBlock containing quota text."""
+    """Build a UserMessage-shaped object with an ERROR ToolResultBlock containing quota text.
+
+    Rule 6 only scans explicit-error tool results (``is_error is True``); a
+    genuine sub-agent quota limit surfaces as an error result, so the fixture
+    sets ``is_error=True``.
+    """
     block = SimpleNamespace(
         tool_use_id="test-tool-id",
         content=marker_text,
+        is_error=True,
     )
     return SimpleNamespace(content=[block])
 
@@ -399,6 +406,48 @@ class TestHasQuotaMarker:
         assert _has_quota_marker("prefix You've hit your limit suffix") is True
 
 
+@pytest.mark.unit
+class TestHasVerbatimQuotaMarker:
+    """_has_verbatim_quota_marker matches ONLY the verbatim CLI lines, never the regex.
+
+    Used for tool-result/result content scanning (Rules 6/8) so benign tool
+    output -- including devbench's own source code that quotes 'rate limit
+    exceeded' -- never trips a false quota pause.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "You've hit your limit",
+            "you've hit your limit",
+            "You have hit your limit",
+            "You\u2019ve hit your limit \u00b7 resets 4:10pm (UTC)",
+            "prefix You've hit your limit suffix",
+        ],
+    )
+    def test_verbatim_lines_match(self, text: str) -> None:
+        assert _has_verbatim_quota_marker(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The regex family is deliberately NOT applied to tool content.
+            "rate limit exceeded",
+            "rate limit reached",
+            "Rate Limit Exceeded",
+            'raise AmendmentError(f"Amendment rate limit exceeded: {n} applied")',
+            "implement rate limiting",
+            "",
+        ],
+    )
+    def test_regex_and_benign_phrases_do_not_match(self, text: str) -> None:
+        assert _has_verbatim_quota_marker(text) is False
+
+    def test_non_string_returns_false(self) -> None:
+        assert _has_verbatim_quota_marker(None) is False  # type: ignore[arg-type]
+        assert _has_verbatim_quota_marker(42) is False  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # _parse_reset_at_from_text -- parametrized time parsing
 # ---------------------------------------------------------------------------
@@ -641,34 +690,46 @@ class TestDetectQuotaErrorRules:
         )
         assert detect_quota_error(obj) is None
 
-    def test_rule6_is_error_true_with_marker_detected(self) -> None:
-        """An errored tool result carrying a genuine limit phrase is detected."""
-        block = SimpleNamespace(tool_use_id="t", content="rate limit exceeded", is_error=True)
+    def test_rule6_is_error_true_with_verbatim_marker_detected(self) -> None:
+        """An errored tool result carrying a VERBATIM CLI limit line is detected (genuine sub-agent limit)."""
+        block = SimpleNamespace(tool_use_id="t", content="You've hit your limit", is_error=True)
         obj = SimpleNamespace(content=[block])
         result = detect_quota_error(obj)
         assert isinstance(result, SubscriptionRateLimitError)
         assert result.source == "claude-code-cli"
 
-    def test_rule6_is_error_none_with_marker_detected(self) -> None:
-        """A tool result with unset is_error still scans (only False is skipped)."""
-        block = SimpleNamespace(tool_use_id="t", content="You've hit your limit", is_error=None)
-        obj = SimpleNamespace(content=[block])
-        result = detect_quota_error(obj)
-        assert isinstance(result, SubscriptionRateLimitError)
-
-    def test_rule6_is_error_false_with_genuine_marker_skipped(self) -> None:
-        """A SUCCESSFUL tool result is never a quota signal, even with genuine phrasing."""
-        block = SimpleNamespace(tool_use_id="t", content="rate limit exceeded", is_error=False)
+    def test_rule6_is_error_true_with_regex_phrase_not_detected(self) -> None:
+        """Even an ERROR tool result is verbatim-only: the broad 'rate limit exceeded' regex
+        is NOT applied to tool content (it appears in devbench's own source the agent reads)."""
+        block = SimpleNamespace(tool_use_id="t", content="rate limit exceeded", is_error=True)
         obj = SimpleNamespace(content=[block])
         assert detect_quota_error(obj) is None
 
-    def test_rule6_is_error_false_with_reviewer_prose_skipped(self) -> None:
-        """A successful tool result carrying benign reviewer prose is skipped."""
-        block = SimpleNamespace(
-            tool_use_id="t",
-            content="API endpoints implement rate limiting, CORS policies, and required security headers.",
-            is_error=False,
+    def test_rule6_is_error_none_successful_read_not_detected(self) -> None:
+        """Regression (false-positive cause): a SUCCESSFUL tool result has is_error=None
+        (Read/Grep/Glob) and must NOT be scanned -- even with a verbatim-looking marker."""
+        block = SimpleNamespace(tool_use_id="t", content="You've hit your limit", is_error=None)
+        obj = SimpleNamespace(content=[block])
+        assert detect_quota_error(obj) is None
+
+    def test_rule6_successful_read_of_amendment_source_not_detected(self) -> None:
+        """Regression for the verbatim reported bug: a successful Read (is_error=None) of
+        devbench's amendment.py -- whose check_rate_limit emits 'Amendment rate limit
+        exceeded: ...' -- must NOT trip a false [QUOTA_WAITING]."""
+        amendment_src = (
+            "def check_rate_limit(self, prior_applied_count: int) -> None:\n"
+            "    if prior_applied_count >= self._config.max_requests_per_execution:\n"
+            "        raise AmendmentError(\n"
+            '            f"Amendment rate limit exceeded: {prior_applied_count} amendment(s) already applied"\n'
+            "        )\n"
         )
+        block = SimpleNamespace(tool_use_id="t", content=amendment_src, is_error=None)
+        obj = SimpleNamespace(content=[block])
+        assert detect_quota_error(obj) is None
+
+    def test_rule6_is_error_false_skipped(self) -> None:
+        """A successful Bash tool result (is_error=False) is never a quota signal."""
+        block = SimpleNamespace(tool_use_id="t", content="You've hit your limit", is_error=False)
         obj = SimpleNamespace(content=[block])
         assert detect_quota_error(obj) is None
 
@@ -714,9 +775,23 @@ class TestDetectQuotaErrorRules:
         result = detect_quota_error(obj)
         assert result is None
 
+    def test_rule8_regex_phrase_not_detected(self) -> None:
+        """Rule 8 is verbatim-only: 'rate limit exceeded' in result text is NOT a quota signal."""
+        obj = _make_result_message_error("error: rate limit exceeded for this operation")
+        assert detect_quota_error(obj) is None
+
     # Rule 9: wrapper BaseException with quota marker in str(obj)
     def test_rule9_base_exception_with_quota_marker(self) -> None:
         obj = Exception("You've hit your limit -- rate limit")
+        result = detect_quota_error(obj)
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert result.source == "claude-code-cli"
+
+    def test_rule9_regex_only_exception_still_detected(self) -> None:
+        """Rule 9 keeps the full matcher: an exception message with only the
+        'rate limit exceeded' regex phrase (no verbatim line) IS detected --
+        an exception message is authoritative, unlike arbitrary tool content."""
+        obj = Exception("anthropic.RateLimitError: rate limit exceeded, try again later")
         result = detect_quota_error(obj)
         assert isinstance(result, SubscriptionRateLimitError)
         assert result.source == "claude-code-cli"

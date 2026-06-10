@@ -52,8 +52,15 @@ ALL_FORBIDDEN_TOKENS = VERDICT_TOKENS + JUDGE_TOKENS
 
 
 def _clean_env() -> dict[str, str]:
-    """Return the process env with known devbench vars stripped."""
-    return {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
+    """Return the process env with known devbench vars stripped.
+
+    ``BASH_ENV``/``ENV`` are stripped so the hook subprocess does not re-source
+    ``shell.env`` (``BASH_ENV=/workspaces/telemetry/shell.env`` in the
+    devcontainer), which would otherwise re-inject the very devbench vars this
+    helper removes and make the test non-hermetic.
+    """
+    excluded = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "BASH_ENV", "ENV"}
+    return {k: v for k, v in os.environ.items() if k not in excluded}
 
 
 def _run_comment_guard(command: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:

@@ -520,6 +520,25 @@ since the last release. PR #119 carries every change.
   for Terratest, ...), never as a path substring. `unit_requires_iac_judge` and
   `VerificationItem.is_infra` inherit the precise predicate.
 
+- **Quota detection false positive on a successful Read of devbench's own
+  source (#236 follow-up 2).** Even after the precise-regex fix, `detect_quota_error`
+  Rule 6 still false-paused: a **successful** `Read` of `amendment.py` (whose
+  `check_rate_limit` emits the literal string "Amendment rate limit exceeded:
+  ...") was scanned and matched the regex, firing `[QUOTA_WAITING]
+  reason=claude-code-cli` at ~40% quota. Two compounding causes are fixed:
+  (a) the Rule 6 gate skipped only `is_error is False`, but a successful
+  Read/Grep/Glob returns `is_error=None` -- so its content was scanned. The gate
+  now scans **only explicit-error** tool results (`is_error is True`); a genuine
+  sub-agent limit is an error result, a successful read never is. (b) Tool-result
+  content (Rules 6 and 8) is now matched with a new verbatim-only helper
+  (`_has_verbatim_quota_marker`, the unambiguous CLI "You've hit your limit"
+  line) instead of the broad "rate limit + verb" regex -- because tool content is
+  arbitrary data the agent read/grepped, and the orchestrator routinely inspects
+  devbench's own quota/amendment code and tests, which quote that phrasing. The
+  broad regex is retained for **exception messages** (Rule 9), which are
+  authoritative. Structured signals (HTTP 429/402, `error == 'rate_limit'`,
+  Bedrock throttle) are unaffected.
+
 - **Quota detection false positive (#236 follow-up).** `detect_quota_error` no
   longer misclassifies benign sub-agent prose as a rate-limit hit. The bare
   `"rate limit"` substring marker is replaced with a precise regex requiring an

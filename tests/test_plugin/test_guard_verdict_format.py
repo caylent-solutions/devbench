@@ -30,12 +30,22 @@ def _clean_env() -> dict[str, str]:
     _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
     _hook_lib.sh must not inherit those vars from the pytest process environment.
     Also strips DEVBENCH_REVIEW_ROUND_TOKEN so tests that omit it start clean.
+
+    ``BASH_ENV``/``ENV`` are stripped too: the devcontainer sets
+    ``BASH_ENV=/workspaces/telemetry/shell.env``, so a non-interactive
+    ``bash <hook>`` re-sources ``shell.env`` on startup -- which the orchestrate
+    skill populates with a per-round ``DEVBENCH_REVIEW_ROUND_TOKEN``. Without
+    stripping it the hook subprocess would re-acquire (or overwrite) the very
+    vars this helper controls, making the tests non-hermetic.
     """
-    return {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_REVIEW_ROUND_TOKEN")
+    excluded = {
+        "DEVBENCH_WORKSPACE_ROOT",
+        "DEVBENCH_LOG_FILE",
+        "DEVBENCH_REVIEW_ROUND_TOKEN",
+        "BASH_ENV",
+        "ENV",
     }
+    return {k: v for k, v in os.environ.items() if k not in excluded}
 
 
 def _run(

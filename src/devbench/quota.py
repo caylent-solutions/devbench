@@ -163,6 +163,31 @@ def _has_quota_marker(text: object) -> bool:
     return _RATE_LIMIT_RE.search(text) is not None
 
 
+def _has_verbatim_quota_marker(text: object) -> bool:
+    """Return True only for a VERBATIM CLI limit line in ``text`` (no regex).
+
+    Stricter than :func:`_has_quota_marker`: matches solely the unambiguous
+    ``_QUOTA_MARKERS`` lines (e.g. "You've hit your limit") and deliberately
+    does NOT apply the ``_RATE_LIMIT_RE`` exhaustion-phrasing regex.
+
+    This is the matcher used when scanning **tool-result / result content**
+    (``detect_quota_error`` Rules 6 and 8). That content is arbitrary tool
+    output -- files the agent read, grep results -- which routinely contains
+    quota phrasing as benign data. devbench's own ``amendment.py`` emits the
+    literal string "Amendment rate limit exceeded: ..." and this module plus
+    ``tests/test_quota.py`` contain "rate limit"/"You've hit your limit" as
+    error strings, docstrings, and fixtures; the orchestrator reads exactly
+    those files while debugging. Matching the broad regex against such content
+    produced false ``[QUOTA_WAITING]`` pauses. Only the verbatim CLI line is a
+    trustworthy quota signal inside tool output. The ``_RATE_LIMIT_RE`` family
+    is reserved for an actual exception message (Rule 9), which is authoritative.
+    Non-string input returns False without raising.
+    """
+    if not isinstance(text, str):
+        return False
+    return any(marker in text for marker in _QUOTA_MARKERS)
+
+
 # ---------------------------------------------------------------------------
 # Reset-time parser
 # ---------------------------------------------------------------------------
@@ -294,19 +319,23 @@ def _apply_rules_1_to_5(obj: object, status_code: object) -> QuotaExhaustedError
 def _apply_rules_6_to_9(obj: object) -> QuotaExhaustedError | None:
     """Rules 6-9: CLI message surfaces and BaseException with quota marker."""
     # Rule 6: UserMessage with ToolResultBlock (content blocks with .content field).
-    # Defense-in-depth gate: scan only error or unknown-status results. A
-    # successful tool result (``is_error is False``) carries benign sub-agent
-    # prose -- e.g. a reviewer echoing "implement rate limiting" -- which must
-    # never trip detection. A genuine sub-agent limit is an error result
-    # (``is_error is True``) but may also arrive with ``is_error`` unset
-    # (``None``), so only the explicit ``False`` case is skipped.
+    # Two-part gate (both required) so benign tool output never trips detection:
+    #   (a) ``is_error is True`` -- ONLY an explicit error tool result is a
+    #       candidate. A successful Read/Grep/Glob returns ``is_error=None`` and
+    #       Bash returns ``is_error=False``; neither is a quota signal -- their
+    #       content is arbitrary file/tool data. (A genuine sub-agent quota limit
+    #       surfaces as an *error* result.)
+    #   (b) verbatim marker only -- scan with ``_has_verbatim_quota_marker``, not
+    #       the broad ``_RATE_LIMIT_RE``, because tool content (e.g. devbench's
+    #       own ``amendment.py`` "Amendment rate limit exceeded: ...") legitimately
+    #       contains that phrasing while the agent debugs the quota/amendment code.
     content = _safe_getattr(obj, "content")
     if isinstance(content, (list, tuple)):
         for block in content:
-            if _safe_getattr(block, "is_error") is False:
+            if _safe_getattr(block, "is_error") is not True:
                 continue
             block_content = _safe_getattr(block, "content")
-            if isinstance(block_content, str) and _has_quota_marker(block_content):
+            if isinstance(block_content, str) and _has_verbatim_quota_marker(block_content):
                 return SubscriptionRateLimitError(
                     reset_at=_parse_reset_at_from_text(block_content),
                     raw_error=obj,
@@ -319,10 +348,13 @@ def _apply_rules_6_to_9(obj: object) -> QuotaExhaustedError | None:
             raw_error=obj,
             source="claude-code-cli",
         )
-    # Rule 8: ResultMessage with is_error=True and quota marker in .result (str)
+    # Rule 8: ResultMessage with is_error=True and a VERBATIM quota line in
+    # .result. The result text is arbitrary CLI output; a genuine subscription
+    # limit is the verbatim "You've hit your limit ... resets ...(UTC)" line, so
+    # the broad regex is not applied here (same rationale as Rule 6).
     if _safe_getattr(obj, "is_error") is True:
         result_field = _safe_getattr(obj, "result")
-        if isinstance(result_field, str) and _has_quota_marker(result_field):
+        if isinstance(result_field, str) and _has_verbatim_quota_marker(result_field):
             return SubscriptionRateLimitError(
                 reset_at=_parse_reset_at_from_text(result_field),
                 raw_error=obj,
@@ -365,15 +397,22 @@ def detect_quota_error(obj: object) -> QuotaExhaustedError | None:
        (source=anthropic-api).
     5. ``response.Error.Code`` in Bedrock throttle set -- ``BedrockThrottleError``
        (source=bedrock).
-    6. UserMessage with a ToolResultBlock that is not a successful result
-       (``is_error`` is True or unset) containing a quota marker
-       -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
+    6. UserMessage with a ToolResultBlock that is an explicit error
+       (``is_error is True``) AND whose content contains a VERBATIM CLI limit
+       line (``_has_verbatim_quota_marker``) -- ``SubscriptionRateLimitError``
+       (source=claude-code-cli). Successful results (``is_error`` ``None``/``False``)
+       and the broad ``rate limit ...`` regex are deliberately NOT matched here:
+       tool content is arbitrary file/tool data (the agent frequently reads
+       devbench's own quota/amendment code, which quotes that phrasing).
     7. Object with ``error == 'rate_limit'`` (AssistantMessage surface)
        -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
-    8. Object with ``is_error == True`` and quota marker in ``result`` (str)
-       -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
-    9. ``BaseException`` with quota marker in ``str(obj)``
-       -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
+    8. Object with ``is_error == True`` and a VERBATIM CLI limit line in
+       ``result`` (str) -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
+       (Verbatim-only, same rationale as Rule 6.)
+    9. ``BaseException`` with a quota marker in ``str(obj)`` -- matched with the
+       full ``_has_quota_marker`` (verbatim OR the ``_RATE_LIMIT_RE`` regex),
+       because an exception message is an authoritative signal, not arbitrary
+       tool content -- ``SubscriptionRateLimitError`` (source=claude-code-cli).
     10. Everything else -- None.
 
     This function never raises regardless of the input type or the internal

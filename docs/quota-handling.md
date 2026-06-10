@@ -31,14 +31,33 @@ sentinel from the inner SDK message loop. The outer handler:
 4. On recovery, emits `[QUOTA_RESUMED] waited_seconds=<N>` and applies the
    configured `resume_strategy` before returning `rc=0`.
 
-Text detection requires explicit exhaustion phrasing -- the verbatim CLI limit
-lines (e.g. "You've hit your limit") or "rate limit" immediately followed by an
-exhaustion verb ("exceeded", "reached", "exhausted", ...). Benign sub-agent
-prose that merely mentions rate limiting (for example a reviewer noting "API
-endpoints implement rate limiting") is never misclassified as a limit. Tool
-results that complete successfully (`is_error` is `False`) are not scanned at
-all, so a passing tool whose output happens to contain a limit phrase cannot
-trip a false pause.
+Text detection is deliberately channel-specific so arbitrary tool output never
+trips a false pause:
+
+- **Tool-result / result content** (a sub-agent `ToolResultBlock`, or a
+  `ResultMessage.result`) is matched **only** when the result is an explicit
+  error (`is_error is True`) **and** the content contains a **verbatim** CLI
+  limit line (e.g. "You've hit your limit"). The broad "rate limit + verb"
+  regex is **not** applied to tool content. Rationale: tool content is
+  arbitrary data the agent read or grepped -- including devbench's own source
+  (e.g. `amendment.py` emits the literal "Amendment rate limit exceeded: ..."
+  and `quota.py`/its tests contain "You've hit your limit" and "rate limit"
+  strings). A **successful** Read/Grep/Glob result carries `is_error=None` and
+  a successful Bash result carries `is_error=False`; neither is scanned, so a
+  passing tool whose output mentions a limit phrase cannot trip a pause. A
+  genuine sub-agent subscription limit surfaces as an *error* result and is
+  still caught.
+- **Exception messages** (`str(exc)`) are matched with the full set: the
+  verbatim CLI lines OR "rate limit" immediately followed by an exhaustion verb
+  ("exceeded", "reached", "exhausted", ...). An exception message is an
+  authoritative signal, not arbitrary content, so the broad regex is retained
+  there.
+- **Structured signals** (HTTP 429/402, `error == 'rate_limit'`, Bedrock
+  throttle codes) are matched directly and are unaffected by the text rules.
+
+Benign sub-agent prose that merely mentions rate limiting (for example a
+reviewer noting "API endpoints implement rate limiting") is never misclassified
+as a limit.
 
 No `asyncio.shield` is used -- a SIGTERM during the wait propagates naturally,
 allowing the SIGTERM handler to force-block the in-flight work unit and exit

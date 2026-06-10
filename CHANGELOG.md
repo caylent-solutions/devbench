@@ -409,6 +409,22 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Shadow-plugin dropped the optional `iac_review` judge (and any agent absent
+  from the override maps).** When an `agents:` model override was configured,
+  `materialise_shadow_plugin` copied only the overridden agent `.md` files as
+  real files and symlinked every other file. The Claude Agent SDK discovers
+  subagents by walking the plugin tree on disk and does not register a symlinked
+  agent `.md`, so `iac-deploy-reviewer` (absent from the historical
+  `_AGENT_FILES` map) stayed a symlink and never registered -- the optional
+  `iac_review` judge could not dispatch and the done-gate blocked every
+  infrastructure unit. The materialiser now writes **every** `agents/**/*.md`
+  file as a real file (model rewritten when overridden, copied verbatim
+  otherwise) and symlinks only non-agent files, so the full agent roster
+  registers regardless of which models are overridden and the fix is robust to
+  agents added in future. `iac_deploy_reviewer` is now an overridable agent
+  (`AgentModelsConfig.iac_deploy_reviewer`, config-schema `agents.iac_deploy_reviewer`,
+  env `JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER`). See `docs/adr/25-per-agent-model-overrides.md`.
+
 - **Quota detection false positive (#236 follow-up).** `detect_quota_error` no
   longer misclassifies benign sub-agent prose as a rate-limit hit. The bare
   `"rate limit"` substring marker is replaced with a precise regex requiring an

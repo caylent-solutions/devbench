@@ -1282,6 +1282,8 @@ class AgentModelsConfig:
         security_reviewer: Override for ``plugin/devbench-orchestrate/agents/security-reviewer.md``.
         task_factory: Override for ``plugin/devbench-orchestrate/agents/task-factory.md``.
         review_supervisor: Override for ``plugin/devbench-orchestrate/agents/review-supervisor.md``.
+        iac_deploy_reviewer: Override for ``plugin/devbench-orchestrate/agents/iac-deploy-reviewer.md``
+            (the optional ``iac_review`` judge).
         review_team: Nested overrides for the four review_team judges.
     """
 
@@ -1291,6 +1293,7 @@ class AgentModelsConfig:
     security_reviewer: str | None = None
     task_factory: str | None = None
     review_supervisor: str | None = None
+    iac_deploy_reviewer: str | None = None
     review_team: ReviewTeamModelsConfig = field(default_factory=ReviewTeamModelsConfig)
 
 
@@ -1393,6 +1396,7 @@ def _parse_agent_models_config(
         "security_reviewer",
         "task_factory",
         "review_supervisor",
+        "iac_deploy_reviewer",
     )
     kwargs: dict[str, str] = {}
     for key in top_fields:

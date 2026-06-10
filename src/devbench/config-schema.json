@@ -631,6 +631,10 @@
           "type": "string",
           "description": "Model for plugin/devbench-orchestrate/agents/review-supervisor.md. Default null (use frontmatter)."
         },
+        "iac_deploy_reviewer": {
+          "type": "string",
+          "description": "Model for plugin/devbench-orchestrate/agents/iac-deploy-reviewer.md (the optional iac_review judge). Default null (use frontmatter). Override via JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER."
+        },
         "review_team": {
           "type": "object",
           "description": "Per-judge overrides for the four review_team agents. Each field defaults to null; the corresponding judge then runs on its frontmatter model.",

@@ -4,9 +4,19 @@ When operators set ``agents.<name>: <model>`` in ``devbench.yaml`` the canonical
 marketplace plugin's agent ``.md`` files cannot be edited safely (the
 marketplace install is shared and treated as immutable). Instead a shadow tree
 is built under ``<workspace>/.devbench/plugin-shadow/devbench/`` that mirrors
-the canonical plugin via symlinks for every file except the agent ``.md``
-files whose model is overridden -- those are written as plain files with the
-``model:`` frontmatter line rewritten to the operator-supplied value.
+the canonical plugin. Every agent ``.md`` file (anything under ``agents/``) is
+materialised as a plain real file -- copied verbatim when its model is not
+overridden, or with the ``model:`` frontmatter line rewritten to the
+operator-supplied value when it is. Every non-agent file is symlinked back to
+the canonical location so the shadow stays cheap to build.
+
+Materialising *all* agent files as real files (rather than only the overridden
+ones) is required because the Claude Agent SDK discovers subagents by walking
+the plugin tree on disk: a symlinked agent ``.md`` is not registered as a
+dispatchable agent type, so any agent left as a symlink silently disappears
+from the session. Copying every agent file guarantees the full agent roster
+registers regardless of which (if any) models are overridden, and is robust to
+agents added to the canonical plugin in future without touching this module.
 
 Both ``cmd_start`` (non-interactive, via ``ClaudeAgentOptions(plugins=...)``)
 and ``devbench prepare-plugin-shadow`` (interactive, via
@@ -39,6 +49,7 @@ _AGENT_FILES: dict[str, str] = {
     "security_reviewer": "agents/security-reviewer.md",
     "task_factory": "agents/task-factory.md",
     "review_supervisor": "agents/review-supervisor.md",
+    "iac_deploy_reviewer": "agents/iac-deploy-reviewer.md",
 }
 
 # Nested review_team field-name -> relative path under the canonical plugin tree.
@@ -54,6 +65,30 @@ _REVIEW_TEAM_FILES: dict[str, str] = {
 # end-of-line; ``subn`` replaces only the first match so the file body cannot
 # accidentally be mutated.
 _MODEL_LINE_RE: re.Pattern[str] = re.compile(r"^model:[ \t]+\S.*$", re.MULTILINE)
+
+# Relative-path prefix (POSIX separators, as produced by ``str(PurePosixPath)``
+# / ``str(Path)`` on the POSIX hosts this module targets) identifying agent
+# definition files inside the canonical plugin tree.
+_AGENTS_DIR_PREFIX = "agents/"
+
+
+def _is_agent_markdown(rel_str: str) -> bool:
+    """Return True when *rel_str* names an agent definition ``.md`` file.
+
+    Any markdown file under ``agents/`` (including nested ``agents/review_team/``)
+    is an agent definition that the Claude Agent SDK must discover as a real
+    file. Non-markdown files under ``agents/`` and every file outside ``agents/``
+    are not agent definitions and stay symlinked.
+
+    Args:
+        rel_str: File path relative to the canonical plugin root, using ``/``
+            separators (``agents/executor.md``,
+            ``agents/review_team/code-reviewer.md``).
+
+    Returns:
+        ``True`` when the path is an agent ``.md`` file, ``False`` otherwise.
+    """
+    return rel_str.startswith(_AGENTS_DIR_PREFIX) and rel_str.endswith(".md")
 
 
 def shadow_plugin_path(workspace_root: Path) -> Path:
@@ -258,9 +293,13 @@ def materialise_shadow_plugin(
     Walks *canonical_plugin_dir* recursively. Each file is mirrored into the
     same relative position under ``shadow_plugin_path(workspace_root)``:
 
-    * Files whose relative path matches an overridden agent are copied as
-      plain files with the ``model:`` frontmatter line rewritten.
-    * Every other file is symlinked back to the canonical location so the
+    * Every agent ``.md`` file (any file under ``agents/`` ending in ``.md``)
+      is materialised as a plain real file -- with the ``model:`` frontmatter
+      line rewritten when that agent's model is overridden, or copied verbatim
+      otherwise. Agent files must be real files (not symlinks) because the
+      Claude Agent SDK does not register a symlinked agent ``.md`` as a
+      dispatchable agent type.
+    * Every non-agent file is symlinked back to the canonical location so the
       shadow stays cheap to build and impossible to drift content-wise.
 
     The shadow tree is rebuilt from scratch on every call (cheap because it
@@ -322,9 +361,11 @@ def materialise_shadow_plugin(
             dest.mkdir(parents=True, exist_ok=True)
             continue
         rel_str = str(rel)
-        if rel_str in overrides:
+        if _is_agent_markdown(rel_str):
             content = src.read_text(encoding="utf-8")
-            _atomic_write(dest, _rewrite_agent_model(content, overrides[rel_str]))
+            if rel_str in overrides:
+                content = _rewrite_agent_model(content, overrides[rel_str])
+            _atomic_write(dest, content)
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.symlink_to(src)

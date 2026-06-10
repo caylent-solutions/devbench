@@ -3163,6 +3163,20 @@ class TestAgentModelsConfig:
         assert rt.agent_models.executor == "opus"
         assert rt.agent_models.manifest_amender == "claude-opus-4-7"
 
+    def test_iac_deploy_reviewer_override_accepted(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            agents:
+              iac_deploy_reviewer: sonnet
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.agent_models.iac_deploy_reviewer == "sonnet"
+
     def test_review_team_nested_override(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",
@@ -3280,6 +3294,7 @@ _ALL_TOP_LEVEL_AGENT_FIELDS = (
     "security_reviewer",
     "task_factory",
     "review_supervisor",
+    "iac_deploy_reviewer",
 )
 
 _ALL_REVIEW_TEAM_FIELDS = (

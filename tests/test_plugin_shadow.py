@@ -47,10 +47,18 @@ _ALL_AGENT_FILES: tuple[str, ...] = (
     "agents/security-reviewer.md",
     "agents/task-factory.md",
     "agents/review-supervisor.md",
+    "agents/iac-deploy-reviewer.md",
     "agents/review_team/code-reviewer.md",
     "agents/review_team/test-reviewer.md",
     "agents/review_team/doc-reviewer.md",
     "agents/review_team/changes-manifest.md",
+)
+
+# Non-agent plugin files that must remain symlinks in the materialised shadow.
+_NON_AGENT_FILES: tuple[str, ...] = (
+    ".claude-plugin/plugin.json",
+    "hooks/hooks.json",
+    "scripts/guard-bash.sh",
 )
 
 
@@ -151,6 +159,11 @@ class TestCollectOverrides:
             "agents/manifest-amender.md": "sonnet",
         }
 
+    def test_iac_deploy_reviewer_field(self) -> None:
+        cfg = AgentModelsConfig(iac_deploy_reviewer="opus")
+        out = _collect_overrides(cfg)
+        assert out == {"agents/iac-deploy-reviewer.md": "opus"}
+
     def test_review_team_fields(self) -> None:
         cfg = AgentModelsConfig(
             review_team=ReviewTeamModelsConfig(code_reviewer="opus", test_reviewer="sonnet"),
@@ -222,7 +235,7 @@ class TestMaterialiseShadowPlugin:
                 AgentModelsConfig(executor="opus"),
             )
 
-    def test_executor_override_writes_real_file_and_symlinks_rest(self, tmp_path: Path) -> None:
+    def test_executor_override_writes_real_files_and_symlinks_non_agents(self, tmp_path: Path) -> None:
         plugin_dir = _build_synthetic_plugin(tmp_path)
         workspace = tmp_path / "ws"
         cfg = AgentModelsConfig(executor="opus")
@@ -231,19 +244,31 @@ class TestMaterialiseShadowPlugin:
 
         assert shadow_root == shadow_plugin_path(workspace)
         assert shadow_root.is_dir()
-        # Executor was overridden -- must be a real file with the rewritten model line.
-        executor = shadow_root / "agents" / "executor.md"
-        assert not executor.is_symlink()
-        assert "model: opus\n" in executor.read_text(encoding="utf-8")
-        # Every other plugin file must be a symlink to the canonical.
+        # EVERY agent .md is a real file (never a symlink) so the Claude Agent
+        # SDK registers every agent type. Overridden agents carry the rewritten
+        # model; non-overridden agents preserve their canonical model line.
         for rel in _ALL_AGENT_FILES:
-            if rel == "agents/executor.md":
-                continue
-            assert (shadow_root / rel).is_symlink()
-            assert (shadow_root / rel).resolve() == (plugin_dir / rel).resolve()
-        assert (shadow_root / ".claude-plugin" / "plugin.json").is_symlink()
-        assert (shadow_root / "hooks" / "hooks.json").is_symlink()
-        assert (shadow_root / "scripts" / "guard-bash.sh").is_symlink()
+            materialised = shadow_root / rel
+            assert materialised.is_file()
+            assert not materialised.is_symlink()
+        executor = shadow_root / "agents" / "executor.md"
+        assert "model: opus\n" in executor.read_text(encoding="utf-8")
+        # review-supervisor was NOT overridden -- its canonical model (sonnet in
+        # the fixture) must survive verbatim, proving non-overridden agents are
+        # copied (not rewritten, not symlinked).
+        supervisor = shadow_root / "agents" / "review-supervisor.md"
+        assert "model: sonnet\n" in supervisor.read_text(encoding="utf-8")
+        # The optional iac_review judge must materialise as a real file too --
+        # the registration bug this guards against (it was previously symlinked
+        # and therefore never registered).
+        iac = shadow_root / "agents" / "iac-deploy-reviewer.md"
+        assert iac.is_file() and not iac.is_symlink()
+        assert "model: opus\n" in iac.read_text(encoding="utf-8")
+        # Non-agent plugin files must still be symlinks to the canonical tree.
+        for rel in _NON_AGENT_FILES:
+            link = shadow_root / rel
+            assert link.is_symlink()
+            assert link.resolve() == (plugin_dir / rel).resolve()
 
     def test_review_team_override(self, tmp_path: Path) -> None:
         plugin_dir = _build_synthetic_plugin(tmp_path)
@@ -257,8 +282,11 @@ class TestMaterialiseShadowPlugin:
         rewritten = shadow_root / "agents" / "review_team" / "code-reviewer.md"
         assert not rewritten.is_symlink()
         assert "model: opus\n" in rewritten.read_text(encoding="utf-8")
-        # Sibling judge stays symlinked.
-        assert (shadow_root / "agents" / "review_team" / "test-reviewer.md").is_symlink()
+        # Sibling judge is a real file with its canonical model (opus in the
+        # fixture) -- every agent .md is materialised, overridden or not.
+        sibling = shadow_root / "agents" / "review_team" / "test-reviewer.md"
+        assert not sibling.is_symlink()
+        assert "model: opus\n" in sibling.read_text(encoding="utf-8")
 
     def test_rebuilds_idempotently(self, tmp_path: Path) -> None:
         plugin_dir = _build_synthetic_plugin(tmp_path)
@@ -325,6 +353,17 @@ class TestMaterialiseShadowPlugin:
         assert shadow_root is not None
         executor = shadow_root / "agents" / "executor.md"
         assert "model: opus\n" in executor.read_text(encoding="utf-8")
+        # Registration-bug guard: every agent .md in the REAL canonical tree
+        # must materialise as a real file, not a symlink -- in particular the
+        # optional iac_review judge, which is absent from the synthetic fixture's
+        # historical override maps. A symlinked agent is not registered by the SDK.
+        for agent_md in sorted((canonical / "agents").rglob("*.md")):
+            rel = agent_md.relative_to(canonical)
+            materialised = shadow_root / rel
+            assert materialised.is_file(), f"missing agent file in shadow: {rel}"
+            assert not materialised.is_symlink(), f"agent file must be a real file, not a symlink: {rel}"
+        iac = shadow_root / "agents" / "iac-deploy-reviewer.md"
+        assert iac.is_file() and not iac.is_symlink()
 
 
 # ---------------------------------------------------------------------------

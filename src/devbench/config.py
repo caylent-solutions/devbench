@@ -538,6 +538,7 @@ _AGENT_MODEL_ENV_VARS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("JUDGE_AGENT_MODEL_SECURITY_REVIEWER", ("security_reviewer",)),
     ("DEVBENCH_AGENT_MODEL_TASK_FACTORY", ("task_factory",)),
     ("JUDGE_AGENT_MODEL_REVIEW_SUPERVISOR", ("review_supervisor",)),
+    ("JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER", ("iac_deploy_reviewer",)),
     ("JUDGE_AGENT_MODEL_CODE_REVIEWER", ("review_team", "code_reviewer")),
     ("JUDGE_AGENT_MODEL_TEST_REVIEWER", ("review_team", "test_reviewer")),
     ("JUDGE_AGENT_MODEL_DOC_REVIEWER", ("review_team", "doc_reviewer")),

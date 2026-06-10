@@ -323,6 +323,7 @@ agents:
   security_reviewer: opus
   task_factory: opus
   review_supervisor: sonnet
+  iac_deploy_reviewer: opus     # optional iac_review judge; env: JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER
   review_team:
     code_reviewer: opus
     test_reviewer: opus
@@ -330,7 +331,9 @@ agents:
     changes_manifest: opus
 ```
 
-All fields default to `null` (agent's `.md` frontmatter default). See
+All fields default to `null` (agent's `.md` frontmatter default). Every agent
+`.md` file is materialised as a real file in the shadow tree so the Claude
+Agent SDK registers it; non-agent files are symlinked. See
 [docs/adr/25-per-agent-model-overrides.md](adr/25-per-agent-model-overrides.md).
 
 ---

@@ -524,6 +524,7 @@ class TestAgentModelEnvOverrideTypeError:
             security_reviewer=None,
             task_factory=None,
             review_supervisor=None,
+            iac_deploy_reviewer=None,
             review_team=review_team,
         )
         with patch.object(config.RUNTIME_CONFIG, "agent_models", fake):
@@ -671,6 +672,7 @@ class TestAgentModelEnvOverrides:
             "JUDGE_AGENT_MODEL_SECURITY_REVIEWER": "opus",
             "DEVBENCH_AGENT_MODEL_TASK_FACTORY": "opus",
             "JUDGE_AGENT_MODEL_REVIEW_SUPERVISOR": "opus",
+            "JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER": "opus",
             "JUDGE_AGENT_MODEL_CODE_REVIEWER": "opus",
             "JUDGE_AGENT_MODEL_TEST_REVIEWER": "opus",
             "JUDGE_AGENT_MODEL_DOC_REVIEWER": "opus",
@@ -685,6 +687,7 @@ class TestAgentModelEnvOverrides:
             assert am.security_reviewer == "opus"
             assert am.task_factory == "opus"
             assert am.review_supervisor == "opus"
+            assert am.iac_deploy_reviewer == "opus"
             assert am.review_team.code_reviewer == "opus"
             assert am.review_team.test_reviewer == "opus"
             assert am.review_team.doc_reviewer == "opus"

@@ -7,8 +7,10 @@
 
 ## Context
 
-DevBench ships ten work agents under `plugin/devbench/agents/`. Each agent's
-`.md` file declares its model in YAML frontmatter:
+DevBench ships eleven work agents under `plugin/devbench-orchestrate/agents/`
+(the six core agents, the four `review_team` judges, and the optional
+`iac-deploy-reviewer` IaC judge). Each agent's `.md` file declares its model in
+YAML frontmatter:
 
 ```yaml
 ---
@@ -40,10 +42,24 @@ forces the operator to keep two parallel configurations.
 
 ## Decision
 
-Materialise a workspace-local **shadow plugin tree** whose agent `.md` files
-are copies (rewritten) of the canonical agent files, while every other file
-is a symlink back to the canonical. Both modes load this shadow tree instead
-of the canonical when any per-agent override is configured.
+Materialise a workspace-local **shadow plugin tree** in which **every** agent
+`.md` file is a real file -- the canonical content copied verbatim, with the
+`model:` frontmatter line rewritten only for agents whose model is overridden
+-- while every **non-agent** file is a symlink back to the canonical. Both
+modes load this shadow tree instead of the canonical when any per-agent
+override is configured.
+
+Agent files must be real files (never symlinks) because the Claude Agent SDK
+discovers subagents by walking the plugin tree on disk: a symlinked agent
+`.md` is not registered as a dispatchable agent type and silently disappears
+from the session. An earlier design symlinked every non-overridden agent and
+copied only the overridden ones; that left agents absent from the override
+maps (notably `iac-deploy-reviewer`) as symlinks, so the optional `iac_review`
+judge failed to dispatch and the done-gate blocked every infrastructure unit.
+Materialising the full agent roster as real files -- regardless of which
+models are overridden -- guarantees the complete roster registers and is
+robust to agents added to the canonical plugin in future without touching the
+shadow module.
 
 Configuration surface: a new top-level `agents:` block in
 `backlog/config/devbench.yaml`. The example below pins each field to its
@@ -101,6 +117,7 @@ agents:
   security_reviewer: opus
   task_factory: opus
   review_supervisor: sonnet
+  iac_deploy_reviewer: opus
   review_team:
     code_reviewer: opus
     test_reviewer: opus
@@ -109,14 +126,18 @@ agents:
 ```
 
 Every field defaults to `null` when absent; a null (or absent) field leaves
-the agent running on its frontmatter model. `DEVBENCH_AGENT_MODEL_<NAME>` (or `JUDGE_AGENT_MODEL_<NAME>` for the five review judges + review-supervisor) env vars override the YAML on
-a per-call basis (precedence: env > yaml > frontmatter).
+the agent running on its frontmatter model. `DEVBENCH_AGENT_MODEL_<NAME>` (or
+`JUDGE_AGENT_MODEL_<NAME>` for the four review judges, `review-supervisor`, and
+`iac-deploy-reviewer`) env vars override the YAML on a per-call basis
+(precedence: env > yaml > frontmatter). The optional IaC judge's env var is
+`JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER`.
 
 The shadow tree lives at `<workspace>/.devbench/plugin-shadow/devbench/`.
-It is rebuilt from scratch on every `devbench start` (cheap because it is
-mostly symlinks) so it can never drift from the current config. When the
-operator removes the `agents:` block, the next launch detects "no overrides"
-and removes the shadow tree before falling back to the canonical plugin path.
+It is rebuilt from scratch on every `devbench start` (cheap: the agent `.md`
+files are small real-file copies and every other file is a symlink) so it can
+never drift from the current config. When the operator removes the `agents:`
+block, the next launch detects "no overrides" and removes the shadow tree
+before falling back to the canonical plugin path.
 
 ### Mode symmetry
 

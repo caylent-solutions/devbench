@@ -444,6 +444,20 @@ since the last release. PR #119 carries every change.
   (`AgentModelsConfig.iac_deploy_reviewer`, config-schema `agents.iac_deploy_reviewer`,
   env `JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER`). See `docs/adr/25-per-agent-model-overrides.md`.
 
+- **`validate-backlog` and `next` disagreed on dependency cycles (TDI-009).**
+  `validate-backlog` walked only the BACKLOG.md index dependency column while
+  `next` (and the orchestrator) schedule on the work-unit `## Dependencies`
+  tables, so a cycle introduced by hand-editing a `## Dependencies` table passed
+  validation and then silently halted the next run with `NO_ACTIONABLE --
+  cyclic` and a misleading node id. Cycle detection is now a single shared
+  routine (`devbench.backlog.dep_cycle.find_cycles`) over one canonical graph --
+  the union of the index column, the `## Dependencies` tables, and the
+  `[BLOCKED_PENDING_PROPOSAL]` marker edges -- used by `validate-backlog` and
+  `next`. `validate-backlog` ERRORs on any cycle `next` / `add-dep` would reject
+  and names the actual cycle members; `next`'s stall diagnostic likewise names
+  the real loop members instead of an arbitrary detection node. Pure-marker
+  cycles continue to be reported by the dedicated marker-cycle check.
+
 - **`iac_review` predicate over-matched on IaC path tokens (TDI-007).**
   `detect_iac_tool` matched a tool by its bare name appearing anywhere in a
   command -- including a path operand (`test -d terragrunt/common/x`,

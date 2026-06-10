@@ -1109,15 +1109,34 @@ def _held_blocking_ids(in_queue_tasks: list[WorkUnit], units_by_id: dict[str, Wo
 
 
 def _cyclic_task_ids(in_queue_tasks: list[WorkUnit], units_by_id: dict[str, WorkUnit]) -> list[str]:
-    """Return IDs of in-queue tasks whose unmet deps are all also in-queue (forming a cycle)."""
+    """Return the members of any dependency cycle that stalls an in-queue task (TDI-009).
+
+    Uses the shared :func:`devbench.backlog.dep_cycle.find_cycles` over the
+    work-unit ``## Dependencies`` graph (the same source ``validate-backlog``'s
+    canonical graph draws on), so ``next`` and ``validate-backlog`` agree on
+    cycle membership and the stall diagnostic names the ACTUAL cycle members --
+    not an arbitrary detection node, the misleading behaviour the previous
+    closed-set heuristic produced. Only cycles among non-terminal units that
+    include at least one in-queue task are returned (those are the cycles that
+    can stall ``next``).
+    """
+    from devbench.backlog.dep_cycle import find_cycles
+
     in_queue_ids = {t.id for t in in_queue_tasks}
+    graph: dict[str, list[str]] = {
+        uid: list(unit.dependencies)
+        for uid, unit in units_by_id.items()
+        if unit.status not in (WorkUnitStatus.DONE, WorkUnitStatus.DECLINED)
+    }
     seen: set[str] = set()
     result: list[str] = []
-    for task in in_queue_tasks:
-        unmet = _unmet_dep_ids(task, units_by_id)
-        if unmet and all(dep_id in in_queue_ids for dep_id in unmet) and task.id not in seen:
-            seen.add(task.id)
-            result.append(task.id)
+    for cycle in find_cycles(graph):
+        if not any(member in in_queue_ids for member in cycle):
+            continue
+        for member in cycle:
+            if member not in seen:
+                seen.add(member)
+                result.append(member)
     return result
 
 

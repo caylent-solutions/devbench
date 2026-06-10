@@ -4855,7 +4855,7 @@ class TestValidateDepCycle4Node:
             },
         )
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        BacklogManager()._check_dep_cycles(index, tmp_path, errors)
         assert any("cycle" in e for e in errors)
 
     def test_5_node_cycle_rejected(self, tmp_path: Path) -> None:
@@ -4870,7 +4870,7 @@ class TestValidateDepCycle4Node:
             },
         )
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        BacklogManager()._check_dep_cycles(index, tmp_path, errors)
         assert any("cycle" in e for e in errors)
 
     def test_4_node_dag_accepted(self, tmp_path: Path) -> None:
@@ -4885,14 +4885,14 @@ class TestValidateDepCycle4Node:
             },
         )
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        BacklogManager()._check_dep_cycles(index, tmp_path, errors)
         assert errors == []
 
     def test_self_dep_reported(self, tmp_path: Path) -> None:
         """A 1-node cycle (self-dep) is also caught."""
         index = self._index_with_deps(tmp_path, {"E0-F1-S1-T1": "E0-F1-S1-T1"})
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        BacklogManager()._check_dep_cycles(index, tmp_path, errors)
         assert any("cycle" in e for e in errors)
 
     def test_disjoint_cycle_reported_once(self, tmp_path: Path) -> None:
@@ -4907,14 +4907,14 @@ class TestValidateDepCycle4Node:
             },
         )
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        BacklogManager()._check_dep_cycles(index, tmp_path, errors)
         cycle_errors = [e for e in errors if "cycle" in e]
         assert len(cycle_errors) == 2
 
     def test_missing_index_no_crash(self, tmp_path: Path) -> None:
         """The cycle check on a missing BACKLOG.md returns silently."""
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", errors)
+        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", tmp_path, errors)
         assert errors == []
 
     def test_summary_row_skipped_when_cell_count_mismatches(self, tmp_path: Path) -> None:

@@ -476,7 +476,7 @@ class BacklogManager:
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
-        self._check_dep_cycles(backlog_index, errors)
+        self._check_dep_cycles(backlog_index, workspace_root, errors)
         errors.extend(self._check_marker_cycles(backlog_index, workspace_root))
         self._check_status_summary(backlog_index, rows, errors)
         if fix:
@@ -977,62 +977,80 @@ class BacklogManager:
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
                     errors.append(f"{row_id}: dependency '{dep_id}' not found in backlog index")
 
-    def _check_dep_cycles(self, backlog_index: Path, errors: list[str]) -> None:
-        """Issue #151: detect dependency cycles via DFS-with-recursion-stack.
+    def _check_dep_cycles(self, backlog_index: Path, workspace_root: Path, errors: list[str]) -> None:
+        """TDI-009: detect dependency cycles over the canonical dependency graph.
 
-        Walks the dep graph derived from the Full Work Unit Index. A cycle
-        exists when, during DFS, we encounter a node that is currently in
-        the recursion stack (the "gray" set). Self-edges and chains of any
-        length (4-node, N-node) are detected because the recursion-stack
-        membership check is the unique cycle witness.
+        The canonical graph unions three edge sources so ``validate-backlog``
+        catches every cycle ``next`` / ``add-dep`` would reject: the BACKLOG.md
+        Full Work Unit Index dependency column, the work-unit ``## Dependencies``
+        tables (the source of truth the orchestrator schedules on -- the
+        representation an operator edits directly), and the
+        ``[BLOCKED_PENDING_PROPOSAL]`` marker edges. A cycle whose edges are
+        entirely marker-only is left to :meth:`_check_marker_cycles` (which
+        renders the dedicated ``marker cycle`` diagnostic); any cycle that
+        includes at least one declared-dependency edge (index or table) is
+        reported here, naming the **actual** cycle members in traversal order so
+        the operator can spot the offending chain.
 
-        Reports one error per cycle, naming the participating node IDs in
-        traversal order so the operator can spot the offending chain. Cycle
-        reporting is normalised: each cycle is rotated to start at its
-        lexicographically smallest ID and reported once even when the DFS
-        encounters it from multiple roots.
+        Detection is the shared :func:`devbench.backlog.dep_cycle.find_cycles`
+        routine, so ``validate-backlog`` and ``next`` agree on cycle membership.
         """
-        graph = self._build_dependency_graph(backlog_index)
-        if not graph:
+        from devbench.backlog.dep_cycle import find_cycles, render_cycle
+
+        union, dep_edges = self._build_canonical_dep_graph(backlog_index, workspace_root)
+        if not union:
             return
+        for cycle in find_cycles(union):
+            closing = (*cycle[1:], cycle[0])
+            if any((src, dst) in dep_edges for src, dst in zip(cycle, closing, strict=True)):
+                errors.append(f"dependency cycle detected: {render_cycle(cycle)}")
 
-        # DFS color tracking: 0 = white (unvisited), 1 = gray (on the
-        # recursion stack -- a back-edge to a gray node is the cycle
-        # witness), 2 = black (fully processed). ``stack`` records the
-        # current DFS chain so we can extract the cycle nodes when a
-        # back-edge fires.
-        color: dict[str, int] = dict.fromkeys(graph, 0)
-        stack: list[str] = []
-        reported: set[tuple[str, ...]] = set()
+    def _build_canonical_dep_graph(
+        self,
+        backlog_index: Path,
+        workspace_root: Path,
+    ) -> tuple[dict[str, list[str]], set[tuple[str, str]]]:
+        """Return ``(union_graph, declared_dep_edges)`` for canonical cycle detection.
 
-        def visit(node: str) -> None:
-            color[node] = 1
-            stack.append(node)
-            for nxt in graph.get(node, ()):
-                if nxt not in color:
-                    # Dependency on a non-indexed ID -- already reported by
-                    # _check_dependencies; skip without traversal.
-                    continue
-                if color[nxt] == 1:
-                    # Cycle: rotate so the lexicographically smallest node
-                    # starts the chain, then dedupe.
-                    cycle_start = stack.index(nxt)
-                    cycle = tuple(stack[cycle_start:])
-                    rotation = cycle.index(min(cycle))
-                    normalised = cycle[rotation:] + cycle[:rotation]
-                    if normalised not in reported:
-                        reported.add(normalised)
-                        chain = " -> ".join([*normalised, normalised[0]])
-                        errors.append(f"dependency cycle detected: {chain}")
-                    continue
-                if color[nxt] == 0:
-                    visit(nxt)
-            stack.pop()
-            color[node] = 2
+        ``union_graph`` merges the BACKLOG.md index dependency column, the
+        work-unit ``## Dependencies`` tables, and the
+        ``[BLOCKED_PENDING_PROPOSAL]`` marker edges. ``declared_dep_edges`` is
+        the set of ``(node, dep)`` pairs that come from a declared dependency
+        (index column or table) -- a cycle is reported by :meth:`_check_dep_cycles`
+        only when it uses at least one such edge, so pure-marker cycles defer to
+        :meth:`_check_marker_cycles`.
+        """
+        from devbench.backlog.parser import BacklogParser
 
-        for node in sorted(graph):
-            if color.get(node) == 0:
-                visit(node)
+        index_graph = self._build_dependency_graph(backlog_index)
+        marker_graph = self._build_marker_graph(backlog_index, workspace_root)
+
+        table_graph: dict[str, list[str]] = {}
+        rows = self._parse_backlog_rows(backlog_index) if backlog_index.exists() else []
+        for row_id, _, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            wu_path = workspace_root / file_path if file_path else None
+            if wu_path is None or not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            table_graph[row_id] = BacklogParser._parse_dependency_table(content)
+
+        union: dict[str, list[str]] = {}
+        dep_edges: set[tuple[str, str]] = set()
+        all_ids = set(index_graph) | set(table_graph) | set(marker_graph)
+        for node in all_ids:
+            targets: list[str] = []
+            for declared in (index_graph.get(node, []), table_graph.get(node, [])):
+                for dep in declared:
+                    dep_edges.add((node, dep))
+                    if dep not in targets:
+                        targets.append(dep)
+            for marker_target in marker_graph.get(node, []):
+                if marker_target not in targets:
+                    targets.append(marker_target)
+            union[node] = targets
+        return union, dep_edges
 
     def _build_dependency_graph(self, backlog_index: Path) -> dict[str, list[str]]:
         """Parse the Full Work Unit Index into a ``{id: [dep_id, ...]}`` map.

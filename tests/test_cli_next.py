@@ -129,6 +129,31 @@ class TestCmdNextNoActionableDiagnostic:
         assert "\u2014" not in reason_line, "em-dash must not appear in reason line"
 
     @pytest.mark.unit
+    def test_cyclic_classification_names_actual_members(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """TDI-009 AC-3: the cyclic diagnostic lists the ACTUAL cycle members.
+
+        A three-task chain T1 -> T2 -> T3 -> T1 must name all three loop members,
+        not an arbitrary detection node.
+        """
+        task_a = _task("E1-F1-S1-T1", dependencies=["E1-F1-S1-T2"])
+        task_b = _task("E1-F1-S1-T2", dependencies=["E1-F1-S1-T3"])
+        task_c = _task("E1-F1-S1-T3", dependencies=["E1-F1-S1-T1"])
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [task_a, task_b, task_c]
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        reason_line = capsys.readouterr().out.splitlines()[1]
+        assert "cyclic" in reason_line
+        for member in ("E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F1-S1-T3"):
+            assert member in reason_line
+
+    @pytest.mark.unit
     def test_reason_line_has_no_em_dash(self, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-253-4: the reason line must not contain an em-dash character."""
         held_dep = _task("E1-F1-S1-T1", status=WorkUnitStatus.HOLD)

@@ -235,6 +235,8 @@ A Task's dependency is satisfied when the dep is in a terminal state (`done` or 
 
 `devbench sync-blocked` is the operator-facing tool for reconciling status against this rule -- run it after manual edits or to triage a drifted backlog. The orchestrator's `next` query enforces the same rule automatically.
 
+**Dependency-cycle detection (TDI-009).** `validate-backlog`, `next`, and `add-dep` detect cycles over one canonical dependency graph via a single shared routine (`devbench.backlog.dep_cycle.find_cycles`). The canonical graph unions the BACKLOG.md index dependency column, the work-unit `## Dependencies` tables (the source of truth an operator edits directly), and the `[BLOCKED_PENDING_PROPOSAL]` marker edges. This closes a prior gap where a cycle introduced by editing a `## Dependencies` table passed `validate-backlog` (which only walked the index column) while `next` later halted with `NO_ACTIONABLE -- cyclic`. The diagnostic now names the **actual** cycle members (e.g. `dependency cycle detected: T1 -> T2 -> T1`), not an arbitrary detection node; a cycle made purely of marker edges is reported by the dedicated marker-cycle check instead.
+
 Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index that mirrors the work-unit files; the work-unit file is the source of truth. `validate-backlog` reports mirror drift between the two as an error so it can be reconciled -- it does not auto-correct.
 
 ---

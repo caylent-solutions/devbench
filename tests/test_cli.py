@@ -12952,6 +12952,35 @@ class TestCmdReconcileCascade:
         assert "## Status: in-queue" in t2
         assert "[CASCADE_RECONCILED]" in t2
 
+    def test_forced_blocked_on_stop_unit_requeued_with_audit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """TDI-002 AC-3: a forced-blocked-on-stop unit (no marker, deps satisfied)
+        is auto-requeued on the sweep with a [REQUEUED_AFTER_STOP] audit."""
+        forced = (
+            "## Comments\n\n[2026-06-09 12:00 UTC] [agent/orchestrator] [FORCED_BLOCKED_ON_STOP] session=overnight\n"
+        )
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T2", "Task", "blocked", "None", "E0-F1-S1-T2", forced),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" in [item["unit_id"] for item in envelope["flipped"]]
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[REQUEUED_AFTER_STOP]" in t2
+
     def test_open_marker_keeps_task_blocked(
         self,
         tmp_path: Path,

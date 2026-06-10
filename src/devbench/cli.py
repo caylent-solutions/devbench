@@ -2469,11 +2469,15 @@ def cmd_reconcile_cascade() -> int:
             continue
 
         manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
-        message = (
-            f"[CASCADE_RECONCILED] markers {marker_ids} terminal and regular deps satisfied; re-queuing"
-            if marker_ids
-            else "[CASCADE_RECONCILED] regular deps satisfied; re-queuing"
-        )
+        if marker_ids:
+            message = f"[CASCADE_RECONCILED] markers {marker_ids} terminal and regular deps satisfied; re-queuing"
+        elif _FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX in content:
+            # TDI-002: the unit's only blocker was the SIGTERM shutdown safeguard
+            # (no marker, deps satisfied). It was merely interrupted; re-queue it
+            # with a distinct audit so the operator sees no action was required.
+            message = "[REQUEUED_AFTER_STOP] interrupted on orchestrator stop; no structural blocker; re-queuing"
+        else:
+            message = "[CASCADE_RECONCILED] regular deps satisfied; re-queuing"
         manager._append_agent_comment(wu_file, "backlog_manager", message)
         flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
 

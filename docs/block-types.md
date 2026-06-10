@@ -3,29 +3,30 @@
 ## Overview
 
 Every work unit that carries status `blocked` is classified into exactly one of
-seven mutually exclusive states by the `BlockedTaskState` classifier defined in
+eight mutually exclusive states by the `BlockedTaskState` classifier defined in
 `src/devbench/backlog/proposal.py`. The classifier runs during the orchestrator's
 triage sweep and drives the report panel, the `devbench list-blocked` output, and
 the ADR-07 cascade-unblock logic. Understanding which state a task is in tells the
 operator whether to act immediately, wait for automation, or resume a held
-dependency. The seven states are, in decision priority order:
+dependency. The eight states are, in decision priority order:
 `RUNTIME_DEGRADATION`, `HELD`, `BLOCKED_ON_HELD`, `AUTO_CLEARING_VIA_PROPOSAL`,
-`AWAITING_DEPENDENCY`, `AWAITING_AMENDMENT_RECOVERY`, and
+`AWAITING_DEPENDENCY`, `AWAITING_AMENDMENT_RECOVERY`, `INTERRUPTED_ON_STOP`, and
 `OPERATOR_ACTION_REQUIRED`.
 
 Two public classifier functions are available:
 
-- **`classify_blocked_task`** -- full seven-bucket classifier. Returns
+- **`classify_blocked_task`** -- full eight-bucket classifier. Returns
   `RUNTIME_DEGRADATION` at priority 0 when a degradation signal is present,
   masking any co-existing structural blocker.
-- **`classify_blocked_task_excluding_degradation`** -- six-bucket classifier
-  (issue #248a). Walks the same decision tree with the degradation rung skipped.
-  Returns the underlying structural bucket even when a degradation signal is
-  present. Never returns `RUNTIME_DEGRADATION`. Consumed by `generate_report`
-  to produce the composite line and by the assistant plugin for the same purpose.
+- **`classify_blocked_task_excluding_degradation`** -- the same classifier with
+  the degradation rung skipped (issue #248a). Walks the same decision tree
+  without priority 0. Returns the underlying structural bucket even when a
+  degradation signal is present. Never returns `RUNTIME_DEGRADATION`. Consumed by
+  `generate_report` to produce the composite line and by the assistant plugin for
+  the same purpose.
 
 
-## Seven Classes -- Summary Table
+## Eight Classes -- Summary Table
 
 | State | Priority | Cause | Resolution hint | Operator action |
 |---|---|---|---|---|
@@ -35,7 +36,8 @@ Two public classifier functions are available:
 | `AUTO_CLEARING_VIA_PROPOSAL` | 3 | At least one `[BLOCKED_PENDING_PROPOSAL]` marker target is non-terminal and not `hold`. ADR-07 cascade is in flight. | Wait; the cascade will unblock this task when all marker targets reach `done`/`declined`. | None -- automation handles it. |
 | `AWAITING_DEPENDENCY` | 4 | No marker present, but a regular Dependencies-table row points at a non-terminal task. | Wait for the declared dependency to complete. | None -- automation handles it. |
 | `AWAITING_AMENDMENT_RECOVERY` | 5 | No marker or pending dep, but a recovery signal is on disk (pending proposal JSON, rejected-amendment archive, or a recent `[BLOCKED]` audit comment from a recovery agent). | Wait; the orchestrator's next sweep will run blocker-resolver / task-factory. | None -- check back if the state persists beyond two sweep cycles. |
-| `OPERATOR_ACTION_REQUIRED` | 6 | None of the above match: no marker, no pending dep, no recovery signal. Includes manual gates (`DO NOT CLAIM`), unknown marker targets, and cascade-stuck states. | Inspect the work-unit's Comments section for the most recent `[BLOCKED]` audit row. | **Required** -- operator must investigate and unblock. |
+| `INTERRUPTED_ON_STOP` | 6 | The only blocking signal is a `[FORCED_BLOCKED_ON_STOP]` audit written by the SIGTERM shutdown safeguard; no structural co-blocker exists. The work was merely interrupted on stop. | Wait; the next reconcile sweep auto-requeues it (`[REQUEUED_AFTER_STOP]`), or run `devbench reconcile-cascade`. | None -- automation handles it. |
+| `OPERATOR_ACTION_REQUIRED` | 7 | None of the above match: no marker, no pending dep, no recovery signal, no forced-stop marker. Includes manual gates (`DO NOT CLAIM`), unknown marker targets, and cascade-stuck states. | Inspect the work-unit's Comments section for the most recent `[BLOCKED]` audit row. | **Required** -- operator must investigate and unblock. |
 
 
 ## Per-Class Reference

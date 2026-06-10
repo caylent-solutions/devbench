@@ -3207,6 +3207,7 @@ class TestBlockedTaskStateCanonicalValues:
             "BLOCKED_ON_HELD",
             "OPERATOR_ACTION_REQUIRED",
             "RUNTIME_DEGRADATION",
+            "INTERRUPTED_ON_STOP",
         }
 
     def test_old_values_removed(self) -> None:

@@ -192,6 +192,14 @@ class BlockedTaskState(Enum):
       ``agent/blocker_resolver``, ``agent/manifest_amender``,
       ``agent/backlog_manager``). The orchestrator's next sweep cycle will
       advance the task. Operator does nothing for now.
+    - ``INTERRUPTED_ON_STOP`` -- the unit's only blocking signal is a
+      ``[FORCED_BLOCKED_ON_STOP]`` audit comment written by the SIGTERM handler
+      when the orchestrator stopped mid-flight, with no structural co-blocker
+      (no unmet dependency, no marker, no recovery signal, no degradation). The
+      work was merely interrupted on shutdown; the orchestrator auto-requeues it
+      to ``in-queue`` on the next sweep (``[REQUEUED_AFTER_STOP]``). Operator
+      does nothing. Checked just before ``OPERATOR_ACTION_REQUIRED`` so a real
+      blocker always wins (TDI-002).
     - ``OPERATOR_ACTION_REQUIRED`` -- none of the above conditions match:
       no marker, no pending-dep, no recovery signal. Includes manual gates
       (``DO NOT CLAIM``), unknown marker targets, and cascade-stuck states.
@@ -209,6 +217,11 @@ class BlockedTaskState(Enum):
     # so the operator sees that a ``make start`` restart -- not a code
     # fix -- is what resolves the task.
     RUNTIME_DEGRADATION = "runtime-degradation"
+    # TDI-002: unit force-blocked by the SIGTERM shutdown safeguard with no
+    # structural co-blocker. Auto-requeued on the next sweep; distinct from
+    # OPERATOR_ACTION_REQUIRED so a benign interruption is not mistaken for a
+    # case that needs human judgement.
+    INTERRUPTED_ON_STOP = "interrupted-on-stop"
 
 
 # Recovery audit-comment heuristics. Used by ``classify_blocked_task``
@@ -284,6 +297,12 @@ _RUNTIME_DEGRADATION_WINDOW_SECONDS: int = 24 * 60 * 60
 _TARGET_REPO_UNRESOLVED_RE: re.Pattern[str] = re.compile(
     re.escape(BLOCKED_TARGET_REPO_UNRESOLVED_MARKER),
 )
+
+# TDI-002: marker the SIGTERM handler writes when it force-blocks the in-flight
+# unit on orchestrator stop (``[FORCED_BLOCKED_ON_STOP] session=<name>``). When
+# this is the unit's only blocking signal, the work was merely interrupted and
+# is safe to auto-requeue. Case-sensitive: the tag is always upper-case.
+_FORCED_BLOCKED_ON_STOP_RE: re.Pattern[str] = re.compile(r"\[FORCED_BLOCKED_ON_STOP\]")
 
 
 def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
@@ -645,6 +664,24 @@ def _has_unresolved_repo_marker(source_file: Path) -> bool:
     return bool(_TARGET_REPO_UNRESOLVED_RE.search(content))
 
 
+def _has_forced_blocked_on_stop_signal(source_file: Path) -> bool:
+    """Return ``True`` iff the WU file carries a ``[FORCED_BLOCKED_ON_STOP]`` marker (TDI-002).
+
+    The SIGTERM handler writes this when the orchestrator stops while the unit
+    is in flight. Consulted by ``_classify_recovery_or_attention`` only after
+    every structural blocker (marker, dependency, recovery signal, degradation)
+    has been ruled out, so a unit reaching this check whose only signal is the
+    forced-stop marker was merely interrupted on shutdown -- ``INTERRUPTED_ON_STOP``
+    rather than ``OPERATOR_ACTION_REQUIRED``. Falls back to ``False`` on read
+    error so the classifier never masks an otherwise detectable blocked state.
+    """
+    try:
+        content = source_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(_FORCED_BLOCKED_ON_STOP_RE.search(content))
+
+
 def _task_status_is_hold(backlog_root: Path, backlog_index: Path, task_id: str) -> bool:
     """Return ``True`` iff ``task_id``'s status in the backlog index is ``hold``.
 
@@ -777,23 +814,30 @@ def _classify_recovery_or_attention(
 ) -> BlockedTaskState:
     """Resolve AWAITING_AMENDMENT_RECOVERY vs OPERATOR_ACTION_REQUIRED when no marker or dep exists.
 
-    Older callers that pass no ``workspace_root`` get
-    ``OPERATOR_ACTION_REQUIRED`` immediately (legacy two-state behaviour).
+    Older callers that pass no ``workspace_root`` skip the three recovery
+    signals (legacy two-state behaviour) but still get the TDI-002
+    ``INTERRUPTED_ON_STOP`` refinement, which depends only on the WU file.
     The three recovery signals are checked cheapest-first: file-presence
-    > glob-match > timestamp-window read of the source file.
+    > glob-match > timestamp-window read of the source file. A recovery signal
+    outranks the forced-stop marker (an in-flight recovery is more specific than
+    a benign interruption).
     """
-    if workspace_root is None:
-        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
-    if _has_pending_proposal_json(workspace_root, task_id):
-        return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
-    if _has_rejected_amendment_archive(workspace_root, task_id):
-        return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
-    effective_now = now if now is not None else datetime.now(UTC)
-    effective_window = (
-        recovery_window_seconds if recovery_window_seconds is not None else DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
-    )
-    if _recent_recovery_audit_comment(source_file, effective_now, effective_window):
-        return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+    if workspace_root is not None:
+        if _has_pending_proposal_json(workspace_root, task_id):
+            return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+        if _has_rejected_amendment_archive(workspace_root, task_id):
+            return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+        effective_now = now if now is not None else datetime.now(UTC)
+        effective_window = (
+            recovery_window_seconds if recovery_window_seconds is not None else DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
+        )
+        if _recent_recovery_audit_comment(source_file, effective_now, effective_window):
+            return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+    # TDI-002: every structural blocker has been ruled out; if the only blocking
+    # signal is the forced-stop marker the unit was merely interrupted on
+    # shutdown and is safe to auto-requeue.
+    if _has_forced_blocked_on_stop_signal(source_file):
+        return BlockedTaskState.INTERRUPTED_ON_STOP
     return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
 

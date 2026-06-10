@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from devbench.actionability import check_actionability
@@ -86,6 +87,9 @@ from devbench.constants import (
 from devbench.instances import is_pid_alive, pid_file_path, read_pid_file
 from devbench.reporting.event_index import EventIndex
 from devbench.scope import ScopeFilter
+
+if TYPE_CHECKING:
+    from devbench.backlog.proposal import BlockedTaskState
 
 _log = logging.getLogger("devbench.reporting.report")
 
@@ -1968,6 +1972,7 @@ class _BacklogTotals:
     tasks_blocked_held: int = 0  # HELD (task's own status is hold)
     tasks_blocked_on_held: int = 0  # BLOCKED_ON_HELD
     tasks_blocked_runtime_degradation: int = 0  # RUNTIME_DEGRADATION (auto-recovers on orchestrator restart)
+    tasks_blocked_interrupted_on_stop: int = 0  # INTERRUPTED_ON_STOP (auto-requeued on next sweep, TDI-002)
     tasks_blocked_operator: int = 0  # OPERATOR_ACTION_REQUIRED
 
     @property
@@ -1985,6 +1990,35 @@ class _BacklogTotals:
         Used by _compute_window_stats for the ETA projection denominator.
         """
         return self.tasks_blocked_auto_clearing
+
+
+def _count_blocked_states(tasks_blocked_and_hold: list) -> dict[BlockedTaskState, int]:
+    """Count each blocked/hold task into its ``BlockedTaskState`` bucket.
+
+    Returns a dict keyed by every ``BlockedTaskState`` member (zero-filled).
+    HOLD-status tasks short-circuit to ``HELD`` without a filesystem read.
+    Fail-loud: a classifier result that is not an enum member raises
+    ``RuntimeError`` (CLAUDE.md forbids silent fallback) so a new state added
+    without updating the renderer is caught rather than silently dropped.
+    """
+    from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+    counts: dict[BlockedTaskState, int] = dict.fromkeys(BlockedTaskState, 0)
+    for u in tasks_blocked_and_hold:
+        if u.status is WorkUnitStatus.HOLD:
+            counts[BlockedTaskState.HELD] += 1
+            continue
+        try:
+            state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id, workspace_root=WORKSPACE_ROOT)
+        except (FileNotFoundError, ValueError, OSError):
+            state = BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        if state not in counts:
+            raise RuntimeError(
+                f"Unhandled BlockedTaskState {state!r} in report counter path; "
+                "update _BacklogTotals + the consumers of _count_blocked_states."
+            )
+        counts[state] += 1
+    return counts
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -2007,57 +2041,12 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined) - len(tasks_draft)
     n_blocked_total = len(tasks_blocked_and_hold)
 
-    # E2-F2-S1: classify each blocked/hold task into one of the six
-    # BlockedTaskState buckets so the ETA projection and the six-panel
-    # report can operate from pre-computed per-state counts.
-    cnt_auto_clearing = 0
-    cnt_amendment_recovery = 0
-    cnt_dependency = 0
-    cnt_held = 0
-    cnt_on_held = 0
-    cnt_runtime_degradation = 0
-    cnt_operator = 0
-    if tasks_blocked_and_hold:
-        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+    # E2-F2-S1: classify each blocked/hold task into one of the per-state
+    # BlockedTaskState buckets so the ETA projection and the panel report can
+    # operate from pre-computed per-state counts.
+    from devbench.backlog.proposal import BlockedTaskState
 
-        for u in tasks_blocked_and_hold:
-            # HOLD-status tasks short-circuit to HELD without hitting the filesystem.
-            if u.status is WorkUnitStatus.HOLD:
-                cnt_held += 1
-                continue
-            try:
-                state = classify_blocked_task(
-                    BACKLOG_ROOT,
-                    BACKLOG_INDEX,
-                    u.id,
-                    workspace_root=WORKSPACE_ROOT,
-                )
-            except (FileNotFoundError, ValueError, OSError):
-                state = BlockedTaskState.OPERATOR_ACTION_REQUIRED
-            if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
-                cnt_auto_clearing += 1
-            elif state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY:
-                cnt_amendment_recovery += 1
-            elif state is BlockedTaskState.AWAITING_DEPENDENCY:
-                cnt_dependency += 1
-            elif state is BlockedTaskState.HELD:
-                cnt_held += 1
-            elif state is BlockedTaskState.BLOCKED_ON_HELD:
-                cnt_on_held += 1
-            elif state is BlockedTaskState.RUNTIME_DEGRADATION:
-                cnt_runtime_degradation += 1
-            elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
-                cnt_operator += 1
-            else:
-                # Every BlockedTaskState enum member must be handled
-                # explicitly above. Hitting this branch means a new
-                # member was added to the enum without updating this
-                # renderer -- fail loud rather than silently routing
-                # to operator-required (CLAUDE.md: no fallback logic).
-                raise RuntimeError(
-                    f"Unhandled BlockedTaskState {state!r} in report counter path; "
-                    "update _BacklogTotals + this if/elif chain."
-                )
+    counts = _count_blocked_states(tasks_blocked_and_hold)
 
     return _BacklogTotals(
         tasks_total=len(tasks),
@@ -2076,13 +2065,14 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_proposed=len(tasks_proposed),
         tasks_declined=len(tasks_declined),
         tasks_draft=len(tasks_draft),
-        tasks_blocked_auto_clearing=cnt_auto_clearing,
-        tasks_blocked_amendment_recovery=cnt_amendment_recovery,
-        tasks_blocked_dependency=cnt_dependency,
-        tasks_blocked_held=cnt_held,
-        tasks_blocked_on_held=cnt_on_held,
-        tasks_blocked_runtime_degradation=cnt_runtime_degradation,
-        tasks_blocked_operator=cnt_operator,
+        tasks_blocked_auto_clearing=counts[BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL],
+        tasks_blocked_amendment_recovery=counts[BlockedTaskState.AWAITING_AMENDMENT_RECOVERY],
+        tasks_blocked_dependency=counts[BlockedTaskState.AWAITING_DEPENDENCY],
+        tasks_blocked_held=counts[BlockedTaskState.HELD],
+        tasks_blocked_on_held=counts[BlockedTaskState.BLOCKED_ON_HELD],
+        tasks_blocked_runtime_degradation=counts[BlockedTaskState.RUNTIME_DEGRADATION],
+        tasks_blocked_interrupted_on_stop=counts[BlockedTaskState.INTERRUPTED_ON_STOP],
+        tasks_blocked_operator=counts[BlockedTaskState.OPERATOR_ACTION_REQUIRED],
     )
 
 
@@ -2208,6 +2198,7 @@ def _classify_blocked_unit_into_buckets(
     held_rows: list,
     on_held_rows: list,
     runtime_degradation_rows: list,
+    interrupted_rows: list,
     operator_rows: list,
 ) -> None:
     """Route one blocked/hold task unit into the appropriate display bucket.
@@ -2262,6 +2253,8 @@ def _classify_blocked_unit_into_buckets(
             workspace_root=WORKSPACE_ROOT,
         )
         runtime_degradation_rows.append((u, structural_state))
+    elif state is BlockedTaskState.INTERRUPTED_ON_STOP:
+        interrupted_rows.append(u)
     elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
         operator_rows.append(u)
     else:
@@ -2356,6 +2349,7 @@ def _render_blocked_panels(
     held_rows: list,
     on_held_rows: list,
     runtime_degradation_rows: list,
+    interrupted_rows: list,
     operator_rows: list,
 ) -> list[str]:
     """Render every per-state blocked panel into display lines.
@@ -2400,6 +2394,14 @@ def _render_blocked_panels(
         )
     )
     lines.extend(_render_runtime_degradation_panel(runtime_degradation_rows))
+    lines.extend(
+        _render_simple_panel(
+            interrupted_rows,
+            "interrupted on stop",
+            "Force-blocked by the orchestrator shutdown safeguard; auto-requeued on the next sweep.",
+            "[interrupted-on-stop -- auto-requeues on next sweep]",
+        )
+    )
     lines.extend(
         _render_simple_panel(
             operator_rows,
@@ -2453,6 +2455,7 @@ def _blocked_listing(units: list) -> list[str]:
     held_rows: list = []
     on_held_rows: list = []
     runtime_degradation_rows: list[tuple] = []  # (unit, structural_state: BlockedTaskState)
+    interrupted_rows: list = []
     operator_rows: list = []
 
     for u in eligible:
@@ -2464,6 +2467,7 @@ def _blocked_listing(units: list) -> list[str]:
             held_rows,
             on_held_rows,
             runtime_degradation_rows,
+            interrupted_rows,
             operator_rows,
         )
 
@@ -2474,6 +2478,7 @@ def _blocked_listing(units: list) -> list[str]:
         held_rows,
         on_held_rows,
         runtime_degradation_rows,
+        interrupted_rows,
         operator_rows,
     )
 

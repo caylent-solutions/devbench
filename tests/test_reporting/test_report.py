@@ -1666,6 +1666,7 @@ class TestBacklogTotalsSixBlockedFields:
             BlockedTaskState.HELD,
             BlockedTaskState.BLOCKED_ON_HELD,
             BlockedTaskState.RUNTIME_DEGRADATION,
+            BlockedTaskState.INTERRUPTED_ON_STOP,
             BlockedTaskState.OPERATOR_ACTION_REQUIRED,
         ]
         units = [
@@ -1689,6 +1690,7 @@ class TestBacklogTotalsSixBlockedFields:
         assert b.tasks_blocked_held == 1
         assert b.tasks_blocked_on_held == 1
         assert b.tasks_blocked_runtime_degradation == 1
+        assert b.tasks_blocked_interrupted_on_stop == 1
         assert b.tasks_blocked_operator == 1
         assert (
             b.tasks_blocked_auto_clearing
@@ -1697,6 +1699,7 @@ class TestBacklogTotalsSixBlockedFields:
             + b.tasks_blocked_held
             + b.tasks_blocked_on_held
             + b.tasks_blocked_runtime_degradation
+            + b.tasks_blocked_interrupted_on_stop
             + b.tasks_blocked_operator
         ) == b.tasks_blocked
 
@@ -1970,6 +1973,7 @@ class TestUnitListings:
             BlockedTaskState.HELD,
             BlockedTaskState.BLOCKED_ON_HELD,
             BlockedTaskState.RUNTIME_DEGRADATION,
+            BlockedTaskState.INTERRUPTED_ON_STOP,
             BlockedTaskState.OPERATOR_ACTION_REQUIRED,
         ]
         units = [
@@ -2000,7 +2004,7 @@ class TestUnitListings:
 
         # Every panel header must appear, in canonical display order.
         panel_headers = [line for line in lines if line.startswith("Blocked tasks (")]
-        assert len(panel_headers) == 7, f"Expected 7 panel headers, got {len(panel_headers)}: {panel_headers}"
+        assert len(panel_headers) == 8, f"Expected 8 panel headers, got {len(panel_headers)}: {panel_headers}"
 
         expected_order = [
             "Blocked tasks (auto-clearing via proposal) (1):",
@@ -2009,6 +2013,7 @@ class TestUnitListings:
             "Blocked tasks (held) (1):",
             "Blocked tasks (blocked-on-held) (1):",
             "Blocked tasks (runtime-degradation) (1):",
+            "Blocked tasks (interrupted on stop) (1):",
             "Blocked tasks (operator action required) (1):",
         ]
         assert panel_headers == expected_order, f"Panel order mismatch: {panel_headers}"
@@ -2035,6 +2040,10 @@ class TestUnitListings:
                     "SDK lost Agent-tool access mid-session; task remains blocked until the orchestrator "
                     "restarts (auto on NO_ACTIONABLE exit; otherwise manual `make start`)."
                 ),
+            ),
+            (
+                _panel_header("interrupted on stop"),
+                "Force-blocked by the orchestrator shutdown safeguard; auto-requeued on the next sweep.",
             ),
             (
                 _panel_header("operator action required"),

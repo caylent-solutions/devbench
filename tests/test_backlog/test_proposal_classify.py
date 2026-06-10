@@ -267,8 +267,8 @@ class TestClassifyBlockedTaskExcludingDegradation:
         )
         assert state is BlockedTaskState[expected_bucket]
 
-    def test_existing_seven_buckets_are_preserved(self) -> None:
-        """All seven BlockedTaskState members are still present after adding the new classifier."""
+    def test_existing_buckets_are_preserved(self) -> None:
+        """All BlockedTaskState members are present (including INTERRUPTED_ON_STOP, TDI-002)."""
         from devbench.backlog.proposal import BlockedTaskState
 
         expected_members = {
@@ -279,6 +279,7 @@ class TestClassifyBlockedTaskExcludingDegradation:
             "BLOCKED_ON_HELD",
             "OPERATOR_ACTION_REQUIRED",
             "RUNTIME_DEGRADATION",
+            "INTERRUPTED_ON_STOP",
         }
         actual_members = {m.name for m in BlockedTaskState}
         assert actual_members == expected_members

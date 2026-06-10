@@ -150,6 +150,22 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`INTERRUPTED_ON_STOP` blocked-task bucket + auto-requeue (TDI-002).** When
+  the orchestrator stops mid-flight, its SIGTERM handler force-blocks the
+  in-flight unit with a `[FORCED_BLOCKED_ON_STOP]` audit. Previously such a unit
+  -- whose work was merely interrupted, with no content defect -- fell through
+  to `OPERATOR_ACTION_REQUIRED` and required a manual `set-status in-queue`. A
+  new `BlockedTaskState.INTERRUPTED_ON_STOP` bucket fires when the forced-stop
+  marker is the unit's only blocking signal (no unmet dependency, marker,
+  recovery signal, or degradation -- any of those wins, so a real blocker is
+  never masked). `reconcile-cascade` (the orchestrator's pre-flight sweep)
+  auto-requeues these units to `in-queue` with a distinct `[REQUEUED_AFTER_STOP]`
+  audit, the report breakdown counts them separately
+  (`tasks_blocked_interrupted_on_stop`) with a dedicated "interrupted on stop"
+  panel, and the `triage-blocked-task` matrix routes the bucket to the
+  no-operator-edit remediation. `docs/block-types.md` documents the eighth
+  state.
+
 - **Verification-contract authoring lints (TDI-001 / TDI-004 / TDI-005).**
   `validate-backlog` gained three checks over the `## Verification` contract
   (WARNING by default, ERROR under `--strict`, which `spec-to-backlog` runs at

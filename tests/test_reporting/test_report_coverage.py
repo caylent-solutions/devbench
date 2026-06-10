@@ -491,12 +491,15 @@ class TestClassifyBlockedUnitIntoBucketsHeldAndUnhandled:
         held: list = []
         on_held: list = []
         runtime_degradation: list = []
+        interrupted: list = []
         op: list = []
         with patch(
             "devbench.backlog.proposal.classify_blocked_task",
             return_value=BlockedTaskState.HELD,
         ):
-            report_mod._classify_blocked_unit_into_buckets(u, auto, amend, dep, held, on_held, runtime_degradation, op)
+            report_mod._classify_blocked_unit_into_buckets(
+                u, auto, amend, dep, held, on_held, runtime_degradation, interrupted, op
+            )
         assert held == [u]
 
     def test_unknown_state_raises_runtime_error(self, tmp_path: Path) -> None:
@@ -520,6 +523,7 @@ class TestClassifyBlockedUnitIntoBucketsHeldAndUnhandled:
         held: list = []
         on_held: list = []
         runtime_degradation: list = []
+        interrupted: list = []
         op: list = []
         with patch(
             "devbench.backlog.proposal.classify_blocked_task",
@@ -527,5 +531,5 @@ class TestClassifyBlockedUnitIntoBucketsHeldAndUnhandled:
         ):
             with pytest.raises(RuntimeError, match=r"Unhandled BlockedTaskState"):
                 report_mod._classify_blocked_unit_into_buckets(
-                    u, auto, amend, dep, held, on_held, runtime_degradation, op
+                    u, auto, amend, dep, held, on_held, runtime_degradation, interrupted, op
                 )

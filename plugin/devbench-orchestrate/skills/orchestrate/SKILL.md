@@ -147,22 +147,25 @@ Process the backlog using the steps below, repeating until all work units are do
    Agent SDK forbids a sub-agent from spawning sub-agents (a nested `Agent(...)` call silently
    no-ops; see ADR-28). The reviewers are dispatched exactly like `security-reviewer` (step 7)
    and `iac-deploy-reviewer` (step 7b) already are: one level deep, SDK-legal.
-   a. **Generate a fresh per-round token scoped to this unit.** Set
-      `DEVBENCH_REVIEW_ROUND_TOKEN=<id>-r<n>-<rand>` where `<id>` is the unit ID, `<n>` is this
-      review round's number (1 for the first review of the unit, incremented on each step-6
-      retry), and `<rand>` is an opaque random suffix (UUID or similar). The token MUST begin
-      with `<id>-`: the `guard-verdict-format.sh` hook is round-aware and rejects any canonical
-      verdict whose token is not scoped to the unit being reviewed, so a stale leftover token
-      can never mask a missing fresh injection.
+   a. **Write a fresh per-round token scoped to this unit.** Run
+      `uv run devbench review-token new <id>`. This writes a `<id>-r<n>-<rand>` token to
+      `<workspace>/.devbench/review-round-token` (incrementing the unit's round counter) and
+      prints it. The `guard-verdict-format.sh` hook reads that FILE as the H3 second factor and
+      is round-aware: it rejects any canonical verdict whose token is not scoped to the unit
+      under review, so a stale leftover token can never mask a missing fresh token. This single
+      token covers the whole review cycle for the unit (the four review_team reviewers in this
+      step plus the security and iac reviewers in steps 7/7b); do NOT write a new token for
+      those later steps -- only on a step-6 retry (a new round).
    b. **In a SINGLE response, dispatch all four reviewers via the Agent tool** -- one call each
-      so they run in parallel -- injecting the same `DEVBENCH_REVIEW_ROUND_TOKEN` into each
-      sub-agent environment: `devbench-orchestrate:code-reviewer`,
-      `devbench-orchestrate:test-reviewer`, `devbench-orchestrate:doc-reviewer`,
-      `devbench-orchestrate:changes-manifest`. Pass the unit ID to each. Each reviewer self-logs
-      its canonical verdict (`code_review` / `test_review` / `doc_review` / `changes_manifest`)
-      and returns a JSON envelope. The guard requires the token for every one of these canonical
-      verdicts; a verdict emitted without the unit-scoped token is blocked at the hook level,
-      preventing rogue sub-agents from writing review-team verdicts.
+      so they run in parallel, by their REGISTERED agent types (Claude Code namespaces a plugin
+      sub-agent by its subdirectory): `devbench-orchestrate:review_team:code-reviewer`,
+      `devbench-orchestrate:review_team:test-reviewer`, `devbench-orchestrate:review_team:doc-reviewer`,
+      `devbench-orchestrate:review_team:changes-manifest`. Pass the unit ID to each. Each reviewer
+      self-logs its canonical verdict (`code_review` / `test_review` / `doc_review` /
+      `changes_manifest`) and returns a JSON envelope. The guard requires the unit-scoped token
+      file for every one of these canonical verdicts; a verdict emitted without it is blocked at
+      the hook level, preventing rogue sub-agents from writing review-team verdicts. You do NOT
+      inject any token env var -- the reviewers and the guard both read the token file.
    c. **Determine pass/fail SOLELY from the canonical verdict lines for THIS round** (fail-closed).
       Run `uv run devbench read-unit <id>` and confirm a `[judge/<name>] [REVIEW_PASS]` line
       exists for EACH of `code_review`, `test_review`, `doc_review`, `changes_manifest` in the
@@ -170,24 +173,25 @@ Process the backlog using the steps below, repeating until all work units are do
       findings -- a reviewer that did not actually run leaves no verdict line, and a missing
       required verdict is a REVIEW_FAIL, never a pass. (Surfacing the JSON envelopes' summaries in
       the PR description is fine; deriving the pass/fail decision from them is not.)
-   d. After the round resolves (pass or fail), clear the token (`DEVBENCH_REVIEW_ROUND_TOKEN=`)
-      so no stale value lingers into a later round or a different unit.
+   d. After the unit's review cycle resolves (all judges incl. security/iac done, or a fail that
+      sends you to step 6), run `uv run devbench review-token clear` so no stale token lingers
+      into a later unit. (On a step-6 retry you will write a fresh token via step 5a again.)
    - If any of the four required verdicts is REVIEW_FAIL or missing: go to step 6.
    - If all four are REVIEW_PASS: go to step 7.
 
 6. On REVIEW_FAIL: no prose -- emit the next tool call immediately.
    a. **Immediately** invoke the `devbench-orchestrate:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
-   b. When executor returns, Return to step 5 -- immediately re-dispatch the four `review_team` reviewers (with a fresh per-round token whose round number `<n>` is incremented). Do NOT invoke security-reviewer here.
+   b. When executor returns, Return to step 5 -- immediately re-dispatch the four `review_team` reviewers. Step 5a writes a fresh round token (`uv run devbench review-token new <id>` increments `<n>`); the prior round's token is superseded. Do NOT invoke security-reviewer here.
    c. After `max_executor_retries` consecutive failures, the next tool calls (in this order, same turn) are mandatory and explicit: (1) `uv run devbench log-comment agent/orchestrator <id> "[BLOCKED] ..."` naming the failing checks, (2) `uv run devbench next`. The `devbench next` call is the only authorised loop-continuation signal -- treat its output exactly like step 2 (ALL_DONE / NO_ACTIONABLE / JSON).
    d. **Per-judge retry budgets (issue #122)**: when `max_executor_retries_per_judge` is set in `backlog/config/devbench.yaml`, the budget for the cycle is the value for the failing judge if listed (e.g., `max_executor_retries_per_judge.test_review`); otherwise fall back to the global `max_executor_retries`. Different judges can fail in different cycles -- count failures **per judge** in the per-task counter and trip the BLOCKED transition the moment ANY single judge's per-judge budget is exhausted. Read both fields once at the start of the work-unit cycle: `uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge` returns the resolved values. Schema validation rejects unknown judge names; an unknown name is a config bug not a runtime concern.
 
 7. On review team REVIEW_PASS:
    - **CRITICAL (issue #128)**: REVIEW_PASS is a terminal signal. After ALL judges return REVIEW_PASS, branch SOLELY on pass-vs-fail -- do NOT inspect verdict bodies, summary text, findings, or comments looking for improvement opportunities. Informational content in PASS verdicts (MEDIUM severity notes, refactor suggestions, "consider also..." remarks) MUST NOT trigger additional executor work cycles. The executor is invoked only when a judge returns REVIEW_FAIL (step 6). Surfacing informational PASS-verdict content in the PR description or a comment is fine; re-running the executor against PASS-verdict content is a violation of this rule and will be regression-tested in `tests/test_integration/test_executor_review_pass_terminality.py`.
-   - Invoke `devbench-orchestrate:security-reviewer` with the unit ID. Inject the same
-     `DEVBENCH_REVIEW_ROUND_TOKEN` that was used in step 5 (same review round) into the
-     security-reviewer sub-agent environment. The guard-verdict-format.sh hook requires the
-     token for the security_review canonical judge name.
-   - If security PASS: proceed immediately to step 7b. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
+   - Invoke `devbench-orchestrate:security-reviewer` with the unit ID. The same unit-scoped review
+     token written in step 5a still applies (same review round; the token file is not cleared until
+     step 5d), so the guard-verdict-format.sh hook accepts the `security_review` canonical verdict
+     without any further action. Do NOT write a new token here.
+   - If security PASS: proceed immediately to step 7b. Do NOT re-run the review_team reviewers. Do NOT re-invoke executor based on the security_review verdict body's informational content.
    - If security FAIL: log a blocker comment and return to step 2.
 
 7b. **Optional IaC evidence review (ADR-27) -- conditional, runs once after security PASS, before git-ops.**
@@ -201,11 +205,12 @@ Process the backlog using the steps below, repeating until all work units are do
        The same predicate gates the done-gate's required-judge set (`BacklogManager._required_judge_set`), so this
        dispatch and the step-9 gate agree by construction: a unit that requires the iac_review verdict at mark-done is
        exactly a unit this step dispatches. When the unit has no infra Verification item, SKIP this step and go to step 8.
-    When both conditions hold: invoke `devbench-orchestrate:iac-deploy-reviewer` with the unit ID. Inject the SAME
-    `DEVBENCH_REVIEW_ROUND_TOKEN` used in step 5 (same review round) into the iac-deploy-reviewer sub-agent
-    environment -- the guard-verdict-format.sh hook requires the token for the `iac_review` canonical judge name. The
-    judge reads the `## Verification` contract and the `.devbench/evidence/<id>/<attempt>/evidence.json` ledger that
-    `verify-ac` wrote (step 4d); it holds NO AWS credentials and provisions nothing.
+    When both conditions hold: invoke `devbench-orchestrate:iac-deploy-reviewer` with the unit ID. The same
+    unit-scoped review token from step 5a still applies (same review round; not cleared until step 5d), so the
+    guard-verdict-format.sh hook accepts the `iac_review` canonical verdict without any further action -- do NOT write
+    a new token here. The judge reads the `## Verification` contract and the
+    `.devbench/evidence/<id>/<attempt>/evidence.json` ledger that `verify-ac` wrote (step 4d); it holds NO AWS
+    credentials and provisions nothing.
     - If iac_review PASS: proceed to step 8. Do NOT re-run review-supervisor or security-reviewer. Do NOT re-invoke
       executor based on the iac_review verdict body's informational content.
     - If iac_review FAIL: log a blocker comment naming the failing AC and return to step 2. The done-gate at step 9

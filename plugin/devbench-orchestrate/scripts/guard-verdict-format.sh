@@ -11,16 +11,22 @@
 #   - judge name must be a known identifier
 #   - feedback must be non-empty when verdict is 'fail'
 #   - canonical reviewer judges require agent_type to be one of the allowed
-#     reviewer agent types: the four review_team reviewers
-#     (devbench-orchestrate:code-reviewer, :test-reviewer, :doc-reviewer,
-#     :changes-manifest -- dispatched directly by the orchestrate skill after
-#     ADR-28 flattened the review pipeline), devbench-orchestrate:security-reviewer,
+#     reviewer agent types: the four review_team reviewers, which Claude Code
+#     namespaces by subdirectory as devbench-orchestrate:review_team:code-reviewer,
+#     :review_team:test-reviewer, :review_team:doc-reviewer,
+#     :review_team:changes-manifest (the REGISTERED form; ADR-28 postmortem),
+#     plus devbench-orchestrate:security-reviewer,
 #     devbench-orchestrate:iac-deploy-reviewer, and the deprecated
-#     devbench-orchestrate:review-supervisor (default-deny H3)
-#   - canonical reviewer judges also require DEVBENCH_REVIEW_ROUND_TOKEN to be
-#     set, non-empty, AND scoped to the unit under review (the token must begin
-#     with "<unit-id>-") so a stale leftover token cannot satisfy a verdict for
-#     a different unit (H3 round-awareness)
+#     devbench-orchestrate:review-supervisor. The flat (no review_team: infix)
+#     forms are kept as defensive cross-version coverage. (default-deny H3)
+#   - canonical reviewer judges also require a per-round token FILE at
+#     <workspace>/.devbench/review-round-token (written by
+#     `devbench review-token new <unit-id>`, removed by `... clear`; ADR-29) that
+#     exists, is non-empty, AND is scoped to the unit under review (begins with
+#     "<unit-id>-") so a stale leftover token cannot satisfy a verdict for a
+#     different unit (H3 round-awareness). The workspace root is resolved from
+#     DEVBENCH_WORKSPACE_ROOT. This file replaces the former
+#     DEVBENCH_REVIEW_ROUND_TOKEN env var entirely.
 #
 # Passthroughs (exit 0 without validating):
 #   - any '--help' / '-h' anywhere after 'log-verdict' -- let the CLI print help
@@ -53,8 +59,8 @@ KNOWN_JUDGES=(
 # (OPTIONAL_JUDGE_NAMES) whose verdict satisfies the done-gate only when the
 # unit's Verification contract makes it applicable AND the judge is enabled;
 # it is still a default-deny canonical verdict, written only by the designated
-# reviewer agent types and only when DEVBENCH_REVIEW_ROUND_TOKEN is set
-# (H3 default-deny).
+# reviewer agent types and only when the per-round token file is present and
+# unit-scoped (H3 default-deny; see the token-file check below).
 CANONICAL_REVIEWER_JUDGES=(
   "code_review"
   "test_review"
@@ -233,7 +239,7 @@ fi
 # audit-only non-canonical judge names (executor, blocker_resolver,
 # manifest_amender, task_factory) remain available to any agent type.
 #
-# H3 also requires the per-round DEVBENCH_REVIEW_ROUND_TOKEN env var to be set,
+# H3 also requires the per-round token FILE (see header; ADR-29) to be present,
 # non-empty, AND scoped to the unit under review (prefix "<unit-id>-") for a
 # canonical verdict. A spoofed agent_type alone is insufficient -- the injected
 # token provides a second factor that a rogue subagent cannot forge without the
@@ -249,14 +255,26 @@ done
 
 if (( IS_CANONICAL_JUDGE == 1 )); then
   # Check agent_type is an allowed reviewer.
+  #
+  # Claude Code namespaces a plugin sub-agent by its subdirectory, so the four
+  # review_team reviewers (agents/review_team/<name>.md) present at runtime as
+  # `devbench-orchestrate:review_team:<name>` -- the `review_team:` infix is the
+  # REGISTERED, load-bearing form (ADR-28 postmortem). The flat
+  # `devbench-orchestrate:<name>` forms are retained as defensive cross-version
+  # coverage in case a future Claude Code release stops infixing the subdir;
+  # they are harmless when unused (no agent resolves to them today).
   ALLOWED_REVIEWER_AGENT_TYPES=(
+    "devbench-orchestrate:review_team:code-reviewer"
+    "devbench-orchestrate:review_team:test-reviewer"
+    "devbench-orchestrate:review_team:doc-reviewer"
+    "devbench-orchestrate:review_team:changes-manifest"
+    "devbench-orchestrate:security-reviewer"
+    "devbench-orchestrate:iac-deploy-reviewer"
+    "devbench-orchestrate:review-supervisor"
     "devbench-orchestrate:code-reviewer"
     "devbench-orchestrate:test-reviewer"
     "devbench-orchestrate:doc-reviewer"
     "devbench-orchestrate:changes-manifest"
-    "devbench-orchestrate:security-reviewer"
-    "devbench-orchestrate:iac-deploy-reviewer"
-    "devbench-orchestrate:review-supervisor"
   )
   IS_ALLOWED_REVIEWER=0
   for allowed in "${ALLOWED_REVIEWER_AGENT_TYPES[@]}"; do
@@ -275,28 +293,50 @@ if (( IS_CANONICAL_JUDGE == 1 )); then
     exit 2
   fi
 
-  # Check the per-round token is set and non-empty.
-  if [[ -z "${DEVBENCH_REVIEW_ROUND_TOKEN:-}" ]]; then
-    echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires DEVBENCH_REVIEW_ROUND_TOKEN to be set." >&2
+  # H3 second factor: a per-round, unit-scoped token (ADR-29). The transport is
+  # a FILE -- <workspace>/.devbench/review-round-token -- written by
+  # `devbench review-token new <unit-id>` before each review round and removed
+  # by `devbench review-token clear` after it. The file replaces the former
+  # DEVBENCH_REVIEW_ROUND_TOKEN env var entirely (which was never implemented in
+  # code and twice failed: a stale shell.env value masked a missing injection,
+  # then a later run wrote it where the hook never read it). The workspace root
+  # comes from the stable DEVBENCH_WORKSPACE_ROOT (set once by `devbench start`),
+  # not from any per-round env -- so there is no per-round env to go stale.
+  REVIEW_TOKEN_WS="${DEVBENCH_WORKSPACE_ROOT:-}"
+  if [[ -z "$REVIEW_TOKEN_WS" ]]; then
+    echo "guard-verdict-format: BLOCKED -- cannot locate the review-round token: DEVBENCH_WORKSPACE_ROOT is unset." >&2
+    echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
+    echo "Reason: the guard reads <workspace>/.devbench/review-round-token; without the workspace root it cannot verify the H3 second factor, so it fails closed." >&2
+    echo "Fix: run reviewers under an orchestrator that exports DEVBENCH_WORKSPACE_ROOT." >&2
+    exit 2
+  fi
+  REVIEW_TOKEN_FILE="${REVIEW_TOKEN_WS%/}/.devbench/review-round-token"
+  if [[ ! -f "$REVIEW_TOKEN_FILE" ]]; then
+    echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires a per-round token file." >&2
     echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
     echo "Agent type: '${AGENT_TYPE}'." >&2
-    echo "Reason: the orchestrator injects DEVBENCH_REVIEW_ROUND_TOKEN into reviewer sub-agents each round; its absence indicates the verdict is not originating from an orchestrated review round." >&2
-    echo "Fix: ensure the orchestrate skill injects DEVBENCH_REVIEW_ROUND_TOKEN before dispatching the reviewer sub-agent." >&2
+    echo "Reason: ${REVIEW_TOKEN_FILE} does not exist; the orchestrate skill writes it via 'devbench review-token new <unit-id>' before dispatching reviewers each round. Its absence indicates the verdict is not originating from an orchestrated review round." >&2
+    echo "Fix: ensure the orchestrate skill runs 'devbench review-token new ${UNIT_ID}' before dispatching this unit's reviewers." >&2
+    exit 2
+  fi
+  REVIEW_TOKEN_VALUE="$(tr -d '\r\n' < "$REVIEW_TOKEN_FILE")"
+  if [[ -z "$REVIEW_TOKEN_VALUE" ]]; then
+    echo "guard-verdict-format: BLOCKED -- the review-round token file is empty (${REVIEW_TOKEN_FILE})." >&2
+    echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
+    echo "Fix: re-run 'devbench review-token new ${UNIT_ID}' to write a fresh token." >&2
     exit 2
   fi
 
   # Round-awareness (H3 hardening): the token MUST be scoped to the unit being
-  # reviewed. The orchestrate skill writes DEVBENCH_REVIEW_ROUND_TOKEN as
-  # "<unit-id>-r<n>-<rand>" before each review round and clears it after, so a
-  # leftover token from a *different* unit's round can never satisfy this unit's
-  # canonical verdict -- the exact staleness that masked the E9-F1-S1-T5
-  # incident, where a stale shell.env token hid a missing fresh injection.
-  if [[ "${DEVBENCH_REVIEW_ROUND_TOKEN}" != "${UNIT_ID}-"* ]]; then
-    echo "guard-verdict-format: BLOCKED -- DEVBENCH_REVIEW_ROUND_TOKEN is not scoped to unit '${UNIT_ID}'." >&2
+  # reviewed (prefix "<unit-id>-"), so a leftover token from a *different* unit's
+  # round can never satisfy this unit's canonical verdict -- the exact staleness
+  # that masked the E9-F1-S1-T5 incident.
+  if [[ "$REVIEW_TOKEN_VALUE" != "${UNIT_ID}-"* ]]; then
+    echo "guard-verdict-format: BLOCKED -- the review-round token is not scoped to unit '${UNIT_ID}'." >&2
     echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge) for unit '${UNIT_ID}'." >&2
     echo "Agent type: '${AGENT_TYPE}'." >&2
-    echo "Reason: the token must begin with '${UNIT_ID}-' (format: <unit-id>-r<n>-<rand>); a token scoped to a different unit indicates a stale/leftover token, not a fresh per-round injection for this unit." >&2
-    echo "Fix: the orchestrate skill must inject a fresh DEVBENCH_REVIEW_ROUND_TOKEN scoped to '${UNIT_ID}' before dispatching this unit's reviewers." >&2
+    echo "Reason: the token must begin with '${UNIT_ID}-' (format: <unit-id>-r<n>-<rand>); a token scoped to a different unit indicates a stale/leftover token, not a fresh per-round token for this unit." >&2
+    echo "Fix: run 'devbench review-token new ${UNIT_ID}' before dispatching this unit's reviewers." >&2
     exit 2
   fi
 fi

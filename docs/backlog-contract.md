@@ -759,7 +759,13 @@ The fix in both cases was to add a `## Dependencies` entry: the full-implementat
 
 `devbench validate-backlog` SHOULD reject any backlog state where two in-queue Tasks list the same file path with no explicit dependency between them. (This rule is part of the post-Backlog-A Tier 3 tooling proposal; until it lands, authors are responsible for self-checking via grep across `## Changes Manifest` blocks.)
 
-For N claimants of the same path, the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
+For N claimants of the same path, the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain as an operator hint; operators may pick any other ordering that resolves their natural execution order.
+
+#### Adds-before-modifies chain ordering (verb-aware)
+
+The suggested chain is **verb-aware**. The validator classifies each claimant's `## Changes Manifest` change for the shared path by its leading word: an `add` family verb (`add` / `new` / `create`) means the Task creates the path; an `edit` family verb (`modify` / `update` / `edit` / `change` / `rewrite` / `delete` / `remove`) means it changes or deletes an existing path. When **exactly one** claimant `add`s the path and **every other** claimant `edit`s it, the adder is placed at the head of the recommended chain -- the modifier/deleter is wired to depend on the adder (`add-dep <modifier> <adder>`), because the file must exist before it can be modified or deleted. The adder runs first regardless of how the Task IDs sort lexically. This avoids the inverted recommendation where a Task that creates files is told to depend on a Task that modifies them.
+
+When the verbs do **not** disambiguate -- no claimant adds, more than one adds, or any non-adder uses an unrecognised verb -- the chain falls back to plain lexical-sort order (the prior behaviour). The recommendation is always deterministic and stable; the `claimed by` list in the message is always lexically sorted regardless of chain order.
 
 The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
 

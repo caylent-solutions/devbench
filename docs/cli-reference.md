@@ -1049,7 +1049,7 @@ Record a judge verdict as an audit comment on the work-unit file. Writes `[REVIE
 Two enforcement layers prevent malformed audit rows:
 
 1. **CLI layer** (`cmd_log_verdict`): refuses any `<judge>` outside `KNOWN_JUDGE_NAMES` with a clear error naming the valid choices. Catches typos like `judge` (literal) or hyphenated forms like `code-reviewer`.
-2. **Hook layer** (`guard-verdict-format.sh`, PreToolUse): mirrors the same allowlist, plus an **agent-type default-deny** rule (H3) -- a canonical reviewer verdict may only be written by an allowlisted reviewer `agent_type` (the four `review_team` reviewers, `security-reviewer`, `iac-deploy-reviewer`, and the deprecated `review-supervisor`) AND only with a unit-scoped `DEVBENCH_REVIEW_ROUND_TOKEN` (ADR-28 round-awareness). The executor and every other agent type are blocked from canonical verdicts; the audit-only `executor` judge name remains allowed (records progress without satisfying the gate).
+2. **Hook layer** (`guard-verdict-format.sh`, PreToolUse): mirrors the same allowlist, plus an **agent-type default-deny** rule (H3) -- a canonical reviewer verdict may only be written by an allowlisted reviewer `agent_type` AND only when the per-round token file is present and unit-scoped. The four `review_team` reviewers are registered by Claude Code under their subdirectory namespace, so the allowlisted agent types are the `review_team:`-infixed forms `devbench-orchestrate:review_team:code-reviewer`, `:review_team:test-reviewer`, `:review_team:doc-reviewer`, and `:review_team:changes-manifest` (the registered, load-bearing slugs per the ADR-28 registered-slug postmortem; the flat `devbench-orchestrate:code-reviewer` forms are retained as defensive cross-version coverage), plus `devbench-orchestrate:security-reviewer`, `devbench-orchestrate:iac-deploy-reviewer`, and the deprecated `devbench-orchestrate:review-supervisor`. The second factor is a per-round, unit-scoped token read from the file `<workspace>/.devbench/review-round-token` (written by `devbench review-token new <unit-id>`, removed by `devbench review-token clear`; [ADR-29](adr/29-file-based-review-token.md)) -- it must exist, be non-empty, and begin with `<unit-id>-` (ADR-28 round-awareness). This file replaces the former `DEVBENCH_REVIEW_ROUND_TOKEN` env var entirely (its `BASH_ENV` transport was never implemented in code and failed twice in production). The executor and every other agent type are blocked from canonical verdicts; the audit-only `executor` judge name remains allowed (records progress without satisfying the gate).
 
 Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
 
@@ -1068,6 +1068,20 @@ uv run devbench log-tdd <id> <RED|GREEN|REFACTOR> <message>
 ```
 
 Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. Enforces the phase token (must be `RED`, `GREEN`, or `REFACTOR`, case-insensitive).
+
+### `review-token`
+
+```
+uv run devbench review-token new <unit-id>
+uv run devbench review-token clear
+```
+
+Manage the file-based per-round review token ([ADR-29](adr/29-file-based-review-token.md)) -- the H3 second factor that `guard-verdict-format.sh` requires before any canonical reviewer verdict.
+
+- `review-token new <unit-id>` writes a fresh `<unit-id>-r<n>-<rand>` token to `<workspace>/.devbench/review-round-token` (mode `0600`) and prints it. `<n>` is the per-unit round number from a monotonic counter persisted in `<workspace>/.devbench/review-round-counters.json` (incremented on each `new` for that unit); `<rand>` is `secrets.token_hex(6)`. Fails fast (rc=1) on a missing or empty unit id.
+- `review-token clear` removes the token file and reports whether one was present.
+
+The orchestrate skill calls `review-token new <id>` at the start of each review round (step 5a) -- the token covers the four `review_team` reviewers plus the step-7 security reviewer and step-7b iac reviewer in the same round -- and `review-token clear` at the end of the round (step 5d). The guard reads `<workspace>/.devbench/review-round-token` directly (resolving the workspace from `DEVBENCH_WORKSPACE_ROOT`) and requires the token to exist, be non-empty, and begin with `<unit-id>-`. This file replaces the former `DEVBENCH_REVIEW_ROUND_TOKEN` env var entirely; there is no override env var (it is a security/correctness gate, not a tunable).
 
 ---
 

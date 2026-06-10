@@ -210,12 +210,13 @@ sequenceDiagram
   Skill->>Exec: invoke with <id>
   Exec->>CLI: read-unit, log-tdd, ...
   Exec-->>Skill: implementation staged
-  Skill->>Judges: 4 parallel Agent calls (direct, ADR-28)
+  Skill->>CLI: review-token new <id> (write per-round token file, ADR-29)
+  Skill->>Judges: 4 parallel Agent calls -- review_team:code-reviewer / :test-reviewer / :doc-reviewer / :changes-manifest (direct, ADR-28)
   Judges-->>Skill: 4 self-logged canonical verdicts
   Skill->>CLI: read-unit (read verdict lines for round)
   Note over Skill: REVIEW_PASS only if all 4 verdict lines present (fail-closed)
   alt all 4 pass
-    Skill->>Sec: invoke with <id>
+    Skill->>Sec: invoke with <id> (same round token covers security + iac reviewers)
     Sec-->>Skill: SECURITY_PASS or SECURITY_FAIL
     alt SECURITY_PASS
       Skill->>Git: git-ops <id>
@@ -228,6 +229,7 @@ sequenceDiagram
     Skill->>Exec: re-invoke with prior feedback
     Note over Skill,Exec: up to max_executor_retries times
   end
+  Skill->>CLI: review-token clear (end of round, ADR-29)
   Skill->>Skill: loop to next work unit
 ```
 
@@ -385,7 +387,7 @@ Four judges in `plugin/devbench-orchestrate/agents/review_team/`:
 - `doc-reviewer.md` -- documentation accuracy, sync with code, no stale docs
 - `changes-manifest.md` -- declared changes match staged changes, no out-of-scope edits
 
-The orchestrate skill (main thread) dispatches all four directly in parallel -- a single response with one `Agent` tool call per reviewer (ADR-28) -- injecting a fresh per-round, unit-scoped `DEVBENCH_REVIEW_ROUND_TOKEN` into each. Each reviewer self-logs its canonical verdict (`code_review` / `test_review` / `doc_review` / `changes_manifest`); the skill derives a single REVIEW_PASS / REVIEW_FAIL from those verdict lines (fail-closed). The legacy `review-supervisor.md` is a deprecated, inert stub and dispatches nothing.
+The orchestrate skill (main thread) dispatches all four directly in parallel -- a single response with one `Agent` tool call per reviewer (ADR-28). Claude Code namespaces a plugin sub-agent by its subdirectory, so the four reviewers register and dispatch under their subdir-namespaced agent types: `devbench-orchestrate:review_team:code-reviewer`, `:review_team:test-reviewer`, `:review_team:doc-reviewer`, and `:review_team:changes-manifest` (the `review_team:` infix is the registered, load-bearing form -- see the ADR-28 registered-slug postmortem). Before each round the skill writes a fresh per-round, unit-scoped token via `devbench review-token new <id>` (a file under `<workspace>/.devbench/`, ADR-29) and clears it with `devbench review-token clear` after the round; this token file replaces the former `DEVBENCH_REVIEW_ROUND_TOKEN` env var entirely. Each reviewer self-logs its canonical verdict (`code_review` / `test_review` / `doc_review` / `changes_manifest`); the skill derives a single REVIEW_PASS / REVIEW_FAIL from those verdict lines (fail-closed). The legacy `review-supervisor.md` is a deprecated, inert stub and dispatches nothing.
 
 ### Tier 2 -- Security gate (sequential, separate)
 
@@ -415,7 +417,7 @@ Walkthrough adding a hypothetical `api-contract` judge that verifies API changes
 
 1. Create `plugin/devbench-orchestrate/agents/review_team/api-contract.md` with the standard agent frontmatter (`name`, `description`, `model`, `tools`, `disallowedTools`) and the review logic body, including the H3 "Token requirement" section. Use one of the existing judges as a template -- the `name:` field becomes the judge's identifier in the verdict log.
 2. Add `"api_contract"` to `REVIEW_JUDGE_NAMES` in `constants.py`.
-3. Add the new reviewer's dispatch to `orchestrate/SKILL.md` step 5 (the skill names each reviewer explicitly after [ADR-28](adr/28-flatten-review-pipeline.md)) and add its `agent_type` (`devbench-orchestrate:api-contract`) to `ALLOWED_REVIEWER_AGENT_TYPES` in `guard-verdict-format.sh`. (The hook hard-codes the allowlist; the judge name itself is also listed in `KNOWN_JUDGES`.)
+3. Add the new reviewer's dispatch to `orchestrate/SKILL.md` step 5 (the skill names each reviewer explicitly after [ADR-28](adr/28-flatten-review-pipeline.md)) and add its `agent_type` to `ALLOWED_REVIEWER_AGENT_TYPES` in `guard-verdict-format.sh`. Because the agent lives under `agents/review_team/`, Claude Code registers it with the subdirectory namespace, so the allowlist entry is the `review_team:`-infixed form `devbench-orchestrate:review_team:api-contract` (the registered, load-bearing slug -- see the ADR-28 registered-slug postmortem), not the flat `devbench-orchestrate:api-contract`. (The hook hard-codes the allowlist; the judge name itself is also listed in `KNOWN_JUDGES`.)
 4. Mention the new judge in `docs/example-work-unit-template.md` so backlog authors know it exists.
 5. Run `make validate` to confirm tests still pass.
 6. Test end-to-end on a sample work unit.
@@ -542,9 +544,9 @@ DevBench registers hooks for Claude Code events via `plugin/devbench-orchestrate
 
 | Hook event | Matcher | Script(s) | Purpose |
 | --- | --- | --- | --- |
-| `PreToolUse` | `Bash` | `hook-logger.sh`, `guard-bash.sh`, `guard-verdict-format.sh`, `guard-git-stage.sh` | Audit log + block destructive bash + validate verdict format + require git stage before commit |
-| `PreToolUse` | `Write` | `guard-work-unit-write.sh` | Block direct edits to work-unit markdown files (only orchestrate skill should modify them) |
-| `PreToolUse` | `Edit` | `guard-work-unit-write.sh` | Same |
+| `PreToolUse` | `Bash` | `hook-logger.sh`, `guard-bash.sh`, `guard-verdict-format.sh`, `guard-comment-format.sh`, `guard-git-stage.sh`, `guard-destructive-git.sh`, `guard-review-supervisor-scope.sh` | Audit log + block destructive bash + validate verdict format + block control-language comments + require git stage before commit + block destructive git + scope the (deprecated) review-supervisor |
+| `PreToolUse` | `Write` | `guard-plugin-write.sh`, `guard-work-unit-write.sh` | Self-protection (hard-deny Write to plugin scripts/hooks, plugin-shadow, `.claude/settings*.json`, the `$BASH_ENV` target -- no role bypass) + block direct edits to work-unit markdown files (only orchestrate skill should modify them) |
+| `PreToolUse` | `Edit` | `guard-plugin-write.sh`, `guard-work-unit-write.sh` | Same |
 | `PreToolUse` | `.*` | `hook-logger.sh` | Catch-all audit log |
 | `PostToolUse` | `Bash` | `hook-logger.sh`, `assert-tests-pass.sh` | Audit log + fail loop if test command exited non-zero |
 | `PostToolUse` | `.*` | `hook-logger.sh` | Catch-all audit log |
@@ -572,6 +574,21 @@ DevBench registers hooks for Claude Code events via `plugin/devbench-orchestrate
 Implementation: `_resolve_caller_role` in `plugin/devbench-orchestrate/scripts/_hook_lib.sh` reads the env var and returns one of the three normalized values. The orchestrator subprocess sets `DEVBENCH_AGENT_ROLE=orchestrator` in its env before invoking any Claude tool; executor subprocesses inherit no such env var.
 
 Content rules (rule 10 em-dash, rule 11 checkout_directory prefix) ALWAYS fire regardless of role -- the role bypass affects only the final block-or-allow gate. An orchestrator-tier write that violates rule 10 or rule 11 is still rejected with exit 2 + a structured error message.
+
+### Guard-the-guards: `guard-plugin-write.sh` (self-protection)
+
+`guard-plugin-write.sh` is a PreToolUse hook on Write and Edit that hard-denies (exit 2) any write whose target is part of the guard layer itself. It closes the gap an autonomous orchestrator session demonstrated: nothing previously blocked Write/Edit to the plugin's own scripts, so a session could edit a security guard (for example `guard-verdict-format.sh`) and disarm the very check that constrains it. The denial is generic (no hardcoded workspace, backlog, or plugin name) and has **no role bypass** -- unlike `guard-work-unit-write.sh`, even `DEVBENCH_AGENT_ROLE=orchestrator` is rejected, because the guard layer must never be editable by the agents it constrains.
+
+Protected target categories (a match in any one is an exit-2 block):
+
+| Category | Match (absolute or workspace-relative `file_path`) |
+| --- | --- |
+| Plugin guard scripts or hook config | path contains a `plugin/` segment AND a later `scripts/` or `hooks/` segment |
+| Workspace shadow plugin | path is under `.devbench/plugin-shadow/` |
+| Claude settings file | basename matches `settings*.json` under a `.claude/` directory (covers `settings.json` + `settings.local.json`) |
+| `$BASH_ENV` env-injection vector | the file named by `$BASH_ENV` (when set), compared as absolute paths -- editing it injects arbitrary code into every non-interactive bash subprocess |
+
+`guard-bash.sh` carries defense-in-depth deny patterns for the same paths so the protection cannot be sidestepped via a Bash mutation (`sed -i`, `tee`, output redirection) instead of a Write/Edit tool call.
 
 ### The Stop hook circuit breaker (the headline reliability feature)
 

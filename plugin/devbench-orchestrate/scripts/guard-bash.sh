@@ -43,4 +43,30 @@ for pattern in "${BLOCKED_PATTERNS[@]}"; do
   fi
 done
 
+# Defense-in-depth atop guard-plugin-write.sh: that hook only fires for the
+# Write / Edit tools, so an agent could route around it by mutating a
+# protected file via a Bash command (sed -i, tee, or shell output
+# redirection). This best-effort regex scan blocks in-place-write Bash
+# commands whose target text matches the same protected paths the
+# guard-plugin-write.sh "guard the guards" hook protects:
+#   - a plugin's guard scripts / hook config (/plugin/.../scripts/ or .../hooks/)
+#   - the workspace shadow plugin (/.devbench/plugin-shadow/)
+#   - Claude settings files (/.claude/settings...)
+# It is best-effort because it pattern-matches the command STRING rather than
+# resolving real file targets; the authoritative block is guard-plugin-write.sh.
+PROTECTED_PATH_RE='(/plugin/[^[:space:]]*/(scripts|hooks)/|/\.devbench/plugin-shadow/|/\.claude/settings)'
+
+# In-place / redirecting write verbs we care about: `sed -i`, `tee`, and
+# `>` / `>>` output redirection.
+INPLACE_WRITE_RE='(sed[[:space:]]+(-[^[:space:]]*[[:space:]]+)*-i|[[:space:]]tee[[:space:]]|^tee[[:space:]]|>>?[[:space:]]*)'
+
+if [[ "$COMMAND" =~ $INPLACE_WRITE_RE ]] && [[ "$COMMAND" =~ $PROTECTED_PATH_RE ]]; then
+  echo "guard-bash: blocked in-place Bash write to a protected guard-layer path" >&2
+  echo "Command: ${COMMAND}" >&2
+  echo "Reason: the command appears to mutate a plugin script/hook, the shadow plugin," >&2
+  echo "or a Claude settings file (defense-in-depth atop guard-plugin-write.sh)." >&2
+  echo "Fix: the guard layer must not be self-modifiable; there is no bypass." >&2
+  exit 2
+fi
+
 exit 0

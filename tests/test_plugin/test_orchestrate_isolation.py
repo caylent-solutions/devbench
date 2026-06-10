@@ -67,21 +67,28 @@ class TestOrchestratePluginSelfContained:
         assert each one's .md file exists under agents/.
         """
         skill_text = (ORCHESTRATE_PLUGIN_ROOT / "skills" / "orchestrate" / "SKILL.md").read_text(encoding="utf-8")
-        # Match every Skill("devbench-orchestrate:<agent>", ...) invocation.
-        invocations = set(re.findall(r"devbench-orchestrate:([a-z][a-z_-]+)", skill_text))
-        # Map review-team underscored shortnames to their actual file
-        # locations (review_team subdir + hyphenated filename).
+        # Match every Skill("devbench-orchestrate:<agent>", ...) invocation. The
+        # capture must allow a ':' so the ADR-28 namespaced review-team slugs
+        # (e.g. devbench-orchestrate:review_team:code-reviewer) are captured WHOLE
+        # rather than truncated at the first ':' (which would yield a bare
+        # "review_team" with no corresponding file).
+        invocations = set(re.findall(r"devbench-orchestrate:([a-z][a-z_:-]+)", skill_text))
+        # Map review-team invocation forms to their actual file locations
+        # (review_team subdir + hyphenated filename).
         review_team_map = {
+            # Legacy underscored shortnames (canonical verdict names).
             "code_review": "review_team/code-reviewer.md",
             "test_review": "review_team/test-reviewer.md",
             "doc_review": "review_team/doc-reviewer.md",
             "changes_manifest": "review_team/changes-manifest.md",
-            # ADR-28: the orchestrate skill dispatches the review_team reviewers
-            # directly by their hyphenated agent names (which live in review_team/).
-            "code-reviewer": "review_team/code-reviewer.md",
-            "test-reviewer": "review_team/test-reviewer.md",
-            "doc-reviewer": "review_team/doc-reviewer.md",
-            "changes-manifest": "review_team/changes-manifest.md",
+            # ADR-28/ADR-29: the orchestrate skill dispatches the review_team
+            # reviewers by their REGISTERED namespaced slug -- Claude Code
+            # namespaces a plugin sub-agent by its agents/ subdirectory, so
+            # review_team/<name>.md registers as review_team:<name>.
+            "review_team:code-reviewer": "review_team/code-reviewer.md",
+            "review_team:test-reviewer": "review_team/test-reviewer.md",
+            "review_team:doc-reviewer": "review_team/doc-reviewer.md",
+            "review_team:changes-manifest": "review_team/changes-manifest.md",
         }
         for invocation in invocations:
             if invocation == "orchestrate":

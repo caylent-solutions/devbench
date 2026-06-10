@@ -27,11 +27,12 @@ summary "no infra Verification item in scope".
 
 ## Token requirement (H3 default-deny)
 
-The `guard-verdict-format.sh` hook requires `DEVBENCH_REVIEW_ROUND_TOKEN` to be set and
-non-empty whenever a canonical reviewer verdict is written (including iac_review). The
-orchestrate skill injects this token into this sub-agent's environment before invocation
-(step 7b of SKILL.md). If the token is absent, the `log-verdict iac_review` call will be
-blocked by the hook with exit 2.
+The `guard-verdict-format.sh` hook requires a per-round, unit-scoped token FILE at
+`<workspace>/.devbench/review-round-token` whenever a canonical reviewer verdict is written
+(including iac_review). The orchestrate skill writes it via `devbench review-token new <unit-id>`
+at the start of the unit's review round (step 5a of SKILL.md); the same token still applies when this
+reviewer runs (step 7b, same round) and is cleared after (step 5d). If the token file is absent or not
+scoped to this unit, the `log-verdict iac_review` call is blocked by the hook with exit 2.
 
 You do not need to set or validate the token yourself -- the orchestrator injects it. The
 constraint is documented here so this reviewer knows why absent-token invocations are

@@ -32,8 +32,13 @@ EXPECTED_PRE_TOOL_USE: dict[str, list[str]] = {
         "guard-destructive-git.sh",
         "guard-review-supervisor-scope.sh",
     ],
-    "Write": ["guard-work-unit-write.sh"],
-    "Edit": ["guard-work-unit-write.sh"],
+    # "Guard the guards": guard-plugin-write.sh runs BEFORE guard-work-unit-write.sh
+    # on Write/Edit. It hard-denies (exit 2, no role bypass) Write/Edit to the
+    # plugin's own scripts/hooks, the workspace shadow plugin, .claude/settings*
+    # files, and the $BASH_ENV target -- closing the self-modification gap that
+    # let an orchestrator session edit guard-verdict-format.sh.
+    "Write": ["guard-plugin-write.sh", "guard-work-unit-write.sh"],
+    "Edit": ["guard-plugin-write.sh", "guard-work-unit-write.sh"],
     ".*": ["hook-logger.sh"],
 }
 

@@ -232,11 +232,12 @@ class TestOrchestrateSkillCapabilities:
             "orchestrate SKILL.md must document the backlog-assistant handoff (issue #246)."
         )
 
-    def test_per_round_token_injection_documented(self) -> None:
-        """H3: orchestrate SKILL.md must document per-round token injection."""
+    def test_per_round_token_documented(self) -> None:
+        """H3/ADR-29: orchestrate SKILL.md must document the file-based per-round token."""
         text = _read(ORCHESTRATE_SKILL)
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in text, (
-            "orchestrate SKILL.md must document DEVBENCH_REVIEW_ROUND_TOKEN injection (H3)."
+        assert "review-token" in text and "review-round-token" in text, (
+            "orchestrate SKILL.md must document the file-based per-round token (H3/ADR-29): "
+            "the 'review-token' CLI verb and the .devbench/review-round-token file."
         )
 
     def test_h4_fail_closed_self_check_documented(self) -> None:
@@ -273,11 +274,14 @@ class TestTestReviewerCapabilities:
 class TestReviewSupervisorCapabilities:
     """Required new-capability text in review-supervisor.md (H3)."""
 
-    def test_round_token_requirement_documented(self) -> None:
-        """H3: review-supervisor must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement."""
+    def test_supervisor_deprecated_documented(self) -> None:
+        """ADR-28: review-supervisor is a deprecated inert stub; the review fan-out + per-round
+        token now live in the orchestrate skill, so the supervisor no longer carries a live token
+        requirement -- it must instead declare its deprecation."""
         text = _read(REVIEW_SUPERVISOR_AGENT)
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in text, (
-            "review-supervisor.md must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement (H3)."
+        assert "ADR-28" in text and ("deprecated" in text.lower()), (
+            "review-supervisor.md must declare itself deprecated (ADR-28); the round-token "
+            "requirement moved to the orchestrate skill + the four review_team reviewers."
         )
 
 
@@ -286,10 +290,10 @@ class TestSecurityReviewerCapabilities:
     """Required new-capability text in security-reviewer.md (H3)."""
 
     def test_round_token_requirement_documented(self) -> None:
-        """H3: security-reviewer must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement."""
+        """H3/ADR-29: security-reviewer must document the file-based per-round token requirement."""
         text = _read(SECURITY_REVIEWER_AGENT)
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in text, (
-            "security-reviewer.md must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement (H3)."
+        assert "review-round-token" in text or "review-token" in text, (
+            "security-reviewer.md must document the file-based per-round token requirement (H3/ADR-29)."
         )
 
 

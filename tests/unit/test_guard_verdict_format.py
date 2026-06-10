@@ -15,25 +15,25 @@ SCRIPT_PATH = (
 
 # H3: an agent type permitted to write canonical reviewer verdicts.
 _REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
-# A token injected by the orchestrator each review round (H3 second factor).
-# Fix B: it must be scoped to the unit under review (prefix "<unit-id>-"); the
-# canonical-judge test below uses unit E201-F1-S2-T1.
+# A per-round token written to the round-token FILE each review round (H3 second
+# factor; ADR-29 replaced the env var with a file). Fix B: it must be scoped to
+# the unit under review (prefix "<unit-id>-"); the canonical-judge test below
+# uses unit E201-F1-S2-T1.
 _ROUND_TOKEN = "E201-F1-S2-T1-r1-token"
 
 
 def _clean_env() -> dict[str, str]:
-    """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
+    """Return the process env with DEVBENCH vars that interfere with hooks stripped.
 
     _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
     _hook_lib.sh must not inherit those vars from the pytest process environment.
-    Also strips DEVBENCH_REVIEW_ROUND_TOKEN so tests that omit it start clean.
 
     ``BASH_ENV``/``ENV`` are stripped too: the devcontainer sets
     ``BASH_ENV=/workspaces/telemetry/shell.env``, so a non-interactive
-    ``bash <hook>`` re-sources ``shell.env`` on startup -- which the orchestrate
-    skill populates with a per-round ``DEVBENCH_REVIEW_ROUND_TOKEN``. Without
-    stripping it the hook subprocess would re-acquire (or overwrite) the very
-    vars this helper controls, making the tests non-hermetic.
+    ``bash <hook>`` re-sources ``shell.env`` on startup. Without stripping it the
+    hook subprocess would re-acquire vars this helper controls, making the tests
+    non-hermetic. The obsolete ``DEVBENCH_REVIEW_ROUND_TOKEN`` (ADR-29 moved the
+    token into a file) is stripped as well -- harmless, kept for hermeticity.
     """
     excluded = {
         "DEVBENCH_WORKSPACE_ROOT",
@@ -45,16 +45,30 @@ def _clean_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in excluded}
 
 
-def _run_hook(payload: dict, round_token: str | None = None) -> subprocess.CompletedProcess:
+def _run_hook(
+    payload: dict,
+    workspace_root: Path | None = None,
+    round_token: str | None = None,
+) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin.
 
     Args:
         payload: The JSON payload to pass on stdin.
-        round_token: When set, inject DEVBENCH_REVIEW_ROUND_TOKEN into the env.
+        workspace_root: When set, export DEVBENCH_WORKSPACE_ROOT pointing at it so
+            the guard can locate the round-token file. Required for any canonical
+            verdict path; harmless for non-canonical paths.
+        round_token: When set, write this value to the round-token FILE at
+            <workspace_root>/.devbench/review-round-token. Requires workspace_root.
     """
     env = _clean_env()
+    if workspace_root is not None:
+        env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace_root)
     if round_token is not None:
-        env["DEVBENCH_REVIEW_ROUND_TOKEN"] = round_token
+        if workspace_root is None:
+            raise ValueError("round_token requires workspace_root to locate the token file")
+        devbench_dir = workspace_root / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "review-round-token").write_text(round_token)
     return subprocess.run(
         ["bash", str(SCRIPT_PATH)],
         input=json.dumps(payload),
@@ -147,13 +161,13 @@ class TestGuardVerdictFormatHook:
             "security_review",
         ],
     )
-    def test_canonical_judge_names_accepted_for_reviewer_with_token(self, judge_name: str) -> None:
+    def test_canonical_judge_names_accepted_for_reviewer_with_token(self, judge_name: str, tmp_path: Path) -> None:
         """AC-2/H3: Canonical reviewer judge identifiers are accepted for reviewer agent with round token."""
         payload = _make_payload(
             f"uv run devbench log-verdict {judge_name} E201-F1-S2-T1 pass",
             agent_type=_REVIEWER_AGENT_TYPE,
         )
-        result = _run_hook(payload, round_token=_ROUND_TOKEN)
+        result = _run_hook(payload, workspace_root=tmp_path, round_token=_ROUND_TOKEN)
         assert result.returncode == 0, f"judge '{judge_name}' was incorrectly rejected: {result.stderr}"
 
     @pytest.mark.parametrize(
@@ -170,6 +184,41 @@ class TestGuardVerdictFormatHook:
         payload = _make_payload(f"uv run devbench log-verdict {judge_name} E201-F1-S2-T1 pass")
         result = _run_hook(payload)
         assert result.returncode == 0, f"judge '{judge_name}' was incorrectly rejected: {result.stderr}"
+
+    # ------------------------------------------------------------------ H3: round-token file fail-closed
+
+    def test_canonical_verdict_without_token_file_exits_2(self, tmp_path: Path) -> None:
+        """H3/ADR-29: a reviewer agent with no round-token FILE is blocked from a canonical verdict."""
+        payload = _make_payload(
+            "uv run devbench log-verdict code_review E201-F1-S2-T1 pass",
+            agent_type=_REVIEWER_AGENT_TYPE,
+        )
+        # workspace_root set but no token written -> the file is absent.
+        result = _run_hook(payload, workspace_root=tmp_path, round_token=None)
+        assert result.returncode == 2
+        assert "guard-verdict-format" in result.stderr
+        assert "token" in result.stderr.lower()
+
+    def test_canonical_verdict_with_foreign_unit_token_exits_2(self, tmp_path: Path) -> None:
+        """H3/Fix B: a round-token FILE scoped to a different unit is rejected."""
+        payload = _make_payload(
+            "uv run devbench log-verdict code_review E201-F1-S2-T1 pass",
+            agent_type=_REVIEWER_AGENT_TYPE,
+        )
+        result = _run_hook(payload, workspace_root=tmp_path, round_token="E999-F9-S9-T9-r1-stale")
+        assert result.returncode == 2
+        assert "E201-F1-S2-T1" in result.stderr
+
+    def test_canonical_verdict_with_unset_workspace_root_exits_2(self) -> None:
+        """H3/ADR-29: without DEVBENCH_WORKSPACE_ROOT the guard cannot locate the token and fails closed."""
+        payload = _make_payload(
+            "uv run devbench log-verdict code_review E201-F1-S2-T1 pass",
+            agent_type=_REVIEWER_AGENT_TYPE,
+        )
+        # No workspace_root -> DEVBENCH_WORKSPACE_ROOT stays unset.
+        result = _run_hook(payload)
+        assert result.returncode == 2
+        assert "DEVBENCH_WORKSPACE_ROOT" in result.stderr
 
     # ------------------------------------------------------------------ AC-3: non-log-verdict commands allowed
 

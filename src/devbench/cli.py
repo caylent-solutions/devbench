@@ -11396,6 +11396,44 @@ def _resolve_unit_file(unit: WorkUnit) -> Path | None:
     return wu_file if wu_file.exists() else None
 
 
+def cmd_review_token(*argv: str) -> int:
+    """Manage the file-based per-round review token (ADR-29).
+
+    Usage:
+        review-token new <unit-id>   -- write a fresh ``<unit-id>-r<n>-<rand>``
+                                        token to ``<workspace>/.devbench/review-round-token``
+                                        (increments the per-unit round counter) and print it.
+        review-token clear           -- remove the token file.
+
+    The ``guard-verdict-format.sh`` PreToolUse hook reads this file as the H3
+    second factor; the orchestrate skill calls ``new`` before each review round
+    and ``clear`` after it. Fails fast (rc=1) on bad usage or a missing unit id.
+    """
+    from devbench import review_token
+
+    if not argv:
+        print("review-token requires a subcommand: 'new <unit-id>' or 'clear'", file=sys.stderr)
+        return 1
+    sub = argv[0]
+    if sub == "new":
+        if len(argv) < 2 or not argv[1].strip():
+            print("review-token new requires a unit id: review-token new <unit-id>", file=sys.stderr)
+            return 1
+        try:
+            token = review_token.new_token(WORKSPACE_ROOT, argv[1])
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(token)
+        return 0
+    if sub == "clear":
+        removed = review_token.clear_token(WORKSPACE_ROOT)
+        print("review-token: cleared" if removed else "review-token: no token file to clear")
+        return 0
+    print(f"review-token: unknown subcommand '{sub}'; expected 'new <unit-id>' or 'clear'", file=sys.stderr)
+    return 1
+
+
 # Command registry: name -> (handler, min_args, description)
 _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
@@ -11702,6 +11740,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         "Best-effort materialise every pending proposal JSON (fires at orchestrate loop start)",
     ),
+    "review-token": (
+        cmd_review_token,
+        1,
+        "Manage the per-round review token file: review-token new <unit-id> | review-token clear",
+    ),
     "write-proposal": (
         cmd_write_proposal,
         1,
@@ -11735,6 +11778,7 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "status",
         "new-task",
         "reject-proposal",
+        "review-token",
         "validate-backlog",
         "log-rejection-feedback",
         # Issue #162 Phase 6: pre-render the report into a snapshot file.

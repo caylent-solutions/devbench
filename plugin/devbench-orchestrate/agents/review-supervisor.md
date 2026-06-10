@@ -26,9 +26,9 @@ The main-thread `orchestrate` skill now dispatches the four `review_team`
 reviewers **directly** (first-level, in parallel), exactly as it already
 dispatches `security-reviewer` and `iac-deploy-reviewer` -- one level deep and
 SDK-legal. Each reviewer self-logs its own canonical verdict (`code_review`,
-`test_review`, `doc_review`, `changes_manifest`) under the round-scoped
-`DEVBENCH_REVIEW_ROUND_TOKEN` the skill injects; the skill determines pass/fail
-solely from those canonical verdict lines (fail-closed). See
+`test_review`, `doc_review`, `changes_manifest`) under the round-scoped token
+file the skill writes via `devbench review-token new <id>` (ADR-29); the skill
+determines pass/fail solely from those canonical verdict lines (fail-closed). See
 `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` step 5.
 
 ## Why the file still exists

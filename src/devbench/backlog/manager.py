@@ -2410,7 +2410,7 @@ class BacklogManager:
         same path (e.g., ``.devcontainer/devcontainer.json`` exists in both
         caylent-telemetry and the kanon repo's per-repo edits).
         """
-        ownership, deps_by_task = self._build_manifest_ownership(rows, workspace_root)
+        ownership, deps_by_task, verbs_by_path = self._build_manifest_ownership(rows, workspace_root)
 
         for (repo, path), owners in ownership.items():
             if len(owners) < 2:
@@ -2426,13 +2426,15 @@ class BacklogManager:
             ids = [tid for tid, _ in relevant]
             if self._tasks_form_dep_chain(ids, deps_by_task):
                 continue
-            sorted_ids = sorted(ids)
+            # Order the chain so an ``add``er of the shared path runs before any
+            # ``modify``/``delete``r of it (falls back to lexicographic).
+            chain_ids = self._order_conflict_chain(ids, verbs_by_path.get((repo, path), {}))
             chain_hint = "\n".join(
-                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(chain_ids)
             )
             errors.append(
                 f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
-                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+                f"claimed by {', '.join(sorted(ids))}. Wire a serial dep chain:\n"
                 f"{chain_hint}\n"
                 f"  -- or any other DAG that totally orders the set. See "
                 f"docs/backlog-contract.md 'Manifest Conflict Rule'."
@@ -2457,7 +2459,7 @@ class BacklogManager:
         ``in-queue``/``proposed``/``blocked`` ERROR path is handled by
         :meth:`_check_manifest_conflicts` and is unaffected.
         """
-        ownership, deps_by_task = self._build_manifest_ownership(rows, workspace_root)
+        ownership, deps_by_task, verbs_by_path = self._build_manifest_ownership(rows, workspace_root)
 
         for (repo, path), owners in ownership.items():
             if len(owners) < 2:
@@ -2468,13 +2470,15 @@ class BacklogManager:
             ids = [tid for tid, _ in relevant]
             if self._tasks_form_dep_chain(ids, deps_by_task):
                 continue
-            sorted_ids = sorted(ids)
+            # Order the chain so an ``add``er of the shared path runs before any
+            # ``modify``/``delete``r of it (falls back to lexicographic).
+            chain_ids = self._order_conflict_chain(ids, verbs_by_path.get((repo, path), {}))
             chain_hint = "\n".join(
-                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(chain_ids)
             )
             message = (
                 f"draft/hold conflict on {path!r} in repo {repo or '(unknown)'}: "
-                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+                f"claimed by {', '.join(sorted(ids))}. Wire a serial dep chain:\n"
                 f"{chain_hint}\n"
                 f"  -- or any other DAG that totally orders the set. See "
                 f"docs/backlog-contract.md 'Manifest Conflict Rule'."
@@ -2488,14 +2492,23 @@ class BacklogManager:
         self,
         rows: list[tuple[str, str, str]],
         workspace_root: Path,
-    ) -> tuple[dict[tuple[str, str], list[tuple[str, str]]], dict[str, set[str]]]:
-        """Build manifest-ownership and dep maps from backlog rows.
+    ) -> tuple[
+        dict[tuple[str, str], list[tuple[str, str]]],
+        dict[str, set[str]],
+        dict[tuple[str, str], dict[str, str]],
+    ]:
+        """Build manifest-ownership, dep, and per-path verb maps from backlog rows.
 
-        Returns a 2-tuple:
+        Returns a 3-tuple:
         - ``ownership``: maps ``(repo, path)`` to a list of ``(task_id, status)``
           pairs for every task that lists that path in its Changes Manifest.
         - ``deps_by_task``: maps each task id to the set of dep IDs parsed from
           its ``## Dependencies`` table.
+        - ``verbs_by_path``: maps ``(repo, path)`` to a ``{task_id: verb}`` map
+          where ``verb`` is the classification of that task's Manifest change
+          for that path (see :meth:`_classify_manifest_verb`). Used to order
+          the recommended serial dep chain so an ``add``er runs before a
+          ``modify``/``delete``r of the same path.
 
         Both :meth:`_check_manifest_conflicts` and
         :meth:`_check_manifest_conflicts_draft_hold` use the same ownership map;
@@ -2505,6 +2518,7 @@ class BacklogManager:
 
         ownership: dict[tuple[str, str], list[tuple[str, str]]] = {}
         deps_by_task: dict[str, set[str]] = {}
+        verbs_by_path: dict[tuple[str, str], dict[str, str]] = {}
 
         for row_id, status, file_path_str in rows:
             if not row_id or row_id.startswith("-") or row_id.lower() == "id":
@@ -2526,10 +2540,85 @@ class BacklogManager:
             for manifest_row in manifest_rows:
                 if not self._is_real_manifest_path(manifest_row.file):
                     continue
-                ownership.setdefault((repo, manifest_row.file), []).append((row_id, status))
+                key = (repo, manifest_row.file)
+                ownership.setdefault(key, []).append((row_id, status))
+                verbs_by_path.setdefault(key, {})[row_id] = self._classify_manifest_verb(manifest_row.change)
             deps_by_task[row_id] = self._extract_dep_ids(content)
 
-        return ownership, deps_by_task
+        return ownership, deps_by_task, verbs_by_path
+
+    # Leading-word verb families used to classify a Changes Manifest ``change``
+    # cell. The verb is the first whitespace-delimited token, matched
+    # case-insensitively; trailing description (e.g. ``add per-suite README``)
+    # is ignored. ``ADD`` means the task creates the path; ``EDIT`` means it
+    # modifies or deletes an existing path. Anything else is ``UNKNOWN`` and
+    # does not disambiguate the chain order.
+    _MANIFEST_ADD_VERBS: frozenset[str] = frozenset({"add", "new", "create", "created"})
+    _MANIFEST_EDIT_VERBS: frozenset[str] = frozenset(
+        {
+            "modify",
+            "modified",
+            "update",
+            "updated",
+            "edit",
+            "edited",
+            "change",
+            "changed",
+            "rewrite",
+            "rewritten",
+            "delete",
+            "deleted",
+            "remove",
+            "removed",
+        }
+    )
+
+    @classmethod
+    def _classify_manifest_verb(cls, change: str) -> str:
+        """Classify a Changes Manifest ``change`` cell into ``add`` / ``edit`` / ``unknown``.
+
+        The verb is the leading whitespace-delimited token of the change
+        description, matched case-insensitively against
+        :data:`_MANIFEST_ADD_VERBS` and :data:`_MANIFEST_EDIT_VERBS`. A
+        trailing free-text description is ignored, so ``add per-suite README``
+        classifies as ``add`` and ``Updated -- architecture section`` as
+        ``edit``. Unrecognised leading words return ``unknown``.
+        """
+        first = change.strip().split(maxsplit=1)
+        if not first:
+            return "unknown"
+        # Strip a trailing ``:`` so ``add:`` matches ``add`` (a real convention).
+        word = first[0].rstrip(":").lower()
+        if word in cls._MANIFEST_ADD_VERBS:
+            return "add"
+        if word in cls._MANIFEST_EDIT_VERBS:
+            return "edit"
+        return "unknown"
+
+    @classmethod
+    def _order_conflict_chain(cls, ids: list[str], verbs: dict[str, str]) -> list[str]:
+        """Return the conflict claimants ordered so the chain dependency root runs first.
+
+        When exactly one claimant ``add``s the shared path and every other
+        claimant ``edit``s it (modify/delete), the adder must run first -- the
+        modifier/deleter depends on the file the adder creates. The adder is
+        placed at the head of the chain and the remaining ids follow in
+        lexicographic order, so the recommendation stays deterministic and
+        stable.
+
+        When the verbs do NOT disambiguate -- no claimant adds, more than one
+        adds, or any non-adder is not an ``edit`` (e.g. an ``unknown`` verb) --
+        this falls back to plain lexicographic ordering, preserving the prior
+        behaviour for the non-add case.
+        """
+        adders = [tid for tid in ids if verbs.get(tid) == "add"]
+        if len(adders) != 1:
+            return sorted(ids)
+        adder = adders[0]
+        others = [tid for tid in ids if tid != adder]
+        if not all(verbs.get(tid) == "edit" for tid in others):
+            return sorted(ids)
+        return [adder, *sorted(others)]
 
     @staticmethod
     def _extract_dep_ids(content: str) -> set[str]:

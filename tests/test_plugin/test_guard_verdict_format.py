@@ -21,24 +21,25 @@ HOOK_PATH = (
 
 # H3: reviewer agent type and round token needed for canonical verdicts.
 _REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
-# Fix B: the token must be scoped to the unit under review (prefix "<unit-id>-");
-# the happy-path canonical tests below use unit E0-F8.
+# ADR-29: the round token now lives in a FILE
+# (<DEVBENCH_WORKSPACE_ROOT>/.devbench/review-round-token). Fix B: it must be
+# scoped to the unit under review (prefix "<unit-id>-"); the happy-path
+# canonical tests below use unit E0-F8.
 _ROUND_TOKEN = "E0-F8-r1-token"
 
 
 def _clean_env() -> dict[str, str]:
-    """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
+    """Return the process env with DEVBENCH vars that interfere with hooks stripped.
 
     _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
     _hook_lib.sh must not inherit those vars from the pytest process environment.
-    Also strips DEVBENCH_REVIEW_ROUND_TOKEN so tests that omit it start clean.
 
     ``BASH_ENV``/``ENV`` are stripped too: the devcontainer sets
     ``BASH_ENV=/workspaces/telemetry/shell.env``, so a non-interactive
-    ``bash <hook>`` re-sources ``shell.env`` on startup -- which the orchestrate
-    skill populates with a per-round ``DEVBENCH_REVIEW_ROUND_TOKEN``. Without
-    stripping it the hook subprocess would re-acquire (or overwrite) the very
-    vars this helper controls, making the tests non-hermetic.
+    ``bash <hook>`` re-sources ``shell.env`` on startup. Without stripping it the
+    hook subprocess would re-acquire vars this helper controls, making the tests
+    non-hermetic. The obsolete ``DEVBENCH_REVIEW_ROUND_TOKEN`` (ADR-29 moved the
+    token into a file) is stripped as well -- harmless, kept for hermeticity.
     """
     excluded = {
         "DEVBENCH_WORKSPACE_ROOT",
@@ -54,20 +55,30 @@ def _run(
     command: str,
     agent_type: str | None = None,
     round_token: str | None = None,
+    workspace_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke the hook with a crafted Bash tool-input command string.
 
     Args:
         command: The bash command string to embed in the hook payload.
         agent_type: When set, adds agent_type field to the JSON payload.
-        round_token: When set, injects DEVBENCH_REVIEW_ROUND_TOKEN env var.
+        round_token: When set, write this value to the round-token FILE at
+            <workspace_root>/.devbench/review-round-token. Requires workspace_root.
+        workspace_root: When set, export DEVBENCH_WORKSPACE_ROOT pointing at it so
+            the guard can locate the round-token file.
     """
     payload: dict[str, object] = {"tool_name": "Bash", "tool_input": {"command": command}}
     if agent_type is not None:
         payload["agent_type"] = agent_type
     env = _clean_env()
+    if workspace_root is not None:
+        env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace_root)
     if round_token is not None:
-        env["DEVBENCH_REVIEW_ROUND_TOKEN"] = round_token
+        if workspace_root is None:
+            raise ValueError("round_token requires workspace_root to locate the token file")
+        devbench_dir = workspace_root / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "review-round-token").write_text(round_token)
     stdin = json.dumps(payload)
     return subprocess.run(
         ["bash", str(HOOK_PATH)],
@@ -128,22 +139,57 @@ class TestGuardVerdictFormat:
         assert result.returncode == 2
         assert "feedback is required" in result.stderr
 
-    def test_happy_path_pass_allows(self) -> None:
-        """Reviewer agent with round token writing a canonical pass verdict is allowed (H3)."""
+    def test_happy_path_pass_allows(self, tmp_path: Path) -> None:
+        """Reviewer agent with round-token file writing a canonical pass verdict is allowed (H3)."""
         result = _run(
             'uv run devbench log-verdict code_review E0-F8 pass "all good"',
             agent_type=_REVIEWER_AGENT_TYPE,
             round_token=_ROUND_TOKEN,
+            workspace_root=tmp_path,
         )
         assert result.returncode == 0
         assert result.stderr == ""
 
-    def test_happy_path_fail_with_feedback_allows(self) -> None:
-        """Reviewer agent with round token writing a canonical fail verdict with feedback is allowed (H3)."""
+    def test_happy_path_fail_with_feedback_allows(self, tmp_path: Path) -> None:
+        """Reviewer agent with round-token file writing a canonical fail verdict with feedback is allowed (H3)."""
         result = _run(
             'uv run devbench log-verdict code_review E0-F8 fail "one issue"',
             agent_type=_REVIEWER_AGENT_TYPE,
             round_token=_ROUND_TOKEN,
+            workspace_root=tmp_path,
+        )
+        assert result.returncode == 0
+        assert result.stderr == ""
+
+    def test_canonical_verdict_without_token_file_is_blocked(self, tmp_path: Path) -> None:
+        """H3/ADR-29: a reviewer agent with no round-token FILE is blocked from a canonical verdict."""
+        result = _run(
+            'uv run devbench log-verdict code_review E0-F8 pass "all good"',
+            agent_type=_REVIEWER_AGENT_TYPE,
+            round_token=None,
+            workspace_root=tmp_path,
+        )
+        assert result.returncode == 2
+        assert "token" in result.stderr.lower()
+
+    def test_canonical_verdict_with_foreign_unit_token_is_blocked(self, tmp_path: Path) -> None:
+        """H3/Fix B: a round-token FILE scoped to a different unit is rejected."""
+        result = _run(
+            'uv run devbench log-verdict code_review E0-F8 pass "all good"',
+            agent_type=_REVIEWER_AGENT_TYPE,
+            round_token="E0-F9-r1-stale",
+            workspace_root=tmp_path,
+        )
+        assert result.returncode == 2
+        assert "E0-F8" in result.stderr
+
+    def test_review_team_namespaced_reviewer_allowed(self, tmp_path: Path) -> None:
+        """ADR-28: the registered review_team:-infixed reviewer agent type is allowlisted."""
+        result = _run(
+            'uv run devbench log-verdict code_review E0-F8 pass "all good"',
+            agent_type="devbench-orchestrate:review_team:code-reviewer",
+            round_token=_ROUND_TOKEN,
+            workspace_root=tmp_path,
         )
         assert result.returncode == 0
         assert result.stderr == ""

@@ -126,7 +126,7 @@ class TestSkillConditionalDispatchWiring:
             "devbench-orchestrate:iac-deploy-reviewer",
             "optional_judges.iac_review",
             "unit_requires_iac_judge",
-            "DEVBENCH_REVIEW_ROUND_TOKEN",
+            "review-token",
             "test_iac_review_dispatch.py",
         ],
     )

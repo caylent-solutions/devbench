@@ -208,7 +208,7 @@ if [ -n "$FILE_PATH" ] && [ -f "${WORKSPACE_ROOT}/${FILE_PATH}" ]; then
 
     if echo "$LAST_COMMENT" | grep -q "executor" 2>/dev/null; then
         LAST_ACTION="executor completed"
-        NEXT_STEP="Dispatch the 4 review_team reviewers directly for ${TASK_ID} (code_review, test_review, doc_review, changes_manifest), injecting a fresh unit-scoped DEVBENCH_REVIEW_ROUND_TOKEN."
+        NEXT_STEP="Dispatch the 4 review_team reviewers directly for ${TASK_ID} (code_review, test_review, doc_review, changes_manifest), after writing a fresh unit-scoped round token via 'devbench review-token new ${TASK_ID}'."
     elif echo "$LAST_COMMENT" | grep -q "REVIEW_PASS.*code_review\|REVIEW_PASS.*test_review\|REVIEW_PASS.*doc_review\|REVIEW_PASS.*changes_manifest" 2>/dev/null; then
         LAST_ACTION="review pass"
         NEXT_STEP="Check if all 4 reviewers passed. If yes, invoke security-reviewer for ${TASK_ID}. If not, run remaining reviewers."

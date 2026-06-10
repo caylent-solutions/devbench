@@ -471,14 +471,59 @@ since the last release. PR #119 carries every change.
   while the file is retained for config / plugin-shadow / activity back-compat).
   The done-gate is unchanged (it is agent-agnostic). See `docs/adr/28-flatten-review-pipeline.md`.
 
-- **Per-round review token is now unit-scoped (round-aware guard).** The H3 guard
-  previously only checked that `DEVBENCH_REVIEW_ROUND_TOKEN` was non-empty; a stale
-  leftover token in `shell.env` (transported via `BASH_ENV`) could mask a missing
-  fresh injection. The orchestrate skill now writes a fresh
-  `<unit-id>-r<n>-<rand>` token before each review round and clears it after, and
-  `guard-verdict-format.sh` requires the token to be scoped to the unit under
-  review (prefix `<unit-id>-`), so a token left over from a different unit's round
-  can never satisfy this unit's canonical verdict.
+- **Reviewer agent-type allowlist corrected to the registered subdir-namespaced
+  slug (ADR-28 follow-up).** The ADR-28 flatten was correct, but the first cut of
+  the H3 guard allowlist + the SKILL step-5 dispatch used the **flat** slug
+  `devbench-orchestrate:code-reviewer` for the four `review_team` reviewers. Claude
+  Code namespaces a plugin sub-agent by its subdirectory, so the reviewers actually
+  register and dispatch as `devbench-orchestrate:review_team:code-reviewer` (and
+  `:review_team:test-reviewer`, `:review_team:doc-reviewer`,
+  `:review_team:changes-manifest`). Because no agent ever presented the flat
+  `agent_type`, the allowlist check failed for every reviewer, no canonical verdict
+  could be written, and the done-gate was unsatisfiable -- blocking every review.
+  `ALLOWED_REVIEWER_AGENT_TYPES` and the SKILL dispatch now use the
+  `review_team:`-infixed (registered) form as authoritative; the flat forms are
+  retained as defensive cross-version coverage. A regression test derives the
+  expected slugs from the `review_team/` directory so the allowlist cannot drift
+  back to the flat form. See the registered-slug postmortem in
+  `docs/adr/28-flatten-review-pipeline.md`.
+
+- **Per-round review token moved off the env var onto a file (ADR-29).** The H3
+  second factor used to be the `DEVBENCH_REVIEW_ROUND_TOKEN` environment variable
+  carried via `shell.env` + `BASH_ENV` -- a transport that was never implemented in
+  code and failed twice in production: a stale leftover token in `shell.env` masked
+  a missing fresh injection, and a later run wrote the value into
+  `.claude/settings.local.json` where the hook never read it. The token now lives in
+  a file, `<workspace>/.devbench/review-round-token`, managed by a new CLI verb:
+  `devbench review-token new <unit-id>` writes a fresh `<unit-id>-r<n>-<rand>` token
+  (per-unit round counter in `review-round-counters.json`) and `devbench
+  review-token clear` removes it. `guard-verdict-format.sh` reads that file
+  (workspace from `DEVBENCH_WORKSPACE_ROOT`) and requires it to exist, be non-empty,
+  and be unit-scoped (prefix `<unit-id>-`). The orchestrate skill writes the token at
+  the start of each review round (covering the four reviewers plus the security and
+  iac reviewers in the same round) and clears it after. Security equivalence is
+  preserved -- still a per-round, unit-scoped second factor; only the transport
+  changed, removing the `BASH_ENV` fragility that caused both incidents. See
+  `docs/adr/29-file-based-review-token.md`.
+
+- **Guard-the-guards: the guard layer is no longer self-modifiable.** An autonomous
+  orchestrator session was able to edit a security guard script because no hook
+  blocked Write/Edit to the plugin's own scripts/hooks. A new PreToolUse hook,
+  `guard-plugin-write.sh` (registered in `hooks.json` under Write + Edit),
+  hard-denies (exit 2, **no role bypass** -- not even
+  `DEVBENCH_AGENT_ROLE=orchestrator`) any Write/Edit whose target is a plugin
+  `scripts/` or `hooks/` directory, the `.devbench/plugin-shadow/` tree, a
+  `.claude/settings*.json` file, or the file named by `$BASH_ENV`. `guard-bash.sh`
+  gained defense-in-depth deny patterns (`sed -i`, `tee`, output redirection) for the
+  same paths so the protection cannot be sidestepped via a Bash mutation.
+
+- **Manifest-conflict add-dep recommendation is now verb-aware
+  (adds-before-modifies).** When two conflicting units' Changes Manifests show one
+  unit `add`s a path that another `modify`s or `delete`s, the recommended `add-dep`
+  chain now places the adder first (the modifier/deleter is wired to depend on the
+  adder, since the file must exist before it can be changed), instead of the prior
+  lexicographic ordering that could invert the dependency. Lexicographic ordering
+  remains the fallback when the verb pattern is ambiguous.
 
 - **Committable-file Manifest sentinels are now rejected (validate-backlog rule 24).**
   A work unit could pass every judge and `verify-ac` (exit 0) and stage its correct

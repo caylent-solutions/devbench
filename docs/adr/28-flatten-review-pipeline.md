@@ -142,4 +142,39 @@ with the round-aware token, the staleness that masked the incident.
 Moving the per-round token off `shell.env`/`BASH_ENV` onto a per-round
 `.devbench/` sidecar file, or the HMAC token scheme ADR-25 deferred. The
 round-aware unit-id scoping is the proportionate hardening for now; the sidecar
-move is a larger transport change tracked separately.
+move is a larger transport change tracked separately. (The sidecar move was
+subsequently made -- see [ADR-29](29-file-based-review-token.md), which replaces
+the env-var transport entirely after it failed twice in production.)
+
+## Registered-slug postmortem
+
+The flatten decision above was correct: the review pipeline had to lose its
+second sub-agent level. But the *first* implementation of the guard allowlist and
+the SKILL dispatch used the wrong agent-type slugs, and that blocked every review
+verdict until corrected.
+
+Claude Code namespaces a plugin sub-agent by the **subdirectory** it lives in.
+The four reviewers live in `agents/review_team/`, so at runtime they register and
+dispatch as:
+
+```
+devbench-orchestrate:review_team:code-reviewer
+devbench-orchestrate:review_team:test-reviewer
+devbench-orchestrate:review_team:doc-reviewer
+devbench-orchestrate:review_team:changes-manifest
+```
+
+The `review_team:` infix is the **registered, load-bearing form**. The initial
+ADR-28 change instead used the flat `devbench-orchestrate:code-reviewer` form in
+both `ALLOWED_REVIEWER_AGENT_TYPES` (guard-verdict-format.sh) and the SKILL step-5
+dispatch. Because no agent ever presents the flat `agent_type`, the H3 guard's
+allowlist check failed for every reviewer, so no canonical verdict could be
+written -- and with no verdict lines, the done-gate was unsatisfiable. The unit
+could never reach `done`.
+
+The fix is to use the subdir-namespaced `review_team:` form as the authoritative
+allowlist + dispatch identifier. The flat forms are retained in the allowlist as
+defensive cross-version coverage (harmless when unused: no agent resolves to them
+today) in case a future Claude Code release stops infixing the subdir. A
+regression test derives the expected slugs from the `review_team/` directory
+listing, so the allowlist cannot silently drift back to the flat form.

@@ -276,3 +276,107 @@ def test_draft_tasks_different_repos_same_path_no_finding(tmp_path: Path, backlo
     conflict_warnings = [w for w in warnings if "conflict" in w.lower() and "shared.yaml" in w]
     assert len(conflict_errors) == 0
     assert len(conflict_warnings) == 0
+
+
+# ---------------------------------------------------------------------------
+# Verb-aware chain ordering: an ``add``er must precede a ``modify``/``delete``r
+# regardless of lexicographic id order (adds-before-modifies).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("edit_verb", ["modify", "delete", "update", "remove"])
+def test_adder_recommended_before_modifier(
+    tmp_path: Path,
+    backlog_dir: Path,
+    edit_verb: str,
+) -> None:
+    """A unit that ``add``s the shared path must be the chain root.
+
+    The adder (E6-F1-S1-T2) sorts AFTER the modifier (E6-F1-S1-T1)
+    lexicographically, so a naive ``sorted(ids)`` chain would (wrongly)
+    recommend the adder depend on the modifier. The verb-aware ordering must
+    instead recommend the modifier depend on the adder: ``add-dep T1 T2``.
+    """
+    repo = "ex/foo"
+    # T1 is lexicographically FIRST but only modifies/deletes the file.
+    _make_task(backlog_dir, "E6-F1-S1-T1", repo, f"| `shared.yaml` | {edit_verb} |\n", status="in-queue")
+    # T2 is lexicographically LAST but is the one that creates the file.
+    _make_task(backlog_dir, "E6-F1-S1-T2", repo, "| `shared.yaml` | add |\n", status="in-queue")
+    _make_index(
+        tmp_path,
+        f"| E6-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/E6-F1-S1-T1.md` |\n"
+        f"| E6-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/E6-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, _warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1, f"Expected exactly one conflict error; got: {errors}"
+    message = conflict_errors[0]
+    # The recommendation must order the modifier as the dependent of the adder.
+    assert "uv run devbench add-dep E6-F1-S1-T1 E6-F1-S1-T2" in message, (
+        f"Expected modifier-depends-on-adder recommendation; got:\n{message}"
+    )
+    # The wrong (lexicographic) direction must NOT be recommended.
+    assert "uv run devbench add-dep E6-F1-S1-T2 E6-F1-S1-T1" not in message
+    # Claim list stays lexicographically ordered regardless of chain order.
+    assert "claimed by E6-F1-S1-T1, E6-F1-S1-T2" in message
+
+
+@pytest.mark.unit
+def test_all_modify_falls_back_to_lexicographic(
+    tmp_path: Path,
+    backlog_dir: Path,
+) -> None:
+    """When no single ``add``er disambiguates, the chain stays lexicographic.
+
+    Both claimants modify the shared path, so the recommendation must preserve
+    the prior behaviour: the lexicographically LATER id depends on the EARLIER
+    one (``add-dep T2 T1``).
+    """
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E7-F1-S1-T1", repo, "| `shared.yaml` | modify |\n", status="in-queue")
+    _make_task(backlog_dir, "E7-F1-S1-T2", repo, "| `shared.yaml` | modify |\n", status="in-queue")
+    _make_index(
+        tmp_path,
+        f"| E7-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/E7-F1-S1-T1.md` |\n"
+        f"| E7-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/E7-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, _warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1, f"Expected exactly one conflict error; got: {errors}"
+    message = conflict_errors[0]
+    # Lexicographic fallback: later id depends on earlier id.
+    assert "uv run devbench add-dep E7-F1-S1-T2 E7-F1-S1-T1" in message, (
+        f"Expected lexicographic fallback recommendation; got:\n{message}"
+    )
+    assert "uv run devbench add-dep E7-F1-S1-T1 E7-F1-S1-T2" not in message
+
+
+@pytest.mark.unit
+def test_two_adders_falls_back_to_lexicographic(
+    tmp_path: Path,
+    backlog_dir: Path,
+) -> None:
+    """When MORE than one claimant adds the path, verbs do not disambiguate.
+
+    Two adders mean there is no single creator the others can depend on, so the
+    recommendation falls back to the lexicographic chain.
+    """
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E8-F1-S1-T1", repo, "| `shared.yaml` | add |\n", status="in-queue")
+    _make_task(backlog_dir, "E8-F1-S1-T2", repo, "| `shared.yaml` | add |\n", status="in-queue")
+    _make_index(
+        tmp_path,
+        f"| E8-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/E8-F1-S1-T1.md` |\n"
+        f"| E8-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/E8-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, _warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
+    conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1, f"Expected exactly one conflict error; got: {errors}"
+    message = conflict_errors[0]
+    assert "uv run devbench add-dep E8-F1-S1-T2 E8-F1-S1-T1" in message, (
+        f"Expected lexicographic fallback for two-adder case; got:\n{message}"
+    )

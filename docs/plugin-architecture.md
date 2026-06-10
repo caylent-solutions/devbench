@@ -51,6 +51,10 @@ plugin/devbench-orchestrate/
     ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the work unit's Changes Manifest
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
     ├── guard-destructive-git.sh ← blocks direct destructive git operations from non-git-ops agents
+    ├── guard-plugin-write.sh    ← "guard the guards": PreToolUse on Write/Edit; hard-denies (no role
+    │                              bypass) writes to any plugin scripts/hooks dir, the
+    │                              .devbench/plugin-shadow/ tree, .claude/settings*.json, and the
+    │                              $BASH_ENV-named file. The guard layer must not be self-modifiable.
     ├── guard-review-supervisor-scope.sh
     │                            ← enforces read-only scope on the review-supervisor agent.
     │                              Blocks Bash mutations (git commit/push, rm, sed -i, > redirection, etc.)
@@ -146,12 +150,14 @@ The current `hooks.json` registers ten hook event types. Below shows the structu
       {
         "matcher": "Write",
         "hooks": [
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-plugin-write.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-work-unit-write.sh"}
         ]
       },
       {
         "matcher": "Edit",
         "hooks": [
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-plugin-write.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-work-unit-write.sh"}
         ]
       }
@@ -177,6 +183,8 @@ The current `hooks.json` registers ten hook event types. Below shows the structu
 ```
 
 For the full hook table (all ten event types and their scripts), see [Hooks layer](architecture.md#9-hooks-layer) in the architecture doc.
+
+The Write/Edit matchers run `guard-plugin-write.sh` first -- the "guard the guards" hook. It hard-denies (exit 2, no role bypass) any Write/Edit whose target is a plugin `scripts/` or `hooks/` file, anything under `.devbench/plugin-shadow/`, a `.claude/settings*.json` file, or the file named by `$BASH_ENV`. The guard layer must not be editable by the agents it constrains, so unlike `guard-work-unit-write.sh` it ignores `DEVBENCH_AGENT_ROLE` entirely. See [architecture.md → Guard-the-guards](architecture.md#9-hooks-layer) for the protected-category table.
 
 ### The Stop hook circuit breaker
 
@@ -282,6 +290,11 @@ branches, merge strategy, timeouts). The plugin is config-agnostic.
 $DEVBENCH_WORKSPACE_ROOT/
 ├── BACKLOG.md
 ├── CLAUDE.md
+├── .devbench/                   ← per-workspace runtime state (not part of plugin)
+│   ├── review-round-token       ← file-based per-round review token (ADR-29); written by
+│   │                              `devbench review-token new <id>`, removed by `... clear`,
+│   │                              read by guard-verdict-format.sh as the H3 second factor
+│   └── review-round-counters.json ← per-unit monotonic round counter backing the token's `r<n>`
 ├── backlog/
 │   └── config/
 │       └── devbench.yaml        ← workspace config, not part of plugin

@@ -204,15 +204,26 @@ class TestIacDeployReviewerAgent:
         )
 
     def test_iac_deploy_reviewer_has_token_requirement_section(self) -> None:
-        """The agent must carry the H3 DEVBENCH_REVIEW_ROUND_TOKEN requirement
-        section (mirrors security-reviewer.md), since iac_review is a canonical
-        reviewer verdict subject to the default-deny token guard."""
+        """The agent must carry the H3 'Token requirement' section (mirrors
+        security-reviewer.md), since iac_review is a canonical reviewer verdict
+        subject to the default-deny token guard. ADR-29 changed the transport
+        from the DEVBENCH_REVIEW_ROUND_TOKEN env var to a FILE under
+        ``<workspace>/.devbench/review-round-token`` written by the
+        `review-token` CLI verb, so the section documents the file-based form."""
         content = self._IAC_PATH.read_text(encoding="utf-8")
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in content, (
-            "iac-deploy-reviewer.md must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement (H3)."
-        )
         assert "Token requirement" in content, (
             "iac-deploy-reviewer.md must include the H3 'Token requirement' section like security-reviewer.md."
+        )
+        assert "review-round-token" in content, (
+            "iac-deploy-reviewer.md must document the file-based H3 token at "
+            "<workspace>/.devbench/review-round-token (ADR-29)."
+        )
+        assert "review-token" in content, (
+            "iac-deploy-reviewer.md must reference the `review-token` CLI verb that writes the round token (ADR-29)."
+        )
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" not in content, (
+            "iac-deploy-reviewer.md must NOT reference the removed DEVBENCH_REVIEW_ROUND_TOKEN env var (ADR-29 "
+            "replaced the env-var transport with a token file)."
         )
 
     def test_iac_deploy_reviewer_reads_evidence_ledger(self) -> None:
@@ -396,11 +407,18 @@ _SKILL_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
 )
 
+_REVIEW_TEAM_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "review_team"
+
+# ADR-28: reviewers are dispatched by their REGISTERED namespaced slug. Claude
+# Code namespaces a plugin sub-agent by its agents/ subdirectory, so a file at
+# ``agents/review_team/<name>.md`` registers as
+# ``devbench-orchestrate:review_team:<name>`` -- NOT the flat
+# ``devbench-orchestrate:<name>`` form.
 _REVIEW_TEAM_AGENT_TYPES = [
-    "devbench-orchestrate:code-reviewer",
-    "devbench-orchestrate:test-reviewer",
-    "devbench-orchestrate:doc-reviewer",
-    "devbench-orchestrate:changes-manifest",
+    "devbench-orchestrate:review_team:code-reviewer",
+    "devbench-orchestrate:review_team:test-reviewer",
+    "devbench-orchestrate:review_team:doc-reviewer",
+    "devbench-orchestrate:review_team:changes-manifest",
 ]
 
 
@@ -410,7 +428,9 @@ class TestSkillDispatchesReviewTeamDirectly:
 
     The orchestrate skill (main thread) is the dispatcher, not review-supervisor,
     because the Claude Agent SDK forbids a sub-agent from spawning sub-agents.
-    Step 5 must name each reviewer agent_type and inject the per-round token.
+    Step 5 must name each reviewer by its registered namespaced slug
+    (``devbench-orchestrate:review_team:<name>``) and write the per-round token
+    via the ``review-token`` CLI verb (ADR-29 -- the env var transport is gone).
     """
 
     def _step5_region(self) -> str:
@@ -425,14 +445,41 @@ class TestSkillDispatchesReviewTeamDirectly:
     def test_step5_dispatches_each_reviewer_agent_type(self, agent_type: str) -> None:
         region = self._step5_region()
         assert agent_type in region, (
-            f"SKILL.md step 5 must dispatch '{agent_type}' directly (ADR-28 flattened pipeline)."
+            f"SKILL.md step 5 must dispatch the registered namespaced slug '{agent_type}' "
+            "directly (ADR-28 flattened pipeline; Claude Code namespaces a plugin sub-agent "
+            "by its agents/ subdirectory)."
         )
 
-    def test_step5_injects_round_token(self) -> None:
+    def test_step5_references_review_token_cli_verb(self) -> None:
+        """ADR-29: the per-round token is now a FILE written by the `review-token`
+        CLI verb; the `DEVBENCH_REVIEW_ROUND_TOKEN` env var transport is gone."""
         region = self._step5_region()
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in region, (
-            "SKILL.md step 5 must inject DEVBENCH_REVIEW_ROUND_TOKEN into each reviewer sub-agent."
+        assert "review-token" in region, (
+            "SKILL.md step 5 must write the per-round token via the `review-token` CLI verb "
+            "(ADR-29 file-based token); it no longer injects the DEVBENCH_REVIEW_ROUND_TOKEN env var."
         )
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" not in region, (
+            "SKILL.md step 5 must NOT reference the removed DEVBENCH_REVIEW_ROUND_TOKEN env var (ADR-29)."
+        )
+
+    def test_step5_dispatches_every_review_team_member_from_directory(self) -> None:
+        """Regression pin: derive the expected dispatch slug set from the
+        ``review_team/`` directory listing so a future re-layout or rename of any
+        reviewer file fails CI unless SKILL.md step 5 is updated in lockstep.
+
+        Each file ``review_team/<name>.md`` registers as
+        ``devbench-orchestrate:review_team:<name>`` and must be dispatched in step 5.
+        """
+        region = self._step5_region()
+        reviewer_files = sorted(_REVIEW_TEAM_DIR.glob("*.md"))
+        assert reviewer_files, f"no reviewer files found under {_REVIEW_TEAM_DIR}"
+        for reviewer in reviewer_files:
+            expected_slug = f"devbench-orchestrate:review_team:{reviewer.stem}"
+            assert expected_slug in region, (
+                f"SKILL.md step 5 must dispatch '{expected_slug}', derived from the "
+                f"directory file {reviewer.name}. A reviewer file exists with no matching "
+                "step-5 dispatch slug -- a re-layout/rename drifted from the SKILL."
+            )
 
     def test_step5_is_fail_closed_on_canonical_verdict_lines(self) -> None:
         """Pass/fail must be derived from canonical verdict lines, not reviewer prose/JSON."""
@@ -450,10 +497,13 @@ class TestSkillDispatchesReviewTeamDirectly:
 
 @pytest.mark.unit
 class TestReviewTeamTokenRequirement:
-    """ADR-28: each review_team reviewer is the direct token consumer and must
-    carry the H3 DEVBENCH_REVIEW_ROUND_TOKEN requirement section (mirrors
-    security-reviewer.md), since the orchestrate skill now injects the token
-    into each reviewer directly rather than via the supervisor.
+    """ADR-28 + ADR-29: each review_team reviewer is the direct token consumer
+    and must carry the H3 'Token requirement' section (mirrors
+    security-reviewer.md), since the orchestrate skill dispatches each reviewer
+    directly rather than via the supervisor. ADR-29 changed the token transport
+    from the DEVBENCH_REVIEW_ROUND_TOKEN env var to a FILE under
+    ``<workspace>/.devbench/review-round-token`` written by the `review-token`
+    CLI verb, so the section now documents the file-based mechanism.
     """
 
     @pytest.mark.parametrize("agent_filename", REVIEW_TEAM_AGENTS)
@@ -462,8 +512,16 @@ class TestReviewTeamTokenRequirement:
         assert "Token requirement" in content, (
             f"{agent_filename} must include the H3 'Token requirement' section (ADR-28 direct dispatch)."
         )
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in content, (
-            f"{agent_filename} must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement (H3)."
+        assert "review-round-token" in content, (
+            f"{agent_filename} must document the file-based H3 token at "
+            "<workspace>/.devbench/review-round-token (ADR-29)."
+        )
+        assert "review-token" in content, (
+            f"{agent_filename} must reference the `review-token` CLI verb that writes the round token (ADR-29)."
+        )
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" not in content, (
+            f"{agent_filename} must NOT reference the removed DEVBENCH_REVIEW_ROUND_TOKEN env var (ADR-29 "
+            "replaced the env-var transport with a token file)."
         )
 
 
@@ -586,16 +644,28 @@ class TestSkillIacReviewConditionalDispatch:
             "so dispatch agrees with the step-9 done-gate by construction."
         )
 
-    def test_skill_iac_dispatch_injects_review_round_token(self) -> None:
-        """The solo dispatch must inject DEVBENCH_REVIEW_ROUND_TOKEN like security-reviewer."""
+    def test_skill_iac_dispatch_reuses_step5a_round_token(self) -> None:
+        """ADR-29: step 7b no longer injects a separate DEVBENCH_REVIEW_ROUND_TOKEN
+        env var. The token is now a FILE written once by step 5a (`review-token new`)
+        and reused for the whole review cycle, so 7b must NOT require a fresh token
+        injection -- it explicitly reuses the same step-5a round token."""
         content = self._SKILL_PATH.read_text()
         heading_pos = content.find("7b.")
         assert heading_pos >= 0
-        # The token must be referenced in the iac dispatch region (between 7b and step 8).
+        # The iac dispatch region (between 7b and step 8).
         next_step_pos = content.find("\n8. ", heading_pos)
         region = content[heading_pos:next_step_pos] if next_step_pos > heading_pos else content[heading_pos:]
-        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in region, (
-            "SKILL.md step 7b must inject DEVBENCH_REVIEW_ROUND_TOKEN into the iac-deploy-reviewer environment."
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" not in region, (
+            "SKILL.md step 7b must NOT inject the removed DEVBENCH_REVIEW_ROUND_TOKEN env var (ADR-29 "
+            "replaced the env-var transport with a file written once by step 5a)."
+        )
+        assert "step 5a" in region or "from step 5a" in region, (
+            "SKILL.md step 7b must state it reuses the same unit-scoped review token written by step 5a "
+            "(ADR-29 file-based token), rather than requiring a separate token injection."
+        )
+        assert "do NOT write" in region or "do not write" in region.lower(), (
+            "SKILL.md step 7b must explicitly say to NOT write a new token here -- it reuses the "
+            "step-5a round token file for the same review cycle."
         )
 
     def test_skill_supervisor_does_not_dispatch_iac_review(self) -> None:

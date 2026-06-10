@@ -18,13 +18,13 @@ Git diff (authoritative work-unit scope per ADR-12):
 
 ## Token requirement (H3 default-deny)
 
-The `guard-verdict-format.sh` hook requires `DEVBENCH_REVIEW_ROUND_TOKEN` to be set,
-non-empty, AND scoped to the unit under review (the token begins with `<unit-id>-`) whenever
-a canonical reviewer verdict -- here `changes_manifest` -- is recorded. The orchestrate skill
-injects this token into this sub-agent's environment before dispatching the four `review_team`
-reviewers in parallel (step 5 of SKILL.md); after ADR-28 flattened the pipeline, this agent is
-dispatched directly by the skill, so it is the direct token consumer. If the token is absent or
-not scoped to this unit, the canonical-verdict call is blocked by the hook with exit 2.
+The `guard-verdict-format.sh` hook requires a per-round, unit-scoped token FILE at
+`<workspace>/.devbench/review-round-token` whenever a canonical reviewer verdict -- here
+`changes_manifest` -- is recorded. The orchestrate skill writes it via `devbench review-token new <unit-id>`
+before dispatching the four `review_team` reviewers in parallel (step 5a of SKILL.md) and clears it
+after the round (step 5d); after ADR-28/ADR-29 this agent is dispatched directly and the hook reads
+the file. If the token file is absent or not scoped to this unit, the canonical-verdict call is
+blocked by the hook with exit 2.
 
 You do not set or validate the token yourself -- the orchestrator injects it. This note
 documents why an absent-token invocation is blocked.

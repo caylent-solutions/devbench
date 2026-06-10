@@ -153,6 +153,27 @@ The single source rendered by skills 1 and 5:
 
 No PreToolUse hooks are installed. The plugin is safe to enable in any operator workspace.
 
+### Enabling takes effect in the next session (TDI-006)
+
+`claude plugin enable devbench-backlog-assistant` registers the plugin's skills at the
+**next** session start, not in the session the command was run in (skills are discovered
+when a session begins). If a skill is not invocable immediately after enabling, start a new
+session (or restart the active one) -- do not assume the skill is live mid-session.
+
+### `triage-blocked-task` routes (TDI-006)
+
+Beyond the structural buckets, the matrix routes three operationally common states:
+
+- **Done-gate deferred-evidence hold** -- a fully-implemented unit `HELD` solely because an
+  executable AC is `type=deferred` and `done_gate.allow_deferred_evidence` is `false`. When the
+  deferred AC names a runnable tool, the remedy is to reclassify it to `type=command` (TDI-004)
+  and re-queue, NOT to flip the secure-default policy.
+- **`INTERRUPTED_ON_STOP`** -- force-blocked by the SIGTERM shutdown safeguard with no structural
+  blocker; re-queued automatically on the next sweep (TDI-002).
+- **Pending proposal with alternatives** -- when `.devbench/proposals/<id>.json` carries
+  `proposed_tasks`, the skill lists the draft resolution-path ids + titles and instructs the
+  operator to promote one (or fold the fix into the source unit).
+
 ## Auto-resolve engine (issue #263, opt-in)
 
 The auto-resolve engine lets the `triage-blocked-task` skill apply a

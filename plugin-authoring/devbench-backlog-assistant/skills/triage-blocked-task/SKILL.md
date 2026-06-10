@@ -13,6 +13,11 @@ eight-bucket matrix -- then STOP. You never run any mutating verb without an exp
 
 Fail-fast on: missing env `DEVBENCH_WORKSPACE_ROOT`, unresolvable work unit id, absent backlog index.
 
+> **Enablement note (TDI-006).** `claude plugin enable devbench-backlog-assistant` registers the
+> plugin's skills for the **next** session, not the one it was run in -- skills are discovered at
+> session start. If this skill is not invocable immediately after enabling, start a new session (or
+> restart the active one); do not assume it is live mid-session.
+
 ---
 
 ## Step 1 -- Resolve the work unit
@@ -113,6 +118,40 @@ Suggested intervention: inspect the cascade chain and consider declining the roo
 
 ---
 
+## Sub-cap 1c -- Done-gate deferred-evidence check (TDI-006 / TDI-004)
+
+A fully-implemented unit can be `HELD` (or blocked) by the done-gate solely because an
+executable AC is `type=deferred` and `done_gate.allow_deferred_evidence` is `false` (the
+secure default). This is NOT a structural blocker. Before recommending a plain `unhold`,
+inspect the unit's `## Verification` directives for a `type=deferred` directive whose
+`reason` names a runnable project tool (terraform / terragrunt / tofu / terratest / pytest /
+make / cdk / sam / ... or "at execution time") and carries no live/production/operator-only
+signal. Use the shared detector -- never re-implement it:
+
+```bash
+python -c "
+import os
+from pathlib import Path
+from devbench.verification import VerificationType, parse_verification_section, deferred_reason_names_runnable_tool
+
+workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
+content = (workspace / '<relative-path-to-wu-from-read-unit>').read_text()
+for item in parse_verification_section(content):
+    if item.vtype is VerificationType.DEFERRED:
+        tool = deferred_reason_names_runnable_tool(item.reason)
+        if tool:
+            print(f'RECLASSIFY {\",\".join(item.ac_ids)} tool={tool}')
+"
+```
+
+When a `RECLASSIFY` line is printed, the remediation is to **reclassify the mis-labelled
+`type=deferred` directive to `type=command`** (the orchestrator can run the check; see TDI-004)
+and re-queue -- NOT to flip `done_gate.allow_deferred_evidence`. Only when no deferred AC names a
+runnable tool (the check is genuinely operator-only, e.g. a live production apply) is the
+policy decision the operator's to make.
+
+---
+
 ## Step 3 -- Print the audit tail
 
 Read the last `skills.triage_audit_tail` lines (default 20) from the work unit comments
@@ -124,11 +163,11 @@ and display which signals fired.
 
 Based on the classified bucket, print the corresponding remediation command:
 
-- `HELD` -- `uv run devbench unhold <id>`
+- `HELD` -- if Sub-cap 1c printed a `RECLASSIFY` line (done-gate deferred-evidence hold whose deferred AC names a runnable tool), recommend reclassifying that directive to `type=command` (TDI-004) and re-queueing -- do NOT flip `done_gate.allow_deferred_evidence`. Otherwise: `uv run devbench unhold <id>`
 - `BLOCKED_ON_HELD` -- `uv run devbench unhold <target>` (resolve the held dependency id)
 - `AUTO_CLEARING_VIA_PROPOSAL` -- no action required (optionally: `uv run devbench reconcile-cascade`)
 - `AWAITING_DEPENDENCY` -- wait for dependency, or: `uv run devbench set-status <dep> done && uv run devbench reconcile-cascade`
-- `AWAITING_AMENDMENT_RECOVERY` -- show the pending proposal path; `uv run devbench reconcile-cascade` if stalled; route rejected amendment to `rewrite-impossibility <id>`
+- `AWAITING_AMENDMENT_RECOVERY` -- show the pending proposal path; `uv run devbench reconcile-cascade` if stalled; route rejected amendment to `rewrite-impossibility <id>`. **If a `.devbench/proposals/<id>.json` exists with `proposed_tasks` (TDI-006 Gap 4):** print the rejection reason and list each draft resolution-path task id + title, and instruct the operator to review/edit and promote ONE (`uv run devbench promote-proposal <draft-id>`) -- or fold the fix into the source unit directly. Note any proposed path that is itself unsatisfiable (e.g. it references an artifact that neither exists nor is created by a task -- tie-in with TDI-005's referential-integrity check).
 - `RUNTIME_DEGRADATION` -- `make start` (see sub-cap 1a/1b warnings above)
 - `INTERRUPTED_ON_STOP` -- no operator edit required; the unit was force-blocked by the SIGTERM shutdown safeguard with no structural blocker. The next sweep auto-requeues it; to requeue now run `uv run devbench reconcile-cascade` (it emits `[REQUEUED_AFTER_STOP]`). Do NOT treat this as `OPERATOR_ACTION_REQUIRED`.
 - `OPERATOR_ACTION_REQUIRED` -- route by sub-cause:

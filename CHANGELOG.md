@@ -150,6 +150,17 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`triage-blocked-task` matrix routes + enablement note (TDI-006).** The
+  backlog-assistant triage skill gained routes for three operationally common
+  states: a done-gate deferred-evidence `HELD` whose deferred AC names a runnable
+  tool routes to reclassify-as-`type=command` (TDI-004), not to flipping the
+  secure-default policy (new Sub-cap 1c using the shared
+  `deferred_reason_names_runnable_tool` detector); `INTERRUPTED_ON_STOP` routes to
+  re-queue (TDI-002); and a pending `.devbench/proposals/<id>.json` with
+  `proposed_tasks` is surfaced with its draft resolution-path alternatives and a
+  promote-one / correct-source instruction. The skill and `docs/backlog-assistant.md`
+  now document that enabling the plugin takes effect in the next session.
+
 - **`INTERRUPTED_ON_STOP` blocked-task bucket + auto-requeue (TDI-002).** When
   the orchestrator stops mid-flight, its SIGTERM handler force-blocks the
   in-flight unit with a `[FORCED_BLOCKED_ON_STOP]` audit. Previously such a unit

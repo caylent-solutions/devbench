@@ -253,3 +253,40 @@ def test_auto_generated_draft_passes_verification_contract(
     errors, warnings = _validate(tmp_path, strict=True)
     assert _contract_findings(errors) == []
     assert _contract_findings(warnings) == []
+
+
+def test_promoted_proposal_draft_with_files_and_executable_ac_validates_clean(
+    tmp_path: Path, backlog_dir: Path
+) -> None:
+    """TDI-008 AC-1/2/3: a materialised draft with files_to_own + an executable AC,
+    promoted to in-queue, has concrete add rows (no TODO), a type=command
+    directive per executable AC, and introduces no validate-backlog errors."""
+    from devbench.backlog.proposal import ProposedTask, generate_draft_md
+
+    _make_index(tmp_path, "E1-F1-S1-T1")
+    draft = generate_draft_md(
+        ProposedTask(
+            suggested_id="E1-F1-S1-T1",
+            title="Task Title",
+            files_to_own=["src/resolver.py", "tests/test_resolver.py"],
+            linked_scenarios=[],
+            suggested_acs=["AC-1 a real terraform validate of the module passes", "AC-2 the resolver is documented"],
+            suggested_approach="Wire the resolver and validate the module.",
+        ),
+        repo=_REPO,
+        source_task_id="E1-F1-S1-T0",
+        generated_at="NOW",
+        status="in-queue",
+    )
+    # AC-1: concrete add rows, no TODO cell.
+    assert "| `src/resolver.py` | add |" in draft
+    assert "TODO" not in draft
+    # AC-3: executable AC gets a type=command directive; qualitative AC gets type=judge.
+    assert "- VERIFY AC-1 | type=command" in draft
+    assert "- VERIFY AC-2 | type=judge" in draft
+
+    (backlog_dir / "E1-F1-S1-T1.md").write_text(draft, encoding="utf-8")
+
+    # AC-2: promoting (status in-queue) introduces no validate-backlog ERRORs.
+    errors, _ = _validate(tmp_path, strict=True)
+    assert errors == [], f"unexpected validate errors on promoted draft: {errors}"

@@ -460,6 +460,19 @@ since the last release. PR #119 carries every change.
   (`AgentModelsConfig.iac_deploy_reviewer`, config-schema `agents.iac_deploy_reviewer`,
   env `JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER`). See `docs/adr/25-per-agent-model-overrides.md`.
 
+- **Materialised proposal-draft tasks were non-canonical stubs (TDI-008).** The
+  task-factory draft generator emitted `TODO -- describe change` Changes Manifest
+  cells and a single `type=judge` Verification stub, so promoting a draft to
+  `in-queue` hit `validate-backlog` ERRORs (manifest parse, orphan paths) and an
+  under-specified task. `generate_draft_md` now emits a valid Changes Manifest --
+  concrete `add` rows from the proposal's `files_to_own`, or a documented sentinel
+  (`<resolution-targets-determined-at-execution>`) when the file set is
+  undetermined, never `TODO` -- and a real `## Verification` directive per AC: a
+  `type=command` skeleton (with a fill-in cmd) for executable ACs and `type=judge`
+  for qualitative ones, so every executable AC is covered by the verification
+  contract. A draft with `files_to_own` and an executable AC now promotes to
+  `in-queue` with no new validate-backlog errors.
+
 - **`validate-backlog` and `next` disagreed on dependency cycles (TDI-009).**
   `validate-backlog` walked only the BACKLOG.md index dependency column while
   `next` (and the orchestrator) schedule on the work-unit `## Dependencies`

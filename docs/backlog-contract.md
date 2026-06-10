@@ -187,8 +187,9 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 21. Verification command-path contract (TDI-001): a `## Verification` `type=command` path operand must not begin with the unit's `checkout_directory` name, must resolve against the present checkout, and must not feed a recursive `grep` from a `$(find ...)` substitution. WARNING by default, ERROR under `--strict`.
 22. Command-vs-deferred classification (TDI-004): a `type=deferred` directive whose `reason` names a runnable project tool (with no live/operator-only signal) is flagged as a mis-classified runnable check. WARNING by default, ERROR under `--strict`.
 23. AC referential integrity (TDI-005): a path an AC / `type=command` directive asserts must exist must either be present in the checkout, `add`ed by some task's Changes Manifest, or marked an external carve-out. WARNING by default, ERROR under `--strict`; runs only when the checkout is present.
+24. No committable-file sentinels: a Changes Manifest sentinel that stands in for committable files (it is not a recognised no-op / undetermined family or `<family:detail>` variant, and it contains a path separator or a `files`/`template`/`example` keyword) cannot satisfy the git-ops integrity gate and is rejected. WARNING by default, ERROR under `--strict`. See "Committable-file sentinels (forbidden)" below.
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rules 21-23 were added to close the `## Verification` authoring gaps (see "Verification Contract" below): a command path written against the wrong working directory, a runnable check mis-marked `deferred`, and an AC asserting a path that nothing creates -- each previously surfaced only at execution time. Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rules 21-23 were added to close the `## Verification` authoring gaps (see "Verification Contract" below): a command path written against the wrong working directory, a runnable check mis-marked `deferred`, and an AC asserting a path that nothing creates -- each previously surfaced only at execution time. Rule 24 was added after a unit (E9-F1-S1-T5) passed every judge and staged its files yet could never commit, because its Manifest used free-form sentinels naming files the git-ops integrity gate could not expand -- a terminal block a restart cannot clear. Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 
@@ -401,6 +402,34 @@ allowlist when possible; the pattern is a fallback for ad-hoc cases.
 When a task uses a sentinel Manifest, the orchestrator's
 ``manifest_amendment`` workflow can replace it with concrete paths
 mid-execution if real changes turn out to be required.
+
+#### Committable-file sentinels (forbidden)
+
+A sentinel documents a unit that produces **no** committable files (the
+no-op families above) or whose file list is genuinely undetermined until
+execution (``<source-drift-fix-targets-determined-at-execution>``, amended
+at runtime via ``manifest_amendment``). A sentinel MUST NOT stand in for
+committable files the author simply did not enumerate -- e.g.
+``<providers/aws/primitives/waf-webacl/ example + aux template files,
+determined at execution>``.
+
+The reason is structural, not stylistic. The git-ops integrity gate
+``assert_staged_matches_manifest`` (``src/devbench/backlog/manifest.py``)
+verifies the staged file set against the Manifest by **exact path-set
+membership** and never expands sentinels. A unit whose Manifest is a
+free-form sentinel naming files it failed to list can therefore pass every
+judge and ``verify-ac`` (exit 0), stage the correct files, yet **never
+commit** -- the staged files are rejected as out-of-manifest. A restart
+cannot clear this; only enumerating the paths can.
+
+``validate-backlog`` enforces this: a sentinel that is neither a recognised
+no-op family nor a recognised ``<family:detail>`` variant, and that stands
+in for committable files (it contains a path separator, or a
+``files``/``template``/``example`` keyword), is a **WARNING** by default and
+an **ERROR** under ``--strict`` (which ``spec-to-backlog`` runs). To fix:
+enumerate the concrete paths the unit creates/modifies (matching a done
+sibling unit's Manifest is the fastest reference); only for a genuinely
+unknowable list use ``<source-drift-fix-targets-determined-at-execution>``.
 
 ## Definition of Done
 

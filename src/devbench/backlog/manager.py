@@ -495,6 +495,7 @@ class BacklogManager:
         self._check_dep_id_format(rows, workspace_root, errors)
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
+        self._check_no_committable_manifest_sentinel(rows, workspace_root, errors, warnings, strict=strict)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         self._check_verification_contract(rows, workspace_root, errors, warnings, strict=strict)
         self._check_verification_path_contract(rows, workspace_root, errors, warnings, strict=strict)
@@ -2701,6 +2702,103 @@ class BacklogManager:
                         f"and amend the Manifest at runtime via "
                         f"`manifest_amendment`. See "
                         f"docs/backlog-contract.md 'Manifest Glob Rejection'."
+                    )
+
+    # Words that betray a sentinel standing in for committable files (vs a
+    # no-op marker). Compiled once; matched only after the recognised-prefix
+    # exemption below, so a ``<decision-only: chose a template engine>`` row
+    # is never flagged for merely naming a keyword.
+    _COMMITTABLE_SENTINEL_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(files?|templates?|examples?)\b", re.IGNORECASE
+    )
+
+    # The sanctioned no-op / undetermined sentinel families. Their exact forms
+    # live in ``devbench.backlog.sentinels.BACKLOG_SENTINEL_VALUES``; this tuple
+    # additionally exempts operator-defined per-task variants of the same family
+    # (e.g. ``<verification-only:E1-F1-S1-T2>``) from the committable-file rule.
+    _RECOGNISED_NOOP_SENTINELS: ClassVar[tuple[str, ...]] = (
+        "verification-only",
+        "decision-only",
+        "no changes",
+        "no-op",
+        "source-drift-fix-targets-determined-at-execution",
+    )
+
+    @classmethod
+    def _is_recognised_noop_sentinel(cls, value: str) -> bool:
+        """Return ``True`` for a sanctioned no-op / undetermined sentinel (or variant).
+
+        These document a unit as producing no committable files, or a file list
+        amended at runtime via ``manifest_amendment``; they are exempt from the
+        committable-file sentinel rule. Both the bare family name and an
+        operator-defined ``<family:detail>`` variant are recognised.
+        """
+        inner = value.strip().strip("<>").strip().lower()
+        return any(inner == family or inner.startswith(f"{family}:") for family in cls._RECOGNISED_NOOP_SENTINELS)
+
+    def _check_no_committable_manifest_sentinel(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+        warnings: list[str],
+        strict: bool = False,
+    ) -> None:
+        """Reject a Changes Manifest sentinel that stands in for committable files.
+
+        ``validate-backlog`` exempts angle-bracket sentinels from path-based
+        rules, but the git-ops integrity gate ``assert_staged_matches_manifest``
+        (``devbench.backlog.manifest``) does exact path-set membership and never
+        expands sentinels. A unit whose Manifest row is a *free-form* sentinel
+        naming files it failed to enumerate (e.g.
+        ``<providers/aws/primitives/waf-webacl/ example + aux template files,
+        determined at execution>``) can therefore pass every judge yet never
+        commit -- its real staged files are rejected as out-of-manifest.
+
+        A sentinel is flagged when it is neither a recognised no-op /
+        undetermined sentinel (see :meth:`_is_recognised_noop_sentinel`) nor a
+        recognised variant, *and* it stands in for committable files -- detected
+        by a path separator or a file-creation keyword. Routed to *warnings* by
+        default (back-compat) and to *errors* under ``--strict`` (which
+        ``spec-to-backlog`` runs), so the integrity gate's exact-membership
+        assumption is true by construction without weakening the commit gate.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.backlog.sentinels import is_sentinel_manifest_value
+
+        def route(message: str) -> None:
+            (errors if strict else warnings).append(message)
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                continue
+            for manifest_row in manifest_rows:
+                value = manifest_row.file.strip()
+                if not is_sentinel_manifest_value(value):
+                    continue
+                if self._is_recognised_noop_sentinel(value):
+                    continue
+                if "/" in value or self._COMMITTABLE_SENTINEL_RE.search(value):
+                    route(
+                        f"{row_id}: Changes Manifest sentinel {manifest_row.file!r} stands in "
+                        f"for committable files but cannot satisfy the git-ops integrity gate "
+                        f"-- `assert_staged_matches_manifest` does exact path-set membership and "
+                        f"never expands sentinels, so the staged files would be rejected as "
+                        f"out-of-manifest at commit time. Enumerate the concrete file paths this "
+                        f"unit creates/modifies. For a genuinely undetermined list, use the "
+                        f"recognised `<source-drift-fix-targets-determined-at-execution>` sentinel "
+                        f"and amend the Manifest at runtime via `manifest_amendment`. See "
+                        f"docs/backlog-contract.md 'Committable-file sentinels'."
                     )
 
     def _check_source_test_pairs(

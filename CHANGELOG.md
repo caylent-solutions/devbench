@@ -455,6 +455,21 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Committable-file Manifest sentinels are now rejected (validate-backlog rule 24).**
+  A work unit could pass every judge and `verify-ac` (exit 0) and stage its correct
+  files, yet never commit -- because its `## Changes Manifest` used free-form
+  angle-bracket sentinels naming files the git-ops integrity gate could not expand
+  (`assert_staged_matches_manifest` does exact path-set membership), so the staged
+  files were rejected as out-of-manifest. A restart cannot clear this terminal block.
+  `BacklogManager.validate_with_warnings` now flags a sentinel that is neither a
+  recognised no-op / undetermined family (`<verification-only>`, `<decision-only>`,
+  `<no changes>`, `<no-op>`, `<source-drift-fix-targets-determined-at-execution>`)
+  nor a `<family:detail>` variant, and that stands in for committable files (it
+  contains a path separator, or a `files`/`template`/`example` keyword): WARNING by
+  default, ERROR under `--strict` (which `spec-to-backlog` runs). The
+  `spec-to-backlog` skill's forbidden-patterns list and `docs/backlog-contract.md`
+  document the rule and the fix (enumerate the concrete paths).
+
 - **Minor hardening (TDI-003).** Three small, independent items: (a) `wait_for_reset`
   now treats a known, elapsed `reset_at` as the authoritative readiness signal and
   resumes **without** consulting the recovery probe -- the probe tests the raw

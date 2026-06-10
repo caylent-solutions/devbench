@@ -150,6 +150,25 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Verification-contract authoring lints (TDI-001 / TDI-004 / TDI-005).**
+  `validate-backlog` gained three checks over the `## Verification` contract
+  (WARNING by default, ERROR under `--strict`, which `spec-to-backlog` runs at
+  authoring time): (TDI-001) a `type=command` path operand that begins with the
+  unit's own target-repo `checkout_directory` name, does not resolve against a
+  present checkout, or feeds a recursive `grep` from a `$(find ...)`
+  substitution -- `verify-ac` runs each command in the checkout root, so paths
+  must be repo-root-relative; (TDI-004) a `type=deferred` directive whose
+  `reason` names a runnable project tool (with no live/operator-only signal),
+  which should be `type=command` -- the held-unit remedy is reclassification,
+  not relaxing `done_gate.allow_deferred_evidence`; (TDI-005) an Acceptance
+  Criterion or `type=command` path asserting an artifact must exist that is
+  neither present in the checkout, `add`ed by any task's Changes Manifest, nor
+  marked external. New `verification.py` helpers (`extract_command_paths`,
+  `command_substitution_feeds_grep`, `deferred_reason_names_runnable_tool`) back
+  the checks; `spec-to-backlog`/`create-spec` guidance + rubric items and
+  `docs/backlog-contract.md` ("Verification Contract", rules 21-23) document
+  the rules.
+
 - **Authoring-time draft/hold manifest conflict detection and `--strict` flag**
   (issue #267). `validate-backlog` now runs a second conflict pass (`_check_manifest_conflicts_draft_hold`,
   Check 12-draft) scoped to `draft` and `hold` tasks. Two `draft`/`hold` tasks that claim the same
@@ -424,6 +443,17 @@ since the last release. PR #119 carries every change.
   agents added in future. `iac_deploy_reviewer` is now an overridable agent
   (`AgentModelsConfig.iac_deploy_reviewer`, config-schema `agents.iac_deploy_reviewer`,
   env `JUDGE_AGENT_MODEL_IAC_DEPLOY_REVIEWER`). See `docs/adr/25-per-agent-model-overrides.md`.
+
+- **`iac_review` predicate over-matched on IaC path tokens (TDI-007).**
+  `detect_iac_tool` matched a tool by its bare name appearing anywhere in a
+  command -- including a path operand (`test -d terragrunt/common/x`,
+  `jq . providers/aws/accounts.json`) -- so pure data-file tasks were routed to
+  the optional `iac_review` judge unnecessarily (and held at the done-gate when
+  that judge could not dispatch). `IAC_TOOL_PATTERNS` is now verb-anchored: a
+  tool counts only when invoked with a lifecycle verb/subcommand
+  (`terraform validate`, `terragrunt run-all apply`, `cdk deploy`, `go test`
+  for Terratest, ...), never as a path substring. `unit_requires_iac_judge` and
+  `VerificationItem.is_infra` inherit the precise predicate.
 
 - **Quota detection false positive (#236 follow-up).** `detect_quota_error` no
   longer misclassifies benign sub-agent prose as a rate-limit hit. The bare

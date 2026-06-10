@@ -184,8 +184,11 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
 20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default on; set `false` to opt out per workspace)
+21. Verification command-path contract (TDI-001): a `## Verification` `type=command` path operand must not begin with the unit's `checkout_directory` name, must resolve against the present checkout, and must not feed a recursive `grep` from a `$(find ...)` substitution. WARNING by default, ERROR under `--strict`.
+22. Command-vs-deferred classification (TDI-004): a `type=deferred` directive whose `reason` names a runnable project tool (with no live/operator-only signal) is flagged as a mis-classified runnable check. WARNING by default, ERROR under `--strict`.
+23. AC referential integrity (TDI-005): a path an AC / `type=command` directive asserts must exist must either be present in the checkout, `add`ed by some task's Changes Manifest, or marked an external carve-out. WARNING by default, ERROR under `--strict`; runs only when the checkout is present.
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rules 21-23 were added to close the `## Verification` authoring gaps (see "Verification Contract" below): a command path written against the wrong working directory, a runnable check mis-marked `deferred`, and an AC asserting a path that nothing creates -- each previously surfaced only at execution time. Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 
@@ -514,6 +517,48 @@ Back-compat: because the two findings default to warnings, pre-existing backlogs
 ```
 
 Here AC-3 and AC-7 are executable (exit-0 proof required), AC-9 is operator-only (blocks `mark-done` unless `done_gate.allow_deferred_evidence` is enabled), and AC-11 is qualitative (the core judges assess it). The DoD item references AC-3 rather than asserting an un-AC'd outcome.
+
+### `verify-ac` working directory and path resolution (TDI-001)
+
+`devbench verify-ac` runs **every `type=command` directive with the target-repo checkout root as the working directory** (it resolves the repo from the configured `repos:` paths and runs each `cmd` there). Therefore every path operand in a `cmd` MUST be **relative to the target-repo checkout root** -- never relative to the workspace root, and never prefixed with the repo's own `checkout_directory` name. A path written against the wrong base cannot resolve, and the AC-evidence gate becomes unsatisfiable regardless of the implementation (`test -f` exits non-zero; a negated `! grep ... $(find <bad-path> ...)` worse still -- `find` yields zero operands, the recursive `grep` scans the whole tree, and `!` inverts an unrelated match into a false failure).
+
+Correct (repo-root-relative):
+
+```
+- VERIFY AC-3 | type=command | cmd=`test -d providers/aws/references/data-lake` | expect-exit=0
+```
+
+Incorrect (prefixed with the repo's `checkout_directory` name `tools-telemetry`):
+
+```
+- VERIFY AC-3 | type=command | cmd=`test -d tools-telemetry/providers/aws/references/data-lake` | expect-exit=0
+```
+
+`validate-backlog` flags a `type=command` path operand that begins with the unit's checkout-directory name (WARNING by default, ERROR under `--strict`), and -- when the checkout is present on disk -- a literal operand that does not resolve. Also avoid a `cmd` whose `grep` takes its file operands from a `$(find ...)` substitution: prefer an explicit file list or `grep -r <dir>` so a zero-operand expansion cannot trigger a tree-wide scan.
+
+### Command vs deferred (TDI-004)
+
+An acceptance criterion whose check runs with the **project's standard toolchain** -- the same environment `verify-ac` and the review judges run in -- MUST be `type=command` (or `terratest`/`plan`/etc.), NOT `type=deferred`. `type=deferred` is reserved strictly for checks that genuinely cannot run in the orchestrator environment: live-production mutations, credentials the orchestrator must not hold, or manual human sign-off.
+
+`done_gate.allow_deferred_evidence: false` is the **secure default**: a unit carrying a `type=deferred` executable AC is held pending an operator policy decision. When a unit holds on deferred evidence, the remedy is almost always to **reclassify a mis-labelled `deferred` check as `command`** -- never to relax the policy toggle. `validate-backlog` flags a `type=deferred` directive whose `reason` names a runnable project tool (terraform / terragrunt / tofu / terratest / pytest / make / cdk / sam / ... ) or "at execution time" and carries no live/production/operator-only signal (WARNING by default, ERROR under `--strict`).
+
+```
+# Mis-classified -- a check the orchestrator CAN run; must be type=command:
+- VERIFY AC-1 | type=deferred | owner=operator | reason="terraform validate requires the toolchain at execution time"
+
+# Legitimately deferred -- cannot run in the orchestrator:
+- VERIFY AC-9 | type=deferred | owner=operator | reason="real production terragrunt apply against a live account"
+```
+
+### AC Referential Integrity (TDI-005)
+
+When an Acceptance Criterion (or a `type=command` path operand) asserts that a concrete path must **exist or resolve** (a module directory, a file, a referenced primitive), that path must satisfy one of three resolutions:
+
+1. it **exists** in the target-repo checkout, or
+2. it is **created by a task** -- it appears as an `add` row in some backlog task's `## Changes Manifest`, or
+3. it is an explicit **external carve-out** (a pinned third-party / out-of-repo source; declare it inline with a trailing ` (ref)` or external wording).
+
+A required path that satisfies none of these is unsatisfiable: the unit cannot reach `done` and the executor can only escalate. `validate-backlog` flags such a path (WARNING by default, ERROR under `--strict`) naming the AC, the path, and the three resolutions. The check runs only when the target-repo checkout is present, so absence is asserted with certainty.
 
 ---
 

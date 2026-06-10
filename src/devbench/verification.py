@@ -77,28 +77,56 @@ INFRA_TYPES: frozenset[VerificationType] = frozenset(
 # ---------------------------------------------------------------------------
 # IaC tool matrix -- the single maintained, extensible source of truth.
 # Adding support for a new IaC tool is a one-line addition here.
-# Patterns are matched (case-insensitively, word-ish boundaries) against a
-# verification item's ``cmd`` (and against AC/DoD prose by the validator lint).
+#
+# Each pattern matches the tool only when it is the **invoked command paired
+# with an IaC lifecycle verb/subcommand** (e.g. ``terraform validate``,
+# ``terragrunt run-all apply``, ``cdk deploy``) -- never when the tool's name
+# appears solely as a **path operand** (e.g. ``test -d terragrunt/common/x``,
+# ``jq . providers/aws/accounts.json``). Path-substring matches were the
+# proximate cause of data-file tasks being routed to the optional ``iac_review``
+# judge unnecessarily (TDI-007); requiring an adjacent lifecycle verb makes the
+# predicate precise. The terratest test-runners (``go test``, ``make tf-test``,
+# ``terratest``) are matched as invocation tokens, never as path components.
 # ---------------------------------------------------------------------------
+
+#: Lifecycle subcommands shared by the terraform/opentofu/terragrunt family.
+#: Their presence immediately after the tool name is what distinguishes an
+#: actual provisioning/plan/validate/destroy invocation from a path operand.
+_IAC_LIFECYCLE_VERB: str = (
+    r"(?:init|validate|plan|apply|destroy|refresh|import|output|state|providers|"
+    r"graph|fmt|workspace|console|show|taint|untaint|force-unlock|"
+    r"run-all|run|render-json|hcl|hclfmt|graph-dependencies|output-module-groups)"
+)
+
 IAC_TOOL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("terraform", re.compile(r"\bterraform\b", re.IGNORECASE)),
-    ("opentofu", re.compile(r"\btofu\b", re.IGNORECASE)),
-    ("terragrunt", re.compile(r"\bterragrunt\b", re.IGNORECASE)),
-    # Terratest is exercised via Go tests and/or the conventional ``make tf-test`` target.
-    ("terratest", re.compile(r"\btf-test\b|\bterratest\b|\bgo\s+test\b", re.IGNORECASE)),
-    ("cdktf", re.compile(r"\bcdktf\b", re.IGNORECASE)),
-    ("aws-cdk", re.compile(r"\bcdk\s+(deploy|synth|destroy|diff)\b", re.IGNORECASE)),
-    ("cloudformation", re.compile(r"\baws\s+cloudformation\b|\bcloudformation\b", re.IGNORECASE)),
-    ("aws-sam", re.compile(r"\bsam\s+(build|deploy|sync|validate)\b", re.IGNORECASE)),
-    ("aws-cli", re.compile(r"\baws\s+\w", re.IGNORECASE)),
+    ("terraform", re.compile(rf"\bterraform\s+{_IAC_LIFECYCLE_VERB}\b", re.IGNORECASE)),
+    ("opentofu", re.compile(rf"\btofu\s+{_IAC_LIFECYCLE_VERB}\b", re.IGNORECASE)),
+    ("terragrunt", re.compile(rf"\bterragrunt\s+{_IAC_LIFECYCLE_VERB}\b", re.IGNORECASE)),
+    # Terratest is exercised via Go tests and/or the conventional ``make tf-test``
+    # target. Anchored so a path component named ``terratest/`` does not match.
+    ("terratest", re.compile(r"(?<![\w/-])(?:tf-test|terratest)(?![\w/-])|\bgo\s+test\b", re.IGNORECASE)),
+    ("cdktf", re.compile(r"\bcdktf\s+(?:deploy|synth|destroy|diff|plan|apply)\b", re.IGNORECASE)),
+    ("aws-cdk", re.compile(r"\bcdk\s+(?:deploy|synth|destroy|diff)\b", re.IGNORECASE)),
+    (
+        "cloudformation",
+        re.compile(
+            r"\baws\s+cloudformation\s+(?:deploy|create-stack|update-stack|delete-stack|execute-change-set)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("aws-sam", re.compile(r"\bsam\s+(?:build|deploy|sync|validate)\b", re.IGNORECASE)),
 )
 
 
 def detect_iac_tool(command: str | None) -> str | None:
-    """Return the IaC tool name matched in *command*, or ``None``.
+    """Return the IaC tool name *invoked* in *command*, or ``None``.
 
-    The first pattern in :data:`IAC_TOOL_PATTERNS` to match wins (ordering puts the
-    specific tools ahead of the broad ``aws-cli`` catch-all).
+    A tool is detected only when *command* invokes it with a recognised
+    lifecycle verb/subcommand (see :data:`IAC_TOOL_PATTERNS`); a bare path
+    operand that merely contains an IaC tool/directory name (``terragrunt/...``,
+    ``providers/aws/...``) does not count. The first pattern in
+    :data:`IAC_TOOL_PATTERNS` to match wins (ordering puts the more specific
+    tools first).
     """
     if not command:
         return None
@@ -133,6 +161,144 @@ def text_has_execution_verb(text: str) -> bool:
     forbid un-AC'd executable claims in the Definition of Done.
     """
     return bool(_EXECUTION_VERB_RE.search(text or ""))
+
+
+# ---------------------------------------------------------------------------
+# Command-path extraction + classification for the validator path lints
+# (TDI-001 verify-ac working-directory contract, TDI-004 deferred-vs-command,
+# TDI-005 AC referential integrity). Pure, stdlib-only, fully unit-testable.
+# ---------------------------------------------------------------------------
+
+#: A ``$(...)`` command substitution or a backtick substitution. Stripped before
+#: extracting literal path operands so a substitution's contents are not mistaken
+#: for a literal path the author must back.
+_CMD_SUBSTITUTION_RE: re.Pattern[str] = re.compile(r"\$\([^)]*\)|`[^`]*`")
+
+#: A ``grep`` (optionally negated) whose file operands come from a ``$(find ...)``
+#: substitution. When ``find`` yields zero operands the recursive ``grep`` falls
+#: back to scanning the whole working tree -- a silent, unbounded check (TDI-001
+#: layer 3 / AC-5). Matched on the command head + the substitution operand.
+_FIND_FEEDS_GREP_RE: re.Pattern[str] = re.compile(r"\bgrep\b[^|;&]*\$\(\s*find\b", re.IGNORECASE)
+
+#: File extensions that mark a bare (slash-less) token as a path operand.
+_PATH_EXTENSIONS: tuple[str, ...] = (
+    ".tf",
+    ".tfvars",
+    ".hcl",
+    ".py",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".md",
+    ".sh",
+    ".txt",
+    ".cfg",
+    ".ini",
+    ".go",
+)
+
+_PATH_EXT_RE: re.Pattern[str] = re.compile(r"\.[A-Za-z0-9]{1,6}$")
+
+
+def _looks_like_path_operand(token: str) -> bool:
+    """Return ``True`` when *token* is a literal filesystem path operand.
+
+    A path operand contains a ``/`` separator or ends in a recognised file
+    extension. Shell flags (``-r``), key=value forms, variable refs (``$X``),
+    glob patterns (``*``), and bare command words (``grep``, ``test``) are
+    excluded so only resolvable literal paths are returned.
+    """
+    if not token or token.startswith(("-", "$")):
+        return False
+    if "=" in token or "*" in token or "?" in token:
+        return False
+    if "/" in token:
+        return True
+    return bool(_PATH_EXT_RE.search(token)) and token.endswith(_PATH_EXTENSIONS)
+
+
+def extract_command_paths(command: str | None) -> list[str]:
+    """Return the literal filesystem path operands invoked in *command*.
+
+    Command substitutions (``$(...)``/backticks) are stripped first so their
+    contents are not treated as literal operands. Each surviving whitespace
+    token is unquoted and kept only when it :func:`_looks_like_path_operand`.
+    Order-preserving and de-duplicated. Used by the validator to check that a
+    ``type=command`` directive's paths resolve against the target-repo checkout
+    root (the ``verify-ac`` working directory).
+    """
+    if not command:
+        return []
+    stripped = _CMD_SUBSTITUTION_RE.sub(" ", command)
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in stripped.split():
+        token = raw.strip().strip("'\"").strip("'\"")
+        if not _looks_like_path_operand(token):
+            continue
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def command_substitution_feeds_grep(command: str | None) -> bool:
+    """Return ``True`` when *command* pipes a ``$(find ...)`` into a ``grep``.
+
+    Flags the ``! grep ... $(find <path> ...)`` shape whose recursive ``grep``
+    silently scans the whole tree when ``find`` returns zero operands (TDI-001).
+    """
+    if not command:
+        return False
+    return bool(_FIND_FEEDS_GREP_RE.search(command))
+
+
+#: Runnable project tools/test-runners available in the orchestrator's execution
+#: environment (the same environment ``verify-ac`` and the review judges run in).
+#: A ``type=deferred`` directive whose reason names one of these is almost always
+#: a mis-classified runnable check (TDI-004).
+_RUNNABLE_TOOL_RE: re.Pattern[str] = re.compile(
+    r"\b("
+    r"terraform|terragrunt|tofu|terratest|tf-test|cdktf|cdk|sam|"
+    r"pytest|go\s+test|make|npm|yarn|pnpm|cargo|gradle|mvn|tox|"
+    r"toolchain|at\s+execution\s+time"
+    r")\b",
+    re.IGNORECASE,
+)
+
+#: Signals that a deferred check genuinely cannot run in the orchestrator
+#: environment (live mutation, credentials, manual sign-off). When present these
+#: veto the runnable-tool finding so a legitimately operator-only directive that
+#: happens to name a tool (e.g. "real production terragrunt apply against a live
+#: account") is not flagged.
+_OPERATOR_ONLY_RE: re.Pattern[str] = re.compile(
+    r"\b("
+    r"live|prod|production|operator[- ]only|manual|human|sign[- ]?off|"
+    r"credential|secret|real\s+account|cannot\s+run|not\s+available|"
+    r"requires\s+aws|against\s+(?:a\s+)?live"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def deferred_reason_names_runnable_tool(reason: str | None) -> str | None:
+    """Return the runnable tool/phrase named in a ``type=deferred`` *reason*, or ``None``.
+
+    A ``type=deferred`` directive is legitimate only for a check that cannot run
+    in the orchestrator environment. When the reason instead names a project
+    tool that IS runnable there (and carries no live/production/operator-only
+    signal), the directive is a mis-classified runnable check that should be
+    ``type=command`` (TDI-004). Returns the matched tool/phrase so the validator
+    message can name it; returns ``None`` when the reason is clean or genuinely
+    operator-only.
+    """
+    if not reason:
+        return None
+    if _OPERATOR_ONLY_RE.search(reason):
+        return None
+    match = _RUNNABLE_TOOL_RE.search(reason)
+    return match.group(1) if match is not None else None
 
 
 # ---------------------------------------------------------------------------

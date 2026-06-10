@@ -78,7 +78,7 @@ from devbench.utils.io import atomic_write_text
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from devbench.verification import EvidenceCompleteness
+    from devbench.verification import EvidenceCompleteness, VerificationItem
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
 # "finalised" and does not block its parent from rolling to done. Kept at
@@ -497,6 +497,8 @@ class BacklogManager:
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         self._check_verification_contract(rows, workspace_root, errors, warnings, strict=strict)
+        self._check_verification_path_contract(rows, workspace_root, errors, warnings, strict=strict)
+        self._check_ac_referential_integrity(rows, workspace_root, errors, warnings, strict=strict)
         self._check_target_repo_resolves(rows, workspace_root, errors)
         self._check_manifest_multi_repo_prefixes(rows, workspace_root, errors)
         self._check_dep_file_exists(rows, workspace_root, errors)
@@ -3327,6 +3329,275 @@ class BacklogManager:
                     f"directive) or cite the 'AC-N' it satisfies. See "
                     f"docs/backlog-contract.md 'Verification Contract'."
                 )
+
+    # Existence-assertion language in an AC: the line claims a concrete path
+    # must exist / resolve / be present (TDI-005 referential integrity).
+    _EXISTENCE_ASSERTION_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(exists?|resolves?|present|on disk|must point to|already (?:exists|present))\b",
+        re.IGNORECASE,
+    )
+    # External / out-of-repo carve-out signals on an AC line: a required path
+    # explicitly declared not-in-this-repo is an allowed resolution.
+    _EXTERNAL_CARVEOUT_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(external|out[- ]of[- ]repo|third[- ]party|pinned|upstream|published)\b",
+        re.IGNORECASE,
+    )
+
+    def _check_verification_path_contract(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+        warnings: list[str],
+        strict: bool = False,
+    ) -> None:
+        """TDI-001 / TDI-004: verify-ac command-path and deferred-classification lints.
+
+        Per work unit, over its ``## Verification`` directives (warning by
+        default, error under ``--strict``):
+
+        * **TDI-001 workspace-prefix smell:** a ``type=command`` path operand
+          beginning with the unit's own target-repo checkout-directory name.
+          ``verify-ac`` runs each command IN the checkout root, so such a path
+          cannot resolve; paths must be repo-root-relative.
+        * **TDI-001 unbounded-grep smell:** a ``type=command`` whose ``grep``
+          takes file operands from a ``$(find ...)`` substitution -- a tree-wide
+          scan when ``find`` yields nothing.
+        * **TDI-004 mis-classified deferred:** a ``type=deferred`` directive
+          whose reason names a runnable project tool (with no live/operator-only
+          signal) should be ``type=command``.
+
+        Malformed directives are skipped here (``_check_verification_contract``
+        reports them as errors).
+        """
+        from devbench.config import RUNTIME_CONFIG
+        from devbench.verification import parse_verification_section
+
+        def route(message: str) -> None:
+            (errors if strict else warnings).append(message)
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                items = parse_verification_section(content)
+            except ValueError:
+                continue  # malformed: reported by _check_verification_contract
+            repo = self._extract_repo(content)
+            checkout_name: str | None = None
+            if repo is not None and repo in RUNTIME_CONFIG.repos:
+                checkout_name = RUNTIME_CONFIG.repos[repo].checkout_directory
+            for item in items:
+                self._verify_path_finding_for_item(row_id, item, checkout_name, route)
+
+    def _verify_path_finding_for_item(
+        self,
+        row_id: str,
+        item: "VerificationItem",
+        checkout_name: str | None,
+        route: "Callable[[str], None]",
+    ) -> None:
+        """Emit the TDI-001 / TDI-004 path-contract findings for one VERIFY item."""
+        from devbench.verification import (
+            VerificationType,
+            command_substitution_feeds_grep,
+            deferred_reason_names_runnable_tool,
+            extract_command_paths,
+        )
+
+        acs = ", ".join(item.ac_ids)
+        if item.vtype is VerificationType.DEFERRED:
+            tool = deferred_reason_names_runnable_tool(item.reason)
+            if tool is not None:
+                route(
+                    f"{row_id}: '## Verification' directive for {acs} is type=deferred but its "
+                    f"reason names a runnable tool ({tool!r}); a check the orchestrator can run "
+                    f"(the same environment verify-ac and the judges use) must be type=command. "
+                    f"Reserve type=deferred for live-production / operator-only checks; the held-unit "
+                    f"remedy is reclassification, not relaxing done_gate.allow_deferred_evidence. "
+                    f"See docs/backlog-contract.md 'Verification Contract'."
+                )
+            return
+        if item.vtype is not VerificationType.COMMAND or not item.command:
+            return
+        if command_substitution_feeds_grep(item.command):
+            route(
+                f"{row_id}: '## Verification' command for {acs} feeds a grep from $(find ...); "
+                f"when find yields no operands grep scans the entire tree (and a negated match "
+                f"silently inverts). Use an explicit file list or 'grep -r <dir>'. "
+                f"See docs/backlog-contract.md 'Verification Contract'."
+            )
+        if not checkout_name:
+            return
+        bare = checkout_name.rstrip("/")
+        prefix = bare + "/"
+        for operand in extract_command_paths(item.command):
+            if operand == bare or operand.startswith(prefix):
+                route(
+                    f"{row_id}: '## Verification' command path {operand!r} for {acs} begins with "
+                    f"the target-repo checkout-directory name {checkout_name!r}. verify-ac runs each "
+                    f"command IN the checkout root, so type=command paths must be repo-root-relative "
+                    f"(drop the {prefix!r} prefix). See docs/backlog-contract.md 'Verification Contract'."
+                )
+
+    def _collect_manifest_add_paths(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> set[str]:
+        """Return the set of normalised repo-relative paths any task ``add``s.
+
+        Walks every Task work unit's Changes Manifest and collects the
+        (checkout-prefix-normalised) path of each row whose change is ``add``.
+        Used by :meth:`_check_ac_referential_integrity` to treat a path that a
+        backlog task creates as a valid resolution for an existence assertion.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.config import RUNTIME_CONFIG
+
+        created: set[str] = set()
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                continue
+            repo = self._extract_repo(content)
+            checkout_dir: str | None = None
+            if repo is not None and repo in RUNTIME_CONFIG.repos:
+                checkout_dir = RUNTIME_CONFIG.repos[repo].checkout_directory
+            for manifest_row in manifest_rows:
+                if manifest_row.change.strip().lower() != "add":
+                    continue
+                if not self._is_real_manifest_path(manifest_row.file):
+                    continue
+                created.add(self._normalise_orphan_path(manifest_row.file, checkout_dir))
+        return created
+
+    def _check_ac_referential_integrity(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+        warnings: list[str],
+        strict: bool = False,
+    ) -> None:
+        """TDI-005 (+ TDI-001 AC-3): a required path must exist, be created, or be external.
+
+        For each Task whose target-repo checkout is present on disk, every path
+        the unit asserts must exist/resolve -- a ``type=command`` directive's
+        literal operand, or a backtick path token on an Acceptance-Criterion
+        line that uses existence language -- must satisfy one of three
+        resolutions: it exists in the checkout, it is ``add``ed by some task's
+        Changes Manifest, or it is declared an external carve-out. A path that
+        satisfies none is flagged (warning by default, error under ``--strict``)
+        naming the AC, the path, and the three resolutions. The check only runs
+        when the checkout is present, so absence can be asserted with certainty.
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        def route(message: str) -> None:
+            (errors if strict else warnings).append(message)
+
+        created = self._collect_manifest_add_paths(rows, workspace_root)
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            repo = self._extract_repo(content)
+            if repo is None or repo not in RUNTIME_CONFIG.repos:
+                continue
+            repo_cfg = RUNTIME_CONFIG.repos[repo]
+            checkout_path = repo_cfg.resolved_checkout_path
+            if checkout_path is None or not checkout_path.is_dir():
+                continue  # cannot assert absence without the checkout
+            self._check_unit_referential_integrity(
+                row_id, content, checkout_path, repo_cfg.checkout_directory, created, route
+            )
+
+    def _collect_required_existing_paths(
+        self,
+        content: str,
+        checkout_name: str | None,
+    ) -> list[tuple[str, str]]:
+        """Return ``(source-label, path-token)`` for every path the unit asserts must exist.
+
+        Sources: ``type=command`` directive operands (excluding the
+        workspace-prefix smell, reported separately) and backtick path tokens on
+        Acceptance-Criterion lines that use existence language and do not declare
+        an external carve-out.
+        """
+        from devbench.verification import VerificationType, extract_command_paths, parse_verification_section
+
+        bare = checkout_name.rstrip("/") if checkout_name else None
+        prefix = (bare + "/") if bare else None
+        required: list[tuple[str, str]] = []
+
+        try:
+            items = parse_verification_section(content)
+        except ValueError:
+            items = []
+        for item in items:
+            if item.vtype is not VerificationType.COMMAND or not item.command:
+                continue
+            acs = ", ".join(item.ac_ids)
+            for operand in extract_command_paths(item.command):
+                if prefix is not None and (operand == bare or operand.startswith(prefix)):
+                    continue  # workspace-prefix smell -- reported by the path-contract check
+                required.append((f"VERIFY {acs}", operand))
+
+        sections = self._extract_sections(content)
+        for line in sections.get("Acceptance Criteria", "").splitlines():
+            if not self._EXISTENCE_ASSERTION_RE.search(line) or self._EXTERNAL_CARVEOUT_RE.search(line):
+                continue
+            for token, has_ref in self._iter_orphan_candidates(line):
+                if has_ref or "/" not in token or "*" in token or "=" in token or "://" in token:
+                    continue
+                required.append(("## Acceptance Criteria", token))
+        return required
+
+    def _check_unit_referential_integrity(
+        self,
+        row_id: str,
+        content: str,
+        checkout_path: Path,
+        checkout_name: str | None,
+        created: set[str],
+        route: "Callable[[str], None]",
+    ) -> None:
+        """Per-unit body of :meth:`_check_ac_referential_integrity`."""
+        required = self._collect_required_existing_paths(content, checkout_name)
+        for label, token in required:
+            normalised = self._normalise_orphan_path(token, checkout_name)
+            if (checkout_path / normalised).exists():
+                continue
+            if normalised in created or any(c == normalised or c.startswith(normalised + "/") for c in created):
+                continue
+            route(
+                f"{row_id}: {label} requires path {token!r} which is absent from the "
+                f"{checkout_name or 'target-repo'} checkout, not created by any task's Changes Manifest "
+                f"(no 'add' row), and not marked external. Resolve by one of: (a) confirm it exists in the "
+                f"target repo, (b) add a task whose Changes Manifest 'add's it, or (c) mark it an external "
+                f"carve-out (trailing ' (ref)'). See docs/backlog-contract.md 'AC Referential Integrity'."
+            )
 
     # ------------------------------------------------------------------
     # C1/C3/C4/C6/C7: impossibility checks (issue #240a / AC-240-1)

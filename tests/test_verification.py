@@ -22,12 +22,15 @@ from devbench.verification import (
     EvidenceRecord,
     VerificationItem,
     VerificationType,
+    command_substitution_feeds_grep,
     deferred_items,
+    deferred_reason_names_runnable_tool,
     detect_iac_tool,
     evidence_attempt_dir,
     evidence_completeness,
     evidence_root,
     executable_items,
+    extract_command_paths,
     has_verification_section,
     latest_attempt_number,
     next_attempt_number,
@@ -49,28 +52,50 @@ from devbench.verification import (
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
+        # Tool invoked with a lifecycle verb/subcommand -> detected (TDI-007).
         ("terraform apply -auto-approve", "terraform"),
+        ("terraform validate", "terraform"),
+        ("terraform init -backend=false", "terraform"),
         ("tofu plan", "opentofu"),
         ("terragrunt run-all apply", "terragrunt"),
+        ("terragrunt apply", "terragrunt"),
         ("make tf-test UNIT=sandbox/000/data-lake/000", "terratest"),
         ("go test ./tests/...", "terratest"),
         ("cdktf deploy", "cdktf"),
         ("cdk deploy MyStack", "aws-cdk"),
         ("aws cloudformation deploy --template-file t.yaml", "cloudformation"),
         ("sam deploy --guided", "aws-sam"),
-        ("aws s3 ls", "aws-cli"),
     ],
 )
 def test_detect_iac_tool_matrix(command: str, expected: str) -> None:
     assert detect_iac_tool(command) == expected
 
 
-@pytest.mark.parametrize("command", ["", None, "pytest -q", "make lint", "echo hello"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "",
+        None,
+        "pytest -q",
+        "make lint",
+        "echo hello",
+        # TDI-007: a tool name appearing only as a PATH OPERAND (no lifecycle
+        # verb) must NOT be detected as an IaC invocation.
+        "test -d terragrunt/common/sandbox/000",
+        "jq -e . terragrunt/common/accounts.json",
+        "grep -q region providers/aws/references/vpc-network/main.tf",
+        "cat terraform.tfvars",
+        "test -f providers/aws/primitives/spice-kms/variables.tf",
+        # aws CLI without a CloudFormation provisioning verb is not IaC.
+        "aws s3 ls",
+        "aws ec2 describe-instances",
+    ],
+)
 def test_detect_iac_tool_negative(command: str | None) -> None:
     assert detect_iac_tool(command) is None
 
 
-def test_terragrunt_precedence_over_aws_cli() -> None:
+def test_terragrunt_precedence_over_other_tools() -> None:
     # A terragrunt command that also mentions aws must classify as terragrunt.
     assert detect_iac_tool("terragrunt apply") == "terragrunt"
 
@@ -106,6 +131,80 @@ def test_text_has_execution_verb_positive(text: str) -> None:
 )
 def test_text_has_execution_verb_negative(text: str) -> None:
     assert text_has_execution_verb(text) is False
+
+
+# ---------------------------------------------------------------------------
+# Command-path extraction + classification (TDI-001 / 004 / 005)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (None, []),
+        ("", []),
+        # Slash paths are operands; the command word and flags are not.
+        ("test -d terragrunt/common/sandbox/000", ["terragrunt/common/sandbox/000"]),
+        ("grep -q x providers/aws/references/vpc/main.tf", ["providers/aws/references/vpc/main.tf"]),
+        # Bare filename with a known extension counts; the command word does not.
+        ("cat terraform.tfvars", ["terraform.tfvars"]),
+        # Command substitutions are stripped, so their contents are not operands.
+        ("grep -rnE PATTERN $(find providers -name '*.tf')", []),
+        ("echo `cat providers/aws/x.tf`", []),
+        # Excluded shapes: flags, key=value, var refs, globs, bare words.
+        ("terraform validate -backend=false", []),
+        ("jq -e . ${CONFIG}", []),
+        ("ls providers/*.tf", []),
+        ("make lint", []),
+        # De-duplication, order preserved.
+        ("diff a/x.tf a/x.tf", ["a/x.tf"]),
+        # Unknown extension on a slash-less token is NOT a path operand.
+        ("run something.zzz", []),
+    ],
+)
+def test_extract_command_paths(command: str | None, expected: list[str]) -> None:
+    assert extract_command_paths(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("! grep -rnE PATTERN $(find providers/aws -name '*.tf')", True),
+        ("grep -q x $(find . -name '*.py')", True),
+        # A plain grep against explicit files does not feed from find.
+        ("grep -q x providers/aws/main.tf", False),
+        ("terraform validate", False),
+    ],
+)
+def test_command_substitution_feeds_grep(command: str | None, expected: bool) -> None:
+    assert command_substitution_feeds_grep(command) is expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_match"),
+    [
+        (None, None),
+        ("", None),
+        # Mis-classified: names a runnable tool with no live/operator signal.
+        ("requires the Terraform toolchain the orchestrator runs at execution time", "Terraform"),
+        ("runs terraform init -backend=false && terraform validate", "terraform"),
+        ("pytest must run for this check", "pytest"),
+        # Genuinely operator-only: vetoed even though it names a tool.
+        ("real production terragrunt apply against a live account", None),
+        ("prod apply is operator-only", None),
+        ("requires AWS credentials the orchestrator must not hold", None),
+        # No tool named at all.
+        ("a human must visually inspect the dashboard", None),
+    ],
+)
+def test_deferred_reason_names_runnable_tool(reason: str | None, expected_match: str | None) -> None:
+    result = deferred_reason_names_runnable_tool(reason)
+    if expected_match is None:
+        assert result is None
+    else:
+        assert result is not None and result.lower() == expected_match.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +338,33 @@ def test_unit_requires_iac_judge_false_on_malformed() -> None:
     # A malformed directive must not raise here; the validator reports it separately.
     content = "# T1\n\n## Verification\n- VERIFY AC-1 | type=bogus\n"
     assert unit_requires_iac_judge(content) is False
+
+
+def test_unit_requires_iac_judge_false_for_path_substring_only() -> None:
+    # TDI-007 AC-1: type=command directives that only run jq/test/grep against
+    # IaC-named paths (no lifecycle verb) must NOT require the iac_review judge.
+    content = (
+        "# T1\n\n## Verification\n"
+        "- VERIFY AC-1 | type=command | cmd=`test -d terragrunt/common/sandbox/000`\n"
+        "- VERIFY AC-2 | type=command | cmd=`jq -e . terragrunt/common/accounts.json`\n"
+        "- VERIFY AC-3 | type=command | cmd=`grep -q region providers/aws/references/vpc-network/main.tf`\n"
+    )
+    assert unit_requires_iac_judge(content) is False
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "terraform validate",
+        "terragrunt run-all plan",
+        "go test ./tests/...",
+    ],
+)
+def test_unit_requires_iac_judge_true_for_lifecycle_verb(cmd: str) -> None:
+    # TDI-007 AC-2: a directive that actually invokes an IaC tool with a
+    # lifecycle verb requires the iac_review judge.
+    content = f"# T1\n\n## Verification\n- VERIFY AC-1 | type=command | cmd=`{cmd}`\n"
+    assert unit_requires_iac_judge(content) is True
 
 
 # ---------------------------------------------------------------------------

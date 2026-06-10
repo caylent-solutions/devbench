@@ -118,7 +118,7 @@ class TestContinueOrchestrationHook:
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
         reason = output["reason"]
-        assert "review-supervisor" in reason
+        assert "review_team" in reason
 
     def test_block_reason_next_step_after_review_pass(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"

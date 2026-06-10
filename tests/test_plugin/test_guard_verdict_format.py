@@ -21,7 +21,9 @@ HOOK_PATH = (
 
 # H3: reviewer agent type and round token needed for canonical verdicts.
 _REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
-_ROUND_TOKEN = "test-round-token"
+# Fix B: the token must be scoped to the unit under review (prefix "<unit-id>-");
+# the happy-path canonical tests below use unit E0-F8.
+_ROUND_TOKEN = "E0-F8-r1-token"
 
 
 def _clean_env() -> dict[str, str]:

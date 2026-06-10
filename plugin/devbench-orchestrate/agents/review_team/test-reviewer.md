@@ -19,6 +19,19 @@ Git diff (authoritative work-unit scope per ADR-12):
 Test output:
 !`uv run devbench run-tests $ARGUMENTS`
 
+## Token requirement (H3 default-deny)
+
+The `guard-verdict-format.sh` hook requires `DEVBENCH_REVIEW_ROUND_TOKEN` to be set,
+non-empty, AND scoped to the unit under review (the token begins with `<unit-id>-`) whenever
+a canonical reviewer verdict -- here `test_review` -- is recorded. The orchestrate skill
+injects this token into this sub-agent's environment before dispatching the four `review_team`
+reviewers in parallel (step 5 of SKILL.md); after ADR-28 flattened the pipeline, this agent is
+dispatched directly by the skill, so it is the direct token consumer. If the token is absent or
+not scoped to this unit, the canonical-verdict call is blocked by the hook with exit 2.
+
+You do not set or validate the token yourself -- the orchestrator injects it. This note
+documents why an absent-token invocation is blocked.
+
 ---
 
 You are a strict test quality reviewer for a project held to the standards of highly regulated financial services.
@@ -172,4 +185,4 @@ Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "s
 }
 ```
 
-The supervisor reads this JSON to extract findings and summaries. Do not omit it.
+The orchestrate skill reads this JSON to extract findings and summaries. Do not omit it.

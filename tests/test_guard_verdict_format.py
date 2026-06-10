@@ -35,8 +35,15 @@ NON_CANONICAL_JUDGES = [
 ]
 
 REVIEWER_AGENT_TYPES = [
-    "devbench-orchestrate:review-supervisor",
+    # ADR-28: the four review_team reviewers are now dispatched directly by the
+    # orchestrate skill and present their own agent_type, so each is allowlisted.
+    "devbench-orchestrate:code-reviewer",
+    "devbench-orchestrate:test-reviewer",
+    "devbench-orchestrate:doc-reviewer",
+    "devbench-orchestrate:changes-manifest",
     "devbench-orchestrate:security-reviewer",
+    # Deprecated, but still in the allowlist for back-compat.
+    "devbench-orchestrate:review-supervisor",
 ]
 
 NON_REVIEWER_AGENT_TYPES = [
@@ -49,7 +56,8 @@ NON_REVIEWER_AGENT_TYPES = [
 ]
 
 SAMPLE_UNIT_ID = "E8-F3-S1-T1"
-ROUND_TOKEN = "test-round-token-abc123"
+# Fix B: the round token must be scoped to the unit under review (prefix "<unit-id>-").
+ROUND_TOKEN = f"{SAMPLE_UNIT_ID}-r1-abc123"
 
 
 def _clean_env() -> dict[str, str]:
@@ -228,6 +236,47 @@ class TestH3RoundTokenRequired:
         result = _run_hook(cmd, agent_type=agent_type, round_token=None)
         assert result.returncode == 0, (
             f"agent_type='{agent_type}' non-canonical judge='{judge}' should be allowed without token"
+            f" but got exit {result.returncode}; stderr: {result.stderr}"
+        )
+
+
+# --------------------------------------------------------------------------- Fix B: round token unit-scoped
+
+
+@pytest.mark.unit
+class TestH3RoundTokenUnitScoped:
+    """Fix B: the round token must be scoped to the unit being reviewed.
+
+    The orchestrate skill writes DEVBENCH_REVIEW_ROUND_TOKEN as
+    ``<unit-id>-r<n>-<rand>`` before each review round and clears it after, so a
+    leftover token scoped to a DIFFERENT unit can never satisfy this unit's
+    canonical verdict -- the exact staleness that masked the E9-F1-S1-T5
+    incident.
+    """
+
+    @pytest.mark.parametrize("judge", CANONICAL_JUDGES)
+    @pytest.mark.parametrize("agent_type", REVIEWER_AGENT_TYPES)
+    def test_token_scoped_to_other_unit_blocked(self, judge: str, agent_type: str) -> None:
+        """A token prefixed for a different unit is rejected even for a reviewer agent."""
+        cmd = f"uv run devbench log-verdict {judge} {SAMPLE_UNIT_ID} pass"
+        stale = "E1-F1-S1-T9-r1-stale"  # scoped to a DIFFERENT unit than SAMPLE_UNIT_ID
+        result = _run_hook(cmd, agent_type=agent_type, round_token=stale)
+        assert result.returncode == 2, (
+            f"agent_type='{agent_type}' judge='{judge}' with a foreign-unit token should be blocked"
+            f" but got exit {result.returncode}; stderr: {result.stderr}"
+        )
+        assert SAMPLE_UNIT_ID in result.stderr, (
+            f"stderr must name the unit the token failed to scope to, got: {result.stderr!r}"
+        )
+
+    @pytest.mark.parametrize("judge", CANONICAL_JUDGES)
+    @pytest.mark.parametrize("agent_type", REVIEWER_AGENT_TYPES)
+    def test_token_scoped_to_correct_unit_allowed(self, judge: str, agent_type: str) -> None:
+        """A token correctly scoped to the unit under review is accepted."""
+        cmd = f"uv run devbench log-verdict {judge} {SAMPLE_UNIT_ID} pass"
+        result = _run_hook(cmd, agent_type=agent_type, round_token=f"{SAMPLE_UNIT_ID}-r2-xyz")
+        assert result.returncode == 0, (
+            f"agent_type='{agent_type}' judge='{judge}' with a correctly-scoped token should be allowed"
             f" but got exit {result.returncode}; stderr: {result.stderr}"
         )
 

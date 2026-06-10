@@ -455,6 +455,31 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Flattened the code-review pipeline so no sub-agent spawns sub-agents (ADR-28).**
+  The four `review_team` reviewers were routed through a `review-supervisor`
+  sub-agent that tried to spawn them via the Agent tool -- a nested-subagent spawn
+  the Claude Agent SDK forbids (it silently no-ops). The fan-out never ran; the
+  unit stalled as a `RUNTIME_DEGRADATION` no restart could clear (observed on
+  E9-F1-S1-T5), and the degraded path could even improvise a fabricated PASS. The
+  orchestrate skill now dispatches the four reviewers **directly** (first-level,
+  in parallel), exactly as it already dispatches `security-reviewer` and
+  `iac-deploy-reviewer`. Pass/fail is determined **solely from the canonical
+  verdict lines for the round** (fail-closed -- a missing verdict is a fail, never
+  an inferred pass). `guard-verdict-format.sh` adds the four reviewer agent types
+  to its allowlist, and `review-supervisor` is demoted to an inert deprecation
+  stub (its frontmatter drops the `Agent(...)` tool -- the literal SDK fix --
+  while the file is retained for config / plugin-shadow / activity back-compat).
+  The done-gate is unchanged (it is agent-agnostic). See `docs/adr/28-flatten-review-pipeline.md`.
+
+- **Per-round review token is now unit-scoped (round-aware guard).** The H3 guard
+  previously only checked that `DEVBENCH_REVIEW_ROUND_TOKEN` was non-empty; a stale
+  leftover token in `shell.env` (transported via `BASH_ENV`) could mask a missing
+  fresh injection. The orchestrate skill now writes a fresh
+  `<unit-id>-r<n>-<rand>` token before each review round and clears it after, and
+  `guard-verdict-format.sh` requires the token to be scoped to the unit under
+  review (prefix `<unit-id>-`), so a token left over from a different unit's round
+  can never satisfy this unit's canonical verdict.
+
 - **Committable-file Manifest sentinels are now rejected (validate-backlog rule 24).**
   A work unit could pass every judge and `verify-ac` (exit 0) and stage its correct
   files, yet never commit -- because its `## Changes Manifest` used free-form

@@ -28,12 +28,12 @@ plugin/devbench-orchestrate/
 │   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
 │   ├── executor.md              ← dev agent: implements work units via TDD
-│   ├── review-supervisor.md     ← discovers and invokes all review_team agents in parallel
+│   ├── review-supervisor.md     ← DEPRECATED (ADR-28): inert stub; the orchestrate skill now dispatches the review_team agents directly
 │   ├── security-reviewer.md     ← security review gate agent
 │   ├── blocker-resolver.md      ← dependency blocker assessment agent + proposal emission after amendment reject
 │   ├── manifest-amender.md      ← conditional judge for TDD GREEN manifest amendments
 │   ├── task-factory.md          ← materialises blocker-resolver proposals into draft `proposed` work units
-│   └── review_team/             ← review team agents invoked by review-supervisor
+│   └── review_team/             ← review team agents dispatched directly by the orchestrate skill (ADR-28)
 │       ├── code-reviewer.md     ← SOLID, DRY, fail-fast, 12-factor review
 │       ├── test-reviewer.md     ← TDD discipline, test quality, assertions
 │       ├── doc-reviewer.md      ← accuracy, completeness, sync with code
@@ -58,6 +58,7 @@ plugin/devbench-orchestrate/
     │                              review_team allowlist (devbench:code_review, test_review, doc_review,
     │                              changes_manifest). Issue #118 -- closes the loophole where the
     │                              supervisor escalated to repo-mutation rights via subagent spawn.
+    │                              Dormant after ADR-28: the supervisor is deprecated and never invoked.
     └── assert-tests-pass.sh     ← enforces test suite passes after Bash
 ```
 

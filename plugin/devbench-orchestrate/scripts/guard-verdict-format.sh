@@ -11,11 +11,16 @@
 #   - judge name must be a known identifier
 #   - feedback must be non-empty when verdict is 'fail'
 #   - canonical reviewer judges require agent_type to be one of the allowed
-#     reviewer agent types: devbench-orchestrate:review-supervisor,
-#     devbench-orchestrate:security-reviewer, or
-#     devbench-orchestrate:iac-deploy-reviewer (default-deny H3)
+#     reviewer agent types: the four review_team reviewers
+#     (devbench-orchestrate:code-reviewer, :test-reviewer, :doc-reviewer,
+#     :changes-manifest -- dispatched directly by the orchestrate skill after
+#     ADR-28 flattened the review pipeline), devbench-orchestrate:security-reviewer,
+#     devbench-orchestrate:iac-deploy-reviewer, and the deprecated
+#     devbench-orchestrate:review-supervisor (default-deny H3)
 #   - canonical reviewer judges also require DEVBENCH_REVIEW_ROUND_TOKEN to be
-#     set and non-empty, even for the allowed reviewer agent types (H3)
+#     set, non-empty, AND scoped to the unit under review (the token must begin
+#     with "<unit-id>-") so a stale leftover token cannot satisfy a verdict for
+#     a different unit (H3 round-awareness)
 #
 # Passthroughs (exit 0 without validating):
 #   - any '--help' / '-h' anywhere after 'log-verdict' -- let the CLI print help
@@ -211,18 +216,29 @@ fi
 # test_review, doc_review, changes_manifest, security_review -- plus the
 # optional specialty judge iac_review) may ONLY be written by the designated
 # reviewer agent types:
-#   - devbench-orchestrate:review-supervisor
+#   - devbench-orchestrate:code-reviewer    (review_team, direct-dispatched)
+#   - devbench-orchestrate:test-reviewer    (review_team, direct-dispatched)
+#   - devbench-orchestrate:doc-reviewer     (review_team, direct-dispatched)
+#   - devbench-orchestrate:changes-manifest (review_team, direct-dispatched)
 #   - devbench-orchestrate:security-reviewer
 #   - devbench-orchestrate:iac-deploy-reviewer
+#   - devbench-orchestrate:review-supervisor (deprecated; ADR-28)
+# The four review_team reviewers were added when ADR-28 flattened the review
+# pipeline: the orchestrate skill now dispatches them directly (first-level)
+# instead of via review-supervisor, because the Claude Agent SDK forbids a
+# sub-agent from spawning sub-agents. Each reviewer therefore presents its own
+# agent_type and must be allowlisted to write its canonical verdict.
 # Every other agent type -- including the executor, manifest-amender, and any
 # absent or spoofed agent_type -- is blocked from canonical verdicts. The
 # audit-only non-canonical judge names (executor, blocker_resolver,
 # manifest_amender, task_factory) remain available to any agent type.
 #
-# H3 also requires the per-round DEVBENCH_REVIEW_ROUND_TOKEN env var to be
-# set and non-empty for a canonical verdict. A spoofed agent_type alone is
-# insufficient -- the injected token provides a second factor that a rogue
-# subagent cannot forge without the orchestrator's cooperation.
+# H3 also requires the per-round DEVBENCH_REVIEW_ROUND_TOKEN env var to be set,
+# non-empty, AND scoped to the unit under review (prefix "<unit-id>-") for a
+# canonical verdict. A spoofed agent_type alone is insufficient -- the injected
+# token provides a second factor that a rogue subagent cannot forge without the
+# orchestrator's cooperation, and the unit-id scoping ensures a stale leftover
+# token from a prior unit's round cannot satisfy this unit's verdict.
 IS_CANONICAL_JUDGE=0
 for canonical in "${CANONICAL_REVIEWER_JUDGES[@]}"; do
   if [[ "$JUDGE" == "$canonical" ]]; then
@@ -234,9 +250,13 @@ done
 if (( IS_CANONICAL_JUDGE == 1 )); then
   # Check agent_type is an allowed reviewer.
   ALLOWED_REVIEWER_AGENT_TYPES=(
-    "devbench-orchestrate:review-supervisor"
+    "devbench-orchestrate:code-reviewer"
+    "devbench-orchestrate:test-reviewer"
+    "devbench-orchestrate:doc-reviewer"
+    "devbench-orchestrate:changes-manifest"
     "devbench-orchestrate:security-reviewer"
     "devbench-orchestrate:iac-deploy-reviewer"
+    "devbench-orchestrate:review-supervisor"
   )
   IS_ALLOWED_REVIEWER=0
   for allowed in "${ALLOWED_REVIEWER_AGENT_TYPES[@]}"; do
@@ -250,8 +270,8 @@ if (( IS_CANONICAL_JUDGE == 1 )); then
     echo "guard-verdict-format: BLOCKED -- canonical reviewer verdict requires an allowed reviewer agent type." >&2
     echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
     echo "Agent type presented: '${AGENT_TYPE:-<absent>}'." >&2
-    echo "Allowed agent types for canonical verdicts: devbench-orchestrate:review-supervisor, devbench-orchestrate:security-reviewer, devbench-orchestrate:iac-deploy-reviewer." >&2
-    echo "Fix: only the review-supervisor, security-reviewer, and iac-deploy-reviewer agents may write canonical reviewer verdicts." >&2
+    echo "Allowed agent types for canonical verdicts: the four review_team reviewers (devbench-orchestrate:code-reviewer, :test-reviewer, :doc-reviewer, :changes-manifest), devbench-orchestrate:security-reviewer, devbench-orchestrate:iac-deploy-reviewer, devbench-orchestrate:review-supervisor." >&2
+    echo "Fix: only the four review_team reviewers, the security-reviewer, the iac-deploy-reviewer, and the (deprecated) review-supervisor may write canonical reviewer verdicts." >&2
     exit 2
   fi
 
@@ -261,7 +281,22 @@ if (( IS_CANONICAL_JUDGE == 1 )); then
     echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge)." >&2
     echo "Agent type: '${AGENT_TYPE}'." >&2
     echo "Reason: the orchestrator injects DEVBENCH_REVIEW_ROUND_TOKEN into reviewer sub-agents each round; its absence indicates the verdict is not originating from an orchestrated review round." >&2
-    echo "Fix: ensure the orchestrate skill injects DEVBENCH_REVIEW_ROUND_TOKEN before invoking the reviewer sub-agent." >&2
+    echo "Fix: ensure the orchestrate skill injects DEVBENCH_REVIEW_ROUND_TOKEN before dispatching the reviewer sub-agent." >&2
+    exit 2
+  fi
+
+  # Round-awareness (H3 hardening): the token MUST be scoped to the unit being
+  # reviewed. The orchestrate skill writes DEVBENCH_REVIEW_ROUND_TOKEN as
+  # "<unit-id>-r<n>-<rand>" before each review round and clears it after, so a
+  # leftover token from a *different* unit's round can never satisfy this unit's
+  # canonical verdict -- the exact staleness that masked the E9-F1-S1-T5
+  # incident, where a stale shell.env token hid a missing fresh injection.
+  if [[ "${DEVBENCH_REVIEW_ROUND_TOKEN}" != "${UNIT_ID}-"* ]]; then
+    echo "guard-verdict-format: BLOCKED -- DEVBENCH_REVIEW_ROUND_TOKEN is not scoped to unit '${UNIT_ID}'." >&2
+    echo "Judge attempted: '${JUDGE}' (a canonical reviewer judge) for unit '${UNIT_ID}'." >&2
+    echo "Agent type: '${AGENT_TYPE}'." >&2
+    echo "Reason: the token must begin with '${UNIT_ID}-' (format: <unit-id>-r<n>-<rand>); a token scoped to a different unit indicates a stale/leftover token, not a fresh per-round injection for this unit." >&2
+    echo "Fix: the orchestrate skill must inject a fresh DEVBENCH_REVIEW_ROUND_TOKEN scoped to '${UNIT_ID}' before dispatching this unit's reviewers." >&2
     exit 2
   fi
 fi

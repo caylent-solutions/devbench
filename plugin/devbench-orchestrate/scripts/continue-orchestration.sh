@@ -208,13 +208,13 @@ if [ -n "$FILE_PATH" ] && [ -f "${WORKSPACE_ROOT}/${FILE_PATH}" ]; then
 
     if echo "$LAST_COMMENT" | grep -q "executor" 2>/dev/null; then
         LAST_ACTION="executor completed"
-        NEXT_STEP="Invoke review-supervisor for ${TASK_ID}. Run the 4 review agents (code_review, test_review, doc_review, changes_manifest)."
+        NEXT_STEP="Dispatch the 4 review_team reviewers directly for ${TASK_ID} (code_review, test_review, doc_review, changes_manifest), injecting a fresh unit-scoped DEVBENCH_REVIEW_ROUND_TOKEN."
     elif echo "$LAST_COMMENT" | grep -q "REVIEW_PASS.*code_review\|REVIEW_PASS.*test_review\|REVIEW_PASS.*doc_review\|REVIEW_PASS.*changes_manifest" 2>/dev/null; then
         LAST_ACTION="review pass"
         NEXT_STEP="Check if all 4 reviewers passed. If yes, invoke security-reviewer for ${TASK_ID}. If not, run remaining reviewers."
     elif echo "$LAST_COMMENT" | grep -q "REVIEW_FAIL" 2>/dev/null; then
         LAST_ACTION="review fail"
-        NEXT_STEP="Re-run executor for ${TASK_ID} with prior feedback, then re-run review-supervisor."
+        NEXT_STEP="Re-run executor for ${TASK_ID} with prior feedback, then re-dispatch the 4 review_team reviewers."
     elif echo "$LAST_COMMENT" | grep -q "security_review.*REVIEW_PASS" 2>/dev/null; then
         LAST_ACTION="security pass"
         NEXT_STEP="Run uv run devbench git-ops ${TASK_ID} then uv run devbench mark-done ${TASK_ID}."

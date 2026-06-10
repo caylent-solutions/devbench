@@ -13,10 +13,12 @@ SCRIPT_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 )
 
-# H3: the two agent types permitted to write canonical reviewer verdicts.
+# H3: an agent type permitted to write canonical reviewer verdicts.
 _REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
-# A token value injected by the orchestrator each review round (H3 second factor).
-_ROUND_TOKEN = "test-round-token"
+# A token injected by the orchestrator each review round (H3 second factor).
+# Fix B: it must be scoped to the unit under review (prefix "<unit-id>-"); the
+# canonical-judge test below uses unit E201-F1-S2-T1.
+_ROUND_TOKEN = "E201-F1-S2-T1-r1-token"
 
 
 def _clean_env() -> dict[str, str]:

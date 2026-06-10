@@ -142,19 +142,42 @@ Process the backlog using the steps below, repeating until all work units are do
       (back-compat: nothing to verify). The done-gate at step 9 re-checks this ledger, so a unit
       cannot reach done unless `verify-ac` last exited `0`.
 
-5. Invoke `review-supervisor` with the unit ID. Before invoking, generate a per-round token
-   and inject it as `DEVBENCH_REVIEW_ROUND_TOKEN` into the sub-agent environment (H3 guard
-   requirement). The token value is an opaque string unique to this review round; use a UUID
-   or the combination of the unit ID and a monotonic counter. The guard-verdict-format.sh hook
-   requires this token to be set for any canonical reviewer verdict (code_review, test_review,
-   doc_review, changes_manifest, security_review); a canonical verdict emitted without the token
-   is blocked at the hook level, preventing rogue sub-agents from writing review-team verdicts.
-   - If result is REVIEW_FAIL: go to step 6.
-   - If result is REVIEW_PASS: go to step 7.
+5. **Dispatch the four `review_team` reviewers directly (parallel, first-level).** The review
+   fan-out is performed by THIS orchestrate skill -- not by a sub-agent -- because the Claude
+   Agent SDK forbids a sub-agent from spawning sub-agents (a nested `Agent(...)` call silently
+   no-ops; see ADR-28). The reviewers are dispatched exactly like `security-reviewer` (step 7)
+   and `iac-deploy-reviewer` (step 7b) already are: one level deep, SDK-legal.
+   a. **Generate a fresh per-round token scoped to this unit.** Set
+      `DEVBENCH_REVIEW_ROUND_TOKEN=<id>-r<n>-<rand>` where `<id>` is the unit ID, `<n>` is this
+      review round's number (1 for the first review of the unit, incremented on each step-6
+      retry), and `<rand>` is an opaque random suffix (UUID or similar). The token MUST begin
+      with `<id>-`: the `guard-verdict-format.sh` hook is round-aware and rejects any canonical
+      verdict whose token is not scoped to the unit being reviewed, so a stale leftover token
+      can never mask a missing fresh injection.
+   b. **In a SINGLE response, dispatch all four reviewers via the Agent tool** -- one call each
+      so they run in parallel -- injecting the same `DEVBENCH_REVIEW_ROUND_TOKEN` into each
+      sub-agent environment: `devbench-orchestrate:code-reviewer`,
+      `devbench-orchestrate:test-reviewer`, `devbench-orchestrate:doc-reviewer`,
+      `devbench-orchestrate:changes-manifest`. Pass the unit ID to each. Each reviewer self-logs
+      its canonical verdict (`code_review` / `test_review` / `doc_review` / `changes_manifest`)
+      and returns a JSON envelope. The guard requires the token for every one of these canonical
+      verdicts; a verdict emitted without the unit-scoped token is blocked at the hook level,
+      preventing rogue sub-agents from writing review-team verdicts.
+   c. **Determine pass/fail SOLELY from the canonical verdict lines for THIS round** (fail-closed).
+      Run `uv run devbench read-unit <id>` and confirm a `[judge/<name>] [REVIEW_PASS]` line
+      exists for EACH of `code_review`, `test_review`, `doc_review`, `changes_manifest` in the
+      current round. NEVER infer a pass from reviewer prose, the JSON envelope, or the absence of
+      findings -- a reviewer that did not actually run leaves no verdict line, and a missing
+      required verdict is a REVIEW_FAIL, never a pass. (Surfacing the JSON envelopes' summaries in
+      the PR description is fine; deriving the pass/fail decision from them is not.)
+   d. After the round resolves (pass or fail), clear the token (`DEVBENCH_REVIEW_ROUND_TOKEN=`)
+      so no stale value lingers into a later round or a different unit.
+   - If any of the four required verdicts is REVIEW_FAIL or missing: go to step 6.
+   - If all four are REVIEW_PASS: go to step 7.
 
 6. On REVIEW_FAIL: no prose -- emit the next tool call immediately.
    a. **Immediately** invoke the `devbench-orchestrate:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
-   b. When executor returns, Return to step 5 -- immediately re-invoke `review-supervisor`. Do NOT invoke security-reviewer here.
+   b. When executor returns, Return to step 5 -- immediately re-dispatch the four `review_team` reviewers (with a fresh per-round token whose round number `<n>` is incremented). Do NOT invoke security-reviewer here.
    c. After `max_executor_retries` consecutive failures, the next tool calls (in this order, same turn) are mandatory and explicit: (1) `uv run devbench log-comment agent/orchestrator <id> "[BLOCKED] ..."` naming the failing checks, (2) `uv run devbench next`. The `devbench next` call is the only authorised loop-continuation signal -- treat its output exactly like step 2 (ALL_DONE / NO_ACTIONABLE / JSON).
    d. **Per-judge retry budgets (issue #122)**: when `max_executor_retries_per_judge` is set in `backlog/config/devbench.yaml`, the budget for the cycle is the value for the failing judge if listed (e.g., `max_executor_retries_per_judge.test_review`); otherwise fall back to the global `max_executor_retries`. Different judges can fail in different cycles -- count failures **per judge** in the per-task counter and trip the BLOCKED transition the moment ANY single judge's per-judge budget is exhausted. Read both fields once at the start of the work-unit cycle: `uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge` returns the resolved values. Schema validation rejects unknown judge names; an unknown name is a config bug not a runtime concern.
 
@@ -237,15 +260,15 @@ Process the backlog using the steps below, repeating until all work units are do
 ## Standards
 
 - Never modify files under `backlog/` directly -- use `uv run devbench log-verdict` and `mark-done`.
-- Never bypass the done-gate -- review-supervisor must pass before git-ops.
-- Security review runs exactly once per work unit -- after review-supervisor passes. If security passes, go to step 7b.
-- The optional `iac_review` judge (step 7b) runs at most once per work unit, only when `optional_judges.iac_review: true` AND the unit's `## Verification` contract has an infrastructure item (`verification.unit_requires_iac_judge`). The five core judges (code_review, test_review, doc_review, changes_manifest, security_review) are always-on and are NOT toggleable; only specialty judges like `iac_review` are conditional. `review-supervisor` dispatches ONLY its four `review_team/` members and never dispatches `iac_review`; the orchestrate skill dispatches `iac_review` as a solo step (7b), exactly like the security-reviewer.
-- The retry loop (step 6) re-runs only review-supervisor, never security-reviewer, never iac-deploy-reviewer.
+- Never bypass the done-gate -- all four `review_team` judges (code_review, test_review, doc_review, changes_manifest) must pass before git-ops.
+- Security review runs exactly once per work unit -- after the four `review_team` judges pass. If security passes, go to step 7b.
+- The optional `iac_review` judge (step 7b) runs at most once per work unit, only when `optional_judges.iac_review: true` AND the unit's `## Verification` contract has an infrastructure item (`verification.unit_requires_iac_judge`). The five core judges (code_review, test_review, doc_review, changes_manifest, security_review) are always-on and are NOT toggleable; only specialty judges like `iac_review` are conditional. The orchestrate skill dispatches the four `review_team/` members directly (step 5) and never dispatches `iac_review` as part of that fan-out; `iac_review` is a solo step (7b), exactly like the security-reviewer. (The legacy `review-supervisor` agent is deprecated and dispatches nothing -- see ADR-28.)
+- The retry loop (step 6) re-runs only the four `review_team` reviewers, never security-reviewer, never iac-deploy-reviewer.
 - Log all significant actions and decisions to the work unit Comments via `log-verdict`.
 
 ## H4 fail-closed self-check
 
-Before step 5 (invoking review-supervisor), the orchestrator must confirm that the executor
+Before step 5 (dispatching the review_team reviewers), the orchestrator must confirm that the executor
 staged at least the files listed in the work unit's Changes Manifest (excluding sentinel rows).
 This is the H4 fail-closed guard: if no files are staged and the executor did not emit a
 NEEDS_ESCALATION comment, the task is in an ambiguous state. In that case:
@@ -253,10 +276,10 @@ NEEDS_ESCALATION comment, the task is in an ambiguous state. In that case:
 1. Run `git -C <repo_path> diff --staged --name-only` and compare to the Changes Manifest.
 2. If the staged set is empty AND no `[NEEDS_ESCALATION]` or `[BLOCKED]` audit comment exists
    on the task from the current executor run: log a `[BLOCKED]` audit comment naming the empty
-   staged set, then return to step 2. Do NOT invoke review-supervisor on an empty diff --
+   staged set, then return to step 2. Do NOT dispatch the review_team reviewers on an empty diff --
    a review of nothing would produce a spurious PASS and the task would be incorrectly marked done.
 3. If the staged set is non-empty (or the executor logged a NEEDS_ESCALATION): proceed to step 5
-   normally. The H4 guard does NOT fire when review-supervisor already has evidence to evaluate.
+   normally. The H4 guard does NOT fire when the reviewers already have evidence to evaluate.
 
 The H4 guard is a fail-closed safety net only. It runs once per review cycle, immediately before
 step 5. It does NOT run between step 6 (REVIEW_FAIL) and step 5 retry -- the executor is expected

@@ -52,6 +52,14 @@ orchestrator runtime is degraded -- specifically `agent-tool-unavailable` or
 sub-agents; only restarting the orchestrator via `make start` restores normal
 operation (issue #183).
 
+Note (ADR-28): the original source of this signal was the `review-supervisor`
+sub-agent trying to spawn the four review_team reviewers via the Agent tool -- a
+nested-subagent spawn the SDK silently drops. That fan-out was flattened: the
+orchestrate skill now dispatches the reviewers directly (first-level), so this
+specific degradation no longer arises for the review tier. The bucket and its
+signal-phrase detection are retained defensively for any other agent that loses
+Agent-tool access.
+
 **Detection.**
 `classify_blocked_task` checks this at priority 0 (before any structural bucket)
 via `_has_runtime_degradation_signal` (`proposal.py`). The check reads the

@@ -52,7 +52,14 @@ class TestReviewSupervisorFrontmatter:
         assert self._SUPERVISOR_PATH.exists(), f"review-supervisor.md not found at {self._SUPERVISOR_PATH}"
 
     def test_review_supervisor_frontmatter_valid(self) -> None:
-        """AC-2: Frontmatter must contain name: review-supervisor and tools: Bash, Agent(...)."""
+        """AC-2 / ADR-28: Frontmatter must name review-supervisor with tools: Bash and NO Agent tool.
+
+        The review pipeline was flattened (ADR-28): the orchestrate skill now
+        dispatches the four review_team reviewers directly, and the supervisor is
+        demoted to an inert deprecation stub. Its frontmatter MUST drop the
+        ``Agent(...)`` tool -- declaring it was the literal SDK violation (a
+        sub-agent cannot spawn sub-agents) that caused the runtime degradation.
+        """
         content = self._SUPERVISOR_PATH.read_text()
 
         # Extract frontmatter block between --- delimiters
@@ -72,37 +79,52 @@ class TestReviewSupervisorFrontmatter:
         )
         assert "tools:" in frontmatter, f"Frontmatter must contain a tools: field. Got:\n{frontmatter}"
         assert "Bash" in frontmatter, f"Frontmatter tools must include Bash. Got:\n{frontmatter}"
-        assert "Agent" in frontmatter, f"Frontmatter tools must include Agent(...). Got:\n{frontmatter}"
+        assert "Agent" not in frontmatter, (
+            f"review-supervisor.md frontmatter must NOT include the Agent tool after ADR-28 "
+            f"flattened the review pipeline (a sub-agent cannot spawn sub-agents). Got:\n{frontmatter}"
+        )
 
 
 @pytest.mark.unit
-class TestReviewSupervisorStep0SelfCheck:
-    """Issue #183(a): review-supervisor.md must instruct the agent to
-    self-check Agent-tool availability before dispatching reviewers,
-    and to emit a structured ``agent-tool-unavailable`` audit comment
-    on failure so ``classify_blocked_task`` priority-0 can bucket the
-    task as ``RUNTIME_DEGRADATION``.
+class TestReviewSupervisorDeprecated:
+    """ADR-28: review-supervisor.md is a demoted, inert deprecation stub.
+
+    The Step-0 Agent-tool self-check (issue #183) and the whole dispatch /
+    aggregation body are removed: the orchestrate skill now dispatches the four
+    review_team reviewers directly (first-level), so the supervisor no longer
+    spawns anything, self-checks anything, or logs verdicts. The file is kept
+    only so config / plugin-shadow / activity references continue to resolve.
     """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    def test_supervisor_contains_step_0_self_check(self) -> None:
+    def test_supervisor_marked_deprecated(self) -> None:
         content = self._SUPERVISOR_PATH.read_text()
-        assert "Step 0:" in content, "review-supervisor.md must declare a Step 0 self-check"
-        assert "Agent tool" in content, "Step 0 must describe how to detect missing Agent tool access"
-
-    def test_supervisor_emits_structured_runtime_degradation_payload(self) -> None:
-        """The audit-comment phrasing must match the regex in
-        ``classify_blocked_task`` (``agent-tool-unavailable`` keyword) so
-        the priority-0 check actually fires when the agent emits it.
-        """
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "agent-tool-unavailable" in content, (
-            "review-supervisor.md must emit the canonical 'agent-tool-unavailable' "
-            "payload so classify_blocked_task can detect the degraded runtime"
+        assert "DEPRECATED" in content or "deprecated" in content.lower(), (
+            "review-supervisor.md must declare itself deprecated (ADR-28)."
         )
-        assert "log-comment review-supervisor" in content, (
-            "review-supervisor.md must instruct logging the failure via log-comment"
+
+    def test_supervisor_states_it_must_not_be_invoked(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "do not invoke" in content or "must not be invoked" in content, (
+            "review-supervisor.md must state it must not be invoked."
+        )
+
+    def test_supervisor_no_longer_dispatches_reviewers(self) -> None:
+        """The stub must not instruct spawning reviewers via the Agent tool."""
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "Step 0:" not in content, (
+            "review-supervisor.md must not retain the Step 0 Agent-tool self-check; "
+            "the supervisor no longer dispatches reviewers (ADR-28)."
+        )
+        assert "Invoke All Reviewers" not in content, (
+            "review-supervisor.md must not retain the parallel-dispatch instruction."
+        )
+
+    def test_supervisor_references_adr_28(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "ADR-28" in content, (
+            "review-supervisor.md must reference ADR-28 so readers can trace why it was retired."
         )
 
 
@@ -290,40 +312,30 @@ class TestReviewTeamModelDefault:
 
 @pytest.mark.unit
 class TestReviewSupervisorVerdictFormat:
-    """AC-4, AC-5: review-supervisor must use lowercase pass/fail in log-verdict calls."""
+    """ADR-28: the demoted supervisor must not carry any REVIEW_PASS/REVIEW_FAIL verdict tokens.
+
+    It logs no verdicts at all now, so the regression pin is simply that the
+    legacy uppercase verdict tokens do not reappear in the stub.
+    """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
     def test_supervisor_no_review_fail_token(self) -> None:
-        """AC-4: review-supervisor must not use REVIEW_FAIL as a verdict token."""
+        """The stub must not use REVIEW_FAIL as a verdict token."""
         content = self._SUPERVISOR_PATH.read_text()
-        assert "REVIEW_FAIL" not in content, (
-            "review-supervisor.md must not use 'REVIEW_FAIL' as a verdict token. "
-            "Use lowercase 'fail' in log-verdict calls."
-        )
+        assert "REVIEW_FAIL" not in content, "review-supervisor.md must not use the 'REVIEW_FAIL' verdict token."
 
     def test_supervisor_no_review_pass_token(self) -> None:
-        """AC-5: review-supervisor must not use REVIEW_PASS as a verdict token."""
+        """The stub must not use REVIEW_PASS as a verdict token."""
         content = self._SUPERVISOR_PATH.read_text()
-        assert "REVIEW_PASS" not in content, (
-            "review-supervisor.md must not use 'REVIEW_PASS' as a verdict token. "
-            "Use lowercase 'pass' in log-verdict calls."
-        )
+        assert "REVIEW_PASS" not in content, "review-supervisor.md must not use the 'REVIEW_PASS' verdict token."
 
-    def test_supervisor_fail_branch_uses_lowercase_fail(self) -> None:
-        """AC-4: log-verdict calls in review-supervisor must use lowercase 'fail'."""
+    def test_supervisor_logs_no_verdicts(self) -> None:
+        """The demoted stub must not contain any log-verdict instruction."""
         content = self._SUPERVISOR_PATH.read_text()
-        # Should have at least one log-verdict call with lowercase 'fail'
-        assert re.search(r"log-verdict\s+\S+\s+\S+\s+fail\b", content), (
-            "review-supervisor.md must contain log-verdict calls using lowercase 'fail'."
-        )
-
-    def test_supervisor_pass_branch_uses_lowercase_pass(self) -> None:
-        """AC-5: log-verdict calls in review-supervisor must use lowercase 'pass'."""
-        content = self._SUPERVISOR_PATH.read_text()
-        # Should have at least one log-verdict call with lowercase 'pass'
-        assert re.search(r"log-verdict\s+\S+\s+\S+\s+pass\b", content), (
-            "review-supervisor.md must contain log-verdict calls using lowercase 'pass'."
+        assert "log-verdict" not in content, (
+            "review-supervisor.md must not instruct any log-verdict call -- the four review_team "
+            "reviewers self-log their canonical verdicts after ADR-28."
         )
 
 
@@ -380,39 +392,78 @@ class TestReviewerJsonEnvelope:
         ), f"{agent_filename} must instruct the agent that the JSON envelope is the last thing output in the response."
 
 
+_SKILL_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+)
+
+_REVIEW_TEAM_AGENT_TYPES = [
+    "devbench-orchestrate:code-reviewer",
+    "devbench-orchestrate:test-reviewer",
+    "devbench-orchestrate:doc-reviewer",
+    "devbench-orchestrate:changes-manifest",
+]
+
+
 @pytest.mark.unit
-class TestReviewSupervisorUsesJsonEnvelope:
-    """AC-6, AC-9: review-supervisor must use reviewer JSON envelope data, not hardcoded strings."""
+class TestSkillDispatchesReviewTeamDirectly:
+    """ADR-28: SKILL.md step 5 dispatches the four review_team reviewers directly.
 
-    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+    The orchestrate skill (main thread) is the dispatcher, not review-supervisor,
+    because the Claude Agent SDK forbids a sub-agent from spawning sub-agents.
+    Step 5 must name each reviewer agent_type and inject the per-round token.
+    """
 
-    def test_supervisor_no_hardcoded_passed_strings(self) -> None:
-        """AC-9: Supervisor must not hardcode 'X passed' strings in log-verdict calls."""
-        content = self._SUPERVISOR_PATH.read_text()
-        hardcoded_patterns = [
-            "code-reviewer passed",
-            "test-reviewer passed",
-            "doc-reviewer passed",
-            "changes-manifest passed",
-        ]
-        for pattern in hardcoded_patterns:
-            assert pattern not in content, (
-                f"review-supervisor.md must not hardcode '{pattern}' in log-verdict calls. "
-                "Use the actual reviewer JSON summary from the envelope."
-            )
+    def _step5_region(self) -> str:
+        """Return SKILL.md text from step 5 up to step 6 (the dispatch region)."""
+        content = _SKILL_PATH.read_text()
+        start = content.find("\n5. ")
+        assert start >= 0, "SKILL.md must declare a step 5."
+        end = content.find("\n6. ", start)
+        return content[start:end] if end > start else content[start:]
 
-    def test_supervisor_references_json_envelope(self) -> None:
-        """AC-6, AC-9: Supervisor must instruct parsing of reviewer JSON envelope."""
-        content = self._SUPERVISOR_PATH.read_text()
-        assert re.search(r"\bjson\b", content, re.IGNORECASE), (
-            "review-supervisor.md must instruct parsing the reviewer JSON envelope to extract verdicts and summaries."
+    @pytest.mark.parametrize("agent_type", _REVIEW_TEAM_AGENT_TYPES)
+    def test_step5_dispatches_each_reviewer_agent_type(self, agent_type: str) -> None:
+        region = self._step5_region()
+        assert agent_type in region, (
+            f"SKILL.md step 5 must dispatch '{agent_type}' directly (ADR-28 flattened pipeline)."
         )
 
-    def test_supervisor_fail_branch_logs_findings_as_comments(self) -> None:
-        """AC-6: Supervisor FAIL branch must relay individual findings via log-comment."""
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "log-comment" in content, (
-            "review-supervisor.md must use log-comment to relay reviewer findings in the FAIL branch."
+    def test_step5_injects_round_token(self) -> None:
+        region = self._step5_region()
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in region, (
+            "SKILL.md step 5 must inject DEVBENCH_REVIEW_ROUND_TOKEN into each reviewer sub-agent."
+        )
+
+    def test_step5_is_fail_closed_on_canonical_verdict_lines(self) -> None:
+        """Pass/fail must be derived from canonical verdict lines, not reviewer prose/JSON."""
+        region = self._step5_region().lower()
+        assert "review_pass" in region or "canonical verdict" in region, (
+            "SKILL.md step 5 must determine pass/fail from the canonical verdict lines for the round."
+        )
+
+    def test_step5_does_not_invoke_review_supervisor(self) -> None:
+        region = self._step5_region()
+        assert "Invoke `review-supervisor`" not in region and "invoke review-supervisor" not in region.lower(), (
+            "SKILL.md step 5 must NOT invoke review-supervisor -- it dispatches the reviewers directly (ADR-28)."
+        )
+
+
+@pytest.mark.unit
+class TestReviewTeamTokenRequirement:
+    """ADR-28: each review_team reviewer is the direct token consumer and must
+    carry the H3 DEVBENCH_REVIEW_ROUND_TOKEN requirement section (mirrors
+    security-reviewer.md), since the orchestrate skill now injects the token
+    into each reviewer directly rather than via the supervisor.
+    """
+
+    @pytest.mark.parametrize("agent_filename", REVIEW_TEAM_AGENTS)
+    def test_reviewer_has_token_requirement_section(self, agent_filename: str) -> None:
+        content = (REVIEW_TEAM_DIR / agent_filename).read_text()
+        assert "Token requirement" in content, (
+            f"{agent_filename} must include the H3 'Token requirement' section (ADR-28 direct dispatch)."
+        )
+        assert "DEVBENCH_REVIEW_ROUND_TOKEN" in content, (
+            f"{agent_filename} must document the DEVBENCH_REVIEW_ROUND_TOKEN requirement (H3)."
         )
 
 
@@ -656,55 +707,6 @@ class TestExecutorCommentLanguageDiscipline:
         assert "bypass" in section_body.lower() or "evade" in section_body.lower(), (
             "executor.md must explicitly forbid bypass attempts so the agent does not try "
             "to add noqa-style annotations to get around the hook."
-        )
-
-
-@pytest.mark.unit
-class TestReviewSupervisorCanonicalJudgeNames:
-    """ADR-08 slice G: supervisor must use underscored canonical judge names in log-verdict."""
-
-    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
-
-    _CANONICAL_JUDGE_NAMES = (
-        "code_review",
-        "test_review",
-        "doc_review",
-        "changes_manifest",
-        "security_review",
-    )
-
-    _HYPHENATED_REVIEWER_NAMES = (
-        "code-reviewer",
-        "test-reviewer",
-        "doc-reviewer",
-    )
-
-    def test_supervisor_contains_all_canonical_judge_names(self) -> None:
-        """Each underscored name must appear in the supervisor's log-verdict examples."""
-        content = self._SUPERVISOR_PATH.read_text()
-        for name in self._CANONICAL_JUDGE_NAMES:
-            assert name in content, (
-                f"review-supervisor.md must reference canonical judge name '{name}' "
-                "so the supervisor emits the exact string the done-gate parser looks for."
-            )
-
-    def test_supervisor_has_no_hyphenated_log_verdict_calls(self) -> None:
-        """Regression pin: no ``log-verdict <hyphenated-name>`` examples in supervisor."""
-        content = self._SUPERVISOR_PATH.read_text()
-        for name in self._HYPHENATED_REVIEWER_NAMES:
-            bad = f"log-verdict {name}"
-            assert bad not in content, (
-                f"review-supervisor.md must not contain '{bad}'. "
-                "Hyphenated reviewer frontmatter names do not match the done-gate parser's "
-                "canonical underscored set. Use e.g. 'log-verdict code_review' instead."
-            )
-
-    def test_supervisor_has_mapping_or_warning(self) -> None:
-        """Prompt must explicitly warn against deriving the judge name from frontmatter."""
-        content = self._SUPERVISOR_PATH.read_text().lower()
-        assert "frontmatter" in content or "canonical" in content, (
-            "review-supervisor.md must contain a caution or mapping that steers the agent "
-            "away from the reviewer's frontmatter name toward the canonical underscored form."
         )
 
 

@@ -76,6 +76,12 @@ class TestOrchestratePluginSelfContained:
             "test_review": "review_team/test-reviewer.md",
             "doc_review": "review_team/doc-reviewer.md",
             "changes_manifest": "review_team/changes-manifest.md",
+            # ADR-28: the orchestrate skill dispatches the review_team reviewers
+            # directly by their hyphenated agent names (which live in review_team/).
+            "code-reviewer": "review_team/code-reviewer.md",
+            "test-reviewer": "review_team/test-reviewer.md",
+            "doc-reviewer": "review_team/doc-reviewer.md",
+            "changes-manifest": "review_team/changes-manifest.md",
         }
         for invocation in invocations:
             if invocation == "orchestrate":

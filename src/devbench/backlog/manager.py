@@ -267,37 +267,17 @@ class BacklogManager:
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
-        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
+        # Append the ``[BLOCKED] <reason>`` audit comment BEFORE the status
+        # write so the operator-notification routed off ``_set_status`` (spec
+        # F1) can read this call's reason from the audit trail for the Slack
+        # context block.  ``_set_status`` then fires the transition-aware
+        # blocked notification for every caller (mark_blocked, force_status,
+        # the orchestrator's ``set-status blocked``, the done-gate-refusal
+        # path, and the reconcile sweep) -- this method no longer notifies
+        # directly, so a single write-surface hook covers all of them and the
+        # done-gate-refusal block now pages (G1).
         self._append_comment(work_unit_path, "BLOCKED", reason)
-        # Operator notification (PR #202).  Fires only when the classifier
-        # determines the block is OPERATOR_ACTION_REQUIRED -- the other
-        # blocked-buckets (AWAITING_DEPENDENCY, AUTO_CLEARING_VIA_PROPOSAL,
-        # etc.) auto-resolve so notifying on them every time would be noisy.
-        # All notification helpers are best-effort and gated by per-event
-        # toggles in devbench.yaml; safe to call unconditionally.
-        try:
-            from devbench.backlog.proposal import classify_blocked_task
-            from devbench.notifications import notify_blocked_classification_transition
-
-            workspace_root = backlog_index.parent
-            state = classify_blocked_task(
-                backlog_index.parent / "backlog",
-                backlog_index,
-                unit_id,
-                workspace_root=workspace_root,
-            )
-            title = _extract_wu_title(work_unit_path, unit_id)
-            # Issue #207 + #209: routes through the transition-aware helper
-            # so the ping fires on every transition INTO any of the seven
-            # blocked classes (initial mark_blocked OR later reclassification
-            # via cmd_sync_blocked / cmd_reconcile_cascade).  Each class has
-            # its own per-event toggle in devbench.yaml; the dispatcher
-            # picks the right notify_* helper based on the classifier's
-            # return value.
-            notify_blocked_classification_transition(unit_id, title, reason, state.name, workspace_root)
-        except (OSError, ValueError, ImportError):
-            # Classifier I/O failures should not block the status write.
-            pass
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
 
     def mark_declined(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Declined in both files and append a comment.
@@ -1374,6 +1354,109 @@ class BacklogManager:
                 self._auto_requeue_regular_dep_dependents(backlog_index, unit_id)
             if canonical == STATUS_DONE:
                 self._rollup_parent_status(backlog_index, unit_id)
+
+        # Operator-block Slack-gap spec F1 / F2: route the blocked-classification
+        # notification (and the leave-blocked cache invalidation) off this shared
+        # status-write surface so EVERY path that writes a status notifies, not
+        # only ``mark_blocked``.  This closes G1 -- the done-gate-refusal /
+        # orchestrator ``set-status blocked`` path now pages because the
+        # notification is keyed on the write, not the caller.  Best-effort and
+        # gated by the per-event toggle; runs LAST so a classify/notify/IO
+        # failure can never break or delay the status write itself.
+        self._fire_status_transition_notifications(work_unit_path, backlog_index, unit_id, canonical)
+
+    def _fire_status_transition_notifications(
+        self,
+        work_unit_path: Path,
+        backlog_index: Path,
+        unit_id: str,
+        canonical: str,
+    ) -> None:
+        """Route status-write notifications off the shared write surface.
+
+        Operator-block Slack-gap spec F1 / F2.  Called once at the tail of
+        :meth:`_set_status` for every transition:
+
+        - ``canonical == 'blocked'`` -> classify the unit and route through
+          :func:`notify_blocked_classification_transition` so the correct
+          per-class operator ping fires regardless of which caller performed the
+          write (``mark_blocked``, ``force_status``, the orchestrator's
+          ``set-status blocked``, the done-gate-refusal path, or the reconcile
+          sweep).  Closes G1.
+        - any other status -> invalidate this unit's transition-cache entry via
+          :func:`invalidate_notification_state_for_unit` so a unit that leaves
+          ``blocked`` and later re-enters the same class re-notifies instead of
+          being suppressed by a stale ``cached == current`` entry.  Closes G2.
+
+        Best-effort: every classify / notify / cache I/O failure is swallowed
+        (``OSError``, ``ValueError``, ``ImportError``) so a notification bug can
+        never break or delay the status write (notification contract / AC-8).
+        Skips Stories / Features / Epics whose status is auto-rolled from
+        children -- only tasks carry an operator-actionable block.
+        """
+        if "-T" not in unit_id:
+            return
+        workspace_root = backlog_index.parent
+        try:
+            from devbench.notifications import (
+                invalidate_notification_state_for_unit,
+                notify_blocked_classification_transition,
+            )
+
+            if canonical == STATUS_BLOCKED:
+                from devbench.backlog.proposal import classify_blocked_task
+
+                state = classify_blocked_task(
+                    workspace_root / "backlog",
+                    backlog_index,
+                    unit_id,
+                    workspace_root=workspace_root,
+                )
+                title = _extract_wu_title(work_unit_path, unit_id)
+                reason = self._latest_block_reason(work_unit_path, unit_id)
+                # Issue #207 + #209 + operator-block Slack-gap spec: the
+                # transition-aware dispatcher fires the right per-class
+                # ``notify_work_unit_blocked_*`` helper on every transition INTO
+                # a blocked class, deduped via the per-workspace cache so a unit
+                # that stays blocked across many writes pages only once.
+                notify_blocked_classification_transition(unit_id, title, reason, state.name, workspace_root)
+            else:
+                invalidate_notification_state_for_unit(workspace_root, unit_id)
+        except (OSError, ValueError, ImportError):
+            # Classifier / notifier / cache I/O failures must never break or
+            # delay the status write (best-effort notification contract).
+            pass
+
+    @staticmethod
+    def _latest_block_reason(work_unit_path: Path, unit_id: str) -> str:
+        """Return the most recent ``[BLOCKED]`` audit reason for the Slack context.
+
+        Reads the work-unit file's ``## Comments`` audit trail and returns the
+        body of the last ``[BLOCKED] ...`` comment, stripped of the marker.
+        Falls back to a generic phrase when no ``[BLOCKED]`` comment is present
+        (e.g. an operator ``set-status <id> blocked`` with no prior audit row).
+        Best-effort: never raises -- consumed by the best-effort notifier.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            unit_id: The work-unit identifier (used in the fallback message).
+
+        Returns:
+            The latest block reason text, or a generic fallback.
+        """
+        try:
+            content = work_unit_path.read_text(encoding="utf-8")
+        except OSError:
+            return f"{unit_id} set to blocked"
+        latest: str | None = None
+        for line in content.splitlines():
+            marker = "[BLOCKED]"
+            idx = line.find(marker)
+            if idx != -1:
+                latest = line[idx + len(marker) :].strip()
+        if latest:
+            return latest
+        return f"{unit_id} set to blocked"
 
     @staticmethod
     def _required_judge_set(content: str) -> frozenset[str]:

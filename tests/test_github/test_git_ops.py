@@ -11,6 +11,44 @@ import pytest
 from devbench.github.git_ops import CIResult, ConflictingPRError, GitOpsService
 
 
+def _git_in(repo_path: Path, args: list[str]) -> tuple[int, str, str]:
+    """Run a git command in ``repo_path`` and return (rc, stdout, stderr)."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def _init_temp_git_repo(tmp_path: Path, branch: str) -> Path:
+    """Initialise a hermetic git repo on ``branch`` with an initial commit.
+
+    Sets a local committer identity and an empty seed commit so HEAD exists
+    and ``assert_on_branch`` passes. Returns the repo path.
+    """
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _git_in(repo_path, ["init", "-b", branch])
+    _git_in(repo_path, ["config", "user.email", "test@example.com"])
+    _git_in(repo_path, ["config", "user.name", "Test"])
+    _git_in(repo_path, ["commit", "--allow-empty", "-m", "seed: initial commit"])
+    return repo_path
+
+
+def _committed_files_at_head(repo_path: Path) -> list[str]:
+    """Return the files changed by the HEAD commit, sorted."""
+    _, out, _ = _git_in(repo_path, ["show", "--name-only", "--pretty=format:", "HEAD"])
+    return sorted(line for line in out.splitlines() if line.strip())
+
+
+def _untracked_files(repo_path: Path) -> list[str]:
+    """Return untracked file paths reported by ``git status --porcelain``."""
+    _, out, _ = _git_in(repo_path, ["status", "--porcelain"])
+    return [line[3:] for line in out.splitlines() if line.startswith("??")]
+
+
 class TestGitOpsInit:
     """Test initialization."""
 
@@ -1152,6 +1190,94 @@ class TestCommitLocal:
         judge = GitOpsService()
         with pytest.raises(ValueError, match="Invalid branch name"):
             judge.commit_local("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg")
+
+    def test_commit_local_with_manifest_paths_stages_only_those_paths(self, tmp_path: Path) -> None:
+        """manifest_paths-scoped commit_local stages ONLY the listed paths.
+
+        Reproduces issue #247 (git-ops add-all sweeps parked files into a
+        sibling commit). In a real temp git repo, unit B leaves an
+        authored-but-uncommitted file that is NOT in unit A's manifest. When A
+        commits with manifest_paths=[A's file], only A's file is committed and
+        B's foreign file remains uncommitted in the working tree.
+        """
+        repo_path = _init_temp_git_repo(tmp_path, "feature/x")
+        unit_a_file = repo_path / "unit_a.txt"
+        unit_a_file.write_text("A authored content\n", encoding="utf-8")
+        foreign_b_file = repo_path / "unit_b_parked.txt"
+        foreign_b_file.write_text("B parked content\n", encoding="utf-8")
+
+        judge = GitOpsService()
+        judge.commit_local(
+            "caylent-solutions/git-repo",
+            repo_path,
+            "feature/x",
+            "E8-F1-S1-T5: unit A",
+            manifest_paths=["unit_a.txt"],
+        )
+
+        committed = _committed_files_at_head(repo_path)
+        assert committed == ["unit_a.txt"], f"expected only unit_a.txt committed, got {committed}"
+        # The foreign file must still be sitting uncommitted in the working tree.
+        assert "unit_b_parked.txt" in _untracked_files(repo_path)
+
+    def test_commit_local_with_manifest_paths_stages_tracked_deletion(self, tmp_path: Path) -> None:
+        """manifest_paths-scoped staging covers deletions of tracked files.
+
+        ``git add -- <path>`` stages an add, a modification, OR the removal of a
+        tracked file. A manifest entry whose change verb is a delete must be
+        committed as a deletion, not silently skipped.
+        """
+        repo_path = _init_temp_git_repo(tmp_path, "feature/x")
+        doomed = repo_path / "to_delete.txt"
+        doomed.write_text("seed\n", encoding="utf-8")
+        _git_in(repo_path, ["add", "to_delete.txt"])
+        _git_in(repo_path, ["commit", "-m", "seed: add to_delete.txt"])
+
+        doomed.unlink()
+        # A foreign file sits uncommitted alongside the deletion.
+        foreign = repo_path / "foreign.txt"
+        foreign.write_text("foreign\n", encoding="utf-8")
+
+        judge = GitOpsService()
+        judge.commit_local(
+            "caylent-solutions/git-repo",
+            repo_path,
+            "feature/x",
+            "E1-F1-S1-T1: delete to_delete.txt",
+            manifest_paths=["to_delete.txt"],
+        )
+
+        # The deletion is recorded in the new commit.
+        _, head_files, _ = _git_in(repo_path, ["ls-tree", "-r", "--name-only", "HEAD"])
+        assert "to_delete.txt" not in head_files.split()
+        # The foreign file was not swept into the deletion commit.
+        assert "foreign.txt" in _untracked_files(repo_path)
+
+    def test_commit_local_none_manifest_falls_back_to_add_all(self, tmp_path: Path) -> None:
+        """manifest_paths=None preserves the legacy ``git add -A`` behaviour."""
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["status", "--porcelain"]:
+                return (0, "M src/foo.py\n", "")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.commit_local(
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+                "local commit",
+                manifest_paths=None,
+            )
+
+        assert ["add", "-A"] in git_calls
+        # No per-path staging is performed in the fallback path.
+        assert not any(c[:2] == ["add", "--"] for c in git_calls)
 
 
 class TestAssertOnBranch:

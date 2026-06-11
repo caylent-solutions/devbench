@@ -781,6 +781,72 @@ class TestExecutorCommentLanguageDiscipline:
 
 
 @pytest.mark.unit
+class TestExecutorNoLiteralEmDashGuidance:
+    """Executor prompt must teach that the no-em-dash standard applies to tests too.
+
+    Regression pin for the recurring self-inflicted block where the executor
+    authored a TDD ``no-em-dash guard`` test by pasting the LITERAL U+2014 glyph
+    into the assertion (e.g. ``assert <U+2014> not in content``). The commit-time
+    guard hook and the apply-amendment Layer-3 byte-level scan roll back ANY file
+    containing a literal U+2014 -- including test files -- so the unit blocks on
+    its own guard and spawns fix-proposal churn. The prompt must steer the agent
+    to construct the character from an escape sequence and to prefer omitting the
+    redundant assertion entirely.
+    """
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+    # Built from an escape so this test file itself never embeds a literal U+2014.
+    _EM_DASH = chr(0x2014)
+
+    def test_executor_prompt_has_no_literal_em_dash(self) -> None:
+        """The prompt file must not itself contain a literal U+2014 -- otherwise
+        the guard hook / Layer-3 scan would roll back the executor.md edit."""
+        content = self._EXECUTOR_PATH.read_text(encoding="utf-8")
+        assert self._EM_DASH not in content, (
+            "executor.md must not embed a literal U+2014; the guidance text must "
+            "reference the character via an escape sequence, never the glyph."
+        )
+
+    def test_executor_states_standard_applies_to_test_files(self) -> None:
+        """The prompt must say the no-em-dash standard is enforced over test files
+        too (the recurring mistake was treating tests as exempt)."""
+        content = self._EXECUTOR_PATH.read_text(encoding="utf-8")
+        assert "U+2014" in content, "executor.md must reference U+2014 so the agent recognises the forbidden glyph."
+        lowered = content.lower()
+        assert "test file" in lowered, (
+            "executor.md must state the no-em-dash rule applies to test files, not just source."
+        )
+
+    def test_executor_names_both_enforcement_mechanisms(self) -> None:
+        """The prompt must name the two byte-level enforcers (commit-time guard
+        hook AND apply-amendment Layer-3 scan) that roll back the file."""
+        content = self._EXECUTOR_PATH.read_text(encoding="utf-8")
+        assert "guard hook" in content, (
+            "executor.md must name the commit-time guard hook as an enforcer of the no-em-dash rule."
+        )
+        assert "Layer-3" in content or "Layer 3" in content, (
+            "executor.md must name the apply-amendment Layer-3 scan as an enforcer of the no-em-dash rule."
+        )
+
+    def test_executor_prescribes_escape_sequence_construction(self) -> None:
+        """The prompt must instruct constructing the em-dash from an escape
+        (chr(0x2014) or a unicode escape), never the literal glyph."""
+        content = self._EXECUTOR_PATH.read_text(encoding="utf-8")
+        assert "chr(0x2014)" in content, (
+            "executor.md must show chr(0x2014) as the escape-derived construction for the em-dash."
+        )
+
+    def test_executor_discourages_redundant_guard_assertion(self) -> None:
+        """The prompt must tell the agent that a per-file no-em-dash assertion is
+        redundant with the harness-wide enforcement and is better omitted."""
+        lowered = self._EXECUTOR_PATH.read_text(encoding="utf-8").lower()
+        assert "redundant" in lowered, (
+            "executor.md must state that a per-file no-em-dash guard assertion is redundant "
+            "with the guard hook + Layer-3 scan, removing the temptation to embed the glyph."
+        )
+
+
+@pytest.mark.unit
 class TestBlockerResolverSuggestedApproachStructure:
     """ADR-08 slice H: blocker-resolver must require the four-section suggested_approach."""
 

@@ -380,3 +380,83 @@ def test_two_adders_falls_back_to_lexicographic(
     assert "uv run devbench add-dep E8-F1-S1-T2 E8-F1-S1-T1" in message, (
         f"Expected lexicographic fallback for two-adder case; got:\n{message}"
     )
+
+
+# ---------------------------------------------------------------------------
+# G3 (authoring-skills-deterministic-strict-gate AC-4): the verb-aware
+# adds-before-modifies ordering must also hold on the all-draft output under
+# ``--strict`` -- the exact path ``spec-to-backlog`` relies on. The existing
+# verb-aware tests above use ``in-queue`` (the always-error
+# ``_check_manifest_conflicts`` path); these mirror them on the draft/hold
+# strict path (``_check_manifest_conflicts_draft_hold``).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("edit_verb", ["modify", "delete", "update", "remove"])
+def test_draft_strict_adder_recommended_before_modifier(
+    tmp_path: Path,
+    backlog_dir: Path,
+    edit_verb: str,
+) -> None:
+    """On the all-draft output under --strict, the adder must be the chain root.
+
+    The adder (E9-F1-S1-T2) sorts AFTER the modifier (E9-F1-S1-T1)
+    lexicographically; the verb-aware ordering must recommend the modifier
+    depend on the adder (``add-dep T1 T2``), not the reverse -- mirroring AC-4
+    and the validator's in-queue verb-aware test on the draft/hold strict path.
+    """
+    repo = "ex/foo"
+    # T1 sorts FIRST but only modifies/deletes the file.
+    _make_task(backlog_dir, "E9-F1-S1-T1", repo, f"| `shared.yaml` | {edit_verb} |\n", status="draft")
+    # T2 sorts LAST but is the one that creates the file.
+    _make_task(backlog_dir, "E9-F1-S1-T2", repo, "| `shared.yaml` | add |\n", status="draft")
+    _make_index(
+        tmp_path,
+        f"| E9-F1-S1-T1 | T1 | Task | draft | none | {repo} | `backlog/E9-F1-S1-T1.md` |\n"
+        f"| E9-F1-S1-T2 | T2 | Task | draft | none | {repo} | `backlog/E9-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+    conflict_errors = [e for e in errors if "draft/hold conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1, f"Expected exactly one strict draft/hold conflict; got: {errors}"
+    message = conflict_errors[0]
+    # The modifier must be wired as the dependent of the adder (adds-before-modifies).
+    assert "uv run devbench add-dep E9-F1-S1-T1 E9-F1-S1-T2" in message, (
+        f"Expected modifier-depends-on-adder recommendation on the strict draft path; got:\n{message}"
+    )
+    # The wrong (lexicographic) direction must NOT be recommended.
+    assert "uv run devbench add-dep E9-F1-S1-T2 E9-F1-S1-T1" not in message
+    # Under --strict the finding is an ERROR, not a warning.
+    conflict_warnings = [w for w in warnings if "draft/hold conflict" in w and "shared.yaml" in w]
+    assert len(conflict_warnings) == 0
+
+
+@pytest.mark.unit
+def test_draft_strict_all_modify_falls_back_to_lexicographic(
+    tmp_path: Path,
+    backlog_dir: Path,
+) -> None:
+    """On the strict draft path, an all-modify conflict stays lexicographic.
+
+    With no single adder to disambiguate, the recommendation preserves the
+    deterministic positional fallback: the lexicographically later id depends
+    on the earlier one (``add-dep T2 T1``).
+    """
+    repo = "ex/foo"
+    _make_task(backlog_dir, "E10-F1-S1-T1", repo, "| `shared.yaml` | modify |\n", status="draft")
+    _make_task(backlog_dir, "E10-F1-S1-T2", repo, "| `shared.yaml` | modify |\n", status="draft")
+    _make_index(
+        tmp_path,
+        f"| E10-F1-S1-T1 | T1 | Task | draft | none | {repo} | `backlog/E10-F1-S1-T1.md` |\n"
+        f"| E10-F1-S1-T2 | T2 | Task | draft | none | {repo} | `backlog/E10-F1-S1-T2.md` |\n",
+    )
+    mgr = BacklogManager()
+    errors, _warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+    conflict_errors = [e for e in errors if "draft/hold conflict" in e and "shared.yaml" in e]
+    assert len(conflict_errors) == 1, f"Expected exactly one strict draft/hold conflict; got: {errors}"
+    message = conflict_errors[0]
+    assert "uv run devbench add-dep E10-F1-S1-T2 E10-F1-S1-T1" in message, (
+        f"Expected lexicographic fallback on the strict draft path; got:\n{message}"
+    )
+    assert "uv run devbench add-dep E10-F1-S1-T1 E10-F1-S1-T2" not in message

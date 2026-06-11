@@ -471,6 +471,83 @@ class TestFirstAcId:
         assert not items[0].is_executable()
 
 
+class TestDraftVerificationNoPlaceholder:
+    """TDI: a generated proposal must never carry a ``<fill-in>`` placeholder.
+
+    An executable-sounding AC with no derivable command falls back to
+    ``type=judge`` (always satisfiable, never run by verify-ac); only when a
+    concrete command CAN be derived from the manifest does the factory emit a
+    ``type=command`` directive.
+    """
+
+    def test_executable_ac_without_derivable_command_falls_back_to_judge(self) -> None:
+        from devbench.verification import VerificationType, parse_verification_section
+
+        # AC text carries an execution verb ("succeeds"/"deploy") but the manifest
+        # has no test file from which a concrete command can be derived.
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Scope IAM policy",
+            files_to_own=["infra/iam/service.hcl"],
+            linked_scenarios=[],
+            suggested_acs=["AC-FIX-08 a real terragrunt apply succeeds with the scoped policy"],
+            suggested_approach="Scope the policy.",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        # The bug: this used to emit `cmd=\`<fill-in ...>\``.
+        assert "<fill-in" not in md
+        items = parse_verification_section(md)
+        assert len(items) == 1
+        assert items[0].ac_ids == ("AC-FIX-08",)
+        assert items[0].vtype is VerificationType.JUDGE
+        assert not items[0].is_executable()
+
+    def test_executable_ac_with_test_file_in_manifest_emits_concrete_command(self) -> None:
+        from devbench.verification import VerificationType, parse_verification_section
+
+        # A pytest test file in the manifest IS a derivable concrete command.
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Re-author em-dash test",
+            files_to_own=["src/widget.py", "tests/test_widget.py"],
+            linked_scenarios=[],
+            suggested_acs=["AC-T2-3 pytest passes for the re-authored test"],
+            suggested_approach="Re-author the test.",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "<fill-in" not in md
+        items = parse_verification_section(md)
+        assert len(items) == 1
+        assert items[0].ac_ids == ("AC-T2-3",)
+        assert items[0].vtype is VerificationType.COMMAND
+        assert items[0].command is not None
+        assert "tests/test_widget.py" in items[0].command
+        # A concrete command parses as an executable item carrying exit-code evidence.
+        assert items[0].is_executable()
+
+    def test_no_fill_in_placeholder_for_any_executable_ac_combination(self) -> None:
+        # Even with multiple executable ACs and no test file, none becomes a placeholder.
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Deploy + provision",
+            files_to_own=["infra/main.hcl"],
+            linked_scenarios=[],
+            suggested_acs=[
+                "AC-1 terragrunt apply succeeds",
+                "AC-2 the smoke test passes against the deployed stack",
+            ],
+            suggested_approach="Do infra work.",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "<fill-in" not in md
+        # Nothing derivable from the manifest -> every directive is type=judge.
+        from devbench.verification import VerificationType, parse_verification_section
+
+        items = parse_verification_section(md)
+        assert len(items) == 2
+        assert all(item.vtype is VerificationType.JUDGE for item in items)
+
+
 # ---------------------------------------------------------------------------
 # BACKLOG.md manipulation
 # ---------------------------------------------------------------------------
@@ -1039,6 +1116,164 @@ class TestPromoteProposal:
         assert "| E0-F1-S1-T2 |" in source.read_text()
         # Audit comment was added.
         assert "[PROPOSAL_PROMOTED]" in source.read_text()
+
+    def test_refuses_when_verification_has_fill_in_placeholder(self, tmp_path: Path) -> None:
+        """Fail-closed gate: a placeholder cmd in a type=command directive blocks promotion.
+
+        A draft whose ``## Verification`` still carries a ``<fill-in ...>`` (or any
+        unresolved angle-bracket placeholder) inside a ``type=command`` ``cmd=``
+        cannot pass verify-ac, so promoting it would queue a unit that can never
+        reach done. The gate raises naming the offending AC and does NOT flip the
+        draft to in-queue.
+        """
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        draft = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+        content = draft.read_text()
+        # Inject a placeholder directive that a malformed/legacy draft might carry.
+        content = content.replace(
+            "- VERIFY AC-FUNC-001 | type=judge",
+            "- VERIFY AC-FUNC-001 | type=command "
+            "| cmd=`<fill-in the command that proves AC-FUNC-001 at execution time>` | expect-exit=0",
+        )
+        draft.write_text(content)
+        assert "<fill-in" in draft.read_text()
+
+        with pytest.raises(ProposalError, match="AC-FUNC-001"):
+            promote_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                task_id="E0-F1-S1-T2",
+            )
+        # Fail-closed BEFORE any wiring write: source task is never wired.
+        source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        assert "| E0-F1-S1-T2 |" not in source.read_text()
+        assert "[PROPOSAL_PROMOTED]" not in source.read_text()
+
+    def test_refuses_for_generic_angle_bracket_placeholder_in_command(self, tmp_path: Path) -> None:
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        draft = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+        content = draft.read_text().replace(
+            "- VERIFY AC-FUNC-001 | type=judge",
+            "- VERIFY AC-FUNC-001 | type=command | cmd=`uv run pytest <the-test-file>` | expect-exit=0",
+        )
+        draft.write_text(content)
+        with pytest.raises(ProposalError, match="AC-FUNC-001"):
+            promote_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                task_id="E0-F1-S1-T2",
+            )
+
+    def test_allows_concrete_command_directive(self, tmp_path: Path) -> None:
+        """A type=command directive with a real (placeholder-free) cmd promotes cleanly."""
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        draft = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+        content = draft.read_text().replace(
+            "- VERIFY AC-FUNC-001 | type=judge",
+            "- VERIFY AC-FUNC-001 | type=command | cmd=`uv run pytest tests/test_x.py` | expect-exit=0",
+        )
+        draft.write_text(content)
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert "## Status: in-queue" in result.draft_path.read_text()
+
+    def test_allows_angle_brackets_outside_command_directive(self, tmp_path: Path) -> None:
+        """Angle brackets in a judge directive (or non-command field) are harmless.
+
+        verify-ac never executes a type=judge directive, so a ``<...>`` there can
+        never break it; the gate only fences ``type=command`` cmd= operands.
+        """
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        draft = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+        content = draft.read_text().replace(
+            "- VERIFY AC-FUNC-001 | type=judge",
+            "- VERIFY AC-FUNC-001 | type=judge | reason=reviewer confirms <the scoped policy>",
+        )
+        draft.write_text(content)
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert "## Status: in-queue" in result.draft_path.read_text()
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "uv run pytest tests/test_x.py 2>&1",  # shell redirection, not a placeholder
+            "cat < input.txt",  # input redirection, no closing '>'
+            "grep -r foo src/ > out.txt",  # output redirection, no opening '<'
+            "make test && echo done",
+        ],
+    )
+    def test_allows_shell_redirection_in_command(self, tmp_path: Path, cmd: str) -> None:
+        """Shell redirection operators must not be mistaken for ``<...>`` placeholders."""
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        draft = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+        content = draft.read_text().replace(
+            "- VERIFY AC-FUNC-001 | type=judge",
+            f"- VERIFY AC-FUNC-001 | type=command | cmd=`{cmd}` | expect-exit=0",
+        )
+        draft.write_text(content)
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert "## Status: in-queue" in result.draft_path.read_text()
 
     def test_skip_dep_wiring(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)

@@ -221,6 +221,11 @@ Prohibited Patterns:
 - No shell scripts unless explicitly requested.
 - No Co-Authored-By attributions to Claude or Anthropic.
 
+No Literal Em-Dash (U+2014) -- Applies to Tests Too:
+- The no-em-dash standard (Code Standards rule #8 / U+2014) is enforced automatically by the commit-time guard hook AND the apply-amendment Layer-3 scan. Both perform a byte-level scan and roll back ANY file containing a literal U+2014 -- including test files. A rollback blocks the unit on its own guard and spawns fix-proposal churn.
+- Therefore NEVER paste the literal em-dash character into any source or test file. Use `--` (double hyphen) in prose. If a test must reference the em-dash (e.g. a guard assertion over a target file's content), construct the character from its escape sequence -- the Python string `"\u2014"` or `chr(0x2014)` -- never the literal glyph.
+- Prefer NOT to add a redundant literal-em-dash guard assertion at all: the standard is already enforced harness-wide by the guard hook and the Layer-3 scan, so a per-file no-em-dash assertion duplicates existing enforcement and only creates the temptation to embed the glyph.
+
 Complete Replacement:
 - When replacing code, find ALL references to old code first.
 - Update ALL consumers in the same change.

@@ -1070,6 +1070,9 @@ class NotificationsEventsConfig:
     work_unit_blocked_auto_clearing: bool = False
     work_unit_blocked_awaiting_dependency: bool = False
     work_unit_blocked_amendment_recovery: bool = False
+    # Operator-block Slack-gap spec G4 / AC-4: transient SIGTERM-interrupt
+    # bucket (auto-requeued next sweep).  Default OFF -- opt-in only.
+    work_unit_blocked_interrupted_on_stop: bool = False
     work_unit_materialised: bool = False
     work_unit_promoted: bool = False
     pr_opened: bool = False
@@ -1177,6 +1180,12 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
             events_raw.get(
                 "work_unit_blocked_amendment_recovery",
                 defaults.events.work_unit_blocked_amendment_recovery,
+            )
+        ),
+        work_unit_blocked_interrupted_on_stop=bool(
+            events_raw.get(
+                "work_unit_blocked_interrupted_on_stop",
+                defaults.events.work_unit_blocked_interrupted_on_stop,
             )
         ),
         work_unit_materialised=bool(events_raw.get("work_unit_materialised", defaults.events.work_unit_materialised)),

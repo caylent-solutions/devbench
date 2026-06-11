@@ -67,6 +67,11 @@ EVENT_WORK_UNIT_BLOCKED_ON_HELD = "work_unit_blocked_on_held"
 EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING = "work_unit_blocked_auto_clearing"
 EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY = "work_unit_blocked_awaiting_dependency"
 EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY = "work_unit_blocked_amendment_recovery"
+# Operator-block Slack-gap spec G4 / AC-4: the ``INTERRUPTED_ON_STOP`` block
+# bucket (unit force-blocked by the SIGTERM safeguard, auto-requeued on the next
+# sweep) gets its own event so it is mapped rather than unmapped-and-silent.
+# Default toggle OFF -- the interruption is transient, so operators opt in.
+EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP = "work_unit_blocked_interrupted_on_stop"
 EVENT_WORK_UNIT_MATERIALISED = "work_unit_materialised"
 EVENT_WORK_UNIT_PROMOTED = "work_unit_promoted"
 EVENT_PR_OPENED = "pr_opened"
@@ -88,6 +93,7 @@ ALL_EVENTS: tuple[str, ...] = (
     EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING,
     EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY,
     EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY,
+    EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP,
     EVENT_WORK_UNIT_MATERIALISED,
     EVENT_WORK_UNIT_PROMOTED,
     EVENT_PR_OPENED,
@@ -270,7 +276,23 @@ _EVENT_BY_CLASSIFICATION: dict[str, str] = {
     "AWAITING_DEPENDENCY": EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY,
     "AWAITING_AMENDMENT_RECOVERY": EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY,
     "OPERATOR_ACTION_REQUIRED": EVENT_WORK_UNIT_BLOCKED_OPERATOR,
+    # G4 / AC-4: map the transient SIGTERM-interrupt bucket so it is no longer
+    # unmapped-and-silent.  The event's toggle defaults OFF (opt-in).
+    "INTERRUPTED_ON_STOP": EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP,
 }
+
+# ``BlockedTaskState`` member names that DELIBERATELY do not page, with a
+# reviewed rationale (operator-block Slack-gap spec, Inv-2 / AC-4).  The
+# coverage test (``tests/test_notification_coverage.py``) asserts this set and
+# ``_EVENT_BY_CLASSIFICATION`` partition ``BlockedTaskState`` exactly, so a new
+# bucket added without a deliberate decision fails the test instead of silently
+# never paging.
+#
+# Empty today: every bucket -- including ``INTERRUPTED_ON_STOP`` -- maps to an
+# event in ``_EVENT_BY_CLASSIFICATION``.  ``INTERRUPTED_ON_STOP`` maps to a
+# default-OFF event (``work_unit_blocked_interrupted_on_stop``) so the transient
+# auto-requeued interruption is opt-in rather than unmapped-and-silent.
+_DELIBERATELY_SILENT_CLASSIFICATIONS: frozenset[str] = frozenset()
 
 
 def _resolve_backlog_label() -> str:
@@ -682,6 +704,23 @@ def notify_work_unit_blocked_amendment_recovery(unit_id: str, title: str, reason
     )
 
 
+def notify_work_unit_blocked_interrupted_on_stop(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``INTERRUPTED_ON_STOP`` (force-blocked on SIGTERM).
+
+    The unit was interrupted mid-flight by the orchestrator's shutdown safeguard
+    with no structural co-blocker; it auto-requeues on the next sweep.  Toggle
+    defaults OFF (opt-in) -- transient and self-healing, so most operators do
+    not want a page.  Mapped (rather than unmapped-and-silent) so the bucket is
+    coverage-tested and operators who DO want the signal can enable it.
+    """
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP,
+        slack_summary=f":hourglass_flowing_sand: Interrupted on stop: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
 # Map ``BlockedTaskState`` enum-member name -> per-class notify_* function NAME.
 # Stored as a string and resolved through ``globals()`` at call time so test
 # ``patch("devbench.notifications.notify_*")`` patches the same module
@@ -695,6 +734,7 @@ _NOTIFY_FN_NAME_BY_CLASSIFICATION: dict[str, str] = {
     "AWAITING_DEPENDENCY": "notify_work_unit_blocked_awaiting_dependency",
     "AWAITING_AMENDMENT_RECOVERY": "notify_work_unit_blocked_amendment_recovery",
     "OPERATOR_ACTION_REQUIRED": "notify_work_unit_blocked_operator",
+    "INTERRUPTED_ON_STOP": "notify_work_unit_blocked_interrupted_on_stop",
 }
 
 
@@ -826,6 +866,45 @@ def prune_notification_state_for_unblocked(workspace_root: Path, blocked_unit_id
     except OSError as exc:
         print(
             f"[WARN] notification state cache prune failed at {state_path}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def invalidate_notification_state_for_unit(workspace_root: Path, unit_id: str) -> None:
+    """Drop the cached classification for *unit_id* when it leaves ``blocked``.
+
+    Operator-block Slack-gap spec F2 / G2 / AC-2: the transition cache dedups a
+    blocked classification so a unit that stays blocked across many render
+    cycles pages only once.  But when a unit transitions OUT of ``blocked``
+    (requeue / unblock / cascade / done) and LATER re-enters the SAME class, the
+    stale ``cached == current`` entry would suppress the genuine re-block.
+
+    Called from the shared status-write surface (``BacklogManager._set_status``)
+    on every non-``blocked`` transition, so a single hook covers every caller
+    (operator CLI, orchestrator ``set-status``, ``mark_done``, rollups,
+    reconcile sweep) -- symmetric with the blocked-entry notification routed off
+    the same surface.  Complements the bulk
+    :func:`prune_notification_state_for_unblocked` sweep with a precise
+    per-unit invalidation at write time.
+
+    Best-effort: a missing cache file or an entry that is already absent is a
+    no-op; an I/O failure logs ``[WARN]`` and returns so the status write is
+    never broken or delayed (notification contract).
+
+    Args:
+        workspace_root: The workspace root containing ``.devbench/``.
+        unit_id: The unit whose cached classification is dropped.
+    """
+    state_path = workspace_root / ".devbench" / NOTIFICATION_STATE_FILENAME
+    state = _load_notification_state(state_path)
+    if unit_id not in state:
+        return
+    del state[unit_id]
+    try:
+        _save_notification_state(state_path, state)
+    except OSError as exc:
+        print(
+            f"[WARN] notification state cache invalidation failed at {state_path}: {exc}",
             file=sys.stderr,
         )
 
@@ -1076,6 +1155,7 @@ _BLOCKED_CLASS_SAMPLE_DISPATCH = {
     EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING: notify_work_unit_blocked_auto_clearing,
     EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY: notify_work_unit_blocked_awaiting_dependency,
     EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY: notify_work_unit_blocked_amendment_recovery,
+    EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP: notify_work_unit_blocked_interrupted_on_stop,
 }
 
 

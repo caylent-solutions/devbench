@@ -185,9 +185,22 @@ Every functional requirement MUST be written as a numbered `FR-N:` line (e.g., `
 
 **Per-AC discipline**: acceptance criteria are numbered (`AC-N`), reference the spec section that justifies them, and are testable from the spec text alone without asking the implementer to infer intent.
 
+**Per-AC checkbox form (C1)**: author every acceptance criterion in the Section-6 list as a Markdown checkbox whose first token after the checkbox is the AC id -- `- [ ] AC-N: <text>`. This is the only form the downstream `spec-to-backlog` backlog inherits as a *registerable* AC id: the validator's `_CHECKBOX_RE` (in `src/devbench/backlog/manager.py`) registers an AC id only from a checkbox line, so a plain `- AC-N ...` bullet produces a backlog whose DoD/AC-agreement contract fails under `validate-backlog --strict`. Worked shape:
+
+```
+<!-- AC-SECTION-START -->
+
+- [ ] AC-1: `make build` succeeds with exit 0 (Section 4 FR-1).
+- [ ] AC-2: the generated lockfile validates against the schema (Section 5).
+```
+
 **Per-AC verifiability**: every **executable** acceptance criterion -- one whose text asserts a runnable/testable outcome (it names a tool or verb such as `terraform` / `terragrunt` / `tofu` / `apply` / `deploy` / `terratest` / `tf-test` / `cdktf` / `cdk` / `cloudformation` / `sam` / `pytest` / `go test` / `make <target>` / `passes` / `succeeds` / `smoke`) -- MUST be **individually verifiable**: write it so a single concrete command can prove it (real, tool-captured exit code), not bundled with other claims into one AC. `spec-to-backlog` maps each such AC to one `- VERIFY AC-N | type=... | cmd=\`...\` | expect-exit=0` directive in the work unit's `## Verification` section, and the deterministic done-gate (`devbench verify-ac`) blocks `mark-done` until every executable AC has exit-0 proof. An AC that bundles several runnable outcomes cannot be cleanly verified -- split it. Operator-only steps (e.g. a prod apply a human must run) are still authored as individual ACs and decompose to `type=deferred` directives.
 
 When an AC implies a command, write it so that command's path operands are **relative to the target-repo checkout root** (where `verify-ac` runs), never workspace-relative or prefixed with the repo's checkout-directory name (TDI-001). Mark a check `deferred` only when it genuinely cannot run in the orchestrator environment (live-production mutation, credentials, manual sign-off); a check the project toolchain can run -- e.g. `terraform validate` -- is `type=command`, not deferred (TDI-004). And when an AC asserts that a concrete artifact must exist or resolve, confirm it exists in the target repo, is created by a task in the resulting backlog, or is an explicit external carve-out -- do not assert the existence of an unbacked artifact (TDI-005).
+
+**Carry the verifying command in the spec (C2)**: for each **executable** AC, write the concrete verifying command and the expected exit code into the spec text itself -- e.g. `verify: \`make tf-test UNIT=<unit>\` (expect-exit 0)`. State the path operands repo-root-relative (TDI-001) and classify the check as runnable-by-toolchain (`type=command` / `terratest` / `plan`, not `deferred`) when the project toolchain can run it (TDI-004). When the command text and expected exit are present in the spec, `spec-to-backlog` maps the AC to its `- VERIFY AC-N | type=... | cmd=\`...\` | expect-exit=0` directive by **copying** rather than inventing -- which is where TDI-001 path-base and TDI-004 classification errors originate. Operator-only steps still name their command but mark it deferred with the live/production/credentials reason.
+
+**Feasibility against stated tool versions (C3)**: before finalising any AC, check it against the tool/runtime versions the spec itself states (Section 1 context, Section 6 version-interop). Do NOT author an AC that asserts a capability the stated versions cannot provide -- e.g. a resolver pattern or flag the pinned tool version does not support. When an AC depends on a version-specific behaviour, cite the version and the mechanism that provides it in the AC or the section it references. An AC that mandates behaviour impossible on the pinned version is unsatisfiable-by-construction and reaches the backlog as a unit only a human can reconcile.
 
 **AC-N section marker**: the AC-N list MUST be preceded by the stable machine-locatable marker line:
 
@@ -248,6 +261,12 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 10. **AC-SECTION-START marker**: the literal line `<!-- AC-SECTION-START -->` appears immediately before the AC-N list. FAIL if the marker is absent.
 11. **Target Repository block**: a `## Target Repository` section with `Repo:` and `Branch:` fields is present. FAIL if either field is missing.
 12. **Unit Inventory (multi-unit)**: when the spec covers more than one work unit, a `## Unit Inventory` section listing each unit is present. FAIL if the spec is multi-unit and the inventory is absent. (Single-unit specs are exempt.)
+
+**Backlog contract -- AC quality (items 13-15)**
+
+13. **Checkbox AC form (C1)**: every AC in the Section-6 list is a `- [ ] AC-N:` checkbox whose first token after the checkbox is the AC id; there are NO plain-bullet (`- AC-N ...`) ACs. FAIL if any AC is a plain bullet or lacks the `AC-N:` id immediately after the checkbox. Rationale: only checkbox ACs become registerable AC ids in the downstream backlog (the validator's `_CHECKBOX_RE`); a plain-bullet AC makes the backlog's DoD/AC-agreement contract fail under `validate-backlog --strict`.
+14. **Verifying command per executable AC (C2)**: every executable AC (one asserting a runnable/testable outcome) names its concrete verifying command and expected exit in the spec text, written so a path operand is relative to the checkout root (TDI-001) and a toolchain-runnable check is `type=command`-class, not deferred (TDI-004). FAIL if an executable AC asserts a runnable outcome but states no command + expected exit, prefixes a path with the checkout-directory name, or marks a toolchain-runnable check deferred. Rationale: `spec-to-backlog` copies the command into the `VERIFY` directive; inventing it is where TDI-001/004 errors originate.
+15. **Feasibility against stated tool versions (C3)**: no AC asserts a capability that the spec's own stated tool/runtime versions (Section 1 context / Section 6 version-interop) cannot provide. FAIL if an AC depends on a version-specific behaviour the spec's stated versions do not support, or depends on a version-specific behaviour without the spec citing the version and the mechanism that provides it. Rationale: an AC that mandates behaviour impossible on the project's pinned tool version is unsatisfiable-by-construction and can only be reconciled by a human after it reaches the backlog.
 
 **Convergence protocol**: If the rubric score after revision is still > 0 and the loop count equals `skills.max_iterations`, emit a [BLOCKED] comment:
 
@@ -577,6 +596,9 @@ Then offer the spec-to-backlog handoff:
 - **Quality gate**: rubric score must be zero unresolved items before the spec is written
 - **FR list**: at least one `FR-N:` line is present in the spec
 - **AC-N marker**: the literal line `<!-- AC-SECTION-START -->` appears immediately before the AC-N list
+- **Checkbox AC form (C1)**: every AC is a `- [ ] AC-N:` checkbox so the downstream backlog inherits registerable AC ids
+- **Verifying command per executable AC (C2)**: every executable AC names its concrete verifying command + expected exit (repo-root-relative per TDI-001; toolchain-runnable as `type=command`-class per TDI-004)
+- **Feasibility against stated versions (C3)**: no AC asserts a capability the spec's own stated tool/runtime versions cannot provide
 - **Target Repository**: `Repo:` and `Branch:` fields are present
 - **Unit Inventory**: present for multi-unit specs; absent is acceptable for single-unit specs
 - **Readiness self-check**: `check_backlog_readiness` from `devbench.plugin_helpers.spec_backlog_contract` returns without raising before the spec is written

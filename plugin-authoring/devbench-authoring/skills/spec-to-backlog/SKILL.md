@@ -54,12 +54,26 @@ Every leaf task `.md` file MUST contain these 16 sections, in this order:
    - `#### Error Handling Contract` -- ONE subsection only: generic contract followed by task-specific error paths (do NOT add a second `#### Error Handling Contract` subsection)
 9. `### Related Specifications` -- spec section citations + GitHub issue + companion ADRs
 10. `## Dependencies` -- table of upstream tasks this task depends on (`| ID | Title | Status |`)
-11. `## Acceptance Criteria` -- task-specific ACs tied to spec section numbers or AC-N identifiers from spec Section 6; no `AC-XCUT-N` cross-cutting blocks
+11. `## Acceptance Criteria` -- task-specific ACs tied to spec section numbers or AC-N identifiers from spec Section 6; no `AC-XCUT-N` cross-cutting blocks. **CHECKBOX FORM IS MANDATORY (G1)**: every AC MUST be authored as a Markdown checkbox whose first token after the checkbox is the AC id -- `- [ ] AC-N: <text>`. This is the ONLY form the validator registers: `_check_verification_contract` (in `src/devbench/backlog/manager.py`) builds its `existing_ac_ids` set exclusively from checkbox lines matched by `_CHECKBOX_RE` (`r"^\s*-\s*\[[^\]]*\]\s*(.+)$"`). A plain `- AC-N ...` bullet is NEVER registered, so `existing_ac_ids` stays empty and every Definition-of-Done item naming an execution verb is reported as "asserts a runnable outcome but references no Acceptance Criterion" -- the single largest finding class under `validate-backlog --strict`. Authoring an UNCHECKED `- [ ] AC-N:` is correct: the done-path `_tick_completion_checkboxes` ticks them at `done` time. When an AC's prose must cite a spec-level requirement id, write it so it does NOT parse as a local AC id (e.g. `(spec requirement #N)`, not `(AC-N)`).
 12. `## Changes Manifest` -- the canonical 2-column form `| File | Change |`. EXACTLY two columns; the validator's `parse_manifest` rejects any other column count with `ManifestParseError: Manifest row must have exactly 2 columns`. Each row's File cell is a backtick-wrapped relative path (or a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` when the file list is undetermined); the Change cell is one of `add`, `modify`, `delete` (lowercase). Multi-repo work units encode the repo in the File cell as `` `<org/repo>` -- <path> `` (no per-row Repo column). The `## Target Repository` block at the top of the work-unit file is where Repo / Branch live; the Manifest carries paths only. NEVER use glob patterns (``*`` or ``**``) -- use a sentinel instead. See `docs/backlog-contract.md` 'Changes Manifest' section.
 13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`)
 14. `## Verification` -- one `- VERIFY AC-N | ...` directive per **executable** Acceptance Criterion (see the directive grammar below). This section is placed immediately AFTER `## Definition of Done`. It is the machine-checkable contract the deterministic done-gate and the optional `iac_review` judge consume: each executable AC maps to a command whose **real** exit code is captured by `devbench verify-ac` (never self-reported).
 15. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
 16. `## Comments` -- header only (blank at authoring time)
+
+**Authoring the `## Acceptance Criteria` section (checkbox form, G1)**
+
+Each AC is one Markdown checkbox; the AC id is the first token after the checkbox:
+
+```
+## Acceptance Criteria
+
+- [ ] AC-1: `make build` succeeds with exit 0 (spec requirement #4).
+- [ ] AC-2: the generated config validates against the schema.
+- [ ] AC-3: `make tf-test UNIT=<unit>` passes.
+```
+
+Do NOT author a plain bullet (`- AC-1: ...`) -- the validator's `_CHECKBOX_RE` registers an AC id only from a checkbox line, so a plain bullet is invisible to the verification contract.
 
 **Authoring the `## Verification` section (the AC verification contract)**
 
@@ -269,7 +283,7 @@ The output starts with `### Code Standards` and ends after the `#### Error Handl
 **Dependency wiring -- fully resolved at generation time**:
 - `## Dependencies` table: every upstream task this task depends on (real WU IDs -- no placeholders).
 - `### Depends On This` table: every downstream task that depends on this task (real WU IDs -- no placeholders).
-- Manifest-conflict serial-dep chains auto-injected: if two tasks modify the same file, the later task depends on the earlier one so `devbench validate-backlog` Rule 5 (Manifest Conflict Rule) passes from cold start.
+- Manifest-conflict serial-dep chains auto-injected (**verb-aware ordering, G3**): when two or more tasks claim the same Manifest `(repo, path)`, derive each claimant's verb for the shared path from its `## Changes Manifest` change cell (`add`/`new`/`create` -> the task creates the path; `modify`/`update`/`edit`/`delete`/`remove` -> the task edits an existing path). When **exactly one** claimant `add`s the path and every other claimant `modify`s/`delete`s it, wire the chain so the **adder is the dependency** -- the modifiers/deleters depend on it (adds-before-modifies), regardless of task id or topological position. The adder creates the file the others consume, so it must run first; wiring it the other way gates foundational work behind its consumer. **Fall back** to the deterministic positional order (the lexicographically later id depends on the earlier one) ONLY when the verbs do not disambiguate -- no claimant adds, more than one adds, or any non-adder is not an edit. This mirrors the verb-aware recommendation the validator now emits (`_order_conflict_chain` / `_classify_manifest_verb` in `src/devbench/backlog/manager.py`), so authoring-time and validator-time agree, and `devbench validate-backlog` Rule 5 (Manifest Conflict Rule) passes from cold start.
 
 **Default status**: Before writing each task file, read `backlog.default_status_for_new_work_units` from `backlog/config/devbench.yaml` (default: `draft` when that key is absent):
 - Key absent or set to `draft`: write `## Status: draft` as the second line of the task file.
@@ -299,6 +313,7 @@ Score each item PASS or FAIL:
 18. **Verification command-path contract (TDI-001)**: every `## Verification` `type=command` `cmd` path operand is relative to the target-repo checkout root -- NOT workspace-relative, and NOT prefixed with the repo's own `checkout_directory` name; and no `cmd` feeds a recursive `grep` from a `$(find ...)` substitution. FAIL if a `type=command` path begins with the unit's checkout-directory name or relies on an unbounded `$(find ...)`->`grep`. `validate-backlog --strict` enforces this as an ERROR.
 19. **Command-vs-deferred classification (TDI-004)**: no `type=deferred` directive defers a check that runs with the project's standard toolchain (the environment `verify-ac` and the judges run in). FAIL if a `type=deferred` `reason` names a runnable tool (terraform/terragrunt/tofu/terratest/pytest/make/cdk/sam/...) or "at execution time" with no live/production/operator-only signal -- reclassify it as `type=command`. `validate-backlog --strict` enforces this as an ERROR.
 20. **AC referential integrity (TDI-005)**: every path an AC or `type=command` directive asserts must exist either already exists in the target repo, is `add`ed by some task's `## Changes Manifest`, or is an explicit external carve-out. FAIL if an AC requires an artifact that neither exists nor is created by any task and is not marked external. `validate-backlog --strict` enforces this as an ERROR when the checkout is present.
+21. **Checkbox AC form (G1)**: every `## Acceptance Criteria` entry is a `- [ ] AC-N:` checkbox whose first token after the checkbox is a unique, registerable AC id; there are NO plain-bullet (`- AC-N ...`) ACs. Inline references to spec-level requirement ids are written so they do not parse as local AC ids (e.g. `(spec requirement #N)`, not `(AC-N)`). FAIL if any AC is a plain bullet, lacks the `AC-N:` id immediately after the checkbox, or reuses an AC id. The validator registers an AC id ONLY from a `_CHECKBOX_RE` match (`src/devbench/backlog/manager.py`); a plain-bullet AC leaves `existing_ac_ids` empty and makes the DoD/AC-agreement contract (item 17) fail across every verb-bearing DoD item. `validate-backlog --strict` (which this skill runs as its gate, Step 5d / Step 7) surfaces that downstream failure as an ERROR.
 
 **Out-of-authoring-scope checks (C2/C10)**: C2 (`_check_manifest_path_prefixes` -- checkout-directory prefix verification, which requires an on-disk repository checkout to resolve) and C10 (`_check_dep_file_exists` -- verifies that every dependency ID in `## Dependencies` resolves to a real work-unit file on disk, which requires the full backlog tree to be present) are runtime-only invariants enforced by `validate-backlog` at orchestrator time. Do NOT add rubric items for C2 or C10 here; they cannot be caught at authoring time and will be caught by the validator before any executor cycle begins.
 
@@ -324,19 +339,33 @@ For each pass that reports a non-zero count, emit one audit row:
 [POST_PROCESS] <pass_name>: <count> file(s)
 ```
 
-THEN run validate-backlog:
+THEN run the **deterministic strict gate** -- `validate-backlog --strict` is the single source of truth (G2):
 
 ```bash
-uv run devbench validate-backlog
+uv run devbench validate-backlog --strict
 ```
+
+**Why `--strict` is the gate (G2)**: the non-strict `validate-backlog` demotes the verification-contract (executable-AC coverage + DoD/AC agreement), the committable-file-sentinel rule (rule 24), the TDI-001 command-path contract, the TDI-005 referential-integrity contract, and the draft/hold manifest-conflict finding to WARNINGs and exits 0 -- so a backlog can satisfy the Step 5b rubric and pass non-strict validation while still carrying the exact ERROR classes that block the orchestrator. Under `--strict` the validator (`validate_with_warnings(..., strict=True)` in `src/devbench/backlog/manager.py`) promotes all of those to ERRORS. The Step 5b rubric items 17-21 are authoring guidance that helps the model converge; the `--strict` run is the gate. The skill MUST drive the strict run to **zero findings** before declaring this task done -- "the model believes the rubric passed" is NOT sufficient.
+
+**Authoring-time vs. orchestrator-time split**: the text-based contract checks (executable-AC coverage, DoD/AC agreement, command-vs-deferred TDI-004, checkbox-AC form, rule-24 sentinels, manifest conflicts) run without a target-repo checkout and so are fully enforceable at authoring time -- drive them to zero now. The checkout-dependent checks (TDI-001 path resolution, TDI-005 referential integrity) resolve fully only when the checkout is present and otherwise remain orchestrator-time invariants; run `--strict` anyway so the former class is zeroed at authoring time.
 
 On any error:
 1. Parse the error message to identify the offending task file.
 2. Regenerate (or fix via `Edit`) the offending task file.
-3. Re-run the post-processor (with the same `scope_paths`) + `uv run devbench validate-backlog`.
-4. Repeat until rc=0.
+3. Re-run the post-processor (with the same `scope_paths`) + `uv run devbench validate-backlog --strict`.
+4. Repeat until the strict run reports zero findings.
 
-Repeat for every leaf task until all tasks are written and `validate-backlog` is green. See `docs/skills/backlog-post-processor.md` for the full list of post-processing passes, the `scope_paths` / `force_terminal` arguments, and how to add new ones.
+Repeat for every leaf task until all tasks are written and `validate-backlog --strict` is green (zero findings). If `skills.max_iterations` is reached with residual strict findings, emit a `[BLOCKED]` audit listing them rather than shipping a backlog with known strict ERRORS:
+
+```
+[BLOCKED] spec-to-backlog Step 5d strict gate reached max_iterations=<N> with residual strict findings.
+Unresolved strict findings:
+- <validate-backlog --strict ERROR line>
+...
+Fix the above and re-run the skill.
+```
+
+See `docs/skills/backlog-post-processor.md` for the full list of post-processing passes, the `scope_paths` / `force_terminal` arguments, and how to add new ones.
 
 ---
 
@@ -381,19 +410,21 @@ The total row count in the Full Work Unit Index MUST equal the TOTAL in the Stat
 
 ## Step 7 -- Final whole-backlog validation
 
-Run the final validate-backlog pass:
+Run the final validate-backlog pass under the **deterministic strict gate** (G2) -- the strict run over the whole written backlog is the authoritative completion gate:
 
 ```bash
-uv run devbench validate-backlog
+uv run devbench validate-backlog --strict
 ```
+
+`--strict` promotes the verification contract, the committable-file-sentinel rule (24), TDI-001/004/005, and the draft/hold manifest-conflict findings to ERRORS (`validate_with_warnings(..., strict=True)` in `src/devbench/backlog/manager.py`); the non-strict run would demote them to WARNINGs and exit 0, letting a backlog ship with the defect classes that block the orchestrator. This is a single, authoritative "strict-validate-to-zero" gate over the entire backlog, not a per-rule subset.
 
 **Exit conditions** (ALL three must hold simultaneously before the skill exits successfully):
 
-1. `uv run devbench validate-backlog` returns rc=0 with zero errors.
-2. Every leaf task passes the per-task rubric (all items scored PASS in Step 5b, including item 17 -- the Verification contract).
+1. `uv run devbench validate-backlog --strict` returns rc=0 with zero findings (zero errors and -- since strict promotes them -- zero residual warnings in the promoted classes).
+2. Every leaf task passes the per-task rubric (all items scored PASS in Step 5b, including item 17 -- the Verification contract -- and item 21 -- the checkbox AC form).
 3. BACKLOG.md Status Summary total equals the Full Work Unit Index row count.
 
-If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for validate-backlog errors) and re-run Step 7. Repeat until all three conditions pass or `skills.max_iterations` is exhausted.
+If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for `validate-backlog --strict` findings) and re-run Step 7. Repeat until all three conditions pass or `skills.max_iterations` is exhausted.
 
 **Convergence failure protocol** (when `skills.max_iterations` is exhausted without all three conditions passing):
 
@@ -530,8 +561,8 @@ only produces the verified gap list.
 ## Step 7c -- Gap-fill and re-validate loop
 
 Consume the verified gap list produced by Step 7b-3 and close every confirmed gap.
-Repeat until zero confirmed gaps remain AND ``validate-backlog`` returns rc=0, or
-until the iteration budget is exhausted.
+Repeat until zero confirmed gaps remain AND ``validate-backlog --strict`` returns rc=0
+(the deterministic strict gate, G2), or until the iteration budget is exhausted.
 
 ### 7c-1 -- Route each gap to the correct authoring path
 
@@ -565,14 +596,14 @@ using the same sequence as Step 5d (reuse those invocations -- do NOT duplicate 
    existing ones).
 2. Run the post-processor passes (``run_all``) to fix mechanical issues in the
    newly authored or enhanced files.
-3. Run ``validate-backlog``:
+3. Run the deterministic strict gate ``validate-backlog --strict`` (G2):
 
    ```bash
-   uv run devbench validate-backlog
+   uv run devbench validate-backlog --strict
    ```
 
-   If ``validate-backlog`` returns non-zero, fix each reported error (same loop as
-   Step 5d) before proceeding to the re-audit in Step 7c-3.
+   If ``validate-backlog --strict`` returns non-zero, fix each reported finding (same
+   loop as Step 5d) before proceeding to the re-audit in Step 7c-3.
 
 ### 7c-3 -- Re-audit and loop
 
@@ -582,7 +613,7 @@ fresh verified gap list.
 **Success gate (both conditions must hold simultaneously)**:
 
 - Zero confirmed gaps remain (the verified gap list is empty).
-- ``validate-backlog`` returns rc=0.
+- ``validate-backlog --strict`` returns rc=0 (the deterministic strict gate, G2).
 
 When both conditions are satisfied, proceed to Step 8.
 
@@ -663,24 +694,35 @@ required at ``mark-done``).
 ### 7d-2 -- Wire the serial-dep chain for each conflict
 
 For each conflict reported by the strict check (the error message names the
-conflicting task IDs and the shared path), add the required serial dependency so
-that the later task in topological order depends on the earlier one.
+conflicting task IDs and the shared path), add the required serial dependency
+using **verb-aware ordering (G3)** -- the same direction the validator
+recommends.  Derive each claimant's verb for the shared path from its
+``## Changes Manifest`` change cell.  When **exactly one** claimant ``add``s the
+path and every other claimant ``modify``s/``delete``s it, the **adder is the
+dependency** (the modifiers/deleters depend on it -- adds-before-modifies),
+regardless of id or topological position.  Fall back to the deterministic
+positional order (the later task in topological order depends on the earlier
+one) ONLY when the verbs do not disambiguate.  The strict-check error message
+already encodes this direction in its ``uv run devbench add-dep <later>
+<earlier>`` hint -- copy that recommendation verbatim rather than re-deriving the
+ordering.
 
 Reuse the existing dep-wiring step from Step 5 (``Dependency wiring --
-fully resolved at generation time``): for each conflicting pair ``(earlier_id,
-later_id)`` sharing the same ``(repo, path)``:
+fully resolved at generation time``): for each conflicting pair ``(dependency_id,
+dependent_id)`` sharing the same ``(repo, path)`` (where ``dependency_id`` is the
+adder under adds-before-modifies, else the earlier task):
 
-1. Add ``earlier_id`` to the ``## Dependencies`` table of ``later_id``'s work-unit
-   file (or vice-versa when the conflict message specifies a different ordering).
-2. Add ``later_id`` to the ``### Depends On This`` table of ``earlier_id``'s
+1. Add ``dependency_id`` to the ``## Dependencies`` table of ``dependent_id``'s
+   work-unit file (per the verb-aware direction the strict-check hint specifies).
+2. Add ``dependent_id`` to the ``### Depends On This`` table of ``dependency_id``'s
    work-unit file.
 3. Run the post-processor with ``scope_paths`` limited to the two affected files
    so the dep-format post-processing pass normalises the IDs.
 
-Do NOT invent new wiring logic -- the serial-dep auto-injection in Step 5
-(``Manifest-conflict serial-dep chains auto-injected``) is the canonical reference;
-this step applies the same pattern to the all-draft output that Step 5 was supposed
-to wire at authoring time.
+Do NOT invent new wiring logic -- the verb-aware serial-dep auto-injection in
+Step 5 (``Manifest-conflict serial-dep chains auto-injected``) is the canonical
+reference; this step applies the same adds-before-modifies pattern to the
+all-draft output that Step 5 was supposed to wire at authoring time.
 
 ### 7d-3 -- Re-run the strict check
 
@@ -735,7 +777,7 @@ Then emit the success message:
 > - `BACKLOG.md` -- Status Summary + Full Work Unit Index (<N> tasks total)
 > - `backlog/<epic-id>/.../<task-id>.md` -- one file per task (<N> files)
 > - All tasks default to `draft` status
-> - `devbench validate-backlog` passes with rc=0
+> - `devbench validate-backlog --strict` passes with rc=0 (deterministic strict gate, zero findings)
 >
 > Next: review the generated epics in the `draft` status, then release whole epics
 > (or individual tasks) for autonomous orchestrator work using `devbench set-status`:
@@ -787,7 +829,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 **Validation gate (item 11)**
 
-11. **validate-backlog rc=0**: `uv run devbench validate-backlog` returns zero errors. FAIL if any error remains.
+11. **validate-backlog --strict rc=0 (G2 deterministic gate)**: `uv run devbench validate-backlog --strict` returns zero findings. The strict run is the source of truth -- it promotes the verification contract, the committable-file-sentinel rule (24), TDI-001/004/005, and the draft/hold manifest-conflict findings from WARNING to ERROR. FAIL if any strict finding remains.
 
 ---
 
@@ -796,7 +838,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 - **Output files**: `BACKLOG.md` + work-unit `.md` files under `backlog/` in canonical 7-column format
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
 - **Per-task depth**: every task contains all 16 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
-- **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
+- **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog --strict` rc=0 (zero findings; the deterministic strict gate, G2) before the skill exits
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 
 ---
@@ -804,14 +846,15 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 ## Self-critique loop (bounded)
 
 The rubric-driven self-critique loop must terminate -- either when scoring
-reports zero unresolved items AND `validate-backlog` returns rc=0 (success)
-or when the iteration budget is exhausted (escalation). Use the helpers in
+reports zero unresolved items AND `validate-backlog --strict` returns rc=0
+(the deterministic strict gate, G2; success) or when the iteration budget is
+exhausted (escalation). Use the helpers in
 `src/devbench/skill_state.py` to make the bound observable:
 
 - On every iteration call `read_checkpoint("spec-to-backlog", workspace_root)`
   to load the previous counter (returns `None` first time).
 - When the rubric reports `unresolved_count <= SKILL_QUALITY_THRESHOLD` AND
-  `validate-backlog` returns rc=0, call
+  `validate-backlog --strict` returns rc=0, call
   `emit_audit("spec-to-backlog", SKILL_AUDIT_QUALITY_THRESHOLD_REACHED, {...}, workspace_root)`
   and exit success.
 - Otherwise increment the checkpoint via `write_checkpoint(...)` and continue.

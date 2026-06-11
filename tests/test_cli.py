@@ -6509,11 +6509,15 @@ class TestGitOpsDeferred:
             )
 
         assert result == 0
+        # _resolve_unit_file is patched to None here, so the manifest cannot be
+        # parsed and commit_local receives manifest_paths=None (the git add -A
+        # fallback). A resolvable unit file passes the parsed manifest paths.
         mock_ops.commit_local.assert_called_once_with(
             "caylent-solutions/git-repo",
             tmp_path,
             "feature/x",
             "E0-F1-S1-T1: Test Task",
+            None,
         )
         output = json.loads(capsys.readouterr().out.strip())
         assert output["mode"] == "deferred"

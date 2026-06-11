@@ -575,6 +575,7 @@
             "work_unit_blocked_auto_clearing": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as AUTO_CLEARING_VIA_PROPOSAL (ADR-07 cascade in flight; will auto-unblock). Default: false."},
             "work_unit_blocked_awaiting_dependency": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as AWAITING_DEPENDENCY (regular dep still in flight; will auto-unblock). Default: false."},
             "work_unit_blocked_amendment_recovery": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as AWAITING_AMENDMENT_RECOVERY (recovery signal on disk; will resume on next sweep). Default: false."},
+            "work_unit_blocked_interrupted_on_stop": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as INTERRUPTED_ON_STOP (force-blocked by the SIGTERM safeguard; auto-requeued on the next sweep). Transient/self-healing, so default: false (opt-in)."},
             "work_unit_materialised": {"type": "boolean", "description": "Fire when a draft WU file is materialised from a proposal. Default: false."},
             "work_unit_promoted": {"type": "boolean", "description": "Fire when a draft WU is promoted to in-queue. Default: false."},
             "pr_opened": {"type": "boolean", "description": "Fire when 'gh pr create' succeeds. Default: false."},

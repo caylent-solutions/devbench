@@ -3177,6 +3177,33 @@ def cmd_promote(*argv: str) -> int:
     return 1
 
 
+def _fire_promoted_notification(wu_file: Path, unit_id: str) -> None:
+    """Fire the ``work_unit_promoted`` event for a CLI-promoted draft unit.
+
+    Operator-block Slack-gap spec F-proposal / AC-3 / G3: the three CLI promote
+    entry points (:func:`_promote_single`, :func:`_promote_bulk`,
+    :func:`_promote_all`) flip ``draft -> in-queue`` via ``force_status`` -- a
+    different code path from ``promote_proposal`` -- so each needs its own hook
+    to fire the (previously dead) ``work_unit_promoted`` event once per unit.
+
+    Best-effort and gated by the per-event toggle + master switch + webhook
+    presence inside the notifier; every failure is swallowed so a notification
+    bug can never break or delay a promote.
+
+    Args:
+        wu_file: Path to the promoted unit's ``.md`` file (title source).
+        unit_id: The promoted task identifier.
+    """
+    try:
+        from devbench.backlog.manager import _extract_wu_title
+        from devbench.notifications import notify_work_unit_promoted
+
+        title = _extract_wu_title(wu_file, unit_id)
+        notify_work_unit_promoted(unit_id, title)
+    except (OSError, ValueError, ImportError):
+        pass
+
+
 def _promote_single(unit_id: str) -> int:
     """Promote a single work unit from draft to in-queue.
 
@@ -3212,6 +3239,7 @@ def _promote_single(unit_id: str) -> int:
     mgr = BacklogManager()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_QUEUE)
     mgr._append_agent_comment(wu_file, "orchestrator", "[PROMOTED] draft -> in-queue")
+    _fire_promoted_notification(wu_file, unit_id)
 
     logger.info("Promoted %s from draft to in-queue", unit_id)
     print(f"Promoted {unit_id} from draft to in-queue")
@@ -3276,6 +3304,7 @@ def _promote_bulk(scope_id: str) -> int:
     for u, wu_file in resolved:
         mgr.force_status(wu_file, BACKLOG_INDEX, u.id, STATUS_IN_QUEUE)
         mgr._append_agent_comment(wu_file, "orchestrator", "[PROMOTED] draft -> in-queue")
+        _fire_promoted_notification(wu_file, u.id)
         logger.info("Promoted %s from draft to in-queue", u.id)
 
     count = len(resolved)
@@ -3340,6 +3369,7 @@ def _promote_all(*, skip_confirmation: bool) -> int:
     for u, wu_file in resolved:
         mgr.force_status(wu_file, BACKLOG_INDEX, u.id, STATUS_IN_QUEUE)
         mgr._append_agent_comment(wu_file, "orchestrator", "[PROMOTED] draft -> in-queue")
+        _fire_promoted_notification(wu_file, u.id)
         logger.info("Promoted %s from draft to in-queue", u.id)
 
     print(f"Promoted {count} unit(s) from draft to in-queue")
@@ -5004,11 +5034,13 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     # class of bug deterministically before commit. Skipped only when the
     # work-unit file isn't resolvable (orchestrator runs without a backlog
     # context never reach this path in practice).
+    manifest_paths: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
+        manifest_paths = [r.file for r in manifest_rows]
+        assert_staged_matches_manifest(repo_path, manifest_paths)
 
-    ops.commit_local(canonical_repo, repo_path, branch, commit_message)
+    ops.commit_local(canonical_repo, repo_path, branch, commit_message, manifest_paths)
     logger.info("Committed locally (deferred PR): %s on %s", unit_id, branch)
     if wu_file is not None:
         mgr._append_agent_comment(wu_file, "git_ops", f"[COMMIT_DEFERRED] {commit_message}")
@@ -5919,11 +5951,13 @@ def cmd_git_ops(unit_id: str) -> int:
     # Manifest-scope check: every staged path must be in the work unit's
     # Changes Manifest. Catches scope-violation pollution deterministically
     # before commit. Skipped only when the work-unit file isn't resolvable.
+    manifest_paths: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
+        manifest_paths = [r.file for r in manifest_rows]
+        assert_staged_matches_manifest(repo_path, manifest_paths)
 
-    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
+    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message, manifest_paths)
     logger.info("Committed and pushed %s", unit_id)
 
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)

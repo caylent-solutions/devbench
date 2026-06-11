@@ -336,8 +336,15 @@ class GitOpsService:
 
         self.logger.info("Switched to branch %s in %s", branch, repo)
 
-    def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
-        """Validate inputs, stage all changes, commit, and push.
+    def commit_and_push(
+        self,
+        repo: str,
+        repo_path: Path,
+        branch: str,
+        message: str,
+        manifest_paths: list[str] | None = None,
+    ) -> None:
+        """Validate inputs, stage the unit's changes, commit, and push.
 
         Assumes the repository is already on the correct branch -- call
         :meth:`ensure_branch` before the executor agent stages files.
@@ -349,7 +356,17 @@ class GitOpsService:
         1. Validate *repo* against the allow-list (``validate_repo``).
         2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
            rejects consecutive special characters per git ref naming rules).
-        3. ``git add -A`` -- stage all working-tree changes.
+        3. Stage the work unit's changes:
+
+           - When *manifest_paths* is provided (non-``None``): run
+             ``git add -- <path>`` for each manifest path. This stages adds,
+             modifications, AND deletions of tracked files while never absorbing
+             files outside the unit's Changes Manifest -- closing the
+             ``git add -A`` misattribution hole (issue #247) where a different
+             unit's parked, uncommitted files would be swept into this commit.
+           - When *manifest_paths* is ``None``: fall back to ``git add -A`` --
+             stage all working-tree changes (legacy behaviour for callers that
+             do not supply a manifest).
         4. ``git status --porcelain`` -- check whether anything was staged.
 
            - If the output is **non-empty**: proceed to commit and push (steps 5-6).
@@ -380,6 +397,10 @@ class GitOpsService:
                 characters are alphanumerics, underscores, or a single separator
                 (``.``, ``-``, or ``/``) followed by an alphanumeric/underscore.
             message: Commit message.
+            manifest_paths: The work unit's Changes Manifest file paths
+                (repo-root-relative). When provided, only these paths are staged
+                (via ``git add -- <path>``); when ``None``, all working-tree
+                changes are staged via ``git add -A``.
 
         Raises:
             ValueError: If the repo is not in the allow-list, or the branch name
@@ -402,7 +423,7 @@ class GitOpsService:
         # orphan-branch class of bug where a commit lands on backlog/<id>
         # instead of the configured single_branch.
         self.assert_on_branch(repo_path, branch)
-        self._git(["add", "-A"], repo_path)
+        self._stage_changes(repo_path, manifest_paths)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
@@ -425,17 +446,40 @@ class GitOpsService:
         self._git(["push", "origin", branch], repo_path)
         self.logger.info("Committed and pushed to %s on %s", branch, repo)
 
-    def commit_local(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
-        """Stage and commit locally without pushing.
+    def commit_local(
+        self,
+        repo: str,
+        repo_path: Path,
+        branch: str,
+        message: str,
+        manifest_paths: list[str] | None = None,
+    ) -> None:
+        """Stage the unit's changes and commit locally without pushing.
 
         Used in single-branch / defer-PR mode.  Commits are accumulated
         on the branch and pushed later by ``git-ops-finalize``.
+
+        Staging is scoped to the work unit:
+
+        - When *manifest_paths* is provided (non-``None``): run
+          ``git add -- <path>`` for each manifest path. This stages adds,
+          modifications, AND deletions of tracked files while never absorbing
+          files outside the unit's Changes Manifest -- closing the
+          ``git add -A`` misattribution hole (issue #247) where a different
+          unit's parked, uncommitted files would otherwise be swept into this
+          unit's commit.
+        - When *manifest_paths* is ``None``: fall back to ``git add -A`` --
+          stage all working-tree changes (legacy behaviour for callers that do
+          not supply a manifest).
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
             repo_path: Local filesystem path to the repository.
             branch: Branch name (must already be checked out).
             message: Commit message.
+            manifest_paths: The work unit's Changes Manifest file paths
+                (repo-root-relative). When provided, only these paths are staged;
+                when ``None``, all working-tree changes are staged.
 
         Raises:
             ValueError: If the repo is not in the allow-list or branch is invalid.
@@ -453,7 +497,7 @@ class GitOpsService:
         # Same orphan-branch protection as commit_and_push -- refuse to
         # commit when HEAD has drifted off the expected branch.
         self.assert_on_branch(repo_path, branch)
-        self._git(["add", "-A"], repo_path)
+        self._stage_changes(repo_path, manifest_paths)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
@@ -1211,6 +1255,23 @@ class GitOpsService:
                 "Run 'git remote set-head origin --auto' to configure it."
             )
         return stdout.strip().removeprefix("origin/")
+
+    def _stage_changes(self, repo_path: Path, manifest_paths: list[str] | None) -> None:
+        """Stage the work unit's changes for commit.
+
+        When *manifest_paths* is ``None``, stages every working-tree change via
+        ``git add -A`` (legacy broad-add behaviour). When *manifest_paths* is
+        provided, stages ONLY those paths -- one ``git add -- <path>`` per entry
+        -- so the resulting commit can never absorb files outside the unit's
+        Changes Manifest (issue #247). ``git add -- <path>`` correctly stages
+        adds, modifications, and deletions of tracked files, so manifest entries
+        whose change verb is a deletion are committed as deletions.
+        """
+        if manifest_paths is None:
+            self._git(["add", "-A"], repo_path)
+            return
+        for path in manifest_paths:
+            self._git(["add", "--", path], repo_path)
 
     def _git(self, args: list[str], cwd: Path) -> tuple[int, str, str]:
         """Run a ``git`` command, raising ``RuntimeError`` on failure."""

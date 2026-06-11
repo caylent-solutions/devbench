@@ -1477,6 +1477,51 @@ class TestWaitForReset:
         for delay in backoff_delays:
             assert delay <= 600, f"delay {delay} exceeds max_seconds=600"
 
+    def test_emits_polling_heartbeat_per_poll(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A visible [QUOTA_POLLING] heartbeat is logged once per probe poll so a
+        long wait does not look dead between [QUOTA_WAITING] and [QUOTA_RESUMED].
+
+        Uses ``reset_at=None`` so the probe/backoff loop actually runs (a known
+        elapsed reset short-circuits before any probe -- TDI-003a). The probe
+        reports not-recovered for the first two calls, then recovers, so the
+        loop polls three times and emits three heartbeats.
+        """
+        import logging
+
+        from devbench.quota import BackoffConfig
+
+        call_count = 0
+
+        def probe() -> bool:
+            nonlocal call_count
+            call_count += 1
+            return call_count >= 3
+
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        backoff = BackoffConfig(initial_seconds=30, max_seconds=600, multiplier=2.0, jitter=0.2)
+
+        async def run() -> None:
+            with patch("devbench.quota._get_current_utc", return_value=clock):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    await wait_for_reset(
+                        reset_at=None,
+                        poll_interval_seconds=30,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                        backoff_config=backoff,
+                    )
+
+        with caplog.at_level(logging.INFO, logger="devbench.quota"):
+            asyncio.run(run())
+
+        heartbeats = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert len(heartbeats) == 3, f"expected one heartbeat per poll (3), got {heartbeats}"
+        # Each heartbeat is informative: elapsed, probe index, and next-poll delay.
+        first = heartbeats[0]
+        assert "elapsed=" in first
+        assert "probe=" in first
+        assert "next_in=" in first
+
     def test_max_wait_timeout_returns_false(self) -> None:
         """When max_wait is exceeded before the probe succeeds, returns False.
 

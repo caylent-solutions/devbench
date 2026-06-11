@@ -1085,6 +1085,10 @@ class NotificationsEventsConfig:
     ci_pass: bool = False
     orchestrator_stop: bool = False
     orchestrator_auto_restart: bool = False
+    # Quota wait-and-resume lifecycle (operator request).  Default OFF (opt-in)
+    # like every other event, so existing workspaces stay silent on upgrade.
+    quota_waiting: bool = False
+    quota_resumed: bool = False
 
 
 @dataclass
@@ -1198,6 +1202,8 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
         orchestrator_auto_restart=bool(
             events_raw.get("orchestrator_auto_restart", defaults.events.orchestrator_auto_restart)
         ),
+        quota_waiting=bool(events_raw.get("quota_waiting", defaults.events.quota_waiting)),
+        quota_resumed=bool(events_raw.get("quota_resumed", defaults.events.quota_resumed)),
     )
 
     return NotificationsConfig(

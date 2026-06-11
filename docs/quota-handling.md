@@ -27,9 +27,17 @@ sentinel from the inner SDK message loop. The outer handler:
    succeed). When `reset_at` is unknown the loop polls the probe with jittered
    exponential backoff; if the probe is permanently unavailable (no/invalid API
    credential) it emits `[QUOTA_PROBE_UNAVAILABLE]` and stops fast rather than
-   polling for the full `max_wait_seconds`.
+   polling for the full `max_wait_seconds`. While polling, `wait_for_reset`
+   emits a `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` heartbeat once
+   per poll so a long wait is visibly alive in the log rather than looking dead
+   between `[QUOTA_WAITING]` and `[QUOTA_RESUMED]`.
 4. On recovery, emits `[QUOTA_RESUMED] waited_seconds=<N>` and applies the
    configured `resume_strategy` before returning `rc=0`.
+
+The wait-start (`[QUOTA_WAITING]`) and recovery (`[QUOTA_RESUMED]`) points also
+fire the opt-in `quota_waiting` / `quota_resumed` Slack notification events when
+configured (best-effort -- a notify failure never breaks or delays the wait or
+resume). See `docs/slack-notifications.md`.
 
 Text detection is deliberately channel-specific so arbitrary tool output never
 trips a false pause:
@@ -113,6 +121,7 @@ following structured markers:
 | Marker | Format | Emitted when |
 |--------|--------|-------------|
 | `[QUOTA_WAITING]` | `[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>` | Pause begins |
+| `[QUOTA_POLLING]` | `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` | One heartbeat per recovery-probe poll while waiting (visible liveness) |
 | `[QUOTA_RESUMED]` | `[QUOTA_RESUMED] waited_seconds=<N>` | Recovery confirmed |
 | `[QUOTA_PROBE_UNAVAILABLE]` | `[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>` | Probe cannot run (no/invalid credential) and no reset time is known; routed through `on_exhaustion_timeout` |
 | `[QUOTA_FAIL_FAST]` | `[QUOTA_FAIL_FAST] reason=<source>` | `on_exhaustion=fail` (detection) or `on_exhaustion_timeout=fail` (timeout) aborts with a non-zero exit |

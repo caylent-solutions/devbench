@@ -78,6 +78,7 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
+    DEFAULT_VERIFY_AC_PYTEST_SEED,
     DEVBENCH_AUTO_RESOLVE_ENABLED_ENV,
     DEVBENCH_AUTO_RESOLVE_MAX_ATTEMPTS_ENV,
     DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
@@ -765,6 +766,19 @@ LLM_TIMEOUT: int = _resolve_int("DEVBENCH_LLM_TIMEOUT", RUNTIME_CONFIG.timeouts.
 COMMAND_TIMEOUT: int = _resolve_int(
     "DEVBENCH_COMMAND_TIMEOUT", RUNTIME_CONFIG.timeouts.command, DEFAULT_COMMAND_TIMEOUT
 )
+
+# ---------------------------------------------------------------------------
+# Deterministic per-unit verification-gate ordering seed
+# ---------------------------------------------------------------------------
+# ``devbench verify-ac`` pins ``pytest-randomly``'s seed (+ ``PYTHONHASHSEED``)
+# so a unit's ``## Verification`` pytest gate is reproducible run-to-run -- an
+# order-dependent sibling test can no longer block an unrelated unit
+# non-deterministically by the wall-clock seed it happened to draw. Resolution
+# precedence: ``DEVBENCH_VERIFY_AC_PYTEST_SEED`` env var > constant default.
+# Sourced from env-with-default (not YAML) deliberately: it is a verify-ac
+# execution knob an operator may rotate for a one-off reproduction, not a
+# per-workspace backlog setting.
+VERIFY_AC_PYTEST_SEED: int = _resolve_int("DEVBENCH_VERIFY_AC_PYTEST_SEED", None, DEFAULT_VERIFY_AC_PYTEST_SEED)
 
 # ---------------------------------------------------------------------------
 # Thresholds and limits

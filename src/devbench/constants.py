@@ -609,6 +609,18 @@ DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench-orchestrate"
 # ---------------------------------------------------------------------------
 SUBPROCESS_ERROR_EXIT_CODE: int = 127
 
+# ---------------------------------------------------------------------------
+# Deterministic per-unit verification-gate ordering seed.
+# ``devbench verify-ac`` pins ``pytest-randomly``'s seed (and ``PYTHONHASHSEED``)
+# so a unit's ``## Verification`` pytest gate yields the same verdict on every
+# run -- an order-dependent sibling test can no longer block an unrelated unit
+# non-deterministically by the wall-clock seed it happened to draw. Fail-safe
+# default: a fixed, arbitrary non-negative integer. Operators override via
+# ``DEVBENCH_VERIFY_AC_PYTEST_SEED`` (env) when they want to rotate the pinned
+# seed for a one-off reproduction. The orthogonal randomized-order signal is a
+# separate scheduled / CI gate, never a per-unit block.
+DEFAULT_VERIFY_AC_PYTEST_SEED: int = 0
+
 # Exit code emitted by ``cmd_start`` when the orchestrator's SDK subprocess
 # exited via ``NO_ACTIONABLE`` purely because every remaining blocker
 # classifies as ``BlockedTaskState.RUNTIME_DEGRADATION`` (the SDK lost
@@ -688,6 +700,34 @@ ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR
 # The wrapping ``make start`` loop must NOT treat this as an auto-restart
 # because the distinct value (43 != 42) prevents misclassification.
 ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE: int = 43
+
+# TDI: in-process quota-resume cap.
+#
+# When ``quota_handling.on_exhaustion == "wait"`` and a quota wait recovers,
+# ``cmd_start`` re-opens a FRESH ``ClaudeSDKClient`` session and re-runs the
+# orchestrate skill on the remaining backlog rather than exiting (a single
+# quota window must not permanently end an unattended ``--daemon`` run, which
+# has no external ``make start`` restart wrapper).  This constant caps the
+# number of consecutive in-process resumes so a pathological quota loop can
+# never spin forever.
+#
+# Override via env ``DEVBENCH_MAX_QUOTA_RESUMES`` (int).  Unset-safe: the
+# constant is the default when the env var is absent or unparseable.  The
+# default is intentionally high so legitimate overnight runs that cross many
+# quota windows are never cut short by the cap.
+DEFAULT_MAX_QUOTA_RESUMES: int = 1000
+
+# Verbatim audit-log prefix emitted by ``cmd_start`` each time it resumes the
+# orchestrate skill in-process after a quota wait recovered.  Format:
+# ``[ORCHESTRATOR_QUOTA_RESUME] resume=<n> max=<cap>``.  Consumed by operators
+# and automation via ``grep`` on the orchestrator log.
+ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX: str = "[ORCHESTRATOR_QUOTA_RESUME]"
+
+# Verbatim audit-log prefix emitted by ``cmd_start`` when the in-process
+# quota-resume cap (:data:`DEFAULT_MAX_QUOTA_RESUMES` /
+# ``DEVBENCH_MAX_QUOTA_RESUMES``) is exhausted, so the run stops instead of
+# resuming again.  Format: ``[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>``.
+ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]"
 
 # ---------------------------------------------------------------------------
 # Token arithmetic

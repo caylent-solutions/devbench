@@ -93,6 +93,59 @@ class TestRunCommandSuccess:
         assert kwargs["timeout"] == 99
 
 
+class TestRunCommandEnv:
+    """run_command forwards an explicit environment to the subprocess."""
+
+    def test_run_command_passes_env_to_subprocess(self) -> None:
+        """
+        Given: An explicit env mapping is provided
+        When: run_command is called
+        Then: subprocess.run is called with that exact env
+        Spec: AC-2
+        """
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        custom_env = {"PYTHONHASHSEED": "7", "PATH": "/usr/bin"}
+
+        with patch("devbench.utils.process.subprocess.run", return_value=mock_result) as mock_run:
+            run_command(["echo", "x"], env=custom_env)
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["env"] == custom_env
+
+    def test_run_command_defaults_env_to_none(self) -> None:
+        """
+        Given: No env is provided
+        When: run_command is called
+        Then: subprocess.run receives env=None (inherits the parent environment)
+        Spec: AC-2
+        """
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+
+        with patch("devbench.utils.process.subprocess.run", return_value=mock_result) as mock_run:
+            run_command(["echo", "x"])
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["env"] is None
+
+    def test_run_command_env_is_observable_in_child(self) -> None:
+        """
+        Given: An env mapping carrying a custom variable
+        When: run_command runs a real shell that echoes that variable
+        Then: The child process sees the provided value
+        Spec: AC-2
+        """
+        env = {"PATH": "/usr/bin:/bin", "DEVBENCH_GATE_PROBE": "deterministic"}
+        rc, stdout, _ = run_command(["sh", "-c", "echo $DEVBENCH_GATE_PROBE"], env=env)
+        assert rc == 0
+        assert "deterministic" in stdout
+
+
 class TestRunCommandFileNotFound:
     """run_command returns (127, '', '<cmd>: command not found') when exe is missing."""
 

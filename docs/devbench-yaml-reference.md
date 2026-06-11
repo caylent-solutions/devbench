@@ -371,6 +371,11 @@ notifications:
                                          # manual merge.  Default false on upgrade.
     orchestrator_stop: false
     orchestrator_auto_restart: false
+    quota_waiting: false                 # quota hit; orchestrator started waiting
+                                         # for the reset (payload: quota source/reason
+                                         # + provider-stated reset time).  Default false.
+    quota_resumed: false                 # quota recovered and the run resumed
+                                         # (payload: total seconds waited).  Default false.
 ```
 
 ---

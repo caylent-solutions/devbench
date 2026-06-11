@@ -218,6 +218,135 @@ class TestHandleQuotaPause:
         # Verify that a fresh workspace has no checkpoint present.
         assert load_checkpoint(tmp_path) is None
 
+    def test_fires_quota_waiting_notification_at_wait_start(self, tmp_path: Path) -> None:
+        """notify_quota_waiting is fired where [QUOTA_WAITING] is logged, with the
+        quota source and reset_at as its payload arguments."""
+        from devbench.cli import _handle_quota_pause
+        from devbench.config_loader import QuotaHandlingConfig
+
+        reset_at = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
+        exc = _make_quota_exc(reset_at=reset_at)
+        qh_cfg = QuotaHandlingConfig(enabled=True, audit_comment_on_wait=False)
+
+        async def run() -> None:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                with patch("devbench.cli.wait_for_reset", new_callable=AsyncMock, return_value=True):
+                    with patch("devbench.cli._apply_resume_strategy"):
+                        with patch("devbench.notifications.notify_quota_waiting") as mock_waiting:
+                            await _handle_quota_pause(
+                                exc=exc,
+                                qh_cfg=qh_cfg,
+                                workspace_root=tmp_path,
+                                session_name="default",
+                            )
+                            mock_waiting.assert_called_once_with("anthropic-api", reset_at.isoformat())
+
+        asyncio.run(run())
+
+    def test_fires_quota_resumed_notification_on_recovery(self, tmp_path: Path) -> None:
+        """notify_quota_resumed is fired where [QUOTA_RESUMED] is logged, with the
+        waited-seconds total as its payload argument."""
+        from devbench.cli import _handle_quota_pause
+        from devbench.config_loader import QuotaHandlingConfig
+
+        exc = _make_quota_exc()
+        qh_cfg = QuotaHandlingConfig(enabled=True, audit_comment_on_resume=False)
+
+        async def run() -> None:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                with patch("devbench.cli.wait_for_reset", new_callable=AsyncMock, return_value=True):
+                    with patch("devbench.cli._apply_resume_strategy"):
+                        with patch("devbench.notifications.notify_quota_resumed") as mock_resumed:
+                            await _handle_quota_pause(
+                                exc=exc,
+                                qh_cfg=qh_cfg,
+                                workspace_root=tmp_path,
+                                session_name="default",
+                            )
+                            mock_resumed.assert_called_once()
+                            (waited_seconds,) = mock_resumed.call_args.args
+                            assert isinstance(waited_seconds, int)
+
+        asyncio.run(run())
+
+    def test_no_quota_resumed_notification_on_timeout(self, tmp_path: Path) -> None:
+        """On timeout (wait_for_reset returns False) no resume notification fires."""
+        from devbench.cli import _handle_quota_pause
+        from devbench.config_loader import QuotaHandlingConfig
+
+        exc = _make_quota_exc()
+        qh_cfg = QuotaHandlingConfig(enabled=True)
+
+        async def run() -> bool:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                with patch("devbench.cli.wait_for_reset", new_callable=AsyncMock, return_value=False):
+                    with patch("devbench.notifications.notify_quota_resumed") as mock_resumed:
+                        result = await _handle_quota_pause(
+                            exc=exc,
+                            qh_cfg=qh_cfg,
+                            workspace_root=tmp_path,
+                            session_name="default",
+                        )
+                        mock_resumed.assert_not_called()
+                        return result
+
+        assert asyncio.run(run()) is False
+
+    def test_quota_waiting_notification_failure_does_not_break_wait(self, tmp_path: Path) -> None:
+        """A notify failure at wait-start must NEVER break or delay the wait;
+        the wait still proceeds and recovery is still returned."""
+        from devbench.cli import _handle_quota_pause
+        from devbench.config_loader import QuotaHandlingConfig
+
+        exc = _make_quota_exc(reset_at=datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC))
+        qh_cfg = QuotaHandlingConfig(enabled=True)
+
+        async def run() -> bool:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                with patch("devbench.cli.wait_for_reset", new_callable=AsyncMock, return_value=True):
+                    with patch("devbench.cli._apply_resume_strategy"):
+                        with patch(
+                            "devbench.notifications.notify_quota_waiting",
+                            side_effect=RuntimeError("slack down"),
+                        ):
+                            return await _handle_quota_pause(
+                                exc=exc,
+                                qh_cfg=qh_cfg,
+                                workspace_root=tmp_path,
+                                session_name="default",
+                            )
+
+        # Despite the notify exception, the wait completed and recovery returned True.
+        assert asyncio.run(run()) is True
+
+    def test_quota_resumed_notification_failure_does_not_break_resume(self, tmp_path: Path) -> None:
+        """A notify failure on the recovered path must NEVER break the resume;
+        the resume strategy still applies and True is returned."""
+        from devbench.cli import _handle_quota_pause
+        from devbench.config_loader import QuotaHandlingConfig
+
+        exc = _make_quota_exc()
+        qh_cfg = QuotaHandlingConfig(enabled=True)
+
+        async def run() -> bool:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                with patch("devbench.cli.wait_for_reset", new_callable=AsyncMock, return_value=True):
+                    with patch("devbench.cli._apply_resume_strategy") as mock_resume:
+                        with patch(
+                            "devbench.notifications.notify_quota_resumed",
+                            side_effect=RuntimeError("slack down"),
+                        ):
+                            result = await _handle_quota_pause(
+                                exc=exc,
+                                qh_cfg=qh_cfg,
+                                workspace_root=tmp_path,
+                                session_name="default",
+                            )
+                            mock_resume.assert_called_once()
+                            return result
+
+        assert asyncio.run(run()) is True
+
 
 # ---------------------------------------------------------------------------
 # enabled:false legacy exit path

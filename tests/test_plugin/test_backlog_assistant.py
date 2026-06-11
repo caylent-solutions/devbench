@@ -723,3 +723,118 @@ class TestAutoResolveEngineIntegration:
                 "apply_auto_resolve with enabled=False must NOT write the catalog "
                 "(disabled path must be byte-for-byte advise-only with no side-effects -- AC-1)"
             )
+
+
+# ---------------------------------------------------------------------------
+# Regression: triage-blocked-task classifier import-module + call-form drift
+# (TDI: backlog-assistant-triage-classify-import-and-argform-drift)
+#
+# The skill documents `python -c` blocks that import the classifier and call
+# it. Two prior drifts broke the skill's core classification step:
+#   1. Wrong module: imported from devbench.backlog.manager (raises ImportError)
+#      instead of the module that actually exports the symbol.
+#   2. Wrong call form: classify_blocked_task('<id>', workspace) -- 2 positional
+#      args -- instead of the real signature
+#      classify_blocked_task(backlog_root, backlog_index, task_id, *, ...).
+# These tests pin both invariants against the LIVE code so a future module move
+# re-flags the stale docs.
+# ---------------------------------------------------------------------------
+
+# Classifier symbols the skill documents importing + calling.
+_CLASSIFIER_SYMBOLS = (
+    "classify_blocked_task",
+    "classify_blocked_task_excluding_degradation",
+)
+
+
+def _module_that_exports(symbol: str) -> str:
+    """Return the dotted module path that actually defines ``symbol`` at HEAD.
+
+    Discovered dynamically from the live package so that if the function is
+    moved to another module the skill docs are forced to follow (the assertion
+    below compares the skill's documented import module to this value).
+    """
+    import importlib
+
+    proposal = importlib.import_module("devbench.backlog.proposal")
+    obj = getattr(proposal, symbol, None)
+    assert obj is not None, (
+        f"{symbol} is no longer exported by devbench.backlog.proposal; "
+        "update this regression test to discover the new home module"
+    )
+    return obj.__module__
+
+
+def _classifier_import_modules(content: str, symbol: str) -> set[str]:
+    """Modules the SKILL.md documents importing ``symbol`` from.
+
+    Matches ``from <module> import ... <symbol> ...`` lines.
+    """
+    modules: set[str] = set()
+    import_re = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+(.+)$", re.MULTILINE)
+    for module, names in import_re.findall(content):
+        imported = {n.strip() for n in names.split(",")}
+        if symbol in imported:
+            modules.add(module)
+    return modules
+
+
+@pytest.mark.unit
+class TestTriageClassifierImportModule:
+    """AC-2: the skill's documented import module matches the module that
+    actually exports the classifier symbols, so a future move re-flags it."""
+
+    @pytest.mark.parametrize("symbol", _CLASSIFIER_SYMBOLS)
+    def test_skill_imports_classifier_from_exporting_module(self, skill_contents: dict[str, str], symbol: str) -> None:
+        content = skill_contents["triage-blocked-task"]
+        documented = _classifier_import_modules(content, symbol)
+        assert documented, (
+            f"triage-blocked-task SKILL.md documents no import of {symbol!r}; "
+            "the skill's classification step must import the classifier"
+        )
+        exporting = _module_that_exports(symbol)
+        assert documented == {exporting}, (
+            f"triage-blocked-task SKILL.md imports {symbol!r} from {sorted(documented)}, "
+            f"but it is actually exported by {exporting!r}. Update the SKILL.md import "
+            "lines to match the module that owns the symbol (the function moved)."
+        )
+
+    def test_skill_does_not_import_classifier_from_manager(self, skill_contents: dict[str, str]) -> None:
+        """The stale `from devbench.backlog.manager import classify_blocked_task`
+        form raised ImportError; it must not reappear."""
+        content = skill_contents["triage-blocked-task"]
+        for symbol in _CLASSIFIER_SYMBOLS:
+            assert "devbench.backlog.manager" not in _classifier_import_modules(content, symbol), (
+                f"triage-blocked-task SKILL.md imports {symbol!r} from devbench.backlog.manager, "
+                "which does not export it (raises ImportError)"
+            )
+
+
+@pytest.mark.unit
+class TestTriageClassifierCallForm:
+    """AC-1: every documented classify_blocked_task* call uses the real
+    >=3-positional-arg signature, never the stale 2-arg form."""
+
+    @pytest.mark.parametrize("symbol", _CLASSIFIER_SYMBOLS)
+    def test_documented_calls_use_three_or_more_positional_args(
+        self, skill_contents: dict[str, str], symbol: str
+    ) -> None:
+        content = skill_contents["triage-blocked-task"]
+        # Match `symbol(` not preceded by `import `/`def `/an identifier char,
+        # then capture the parenthesised argument list (no nested parens needed
+        # for the documented calls).
+        call_re = re.compile(rf"(?<![\w.]){re.escape(symbol)}\(([^()]*)\)")
+        calls = call_re.findall(content)
+        assert calls, (
+            f"triage-blocked-task SKILL.md documents no call to {symbol}(...); the skill must invoke the classifier"
+        )
+        for args in calls:
+            # Count positional args = top-level comma-separated terms with no '='.
+            terms = [t.strip() for t in args.split(",") if t.strip()]
+            positional = [t for t in terms if "=" not in t]
+            assert len(positional) >= 3, (
+                f"triage-blocked-task SKILL.md calls {symbol}({args}) with "
+                f"{len(positional)} positional arg(s); the real signature requires "
+                "at least 3 positional args (backlog_root, backlog_index, task_id). "
+                "The stale 2-arg form raises TypeError."
+            )

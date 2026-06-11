@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 import tempfile
@@ -31,6 +32,14 @@ from pathlib import Path
 from typing import Any
 
 from devbench.drain import request_drain
+
+logger = logging.getLogger("devbench.quota")
+
+#: Audit marker emitted once per recovery-probe poll while waiting for a quota to
+#: reset, so a long wait is visibly alive between ``[QUOTA_WAITING]`` and
+#: ``[QUOTA_RESUMED]`` rather than looking dead.  Format:
+#: ``[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>``.
+_QUOTA_POLLING_AUDIT_PREFIX: str = "[QUOTA_POLLING]"
 
 # ---------------------------------------------------------------------------
 # Exception hierarchy
@@ -533,6 +542,7 @@ async def wait_for_reset(
 
     raw_delay = float(backoff_config.initial_seconds)
     rng = secrets.SystemRandom()
+    probe_count = 0
 
     while True:
         now = _get_current_utc()
@@ -549,6 +559,25 @@ async def wait_for_reset(
         if reset_at is not None and now >= reset_at:
             return True
 
+        probe_count += 1
+        # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.
+        # Computed before the probe so the heartbeat can report the delay that
+        # would follow a not-recovered probe (``next_in``).
+        jitter_factor = 1.0 + rng.uniform(-backoff_config.jitter, backoff_config.jitter)
+        delay = min(raw_delay * jitter_factor, float(backoff_config.max_seconds))
+
+        # Visible heartbeat: exactly one line per poll so an operator can SEE the
+        # orchestrator is actively polling during a long wait, rather than the
+        # log looking dead between [QUOTA_WAITING] and [QUOTA_RESUMED]. The
+        # backoff interval keeps this from being chatty.
+        logger.info(
+            "%s elapsed=%ds probe=%d next_in=%ds",
+            _QUOTA_POLLING_AUDIT_PREFIX,
+            int(elapsed),
+            probe_count,
+            int(delay),
+        )
+
         try:
             if probe_fn():
                 return True
@@ -559,9 +588,6 @@ async def wait_for_reset(
             # elapsed reset time is handled by the short-circuit above.
             raise
 
-        # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.
-        jitter_factor = 1.0 + rng.uniform(-backoff_config.jitter, backoff_config.jitter)
-        delay = min(raw_delay * jitter_factor, float(backoff_config.max_seconds))
         await asyncio.sleep(delay)
         raw_delay = min(raw_delay * backoff_config.multiplier, float(backoff_config.max_seconds))
 

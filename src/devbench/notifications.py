@@ -83,6 +83,13 @@ EVENT_CI_FAILURE = "ci_failure"
 EVENT_CI_PASS = "ci_pass"
 EVENT_ORCHESTRATOR_STOP = "orchestrator_stop"
 EVENT_ORCHESTRATOR_AUTO_RESTART = "orchestrator_auto_restart"
+# Quota wait-and-resume lifecycle (operator request).  ``quota_waiting`` fires
+# the moment the orchestrator hits a quota and begins waiting; ``quota_resumed``
+# fires when the quota recovers and the run resumes.  Both default OFF (opt-in),
+# mirroring every other event toggle.  Fired from ``_handle_quota_pause`` in
+# ``devbench.cli`` -- see Feature 1 of the quota-notifications change.
+EVENT_QUOTA_WAITING = "quota_waiting"
+EVENT_QUOTA_RESUMED = "quota_resumed"
 
 ALL_EVENTS: tuple[str, ...] = (
     EVENT_WORK_UNIT_DONE,
@@ -102,6 +109,8 @@ ALL_EVENTS: tuple[str, ...] = (
     EVENT_CI_PASS,
     EVENT_ORCHESTRATOR_STOP,
     EVENT_ORCHESTRATOR_AUTO_RESTART,
+    EVENT_QUOTA_WAITING,
+    EVENT_QUOTA_RESUMED,
 )
 
 
@@ -1109,6 +1118,54 @@ def notify_orchestrator_auto_restart(blocked_task_ids: list[str]) -> None:
     )
 
 
+def notify_quota_waiting(reason: str, reset_at: str) -> None:
+    """The orchestrator hit a quota and started waiting for it to reset.
+
+    Fired from ``_handle_quota_pause`` (``devbench.cli``) at the point the
+    ``[QUOTA_WAITING]`` audit line is logged, so the operator learns the run
+    has paused without watching the log.  Best-effort like every other
+    dispatcher: a delivery failure is logged and swallowed, never propagated,
+    so a notify/IO error cannot break or delay the quota wait.
+
+    Args:
+        reason: The quota source / reason string (``QuotaExhaustedError.source``,
+            e.g. ``"anthropic-api"``, ``"bedrock"``, ``"claude-code-cli"``).
+        reset_at: The provider-stated reset time as an ISO 8601 string, or the
+            literal ``"unknown"`` when no reset time was supplied.
+    """
+    _dispatch(
+        EVENT_QUOTA_WAITING,
+        slack_summary=":hourglass_flowing_sand: Quota hit -- waiting for reset",
+        slack_fields=[
+            ("Reason", reason),
+            ("Resets at", reset_at),
+        ],
+        slack_context=None,
+    )
+
+
+def notify_quota_resumed(waited_seconds: int) -> None:
+    """The quota recovered and the orchestrator resumed the run.
+
+    Fired from ``_handle_quota_pause`` (``devbench.cli``) at the point the
+    ``[QUOTA_RESUMED]`` audit line is logged on the recovered path.  Best-effort
+    like every other dispatcher: a delivery failure is logged and swallowed,
+    never propagated, so a notify/IO error cannot break or delay the resume.
+
+    Args:
+        waited_seconds: Total seconds spent waiting before recovery was
+            confirmed.
+    """
+    _dispatch(
+        EVENT_QUOTA_RESUMED,
+        slack_summary=":white_check_mark: Quota recovered -- run resumed",
+        slack_fields=[
+            ("Waited", f"{waited_seconds}s"),
+        ],
+        slack_context=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Self-test driver (used by ``devbench notify-test``)
 # ---------------------------------------------------------------------------
@@ -1193,6 +1250,10 @@ def _fire_sample(event_kind: str) -> None:
         notify_orchestrator_stop("notify-test sample", "E0-F1-S1-T1")
     elif event_kind == EVENT_ORCHESTRATOR_AUTO_RESTART:
         notify_orchestrator_auto_restart(["E0-F1-S1-T2", "E0-F1-S1-T3"])
+    elif event_kind == EVENT_QUOTA_WAITING:
+        notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+    elif event_kind == EVENT_QUOTA_RESUMED:
+        notify_quota_resumed(1234)
     else:
         # ALL_EVENTS guard above keeps us off this branch in practice;
         # the explicit raise is defensive only for future-event additions

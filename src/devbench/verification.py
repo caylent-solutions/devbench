@@ -24,9 +24,15 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+#: The :func:`utils.process.run_command` shape -- ``(cmd, cwd=...) -> (rc, out, err)``.
+#: Declared here (rather than importing the function) so :mod:`verification`
+#: stays dependency-light and the runner can be injected in tests.
+CommandRunner = Callable[..., tuple[int, str, str]]
 
 # ---------------------------------------------------------------------------
 # Verification types
@@ -161,6 +167,119 @@ def text_has_execution_verb(text: str) -> bool:
     forbid un-AC'd executable claims in the Definition of Done.
     """
     return bool(_EXECUTION_VERB_RE.search(text or ""))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic per-unit gate environment.
+#
+# A unit's ``## Verification`` pytest gate must be *reproducible*: the same
+# input must yield the same verdict on every run. When the target repo uses
+# ``pytest-randomly`` (random test order per run, seeded from the clock by
+# default), an order-dependent sibling test can pass on one seed and fail on
+# the next -- so an otherwise-complete, unrelated unit is blocked
+# non-deterministically by a seed it did not choose. Pinning the seed makes
+# the gate's verdict a deterministic function of the code under test; the
+# orthogonal randomized-order signal is surfaced by a separate scheduled pass
+# (an epic-capstone / CI gate), never as a random per-unit block.
+#
+# We pin via environment variables overlaid on the runner's environment so the
+# mechanism requires no change to the target repo's pyproject/pytest config:
+#   * ``PYTHONHASHSEED`` -- ALWAYS set. Removes hash-ordering nondeterminism in
+#     the interpreter itself (dict/set iteration order under the hood). Safe in
+#     every environment; no plugin dependency.
+#   * ``PYTEST_ADDOPTS`` -- set ONLY when ``pin_randomly`` is True (i.e. the
+#     target repo has ``pytest-randomly`` installed). Pins the plugin's seed
+#     (``--randomly-seed=<seed>``) so test ORDER is fixed run-to-run. Keeping
+#     randomization active with a *fixed* seed (rather than disabling it) means
+#     order-dependence is still exercised -- just deterministically -- so a unit
+#     that genuinely breaks ordering still fails its own gate, while a
+#     pre-existing sibling flake is reproducible.
+#
+# ``--randomly-seed`` is a CLI option that ONLY exists when ``pytest-randomly``
+# is installed; injecting it into ``PYTEST_ADDOPTS`` for a repo WITHOUT the
+# plugin would make every pytest invocation error on an unknown option. So the
+# caller probes the target repo once (``pytest_randomly_available``) and passes
+# the result as ``pin_randomly`` -- fail-safe: when the plugin is absent we
+# still pin ``PYTHONHASHSEED`` and never destabilise the gate.
+# ---------------------------------------------------------------------------
+
+#: pytest-randomly's seed flag. A directive that already sets a seed in
+#: ``PYTEST_ADDOPTS`` is normalised so the pinned seed is the only one present
+#: (a duplicate flag would let pytest-randomly pick the last-wins value
+#: silently, defeating reproducibility).
+_RANDOMLY_SEED_FLAG_RE: re.Pattern[str] = re.compile(r"--randomly-seed=\S+")
+
+
+def deterministic_gate_env(base_env: dict[str, str], *, seed: int, pin_randomly: bool = True) -> dict[str, str]:
+    """Return *base_env* overlaid with a pinned, reproducible pytest ordering seed.
+
+    Produces a NEW mapping (never mutates *base_env*) suitable for passing as a
+    subprocess ``env``. The overlay:
+
+    * ALWAYS sets ``PYTHONHASHSEED`` to *seed* (interpreter hash-order
+      determinism -- safe in any environment, no plugin dependency);
+    * when *pin_randomly* is True, sets/normalises ``PYTEST_ADDOPTS`` so it
+      pins ``pytest-randomly`` with ``--randomly-seed=<seed>`` exactly once,
+      preserving any other addopts the caller already had and dropping any
+      stale ``--randomly-seed``. When *pin_randomly* is False the
+      ``--randomly-seed`` flag is NOT injected (a repo without the plugin would
+      error on the unknown option) and any pre-existing addopts are left
+      untouched.
+
+    Args:
+        base_env: The environment to overlay (typically ``os.environ`` copied).
+        seed: The fixed, non-negative ordering seed (operator-configurable via
+            ``config.VERIFY_AC_PYTEST_SEED``).
+        pin_randomly: Whether ``pytest-randomly`` is available in the execution
+            environment, so its seed flag can be safely pinned. Defaults to
+            True; the caller probes the target repo and passes the real value.
+
+    Returns:
+        A new ``dict`` with the deterministic overlay applied.
+
+    Raises:
+        ValueError: When *seed* is negative (a seed must be a non-negative int;
+            fail fast rather than silently coerce).
+    """
+    if seed < 0:
+        raise ValueError(f"deterministic gate seed must be a non-negative integer; got {seed}")
+    env = dict(base_env)
+    env["PYTHONHASHSEED"] = str(seed)
+    if pin_randomly:
+        existing = _RANDOMLY_SEED_FLAG_RE.sub("", env.get("PYTEST_ADDOPTS", "")).strip()
+        pinned = f"--randomly-seed={seed}"
+        env["PYTEST_ADDOPTS"] = f"{existing} {pinned}".strip() if existing else pinned
+    return env
+
+
+def pytest_randomly_available(repo_path: Path, runner: CommandRunner) -> bool:
+    """Return ``True`` when ``pytest-randomly`` is importable in *repo_path*.
+
+    Probes the target-repo execution environment (the same one ``verify-ac``
+    runs the gate commands in) by attempting to import the plugin via the
+    repo's ``python``. This decides whether :func:`deterministic_gate_env` may
+    safely pin the plugin's ``--randomly-seed`` flag: the flag is only a
+    recognised pytest option when the plugin is installed, so pinning it for a
+    repo WITHOUT the plugin would make every gate ``pytest`` invocation error.
+
+    Fail-safe: a missing interpreter or an import failure yields a non-zero
+    exit (``run_command`` returns ``SUBPROCESS_ERROR_EXIT_CODE`` rather than
+    raising), so the gate degrades to the always-safe ``PYTHONHASHSEED`` pin
+    rather than risking a broken ``pytest`` invocation.
+
+    Args:
+        repo_path: The target-repo checkout root the gate commands run in.
+        runner: A callable with the signature of
+            ``utils.process.run_command`` -- ``(cmd, cwd=...) -> (rc, out, err)``.
+            Injected so this stays import-light and unit-testable. It MUST NOT
+            raise on a missing executable (the shared ``run_command`` does not).
+
+    Returns:
+        ``True`` iff the probe command exits 0 (the plugin imported cleanly).
+    """
+    probe = ["python", "-c", "import pytest_randomly"]
+    rc, _, _ = runner(probe, cwd=repo_path)
+    return rc == 0
 
 
 # ---------------------------------------------------------------------------

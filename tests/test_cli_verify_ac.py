@@ -350,6 +350,93 @@ class TestTddGateFromVerifyAc:
         assert records[0].exit_code == 1
 
 
+class TestDeterministicGateSeed:
+    """verify-ac runs each executable directive with a pinned pytest ordering seed.
+
+    The per-unit gate must be reproducible: the same code yields the same
+    verdict on every run. The runner overlays ``PYTHONHASHSEED`` and (when the
+    target repo has ``pytest-randomly``) a fixed ``--randomly-seed`` (via
+    ``PYTEST_ADDOPTS``) on the command's environment so an order-dependent
+    sibling test cannot non-deterministically block the unit.
+    """
+
+    def test_command_env_carries_pinned_randomly_seed_when_plugin_present(
+        self, tmp_path: Path, repo_path: Path
+    ) -> None:
+        workspace = tmp_path / "ws"
+        # The command echoes the two pinned env vars; the artifact captures them.
+        _write_unit(
+            workspace,
+            "- VERIFY AC-1 | type=command | "
+            'cmd=`echo "SEEN_ADDOPTS=$PYTEST_ADDOPTS"; echo "SEEN_HASHSEED=$PYTHONHASHSEED"` | expect-exit=0',
+        )
+        with (
+            patch("devbench.config.VERIFY_AC_PYTEST_SEED", 24680),
+            patch("devbench.verification.pytest_randomly_available", return_value=True),
+        ):
+            rc = _run(workspace, repo_path)
+        assert rc == 0
+        artifact = verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log"
+        text = artifact.read_text(encoding="utf-8")
+        assert "SEEN_ADDOPTS=" in text
+        assert "--randomly-seed=24680" in text
+        assert "SEEN_HASHSEED=24680" in text
+
+    def test_pythonhashseed_pinned_even_without_plugin(self, tmp_path: Path, repo_path: Path) -> None:
+        """With no pytest-randomly the seed flag is NOT injected, but PYTHONHASHSEED still is."""
+        workspace = tmp_path / "ws"
+        _write_unit(
+            workspace,
+            "- VERIFY AC-1 | type=command | "
+            'cmd=`echo "SEEN_ADDOPTS=[$PYTEST_ADDOPTS]"; echo "SEEN_HASHSEED=$PYTHONHASHSEED"` | expect-exit=0',
+        )
+        with (
+            patch("devbench.config.VERIFY_AC_PYTEST_SEED", 5),
+            patch("devbench.verification.pytest_randomly_available", return_value=False),
+        ):
+            rc = _run(workspace, repo_path)
+        assert rc == 0
+        text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(encoding="utf-8")
+        assert "SEEN_HASHSEED=5" in text
+        # No --randomly-seed injected (a repo without the plugin would error on it).
+        assert "--randomly-seed" not in text
+
+    def test_seed_is_deterministic_across_two_runs(self, tmp_path: Path, repo_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        _write_unit(
+            workspace,
+            "- VERIFY AC-1 | type=command | cmd=`echo SEED=$PYTEST_ADDOPTS` | expect-exit=0",
+        )
+        with (
+            patch("devbench.config.VERIFY_AC_PYTEST_SEED", 111),
+            patch("devbench.verification.pytest_randomly_available", return_value=True),
+        ):
+            assert _run(workspace, repo_path) == 0
+            first = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(
+                encoding="utf-8"
+            )
+            assert _run(workspace, repo_path) == 0
+            second = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 2) / "AC-1.log").read_text(
+                encoding="utf-8"
+            )
+        assert "--randomly-seed=111" in first
+        assert first == second
+
+    def test_inherits_parent_env_alongside_pinned_seed(self, tmp_path: Path, repo_path: Path) -> None:
+        """The overlay does not wipe the inherited environment: PATH still resolves tools."""
+        workspace = tmp_path / "ws"
+        # ``env`` is resolved via PATH; if PATH were dropped the command would 127.
+        _write_unit(workspace, "- VERIFY AC-1 | type=command | cmd=`env >/dev/null && echo OK` | expect-exit=0")
+        with (
+            patch("devbench.config.VERIFY_AC_PYTEST_SEED", 5),
+            patch("devbench.verification.pytest_randomly_available", return_value=True),
+        ):
+            rc = _run(workspace, repo_path)
+        assert rc == 0
+        artifact = verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log"
+        assert "OK" in artifact.read_text(encoding="utf-8")
+
+
 class TestRedExitHelpers:
     """Direct unit tests for the TDD-gate splicing helpers."""
 

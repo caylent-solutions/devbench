@@ -26,6 +26,7 @@ from devbench.verification import (
     deferred_items,
     deferred_reason_names_runnable_tool,
     detect_iac_tool,
+    deterministic_gate_env,
     evidence_attempt_dir,
     evidence_completeness,
     evidence_root,
@@ -36,6 +37,7 @@ from devbench.verification import (
     next_attempt_number,
     parse_verification_item,
     parse_verification_section,
+    pytest_randomly_available,
     read_latest_evidence_ledger,
     sanitize_ac_label,
     text_has_execution_verb,
@@ -585,3 +587,101 @@ def test_read_latest_ledger_skips_non_dict_entries(tmp_path: Path) -> None:
     records = read_latest_evidence_ledger(tmp_path, _TASK)
     assert len(records) == 1
     assert records[0].ac_ids == ["AC-1"]
+
+
+# ---------------------------------------------------------------------------
+# Deterministic per-unit gate environment (TDI: AC-FINAL flaky-gate fix, item 1)
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicGateEnv:
+    """``deterministic_gate_env`` pins the pytest ordering seed so a unit's
+    completion gate is reproducible across runs (same input -> same verdict)."""
+
+    def test_overlay_pins_pythonhashseed(self) -> None:
+        overlay = deterministic_gate_env({}, seed=12345)
+        assert overlay["PYTHONHASHSEED"] == "12345"
+
+    def test_pythonhashseed_pinned_even_when_randomly_not_pinned(self) -> None:
+        # The always-safe interpreter-level knob is set regardless of pin_randomly.
+        overlay = deterministic_gate_env({}, seed=8, pin_randomly=False)
+        assert overlay["PYTHONHASHSEED"] == "8"
+
+    def test_overlay_pins_randomly_seed_in_pytest_addopts(self) -> None:
+        overlay = deterministic_gate_env({}, seed=777)
+        assert "--randomly-seed=777" in overlay["PYTEST_ADDOPTS"]
+
+    def test_no_addopts_injected_when_pin_randomly_false(self) -> None:
+        # A repo WITHOUT pytest-randomly would error on the unknown option, so
+        # the seed flag must NOT be injected when pin_randomly is False.
+        overlay = deterministic_gate_env({}, seed=5, pin_randomly=False)
+        assert "PYTEST_ADDOPTS" not in overlay
+
+    def test_pre_existing_addopts_untouched_when_pin_randomly_false(self) -> None:
+        base = {"PYTEST_ADDOPTS": "-q"}
+        overlay = deterministic_gate_env(base, seed=5, pin_randomly=False)
+        assert overlay["PYTEST_ADDOPTS"] == "-q"
+
+    def test_overlay_preserves_existing_pytest_addopts(self) -> None:
+        base = {"PYTEST_ADDOPTS": "--maxfail=1 -q"}
+        overlay = deterministic_gate_env(base, seed=5)
+        addopts = overlay["PYTEST_ADDOPTS"]
+        assert "--maxfail=1" in addopts
+        assert "-q" in addopts
+        assert "--randomly-seed=5" in addopts
+
+    def test_overlay_does_not_duplicate_seed_when_already_present(self) -> None:
+        base = {"PYTEST_ADDOPTS": "--randomly-seed=99"}
+        overlay = deterministic_gate_env(base, seed=5)
+        addopts = overlay["PYTEST_ADDOPTS"]
+        # The pinned seed wins; the stale one must not survive as a duplicate.
+        assert addopts.count("--randomly-seed") == 1
+        assert "--randomly-seed=5" in addopts
+        assert "--randomly-seed=99" not in addopts
+
+    def test_overlay_is_deterministic_same_seed_same_result(self) -> None:
+        assert deterministic_gate_env({}, seed=42) == deterministic_gate_env({}, seed=42)
+
+    def test_overlay_does_not_mutate_input_mapping(self) -> None:
+        base = {"PYTEST_ADDOPTS": "-q"}
+        deterministic_gate_env(base, seed=1)
+        assert base == {"PYTEST_ADDOPTS": "-q"}
+
+    def test_overlay_carries_through_unrelated_keys(self) -> None:
+        base = {"PATH": "/usr/bin", "HOME": "/home/x"}
+        overlay = deterministic_gate_env(base, seed=3)
+        assert overlay["PATH"] == "/usr/bin"
+        assert overlay["HOME"] == "/home/x"
+
+    def test_negative_seed_rejected(self) -> None:
+        with pytest.raises(ValueError, match="seed"):
+            deterministic_gate_env({}, seed=-1)
+
+
+class TestPytestRandomlyAvailable:
+    """``pytest_randomly_available`` probes the target repo, fail-safe to False."""
+
+    def test_true_when_probe_exits_zero(self, tmp_path: Path) -> None:
+        calls: list[tuple[list[str], Path]] = []
+
+        def runner(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+            calls.append((cmd, cwd))
+            return 0, "", ""
+
+        assert pytest_randomly_available(tmp_path, runner) is True
+        # It probes by importing the plugin in the repo working dir.
+        assert calls[0][0] == ["python", "-c", "import pytest_randomly"]
+        assert calls[0][1] == tmp_path
+
+    def test_false_when_probe_nonzero(self, tmp_path: Path) -> None:
+        def runner(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+            return 1, "", "ModuleNotFoundError"
+
+        assert pytest_randomly_available(tmp_path, runner) is False
+
+    def test_false_when_interpreter_missing(self, tmp_path: Path) -> None:
+        # run_command returns 127 (never raises) when python is absent.
+        def runner(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+            return 127, "", "python: command not found"
+
+        assert pytest_randomly_available(tmp_path, runner) is False

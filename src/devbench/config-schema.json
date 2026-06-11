@@ -583,7 +583,9 @@
             "ci_failure": {"type": "boolean", "description": "Fire when CI checks on a WU PR fail. Default: false."},
             "ci_pass": {"type": "boolean", "description": "Fire when CI checks on the finalize-path batch PR turn green (PR ready for manual merge under auto_merge: false). Issue #219. Default: false."},
             "orchestrator_stop": {"type": "boolean", "description": "Fire when the orchestrator loop exits (clean, drain, SIGTERM, or crash). Default: false."},
-            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."}
+            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."},
+            "quota_waiting": {"type": "boolean", "description": "Fire when the orchestrator hits a quota and starts waiting for it to reset (payload carries the quota source/reason and the provider-stated reset time). Default: false."},
+            "quota_resumed": {"type": "boolean", "description": "Fire when the quota recovers and the run resumes (payload carries the total seconds waited). Default: false."}
           }
         },
         "slack": {

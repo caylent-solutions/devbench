@@ -71,6 +71,17 @@ configuration refactor, the EC2 remote-dev provisioning stack, and the
 work-unit lifecycle / authoring CLI improvements that have accumulated
 since the last release. PR #119 carries every change.
 
+### Fixed
+
+- **Harness reliability fixes (2026-06-11)** found during an unattended overnight run:
+  - **git-ops manifest-scoped staging (#247):** `commit_and_push`/`commit_local` stage only the work unit's Changes Manifest paths (per-path `git add`) instead of `git add -A`, so a commit can no longer sweep another (parked/blocked) unit's files into itself and misattribute them (`GET_DIFF_NO_ATTRIBUTABLE`).
+  - **task-factory proposals:** generated recovery proposals emit `type=judge` instead of a `<fill-in>` placeholder command, and `promote-proposal` fails closed on any remaining placeholder in a `type=command` directive.
+  - **executor em-dash discipline:** the executor agent prompt forbids the literal U+2014 in source/test files (construct via `chr(0x2014)`), so no-em-dash guard tests stop blocking their own unit.
+  - **notification coverage:** `notify_work_unit_promoted`/`materialised` wired at every promote/materialise site; the blocked-classification notification routes off the shared status-write surface (done-gate-refusal blocks now notify); the transition cache is invalidated on leave-blocked; `INTERRUPTED_ON_STOP` mapped (new `work_unit_blocked_interrupted_on_stop` event); a keystone coverage test asserts every event has an engine call site.
+  - **quota wait-and-resume resumes in-process:** after a quota wait recovers, `cmd_start` re-opens a fresh SDK session and continues orchestrating (capped by `DEVBENCH_MAX_QUOTA_RESUMES`) instead of exiting, so an unattended/daemon run survives quota windows.
+  - **deterministic verify-ac gate + per-unit AC-FINAL scoping:** the verify-ac pytest gate pins `PYTHONHASHSEED` and the `pytest-randomly` seed (`DEVBENCH_VERIFY_AC_PYTEST_SEED`); AC-FINAL-005/014 scoped to a unit's own tests/modules, with full-suite/global-coverage moved to new epic-capstone IDs AC-FINAL-016/017.
+  - **backlog-assistant triage skill:** `classify_blocked_task` import corrected to `devbench.backlog.proposal` with the real 4-arg signature.
+
 ### Changed (BREAKING)
 
 - **devbench.yaml default changes.** Several built-in defaults changed; workspaces
@@ -149,6 +160,20 @@ since the last release. PR #119 carries every change.
   these tests locally before push.
 
 ### Added
+
+- **Quota wait-and-resume notifications + visible polling heartbeat.** Two new
+  opt-in notification events surface the orchestrator's quota wait-and-resume
+  cycle: `quota_waiting` fires from `_handle_quota_pause` the moment a quota is
+  hit and the wait begins (payload carries the quota source/reason and the
+  provider-stated reset time), and `quota_resumed` fires on the recovered path
+  when the run resumes (payload carries the total seconds waited). Both default
+  `false` (existing workspaces stay silent on upgrade) and follow the existing
+  per-event-toggle + master-switch + webhook-presence gating; firing is
+  best-effort so a notify/IO failure can never break or delay the quota wait or
+  resume. Separately, `wait_for_reset` now emits a `[QUOTA_POLLING] elapsed=<s>
+  probe=<n> next_in=<s>` heartbeat once per recovery-probe poll, so a long wait
+  is visibly alive in the log between `[QUOTA_WAITING]` and `[QUOTA_RESUMED]`
+  rather than looking dead.
 
 - **`triage-blocked-task` matrix routes + enablement note (TDI-006).** The
   backlog-assistant triage skill gained routes for three operationally common

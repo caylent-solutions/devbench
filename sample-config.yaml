@@ -525,6 +525,7 @@ skills:
 #     work_unit_blocked_auto_clearing: false         # AUTO_CLEARING_VIA_PROPOSAL (cascade in flight)
 #     work_unit_blocked_awaiting_dependency: false   # AWAITING_DEPENDENCY (regular dep still in flight)
 #     work_unit_blocked_amendment_recovery: false    # AWAITING_AMENDMENT_RECOVERY (recovery signal on disk)
+#     work_unit_blocked_interrupted_on_stop: false   # INTERRUPTED_ON_STOP (SIGTERM force-block; auto-requeues next sweep)
 #     work_unit_materialised: false        # draft WU file written from a proposal
 #     work_unit_promoted: false            # draft WU promoted to in-queue
 #     pr_opened: false                     # `gh pr create` succeeded
@@ -532,6 +533,8 @@ skills:
 #     ci_failure: false                    # CI run on a WU PR failed
 #     orchestrator_stop: false             # orchestrator loop exited (clean / drain / SIGTERM / crash)
 #     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
+#     quota_waiting: false                 # quota hit; orchestrator started waiting for reset
+#     quota_resumed: false                 # quota recovered; run resumed
 #   slack:
 #     enabled: false                       # endpoint-level toggle; flip to true to enable Slack POSTs
 #     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)

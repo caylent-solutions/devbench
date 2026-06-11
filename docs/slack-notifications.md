@@ -177,6 +177,8 @@ Every event toggle, when it fires, and what's in the payload:
 | `ci_pass` | CI on the auto-finalize batch PR turned GREEN — explicit signal that the PR is ready for manual merge under `auto_merge: false` (#219). **Default off** so existing workspaces stay silent on upgrade. | Task id (most-recent active task or symbolic `finalize`), repo, PR URL. |
 | `orchestrator_stop` | The orchestrator loop exits -- clean, drain, SIGTERM, terminal-marker (#218), or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason, stop-class (see taxonomy below), mention level (see mapping below), in-flight WU id (when one was active), progress context (done/total count, best-effort -- omitted when the backlog parser is unavailable). |
 | `orchestrator_auto_restart` | The orchestrator exited with code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop is restarting. | List of blocked task ids (truncated at 5). |
+| `quota_waiting` | The orchestrator hit a quota and started waiting for it to reset — fires from `_handle_quota_pause` where the `[QUOTA_WAITING]` audit line is logged. **Default off.** Best-effort: a notify failure never breaks or delays the wait. | Quota source/reason (`QuotaExhaustedError.source`), provider-stated reset time (ISO 8601 or `unknown`). |
+| `quota_resumed` | The quota recovered and the run resumed — fires from `_handle_quota_pause` on the recovered path where the `[QUOTA_RESUMED]` audit line is logged. **Default off.** Best-effort: a notify failure never breaks or delays the resume. | Total seconds waited before recovery. |
 
 ### Stop-reason taxonomy
 

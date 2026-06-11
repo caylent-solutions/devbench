@@ -39,16 +39,29 @@ Remediation: verify DEVBENCH_WORKSPACE_ROOT is set and the id is correct.
 ## Step 2 -- Classify the blocked state
 
 Call `classify_blocked_task` via a `python -c` invocation. Never reimplement the
-bucket logic -- delegate entirely:
+bucket logic -- delegate entirely.
+
+> **How to call the classifier (canonical -- reused by Sub-cap 1a and Step 4a).**
+> Both `classify_blocked_task` and `classify_blocked_task_excluding_degradation`
+> live in `devbench.backlog.proposal` (NOT `devbench.backlog.manager`) and take
+> the same call form:
+>
+> ```python
+> from devbench.backlog.proposal import classify_blocked_task
+> classify_blocked_task(workspace / 'backlog', workspace / 'BACKLOG.md', '<id>', workspace_root=workspace)
+> ```
+>
+> i.e. `classify_blocked_task(backlog_root, backlog_index, task_id, *, workspace_root=...)`.
+> Never call it with only the task id and workspace (a 2-positional-arg call) -- that raises `TypeError`.
 
 ```bash
 python -c "
 import os, sys
 from pathlib import Path
-from devbench.backlog.manager import classify_blocked_task
+from devbench.backlog.proposal import classify_blocked_task
 
 workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
-result = classify_blocked_task('<id>', workspace)
+result = classify_blocked_task(workspace / 'backlog', workspace / 'BACKLOG.md', '<id>', workspace_root=workspace)
 print(result.name)
 "
 ```
@@ -59,24 +72,19 @@ If the import or call fails, fail immediately with the raw exception message.
 
 ## Sub-cap 1a -- Composite RUNTIME_DEGRADATION check (#248)
 
-If the classified bucket is `RUNTIME_DEGRADATION`, re-classify excluding the degradation rung:
+If the classified bucket is `RUNTIME_DEGRADATION`, re-classify excluding the degradation
+rung. Use the same canonical call form documented in Step 2 (same module, same
+`(backlog_root, backlog_index, task_id, *, workspace_root=...)` signature):
 
 ```bash
 python -c "
 import os, sys
 from pathlib import Path
-try:
-    from devbench.backlog.manager import classify_blocked_task_excluding_degradation
-    from devbench.backlog.manager import classify_blocked_task
-    workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
-    result = classify_blocked_task_excluding_degradation('<id>', workspace)
-    print(result.name)
-except ImportError:
-    # Graceful degradation: #248 API absent -- re-invoke existing classifier
-    from devbench.backlog.manager import classify_blocked_task
-    workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
-    result = classify_blocked_task('<id>', workspace)
-    print(result.name)
+from devbench.backlog.proposal import classify_blocked_task_excluding_degradation
+
+workspace = Path(os.environ['DEVBENCH_WORKSPACE_ROOT'])
+result = classify_blocked_task_excluding_degradation(workspace / 'backlog', workspace / 'BACKLOG.md', '<id>', workspace_root=workspace)
+print(result.name)
 "
 ```
 

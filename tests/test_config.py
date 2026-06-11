@@ -1096,3 +1096,34 @@ class TestOptionalJudgeAndDoneGateEnvOverrides:
             assert config.OPTIONAL_JUDGES["iac_review"] is False
             assert config.DONE_GATE.allow_deferred_evidence is False
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestVerifyAcPytestSeed:
+    """The deterministic per-unit verification-gate ordering seed.
+
+    Resolution precedence: ``DEVBENCH_VERIFY_AC_PYTEST_SEED`` env var >
+    ``DEFAULT_VERIFY_AC_PYTEST_SEED`` constant. The seed makes a unit's
+    ``## Verification`` pytest gate reproducible across runs.
+    """
+
+    _ENV = "DEVBENCH_VERIFY_AC_PYTEST_SEED"
+
+    def test_defaults_to_constant_when_env_unset(self) -> None:
+        from devbench.constants import DEFAULT_VERIFY_AC_PYTEST_SEED
+
+        env_copy = {k: v for k, v in os.environ.items() if k != self._ENV}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.VERIFY_AC_PYTEST_SEED == DEFAULT_VERIFY_AC_PYTEST_SEED
+        importlib.reload(config)
+
+    def test_env_override_wins(self) -> None:
+        with patch.dict(os.environ, {self._ENV: "13579"}, clear=False):
+            importlib.reload(config)
+            assert config.VERIFY_AC_PYTEST_SEED == 13579
+        importlib.reload(config)
+
+    def test_seed_is_int(self) -> None:
+        importlib.reload(config)
+        assert isinstance(config.VERIFY_AC_PYTEST_SEED, int)

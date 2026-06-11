@@ -68,11 +68,11 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NamedTuple
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -176,6 +176,7 @@ from devbench.constants import (
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
@@ -185,6 +186,8 @@ from devbench.constants import (
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX,
+    ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+    ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
@@ -4515,6 +4518,7 @@ def _run_verification_item(
     *,
     log_bytes: int,
     timeout: int,
+    pin_randomly: bool,
 ) -> "verification.EvidenceRecord":
     """Execute one executable VERIFY directive and capture its REAL exit code.
 
@@ -4524,11 +4528,35 @@ def _run_verification_item(
     trimmed text to a per-AC artifact, and returns an
     :class:`verification.EvidenceRecord` carrying the tool-captured exit code.
 
+    The command runs with a DETERMINISTIC environment overlay
+    (:func:`verification.deterministic_gate_env`): ``PYTHONHASHSEED`` is always
+    pinned, and (when *pin_randomly* is True -- i.e. the target repo has
+    ``pytest-randomly`` installed) a fixed ``--randomly-seed`` is pinned via
+    ``PYTEST_ADDOPTS`` on top of the inherited process environment so the
+    per-unit gate's verdict is reproducible run-to-run. Without this, a target
+    repo using ``pytest-randomly`` (random order per run) can pass an
+    order-dependent sibling test on one wall-clock seed and fail it on the next,
+    non-deterministically blocking an otherwise complete, unrelated unit. The
+    inherited environment is preserved (PATH etc. still resolve the toolchain);
+    only the ordering knobs are overlaid. When the plugin is absent
+    (*pin_randomly* False) the ``--randomly-seed`` option is NOT injected so a
+    repo without the plugin never errors on an unknown pytest option.
+
     The exit code is never self-reported: it comes straight from the subprocess.
     An executable directive with no ``cmd=`` is recorded as a hard failure (exit
     code ``SUBPROCESS_ERROR_EXIT_CODE``) rather than silently passing an empty
     shell -- a missing command can never be proof of a passing AC.
+
+    DEFERRED (not implemented): an automatic flaky-vs-real discriminator that,
+    on failure, re-runs the failing tests in isolation and reclassifies them as
+    a pre-existing order-dependent flake when they pass alone. With the
+    deterministic seed (here) and the spec-to-backlog own-test gate scoping in
+    place, the per-unit non-determinism is already eliminated; an
+    auto-reclassifier was judged too invasive for this critical path (it risks
+    masking a genuine failure as non-attributable, contradicting fail-fast). See
+    ``docs/acceptance-criteria-canonical.md`` "Per-unit gate vs. epic-capstone".
     """
+    from devbench.config import VERIFY_AC_PYTEST_SEED
     from devbench.constants import SUBPROCESS_ERROR_EXIT_CODE
 
     started_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
@@ -4540,7 +4568,10 @@ def _run_verification_item(
             f"VERIFY {', '.join(item.ac_ids)} is executable (type={item.vtype.value}) but declares no cmd=`...`.",
         )
     else:
-        rc, stdout, stderr = run_command(["bash", "-c", command], cwd=repo_path, timeout=timeout)
+        gate_env = verification.deterministic_gate_env(
+            dict(os.environ), seed=VERIFY_AC_PYTEST_SEED, pin_randomly=pin_randomly
+        )
+        rc, stdout, stderr = run_command(["bash", "-c", command], cwd=repo_path, timeout=timeout, env=gate_env)
     finished_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
 
     combined = "\n".join(part for part in (stdout, stderr) if part.strip())
@@ -4629,6 +4660,12 @@ def cmd_verify_ac(unit_id: str) -> int:
     executable = verification.executable_items(items)
     attempt = verification.next_attempt_number(WORKSPACE_ROOT, unit_id)
 
+    # Probe the target repo ONCE: only pin pytest-randomly's seed flag when the
+    # plugin is actually installed there (otherwise pytest would error on the
+    # unknown ``--randomly-seed`` option). ``PYTHONHASHSEED`` is pinned either
+    # way. Skip the probe entirely when there is nothing executable to run.
+    pin_randomly = bool(executable) and verification.pytest_randomly_available(repo_path, run_command)
+
     records: list[verification.EvidenceRecord] = []
     for item in executable:
         records.append(
@@ -4640,6 +4677,7 @@ def cmd_verify_ac(unit_id: str) -> int:
                 attempt,
                 log_bytes=CI_FAILURE_LOG_BYTES,
                 timeout=TEST_TIMEOUT,
+                pin_randomly=pin_randomly,
             )
         )
 
@@ -7094,6 +7132,15 @@ _QUOTA_DRAIN_STOP_REASONS: frozenset[str] = frozenset(
     {_QUOTA_STOP_REASON_DRAIN_DETECTION, _QUOTA_STOP_REASON_DRAIN_TIMEOUT}
 )
 
+#: ``_stop_reason`` string returned by :func:`_dispatch_quota_detection` when a
+#: quota wait recovered.  This value is NOT terminal: ``cmd_start`` treats it as
+#: the signal to re-open a FRESH ``ClaudeSDKClient`` session and resume the
+#: orchestrate skill on the remaining backlog (bounded by
+#: :func:`_resolve_max_quota_resumes`).  Single-sourced so the dispatch, the
+#: cmd_start resume loop, and the notification classifier never drift on the
+#: literal.
+_QUOTA_STOP_REASON_WAIT_RECOVERED: str = "quota-wait-recovered"
+
 #: HTTP timeout in seconds for the ``recovery_probe`` API call issued during
 #: quota wait polling.  A short timeout avoids blocking the orchestrator for
 #: more than one poll cycle on a transient network hang.
@@ -7741,6 +7788,34 @@ def _resolve_max_turn_end_continuations() -> int:
     return DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS
 
 
+def _resolve_max_quota_resumes() -> int:
+    """Return the effective in-process quota-resume cap (env > default).
+
+    Reads ``DEVBENCH_MAX_QUOTA_RESUMES`` from the process environment.  When the
+    variable is absent, empty, or not a parseable positive integer, the constant
+    :data:`~devbench.constants.DEFAULT_MAX_QUOTA_RESUMES` is returned so the
+    caller is never left without a bound (unset-safe).
+
+    A value <= 0 is treated as invalid and falls back to the default rather than
+    disabling the resume loop, so a typo can never silently turn a single quota
+    window back into a run-ending event (fail-safe, not fail-open).
+
+    Returns:
+        The maximum number of consecutive in-process quota resumes ``cmd_start``
+        will perform before stopping with
+        :data:`~devbench.constants.ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX`.
+    """
+    raw = os.environ.get("DEVBENCH_MAX_QUOTA_RESUMES", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return DEFAULT_MAX_QUOTA_RESUMES
+        if parsed > 0:
+            return parsed
+    return DEFAULT_MAX_QUOTA_RESUMES
+
+
 def _label_stop_reason(exc: BaseException) -> str:
     """Return a human-readable label for the orchestrator's exit (#213).
 
@@ -7949,6 +8024,7 @@ async def _handle_quota_pause(
         exc.source,
         reset_at_str,
     )
+    _fire_quota_waiting_notification(exc.source, reset_at_str)
 
     wait_start = datetime.now(tz=UTC)
 
@@ -7985,9 +8061,49 @@ async def _handle_quota_pause(
             _QUOTA_RESUMED_AUDIT_PREFIX,
             waited_seconds,
         )
+        _fire_quota_resumed_notification(waited_seconds)
         _apply_resume_strategy(qh_cfg.resume_strategy, workspace_root)
         return True
     return False
+
+
+def _fire_quota_waiting_notification(reason: str, reset_at: str) -> None:
+    """Best-effort ``quota_waiting`` Slack ping at the start of a quota wait.
+
+    Wraps :func:`devbench.notifications.notify_quota_waiting` in a catch-all so a
+    notify/IO failure (including import or config-read errors that the helper's
+    own dispatcher does not already swallow) can NEVER break or delay the quota
+    wait.  Mirrors the best-effort guard used by every other notification call
+    site in the orchestrator.
+
+    Args:
+        reason: The quota source/reason (``QuotaExhaustedError.source``).
+        reset_at: The provider-stated reset time as ISO 8601, or ``"unknown"``.
+    """
+    try:
+        from devbench.notifications import notify_quota_waiting
+
+        notify_quota_waiting(reason, reset_at)
+    except Exception as exc:  # broad guard: notification must never break/delay the wait
+        logger.warning("[WARN] notify_quota_waiting failed (ignored): %r", exc)
+
+
+def _fire_quota_resumed_notification(waited_seconds: int) -> None:
+    """Best-effort ``quota_resumed`` Slack ping on the quota-recovered path.
+
+    Wraps :func:`devbench.notifications.notify_quota_resumed` in a catch-all so a
+    notify/IO failure can NEVER break or delay the resume.  Mirrors the
+    best-effort guard used by every other notification call site.
+
+    Args:
+        waited_seconds: Total seconds spent waiting before recovery.
+    """
+    try:
+        from devbench.notifications import notify_quota_resumed
+
+        notify_quota_resumed(waited_seconds)
+    except Exception as exc:  # broad guard: notification must never break/delay the resume
+        logger.warning("[WARN] notify_quota_resumed failed (ignored): %r", exc)
 
 
 def _restore_session_env_name(prev: str | None) -> None:
@@ -8082,7 +8198,7 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
         )
     )
     if recovered:
-        return "quota-wait-recovered"
+        return _QUOTA_STOP_REASON_WAIT_RECOVERED
 
     # Timeout (max_wait elapsed) or an unrecoverable probe: apply
     # on_exhaustion_timeout (default "drain").
@@ -8130,6 +8246,142 @@ def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
     )
     request_drain(WORKSPACE_ROOT, reason=f"quota-timeout:{detected.quota_exc.source}")
     return _QUOTA_STOP_REASON_DRAIN_TIMEOUT
+
+
+def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> bool:
+    """Decide whether ``cmd_start`` may resume the orchestrate skill in-process.
+
+    Called after :func:`_dispatch_quota_detection` reports a recovered quota
+    wait (``_stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED``).  A recovered
+    wait is NOT terminal: the orchestrator opens a FRESH ``ClaudeSDKClient``
+    session and re-runs ``_run`` on the remaining backlog so a single quota
+    window cannot permanently end an unattended ``--daemon`` run (which has no
+    external ``make start`` restart wrapper).
+
+    Bounds the resume count by *max_resumes* so a pathological quota loop can
+    never spin forever:
+
+    - When *resumes_used* (resumes already performed, BEFORE this one) is below
+      *max_resumes*, emits ``[ORCHESTRATOR_QUOTA_RESUME] resume=<n> max=<cap>``
+      and returns ``True`` (caller re-runs ``_run``).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>`` and returns ``False``
+      so the caller falls through to the normal terminal classification.
+
+    Args:
+        resumes_used: Number of in-process resumes already performed during this
+            ``cmd_start`` invocation (0 on the first recovery).
+        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+
+    Returns:
+        ``True`` when another in-process resume is permitted; ``False`` when the
+        cap is exhausted and the run must stop.
+    """
+    if resumes_used >= max_resumes:
+        logger.info("%s max=%d", ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+        return False
+    logger.info(
+        "%s resume=%d max=%d",
+        ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+        resumes_used + 1,
+        max_resumes,
+    )
+    return True
+
+
+class _OrchestrateLoopResult(NamedTuple):
+    """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
+
+    Attributes:
+        terminal_rc: The exit code when the loop ended via an early-return
+            terminal path (drain enforced, a non-recovering quota disposition,
+            or the resume cap exhausted) -- always ``0`` for those paths.
+            ``None`` means ``_run`` returned normally and ``cmd_start`` must run
+            its usual post-loop terminal classification (continuation-exhausted /
+            normal-exit) instead of returning ``terminal_rc``.
+        stop_reason: The audit/Slack stop-reason label for the always-fire
+            notification.  Meaningful only when ``terminal_rc`` is not ``None``;
+            on the fall-through path ``cmd_start`` overwrites it.
+        quota_drain_requested: ``True`` when the quota disposition requested a
+            graceful drain that MUST survive process exit, so ``cmd_start``'s
+            exit ``finally`` blocks skip their otherwise-unconditional
+            ``cancel_drain`` (#236 follow-up).
+    """
+
+    terminal_rc: int | None
+    stop_reason: str
+    quota_drain_requested: bool
+
+
+def _drive_orchestrate_with_quota_resume(
+    run: Callable[[], Coroutine[Any, Any, None]],
+    session_name: str,
+) -> _OrchestrateLoopResult:
+    """Drive the orchestrate session loop with in-process quota resume.
+
+    Each iteration runs ONE ``ClaudeSDKClient`` session via ``asyncio.run(run())``
+    (*run* opens a fresh client on every call).  The loop re-enters ONLY when a
+    quota wait recovered: the orchestrator resumes the orchestrate skill on the
+    remaining backlog with a brand-new session rather than exiting, so a single
+    quota window cannot permanently end an unattended ``--daemon`` run that has
+    no external ``make start`` restart wrapper.  The number of consecutive
+    resumes is bounded by :func:`_resolve_max_quota_resumes`.
+
+    Terminal dispositions (each leaves the loop and is returned to ``cmd_start``):
+
+    - ``_run`` returns normally -> ``terminal_rc=None`` (caller runs its normal
+      continuation-exhausted / clean-exit classification).
+    - :class:`_DrainRequested` -> consume the marker, audit, ``terminal_rc=0``.
+    - :class:`_QuotaDetected` with a non-recovering disposition (fail re-raises;
+      drain/keep-waiting return a terminal stop reason) -> ``terminal_rc=0``.
+    - A recovered wait whose resume cap is exhausted -> ``terminal_rc=0`` with the
+      ``"quota-resume-cap-exhausted"`` stop reason (the exhausted audit line was
+      emitted by :func:`_should_resume_after_quota_recovery`).
+
+    Extracted from ``cmd_start`` so the added resume loop does not push that
+    function over ruff PLR0912's 12-branch ceiling.
+
+    Args:
+        run: The ``cmd_start._run`` closure; awaited fresh on every iteration.
+        session_name: Current session name, forwarded to
+            :func:`_dispatch_quota_detection` for the quota checkpoint.
+
+    Returns:
+        An :class:`_OrchestrateLoopResult` describing how the loop ended.
+
+    Raises:
+        :class:`~devbench.quota.QuotaExhaustedError`: Propagated from
+            :func:`_dispatch_quota_detection` when ``quota_handling`` is disabled
+            or the configured disposition is ``fail`` (legacy non-zero exit).
+    """
+    resumes_used = 0
+    max_resumes = _resolve_max_quota_resumes()
+    while True:
+        try:
+            asyncio.run(run())
+        except _DrainRequested as exc:
+            # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5,
+            # AC-188-8): consume the marker so the next run starts unscoped.
+            drained = consume_drain(WORKSPACE_ROOT)
+            reason_text = drained.reason if drained is not None else exc.reason
+            logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
+            return _OrchestrateLoopResult(0, f"drain enforced: {reason_text}", False)
+        except _QuotaDetected as exc:
+            # Issue #236 (AC-236-1): quota wait-and-resume dispatch.
+            stop_reason = _dispatch_quota_detection(exc, session_name)
+            if stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED:
+                if _should_resume_after_quota_recovery(resumes_used, max_resumes):
+                    resumes_used += 1
+                    continue
+                # Recovered but the resume cap is exhausted: stop terminally
+                # (the exhausted audit line was emitted by the helper above).
+                return _OrchestrateLoopResult(0, "quota-resume-cap-exhausted", False)
+            # A drain requested by on_exhaustion / on_exhaustion_timeout must
+            # outlive this process; signal the caller to preserve it.
+            return _OrchestrateLoopResult(0, stop_reason, stop_reason in _QUOTA_DRAIN_STOP_REASONS)
+        # ``_run`` returned normally (no quota / no drain): the session finished
+        # its work -- fall through to cmd_start's terminal classification.
+        return _OrchestrateLoopResult(None, "clean", False)
 
 
 def _resolve_scope_ids_or_error(parsed: _CmdStartArgs, session_scope_path: Path) -> tuple[list[str], int | None]:
@@ -8471,23 +8723,19 @@ def cmd_start(*argv: str) -> int:
     _quota_drain_requested: bool = False
     try:
         try:
-            try:
-                asyncio.run(_run())
-            except _DrainRequested as exc:
-                # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
-                # consume the marker so the next run starts unscoped, then record the audit.
-                drained = consume_drain(WORKSPACE_ROOT)
-                reason_text = drained.reason if drained is not None else exc.reason
-                logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
-                _stop_reason = f"drain enforced: {reason_text}"
-                return 0
-            except _QuotaDetected as exc:
-                # Issue #236 (AC-236-1): quota wait-and-resume dispatch.
-                _stop_reason = _dispatch_quota_detection(exc, parsed.name)
-                # A drain requested by on_exhaustion / on_exhaustion_timeout must
-                # outlive this process; signal the finally blocks to preserve it.
-                _quota_drain_requested = _stop_reason in _QUOTA_DRAIN_STOP_REASONS
-                return 0
+            # TDI: drive the orchestrate session(s) with in-process quota resume.
+            # The helper re-opens a FRESH ClaudeSDKClient and re-runs ``_run`` on
+            # the remaining backlog after every recovered quota wait (bounded by
+            # DEVBENCH_MAX_QUOTA_RESUMES) so a single quota window cannot
+            # permanently end an unattended ``--daemon`` run that lacks the
+            # external ``make start`` restart wrapper.  All non-recovered exits
+            # (clean return, drain enforced, quota fail/drain/keep-waiting,
+            # resume-cap exhausted) are returned terminally.
+            _loop_result = _drive_orchestrate_with_quota_resume(_run, parsed.name)
+            _quota_drain_requested = _loop_result.quota_drain_requested
+            if _loop_result.terminal_rc is not None:
+                _stop_reason = _loop_result.stop_reason
+                return _loop_result.terminal_rc
         finally:
             # Issue #212: drop the drain signal on any exit from the SDK run so
             # the next start does not inherit a stale request.  Run while

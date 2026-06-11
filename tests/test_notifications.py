@@ -409,6 +409,31 @@ class TestPerEventPayloads:
             for f in block.get("fields", []):
                 assert "In-flight" not in f.get("text", "")
 
+    def test_quota_waiting(self) -> None:
+        """The orchestrator hit a quota and started waiting; payload carries the
+        source/reason and the reset-at time."""
+        payload = self._capture_one(
+            notifications.notify_quota_waiting,
+            "anthropic-api",
+            "2026-01-01T16:10:00+00:00",
+            event_name="quota_waiting",
+        )
+        assert "quota" in payload["text"].lower()
+        field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "anthropic-api" in field_blob
+        assert "2026-01-01T16:10:00+00:00" in field_blob
+
+    def test_quota_resumed(self) -> None:
+        """The quota recovered; payload carries the waited-seconds total."""
+        payload = self._capture_one(
+            notifications.notify_quota_resumed,
+            1234,
+            event_name="quota_resumed",
+        )
+        assert "quota" in payload["text"].lower()
+        field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "1234" in field_blob
+
     def test_auto_restart(self) -> None:
         payload = self._capture_one(
             notifications.notify_orchestrator_auto_restart,
@@ -425,6 +450,111 @@ class TestPerEventPayloads:
         )
         field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
         assert "+15 more" in field_blob
+
+
+# ---------------------------------------------------------------------------
+# Quota notification events (quota_waiting / quota_resumed)
+# ---------------------------------------------------------------------------
+
+
+class TestQuotaNotificationEvents:
+    """The two quota lifecycle events follow the shared notify_* contract:
+    they are in ALL_EVENTS, have per-event toggles, gate on the toggle +
+    master switch + webhook presence, and are best-effort on transport
+    failure."""
+
+    def test_events_registered_in_all_events(self) -> None:
+        assert notifications.EVENT_QUOTA_WAITING in notifications.ALL_EVENTS
+        assert notifications.EVENT_QUOTA_RESUMED in notifications.ALL_EVENTS
+        # Constant strings match their config-toggle field names.
+        assert notifications.EVENT_QUOTA_WAITING == "quota_waiting"
+        assert notifications.EVENT_QUOTA_RESUMED == "quota_resumed"
+
+    def test_toggle_fields_default_false(self) -> None:
+        events = NotificationsEventsConfig()
+        assert events.quota_waiting is False
+        assert events.quota_resumed is False
+
+    def test_quota_waiting_no_post_when_toggle_off(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_waiting": False})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_waiting("anthropic-api", "unknown")
+        posted.assert_not_called()
+
+    def test_quota_resumed_no_post_when_toggle_off(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_resumed": False})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_resumed(42)
+        posted.assert_not_called()
+
+    def test_quota_waiting_no_post_when_master_switch_off(self) -> None:
+        cfg = _make_config(enabled=False, events={"quota_waiting": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_waiting("anthropic-api", "unknown")
+        posted.assert_not_called()
+
+    def test_quota_waiting_no_post_when_webhook_absent(self) -> None:
+        cfg = _make_config(enabled=True, slack_url=None, events={"quota_waiting": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_waiting("anthropic-api", "unknown")
+        posted.assert_not_called()
+
+    def test_quota_waiting_posts_when_toggle_on(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_waiting": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+        posted.assert_called_once()
+
+    def test_quota_resumed_posts_when_toggle_on(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_resumed": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_resumed(99)
+        posted.assert_called_once()
+
+    def test_quota_waiting_webhook_failure_does_not_propagate(self, capsys: pytest.CaptureFixture[str]) -> None:
+        cfg = _make_config(enabled=True, events={"quota_waiting": True})
+
+        def boom(*_a: Any, **_kw: Any) -> None:
+            raise RuntimeError("network down")
+
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook", side_effect=boom),
+        ):
+            # Must not raise -- best-effort.
+            notifications.notify_quota_waiting("anthropic-api", "unknown")
+        assert "[WARN]" in capsys.readouterr().err
+
+    def test_quota_resumed_webhook_failure_does_not_propagate(self, capsys: pytest.CaptureFixture[str]) -> None:
+        cfg = _make_config(enabled=True, events={"quota_resumed": True})
+
+        def boom(*_a: Any, **_kw: Any) -> None:
+            raise RuntimeError("network down")
+
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook", side_effect=boom),
+        ):
+            notifications.notify_quota_resumed(7)
+        assert "[WARN]" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +734,38 @@ class TestNotificationsConfigParser:
             """
         )
         assert rt.notifications.events.ci_pass is True
+
+    def test_quota_event_toggles_default_false_and_parse(self) -> None:
+        """The two quota lifecycle event toggles default to False and accept
+        independent boolean overrides from yaml."""
+        # Default false when absent.
+        rt_default = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+            """
+        )
+        assert rt_default.notifications.events.quota_waiting is False
+        assert rt_default.notifications.events.quota_resumed is False
+
+        # Explicit yaml values flip each independently.
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+              events:
+                quota_waiting: true
+                quota_resumed: true
+            """
+        )
+        assert rt.notifications.events.quota_waiting is True
+        assert rt.notifications.events.quota_resumed is True
 
     def test_non_https_webhook_url_rejected(self) -> None:
         with pytest.raises(ValueError, match="must start with 'https://'"):

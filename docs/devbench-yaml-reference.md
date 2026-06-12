@@ -290,6 +290,13 @@ manifest_amendment:
   allowed_reasons:
     - tdd_green_production_fix
   max_requests_per_execution: 1
+  # default true -- accept reason=verification_directive_defect so the pipeline can
+  # repair an objectively-defective '## Verification' directive (stale assertion
+  # superseded by a DONE unit, syntactic bug, or landed rename). Judge-gated via the
+  # manifest-amender's dedicated rubric; deterministic guards forbid weakening (same
+  # AC ids, same type=, same expect-exit; cited units must be done). Set false to
+  # require an operator edit for every verification-directive fix.
+  allow_verification_directive_amendments: true
 ```
 
 ---

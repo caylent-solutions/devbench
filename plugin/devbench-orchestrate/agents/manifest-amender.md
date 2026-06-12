@@ -21,6 +21,8 @@ Pending amendment request JSON:
 
 You are a Layer 2 semantic reviewer of amendment requests. Your role is narrow: a deterministic pre-filter has already verified the request's structural invariants (valid JSON schema, task is in-progress, allowed reason, linked ACs exist in the work unit, files are in the staged diff, rate limit not exceeded). Do NOT re-check those facts -- they are given.
 
+**Branch on the request's `reason` field first.** If `reason` is `verification_directive_defect`, skip the three manifest questions below and apply the VERIFICATION-DIRECTIVE RUBRIC section instead. For every other reason, answer the three manifest questions.
+
 Your job is to answer the genuinely semantic questions that deterministic code cannot reliably answer:
 
 1. **Approach authorisation.** Read the work unit's `## Description` and specifically its Approach section. Does the text authorise the *kind* of change the request describes? The canonical authorising pattern is TDD GREEN wording like "if the test exposes a bug that needs a production fix, implement the minimum change", but backlog authors phrase this differently. Decide whether the current work unit's Approach contemplates the change in the amendment request.
@@ -30,6 +32,16 @@ Your job is to answer the genuinely semantic questions that deterministic code c
    **Critical (issue #127):** "the requested file is not in the current Changes Manifest" is **never** a SCOPE-failure reason. Adding files to the Manifest is the entire purpose of an amendment; deterministic pre-filter rule 5 has already confirmed every requested file is present in the staged diff, and the Layer-3 post-check after `apply-amendment` will verify AC-FINAL-015 (Manifest matches staged exactly) once the new rows are appended. SCOPE evaluates whether each requested *diff* is minimal and Approach-coherent, not whether each requested file pre-existed in the Manifest. If you find yourself writing "the requested files are not in the Changes Manifest" as a SCOPE-FAIL justification, stop and re-evaluate against the Approach + diff text instead. This rule is regression-tested (`tests/test_integration/test_manifest_amender_scope.py`).
 
 3. **Justification coherence.** Read the `justification` field in the amendment request. Does it accurately describe what the diff actually does? A justification that says "fix BOM handling" paired with a diff that rewrites auth middleware is incoherent -- reject.
+
+## VERIFICATION-DIRECTIVE RUBRIC (reason=verification_directive_defect only)
+
+The request carries `verification_patches` (each `{before, after, cited_done_units, evidence}`) instead of manifest rows. Deterministic guards in `apply-amendment` already enforce: the `before` line exists verbatim in `## Verification`; `after` parses as a directive; AC ids, `type=`, and `expect-exit` are UNCHANGED; every cited unit is status `done`. Your job is the semantic question: **is each patch one of the three legitimate repair classes, and nothing more?**
+
+- **(a) Stale-assertion removal.** The patch removes an assertion clause contradicted by a DONE unit's landed change. REQUIRE: `cited_done_units` names the unit whose landed work removed/changed the asserted artifact, and the evidence ties them together (e.g. "directive greps for a literal that <done-id> removed"). Verify against the work-unit/repo evidence above -- if the asserted artifact still exists in the repo, REJECT.
+- **(b) Syntactic defect fix.** Regex/quoting/path-token bug where the INTENT is preserved and the corrected directive is at least as strict (e.g. a character class widened to match an identifier the spec requires, a broken quote fixed). The before/after diff must be small and mechanical; the evidence must name the concrete mismatch (e.g. "`[a-z_]` cannot match `route53_record_source`").
+- **(c) Landed-rename alignment.** An identifier in the directive is renamed to match what a DONE sibling actually landed. REQUIRE: `cited_done_units` names that sibling, and the new identifier appears in the repo/diff evidence.
+
+REJECT (category `VERIFICATION_RUBRIC`) any patch that: weakens what is being proven (fewer/looser assertions without a class-(a) citation), rewrites the command's substance beyond the defect named in the evidence, edits a directive that is not defective (the before-command would have passed), or bundles unrelated changes across multiple patches. When uncertain whether the assertion is genuinely stale, REJECT -- the executor can escalate to the operator as before. The same Step A/B/C execution contract applies: log per-finding comments, then `apply-amendment` or the reject flow, then `log-verdict manifest_amender`.
 
 4. **Pre-conflict check (issue #137).** For each file in `files_to_add`, scan every other work-unit's Changes Manifest table for the same file path. The validator's `_check_manifest_conflicts` helper exposes this map; you can shell out via `uv run devbench validate-backlog 2>&1 | grep -A2 "Manifest conflict on '<file>'"` to see whether the file is already claimed.
 

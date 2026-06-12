@@ -4019,6 +4019,11 @@ def cmd_report(
     else:
         log_file = _resolve_log_file_path()
 
+    # A pending drain is operationally load-bearing context (the orchestrator
+    # stops after the current WU) -- surface it in the report exactly as
+    # cmd_status does (AC-188-7 parity).
+    _render_drain_banner(WORKSPACE_ROOT)
+
     # Resolve scope (AC-190-10, AC-190-11): per-command flags take
     # precedence over an active scope.json; when neither is present,
     # scope_filter is None and generate_report uses the full backlog.

@@ -3,7 +3,9 @@
   "title": "DevBench Configuration",
   "description": "Schema for backlog/config/devbench.yaml",
   "type": "object",
-  "required": ["repos"],
+  "required": [
+    "repos"
+  ],
   "additionalProperties": false,
   "properties": {
     "repos": {
@@ -12,7 +14,10 @@
       "minProperties": 1,
       "patternProperties": {
         "^[^/]+(/[^/]+)?$": {
-          "type": ["object", "null"],
+          "type": [
+            "object",
+            "null"
+          ],
           "description": "Per-repository configuration.",
           "additionalProperties": false,
           "properties": {
@@ -26,7 +31,11 @@
             },
             "merge_strategy": {
               "type": "string",
-              "enum": ["merge", "squash", "rebase"],
+              "enum": [
+                "merge",
+                "squash",
+                "rebase"
+              ],
               "description": "Per-repo PR merge strategy override."
             },
             "local_only": {
@@ -40,7 +49,11 @@
     },
     "merge_strategy": {
       "type": "string",
-      "enum": ["merge", "squash", "rebase"],
+      "enum": [
+        "merge",
+        "squash",
+        "rebase"
+      ],
       "description": "Default PR merge strategy for all repos. Effective strategy at merge time resolves as: DEVBENCH_MERGE_STRATEGY env var > per-repo repos.<org/repo>.merge_strategy > this top-level value > 'squash'."
     },
     "max_executor_retries": {
@@ -53,12 +66,30 @@
       "description": "Optional per-judge override of max_executor_retries (issue #122). Keys must be in the canonical judge allowlist (REVIEW_JUDGE_NAMES + SECURITY_JUDGE_NAMES) plus the optional specialty judges (OPTIONAL_JUDGE_NAMES). Each value falls back to max_executor_retries when absent.",
       "additionalProperties": false,
       "properties": {
-        "code_review": { "type": "integer", "minimum": 1 },
-        "test_review": { "type": "integer", "minimum": 1 },
-        "doc_review": { "type": "integer", "minimum": 1 },
-        "changes_manifest": { "type": "integer", "minimum": 1 },
-        "security_review": { "type": "integer", "minimum": 1 },
-        "iac_review": { "type": "integer", "minimum": 1 }
+        "code_review": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "test_review": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "doc_review": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "changes_manifest": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "security_review": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "iac_review": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "optional_judges": {
@@ -99,11 +130,17 @@
       "description": "List of GitHub organisations permitted for operations."
     },
     "display_timezone": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "IANA timezone name (e.g. 'America/New_York', 'Europe/London') applied by every devbench command that renders timestamps -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the OS local timezone. Override per-invocation via the DEVBENCH_DISPLAY_TIMEZONE env var. Report-specific `report.display_timezone` / DEVBENCH_REPORT_TIMEZONE take precedence over this top-level setting for the report command only."
     },
     "log_file": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Workspace-relative path to the orchestrator's structured shared aggregate log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. When unset, the default is '<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>' (logs/orchestrator.log). Named sessions additionally write a per-session log at '.devbench/sessions/<name>/orchestrator.log' (read via 'report --session <name>'). Per-invocation override via the DEVBENCH_LOG_FILE env var still takes precedence (useful for tests)."
     },
     "timeouts": {
@@ -366,14 +403,41 @@
             "type": "object",
             "description": "Rates for a single model. `input` and `output` are required. The four optional fields override the top-level `cache_*_multiplier` defaults and the global correction factor for this model only.",
             "additionalProperties": false,
-            "required": ["input", "output"],
+            "required": [
+              "input",
+              "output"
+            ],
             "properties": {
-              "input": {"type": "number", "minimum": 0, "description": "Cost per million input tokens in USD."},
-              "output": {"type": "number", "minimum": 0, "description": "Cost per million output tokens in USD."},
-              "cache_read_multiplier": {"type": "number", "minimum": 0, "description": "Optional per-model override for cache-read multiplier (relative to input rate). When omitted, the top-level report.cache_read_multiplier applies."},
-              "cache_write_5min_multiplier": {"type": "number", "minimum": 0, "description": "Optional per-model override for 5-min cache-write multiplier."},
-              "cache_write_1hr_multiplier": {"type": "number", "minimum": 0, "description": "Optional per-model override for 1-hour cache-write multiplier."},
-              "correction_factor": {"type": "number", "exclusiveMinimum": 0, "description": "Per-model contract correction factor (issue #223). Computed cost is multiplied by this value after every other factor. Default 1.0 (no correction). Set via `devbench cost-calibrate <actual-usd>` rather than hand-editing in most workflows."}
+              "input": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Cost per million input tokens in USD."
+              },
+              "output": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Cost per million output tokens in USD."
+              },
+              "cache_read_multiplier": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional per-model override for cache-read multiplier (relative to input rate). When omitted, the top-level report.cache_read_multiplier applies."
+              },
+              "cache_write_5min_multiplier": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional per-model override for 5-min cache-write multiplier."
+              },
+              "cache_write_1hr_multiplier": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional per-model override for 1-hour cache-write multiplier."
+              },
+              "correction_factor": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Per-model contract correction factor (issue #223). Computed cost is multiplied by this value after every other factor. Default 1.0 (no correction). Set via `devbench cost-calibrate <actual-usd>` rather than hand-editing in most workflows."
+              }
             }
           }
         },
@@ -381,14 +445,35 @@
           "type": "object",
           "description": "Rates applied to the `<unknown>` bucket: any transcript message whose `model` field is missing OR a model id not present in `report.models`. When absent, falls back to the Opus 4.7 list rates so unknown models err toward over-reporting cost.",
           "additionalProperties": false,
-          "required": ["input", "output"],
+          "required": [
+            "input",
+            "output"
+          ],
           "properties": {
-            "input": {"type": "number", "minimum": 0},
-            "output": {"type": "number", "minimum": 0},
-            "cache_read_multiplier": {"type": "number", "minimum": 0},
-            "cache_write_5min_multiplier": {"type": "number", "minimum": 0},
-            "cache_write_1hr_multiplier": {"type": "number", "minimum": 0},
-            "correction_factor": {"type": "number", "exclusiveMinimum": 0}
+            "input": {
+              "type": "number",
+              "minimum": 0
+            },
+            "output": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cache_read_multiplier": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cache_write_5min_multiplier": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cache_write_1hr_multiplier": {
+              "type": "number",
+              "minimum": 0
+            },
+            "correction_factor": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
           }
         },
         "display_timezone": {
@@ -447,7 +532,9 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["tdd_green_production_fix"]
+            "enum": [
+              "tdd_green_production_fix"
+            ]
           },
           "description": "List of amendment reasons this backlog accepts. Amendment requests whose reason is not in this list are rejected by the Layer 1 pre-filter. Default: ['tdd_green_production_fix']."
         },
@@ -455,6 +542,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum amendments applied to one task during one executor run. Default 1. Prevents amendment loops."
+        },
+        "allow_verification_directive_amendments": {
+          "type": "boolean",
+          "description": "Whether the 'verification_directive_defect' amendment reason is accepted, letting the pipeline repair an objectively-defective '## Verification' directive (stale assertion superseded by a DONE unit, syntactic regex/quoting bug, or identifier rename landed by a DONE sibling). Judge-gated via the manifest-amender's dedicated rubric; deterministic guards enforce the rewrite is never weaker (same AC ids, same type=, same expect-exit; cited units must be done). Default: true (set false to require an operator edit for every verification-directive fix)."
         }
       }
     },
@@ -465,7 +556,10 @@
       "properties": {
         "default_status_for_new_work_units": {
           "type": "string",
-          "enum": ["draft", "in-queue"],
+          "enum": [
+            "draft",
+            "in-queue"
+          ],
           "description": "Lifecycle status written into the '## Status:' line of every newly created OPERATOR-AUTHORED (spec-to-backlog) work-unit file. Task-factory PROPOSALS are exempt: they are always materialised at 'proposed' and promoted per task_factory.auto_accept_proposals (this key does NOT govern proposal status). Use 'draft' to require explicit human promotion before the orchestrator picks up an authored task. Use 'in-queue' (the default) for the legacy behaviour where new authored tasks are picked up immediately. AC-189-8 and AC-189-9."
         },
         "bulk_update_confirm_threshold": {
@@ -567,25 +661,82 @@
           "description": "Per-event toggles. Every field defaults to false so the dispatcher is silent until the operator opts in.",
           "additionalProperties": false,
           "properties": {
-            "work_unit_done": {"type": "boolean", "description": "Fire when a work unit transitions to done. Default: false."},
-            "work_unit_blocked_operator": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as OPERATOR_ACTION_REQUIRED. Fires on every transition into that class (initial entry + reclassification). Default: false."},
-            "work_unit_blocked_runtime_degradation": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as RUNTIME_DEGRADATION (SDK Agent-tool loss; requires 'make start' restart). Default: false."},
-            "work_unit_blocked_held": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as HELD (status is 'hold'; operator must resume manually). Default: false."},
-            "work_unit_blocked_on_held": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as BLOCKED_ON_HELD (marker target is in 'hold'; operator must resume the held target). Default: false."},
-            "work_unit_blocked_auto_clearing": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as AUTO_CLEARING_VIA_PROPOSAL (ADR-07 cascade in flight; will auto-unblock). Default: false."},
-            "work_unit_blocked_awaiting_dependency": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as AWAITING_DEPENDENCY (regular dep still in flight; will auto-unblock). Default: false."},
-            "work_unit_blocked_amendment_recovery": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as AWAITING_AMENDMENT_RECOVERY (recovery signal on disk; will resume on next sweep). Default: false."},
-            "work_unit_blocked_interrupted_on_stop": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as INTERRUPTED_ON_STOP (force-blocked by the SIGTERM safeguard; auto-requeued on the next sweep). Transient/self-healing, so default: false (opt-in)."},
-            "work_unit_materialised": {"type": "boolean", "description": "Fire when a draft WU file is materialised from a proposal. Default: false."},
-            "work_unit_promoted": {"type": "boolean", "description": "Fire when a draft WU is promoted to in-queue. Default: false."},
-            "pr_opened": {"type": "boolean", "description": "Fire when 'gh pr create' succeeds. Default: false."},
-            "pr_merged": {"type": "boolean", "description": "Fire when 'gh pr merge' succeeds. Default: false."},
-            "ci_failure": {"type": "boolean", "description": "Fire when CI checks on a WU PR fail. Default: false."},
-            "ci_pass": {"type": "boolean", "description": "Fire when CI checks on the finalize-path batch PR turn green (PR ready for manual merge under auto_merge: false). Issue #219. Default: false."},
-            "orchestrator_stop": {"type": "boolean", "description": "Fire when the orchestrator loop exits (clean, drain, SIGTERM, or crash). Default: false."},
-            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."},
-            "quota_waiting": {"type": "boolean", "description": "Fire when the orchestrator hits a quota and starts waiting for it to reset (payload carries the quota source/reason and the provider-stated reset time). Default: false."},
-            "quota_resumed": {"type": "boolean", "description": "Fire when the quota recovers and the run resumes (payload carries the total seconds waited). Default: false."}
+            "work_unit_done": {
+              "type": "boolean",
+              "description": "Fire when a work unit transitions to done. Default: false."
+            },
+            "work_unit_blocked_operator": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as OPERATOR_ACTION_REQUIRED. Fires on every transition into that class (initial entry + reclassification). Default: false."
+            },
+            "work_unit_blocked_runtime_degradation": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as RUNTIME_DEGRADATION (SDK Agent-tool loss; requires 'make start' restart). Default: false."
+            },
+            "work_unit_blocked_held": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as HELD (status is 'hold'; operator must resume manually). Default: false."
+            },
+            "work_unit_blocked_on_held": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as BLOCKED_ON_HELD (marker target is in 'hold'; operator must resume the held target). Default: false."
+            },
+            "work_unit_blocked_auto_clearing": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as AUTO_CLEARING_VIA_PROPOSAL (ADR-07 cascade in flight; will auto-unblock). Default: false."
+            },
+            "work_unit_blocked_awaiting_dependency": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as AWAITING_DEPENDENCY (regular dep still in flight; will auto-unblock). Default: false."
+            },
+            "work_unit_blocked_amendment_recovery": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as AWAITING_AMENDMENT_RECOVERY (recovery signal on disk; will resume on next sweep). Default: false."
+            },
+            "work_unit_blocked_interrupted_on_stop": {
+              "type": "boolean",
+              "description": "Fire when the classifier flags a blocked WU as INTERRUPTED_ON_STOP (force-blocked by the SIGTERM safeguard; auto-requeued on the next sweep). Transient/self-healing, so default: false (opt-in)."
+            },
+            "work_unit_materialised": {
+              "type": "boolean",
+              "description": "Fire when a draft WU file is materialised from a proposal. Default: false."
+            },
+            "work_unit_promoted": {
+              "type": "boolean",
+              "description": "Fire when a draft WU is promoted to in-queue. Default: false."
+            },
+            "pr_opened": {
+              "type": "boolean",
+              "description": "Fire when 'gh pr create' succeeds. Default: false."
+            },
+            "pr_merged": {
+              "type": "boolean",
+              "description": "Fire when 'gh pr merge' succeeds. Default: false."
+            },
+            "ci_failure": {
+              "type": "boolean",
+              "description": "Fire when CI checks on a WU PR fail. Default: false."
+            },
+            "ci_pass": {
+              "type": "boolean",
+              "description": "Fire when CI checks on the finalize-path batch PR turn green (PR ready for manual merge under auto_merge: false). Issue #219. Default: false."
+            },
+            "orchestrator_stop": {
+              "type": "boolean",
+              "description": "Fire when the orchestrator loop exits (clean, drain, SIGTERM, or crash). Default: false."
+            },
+            "orchestrator_auto_restart": {
+              "type": "boolean",
+              "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."
+            },
+            "quota_waiting": {
+              "type": "boolean",
+              "description": "Fire when the orchestrator hits a quota and starts waiting for it to reset (payload carries the quota source/reason and the provider-stated reset time). Default: false."
+            },
+            "quota_resumed": {
+              "type": "boolean",
+              "description": "Fire when the quota recovers and the run resumes (payload carries the total seconds waited). Default: false."
+            }
           }
         },
         "slack": {
@@ -598,7 +749,10 @@
               "description": "Endpoint-level toggle. When false, no Slack POST fires regardless of the master switch or per-event toggles. Default: false."
             },
             "webhook_url": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Slack incoming webhook URL (https://hooks.slack.com/...). null disables Slack notifications. Env override: DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL."
             }
           }
@@ -674,7 +828,11 @@
         },
         "on_exhaustion": {
           "type": "string",
-          "enum": ["wait", "fail", "drain"],
+          "enum": [
+            "wait",
+            "fail",
+            "drain"
+          ],
           "description": "Action when a quota signal is detected. Default: 'wait'."
         },
         "poll_interval_seconds": {
@@ -690,12 +848,20 @@
         },
         "on_exhaustion_timeout": {
           "type": "string",
-          "enum": ["drain", "fail", "keep_waiting"],
+          "enum": [
+            "drain",
+            "fail",
+            "keep_waiting"
+          ],
           "description": "Action when max_wait_seconds elapses without recovery. Default: 'drain'."
         },
         "resume_strategy": {
           "type": "string",
-          "enum": ["continue_current_wu", "restart_wu", "drain_and_resume"],
+          "enum": [
+            "continue_current_wu",
+            "restart_wu",
+            "drain_and_resume"
+          ],
           "description": "How to resume after successful recovery. Default: 'continue_current_wu'."
         },
         "audit_comment_on_wait": {

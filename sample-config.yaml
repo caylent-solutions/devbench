@@ -343,6 +343,13 @@ manifest_amendment:
   allowed_reasons:
     - tdd_green_production_fix
   max_requests_per_execution: 1
+  # Accept reason=verification_directive_defect: the pipeline may repair an
+  # objectively-defective '## Verification' directive (stale assertion
+  # superseded by a DONE unit, syntactic regex/quoting bug, or identifier
+  # rename landed by a DONE sibling). Judge-gated (manifest-amender rubric);
+  # deterministic guards keep the rewrite from ever being weaker (same AC ids,
+  # same type=, same expect-exit; cited units must be done). Default: true.
+  allow_verification_directive_amendments: true
 
 # ---------------------------------------------------------------------------
 # Task factory loop (requires manifest_amendment.enabled: true)

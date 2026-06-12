@@ -127,6 +127,36 @@ If pre-existing index entries from a prior blocked task pollute your staging are
            The orchestrator's next step runs the `manifest-amender` agent, which decides
            whether to apply or reject the amendment. Continue to REFACTOR and Phase 8
            logging as normal; do NOT attempt to run the amender yourself.
+        d. **Defective `## Verification` directive (reason=verification_directive_defect).**
+           When verify-ac fails on a directive that is OBJECTIVELY defective -- (a) it
+           asserts repo state that a DONE unit's landed change removed/renamed, (b) it has
+           a syntactic bug (regex/quoting/path) where the intent is clear, or (c) it names
+           an identifier a DONE sibling landed under a different name -- and the workspace
+           enables `manifest_amendment.allow_verification_directive_amendments`, file a
+           verification-directive amendment INSTEAD of a NEEDS_ESCALATION comment:
+           ```bash
+           cat <<'EOF' | uv run devbench request-amendment $ARGUMENTS
+           {
+             "reason": "verification_directive_defect",
+             "justification": "<which directive is defective and why, in one or two sentences>",
+             "files_to_add": [],
+             "linked_acs": ["<AC-ID of the directive>"],
+             "verification_patches": [
+               {
+                 "before": "<the EXACT defective directive line, verbatim>",
+                 "after": "<the corrected directive line>",
+                 "cited_done_units": ["<done unit id whose landed change justifies the edit, when applicable>"],
+                 "evidence": "<the tool-captured proof: the failing check + the ground-truth fact>"
+               }
+             ]
+           }
+           EOF
+           ```
+           HARD CONSTRAINTS (deterministic guards reject violations): `after` must keep the
+           SAME AC ids, SAME `type=`, SAME `expect-exit` -- you may never weaken the gate,
+           convert command->deferred, or drop coverage. Cited units must be status `done`.
+           If the directive's defect does not fit classes (a)/(b)/(c), or the flag is off,
+           fall back to the `[NEEDS_ESCALATION]` comment as before -- the operator decides.
 
      3. If amendments are disabled: do NOT stage the production fix. Unstage anything
         you staged with `git restore --staged <file>`. Log an escalation comment and

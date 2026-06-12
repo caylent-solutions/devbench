@@ -90,6 +90,31 @@ The executor writes JSON with these fields. `request-amendment` fills in `task_i
 }
 ```
 
+### Verification-directive amendments (`reason: verification_directive_defect`)
+
+A second request shape repairs an objectively-defective `## Verification` directive without an operator stop-window. Accepted only when `manifest_amendment.allow_verification_directive_amendments` is true (the default); carries `verification_patches` instead of manifest rows (`files_to_add` must be empty):
+
+```json
+{
+  "reason": "verification_directive_defect",
+  "justification": "<which directive is defective and why>",
+  "files_to_add": [],
+  "linked_acs": ["<AC-ID of the directive>"],
+  "verification_patches": [
+    {
+      "before": "<the EXACT defective directive line, verbatim>",
+      "after": "<the corrected directive line>",
+      "cited_done_units": ["<done unit id justifying the edit, when applicable>"],
+      "evidence": "<tool-captured proof: the failing check + the ground-truth fact>"
+    }
+  ]
+}
+```
+
+The three legitimate repair classes (the manifest-amender's VERIFICATION-DIRECTIVE RUBRIC rejects everything else): **(a) stale-assertion removal** -- the directive asserts repo state a DONE unit's landed change removed (citation required); **(b) syntactic defect fix** -- regex/quoting/path bug with intent preserved (e.g. a character class that cannot match a spec-required identifier); **(c) landed-rename alignment** -- an identifier renamed to match what a DONE sibling actually landed (citation required).
+
+Deterministic guards in `apply-amendment` make weakening impossible regardless of what the judge approves: the `after` line must keep the **same AC ids, same `type=`, same `expect-exit`** as `before` (so a `command` can never become `deferred` and the gate semantics never loosen); the `before` line must exist verbatim in `## Verification`; every cited unit must be status `done`; the standard Layer 3 post-check (em-dash scan + full `validate-backlog`) runs with atomic rollback. The applied edit writes a `[VERIFICATION_AMENDMENT]` audit comment quoting before/after, citations, and evidence.
+
 ### Operator-mode fields (issue #242 / Appendix D-7)
 
 When `request-amendment` is invoked with `--operator-mode`, the JSON payload may include seven additional optional patch fields. All fields default to their zero value when absent and are validated by `AmendmentRequest.from_dict`.

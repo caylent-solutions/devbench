@@ -47,6 +47,7 @@ from devbench.backlog.manifest import (
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
 from devbench.utils.io import atomic_write_text
+from devbench.verification import VerificationItem, parse_verification_item
 
 if TYPE_CHECKING:
     from devbench.config_loader import AmendmentConfig
@@ -64,7 +65,18 @@ REJECTED_REQUESTS_DIR_NAME = ".devbench/rejected-requests"
 # REVIEW_FAILURES_DIR_NAME.
 AMENDER_REJECTIONS_DIR_NAME = ".devbench/amender-rejections"
 REVIEW_FAILURES_DIR_NAME = ".devbench/review-failures"
-ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset({"tdd_green_production_fix"})
+#: Amendment reason for repairing an objectively-defective ``## Verification``
+#: directive (stale assertion superseded by a DONE unit, syntactic bug, or
+#: identifier rename landed by a DONE sibling). Config-gated by
+#: ``manifest_amendment.allow_verification_directive_amendments``.
+REASON_VERIFICATION_DIRECTIVE_DEFECT: str = "verification_directive_defect"
+
+ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset(
+    {"tdd_green_production_fix", REASON_VERIFICATION_DIRECTIVE_DEFECT}
+)
+
+#: Audit-comment action tag written when a verification-directive amendment is applied.
+VERIFICATION_AMENDMENT_ACTION: str = "VERIFICATION_AMENDMENT"
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
 OPERATOR_AMENDMENT_ACTION = "OPERATOR_AMENDMENT"
@@ -107,6 +119,38 @@ class AmendmentFileEntry:
 
 
 @dataclass(frozen=True)
+class VerificationPatch:
+    """One ``## Verification`` directive rewrite requested in a
+    ``verification_directive_defect`` amendment.
+
+    ``before`` is the EXACT defective directive line as it appears in the
+    work unit; ``after`` is the corrected line. ``cited_done_units`` names the
+    DONE unit(s) whose landed change justifies the edit (required for
+    stale-assertion removals and landed-rename alignments; may be empty for
+    purely syntactic fixes). ``evidence`` is the tool-captured proof of the
+    defect and is always mandatory.
+    """
+
+    before: str
+    after: str
+    cited_done_units: list[str] = dataclass_field(default_factory=list)
+    evidence: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.before or not self.before.strip():
+            raise ValueError("VerificationPatch.before must be non-empty")
+        if not self.after or not self.after.strip():
+            raise ValueError("VerificationPatch.after must be non-empty")
+        if not self.evidence or not self.evidence.strip():
+            raise ValueError("VerificationPatch.evidence must be non-empty")
+        if self.before.strip() == self.after.strip():
+            raise ValueError("VerificationPatch.after must differ from before (no-op patch)")
+        for unit_id in self.cited_done_units:
+            if not unit_id or not str(unit_id).strip():
+                raise ValueError("VerificationPatch.cited_done_units entries must be non-empty")
+
+
+@dataclass(frozen=True)
 class AmendmentRequest:
     """Serialised form of an amendment request emitted by the executor.
 
@@ -133,6 +177,11 @@ class AmendmentRequest:
 
     ``section_patches`` -- mapping of section header (e.g. ``"## Related Specs"``)
     to replacement body text; applied after the named single-section patch fields.
+
+    ``verification_patches`` -- list of :class:`VerificationPatch` directive
+    rewrites; only valid (and required) when ``reason`` is
+    ``verification_directive_defect``, in which case ``files_to_add`` must be
+    empty (a directive amendment never also touches the Manifest).
     """
 
     task_id: str
@@ -150,6 +199,8 @@ class AmendmentRequest:
     title_patch: str = ""
     dod_patch: str = ""
     section_patches: dict[str, str] = dataclass_field(default_factory=dict)
+    # Verification-directive amendment fields
+    verification_patches: list[VerificationPatch] = dataclass_field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the request as a JSON-serialisable dict."""
@@ -203,6 +254,7 @@ class AmendmentRequest:
         title_patch = _parse_title_patch(data)
         dod_patch = _parse_string_field(data, "dod_patch")
         section_patches = _parse_section_patches(data)
+        verification_patches = _parse_verification_patches(data)
 
         return cls(
             task_id=task_id,
@@ -219,6 +271,7 @@ class AmendmentRequest:
             title_patch=title_patch,
             dod_patch=dod_patch,
             section_patches=section_patches,
+            verification_patches=verification_patches,
         )
 
 
@@ -305,6 +358,36 @@ def _parse_section_patches(data: dict[str, Any]) -> dict[str, str]:
         if not isinstance(value, str):
             raise ValueError(f"section_patches values must be strings, got {type(value).__name__}")
     return dict(raw)
+
+
+def _parse_verification_patches(data: dict[str, Any]) -> list[VerificationPatch]:
+    """Parse the optional ``verification_patches`` list from a request dict.
+
+    Raises ``ValueError`` on a non-list value or malformed entries.
+    """
+    raw = data.get("verification_patches", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"verification_patches must be a list, got {type(raw).__name__}")
+    patches: list[VerificationPatch] = []
+    for entry in raw:
+        if isinstance(entry, VerificationPatch):
+            patches.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"verification_patches entries must be objects, got {type(entry).__name__}")
+        _require_keys(entry, ["before", "after", "evidence"])
+        cited_raw = entry.get("cited_done_units", [])
+        if not isinstance(cited_raw, list):
+            raise ValueError(f"cited_done_units must be a list, got {type(cited_raw).__name__}")
+        patches.append(
+            VerificationPatch(
+                before=str(entry["before"]),
+                after=str(entry["after"]),
+                cited_done_units=[str(x) for x in cited_raw],
+                evidence=str(entry["evidence"]),
+            )
+        )
+    return patches
 
 
 def request_path(workspace_root: Path, task_id: str) -> Path:
@@ -400,6 +483,25 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
 
     original_content = wu_file.read_text(encoding="utf-8")
 
+    if request.reason == REASON_VERIFICATION_DIRECTIVE_DEFECT:
+        patched_content = _apply_verification_patches(original_content, request, backlog_index)
+        audit_entry = _build_verification_audit_entry(request)
+        final_content = _append_audit_comment(patched_content, audit_entry)
+        atomic_write_text(wu_file, final_content)
+        try:
+            _post_check(final_content, backlog_index)
+        except AmendmentError:
+            atomic_write_text(wu_file, original_content)
+            raise
+        delete_request(workspace_root, task_id)
+        logger.info(
+            "Verification amendment applied for %s: %d directive(s), reason=%s",
+            task_id,
+            len(request.verification_patches),
+            request.reason,
+        )
+        return
+
     try:
         manifest_rows = [ManifestRow(file=f.path, change=f.change) for f in request.files_to_add]
     except ValueError as exc:
@@ -423,6 +525,133 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
 
     delete_request(workspace_root, task_id)
     logger.info("Amendment applied for %s: %d file(s), reason=%s", task_id, len(manifest_rows), request.reason)
+
+
+_VERIFY_LINE_PREFIX = "- VERIFY"
+
+
+def _parse_directive_line(line: str, *, role: str) -> VerificationItem:
+    """Parse one ``- VERIFY ...`` directive line into a :class:`VerificationItem`.
+
+    Raises ``AmendmentError`` (naming *role*: ``before`` or ``after``) when the
+    line is not a parseable verification directive.
+    """
+    stripped = line.strip()
+    if not stripped.startswith(_VERIFY_LINE_PREFIX):
+        raise AmendmentError(f"Verification patch {role!r} line is not a '- VERIFY' directive: {stripped[:80]!r}")
+    body = stripped[len(_VERIFY_LINE_PREFIX) :]
+    try:
+        return parse_verification_item(body)
+    except ValueError as exc:
+        raise AmendmentError(f"Verification patch {role!r} line does not parse as a directive: {exc}") from exc
+
+
+def _check_patch_invariants(patch: VerificationPatch) -> None:
+    """Deterministic guards: a rewritten directive can never be weaker.
+
+    The AC ids, directive ``type=``, and ``expect-exit`` of ``after`` must be
+    identical to ``before``. Raises ``AmendmentError`` on any violation.
+    """
+    before_item = _parse_directive_line(patch.before, role="before")
+    after_item = _parse_directive_line(patch.after, role="after")
+    if set(before_item.ac_ids) != set(after_item.ac_ids):
+        raise AmendmentError(
+            f"Verification patch changes the directive's AC ids "
+            f"({sorted(before_item.ac_ids)} -> {sorted(after_item.ac_ids)}); AC id changes are never allowed."
+        )
+    if before_item.vtype is not after_item.vtype:
+        raise AmendmentError(
+            f"Verification patch changes the directive's type= "
+            f"({before_item.vtype.value} -> {after_item.vtype.value}); type changes are never allowed."
+        )
+    if before_item.expect_exit != after_item.expect_exit:
+        raise AmendmentError(
+            f"Verification patch changes the directive's expect-exit "
+            f"({before_item.expect_exit} -> {after_item.expect_exit}); expect-exit changes are never allowed."
+        )
+
+
+def _check_citations_done(patches: list[VerificationPatch], backlog_index: Path) -> None:
+    """Every cited unit must exist in the backlog index with status ``done``."""
+    cited = {unit_id for patch in patches for unit_id in patch.cited_done_units}
+    if not cited:
+        return
+    parser = BacklogParser(
+        backlog_root=backlog_index.parent / "backlog",
+        backlog_index=backlog_index,
+    )
+    try:
+        units = {unit.id: unit for unit in parser.parse_index()}
+    except (FileNotFoundError, ValueError) as exc:
+        raise AmendmentError(f"Cannot read backlog index {backlog_index}: {exc}") from exc
+    for unit_id in sorted(cited):
+        unit = units.get(unit_id)
+        if unit is None:
+            raise AmendmentError(f"Verification patch cites unit {unit_id} which does not exist in the backlog index.")
+        if unit.status is not WorkUnitStatus.DONE:
+            raise AmendmentError(
+                f"Verification patch cites unit {unit_id} with status {unit.status.value!r}; "
+                "cited units must be status done (only landed work justifies a directive edit)."
+            )
+
+
+def _apply_verification_patches(content: str, request: AmendmentRequest, backlog_index: Path) -> str:
+    """Rewrite each patched directive line inside the ``## Verification`` section.
+
+    Enforces the deterministic guards (same AC ids / type / expect-exit, cited
+    units done, exact ``before`` line present in the section) and returns the
+    patched work-unit content. Raises ``AmendmentError`` on any violation; the
+    caller owns atomic write + rollback.
+    """
+    for patch in request.verification_patches:
+        _check_patch_invariants(patch)
+    _check_citations_done(request.verification_patches, backlog_index)
+
+    lines = content.splitlines(keepends=True)
+    section_start: int | None = None
+    section_end = len(lines)
+    for idx, line in enumerate(lines):
+        if line.strip() == "## Verification":
+            section_start = idx
+            continue
+        if section_start is not None and line.startswith("## ") and idx > section_start:
+            section_end = idx
+            break
+    if section_start is None:
+        raise AmendmentError("Work unit has no '## Verification' section; cannot apply a verification patch.")
+
+    for patch in request.verification_patches:
+        target = patch.before.strip()
+        replaced = False
+        for idx in range(section_start + 1, section_end):
+            if lines[idx].strip() == target:
+                newline = "\n" if lines[idx].endswith("\n") else ""
+                lines[idx] = patch.after.strip() + newline
+                replaced = True
+                break
+        if not replaced:
+            raise AmendmentError(
+                f"Verification patch 'before' line not found in the '## Verification' section: {target[:120]!r}"
+            )
+    return "".join(lines)
+
+
+def _build_verification_audit_entry(request: AmendmentRequest) -> str:
+    """Render the ``[VERIFICATION_AMENDMENT]`` audit comment for the work unit."""
+    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    parts: list[str] = []
+    for patch in request.verification_patches:
+        cited = ", ".join(patch.cited_done_units) if patch.cited_done_units else "(none)"
+        parts.append(
+            f"before: {patch.before.strip()} | after: {patch.after.strip()} | "
+            f"cited: {cited} | evidence: {patch.evidence.strip()}"
+        )
+    body = " || ".join(parts)
+    return (
+        f"[{timestamp}] [{AMENDER_AGENT_ID}] [{VERIFICATION_AMENDMENT_ACTION}] applied "
+        f"{len(request.verification_patches)} directive patch(es); reason={request.reason}; "
+        f"justification: {request.justification}; {body}\n"
+    )
 
 
 def apply_operator_amendment(backlog_index: Path, task_id: str, request: AmendmentRequest) -> int:
@@ -768,6 +997,7 @@ class PreFilter:
         """
         self.check_enabled()
         self.check_reason_allowed(request)
+        self.check_verification_patch_shape(request)
         self.check_rate_limit(prior_applied_count)
         if not operator_mode:
             unit = self.check_task_exists_and_in_progress(request)
@@ -785,11 +1015,48 @@ class PreFilter:
             )
 
     def check_reason_allowed(self, request: AmendmentRequest) -> None:
-        """The request's reason must be in the backlog's ``allowed_reasons`` list."""
+        """The request's reason must be permitted for this backlog.
+
+        ``verification_directive_defect`` is governed by the dedicated
+        ``manifest_amendment.allow_verification_directive_amendments`` flag
+        (default on) rather than ``allowed_reasons``, so workspaces toggle it
+        without re-declaring the standard reason list.
+        """
+        if request.reason == REASON_VERIFICATION_DIRECTIVE_DEFECT:
+            if not self._config.allow_verification_directive_amendments:
+                raise AmendmentError(
+                    "Verification-directive amendments are disabled for this backlog. "
+                    "Set manifest_amendment.allow_verification_directive_amendments: true "
+                    "in backlog/config/devbench.yaml to enable."
+                )
+            return
         if request.reason not in self._config.allowed_reasons:
             raise AmendmentError(
                 f"Amendment reason {request.reason!r} is not in allowed reasons for this backlog: "
                 f"{sorted(self._config.allowed_reasons)}"
+            )
+
+    def check_verification_patch_shape(self, request: AmendmentRequest) -> None:
+        """Verification patches and the directive-defect reason imply each other.
+
+        A ``verification_directive_defect`` request must carry at least one
+        patch and must NOT also touch the Manifest (``files_to_add`` empty);
+        any other reason must not smuggle in ``verification_patches``.
+        """
+        if request.reason == REASON_VERIFICATION_DIRECTIVE_DEFECT:
+            if not request.verification_patches:
+                raise AmendmentError(
+                    "verification_directive_defect amendments require at least one entry in verification_patches."
+                )
+            if request.files_to_add:
+                raise AmendmentError(
+                    "verification_directive_defect amendments must not carry files_to_add -- "
+                    "a directive amendment never also touches the Changes Manifest."
+                )
+        elif request.verification_patches:
+            raise AmendmentError(
+                f"verification_patches are only valid with reason "
+                f"{REASON_VERIFICATION_DIRECTIVE_DEFECT!r}, got {request.reason!r}."
             )
 
     def check_rate_limit(self, prior_applied_count: int) -> None:

@@ -21338,3 +21338,56 @@ class TestInactivityTimeout:
             f"asyncio.wait_for must not be called when timeout=0 (disabled); got {len(wait_for_calls)} call(s)"
         )
         assert rc == 0
+
+
+class TestCmdReportDrainBanner:
+    """cmd_report prepends the DRAIN REQUESTED banner when a drain signal is pending.
+
+    A pending drain is operationally load-bearing context (the orchestrator will
+    stop after the current WU); the report must surface it just like cmd_status
+    does (AC-188-7 parity).
+    """
+
+    @pytest.mark.unit
+    def test_report_shows_drain_banner_when_pending(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report renders 'DRAIN REQUESTED' (with the reason) when drain.signal exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "pre-release freeze")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="Test report output"),
+        ):
+            rc = cli.cmd_report()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" in out
+        assert "pre-release freeze" in out
+
+    @pytest.mark.unit
+    def test_report_banner_precedes_report_body(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The drain banner appears before the report body so it cannot be missed."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "pre-release freeze")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="Test report output"),
+        ):
+            cli.cmd_report()
+
+        out = capsys.readouterr().out
+        assert out.index("DRAIN REQUESTED") < out.index("Test report output")
+
+    @pytest.mark.unit
+    def test_report_no_banner_without_drain(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report does not render the banner when no drain signal exists."""
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="Test report output"),
+        ):
+            rc = cli.cmd_report()
+
+        assert rc == 0
+        assert "DRAIN REQUESTED" not in capsys.readouterr().out

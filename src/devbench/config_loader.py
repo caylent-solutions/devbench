@@ -529,11 +529,19 @@ class AmendmentConfig:
             pre-filter.
         max_requests_per_execution: Upper bound on amendments applied to a
             single task during one executor run; prevents amendment loops.
+        allow_verification_directive_amendments: Whether the
+            ``verification_directive_defect`` amendment reason is accepted,
+            letting the pipeline repair an objectively-defective
+            ``## Verification`` directive (judge-gated, never weakening:
+            same AC ids / type / expect-exit enforced deterministically).
+            Default ``True`` -- set ``false`` to require an operator edit
+            for every verification-directive fix.
     """
 
     enabled: bool = True
     allowed_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"tdd_green_production_fix"}))
     max_requests_per_execution: int = 1
+    allow_verification_directive_amendments: bool = True
 
 
 @dataclass
@@ -1944,6 +1952,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
         max_requests_per_execution=int(
             amendment_raw.get("max_requests_per_execution", default_amendment.max_requests_per_execution)
+        ),
+        allow_verification_directive_amendments=bool(
+            amendment_raw.get(
+                "allow_verification_directive_amendments",
+                default_amendment.allow_verification_directive_amendments,
+            )
         ),
     )
 

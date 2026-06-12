@@ -778,7 +778,7 @@ uv run devbench start --include "E1-F2-S3-T4"
 # -> orchestrator claims E1-F2-S3-T4, completes it, detects drain, exits rc=0
 ```
 
-**Status banner:** when a drain signal is present, `devbench status` prepends a `DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner above the Status Summary so the operator can see the pending drain at a glance. See the [`status`](#status) section for the full banner format.
+**Status banner:** when a drain signal is present, `devbench status` prepends a `DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner above the Status Summary so the operator can see the pending drain at a glance. See the [`status`](#status) section for the full banner format. `devbench report` renders the same banner ahead of the report body, so the pending drain is visible from either surface.
 
 ---
 

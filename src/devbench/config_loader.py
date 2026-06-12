@@ -648,14 +648,17 @@ class BacklogConfig:
 
     Attributes:
         default_status_for_new_work_units: Lifecycle status written into the
-            ``## Status:`` line of every newly created work-unit file.
-            Accepted values: ``STATUS_DRAFT`` (``'draft'``) or
-            ``STATUS_IN_QUEUE`` (``'in-queue'``), imported from
+            ``## Status:`` line of every newly created OPERATOR-AUTHORED
+            (spec-to-backlog) work-unit file. Task-factory PROPOSALS are
+            exempt: they are always materialised at ``proposed`` and promoted
+            per ``task_factory.auto_accept_proposals`` -- this key does NOT
+            govern proposal status. Accepted values: ``STATUS_DRAFT``
+            (``'draft'``) or ``STATUS_IN_QUEUE`` (``'in-queue'``), imported from
             ``devbench.constants``. Defaults to ``STATUS_IN_QUEUE`` for
             backwards compatibility -- existing workspaces without the config
             key see no behaviour change (AC-189-9). Set to ``STATUS_DRAFT``
             (``'draft'``) to require explicit human promotion before the
-            orchestrator picks up a new task (AC-189-8).
+            orchestrator picks up a new authored task (AC-189-8).
         bulk_update_confirm_threshold: Number of work units above which
             ``devbench set-status`` with selector flags prompts for
             confirmation before applying a bulk status change. Must be >= 0.

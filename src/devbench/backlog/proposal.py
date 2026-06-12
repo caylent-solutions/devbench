@@ -4,10 +4,11 @@ After the manifest-amender rejects an amendment whose changes are legitimate
 production fixes outside the task's scope, the orchestrator invokes
 ``devbench-orchestrate:blocker-resolver`` which writes a proposal JSON file describing
 one or more new work units the factory should generate. ``devbench-orchestrate:task-factory``
-then materialises each proposed task as a draft ``.md`` file with a status
-determined by ``backlog.default_status_for_new_work_units`` in
-``backlog/config/devbench.yaml`` (default: ``in-queue``; ``draft`` when opted in
-via AC-189-8) and inserts a row in ``BACKLOG.md``. The human reviews, edits,
+then materialises each proposed task as a draft ``.md`` file at
+``## Status: proposed`` -- proposals' dedicated staging state -- and inserts a
+row in ``BACKLOG.md``. Promotion to ``in-queue`` is gated by
+``task_factory.auto_accept_proposals`` (auto-promoted at propose / sweep time
+when true; left at ``proposed`` for operator review when false). The human reviews, edits,
 and promotes (``devbench promote-proposal``) or rejects
 (``devbench reject-proposal``) each draft.
 
@@ -32,10 +33,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from devbench.config_loader import RuntimeConfig
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
@@ -47,7 +44,6 @@ from devbench.constants import (
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     STATUS_DECLINED,
     STATUS_DONE,
-    STATUS_DRAFT,
     STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
@@ -57,29 +53,9 @@ from devbench.utils.io import atomic_write_text
 logger = logging.getLogger(__name__)
 
 
-def _get_runtime_config() -> RuntimeConfig:
-    """Return the live ``RUNTIME_CONFIG`` singleton.
-
-    Isolated into a module-level function so tests can monkeypatch it without
-    importing ``devbench.config`` at module load time (which would trigger the
-    full config-load cycle and potentially fail in environments without a
-    ``devbench.yaml``).
-
-    Returns:
-        The ``RuntimeConfig`` instance from ``devbench.config``.
-    """
-    from devbench.config import RUNTIME_CONFIG
-
-    return RUNTIME_CONFIG
-
-
 PROPOSAL_DIR_NAME = ".devbench/proposals"
 REJECTED_PROPOSAL_DIR_NAME = ".devbench/rejected-proposals"
 LOCK_FILE_NAME = ".devbench/task-factory.lock"
-
-# Allowed values for ``backlog.default_status_for_new_work_units`` (AC-189-8).
-# Only these two statuses are valid initial states for materialised work units.
-_ALLOWED_NEW_WU_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
 
 # Minimum character length for a ``suggested_approach`` field. Enforced by
 # ``materialise_proposal`` as a fail-fast contract against thin auto-generated
@@ -1674,23 +1650,24 @@ def materialise_proposal(
     every time a thin draft lands.
 
     The ``## Status:`` line in every new draft file and the corresponding
-    BACKLOG.md row are set to
-    ``RUNTIME_CONFIG.backlog.default_status_for_new_work_units`` (AC-189-8).
-    When the config key is absent the dataclass default (``in-queue``) is
-    used, preserving backwards compatibility for workspaces that have not
-    opted in to the ``backlog:`` YAML section (AC-189-9).
+    BACKLOG.md row are set to ``proposed`` -- proposals' dedicated staging
+    state. Promotion to ``in-queue`` is gated by
+    ``task_factory.auto_accept_proposals`` at the propose / sweep call sites,
+    NOT by ``backlog.default_status_for_new_work_units`` (which governs
+    operator-authored units only).
     """
-    # Read the configured default status for new work units once per call.
-    # The lazy _get_runtime_config() helper is monkeypatched in tests to avoid
-    # loading the real config from disk.
-    runtime_cfg = _get_runtime_config()
-    new_wu_status: str = runtime_cfg.backlog.default_status_for_new_work_units
-    if new_wu_status not in _ALLOWED_NEW_WU_STATUSES:
-        raise ProposalError(
-            f"backlog.default_status_for_new_work_units has invalid value {new_wu_status!r}; "
-            f"allowed values are {sorted(_ALLOWED_NEW_WU_STATUSES)!r}. "
-            "Update backlog/config/devbench.yaml to use 'in-queue' or 'draft'."
-        )
+    # Every proposal is materialised at the dedicated ``proposed`` staging
+    # state. Promotion to ``in-queue`` is gated by
+    # ``task_factory.auto_accept_proposals`` -- applied by the propose /
+    # write-proposal call sites and by ``devbench sweep-proposals`` (which
+    # promote ``proposed`` -> ``in-queue`` when the flag is true, or leave the
+    # draft at ``proposed`` for operator review when false).
+    # ``backlog.default_status_for_new_work_units`` deliberately does NOT apply
+    # here -- it governs operator-authored (spec-to-backlog) units only.
+    # Writing a proposal at ``draft`` would make ``classify_proposed_task``
+    # report it as PROMOTED, so the auto-accept sweep would never promote it:
+    # exactly the defect this status decoupling fixes.
+    new_wu_status: str = STATUS_PROPOSED
     # Thin-approach refusal -- fail fast before any file write so a partial
     # materialisation cannot leave the backlog half-written. Applies to the
     # whole proposal, even if some tasks are already resolved, because a

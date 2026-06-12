@@ -466,7 +466,7 @@
         "default_status_for_new_work_units": {
           "type": "string",
           "enum": ["draft", "in-queue"],
-          "description": "Lifecycle status written into the '## Status:' line of every newly created work-unit file. Use 'draft' to require explicit human promotion before the orchestrator picks up the task. Use 'in-queue' (the default) for the legacy behaviour where new tasks are picked up immediately. AC-189-8 and AC-189-9."
+          "description": "Lifecycle status written into the '## Status:' line of every newly created OPERATOR-AUTHORED (spec-to-backlog) work-unit file. Task-factory PROPOSALS are exempt: they are always materialised at 'proposed' and promoted per task_factory.auto_accept_proposals (this key does NOT govern proposal status). Use 'draft' to require explicit human promotion before the orchestrator picks up an authored task. Use 'in-queue' (the default) for the legacy behaviour where new authored tasks are picked up immediately. AC-189-8 and AC-189-9."
         },
         "bulk_update_confirm_threshold": {
           "type": "integer",

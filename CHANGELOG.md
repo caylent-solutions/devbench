@@ -73,6 +73,8 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **`task_factory.auto_accept_proposals` now actually auto-promotes (2026-06-12).** Proposals were materialised with the status from `backlog.default_status_for_new_work_units` (`draft` / `in-queue`), but `classify_proposed_task` and the auto-promote sweep only act on `## Status: proposed` -- so under the default `draft` the flag was a **silent no-op**: every blocker-resolver fix-proposal stranded at `draft` and required a manual `devbench promote`, defeating unattended operation. `materialise_proposal` now always writes `## Status: proposed` (proposals' dedicated staging state, decoupled from `default_status_for_new_work_units`, which now governs operator-authored spec-to-backlog units only); promotion to `in-queue` is gated by `task_factory.auto_accept_proposals` at the propose / `sweep-proposals` call sites (`true` auto-promotes; `false` leaves the draft at `proposed` for operator review). Removed the now-dead `proposal._get_runtime_config` helper and `_ALLOWED_NEW_WU_STATUSES` constant.
+
 - **Harness reliability fixes (2026-06-11)** found during an unattended overnight run:
   - **git-ops manifest-scoped staging (#247):** `commit_and_push`/`commit_local` stage only the work unit's Changes Manifest paths (per-path `git add`) instead of `git add -A`, so a commit can no longer sweep another (parked/blocked) unit's files into itself and misattribute them (`GET_DIFF_NO_ATTRIBUTABLE`).
   - **task-factory proposals:** generated recovery proposals emit `type=judge` instead of a `<fill-in>` placeholder command, and `promote-proposal` fails closed on any remaining placeholder in a `type=command` directive.

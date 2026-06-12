@@ -11501,25 +11501,17 @@ class TestCmdWriteProposalAutoCascade:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
         # End-to-end: with auto-accept on and a real source-task in the
-        # index, the helper calls materialise and returns "applied" with
-        # the materialised path list.
+        # index, the helper materialises every proposed task at the
+        # dedicated 'proposed' staging state, then promotes it to 'in-queue'
+        # in the same invocation, and returns "applied" with the materialised
+        # path list plus the promoted-id list.
         #
-        # Since AC-189-8, materialise_proposal reads
-        # RUNTIME_CONFIG.backlog.default_status_for_new_work_units and
-        # writes that status into the draft directly. When the configured
-        # default is 'in-queue' (the backwards-compatible default),
-        # classify_proposed_task sees the draft as PROMOTED, so the
-        # auto-cascade's promote loop finds nothing to promote and
-        # 'promoted' is empty -- the task is already at its target status.
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
+        # materialise_proposal always writes '## Status: proposed' (it no
+        # longer reads config); classify_proposed_task therefore sees the
+        # fresh draft as PROPOSED, so the auto-cascade promote loop -- gated
+        # on task_factory.auto_accept_proposals=True -- promotes it to
+        # 'in-queue'. The end-state draft carries '## Status: in-queue'.
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
-        # Patch proposal_mod's config getter so materialise_proposal writes
-        # 'in-queue' directly into the new draft (the backwards-compatible default).
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
 
         # Build a minimum BACKLOG with one source task at E0-F1-S1-T1
         # (currently blocked, since auto-accept emit happens when the
@@ -11567,12 +11559,12 @@ class TestCmdWriteProposalAutoCascade:
         assert isinstance(materialised, list) and materialised  # at least one path
         promoted = result["promoted"]
         assert isinstance(promoted, list)
-        # With default_status='in-queue', materialise_proposal writes 'in-queue'
-        # directly into the draft. The auto-cascade promote loop only promotes
-        # tasks in 'proposed' state; tasks already at 'in-queue' are classified
-        # as PROMOTED and need no explicit promotion step.
-        assert promoted == [], "no explicit promotion needed when draft was materialised directly to in-queue"
-        # The materialised task's file exists with the configured status.
+        # materialise_proposal writes 'proposed'; the auto-cascade promote loop
+        # then promotes every proposed task to 'in-queue', so the proposed task
+        # appears in the promoted list.
+        assert promoted == ["E0-F1-S1-T9"], "auto-accept must promote the freshly-materialised proposed task"
+        # The materialised task's file exists and ends at 'in-queue' (materialised
+        # at 'proposed', then auto-promoted).
         materialised_file = story_dir / "E0-F1-S1-T9.md"
         assert materialised_file.exists()
         materialised_content = materialised_file.read_text(encoding="utf-8")
@@ -12052,14 +12044,14 @@ class TestEmitOrphanCleanupDispatch:
             cfg.INLINE_ORPHAN_CLEANUP_ENABLED = original
 
 
-class TestLegacyEmitOrphanCleanupProposalDefaultStatus:
-    """AC-189-8: ``_legacy_emit_orphan_cleanup_proposal`` respects
-    ``backlog.default_status_for_new_work_units``.
+class TestLegacyEmitOrphanCleanupProposalAutoAccept:
+    """``_legacy_emit_orphan_cleanup_proposal`` gates promotion on
+    ``task_factory.auto_accept_proposals``.
 
-    When the config says ``draft``, the materialised cleanup task must remain
-    in ``draft`` status -- the immediate ``promote_proposal`` call must be
-    skipped.  When the config says ``in-queue`` (the default), the function
-    promotes the draft as before so it is immediately actionable.
+    The cleanup task is always materialised at the dedicated ``proposed``
+    staging state.  When ``auto_accept_proposals`` is true, the function
+    immediately promotes the draft to ``in-queue`` so it is actionable.
+    When false, the draft is left at ``proposed`` for operator review.
     """
 
     _SOURCE_ID = "E0-F1-S1-T1"
@@ -12129,37 +12121,24 @@ class TestLegacyEmitOrphanCleanupProposalDefaultStatus:
         monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
         monkeypatch.setattr(cli, "BACKLOG_INDEX", backlog_index)
 
-    def _runtime_config_with_default_status(self, status: str) -> Any:
-        """Return a RuntimeConfig clone with the given default_status_for_new_work_units."""
+    def _runtime_config_with_auto_accept(self, auto_accept: bool) -> Any:
+        """Return a RuntimeConfig clone with the given task_factory.auto_accept_proposals."""
         import dataclasses
 
-        from devbench.config_loader import BacklogConfig
-
         base = cli.RUNTIME_CONFIG
-        new_backlog = BacklogConfig(default_status_for_new_work_units=status)
-        return dataclasses.replace(base, backlog=new_backlog)
+        new_tf = dataclasses.replace(base.task_factory, auto_accept_proposals=auto_accept)
+        return dataclasses.replace(base, task_factory=new_tf)
 
-    @pytest.mark.parametrize("default_status", ["draft", "in-queue"])
-    def test_materialised_file_reflects_configured_status(
+    def test_auto_accept_true_promotes_to_in_queue(
         self,
-        default_status: str,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        """The cleanup task file's ``## Status:`` line matches the configured default."""
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
+        """When ``auto_accept_proposals`` is true, the cleanup task is materialised
+        at ``proposed`` and then promoted to ``in-queue`` so it is immediately actionable."""
         backlog_root, backlog_index, story_dir = self._build_workspace(tmp_path)
         self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
-        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status(default_status))
-
-        # Patch proposal_mod's config getter so materialise_proposal writes
-        # the configured status directly into the draft file.
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units=default_status))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_auto_accept(True))
 
         result = cli._legacy_emit_orphan_cleanup_proposal(
             unit_id=self._SOURCE_ID,
@@ -12170,35 +12149,24 @@ class TestLegacyEmitOrphanCleanupProposalDefaultStatus:
 
         assert result is True
 
-        # The new draft file must exist in the story dir.
-        drafts = list(story_dir.glob("E0-F1-S1-T*.md"))
-        # Exclude the source task itself.
-        new_drafts = [d for d in drafts if d.name != f"{self._SOURCE_ID}.md"]
+        # Exactly one new draft (excluding the source task itself).
+        new_drafts = [d for d in story_dir.glob("E0-F1-S1-T*.md") if d.name != f"{self._SOURCE_ID}.md"]
         assert len(new_drafts) == 1, f"Expected exactly one new draft, found: {new_drafts}"
-
-        draft_content = new_drafts[0].read_text(encoding="utf-8")
-        assert f"## Status: {default_status}" in draft_content, (
-            f"Expected '## Status: {default_status}' in draft, got content:\n{draft_content[:500]}"
+        content = new_drafts[0].read_text(encoding="utf-8")
+        assert "## Status: in-queue" in content, (
+            f"Expected '## Status: in-queue' after auto-accept promote, got content:\n{content[:500]}"
         )
 
-    def test_draft_status_skips_promote_and_leaves_draft(
+    def test_auto_accept_false_leaves_proposed(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        """When default_status is ``draft``, no promote_proposal call is made
-        and the cleanup task remains in ``draft`` status after the function returns."""
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
+        """When ``auto_accept_proposals`` is false, the cleanup task is left at
+        ``proposed`` for operator review -- no promote step flips it to ``in-queue``."""
         backlog_root, backlog_index, story_dir = self._build_workspace(tmp_path)
         self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
-        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status("draft"))
-
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_auto_accept(False))
 
         result = cli._legacy_emit_orphan_cleanup_proposal(
             unit_id=self._SOURCE_ID,
@@ -12212,62 +12180,20 @@ class TestLegacyEmitOrphanCleanupProposalDefaultStatus:
         new_drafts = [d for d in story_dir.glob("E0-F1-S1-T*.md") if d.name != f"{self._SOURCE_ID}.md"]
         assert len(new_drafts) == 1
         content = new_drafts[0].read_text(encoding="utf-8")
-        # Must stay draft -- no promote step should have flipped it to in-queue.
-        assert "## Status: draft" in content
+        assert "## Status: proposed" in content
         assert "## Status: in-queue" not in content
 
-    def test_in_queue_status_promotes_to_in_queue(
+    def test_error_message_reflects_status(
         self,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        """When default_status is ``in-queue``, the cleanup task is promoted
-        and the draft file reflects ``in-queue`` status (backwards-compatible)."""
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
-        backlog_root, backlog_index, story_dir = self._build_workspace(tmp_path)
-        self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
-        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status("in-queue"))
-
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
-
-        result = cli._legacy_emit_orphan_cleanup_proposal(
-            unit_id=self._SOURCE_ID,
-            unit=self._make_unit(),
-            repo_path=tmp_path / "repo",
-            detected=[".coverage"],
-        )
-
-        assert result is True
-
-        new_drafts = [d for d in story_dir.glob("E0-F1-S1-T*.md") if d.name != f"{self._SOURCE_ID}.md"]
-        assert len(new_drafts) == 1
-        content = new_drafts[0].read_text(encoding="utf-8")
-        # Promoted to in-queue.
-        assert "## Status: in-queue" in content
-
-    def test_error_message_reflects_configured_status(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        tmp_path: Path,
-    ) -> None:
-        """The stderr message names the status the cleanup task was written with
-        (not a hardcoded ``(in-queue)`` label), so operators see the real status."""
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
+        """The stderr message names the real status the cleanup task ended at:
+        ``(proposed)`` when auto-accept is off (not a hardcoded ``(in-queue)`` label)."""
         backlog_root, backlog_index, _ = self._build_workspace(tmp_path)
         self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
-        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status("draft"))
-
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_auto_accept(False))
 
         cli._legacy_emit_orphan_cleanup_proposal(
             unit_id=self._SOURCE_ID,
@@ -12277,10 +12203,9 @@ class TestLegacyEmitOrphanCleanupProposalDefaultStatus:
         )
 
         err = capsys.readouterr().err
-        # The message must not hardcode "(in-queue)" when config says "draft".
-        assert "(in-queue)" not in err, f"Error message hardcodes '(in-queue)' even when config is 'draft': {err!r}"
-        # The message must name the actual configured status.
-        assert "(draft)" in err, f"Expected '(draft)' in stderr message when config is 'draft': {err!r}"
+        # The message must name the actual end-state status, not hardcode "(in-queue)".
+        assert "(proposed)" in err, f"Expected '(proposed)' in stderr when auto-accept is off: {err!r}"
+        assert "(in-queue)" not in err, f"Error message hardcodes '(in-queue)' even when auto-accept is off: {err!r}"
 
 
 class TestFindExistingCleanupProposal:

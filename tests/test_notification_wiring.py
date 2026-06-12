@@ -138,15 +138,6 @@ def _sample_proposal(*, task_ids: list[str]) -> proposal_mod.Proposal:
     )
 
 
-def _patch_runtime_config_in_queue(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force ``materialise_proposal``'s config lookup to 'in-queue' new-WU status."""
-    from devbench.config_loader import BacklogConfig, RuntimeConfig
-
-    fake_config = RuntimeConfig.__new__(RuntimeConfig)
-    object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
-    monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
-
-
 def _make_task_wu(tmp_path: Path, unit_id: str, status: str = "in-queue") -> Path:
     wu = tmp_path / f"{unit_id}.md"
     wu.write_text(f"# {unit_id}: Test Task\n\n## Status: {status}\n\n## Comments\n\n")
@@ -174,8 +165,7 @@ def _cache_path(workspace_root: Path) -> Path:
 class TestMaterialiseFiresEvent:
     """``materialise_proposal`` fires ``work_unit_materialised`` per draft (AC-3)."""
 
-    def test_one_materialised_ping_per_draft(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_runtime_config_in_queue(monkeypatch)
+    def test_one_materialised_ping_per_draft(self, tmp_path: Path) -> None:
         workspace = _build_proposal_workspace(tmp_path)
         proposal = _sample_proposal(task_ids=["E0-F1-S1-T2", "E0-F1-S1-T3"])
 
@@ -200,8 +190,7 @@ class TestMaterialiseFiresEvent:
 class TestPromoteFiresEvent:
     """Every promote entry point fires ``work_unit_promoted`` once per unit (AC-3)."""
 
-    def test_promote_proposal_fires_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_runtime_config_in_queue(monkeypatch)
+    def test_promote_proposal_fires_once(self, tmp_path: Path) -> None:
         workspace = _build_proposal_workspace(tmp_path)
         proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
         write_proposal(workspace, proposal)
@@ -222,9 +211,8 @@ class TestPromoteFiresEvent:
         promoted.assert_called_once()
         assert promoted.call_args.args[0] == "E0-F1-S1-T2"
 
-    def test_promote_all_from_source_fires_per_unit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_promote_all_from_source_fires_per_unit(self, tmp_path: Path) -> None:
         """The bulk path loops ``promote_proposal`` -> one ping per unit, no double-fire."""
-        _patch_runtime_config_in_queue(monkeypatch)
         workspace = _build_proposal_workspace(tmp_path)
         proposal = _sample_proposal(task_ids=["E0-F1-S1-T2", "E0-F1-S1-T3"])
         write_proposal(workspace, proposal)

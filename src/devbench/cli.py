@@ -204,6 +204,7 @@ from devbench.constants import (
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
     STATUS_LINE_RE,
+    STATUS_PROPOSED,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
     VALID_TDD_PHASES,
@@ -5432,13 +5433,11 @@ def _legacy_emit_orphan_cleanup_proposal(
         ],
     )
 
-    # AC-189-8: read the configured default status once so all writes below
-    # are consistent. When the config says ``draft``, the cleanup task is
-    # left in draft state -- the operator must promote it explicitly before
-    # the orchestrator can claim it. When the config says ``in-queue``
-    # (the backwards-compatible default) the draft is promoted immediately,
-    # matching the pre-AC-189-8 behaviour.
-    new_wu_default_status: str = RUNTIME_CONFIG.backlog.default_status_for_new_work_units
+    # Proposals are materialised at ``proposed`` (see materialise_proposal).
+    # Promotion to ``in-queue`` is gated by ``task_factory.auto_accept_proposals``:
+    # when true the cleanup task is promoted immediately so the orchestrator can
+    # claim it; when false it is left at ``proposed`` for operator review.
+    auto_accept_proposals: bool = RUNTIME_CONFIG.task_factory.auto_accept_proposals
 
     try:
         write_proposal(WORKSPACE_ROOT, proposal)
@@ -5449,7 +5448,7 @@ def _legacy_emit_orphan_cleanup_proposal(
             proposal=proposal,
             repo=unit.repo,
         )
-        if new_wu_default_status != STATUS_DRAFT:
+        if auto_accept_proposals:
             promote_proposal(
                 workspace_root=WORKSPACE_ROOT,
                 backlog_root=BACKLOG_ROOT,
@@ -5484,7 +5483,8 @@ def _legacy_emit_orphan_cleanup_proposal(
     print(
         f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
         f"would pollute the commit (sample: {sample}). "
-        f"Auto-emitted cleanup proposal {new_id} ({new_wu_default_status}); "
+        f"Auto-emitted cleanup proposal {new_id} "
+        f"({STATUS_IN_QUEUE if auto_accept_proposals else STATUS_PROPOSED}); "
         f"{unit_id} is now blocked-pending-proposal and will auto-clear when the cleanup commits.{extra} "
         f"Materialised: {[str(p) for p in materialised_files]}.",
         file=sys.stderr,

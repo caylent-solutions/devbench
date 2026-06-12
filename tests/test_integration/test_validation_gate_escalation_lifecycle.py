@@ -26,9 +26,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
-from devbench.backlog import proposal as proposal_mod
 from devbench.backlog.proposal import (
     Proposal,
     ProposedTask,
@@ -194,22 +191,14 @@ class TestValidationGateEscalationHappyPath:
             "No amendment happened, so no rejection archive should exist."
         )
 
-    def test_materialise_creates_drafts_with_config_driven_status(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """task-factory materialises drafts identically regardless of upstream trigger.
+    def test_materialise_creates_drafts_at_proposed(self, tmp_path: Path) -> None:
+        """task-factory materialises drafts at the dedicated ``proposed`` staging state.
 
-        Since AC-189-8, materialise_proposal writes the configured default status
-        (in-queue by default) rather than the hard-coded 'proposed' sentinel. This
-        test patches _get_runtime_config to use 'in-queue', verifying that the
-        draft file's ## Status: line reflects the configuration.
+        materialise_proposal always writes ``## Status: proposed`` regardless of any
+        config -- ``backlog.default_status_for_new_work_units`` governs operator-authored
+        units only, not proposals. Promotion to ``in-queue`` is gated separately by
+        ``task_factory.auto_accept_proposals`` at the propose / sweep call sites.
         """
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
-
         workspace = _workspace(tmp_path)
         proposal = _validation_gate_proposal()
         write_proposal(workspace, proposal)
@@ -226,18 +215,15 @@ class TestValidationGateEscalationHappyPath:
         for draft_path in drafts:
             assert draft_path.is_file(), f"Draft must land on disk: {draft_path}"
             draft_content = draft_path.read_text()
-            assert "## Status: in-queue" in draft_content, (
-                f"Draft {draft_path} must carry the configured default status 'in-queue'."
+            assert "## Status: proposed" in draft_content, (
+                f"Draft {draft_path} must carry the dedicated 'proposed' staging status."
+            )
+            assert "## Status: in-queue" not in draft_content, (
+                f"Draft {draft_path} must NOT be promoted to 'in-queue' by materialise alone."
             )
 
-    def test_materialise_adds_backlog_rows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Every proposed task must get a BACKLOG.md row with the configured default status."""
-        from devbench.config_loader import BacklogConfig, RuntimeConfig
-
-        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
-        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
-
+    def test_materialise_adds_backlog_rows(self, tmp_path: Path) -> None:
+        """Every proposed task must get a BACKLOG.md row at the ``proposed`` staging status."""
         workspace = _workspace(tmp_path)
         proposal = _validation_gate_proposal()
         write_proposal(workspace, proposal)
@@ -252,7 +238,7 @@ class TestValidationGateEscalationHappyPath:
         backlog_text = (workspace / "BACKLOG.md").read_text()
         assert "E0-F9-S2-T6" in backlog_text
         assert "E0-F9-S2-T7" in backlog_text
-        assert "in-queue" in backlog_text
+        assert "proposed" in backlog_text
 
     def test_list_proposals_surfaces_pending_to_operator(self, tmp_path: Path) -> None:
         """`devbench list-proposals` (the CLI) calls this under the hood."""

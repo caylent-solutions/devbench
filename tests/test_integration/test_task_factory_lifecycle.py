@@ -14,10 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from devbench import cli
-from devbench.backlog import proposal as proposal_mod
 from devbench.backlog.proposal import (
     Proposal,
     ProposedTask,
@@ -87,20 +84,6 @@ def _workspace(tmp_path: Path) -> Path:
     story_dir.mkdir(parents=True)
     (story_dir / "E0-F1-S1-T1.md").write_text(_SOURCE_TEMPLATE)
     return tmp_path
-
-
-def _fake_config_with_status(status: str) -> object:
-    """Return a RuntimeConfig-like object with the given default_status_for_new_work_units.
-
-    Used to monkeypatch ``proposal_mod._get_runtime_config`` in tests that
-    need to control the status written into new draft files by
-    ``materialise_proposal``.
-    """
-    from devbench.config_loader import BacklogConfig, RuntimeConfig
-
-    cfg = RuntimeConfig.__new__(RuntimeConfig)
-    object.__setattr__(cfg, "backlog", BacklogConfig(default_status_for_new_work_units=status))
-    return cfg
 
 
 def _proposal(source_id: str = "E0-F1-S1-T1") -> Proposal:
@@ -450,15 +433,15 @@ class TestAffectedTaskIdsLifecycle:
 class TestAutoAcceptProposalsLifecycle:
     """ADR-11 end-to-end: flag=true causes sweep-proposals to auto-promote every draft."""
 
-    def test_auto_accept_promotes_every_draft_end_to_end(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_auto_accept_promotes_every_draft_end_to_end(self, tmp_path: Path) -> None:
         """Materialise via sweep-proposals with flag=true; every draft ends at in-queue.
 
-        Since AC-189-8, materialise_proposal writes the configured default status
-        directly into the draft. When default_status_for_new_work_units='in-queue'
-        (the backwards-compatible default), the draft is created at in-queue
-        immediately and the auto-cascade promote loop finds no 'proposed' tasks to
-        promote -- the task is already at its target status without an explicit
-        promote step.
+        Proposals are materialised at the dedicated ``proposed`` staging state.
+        With ``task_factory.auto_accept_proposals=True`` the sweep's auto-promote
+        loop flips every ``proposed`` draft to ``in-queue`` -- the behaviour the
+        flag promises. (Previously a silent no-op: materialise wrote ``draft`` /
+        ``in-queue`` from ``default_status_for_new_work_units`` and the loop only
+        acts on ``proposed``, so nothing was ever auto-promoted.)
         """
         from unittest.mock import MagicMock, patch
 
@@ -467,9 +450,6 @@ class TestAutoAcceptProposalsLifecycle:
         workspace = _workspace(tmp_path)
         proposal = _proposal()
         write_proposal(workspace, proposal)
-
-        # Patch materialise_proposal's config getter so drafts land at 'in-queue'.
-        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: _fake_config_with_status("in-queue"))
 
         # Source-task row is already in BACKLOG.md via _workspace; its file exists.
         # Build a RUNTIME_CONFIG mock with auto_accept_proposals=True and the
@@ -493,12 +473,13 @@ class TestAutoAcceptProposalsLifecycle:
             rc = cli.cmd_sweep_proposals()
         assert rc == 0
 
-        # Both drafts landed at in-queue (materialised directly, no explicit promote step).
+        # Both drafts were materialised at 'proposed' then auto-promoted to
+        # in-queue by the sweep's auto-accept loop.
         story = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         t2 = (story / "E0-F1-S1-T2.md").read_text()
         t3 = (story / "E0-F1-S1-T3.md").read_text()
-        assert "## Status: in-queue" in t2, "T2 must be at in-queue (materialised directly)"
-        assert "## Status: in-queue" in t3, "T3 must be at in-queue (materialised directly)"
+        assert "## Status: in-queue" in t2, "T2 must be auto-promoted to in-queue"
+        assert "## Status: in-queue" in t3, "T3 must be auto-promoted to in-queue"
         # Verify that both draft files were created (materialise_proposal ran).
         assert (story / "E0-F1-S1-T2.md").exists()
         assert (story / "E0-F1-S1-T3.md").exists()

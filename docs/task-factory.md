@@ -1,6 +1,6 @@
 # Task Factory (Proposed Work Units)
 
-The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files. Each draft's initial status is determined by `backlog.default_status_for_new_work_units` in `backlog/config/devbench.yaml` (`in-queue` by default; `draft` when opted in via AC-189-8). The human reviews, edits, and promotes each draft; the orchestrator continues on other actionable tasks until promotion.
+The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files. Each draft is materialised at `## Status: proposed` (its dedicated staging state). With `task_factory.auto_accept_proposals: true` (the default) the orchestrator's `sweep-proposals` auto-promotes each draft to `in-queue`; set it `false` to leave drafts at `proposed` for the human to review, edit, and promote. (`backlog.default_status_for_new_work_units` governs operator-authored spec-to-backlog units only, NOT proposals.)
 
 See [ADR-03: Task factory](adr/03-task-factory.md) for the design rationale and alternatives considered.
 
@@ -41,7 +41,7 @@ If the operator decides that some proposed drafts should never be promoted, they
 4. **Orchestrator invokes `devbench:blocker-resolver`**. The agent reads the archived request + rejection rationale and decomposes the out-of-scope fixes into a structured proposal JSON. It calls `uv run devbench write-proposal <id>` with the JSON on stdin; the file lands at `<workspace>/.devbench/proposals/<id>.json`.
 5. **Orchestrator invokes `devbench:task-factory`**. The agent calls `uv run devbench materialise-proposal <id>`, which:
    - Reads the proposal JSON.
-   - Writes one draft `.md` per proposed task under `backlog/<epic>/<feature>/<story>/<task-id>.md`, each with a `## Status:` line set to the value of `backlog.default_status_for_new_work_units` (default `in-queue`; `draft` when opted in via AC-189-8), plus an auto-generated header marker naming the source task.
+   - Writes one draft `.md` per proposed task under `backlog/<epic>/<feature>/<story>/<task-id>.md`, each at `## Status: proposed` (proposals' dedicated staging state; promotion to `in-queue` is gated by `task_factory.auto_accept_proposals`), plus an auto-generated header marker naming the source task.
    - Inserts a matching row in `BACKLOG.md` carrying the same config-driven default status.
    - Refreshes the Status Summary table.
 6. **Orchestrator returns to step 1** (`devbench next`). Proposed tasks are NOT in the actionable set, so the loop picks another task; the source task stays blocked.

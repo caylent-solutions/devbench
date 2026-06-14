@@ -16,21 +16,27 @@ sentinel from the inner SDK message loop. The outer handler:
    a SIGTERM during the wait does not lose the pause state.
 2. Emits a structured audit marker to the orchestrator log:
    `[QUOTA_WAITING] reason=<source> reset_at=<ISO|unknown>`.
-3. Calls `wait_for_reset`, which sleeps until `reset_at` (if known). A known,
+3. Calls `wait_for_reset`, which waits until `reset_at` (if known). A known,
    elapsed `reset_at` is the **authoritative** readiness signal: the wait
    resumes the moment it passes, **without** consulting the recovery probe
-   (TDI-003a). The probe is **best-effort** and only consulted while `reset_at`
-   is unknown -- it issues a direct Anthropic **API** call, which tests a
-   different auth channel than the Claude Code CLI/SDK **subscription** channel
-   the orchestrator runs on, so a probe success does not prove the exhausted
-   subscription quota cleared (and on subscription auth the probe can never
-   succeed). When `reset_at` is unknown the loop polls the probe with jittered
-   exponential backoff; if the probe is permanently unavailable (no/invalid API
-   credential) it emits `[QUOTA_PROBE_UNAVAILABLE]` and stops fast rather than
-   polling for the full `max_wait_seconds`. While polling, `wait_for_reset`
-   emits a `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` heartbeat once
-   per poll so a long wait is visibly alive in the log rather than looking dead
-   between `[QUOTA_WAITING]` and `[QUOTA_RESUMED]`.
+   (TDI-003a). When `reset_at` is known and still in the future the wait does
+   **not** sleep once for the whole window -- it steps toward the reset in
+   `poll_interval_seconds`-bounded sleeps, emitting a heartbeat each interval
+   (no probe runs on this path, so `probe=0`). The probe is **best-effort** and
+   only consulted while `reset_at` is unknown -- it issues a direct Anthropic
+   **API** call, which tests a different auth channel than the Claude Code
+   CLI/SDK **subscription** channel the orchestrator runs on, so a probe success
+   does not prove the exhausted subscription quota cleared (and on subscription
+   auth the probe can never succeed). When `reset_at` is unknown the loop polls
+   the probe with jittered exponential backoff; if the probe is permanently
+   unavailable (no/invalid API credential) it emits `[QUOTA_PROBE_UNAVAILABLE]`
+   and stops fast rather than polling for the full `max_wait_seconds`. On
+   **every** waiting path -- both the provider-stated `reset_at` wait and the
+   probe loop -- `wait_for_reset` emits a
+   `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` heartbeat once per poll
+   interval so a long wait is visibly alive in the log rather than looking dead
+   between `[QUOTA_WAITING]` and `[QUOTA_RESUMED]`. The heartbeat is itself
+   best-effort: a logging failure can never break or delay the wait or resume.
 4. On recovery, emits `[QUOTA_RESUMED] waited_seconds=<N>` and applies the
    configured `resume_strategy` before returning `rc=0`.
 
@@ -121,7 +127,7 @@ following structured markers:
 | Marker | Format | Emitted when |
 |--------|--------|-------------|
 | `[QUOTA_WAITING]` | `[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>` | Pause begins |
-| `[QUOTA_POLLING]` | `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` | One heartbeat per recovery-probe poll while waiting (visible liveness) |
+| `[QUOTA_POLLING]` | `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` | One heartbeat per poll interval on every waiting path -- the provider-stated `reset_at` wait (`probe=0`, no probe run) and the probe loop -- for visible liveness; best-effort (a logging failure never breaks the wait) |
 | `[QUOTA_RESUMED]` | `[QUOTA_RESUMED] waited_seconds=<N>` | Recovery confirmed |
 | `[QUOTA_PROBE_UNAVAILABLE]` | `[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>` | Probe cannot run (no/invalid credential) and no reset time is known; routed through `on_exhaustion_timeout` |
 | `[QUOTA_FAIL_FAST]` | `[QUOTA_FAIL_FAST] reason=<source>` | `on_exhaustion=fail` (detection) or `on_exhaustion_timeout=fail` (timeout) aborts with a non-zero exit |

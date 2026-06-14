@@ -45,7 +45,7 @@ If the answer to any question is unclear or negative, the judge rejects. It does
 
 ### Layer 3 -- deterministic post-check + atomic rollback
 
-After the judge invokes `devbench apply-amendment`, the CLI appends the rows to the manifest, writes an audit comment, and performs the write atomically via temp-file-plus-rename. Immediately afterward the post-check runs:
+After the judge invokes `devbench apply-amendment`, the CLI removes any `files_to_remove` rows (fail-fast on an absent path), appends the `files_to_add` rows to the manifest, writes an audit comment, and performs the write atomically via temp-file-plus-rename. Immediately afterward the post-check runs:
 
 - No em-dash (U+2014) introduced in the updated work-unit file.
 - `devbench validate-backlog` still returns zero errors against the full backlog (catches BACKLOG.md drift, orphan references, status-summary count mismatches, and every other existing integrity rule).
@@ -71,7 +71,7 @@ Use `request-amendment <task-id> --operator-mode` when a human operator needs to
 
 1. Operator invokes `uv run devbench request-amendment <task-id> --operator-mode` with the full payload JSON (including `"operator_mode": true`) on stdin.
 2. The CLI validates the payload schema (all eight operator-mode fields; see Appendix D-7 table above).
-3. `request-amendment` applies the amendment **synchronously**: appends `files_to_add` rows, writes the operator-amendment audit entry, runs Layer-3 post-check.
+3. `request-amendment` applies the amendment **synchronously**: removes any `files_to_remove` rows, appends `files_to_add` rows, writes the operator-amendment audit entry, runs Layer-3 post-check. A `files_to_remove` path that is absent from the Changes Manifest fails fast with an actionable error before any write (no partial removal).
 4. On Layer-3 success: the work-unit file is updated and the audit `[OPERATOR_AMENDMENT] applied; layer3=validate-backlog rc=0` appears in `## Comments`. No pending request file is written.
 5. On Layer-3 failure: the work-unit file is restored to its pre-amendment content and the command exits with rc=1.
 
@@ -115,6 +115,28 @@ The three legitimate repair classes (the manifest-amender's VERIFICATION-DIRECTI
 
 Deterministic guards in `apply-amendment` make weakening impossible regardless of what the judge approves: the `after` line must keep the **same AC ids, same `type=`, same `expect-exit`** as `before` (so a `command` can never become `deferred` and the gate semantics never loosen); the `before` line must exist verbatim in `## Verification`; every cited unit must be status `done`; the standard Layer 3 post-check (em-dash scan + full `validate-backlog`) runs with atomic rollback. The applied edit writes a `[VERIFICATION_AMENDMENT]` audit comment quoting before/after, citations, and evidence.
 
+### Manifest-row-superseded amendments (`reason: manifest_row_superseded`)
+
+A third request shape lets the **executor** self-remove a `## Changes Manifest` row whose file a DONE sibling renamed or deleted -- a row that otherwise deterministically re-fails git-ops staging (the file is absent on disk) and previously required an operator stop-window edit. Accepted only when `manifest_amendment.allow_manifest_row_superseded_amendments` is true (the default); carries `manifest_row_superseded_claims` instead of `files_to_add` (which must be empty):
+
+```json
+{
+  "reason": "manifest_row_superseded",
+  "justification": "<which row is stale and which DONE sibling superseded it>",
+  "files_to_add": [],
+  "linked_acs": ["<AC-ID this row served>"],
+  "manifest_row_superseded_claims": [
+    {
+      "row_path": "<the EXACT ManifestRow.file value to remove>",
+      "cited_done_units": ["<done unit id whose landed rename/delete explains the absence>"],
+      "evidence": "<tool-captured proof: e.g. the git log line for the rename + the file-absent check>"
+    }
+  ]
+}
+```
+
+Deterministic guards in `apply-amendment` (the CLI resolves the unit's target repo and staged-file set generically and threads both in) require, before any row is removed: **(a)** the row's file is **absent on disk** in the target repo (a row whose file still exists is never removed); **(b)** every cited unit is status `done` in the backlog index; **(c)** the staged diff **does not touch** the removed path (a path the executor is actively staging is not "superseded"). On success the row is dropped via `remove_rows`, the standard Layer 3 post-check (em-dash scan + full `validate-backlog`) runs with atomic rollback, and a `[MANIFEST_ROW_REMOVED]` audit comment naming the removed row(s), citations, and evidence is written. This mirrors the operator-path `files_to_remove` (below) but is gated by deterministic, never-weakening guards so the executor can apply it without an operator edit.
+
 ### Operator-mode fields (issue #242 / Appendix D-7)
 
 When `request-amendment` is invoked with `--operator-mode`, the JSON payload may include seven additional optional patch fields. All fields default to their zero value when absent and are validated by `AmendmentRequest.from_dict`.
@@ -141,7 +163,7 @@ When `request-amendment` is invoked with `--operator-mode`, the JSON payload may
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `operator_mode` | `bool` | `false` | When `true`, bypasses the in-progress status gate and the LLM judge; applies synchronously. |
-| `files_to_remove` | `list[str]` | `[]` | File paths to remove from the Changes Manifest table. |
+| `files_to_remove` | `list[str]` | `[]` | File paths to remove from the Changes Manifest table. Applied by both `apply-amendment` (approved-request path) and the operator path. Each path must already be a row in the manifest; an absent path fails fast with `AmendmentError` (no partial removal). Use this to drop a row whose file a DONE sibling renamed/deleted. |
 | `target_repository` | `str` | `""` | When non-empty, replaces the work-unit's Target Repository value. |
 | `description_patch` | `str` | `""` | When non-empty, replaces the entire Description section body. |
 | `approach_patch` | `str` | `""` | When non-empty, replaces the entire Approach section body. |
@@ -156,6 +178,7 @@ Every amendment action leaves a timestamped entry in the work-unit `## Comments`
 - On apply: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_APPLIED] <reason>; added N file(s); justification: <...>`
 - On reject: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_REJECTED] <reason>; rejected: <...>`
 - On operator-mode apply: `[YYYY-MM-DD HH:MM UTC] [operator] [OPERATOR_AMENDMENT] applied; layer3=validate-backlog rc=<n>; reason=<...>; justification: <...>`
+- When an amendment removes rows, the audit entry (apply or operator-mode) carries a trailing `; [MANIFEST_ROW_REMOVED] <path>[, <path>...]` fragment naming every removed row.
 
 The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent. Operator-mode amendments do not go through the amender agent and therefore do not log a judge verdict.
 
@@ -197,7 +220,7 @@ The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_han
 
 ## Related code and tests
 
-- `src/devbench/backlog/manifest.py` -- Changes Manifest parser and writer (Layer 3 mechanics).
+- `src/devbench/backlog/manifest.py` -- Changes Manifest parser and writer (Layer 3 mechanics); `append_rows` / `remove_rows` splice rows into / out of the manifest.
 - `src/devbench/backlog/amendment.py` -- amendment request schema, PreFilter, apply/reject/operator lifecycle, post-check.
 - `src/devbench/cli.py` -- `cmd_request_amendment` (variadic, `--operator-mode`), `cmd_apply_amendment`, `cmd_reject_amendment`.
 - `plugin/devbench-orchestrate/agents/manifest-amender.md` -- Layer 2 judge prompt.

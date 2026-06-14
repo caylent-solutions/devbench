@@ -257,8 +257,13 @@ hook_tail:
 
 ```yaml
 orchestrate:
-  max_cascade_depth: 2  # recovery-of-recovery cascade depth cap
+  max_cascade_depth: 2       # recovery-of-recovery cascade depth cap
+  model: claude-opus-4-8     # REQUIRED to launch the orchestrator; see below
 ```
+
+**`model`** is the model the top-level orchestrate SDK session runs on when devbench launches it non-interactively (`devbench start` / `--daemon`). devbench passes it into `ClaudeAgentOptions(model=...)`, so the session is **pinned** to this value and can never inherit the interactive Claude Code (`~/.claude/settings.json`) model. It is **required** for `devbench start` and has **no fallback** (not to `DEVBENCH_CLAUDE_MODEL`, not to the CLI settings) -- the orchestrator-launch path fails fast with an actionable error when it is unset. Short name (`opus` | `sonnet`) or a full Anthropic id when `use_bedrock: false`; a Bedrock ARN when `true`. Haiku is rejected (#198).
+
+Interactive vs non-interactive: this key governs ONLY the SDK-launched orchestrator. When an operator runs the `/devbench-orchestrate:orchestrate` slash command inside their own interactive Claude Code session, the skill runs on the **host session's selected model** -- devbench cannot and does not override the host session. (The work agents -- executor / judges / etc. -- get their model from each agent's plugin `.md` frontmatter, overridable via the `agents:` block.)
 
 ---
 

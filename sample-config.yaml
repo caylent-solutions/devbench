@@ -65,12 +65,19 @@ use_bedrock: false
 # AWS region for Bedrock when use_bedrock: true.
 bedrock_region: us-east-1
 
-# Per-agent model overrides live in the `agents:` block lower in this file
-# (ADR-25). `DEVBENCH_CLAUDE_MODEL` (env var, required) is the SDK caller's
-# model -- it governs the orchestrate skill's coordination calls only; it
-# does NOT route the work agents (executor / judges / etc.), each of which
-# loads its model from its plugin .md frontmatter and can be overridden
-# via the `agents:` block.
+# Model routing summary:
+#   - The top-level ORCHESTRATE SESSION model is `orchestrate.model` (below).
+#     When devbench launches the orchestrator non-interactively (`devbench start`
+#     / `--daemon`) it PINS the SDK session to that value, so the session can
+#     never inherit the interactive Claude Code (~/.claude/settings.json) model.
+#     It is required for `devbench start`; there is NO fallback. (When you run
+#     the `/devbench-orchestrate:orchestrate` slash command inside your own
+#     interactive Claude Code session, the skill runs on YOUR selected model --
+#     devbench cannot override the host session; `orchestrate.model` governs the
+#     SDK-launched orchestrator only.)
+#   - The work agents (executor / judges / etc.) load their model from each
+#     agent's plugin .md frontmatter and can be overridden via the `agents:`
+#     block lower in this file (ADR-25).
 
 # Hard allowlist of GitHub orgs devbench may operate against. Empty means
 # every org listed in repos: above is permitted; otherwise restrict here.
@@ -258,6 +265,42 @@ orchestrate:
   # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
   # layer. Override via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
   max_cascade_depth: 2
+  # Model for the top-level orchestrate SDK session launched by `devbench start`
+  # / `--daemon`. devbench passes this into ClaudeAgentOptions(model=...) so the
+  # session is pinned to it and never inherits the interactive Claude Code
+  # (~/.claude/settings.json) selection. REQUIRED to launch the orchestrator;
+  # no env/settings fallback (the launch fails fast when unset). Short name
+  # (opus|sonnet) or full Anthropic id when use_bedrock:false; Bedrock ARN when
+  # true. Haiku is rejected (#198). Does NOT affect the interactive
+  # /devbench-orchestrate:orchestrate slash command (runs on the host session's model).
+  model: claude-opus-4-8
+  # Startup harness-integrity check (ADR-30). Before any SDK subprocess is
+  # spawned, `devbench start` compares the devbench checkout against committed
+  # git state and reacts to uncommitted edits under the devbench package source
+  # (src/devbench/**) -- the signature of a prior orchestrate self-edit or an
+  # unreviewed manual change. 'off' skips it; 'warn' (the default) emits a loud
+  # [HARNESS_INTEGRITY] warning and continues; 'fail' refuses to start. Pairs
+  # with the guard-harness-write.sh PreToolUse hook that hard-denies the session
+  # from editing the harness in the first place.
+  harness_integrity_check: warn
+  # Within-claim repeated-failure bound. A single in-progress claim that repeats
+  # the SAME unresolvable AC-verify / TDD-RED / live-test signature
+  # max_within_claim_attempts times -- while staying busy so the inactivity
+  # budget keeps resetting -- is BLOCKED with a [CLAIM_NOT_CONVERGING] audit
+  # comment instead of churning for hours. Keyed on the REPEATED IDENTICAL
+  # signature (NOT raw duration), so a genuinely-progressing long live run
+  # (a different signal each round) is never killed. Default on.
+  within_claim_convergence_check: true
+  # How many times the SAME failing signature may recur within one claim before
+  # the bound trips. Default 4. Override via
+  # DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS.
+  max_within_claim_attempts: 4
+  # Secondary wall-clock backstop for a single claim, in seconds. Set well above
+  # the observed-legit maximum (e.g. a 3.5h live firehose apply) so it only fires
+  # on an implausibly long stuck claim with no repeated-identical signature.
+  # Default 21600 (6h); 0 disables the backstop (the signature bound still
+  # applies). Override via DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS.
+  max_claim_wall_clock_seconds: 21600
 
 # ---------------------------------------------------------------------------
 # Report / cost estimation
@@ -350,6 +393,13 @@ manifest_amendment:
   # deterministic guards keep the rewrite from ever being weaker (same AC ids,
   # same type=, same expect-exit; cited units must be done). Default: true.
   allow_verification_directive_amendments: true
+  # Accept reason=manifest_row_superseded: the executor may self-remove a
+  # Changes Manifest row whose file a DONE sibling renamed/deleted (otherwise
+  # git-ops staging deterministically re-fails because the file is absent on
+  # disk). Judge-gated; deterministic guards require the row's file ABSENT on
+  # disk, every cited unit status done, and the staged diff not touching the
+  # removed path -- a row whose file still exists is never removed. Default: true.
+  allow_manifest_row_superseded_amendments: true
 
 # ---------------------------------------------------------------------------
 # Task factory loop (requires manifest_amendment.enabled: true)

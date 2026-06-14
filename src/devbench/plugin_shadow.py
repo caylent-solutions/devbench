@@ -29,13 +29,19 @@ branch coverage (Makefile :: ``test-coverage-new``) is achievable.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from devbench.constants import PLUGIN_SHADOW_DIR_NAME, SHADOW_PID_SENTINEL_FILENAME
+from devbench.constants import (
+    PLUGIN_SHADOW_DIR_NAME,
+    SHADOW_OVERRIDES_FINGERPRINT_FILENAME,
+    SHADOW_PID_SENTINEL_FILENAME,
+)
 
 if TYPE_CHECKING:
     from devbench.config_loader import AgentModelsConfig
@@ -110,7 +116,7 @@ def shadow_plugin_path(workspace_root: Path) -> Path:
 
 
 def _sentinel_path(workspace_root: Path) -> Path:
-    """Return the absolute path to the shadow plugin's PID sentinel file.
+    """Return the absolute path to the shadow plugin's owner-PID sentinel file.
 
     Lives at ``<workspace_root>/<PLUGIN_SHADOW_DIR_NAME>/devbench/<SHADOW_PID_SENTINEL_FILENAME>``
     so a ``shutil.rmtree`` of the shadow tree removes the sentinel atomically.
@@ -119,18 +125,69 @@ def _sentinel_path(workspace_root: Path) -> Path:
     return shadow_plugin_path(workspace_root) / SHADOW_PID_SENTINEL_FILENAME
 
 
-def write_pid_sentinel(workspace_root: Path, pid: int) -> None:
-    """Record the orchestrator PID that owns the materialised shadow plugin.
+def _fingerprint_path(workspace_root: Path) -> Path:
+    """Return the absolute path to the shadow plugin's overrides-fingerprint file.
 
-    Called by ``cmd_start`` immediately after ``materialise_shadow_plugin``
-    returns a non-None path. Atomic: writes to ``.pid.tmp`` then renames over
-    the target, so a concurrent reader of the sentinel always sees either the
-    prior PID or the new PID, never a half-written value. The shadow root is
-    assumed to exist (the materialiser created it).
+    Lives next to the owner sentinel inside the shadow tree so a clean rebuild
+    (``shutil.rmtree``) removes it atomically. The path is deterministic; this
+    function does not consult the filesystem.
+    """
+    return shadow_plugin_path(workspace_root) / SHADOW_OVERRIDES_FINGERPRINT_FILENAME
+
+
+def _overrides_fingerprint(overrides: dict[str, str]) -> str:
+    """Return a stable hash of the per-agent override map.
+
+    Pure function: deterministic, no I/O, order-independent. Two materialise
+    calls with the same set of ``{relative_path: model}`` overrides produce the
+    same fingerprint, so an already-built shadow can be recognised as
+    up-to-date and REUSED instead of cleared and rebuilt. Returns the full
+    SHA-256 hex digest of the canonical JSON encoding (sorted keys).
+    """
+    canonical = json.dumps(overrides, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _write_fingerprint(workspace_root: Path, fingerprint: str) -> None:
+    """Record *fingerprint* inside the shadow tree atomically (temp + rename).
+
+    The shadow root is assumed to exist (the materialiser created it).
+    """
+    target = _fingerprint_path(workspace_root)
+    tmp = target.parent / (target.name + ".tmp")
+    tmp.write_text(fingerprint, encoding="utf-8")
+    tmp.replace(target)
+
+
+def _read_fingerprint(workspace_root: Path) -> str | None:
+    """Return the recorded overrides fingerprint, or ``None`` when absent.
+
+    ``None`` covers a shadow built by a pre-fingerprint devbench build (no
+    marker yet); callers treat that as "fingerprint unknown -> not a safe
+    reuse" and fall through to the clear+rebuild path (which is itself owner-
+    guarded), so the missing marker can never silently reuse a stale tree.
+    """
+    target = _fingerprint_path(workspace_root)
+    if not target.exists():
+        return None
+    return target.read_text(encoding="utf-8").strip()
+
+
+def write_pid_sentinel(workspace_root: Path, pid: int) -> None:
+    """Register *pid* as an additional owner of the materialised shadow plugin.
+
+    Called by ``cmd_start`` (and by ``materialise_shadow_plugin`` on the reuse
+    path) so every concurrent orchestrator that shares one identical shadow is
+    recorded as an owner. Multi-owner: the sentinel holds the SET of owning
+    PIDs, one per line. Dead PIDs already present in the sentinel are pruned
+    before this PID is added, so the file never grows unbounded across runs.
+    Atomic: writes to ``.pid.tmp`` then renames over the target, so a
+    concurrent reader always sees a consistent owner set, never a half-written
+    value. The shadow root is assumed to exist (the materialiser created it).
 
     Args:
         workspace_root: Workspace whose shadow tree was just materialised.
-        pid: Process id of the orchestrator that owns the shadow.
+        pid: Process id of the orchestrator registering as an owner.
 
     Raises:
         FileNotFoundError: If the shadow plugin root does not exist (caller
@@ -139,31 +196,42 @@ def write_pid_sentinel(workspace_root: Path, pid: int) -> None:
     sentinel = _sentinel_path(workspace_root)
     if not sentinel.parent.is_dir():
         raise FileNotFoundError(
-            f"Cannot write PID sentinel: shadow plugin root '{sentinel.parent}' "
+            f"Cannot write owner sentinel: shadow plugin root '{sentinel.parent}' "
             "does not exist. Call materialise_shadow_plugin first."
         )
+    owners = {owner for owner in _read_owner_pids(workspace_root) if _is_pid_alive(owner)}
+    owners.add(pid)
     tmp = sentinel.parent / (sentinel.name + ".tmp")
-    tmp.write_text(str(pid), encoding="utf-8")
+    tmp.write_text("\n".join(str(owner) for owner in sorted(owners)) + "\n", encoding="utf-8")
     tmp.replace(sentinel)
 
 
-def _read_sentinel_pid(workspace_root: Path) -> int | None:
-    """Return the PID stored in the shadow plugin's sentinel file, or None.
+def _read_owner_pids(workspace_root: Path) -> set[int]:
+    """Return the set of owner PIDs recorded in the shadow plugin's sentinel.
 
-    Returns ``None`` when the sentinel does not exist (the common case before
-    ``cmd_start`` has materialised a shadow or after a clean rebuild).
+    Returns an empty set when the sentinel does not exist (the common case
+    before ``cmd_start`` has materialised a shadow or after a clean rebuild).
 
     Raises:
-        ValueError: If the sentinel exists but does not contain a valid
-            integer. Intentional fail-fast: a corrupt sentinel is a sign of
-            file-system corruption or operator interference; we surface it
+        ValueError: If the sentinel exists but contains a line that is not a
+            valid integer. Intentional fail-fast: a corrupt sentinel is a sign
+            of file-system corruption or operator interference; we surface it
             rather than silently overwriting.
     """
     sentinel = _sentinel_path(workspace_root)
     if not sentinel.exists():
-        return None
-    raw = sentinel.read_text(encoding="utf-8").strip()
-    return int(raw)
+        return set()
+    raw = sentinel.read_text(encoding="utf-8")
+    return {int(line.strip()) for line in raw.splitlines() if line.strip()}
+
+
+def _live_owner_pids(workspace_root: Path) -> set[int]:
+    """Return the subset of recorded owner PIDs that name a live process.
+
+    Dead PIDs are pruned. Propagates ``ValueError`` from ``_read_owner_pids``
+    on a corrupt sentinel.
+    """
+    return {pid for pid in _read_owner_pids(workspace_root) if _is_pid_alive(pid)}
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -188,12 +256,12 @@ def clear_shadow_plugin(workspace_root: Path) -> bool:
     Idempotent: a second call after the tree is gone returns ``False`` and
     does not raise.
 
-    Refuses to delete the tree when the recorded PID sentinel names a live
-    process. Lets ``cmd_start`` rebuild its own shadow at startup (the
-    materialise_shadow_plugin path clears + writes its own sentinel), but
-    prevents a stray ``devbench prepare-plugin-shadow`` from clearing a
+    Refuses to delete the tree when ANY recorded owner PID names a live
+    process. Lets an operator ``clear`` / ``prepare-plugin-shadow`` rebuild a
+    shadow nobody owns, but prevents a stray invocation from clearing a
     running orchestrator's plugin files out from under it (the bug that
-    silently stops hook telemetry mid-run).
+    silently stops hook telemetry mid-run) -- and prevents a second concurrent
+    session's rebuild from yanking the shadow away from a live sibling.
 
     Args:
         workspace_root: Workspace root whose shadow tree should be removed.
@@ -203,21 +271,22 @@ def clear_shadow_plugin(workspace_root: Path) -> bool:
         ``False`` when it did not exist.
 
     Raises:
-        RuntimeError: When a sentinel PID is found AND that PID is alive.
-            The caller is presumed to be a stray operator action; the
-            recommended remedy is to stop the named orchestrator first.
+        RuntimeError: When one or more recorded owner PIDs are alive. The
+            caller is presumed to be a stray clear; the recommended remedy is
+            to stop the named orchestrator(s) first.
         ValueError: When the sentinel exists but is corrupt (propagated
-            from ``_read_sentinel_pid``).
+            from ``_read_owner_pids``).
     """
     shadow_root = workspace_root / PLUGIN_SHADOW_DIR_NAME
     if not shadow_root.exists():
         return False
-    pid = _read_sentinel_pid(workspace_root)
-    if pid is not None and _is_pid_alive(pid):
+    live = _live_owner_pids(workspace_root)
+    if live:
+        pids = ", ".join(str(pid) for pid in sorted(live))
         raise RuntimeError(
             f"Refusing to clear shadow plugin at '{shadow_root}': "
-            f"orchestrator process PID {pid} is alive and using it. "
-            f"Stop the orchestrator first (e.g. send SIGTERM to PID {pid}) "
+            f"orchestrator process(es) PID {pids} are alive and using it. "
+            f"Stop the orchestrator(s) first (e.g. send SIGTERM to PID {pids}) "
             "before clearing the shadow."
         )
     shutil.rmtree(shadow_root)
@@ -302,9 +371,20 @@ def materialise_shadow_plugin(
     * Every non-agent file is symlinked back to the canonical location so the
       shadow stays cheap to build and impossible to drift content-wise.
 
-    The shadow tree is rebuilt from scratch on every call (cheap because it
-    is mostly symlinks) which guarantees it exactly matches *agent_models*
-    and never lingers stale after the operator removes the YAML section.
+    Reentrant / idempotent across concurrent sessions. The shadow content is
+    a pure function of the canonical plugin + the requested overrides, so all
+    sessions on one workspace want the SAME shadow:
+
+    * If an up-to-date shadow already exists (its recorded overrides
+      fingerprint matches the requested overrides), REUSE it: register this
+      process as an additional owner, skip the clear+rebuild, and return the
+      existing path. A live sibling owner is therefore shared, not clobbered.
+    * If a shadow exists but its fingerprint DIFFERS and a live owner holds
+      it, fail fast (``RuntimeError``) naming the owner(s) -- a rebuild would
+      yank the plugin files out from under the running sibling.
+    * Otherwise (no shadow, or a stale shadow with no live owner) clear +
+      rebuild from scratch (cheap because it is mostly symlinks), write the
+      fingerprint, register this process as the owner, and return the path.
 
     When *agent_models* has no overrides, any existing shadow tree is
     removed and ``None`` is returned so callers fall back to the canonical
@@ -324,9 +404,12 @@ def materialise_shadow_plugin(
 
     Raises:
         FileNotFoundError: If *canonical_plugin_dir* does not exist.
+        RuntimeError: If a stale shadow (overrides differ) is held by a live
+            owner -- rebuilding would clobber the running sibling.
         ValueError: If an overridden agent file has no ``model:`` line, or
             if an override targets a relative path that does not exist
-            under *canonical_plugin_dir* (typo / structural drift).
+            under *canonical_plugin_dir* (typo / structural drift), or if the
+            owner sentinel is corrupt.
     """
     if not canonical_plugin_dir.is_dir():
         raise FileNotFoundError(
@@ -350,8 +433,31 @@ def materialise_shadow_plugin(
                 "in devbench.plugin_shadow."
             )
 
-    clear_shadow_plugin(workspace_root)
     shadow_root = shadow_plugin_path(workspace_root)
+    fingerprint = _overrides_fingerprint(overrides)
+
+    # Reuse path: an up-to-date shadow already exists. Register this process
+    # as an additional owner and return without clearing or rebuilding so a
+    # live sibling session is shared rather than clobbered.
+    if shadow_root.exists() and _read_fingerprint(workspace_root) == fingerprint:
+        write_pid_sentinel(workspace_root, os.getpid())
+        return shadow_root
+
+    # Stale shadow held by a live owner: a rebuild would yank the plugin files
+    # out from under the running sibling. Fail fast naming the owner(s).
+    if shadow_root.exists():
+        live = _live_owner_pids(workspace_root)
+        if live:
+            pids = ", ".join(str(pid) for pid in sorted(live))
+            raise RuntimeError(
+                f"Refusing to rebuild shadow plugin at '{shadow_root}': the requested "
+                f"per-agent model overrides differ from the running session(s) "
+                f"(owner PID {pids}), and rebuilding would clobber the shadow they "
+                f"are using. Stop the orchestrator(s) (e.g. send SIGTERM to PID {pids}), "
+                "or launch the new session with matching agents.* overrides."
+            )
+
+    clear_shadow_plugin(workspace_root)
     shadow_root.mkdir(parents=True, exist_ok=True)
 
     for src in canonical_plugin_dir.rglob("*"):
@@ -370,4 +476,6 @@ def materialise_shadow_plugin(
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.symlink_to(src)
 
+    _write_fingerprint(workspace_root, fingerprint)
+    write_pid_sentinel(workspace_root, os.getpid())
     return shadow_root

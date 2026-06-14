@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,57 +20,85 @@ from devbench import cli as cli_mod
 from devbench.backlog.work_unit import WorkUnit
 
 # ---------------------------------------------------------------------------
-# _clean_target_repo_on_block — lines 1597-1648
+# _clean_target_repo_on_block — deterministic checkout resolution + fail-fast
 # ---------------------------------------------------------------------------
 
 
 class TestCleanTargetRepoOnBlock:
-    """Every branch of the local-repo cleanup helper."""
+    """Resolves the checkout deterministically (repo -> REPO_LOCAL_PATHS); fails fast, never silently skips."""
 
-    def test_read_error_returns_one(self, tmp_path: Path) -> None:
-        # Path that exists as a directory cannot be read_text()'d (IsADirectoryError → OSError).
-        d = tmp_path / "actually-a-dir"
-        d.mkdir()
-        assert cli_mod._clean_target_repo_on_block(d) == 1
+    @staticmethod
+    def _unit(repo: str = "acme/widget", uid: str = "E1-F1-S1-T1") -> WorkUnit:
+        # ``_clean_target_repo_on_block`` reads only ``.id`` + ``.repo``; a
+        # SimpleNamespace stand-in is sufficient. Cast so the duck-typed double
+        # type-checks against the WorkUnit parameter without a real (heavier)
+        # WorkUnit construction.
+        return cast(WorkUnit, SimpleNamespace(id=uid, repo=repo))
 
-    def test_missing_local_path_marker_returns_zero(self, tmp_path: Path) -> None:
-        wu = tmp_path / "wu.md"
-        wu.write_text("no local path marker here", encoding="utf-8")
-        assert cli_mod._clean_target_repo_on_block(wu) == 0
+    def test_happy_path_resets_and_cleans_resolved_checkout(self, tmp_path: Path) -> None:
+        local = tmp_path / "repo"
+        local.mkdir()
+        good = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            patch("devbench.cli.resolve_repo", return_value="acme/widget"),
+            patch.dict(cli_mod.REPO_LOCAL_PATHS, {"acme/widget": local}, clear=False),
+            patch("devbench.cli.subprocess.run", return_value=good) as run,
+        ):
+            assert cli_mod._clean_target_repo_on_block(self._unit()) == 0
+        # Cleanup ran against the DETERMINISTICALLY-resolved path, with no Local-path prose scrape.
+        cmds = [call.args[0] for call in run.call_args_list]
+        assert ["git", "-C", str(local), "reset", "--hard", "HEAD"] in cmds
+        assert ["git", "-C", str(local), "clean", "-fd"] in cmds
 
-    def test_local_path_missing_on_disk_returns_zero(self, tmp_path: Path) -> None:
-        wu = tmp_path / "wu.md"
-        wu.write_text("- **Local path:** `/no-such-dir-on-disk-12345`\n", encoding="utf-8")
-        assert cli_mod._clean_target_repo_on_block(wu) == 0
+    def test_unresolvable_repo_fails_fast_without_git(self) -> None:
+        with (
+            patch("devbench.cli.resolve_repo", side_effect=ValueError("unknown repo")),
+            patch("devbench.cli.subprocess.run") as run,
+        ):
+            assert cli_mod._clean_target_repo_on_block(self._unit(repo="bogus")) == 1
+        run.assert_not_called()
+
+    def test_no_local_checkout_configured_fails_fast(self) -> None:
+        with (
+            patch("devbench.cli.resolve_repo", return_value="acme/widget"),
+            patch.dict(cli_mod.REPO_LOCAL_PATHS, {}, clear=True),
+            patch("devbench.cli.subprocess.run") as run,
+        ):
+            assert cli_mod._clean_target_repo_on_block(self._unit()) == 1
+        run.assert_not_called()
+
+    def test_checkout_dir_missing_fails_fast(self, tmp_path: Path) -> None:
+        missing = tmp_path / "gone"
+        with (
+            patch("devbench.cli.resolve_repo", return_value="acme/widget"),
+            patch.dict(cli_mod.REPO_LOCAL_PATHS, {"acme/widget": missing}, clear=False),
+            patch("devbench.cli.subprocess.run") as run,
+        ):
+            assert cli_mod._clean_target_repo_on_block(self._unit()) == 1
+        run.assert_not_called()
 
     def test_git_reset_failure_returns_one(self, tmp_path: Path) -> None:
         local = tmp_path / "repo"
         local.mkdir()
-        wu = tmp_path / "wu.md"
-        wu.write_text(f"- **Local path:** `{local}`\n", encoding="utf-8")
-        # Mock subprocess.run so the reset call fails.
         bad_reset = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="reset failed")
-        with patch("devbench.cli.subprocess.run", return_value=bad_reset):
-            assert cli_mod._clean_target_repo_on_block(wu) == 1
+        with (
+            patch("devbench.cli.resolve_repo", return_value="acme/widget"),
+            patch.dict(cli_mod.REPO_LOCAL_PATHS, {"acme/widget": local}, clear=False),
+            patch("devbench.cli.subprocess.run", return_value=bad_reset),
+        ):
+            assert cli_mod._clean_target_repo_on_block(self._unit()) == 1
 
     def test_git_clean_failure_returns_one(self, tmp_path: Path) -> None:
         local = tmp_path / "repo"
         local.mkdir()
-        wu = tmp_path / "wu.md"
-        wu.write_text(f"- **Local path:** `{local}`\n", encoding="utf-8")
         good = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         bad_clean = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="clean failed")
-        with patch("devbench.cli.subprocess.run", side_effect=[good, bad_clean]):
-            assert cli_mod._clean_target_repo_on_block(wu) == 1
-
-    def test_happy_path_returns_zero(self, tmp_path: Path) -> None:
-        local = tmp_path / "repo"
-        local.mkdir()
-        wu = tmp_path / "wu.md"
-        wu.write_text(f"- **Local path:** `{local}`\n", encoding="utf-8")
-        good = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with patch("devbench.cli.subprocess.run", return_value=good):
-            assert cli_mod._clean_target_repo_on_block(wu) == 0
+        with (
+            patch("devbench.cli.resolve_repo", return_value="acme/widget"),
+            patch.dict(cli_mod.REPO_LOCAL_PATHS, {"acme/widget": local}, clear=False),
+            patch("devbench.cli.subprocess.run", side_effect=[good, bad_clean]),
+        ):
+            assert cli_mod._clean_target_repo_on_block(self._unit()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1100,3 +1129,25 @@ class TestRunInlineCleanupSteps:
         ):
             with pytest.raises(cli_mod._InlineCleanupError, match=r"re-stage executor paths"):
                 cli_mod._run_inline_cleanup_steps(repo, ["a.tmp"])
+
+
+# ---------------------------------------------------------------------------
+# _write_escalation_proposal — defensive None-proposal guard
+# ---------------------------------------------------------------------------
+
+
+class TestWriteEscalationProposalNoneGuard:
+    """Fails fast if the builder returns no proposal despite out-of-scope files (covers the guard)."""
+
+    def test_none_proposal_raises_proposal_input_error(self) -> None:
+        with (
+            patch("devbench.cli.allocate_next_ids", return_value=["E1-F1-S1-T9"]),
+            patch("devbench.cli.build_escalation_proposal", return_value=None),
+        ):
+            with pytest.raises(cli_mod._ProposalInputError, match=r"no proposal despite out-of-scope"):
+                cli_mod._write_escalation_proposal(
+                    source_task_id="E1-F1-S1-T1",
+                    attributed_files=["x/y.tf"],
+                    manifest_files=["a/b.py"],
+                    out_of_scope=["x/y.tf"],
+                )

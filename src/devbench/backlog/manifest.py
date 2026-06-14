@@ -13,10 +13,13 @@ This module provides:
 - ``append_rows`` -- splice additional rows into an existing work-unit
   Markdown string without modifying anything outside the Changes Manifest
   section body.
+- ``remove_rows`` -- splice named rows OUT of an existing work-unit Markdown
+  string, mirroring ``append_rows``. Fails fast when a named path is absent
+  from the manifest.
 
 The writer is used by the manifest amendment workflow to add production-fix
 rows to a work-unit's manifest at runtime after a judge has approved the
-amendment. It is never used to remove rows.
+amendment, and to remove a row a landed sibling rename/delete made stale.
 """
 
 from __future__ import annotations
@@ -43,6 +46,10 @@ _SECTION_RE = re.compile(
 
 class ManifestParseError(ValueError):
     """Raised when the Changes Manifest section cannot be parsed."""
+
+
+class ManifestRowNotFoundError(ValueError):
+    """Raised when a row requested for removal is absent from the manifest."""
 
 
 @dataclass(frozen=True)
@@ -178,6 +185,44 @@ def append_rows(content: str, new_rows: list[ManifestRow]) -> str:
     existing = _parse_body(match.group(2))
     combined = existing + list(new_rows)
     rendered = render_manifest_rows(combined)
+
+    replacement = match.group(1) + "\n" + rendered + "\n"
+    return content[: match.start()] + replacement + content[match.end() :]
+
+
+def remove_rows(content: str, paths_to_remove: list[str]) -> str:
+    """Return ``content`` with the rows naming ``paths_to_remove`` removed.
+
+    Each path is matched against the parsed ``ManifestRow.file`` value (the
+    bare repo-relative path -- the repo-prefixed ``` `<repo>` -- `<path>` ```
+    display form parses down to ``<path>``). Surviving rows are preserved in
+    order and re-rendered with the canonical formatter; content outside the
+    Changes Manifest section is left byte-for-byte identical.
+
+    Returns ``content`` unchanged when ``paths_to_remove`` is empty. Raises
+    ``ManifestParseError`` when the section is missing or malformed, and
+    ``ManifestRowNotFoundError`` (fail-fast) when ANY requested path is absent
+    from the manifest -- no partial removal is applied.
+    """
+    if not paths_to_remove:
+        return content
+
+    match = _SECTION_RE.search(content)
+    if match is None:
+        raise ManifestParseError(f"'## {MANIFEST_HEADER}' section not found in work-unit content")
+
+    existing = _parse_body(match.group(2))
+    present = {row.file for row in existing}
+    missing = [path for path in paths_to_remove if path not in present]
+    if missing:
+        raise ManifestRowNotFoundError(
+            f"Cannot remove manifest row(s) {missing}: not present in the Changes Manifest. "
+            f"Manifest declares: {sorted(present)}."
+        )
+
+    remove_set = set(paths_to_remove)
+    survivors = [row for row in existing if row.file not in remove_set]
+    rendered = render_manifest_rows(survivors)
 
     replacement = match.group(1) + "\n" + rendered + "\n"
     return content[: match.start()] + replacement + content[match.end() :]

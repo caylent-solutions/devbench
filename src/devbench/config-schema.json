@@ -329,6 +329,33 @@
           "type": "integer",
           "minimum": 1,
           "description": "Cap on recovery-of-a-recovery cascade depth. When a proposal would land at depth >= this cap, the source task transitions to NEEDS_OPERATOR_ATTENTION instead of materialising another recovery layer. Default: 2."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model for the top-level orchestrate SDK session launched non-interactively by `devbench start` / `--daemon`. Single source of truth for the orchestrator model: devbench passes it into ClaudeAgentOptions(model=...) so the session never inherits the interactive Claude Code (~/.claude/settings.json) model. No env/settings fallback; the orchestrator-launch path fails fast when unset. Short name (opus|sonnet) or full Anthropic id when use_bedrock:false; Bedrock ARN when true. Haiku rejected (#198). Does NOT affect the interactive /devbench-orchestrate:orchestrate slash command, which runs on the host session's selected model."
+        },
+        "harness_integrity_check": {
+          "type": "string",
+          "enum": [
+            "off",
+            "warn",
+            "fail"
+          ],
+          "description": "Startup integrity check `devbench start` runs against the devbench checkout: it detects uncommitted edits under the devbench package source (src/devbench/**) -- the signature of a prior orchestrate self-edit or unreviewed manual change -- before any run begins. 'off' skips it; 'warn' (the default) emits a loud warning and continues; 'fail' refuses to start. Pairs with the guard-harness-write.sh PreToolUse hook that hard-denies the session from editing the harness in the first place."
+        },
+        "within_claim_convergence_check": {
+          "type": "boolean",
+          "description": "Whether the within-claim repeated-failure bound is active (default true). A single in-progress claim that repeats the SAME unresolvable AC-verify / TDD-RED / live-test signature max_within_claim_attempts times -- while staying busy so the inactivity budget keeps resetting -- is BLOCKED with a [CLAIM_NOT_CONVERGING] audit comment instead of churning for hours. Keyed on the REPEATED IDENTICAL signature (not raw duration), so a genuinely-progressing long live run is never killed. Set false to disable."
+        },
+        "max_within_claim_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of times the SAME failing AC-verify / TDD-RED / live-test signature may recur within one claim before the within_claim_convergence_check bound BLOCKs the unit. Default 4. Override via DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS."
+        },
+        "max_claim_wall_clock_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Secondary wall-clock backstop for a single claim, in seconds, for the within_claim_convergence_check bound. Set well above the observed-legit maximum (e.g. a 3.5h live firehose apply) so it only fires on an implausibly long stuck claim with no repeated-identical signature. Default 21600 (6h). 0 disables the backstop (the repeated-signature bound still applies). Override via DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS."
         }
       }
     },
@@ -546,6 +573,10 @@
         "allow_verification_directive_amendments": {
           "type": "boolean",
           "description": "Whether the 'verification_directive_defect' amendment reason is accepted, letting the pipeline repair an objectively-defective '## Verification' directive (stale assertion superseded by a DONE unit, syntactic regex/quoting bug, or identifier rename landed by a DONE sibling). Judge-gated via the manifest-amender's dedicated rubric; deterministic guards enforce the rewrite is never weaker (same AC ids, same type=, same expect-exit; cited units must be done). Default: true (set false to require an operator edit for every verification-directive fix)."
+        },
+        "allow_manifest_row_superseded_amendments": {
+          "type": "boolean",
+          "description": "Whether the 'manifest_row_superseded' amendment reason is accepted, letting the executor self-remove a Changes Manifest row whose file a DONE sibling renamed/deleted (the row deterministically re-fails git-ops because the file is absent on disk). Judge-gated; deterministic guards require the row's file ABSENT on disk, every cited unit status done, and the staged diff not touching the removed path -- a row whose file still exists is never removed. Default: true (set false to require an operator edit for every superseded-row fix)."
         }
       }
     },

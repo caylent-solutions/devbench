@@ -68,6 +68,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -105,6 +106,7 @@ from devbench.backlog.amendment import (
     AmendmentRequest,
     apply_amendment,
     apply_operator_amendment,
+    read_request,
     read_review_failure_files,
     reject_amendment,
     write_request,
@@ -112,6 +114,8 @@ from devbench.backlog.amendment import (
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
+    ESCALATION_NO_PROPOSAL_MARKER,
+    ESCALATION_PROPOSAL_WRITTEN_MARKER,
     BlockedTaskState,
     CascadeDepthError,
     Proposal,
@@ -121,6 +125,8 @@ from devbench.backlog.proposal import (
     _compute_fix_signature,
     _extract_intent_phrase,
     add_dep,
+    allocate_next_ids,
+    build_escalation_proposal,
     classify_blocked_task,
     classify_proposed_task,
     detect_placeholder_descriptions,
@@ -166,25 +172,31 @@ from devbench.config_loader import (
 )
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
-    BACKLOG_LOCAL_PATH_RE,
     BACKLOG_STATUS_RE,
     BLOCKED_TARGET_REPO_UNRESOLVED_MARKER,
     CLAIM_BLOCKED_PRECLAIM,
+    CLAIM_NOT_CONVERGING_MARKER,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS,
     DEFAULT_MAX_QUOTA_RESUMES,
+    DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
     DEFAULT_PLUGIN_SUBPATH,
+    DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
+    FATAL_SDK_ERROR_CODES,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_FATAL_ERROR_AUDIT_PREFIX,
+    ORCHESTRATOR_FATAL_ERROR_EXIT_CODE,
     ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
@@ -1601,7 +1613,7 @@ def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
     logger.info("Set %s to %s", unit_id, new_status)
 
     if new_status.lower() == "blocked":
-        rc = _clean_target_repo_on_block(wu_file)
+        rc = _clean_target_repo_on_block(target)
         if rc != 0:
             print(f"WARNING: target repo cleanup failed for '{unit_id}' (exit {rc})", file=sys.stderr)
 
@@ -1882,49 +1894,62 @@ def _apply_bulk_set_status(
     )
 
 
-def _clean_target_repo_on_block(wu_file: Path) -> int:
+def _clean_target_repo_on_block(unit: WorkUnit) -> int:
     """Reset and clean the target repo's working tree when a task transitions to blocked.
 
-    Reads the ``Local path:`` field from the work-unit file and runs
-    ``git reset --hard HEAD`` and ``git clean -fd`` against that directory.
-    Both commands are run with ``check=False``; returns 1 if either fails.
+    Resolves the target checkout DETERMINISTICALLY from the unit's configured
+    repo (``resolve_repo`` + ``REPO_LOCAL_PATHS`` -- the same resolution the
+    claim and git-ops paths use), then runs ``git reset --hard HEAD`` and
+    ``git clean -fd`` against it.
 
-    If ``Local path:`` is absent from the file (e.g. validation gates with no
-    local path), logs a warning and returns 0 as a defensive skip -- this is
-    NOT a fallback; the task is already blocked, so failing here would obscure
-    the real status transition.
+    Fails fast (returns 1 with an actionable error) when the repo is
+    unrecognised or has no configured local checkout -- it never silently
+    skips, because leftover staged/untracked files from the blocked unit would
+    otherwise pollute the next claimed unit's working tree and review diff.
+    (Previously this scraped a ``Local path:`` line out of the work-unit prose
+    and skipped cleanup when absent -- a fragile no-op that leaked the blocked
+    unit's partial work into subsequent units.)
 
     Args:
-        wu_file: Path to the work-unit ``.md`` file.
+        unit: The work unit being transitioned to ``blocked``.
 
     Returns:
-        0 on success or when ``Local path:`` is absent; 1 if a git command
-        errors.
+        0 when the target working tree was reset + cleaned; 1 when the repo
+        cannot be resolved, the checkout is missing, or a git command errors.
     """
     try:
-        content = wu_file.read_text()
-    except OSError as exc:
-        logger.warning("_clean_target_repo_on_block: cannot read '%s': %s", wu_file, exc)
+        canonical_repo = resolve_repo(unit.repo)
+    except ValueError as exc:
+        logger.error(
+            "_clean_target_repo_on_block: cannot resolve target repo %r for unit %s: %s",
+            unit.repo,
+            unit.id,
+            exc,
+        )
         return 1
 
-    match = BACKLOG_LOCAL_PATH_RE.search(content)
-    if not match:
-        logger.warning(
-            "_clean_target_repo_on_block: 'Local path:' not found in '%s'; skipping repo cleanup",
-            wu_file,
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        logger.error(
+            "_clean_target_repo_on_block: no local checkout configured for repo %r (unit %s); "
+            "cannot clean the target working tree (configure REPO_LOCAL_PATHS).",
+            canonical_repo,
+            unit.id,
         )
-        return 0
+        return 1
 
-    local_path = match.group(1).strip()
-    if not Path(local_path).exists():
-        logger.warning(
-            "_clean_target_repo_on_block: local path '%s' does not exist; skipping repo cleanup",
-            local_path,
+    repo_path = Path(repo_path)
+    if not repo_path.is_dir():
+        logger.error(
+            "_clean_target_repo_on_block: configured checkout %r for repo %r does not exist (unit %s).",
+            str(repo_path),
+            canonical_repo,
+            unit.id,
         )
-        return 0
+        return 1
 
     reset_result = subprocess.run(
-        ["git", "-C", local_path, "reset", "--hard", "HEAD"],
+        ["git", "-C", str(repo_path), "reset", "--hard", "HEAD"],
         check=False,
         capture_output=True,
         text=True,
@@ -1932,13 +1957,13 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
     if reset_result.returncode != 0:
         logger.warning(
             "_clean_target_repo_on_block: git reset failed for '%s': %s",
-            local_path,
+            repo_path,
             reset_result.stderr.strip(),
         )
         return 1
 
     clean_result = subprocess.run(
-        ["git", "-C", local_path, "clean", "-fd"],
+        ["git", "-C", str(repo_path), "clean", "-fd"],
         check=False,
         capture_output=True,
         text=True,
@@ -1946,12 +1971,12 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
     if clean_result.returncode != 0:
         logger.warning(
             "_clean_target_repo_on_block: git clean failed for '%s': %s",
-            local_path,
+            repo_path,
             clean_result.stderr.strip(),
         )
         return 1
 
-    logger.info("_clean_target_repo_on_block: cleaned target repo at '%s'", local_path)
+    logger.info("_clean_target_repo_on_block: cleaned target repo at '%s'", repo_path)
     return 0
 
 
@@ -5045,6 +5070,24 @@ def _resolve_git_ops_context(unit_id: str) -> tuple[WorkUnit, str, Path]:
     return unit, canonical_repo, repo_path
 
 
+def _committable_manifest_paths(manifest_rows: list) -> list[str]:
+    """Return real file paths from *manifest_rows*, excluding sentinel rows.
+
+    Sentinel Manifest values (``<verification-only>``, ``<decision-only>``,
+    ``<no changes>``, etc.) document a unit's intent and are never real file
+    paths. They must be excluded before the paths are handed to ``git add``
+    (which fails with exit 128 on a non-existent pathspec) or to
+    ``assert_staged_matches_manifest``. This mirrors how the validator already
+    exempts sentinel values from path-based Manifest rules
+    (``devbench.backlog.sentinels.is_sentinel_manifest_value``), so a
+    verification-only unit -- including one amended to add real files -- can
+    reach the commit step without the sentinel row poisoning ``git add``.
+    """
+    from devbench.backlog.sentinels import is_sentinel_manifest_value
+
+    return [row.file for row in manifest_rows if not is_sentinel_manifest_value(row.file)]
+
+
 def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_path: Path, branch: str) -> int:
     """Commit locally only (no push/PR/merge) for single-branch deferred mode."""
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
@@ -5081,7 +5124,7 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     manifest_paths: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        manifest_paths = [r.file for r in manifest_rows]
+        manifest_paths = _committable_manifest_paths(manifest_rows)
         assert_staged_matches_manifest(repo_path, manifest_paths)
 
     ops.commit_local(canonical_repo, repo_path, branch, commit_message, manifest_paths)
@@ -5997,7 +6040,7 @@ def cmd_git_ops(unit_id: str) -> int:
     manifest_paths: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        manifest_paths = [r.file for r in manifest_rows]
+        manifest_paths = _committable_manifest_paths(manifest_rows)
         assert_staged_matches_manifest(repo_path, manifest_paths)
 
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message, manifest_paths)
@@ -7007,6 +7050,131 @@ def _resolve_plugin_path() -> Path:
     return shadow if shadow is not None else canonical
 
 
+def _devbench_repo_root() -> Path:
+    """Return the devbench package checkout root (the dir holding ``src/devbench``).
+
+    Resolved generically from this module's location: ``cli.py`` lives at
+    ``<root>/src/devbench/cli.py``, so the root is two parents up from the
+    package dir. No hardcoded path. Used by the startup harness-integrity check
+    so it inspects the SAME checkout the orchestrator runs from.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+#: Deterministic audit marker emitted by the startup harness-integrity check.
+HARNESS_INTEGRITY_MARKER: str = "[HARNESS_INTEGRITY]"
+
+
+def _check_harness_integrity(mode: str) -> int | None:
+    """Detect uncommitted edits under the devbench package source at startup.
+
+    ``mode`` is ``orchestrate.harness_integrity_check`` -- ``"off"`` (skip),
+    ``"warn"`` (the default: emit a loud ``[HARNESS_INTEGRITY]`` warning and
+    continue), or ``"fail"`` (refuse to start).
+
+    Returns a non-zero exit code only when ``mode == "fail"`` AND uncommitted
+    edits are found under ``src/devbench/`` in the devbench checkout. Returns
+    ``None`` in every other case (disabled, clean, warn-only, or a non-git
+    checkout where the concept does not apply -- the check degrades gracefully
+    and never blocks on its own infrastructure failure).
+    """
+    if mode == "off":
+        return None
+
+    root = _devbench_repo_root()
+    pkg_rel = "src/devbench"
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--", pkg_rel],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Not a git checkout / git unavailable: cannot have tracked uncommitted
+        # edits. Degrade gracefully -- never block on our own tooling failure.
+        return None
+    if result.returncode != 0:
+        return None
+    dirty = [line for line in result.stdout.splitlines() if line.strip()]
+    if not dirty:
+        return None
+
+    paths = ", ".join(line[3:].strip() for line in dirty)
+    print(
+        f"{HARNESS_INTEGRITY_MARKER} uncommitted edits detected under the devbench package "
+        f"source ({pkg_rel}/) in the checkout the orchestrator runs from ({root}): {paths}. "
+        "This is the signature of a prior orchestrate self-edit or an unreviewed manual change. "
+        "The orchestrate session is forbidden from editing the harness (guard-harness-write.sh); "
+        "review and commit or revert these edits before running.",
+        file=sys.stderr,
+    )
+    if mode == "fail":
+        print(
+            f"{HARNESS_INTEGRITY_MARKER} orchestrate.harness_integrity_check=fail; refusing to start.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _check_orchestrator_startup_gates(plugin_path: Path) -> int | None:
+    """Run the pre-SDK startup gates; return a non-zero exit code on the first
+    blocking failure, else ``None``.
+
+    Gate order:
+
+    1. Guard hooks registered (H4, spec AC-H4-1): fail closed when the plugin's
+       PreToolUse guard hooks are not loaded.
+    2. Harness integrity (``orchestrate.harness_integrity_check``, default
+       ``warn``): warn or fail fast on uncommitted edits under the devbench
+       package source -- the signature of a prior orchestrate self-edit. Pairs
+       with the ``guard-harness-write.sh`` hook that hard-denies the session
+       from editing the harness in the first place.
+    """
+    if (hook_check_rc := _check_guard_hooks_registered(plugin_path)) is not None:
+        return hook_check_rc
+    if (integrity_rc := _check_harness_integrity(RUNTIME_CONFIG.orchestrate.harness_integrity_check)) is not None:
+        return integrity_rc
+    return None
+
+
+class _OrchestratorModelUnsetError(RuntimeError):
+    """Raised by :func:`_resolve_orchestrator_model` when no model is configured."""
+
+
+def _resolve_orchestrator_model() -> str:
+    """Return the orchestrate-session model from ``orchestrate.model`` in devbench.yaml.
+
+    This is the SINGLE source of truth for the model the SDK-launched
+    orchestrator runs on (``devbench start`` / ``--daemon``). The value is
+    passed into ``ClaudeAgentOptions(model=...)`` so the session can NEVER
+    inherit the interactive Claude Code ``~/.claude/settings.json`` model. Per
+    CLAUDE.md there is NO fallback (not to ``DEVBENCH_CLAUDE_MODEL``, not to the
+    CLI settings): when ``orchestrate.model`` is unset the orchestrator-launch
+    path fails fast.
+
+    Returns:
+        The configured non-empty orchestrate model string.
+
+    Raises:
+        _OrchestratorModelUnsetError: When ``orchestrate.model`` is absent/empty.
+    """
+    model = RUNTIME_CONFIG.orchestrate.model
+    if not model or not model.strip():
+        raise _OrchestratorModelUnsetError(
+            "orchestrate.model is not set in backlog/config/devbench.yaml. "
+            "The SDK-launched orchestrator requires an explicit model so it never "
+            "inherits the interactive Claude Code (~/.claude/settings.json) selection. "
+            "Set e.g.:\n\norchestrate:\n  model: claude-opus-4-8\n\n"
+            "and restart. (This does not affect the interactive "
+            "/devbench-orchestrate:orchestrate slash command, which runs on your "
+            "host session's selected model.)"
+        )
+    return model.strip()
+
+
 #: Fail-closed error message emitted by ``cmd_start`` when guard hooks are absent.
 #: Verbatim string required by spec AC-H4-1 (E8.F4.S1).
 _GUARD_HOOKS_ABSENT_ERROR: str = (
@@ -7246,6 +7414,193 @@ def _is_claim_tool_use(message: object) -> bool:
         if isinstance(command, str) and "devbench claim" in command:
             return True
     return False
+
+
+#: Captures the unit-id argument of a ``devbench claim <id>`` Bash command.
+_CLAIM_UNIT_ID_RE: re.Pattern[str] = re.compile(r"devbench\s+claim\s+(\S+)")
+
+
+def _claimed_unit_id(message: object) -> str | None:
+    """Return the unit-id of a ``devbench claim <id>`` Bash tool-use, or ``None``.
+
+    Duck-typed; used by ``_run`` to tell the within-claim convergence tracker
+    which unit is now in flight. Returns ``None`` when *message* is not a claim.
+    """
+    for command in _bash_commands(message):
+        match = _CLAIM_UNIT_ID_RE.search(command)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _bash_commands(message: object) -> list[str]:
+    """Return every Bash ``tool_input.command`` string carried by *message*.
+
+    Duck-typed; returns an empty list when *message* has no tool-use content.
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, (list, tuple)):
+        return []
+    commands: list[str] = []
+    for block in content:
+        if getattr(block, "name", None) != "Bash":
+            continue
+        block_input = getattr(block, "input", None)
+        if not isinstance(block_input, dict):
+            continue
+        command = block_input.get("command", "")
+        if isinstance(command, str) and command.strip():
+            commands.append(command.strip())
+    return commands
+
+
+#: Bash command fragments that identify a deterministic acceptance / TDD-RED /
+#: live-test re-run -- the observable signal a non-converging claim repeats. A
+#: claim that runs the SAME one of these over and over (same target identifier)
+#: without ever completing is "busy but not converging." Matched as substrings
+#: so the helper is robust to surrounding flags / env prefixes.
+_CLAIM_FAILURE_COMMAND_MARKERS: tuple[str, ...] = (
+    "devbench verify-ac",
+    "tf-test",
+    "go test",
+    "terratest",
+    "pytest",
+    "make test",
+)
+
+#: Captures a unit-id-shaped or path-shaped target token so two re-runs of the
+#: same check against the same target collapse to one signature, while a re-run
+#: against a DIFFERENT target (genuine progress) is a distinct signature.
+_FAILURE_TARGET_RE: re.Pattern[str] = re.compile(r"(E\d+-F\d+-S\d+-T\d+|[A-Za-z0-9_.-]*/[A-Za-z0-9_./-]+)")
+
+#: Captures a ``KEY=value`` argument (e.g. ``MODULE_PATH=providers/aws/alb``) so
+#: a parameterised test command keys on its value -- distinguishing two modules
+#: even when the value itself is not path-shaped.
+_FAILURE_KV_ARG_RE: re.Pattern[str] = re.compile(r"\b([A-Z_]+)=(\S+)")
+
+
+def _failure_target_token(command: str) -> str:
+    """Return the most specific target identifier in *command* for signature keying.
+
+    Preference order so a parameterised check keys on the thing that varies
+    between genuinely-different targets: an explicit ``KEY=value`` value first
+    (e.g. ``MODULE_PATH=...``), then a unit-id / path token, else the empty
+    string (no distinguishable target).
+    """
+    kv = _FAILURE_KV_ARG_RE.search(command)
+    if kv is not None:
+        return kv.group(2)
+    target = _FAILURE_TARGET_RE.search(command)
+    return target.group(0) if target is not None else ""
+
+
+def _extract_failure_signature(message: object) -> str | None:
+    """Return a stable signature for a repeated AC-verify / TDD-RED / test re-run.
+
+    Pure + deterministic. Scans the Bash commands in *message* for one of
+    :data:`_CLAIM_FAILURE_COMMAND_MARKERS`; when found, returns a normalised
+    signature combining the matched marker with the command's target identifier
+    (a work-unit id, a ``KEY=value`` arg, or a path token). Two re-runs of the
+    SAME check against the SAME target share a signature; a re-run against a
+    DIFFERENT target is a DISTINCT signature (so genuine progress across targets
+    does not accrue toward the bound).
+
+    Returns ``None`` when the message carries no recognisable verification /
+    test re-run -- a claim, a status read, an edit, etc. never produce a
+    signature, so only repeated *checking* of the same thing counts.
+    """
+    for command in _bash_commands(message):
+        for marker in _CLAIM_FAILURE_COMMAND_MARKERS:
+            if marker in command:
+                return f"{marker}::{_failure_target_token(command)}"
+    return None
+
+
+class ClaimConvergenceTracker:
+    """Bound a single in-progress claim that repeats the SAME failure forever.
+
+    Neither the turn-end continuation budget (no-activity stalls) nor the
+    cascade circuit-breaker (claim re-queue cycles) bounds a unit that stays
+    "busy" while re-running the SAME unresolvable AC-verify / TDD-RED / live
+    test for hours. This tracker does.
+
+    It keys on the REPEATED IDENTICAL failure signature, never on raw duration:
+    a genuinely-progressing long run emits a DIFFERENT signature each round (or
+    no repeated failure at all), so the per-signature count never reaches the
+    bound and the run is left alone. A wall-clock backstop fires only after a
+    duration set well above the observed-legit maximum, as a last resort for a
+    claim stuck for an implausibly long time without a repeated signature.
+
+    All clock values are injected via the ``now`` parameter (no hardcoded clock)
+    so the tracker is fully deterministic under test.
+    """
+
+    def __init__(self, *, max_within_claim_attempts: int, max_claim_wall_clock_seconds: float) -> None:
+        self._max_attempts = max_within_claim_attempts
+        self._max_wall_clock = max_claim_wall_clock_seconds
+        self.current_unit_id: str | None = None
+        self._claim_started_at: float | None = None
+        self._signature_counts: dict[str, int] = {}
+
+    def note_claim(self, unit_id: str, *, now: float) -> None:
+        """Begin tracking a freshly-claimed unit, resetting all per-claim state."""
+        self.current_unit_id = unit_id
+        self._claim_started_at = now
+        self._signature_counts = {}
+
+    def observe(self, message: object, *, now: float) -> str | None:
+        """Fold *message* into the bound; return the recurring failure when tripped.
+
+        Returns the recurring failure signature (or a wall-clock diagnostic)
+        when the bound trips for the current claim, else ``None``. Safe to call
+        before any claim has been noted (returns ``None``).
+        """
+        if self.current_unit_id is None or self._claim_started_at is None:
+            return None
+
+        signature = _extract_failure_signature(message)
+        if signature is not None:
+            count = self._signature_counts.get(signature, 0) + 1
+            self._signature_counts[signature] = count
+            if count >= self._max_attempts:
+                return signature
+
+        if self._max_wall_clock > 0 and (now - self._claim_started_at) >= self._max_wall_clock:
+            return f"wall-clock backstop exceeded for {self.current_unit_id}"
+        return None
+
+
+#: Sub-agent (Task tool) activity message class names. Their presence means the
+#: orchestrator is doing real work via a spawned agent (e.g. a long terraform
+#: apply / make validate) even when the top-level session is quiet -- so the
+#: turn-end stall budget must NOT accrue against them.
+_SUBAGENT_ACTIVITY_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {"TaskStartedMessage", "TaskProgressMessage", "TaskNotificationMessage"}
+)
+
+
+def _is_genuine_progress(message: object) -> bool:
+    """Return ``True`` when *message* shows the orchestrator is doing real work.
+
+    Used to reset the turn-end stall budget so a legitimately long-running unit
+    (a quiet sub-agent running a terraform apply / ``make validate`` / a real
+    terratest) is NOT killed by accumulating inactivity timeouts. Genuine
+    progress is any of: a work-unit claim, a sub-agent Task activity message, or
+    any tool-use block in the message content (the model is actively invoking a
+    tool). An empty or synthetic message (e.g. the ``model_not_found`` error
+    AssistantMessage) is NOT progress -- those still accrue toward the budget so
+    a true no-progress loop still trips, and a fatal error exits via
+    :func:`detect_fatal_sdk_error` before reaching this check. Duck-typed; never
+    raises.
+    """
+    if type(message).__name__ in _SUBAGENT_ACTIVITY_MESSAGE_TYPES:
+        return True
+    content = getattr(message, "content", None)
+    if not isinstance(content, (list, tuple)):
+        return False
+    # A tool-use block carries a ``name`` + ``input`` (ToolUseBlock); its presence
+    # means the model is actively calling a tool == real work.
+    return any(getattr(block, "name", None) and getattr(block, "input", None) is not None for block in content)
 
 
 @dataclass(frozen=True)
@@ -7574,6 +7929,50 @@ def _extract_sdk_result_text(message: object) -> str | None:
     return None
 
 
+def _check_quota_and_drain(message: object) -> None:
+    """Per-message quota + drain-on-claim short-circuit for the orchestrate loop.
+
+    Raises :class:`_QuotaDetected` when ``message`` carries a quota / rate-limit
+    error (#236), or :class:`_DrainRequested` when a claim tool-use is observed
+    while a drain signal is pending (#188/#212). No-op otherwise. Extracted from
+    ``_run`` so its branch count stays under ruff PLR0912.
+    """
+    _qe = detect_quota_error(message)
+    if _qe is not None:
+        raise _QuotaDetected(_qe)
+    _drain = read_drain_state(WORKSPACE_ROOT)
+    if _is_claim_tool_use(message) and _drain is not None:
+        raise _DrainRequested(_drain.reason)
+
+
+def detect_fatal_sdk_error(message: object) -> str | None:
+    """Return a non-retryable fatal-error code carried by ``message``, else ``None``.
+
+    A hard SDK error such as ``model_not_found`` (the configured model does not
+    exist / the account lacks access -- e.g. a withdrawn model) recurs
+    identically every turn; it cannot be resolved by retrying, only by operator
+    action. ``_run`` checks this BEFORE the turn-end continuation path so such an
+    error exits fast on the FIRST occurrence instead of re-prompting forever
+    (the runaway this guards against). Quota / rate-limit errors are deliberately
+    NOT matched here -- they route to the quota wait-and-resume path via
+    :func:`detect_quota_error`.
+
+    Detection is duck-typed: it inspects the message's ``error`` attribute
+    (carried by a synthetic ``AssistantMessage`` like
+    ``error='model_not_found'``) and matches it case-insensitively against
+    :data:`~devbench.constants.FATAL_SDK_ERROR_CODES`. Returns the matched code
+    when found, else ``None``.
+    """
+    err = getattr(message, "error", None)
+    if not isinstance(err, str) or not err:
+        return None
+    err_lower = err.lower()
+    for code in FATAL_SDK_ERROR_CODES:
+        if code in err_lower:
+            return code
+    return None
+
+
 #: Issue #218: the three terminal sentinels the orchestrate skill emits
 #: at end-of-run (per ``plugin/devbench-orchestrate/skills/orchestrate/SKILL.md``
 #: lines 8, 32, 35-36).  ``NO_ACTIONABLE_IN_SCOPE`` is caught by the
@@ -7657,6 +8056,41 @@ def _classify_normal_exit_reason(sdk_result_text: str | None) -> str:
     if _is_terminal_orchestrate_result(sdk_result_text):
         return f"clean exit: {sdk_result_text}"
     return _STOP_REASON_PREMATURE_TURN_END
+
+
+def _classify_orchestrator_exit(
+    *,
+    fatal_error_code: str | None,
+    continuation_exhausted: bool,
+    claim_not_converging: str | None,
+    sdk_result_text: str | None,
+) -> tuple[int, str]:
+    """Map a normal (non-exception) SDK-loop exit to ``(restart_rc, stop_reason)``.
+
+    Extracted from ``cmd_start`` to keep its branch count under PLR0912. Decision
+    order (first match wins):
+
+    1. ``fatal_error_code`` set -- non-retryable SDK error (e.g.
+       ``model_not_found``): exit with the distinct fatal-error code so the
+       wrapping ``make start`` loop does NOT auto-restart (a restart re-hits the
+       same error). Operator must fix the model.
+    2. ``continuation_exhausted`` -- the turn-end continuation budget tripped:
+       exit with the distinct continuations-exhausted code.
+    3. ``claim_not_converging`` set -- the within-claim convergence bound tripped
+       and the in-flight unit was force-blocked with ``[CLAIM_NOT_CONVERGING]``.
+       The blocked unit awaits operator review; remaining units are unaffected,
+       so the normal auto-restart classification applies (a restart picks up the
+       next claimable unit rather than re-churning the blocked one).
+    4. Otherwise -- classify the normal exit reason and run the auto-restart
+       check.
+    """
+    if fatal_error_code is not None:
+        return ORCHESTRATOR_FATAL_ERROR_EXIT_CODE, f"fatal SDK error: {fatal_error_code}"
+    if continuation_exhausted:
+        return ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, "continuation budget exhausted"
+    if claim_not_converging is not None:
+        return _check_auto_restart_and_notify(f"claim not converging: {claim_not_converging}")
+    return _check_auto_restart_and_notify(_classify_normal_exit_reason(sdk_result_text))
 
 
 def _is_sdk_result_message(message: object) -> bool:
@@ -7791,6 +8225,41 @@ def _resolve_max_turn_end_continuations() -> int:
     if raw:
         return int(raw)
     return DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS
+
+
+def _resolve_within_claim_convergence_check() -> bool:
+    """Return whether the within-claim convergence bound is active (env > YAML > default)."""
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    yaml_value = RUNTIME_CONFIG.orchestrate.within_claim_convergence_check
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK
+
+
+def _resolve_max_within_claim_attempts() -> int:
+    """Return the within-claim repeated-failure attempt cap (env > YAML > default)."""
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "").strip()
+    if raw:
+        return int(raw)
+    yaml_value = RUNTIME_CONFIG.orchestrate.max_within_claim_attempts
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS
+
+
+def _resolve_max_claim_wall_clock_seconds() -> float:
+    """Return the within-claim wall-clock backstop in seconds (env > YAML > default)."""
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS", "").strip()
+    if raw:
+        return float(raw)
+    yaml_value = RUNTIME_CONFIG.orchestrate.max_claim_wall_clock_seconds
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS
 
 
 def _resolve_max_quota_resumes() -> int:
@@ -8548,11 +9017,23 @@ def cmd_start(*argv: str) -> int:
 
     plugin_path = _resolve_plugin_path()
 
-    # H4 (spec AC-H4-1, E8.F4.S1): fail closed when guard hooks are not loaded.
-    # The check runs immediately after the plugin path is resolved so the error
-    # surfaces before any SDK subprocess is spawned.
-    if (hook_check_rc := _check_guard_hooks_registered(plugin_path)) is not None:
-        return hook_check_rc
+    # Startup gates run immediately after the plugin path is resolved, before
+    # any SDK subprocess is spawned: fail closed when guard hooks are not
+    # loaded (H4), then warn / fail on uncommitted harness-source edits.
+    if (gate_rc := _check_orchestrator_startup_gates(plugin_path)) is not None:
+        return gate_rc
+
+    # Resolve the orchestrate-session model from devbench.yaml (orchestrate.model)
+    # and fail fast BEFORE spawning the SDK subprocess when it is unset. This is
+    # the single source of truth -- the session is pinned to this model so it can
+    # never inherit the interactive Claude Code (~/.claude/settings.json) model.
+    # No fallback (CLAUDE.md). Scoped to the orchestrator-launch path so other
+    # commands (status / report / validate-backlog) load without requiring it.
+    try:
+        _orchestrator_model = _resolve_orchestrator_model()
+    except _OrchestratorModelUnsetError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # When the resolver returned the shadow path (overrides configured),
     # record this orchestrator's PID inside the shadow tree. The sentinel
@@ -8617,6 +9098,15 @@ def cmd_start(*argv: str) -> int:
     # return the distinct exit code without raising an exception.
     _continuation_exhausted: bool = False
 
+    # Set by ``_run`` to the fatal SDK error code (e.g. ``model_not_found``) when a
+    # non-retryable error is detected, so the outer handler returns the distinct
+    # fatal-error exit code instead of looping. ``None`` when no fatal error.
+    _fatal_error_code: str | None = None
+
+    # Set by ``_run`` when the within-claim convergence bound trips so the outer
+    # handler records the right stop reason. ``None`` when the bound never trips.
+    _claim_not_converging: str | None = None
+
     async def _run() -> None:
         """Drive a stateful ClaudeSDKClient session with drain enforcement.
 
@@ -8628,12 +9118,26 @@ def cmd_start(*argv: str) -> int:
 
         A per-stall counter ``stall_count`` increments on every non-terminal
         ResultMessage (or per-message inactivity timeout) and resets to zero
-        on any non-ResultMessage (tool-call or genuine progress).  When
-        ``stall_count`` reaches the cap resolved by
+        on genuine progress (``_is_genuine_progress``: a claim, a tool-use, or
+        sub-agent Task activity). It is deliberately NOT reset by every
+        non-ResultMessage: an arbitrary empty/synthetic message is not progress,
+        and resetting on it made the budget unreachable (every turn emits such a
+        message before its ResultMessage), letting a no-sentinel-every-turn
+        condition loop forever. Resetting on real activity (not only a claim)
+        keeps a legitimately long-running unit -- a quiet sub-agent doing a
+        terraform apply / make validate -- alive across its inactivity timeouts.
+        When ``stall_count`` reaches the cap resolved by
         :func:`_resolve_max_turn_end_continuations`, ``_run`` logs
         ``ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX`` and
         returns, signalling the outer handler via ``_continuation_exhausted``
         (Issue #262 E10-F1-S3).
+
+        A non-retryable fatal SDK error (``detect_fatal_sdk_error``, e.g.
+        ``model_not_found``) is detected per message and exits ``_run`` on the
+        FIRST occurrence via ``_fatal_error_code`` (the outer handler returns
+        ``ORCHESTRATOR_FATAL_ERROR_EXIT_CODE``), never entering the continuation
+        loop -- the error recurs identically every turn and only operator action
+        (fixing ``orchestrate.model``) can resolve it.
 
         Each await for the next SDK message is wrapped in
         ``asyncio.wait_for(..., timeout=ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS)``
@@ -8647,14 +9151,51 @@ def cmd_start(*argv: str) -> int:
                 tool-use is observed.
             _QuotaDetected: A quota error is detected in the SDK message stream.
         """
-        nonlocal _sdk_result_text, _continuation_exhausted
+        nonlocal _sdk_result_text, _continuation_exhausted, _fatal_error_code, _claim_not_converging
+        # Pin the orchestrate session to the devbench.yaml-configured model
+        # (resolved + fail-fast-checked in cmd_start). Passing model= here is
+        # what prevents the session from inheriting the interactive Claude Code
+        # (~/.claude/settings.json) model -- the root cause of the model_not_found
+        # runaway. No fallback (CLAUDE.md).
         options = ClaudeAgentOptions(
             plugins=[{"type": "local", "path": str(plugin_path)}],
             permission_mode="bypassPermissions",
+            model=_orchestrator_model,
         )
         _orchestrate_prompt = "Run the devbench-orchestrate:orchestrate skill to process the backlog until complete"
         _continuation_budget = _resolve_max_turn_end_continuations()
         _inactivity_timeout = ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS
+        # Within-claim convergence bound (config-gated, default on): block a
+        # claim that repeats the SAME unresolvable failure rather than churning.
+        _convergence_enabled = _resolve_within_claim_convergence_check()
+        _convergence_tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=_resolve_max_within_claim_attempts(),
+            max_claim_wall_clock_seconds=_resolve_max_claim_wall_clock_seconds(),
+        )
+
+        def _check_convergence(msg: object) -> bool:
+            """Fold *msg* into the convergence tracker; block + return True when it trips.
+
+            Notes a new claim, then observes the message for a repeated failure
+            signature. When the bound trips, force-blocks the in-flight unit
+            with the ``[CLAIM_NOT_CONVERGING]`` marker and records the stop
+            reason. Returns True to signal ``_run`` to exit. A no-op (returns
+            False) when the bound is disabled.
+            """
+            nonlocal _claim_not_converging
+            if not _convergence_enabled:
+                return False
+            now = time.monotonic()
+            claimed = _claimed_unit_id(msg)
+            if claimed is not None:
+                _convergence_tracker.note_claim(claimed, now=now)
+            recurring = _convergence_tracker.observe(msg, now=now)
+            if recurring is not None and _convergence_tracker.current_unit_id is not None:
+                _block_non_converging_claim(_convergence_tracker.current_unit_id, recurring)
+                _claim_not_converging = recurring
+                return True
+            return False
+
         async with ClaudeSDKClient(options=options) as client:
             await client.query(_orchestrate_prompt)
             stall_count: int = 0
@@ -8665,6 +9206,22 @@ def cmd_start(*argv: str) -> int:
                         client.receive_response(), _inactivity_timeout
                     ):
                         logger.info("sdk message: %s", message)
+                        # Fatal, non-retryable SDK error (e.g. model_not_found): exit
+                        # fast on the FIRST occurrence. Such an error recurs identically
+                        # every turn and must never be fed into the continuation loop
+                        # (the model_not_found runaway). Checked before the continuation
+                        # path; quota errors are NOT matched here -- they route below.
+                        if (_fatal := detect_fatal_sdk_error(message)) is not None:
+                            logger.info(
+                                "%s%s model=%r detail=%r remediation=%s",
+                                ORCHESTRATOR_FATAL_ERROR_AUDIT_PREFIX,
+                                _fatal,
+                                _orchestrator_model,
+                                _extract_sdk_result_text(message) or getattr(message, "error", ""),
+                                "set orchestrate.model in devbench.yaml to an accessible model and restart",
+                            )
+                            _fatal_error_code = _fatal
+                            return
                         _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
                         # Issue #218: check terminal sentinel on every message that
                         # carries result text; break immediately to avoid re-invoking.
@@ -8673,8 +9230,6 @@ def cmd_start(*argv: str) -> int:
                         # Issue #262 (E10-F1-S2 + E10-F1-S3): handle ResultMessage
                         # turn boundary.  True means a non-terminal continuation was
                         # issued; increment the stall counter and enforce the budget.
-                        # Falls through (no break) when False, meaning a non-ResultMessage
-                        # (genuine tool-call / progress) was received: reset the counter.
                         if await _handle_result_message(message, client):
                             stall_count += 1
                             if stall_count >= _continuation_budget:
@@ -8682,21 +9237,31 @@ def cmd_start(*argv: str) -> int:
                                 _continuation_exhausted = True
                                 return
                             break
-                        stall_count = 0
-                        # Issue #236: per-message quota detection (AC-236-1). Check
-                        # before the drain-on-claim path so a quota hit is not masked
-                        # by an unrelated claim check.
-                        _qe = detect_quota_error(message)
-                        if _qe is not None:
-                            raise _QuotaDetected(_qe)
-                        # Issue #188 + #212: drain-on-claim short-circuit. Combined
-                        # condition (rather than nested ifs) keeps ``_run`` under
-                        # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
-                        # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
-                        _drain = read_drain_state(WORKSPACE_ROOT)
-                        if _is_claim_tool_use(message) and _drain is not None:
-                            drain_state = _drain
-                            raise _DrainRequested(drain_state.reason)
+                        # Reset the stall budget on GENUINE PROGRESS (a claim, a
+                        # tool-use, or sub-agent Task activity), NOT on every
+                        # non-ResultMessage. The prior unconditional reset made the
+                        # budget unreachable (every turn emits a message before its
+                        # ResultMessage), so a no-sentinel-every-turn condition looped
+                        # forever. Resetting ONLY on a claim was too strict -- a
+                        # legitimately long-running unit (a quiet sub-agent doing a
+                        # terraform apply / make validate) accrues inactivity timeouts
+                        # with no new claim and would be killed. Resetting on any real
+                        # activity keeps long runs alive while still bounding a true
+                        # no-progress / empty-turn loop (a fatal error exits earlier).
+                        if _is_genuine_progress(message):
+                            stall_count = 0
+                        # Within-claim convergence bound: a claim that repeats
+                        # the SAME unresolvable failure beyond the configured cap
+                        # (or exceeds the wall-clock backstop) is force-blocked
+                        # with [CLAIM_NOT_CONVERGING] and the loop exits, routing
+                        # the unit to the operator/stop-window path.
+                        if _check_convergence(message):
+                            return
+                        # Per-message quota detection (#236) + drain-on-claim
+                        # short-circuit (#188/#212), factored into one helper that
+                        # raises _QuotaDetected / _DrainRequested. Keeps _run under
+                        # ruff PLR0912's 12-branch cap.
+                        _check_quota_and_drain(message)
                     else:
                         # receive_response exhausted without a turn-boundary: loop is done.
                         _exhausted = True
@@ -8767,15 +9332,13 @@ def cmd_start(*argv: str) -> int:
         # Issue #217: bubble the SDK's final ResultMessage text into the Slack reason.
         # Issue #271 (E14-F1-S1-T1): distinguish premature turn-end from genuine
         # completion so the stop reason is never the bare literal "clean".
-        # Both branches produce a ``(rc, stop_reason)`` tuple so the always-fire
-        # notification receives the correct label regardless of which path ran.
-        # Ternary form keeps cmd_start's return-statement count under PLR0911's cap.
-        if _continuation_exhausted:
-            _stop_reason = "continuation budget exhausted"
-            restart_rc = ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
-        else:
-            _stop_reason = _classify_normal_exit_reason(_sdk_result_text)
-            restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
+        # Extracted into a helper so cmd_start stays under PLR0912's branch cap.
+        restart_rc, _stop_reason = _classify_orchestrator_exit(
+            fatal_error_code=_fatal_error_code,
+            continuation_exhausted=_continuation_exhausted,
+            claim_not_converging=_claim_not_converging,
+            sdk_result_text=_sdk_result_text,
+        )
         return restart_rc
     except BaseException as exc:
         # Capture the exit reason for the always-fire notification before
@@ -9919,6 +10482,42 @@ def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
     )
 
 
+def _block_non_converging_claim(unit_id: str, recurring_failure: str) -> None:
+    """Force-block *unit_id* with a ``[CLAIM_NOT_CONVERGING]`` audit comment.
+
+    Called from ``_run`` when the within-claim convergence bound trips: the
+    claim has repeated the SAME unresolvable failure beyond the configured
+    attempt cap (or exceeded the wall-clock backstop). Routes the unit to the
+    normal operator / stop-window path -- the correct outcome for a failure
+    that cannot be resolved in scope. Best-effort: a read/parse failure is
+    logged and swallowed so the loop can still exit cleanly.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        unit = _find_unit(parser.parse_index(), unit_id)
+        if unit is None:
+            logger.warning("%s could not locate unit %s to block (not in index)", CLAIM_NOT_CONVERGING_MARKER, unit_id)
+            return
+        wu_file = _resolve_unit_file(unit)
+        if wu_file is None:
+            logger.warning("%s could not resolve file for unit %s", CLAIM_NOT_CONVERGING_MARKER, unit_id)
+            return
+        mgr = BacklogManager()
+        mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_BLOCKED)
+        mgr._append_agent_comment(
+            wu_file,
+            "orchestrator",
+            f"{CLAIM_NOT_CONVERGING_MARKER} claim repeated the same unresolvable failure "
+            f"without converging: {recurring_failure}. Blocked for operator review at the "
+            "stop-window (the failure cannot be resolved in scope -- e.g. a vendored/target-repo "
+            "defect a verification-only unit cannot fix). Record a tracked-devbench-issues/*.md "
+            "if this is a harness/target-repo bug.",
+        )
+        logger.info("%s task=%s recurring_failure=%r", CLAIM_NOT_CONVERGING_MARKER, unit_id, recurring_failure)
+    except (OSError, ValueError) as exc:
+        logger.warning("%s failed to block unit %s: %s", CLAIM_NOT_CONVERGING_MARKER, unit_id, exc)
+
+
 def _send_sigterm_to_session(session_name: str) -> tuple[int, str, str]:
     """Read the PID file for *session_name* and send SIGTERM.
 
@@ -10183,15 +10782,74 @@ def cmd_apply_amendment(unit_id: str) -> int:
     the work unit's Changes Manifest, runs the Layer 3 post-check, and
     deletes the request on success. On any post-check failure the work unit
     is restored to its pre-amendment content and this command exits non-zero.
+
+    For a ``manifest_row_superseded`` request the deterministic guards need the
+    target repo's working tree (the removed row's file must be absent on disk)
+    and the staged-file set (it must not touch the removed path). Both are
+    resolved generically from the unit's target repo here and threaded into
+    ``apply_amendment``; other reasons do not require them, so the repo
+    resolution is skipped entirely for them.
     """
+    repo_path: Path | None = None
+    staged_files: frozenset[str] | None = None
+    if _amendment_reason_needs_repo_context(unit_id):
+        repo_path, staged_files = _resolve_amendment_repo_context(unit_id)
+
     try:
-        apply_amendment(WORKSPACE_ROOT, BACKLOG_INDEX, unit_id)
+        apply_amendment(
+            WORKSPACE_ROOT,
+            BACKLOG_INDEX,
+            unit_id,
+            repo_path=repo_path,
+            staged_files=staged_files,
+        )
     except AmendmentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     print(json.dumps({"task_id": unit_id, "status": "applied"}))
     return 0
+
+
+def _amendment_reason_needs_repo_context(unit_id: str) -> bool:
+    """Return ``True`` iff the pending request for *unit_id* needs repo context.
+
+    Only the ``manifest_row_superseded`` reason inspects the target repo's
+    working tree and staged diff. Reading the reason here lets every other
+    reason skip repo resolution entirely (so a workspace whose repo is not
+    locally configured still applies tdd/verification amendments). Best-effort:
+    returns ``False`` when the request cannot be read (apply_amendment then
+    surfaces the canonical error).
+    """
+    from devbench.backlog.amendment import REASON_MANIFEST_ROW_SUPERSEDED
+
+    try:
+        request = read_request(WORKSPACE_ROOT, unit_id)
+    except AmendmentError:
+        return False
+    return request.reason == REASON_MANIFEST_ROW_SUPERSEDED
+
+
+def _resolve_amendment_repo_context(unit_id: str) -> tuple[Path | None, frozenset[str] | None]:
+    """Return ``(repo_path, staged_files)`` for *unit_id*, or ``(None, None)``.
+
+    Resolves the unit's target repo working directory and its staged-file set
+    (``git diff --cached --name-only``). Returns ``(None, None)`` when the repo
+    cannot be resolved -- the manifest-row-superseded guards then fail fast with
+    an actionable error, and other amendment reasons (which do not need the
+    repo) proceed unaffected. Best-effort: never raises.
+    """
+    from devbench.backlog.manifest import list_staged_files
+
+    resolved = _resolve_unit_file_and_repo_path(unit_id)
+    if resolved is None:
+        return None, None
+    _wu_file, repo_path = resolved
+    try:
+        staged = frozenset(list_staged_files(repo_path))
+    except RuntimeError:
+        return repo_path, None
+    return repo_path, staged
 
 
 def cmd_reject_amendment(unit_id: str, rejection_reason: str) -> int:
@@ -11174,6 +11832,181 @@ def _maybe_auto_cascade_proposal(source_task_id: str, proposal: Proposal) -> dic
     }
 
 
+def cmd_escalate_proposal(source_task_id: str) -> int:
+    """Auto-decompose a cross-unit-defect escalation into a fix proposal.
+
+    Reads ``{"attributed_files": [...]}`` JSON on stdin -- the files the executor
+    attributed a ``NEEDS_ESCALATION`` live-AC failure to. Resolves the blocked
+    unit's own Changes Manifest, computes the OUT-OF-SCOPE subset (attributed
+    files not in the unit's manifest), and:
+
+    * When at least one file is out-of-scope: allocates fix-unit ids, builds a
+      :class:`Proposal` with one ``proposed_tasks`` entry per out-of-scope file
+      (concrete manifest + corrective AC + a re-run of the failing live AC),
+      writes ``.devbench/proposals/<id>.json``, and appends the deterministic
+      ``[ESCALATION_PROPOSAL_WRITTEN]`` audit marker to the blocked unit. The
+      operator/auto-accept pipeline then materialises + dep-wires the fixes.
+
+    * When NO attributed file is out-of-scope (or none was supplied): appends the
+      deterministic ``[ESCALATION_NO_PROPOSAL]`` marker so a watching
+      operator/loop can detect "blocked with no auto-resolution draft" without
+      reading prose, and returns success (there is nothing to decompose).
+
+    Prints a one-line JSON summary. Fails fast on stdin/schema errors or an
+    unresolvable unit.
+    """
+    try:
+        attributed_files = _read_attributed_files_from_stdin()
+        wu_file, _unit, manifest_files = _resolve_escalation_context(source_task_id)
+    except _ProposalInputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    out_of_scope = [f.strip() for f in attributed_files if f.strip() and f.strip() not in set(manifest_files)]
+    mgr = BacklogManager()
+
+    if not out_of_scope:
+        mgr._append_agent_comment(
+            wu_file,
+            "orchestrator",
+            f"{ESCALATION_NO_PROPOSAL_MARKER} {source_task_id} blocked with no out-of-scope attributed "
+            "file to decompose; no fix-proposal created. Operator review required.",
+        )
+        print(json.dumps({"source_task_id": source_task_id, "proposal_written": False, "out_of_scope": []}))
+        return 0
+
+    try:
+        written, fix_ids = _write_escalation_proposal(
+            source_task_id=source_task_id,
+            attributed_files=attributed_files,
+            manifest_files=manifest_files,
+            out_of_scope=out_of_scope,
+        )
+    except _ProposalInputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    mgr._append_agent_comment(
+        wu_file,
+        "orchestrator",
+        f"{ESCALATION_PROPOSAL_WRITTEN_MARKER} {source_task_id} decomposed cross-unit defect into "
+        f"fix unit(s) {', '.join(fix_ids)} for out-of-scope file(s) {', '.join(out_of_scope)}; "
+        f"proposal at {written}. Promote to wire {source_task_id} depends-on the fix unit(s).",
+    )
+    logger.info(
+        "%s source=%s fix_units=%s out_of_scope=%s",
+        ESCALATION_PROPOSAL_WRITTEN_MARKER,
+        source_task_id,
+        fix_ids,
+        out_of_scope,
+    )
+    print(
+        json.dumps(
+            {
+                "source_task_id": source_task_id,
+                "proposal_written": True,
+                "proposal_path": str(written),
+                "fix_units": fix_ids,
+                "out_of_scope": out_of_scope,
+            }
+        )
+    )
+    return 0
+
+
+def _resolve_escalation_context(source_task_id: str) -> tuple[Path, WorkUnit, list[str]]:
+    """Resolve ``(wu_file, unit, manifest_files)`` for an escalation, or raise.
+
+    Raises ``_ProposalInputError`` (with an actionable message) when the index
+    is unreadable, the unit is missing, the file is missing, or the manifest is
+    malformed -- collapsing four failure returns in ``cmd_escalate_proposal``
+    into one handled exception (keeps the command under PLR0911's return cap).
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        unit = _find_unit(parser.parse_index(), source_task_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise _ProposalInputError(f"cannot read backlog index: {exc}") from exc
+    if unit is None:
+        raise _ProposalInputError(f"work unit {source_task_id!r} not found in backlog")
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        raise _ProposalInputError(f"work-unit file not found for {source_task_id!r}")
+    try:
+        manifest_files = [row.file for row in parse_manifest(wu_file.read_text(encoding="utf-8"))]
+    except ManifestParseError as exc:
+        raise _ProposalInputError(f"cannot read Changes Manifest for {source_task_id!r}: {exc}") from exc
+    return wu_file, unit, manifest_files
+
+
+def _write_escalation_proposal(
+    *,
+    source_task_id: str,
+    attributed_files: list[str],
+    manifest_files: list[str],
+    out_of_scope: list[str],
+) -> tuple[Path, list[str]]:
+    """Allocate ids, build + write the escalation proposal; return ``(path, fix_ids)``.
+
+    Raises ``_ProposalInputError`` on any build / write failure (caught once by
+    ``cmd_escalate_proposal``). ``out_of_scope`` is non-empty (the caller has
+    already short-circuited the no-out-of-scope case).
+    """
+    story_id = "-".join(source_task_id.split("-")[:3])
+    try:
+        suggested_ids = allocate_next_ids(WORKSPACE_ROOT, BACKLOG_ROOT, story_id, len(out_of_scope))
+        proposal = build_escalation_proposal(
+            source_task_id=source_task_id,
+            attributed_files=attributed_files,
+            manifest_files=manifest_files,
+            suggested_ids=suggested_ids,
+            generated_at=datetime.now(tz=UTC).isoformat(),
+            rejection_reason=(
+                f"{source_task_id} live acceptance check failed due to defect(s) in file(s) "
+                f"outside its Changes Manifest: {', '.join(out_of_scope)}"
+            ),
+        )
+    except (ProposalError, ValueError) as exc:
+        raise _ProposalInputError(f"cannot build escalation proposal: {exc}") from exc
+    if proposal is None:
+        raise _ProposalInputError("escalation produced no proposal despite out-of-scope files")
+    try:
+        written = write_proposal(WORKSPACE_ROOT, proposal)
+    except ProposalError as exc:
+        raise _ProposalInputError(str(exc)) from exc
+    return written, [t.suggested_id for t in proposal.proposed_tasks]
+
+
+def _read_attributed_files_from_stdin() -> list[str]:
+    """Read stdin and return the ``attributed_files`` list.
+
+    Raises ``_ProposalInputError`` on any stdin / schema failure.
+    """
+    try:
+        raw = sys.stdin.read()
+    except OSError as exc:
+        raise _ProposalInputError(f"cannot read stdin: {exc}") from exc
+    if not raw.strip():
+        raise _ProposalInputError('escalation JSON required on stdin (expected {"attributed_files": [...]})')
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _ProposalInputError(f"escalation input is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise _ProposalInputError("escalation input must be a JSON object")
+    files_raw = data.get("attributed_files", [])
+    if not isinstance(files_raw, list):
+        raise _ProposalInputError(f"attributed_files must be a list, got {type(files_raw).__name__}")
+    result: list[str] = []
+    for entry in files_raw:
+        if not isinstance(entry, str):
+            raise _ProposalInputError(f"attributed_files entries must be strings, got {type(entry).__name__}")
+        result.append(entry)
+    return result
+
+
 def cmd_list_proposals() -> int:
     """Print every pending task-factory proposal with per-task lifecycle labels.
 
@@ -12036,6 +12869,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_write_proposal,
         1,
         "Persist a blocker-resolver proposal JSON (stdin): write-proposal <source-task-id>",
+    ),
+    "escalate-proposal": (
+        cmd_escalate_proposal,
+        1,
+        'Decompose a cross-unit-defect escalation into a fix proposal (stdin {"attributed_files": [...]}): '
+        "escalate-proposal <source-task-id>",
     ),
 }
 

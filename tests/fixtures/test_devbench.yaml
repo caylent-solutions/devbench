@@ -11,6 +11,12 @@ max_executor_retries: 3
 use_bedrock: false
 bedrock_region: us-east-1
 
+# The SDK-launched orchestrator pins its session to this model (single source of
+# truth; no fallback). Required by cmd_start; set here so the cmd_start test
+# suite exercises the launch path without each test re-declaring it.
+orchestrate:
+  model: sonnet
+
 timeouts:
   gh_api: 10
   test: 60

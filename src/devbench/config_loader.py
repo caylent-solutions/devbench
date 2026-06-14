@@ -114,6 +114,13 @@ _QUOTA_HANDLING_POLL_INTERVAL_MIN: int = 30
 _QUOTA_HANDLING_POLL_INTERVAL_MAX: int = 3600
 _QUOTA_HANDLING_MAX_WAIT_MIN: int = 1
 
+# Harness self-edit integrity check (trust-gap fix). When ``devbench start``
+# launches the orchestrator it can warn (or fail fast) if there are uncommitted
+# edits under the devbench package source -- catching drift from any prior
+# self-edit or manual change before a run begins. Default "warn".
+_ORCHESTRATE_VALID_HARNESS_INTEGRITY_CHECK: frozenset[str] = frozenset({"off", "warn", "fail"})
+_ORCHESTRATE_DEFAULT_HARNESS_INTEGRITY_CHECK: str = "warn"
+
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
 # Pinned here so SKILL.md prose and tests reference the same literals.
@@ -536,12 +543,20 @@ class AmendmentConfig:
             same AC ids / type / expect-exit enforced deterministically).
             Default ``True`` -- set ``false`` to require an operator edit
             for every verification-directive fix.
+        allow_manifest_row_superseded_amendments: Whether the
+            ``manifest_row_superseded`` amendment reason is accepted, letting
+            the executor self-remove a Changes Manifest row whose file a DONE
+            sibling renamed/deleted (deterministic guards enforce the row's
+            file is absent on disk, every cited unit is done, and the staged
+            diff does not touch the removed path). Default ``True`` -- set
+            ``false`` to require an operator edit for every superseded-row fix.
     """
 
     enabled: bool = True
     allowed_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"tdd_green_production_fix"}))
     max_requests_per_execution: int = 1
     allow_verification_directive_amendments: bool = True
+    allow_manifest_row_superseded_amendments: bool = True
 
 
 @dataclass
@@ -598,9 +613,105 @@ class OrchestrateConfig:
     Field is ``None`` when absent from YAML; ``config.py`` resolves
     env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``
     constant.
+
+    ``model`` is the model the top-level orchestrate SDK session runs on
+    when devbench launches the orchestrator non-interactively
+    (``devbench start`` / ``--daemon``). It is the single source of truth for
+    the orchestrator model: when devbench drives the session it passes this
+    value into ``ClaudeAgentOptions(model=...)`` so the session can NEVER
+    inherit the interactive Claude Code ``~/.claude/settings.json`` model.
+    There is no env or settings fallback (CLAUDE.md: no fallback logic); the
+    orchestrator-launch path fails fast when this is unset. ``None`` when
+    absent from YAML -- non-orchestrator commands (status / report /
+    validate-backlog) load fine; only ``devbench start`` requires it.
+    (Note: when an operator runs the ``/devbench-orchestrate:orchestrate``
+    slash command inside their own interactive Claude Code session, the skill
+    runs on the host session's selected model -- devbench cannot and does not
+    override that; this key governs the SDK-launched orchestrator only.)
+
+    ``harness_integrity_check`` controls the startup integrity check that
+    ``devbench start`` runs against the devbench checkout: it detects
+    uncommitted edits under the devbench package source (``src/devbench/**``)
+    -- the signature of a prior orchestrate self-edit or an unreviewed manual
+    change -- before any run begins. One of ``"off"`` (skip), ``"warn"`` (the
+    default: emit a loud warning and continue), or ``"fail"`` (refuse to start).
+
+    ``within_claim_convergence_check`` toggles the within-claim repeated-failure
+    bound. When ``True`` (the default) a single in-progress claim that repeats
+    the SAME unresolvable AC-verify / TDD-RED / live-test signature
+    ``max_within_claim_attempts`` times -- or exceeds the generous
+    ``max_claim_wall_clock_seconds`` backstop -- is BLOCKED with a
+    ``[CLAIM_NOT_CONVERGING]`` audit comment instead of churning. ``None`` for
+    the integer/float fields falls through to the constants.py defaults
+    resolved by ``config.py`` (env > YAML > default). The bound keys on the
+    REPEATED IDENTICAL signature, never raw duration, so a genuinely-progressing
+    long live run is not killed.
     """
 
     max_cascade_depth: int | None = None
+    model: str | None = None
+    harness_integrity_check: str = _ORCHESTRATE_DEFAULT_HARNESS_INTEGRITY_CHECK
+    within_claim_convergence_check: bool | None = None
+    max_within_claim_attempts: int | None = None
+    max_claim_wall_clock_seconds: float | None = None
+
+
+def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bool) -> OrchestrateConfig:
+    """Build an :class:`OrchestrateConfig` from the ``orchestrate:`` YAML block.
+
+    Validates ``orchestrate.model`` (non-empty when set; rejected by the same
+    rules as per-agent models -- haiku banned, channel must match
+    ``use_bedrock``). Extracted from ``load_runtime_config`` to keep its branch
+    count under ruff PLR0912.
+    """
+    model: str | None = None
+    raw_model = orchestrate_raw.get("model")
+    if raw_model is not None:
+        model = str(raw_model).strip()
+        if not model:
+            raise ValueError(f"Config file '{path}': orchestrate.model must be a non-empty string when set.")
+        validate_agent_model_value(f"Config file '{path}'", "orchestrate.model", model, use_bedrock)
+    max_cascade_depth = int(orchestrate_raw["max_cascade_depth"]) if "max_cascade_depth" in orchestrate_raw else None
+    harness_integrity_check = str(
+        orchestrate_raw.get("harness_integrity_check", _ORCHESTRATE_DEFAULT_HARNESS_INTEGRITY_CHECK)
+    )
+    if harness_integrity_check not in _ORCHESTRATE_VALID_HARNESS_INTEGRITY_CHECK:
+        valid = ", ".join(sorted(_ORCHESTRATE_VALID_HARNESS_INTEGRITY_CHECK))
+        raise ValueError(
+            f"Config file '{path}': orchestrate.harness_integrity_check {harness_integrity_check!r} "
+            f"is not one of [{valid}]."
+        )
+    within_claim_convergence_check = (
+        bool(orchestrate_raw["within_claim_convergence_check"])
+        if "within_claim_convergence_check" in orchestrate_raw
+        else None
+    )
+    max_within_claim_attempts = (
+        int(orchestrate_raw["max_within_claim_attempts"]) if "max_within_claim_attempts" in orchestrate_raw else None
+    )
+    if max_within_claim_attempts is not None and max_within_claim_attempts < 1:
+        raise ValueError(
+            f"Config file '{path}': orchestrate.max_within_claim_attempts must be >= 1; "
+            f"got {max_within_claim_attempts!r}."
+        )
+    max_claim_wall_clock_seconds = (
+        float(orchestrate_raw["max_claim_wall_clock_seconds"])
+        if "max_claim_wall_clock_seconds" in orchestrate_raw
+        else None
+    )
+    if max_claim_wall_clock_seconds is not None and max_claim_wall_clock_seconds < 0:
+        raise ValueError(
+            f"Config file '{path}': orchestrate.max_claim_wall_clock_seconds must be >= 0 "
+            f"(0 disables the backstop); got {max_claim_wall_clock_seconds!r}."
+        )
+    return OrchestrateConfig(
+        max_cascade_depth=max_cascade_depth,
+        model=model,
+        harness_integrity_check=harness_integrity_check,
+        within_claim_convergence_check=within_claim_convergence_check,
+        max_within_claim_attempts=max_within_claim_attempts,
+        max_claim_wall_clock_seconds=max_claim_wall_clock_seconds,
+    )
 
 
 @dataclass
@@ -1959,6 +2070,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
                 default_amendment.allow_verification_directive_amendments,
             )
         ),
+        allow_manifest_row_superseded_amendments=bool(
+            amendment_raw.get(
+                "allow_manifest_row_superseded_amendments",
+                default_amendment.allow_manifest_row_superseded_amendments,
+            )
+        ),
     )
 
     # Populate TaskFactory config from YAML task_factory block. Requires
@@ -2025,12 +2142,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     # Populate OrchestrateConfig from YAML orchestrate block (issue #144).
     # Schema enforces minimum:1; absent field stays None so config.py
     # applies the env > default fallback chain.
-    orchestrate_raw = raw.get("orchestrate") or {}
-    orchestrate = OrchestrateConfig(
-        max_cascade_depth=(
-            int(orchestrate_raw["max_cascade_depth"]) if "max_cascade_depth" in orchestrate_raw else None
-        ),
-    )
+    orchestrate = _parse_orchestrate_config(path, raw.get("orchestrate") or {}, bool(raw.get("use_bedrock", False)))
 
     # Populate BacklogConfig from YAML backlog block (issue #189).
     # Schema enforces enum on default_status_for_new_work_units and

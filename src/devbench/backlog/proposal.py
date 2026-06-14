@@ -57,6 +57,15 @@ PROPOSAL_DIR_NAME = ".devbench/proposals"
 REJECTED_PROPOSAL_DIR_NAME = ".devbench/rejected-proposals"
 LOCK_FILE_NAME = ".devbench/task-factory.lock"
 
+#: Deterministic audit marker written when a cross-unit-defect escalation
+#: materialises a fix-proposal (one proposed task per out-of-scope file).
+ESCALATION_PROPOSAL_WRITTEN_MARKER: str = "[ESCALATION_PROPOSAL_WRITTEN]"
+#: Deterministic audit marker written when an escalation block has NO
+#: out-of-scope attributed file to decompose (so no proposal is created) --
+#: lets a watching operator/loop detect "blocked with no auto-resolution
+#: draft" without reading prose.
+ESCALATION_NO_PROPOSAL_MARKER: str = "[ESCALATION_NO_PROPOSAL]"
+
 # Minimum character length for a ``suggested_approach`` field. Enforced by
 # ``materialise_proposal`` as a fail-fast contract against thin auto-generated
 # drafts that previously required operator hand-editing on every promotion.
@@ -1332,6 +1341,120 @@ def allocate_next_ids(workspace_root: Path, backlog_root: Path, story_id: str, c
 # ---------------------------------------------------------------------------
 # Proposal I/O
 # ---------------------------------------------------------------------------
+
+
+def build_escalation_proposal(
+    *,
+    source_task_id: str,
+    attributed_files: list[str],
+    manifest_files: list[str],
+    suggested_ids: list[str],
+    generated_at: str,
+    rejection_reason: str,
+) -> Proposal | None:
+    """Decompose a cross-unit-defect block into a fix :class:`Proposal`, or ``None``.
+
+    When a unit blocks with ``NEEDS_ESCALATION`` and its live-AC failure is
+    attributed to files OUTSIDE its own Changes Manifest, this builds a proposal
+    with one :class:`ProposedTask` per out-of-scope file: each fix task owns
+    exactly that one offending file, carries a corrective AC plus a re-run of the
+    blocked unit's failing live AC, and a deterministic four-section approach
+    narrative long enough to clear ``materialise_proposal``'s thin-approach floor.
+
+    The blocked unit is the proposal's ``source_task_id`` so the standard
+    promote-proposal pipeline wires it to ``depends-on`` the fix unit(s)
+    (``[BLOCKED_PENDING_PROPOSAL]`` markers) and the ADR-07 cascade re-queues it
+    once the fixes complete.
+
+    Returns ``None`` when NO attributed file is out-of-scope (every attributed
+    file is already in the blocked unit's own manifest, so there is nothing to
+    decompose) -- the caller emits the ``[ESCALATION_NO_PROPOSAL]`` marker.
+
+    Args:
+        source_task_id: The blocked unit's id.
+        attributed_files: Files the executor attributed the failure to.
+        manifest_files: The blocked unit's own Changes Manifest file paths.
+        suggested_ids: Pre-allocated task ids (one per out-of-scope file, in
+            order). Allocate via :func:`allocate_next_ids` at the call site so
+            this builder stays pure (no filesystem / lock dependency).
+        generated_at: ISO timestamp stamped into the proposal.
+        rejection_reason: Human-readable cause recorded on the proposal.
+
+    Raises:
+        ValueError: When ``suggested_ids`` has fewer entries than out-of-scope
+            files (a caller allocation bug -- fail fast rather than silently
+            dropping a fix task).
+    """
+    in_scope = set(manifest_files)
+    # Preserve order, dedupe, and keep only out-of-scope files.
+    seen: set[str] = set()
+    out_of_scope: list[str] = []
+    for path in attributed_files:
+        normalised = path.strip()
+        if not normalised or normalised in in_scope or normalised in seen:
+            continue
+        seen.add(normalised)
+        out_of_scope.append(normalised)
+
+    if not out_of_scope:
+        return None
+
+    if len(suggested_ids) < len(out_of_scope):
+        raise ValueError(
+            f"build_escalation_proposal needs at least {len(out_of_scope)} suggested_ids "
+            f"(one per out-of-scope file), got {len(suggested_ids)}. "
+            "Allocate enough ids via allocate_next_ids before calling."
+        )
+
+    tasks = [
+        _build_escalation_fix_task(
+            suggested_id=suggested_ids[idx],
+            offending_file=offending_file,
+            source_task_id=source_task_id,
+        )
+        for idx, offending_file in enumerate(out_of_scope)
+    ]
+
+    return Proposal(
+        source_task_id=source_task_id,
+        generated_at=generated_at,
+        rejection_reason=rejection_reason,
+        proposed_tasks=tasks,
+    )
+
+
+def _build_escalation_fix_task(*, suggested_id: str, offending_file: str, source_task_id: str) -> ProposedTask:
+    """Build one fix :class:`ProposedTask` owning *offending_file*.
+
+    The corrective AC names the file to repair AND a re-run of the blocked
+    unit's failing live AC (referencing ``source_task_id``) so the cascade
+    re-validates the original failure once the fix lands. The approach narrative
+    is the deterministic four-section structure ``materialise_proposal`` requires.
+    """
+    corrective_acs = [
+        f"AC-FIX-1 the defect in `{offending_file}` is corrected so it no longer causes "
+        f"the cross-unit live-AC failure attributed to it.",
+        f"AC-FIX-2 re-running the blocked unit {source_task_id}'s failing live acceptance "
+        f"check passes (exit 0) after this fix lands.",
+    ]
+    approach = (
+        f"Context: the live acceptance check of {source_task_id} failed due to a defect in "
+        f"`{offending_file}`, which is OUTSIDE {source_task_id}'s Changes Manifest -- it belongs "
+        "to another (already-done) unit, so it cannot be fixed in the blocked unit's scope. "
+        f"Scope: exactly `{offending_file}` (the single offending file) plus any companion test it owns. "
+        "TDD approach: 1. RED -- reproduce the cross-unit failure in a test that exercises "
+        f"`{offending_file}`. 2. GREEN -- apply the minimal correction. 3. REFACTOR -- tidy without "
+        f"changing behaviour. Verify: re-run {source_task_id}'s failing live acceptance check and "
+        "confirm it now exits 0, plus the repo's standard lint/format/test gates."
+    )
+    return ProposedTask(
+        suggested_id=suggested_id,
+        title=f"Fix cross-unit defect in {offending_file} blocking {source_task_id}",
+        files_to_own=[offending_file],
+        linked_scenarios=[],
+        suggested_acs=corrective_acs,
+        suggested_approach=approach,
+    )
 
 
 def write_proposal(workspace_root: Path, proposal: Proposal) -> Path:

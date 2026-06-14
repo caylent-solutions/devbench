@@ -460,8 +460,18 @@ The `orchestrate:` section controls orchestrator runtime tuning knobs.
 
 Ask the operator:
 
-> "Section: orchestrate (orchestrator runtime tuning; leave blank to use built-in defaults)
+> "Section: orchestrate (orchestrator runtime tuning)
 >
+>   model             -- Model for the top-level orchestrate SDK session when
+>                        devbench launches the orchestrator non-interactively
+>                        (`devbench start` / `--daemon`). devbench PINS the session
+>                        to this model so it never inherits the interactive Claude
+>                        Code (~/.claude/settings.json) selection. REQUIRED to launch
+>                        the orchestrator; there is NO fallback. Short name (opus|sonnet)
+>                        or full Anthropic id (use_bedrock:false) / Bedrock ARN (true).
+>                        Haiku is rejected. Does NOT affect the interactive
+>                        /devbench-orchestrate:orchestrate slash command (which runs on
+>                        the host session's selected model). [recommended: claude-opus-4-8]
 >   max_cascade_depth -- Cap on recovery-of-a-recovery cascade depth. When a
 >                        proposal would land at depth >= this cap, the source task
 >                        transitions to NEEDS_OPERATOR_ATTENTION instead of
@@ -469,9 +479,11 @@ Ask the operator:
 >                        [integer >= 1, default: 2]
 >                        Override at runtime via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH."
 
-Validate the provided value (when not blank) is an integer >= 1. Reject with:
+Validate `model` (when the operator intends to run `devbench start`): non-empty; not haiku; a short name / Anthropic id when use_bedrock:false, or a Bedrock ARN when true. Reject haiku with the #198 rationale. Validate `max_cascade_depth` (when not blank) is an integer >= 1. Reject with:
 
 > "[INVALID] orchestrate.max_cascade_depth must be an integer >= 1. Re-enter."
+
+Strongly recommend setting `orchestrate.model` -- without it `devbench start` fails fast at launch (by design: the orchestrator must never silently inherit the interactive model).
 
 ---
 
@@ -658,7 +670,7 @@ Report:
 >   manifest_amendment: enabled=<value>
 >   backlog:            default_status_for_new_work_units=<value>
 >   skills:             fan_out_threshold=<value>, max_iterations=<value>
->   orchestrate:        max_cascade_depth=<value>
+>   orchestrate:        model=<value>, max_cascade_depth=<value>
 >   report:             <N models configured>, default_model=input:<value>/output:<value>
 >   notifications:      enabled=<value>, events=<comma-separated list of enabled events>
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>

@@ -6596,6 +6596,64 @@ class TestGitOpsDeferred:
         assert call_args[0][0] == wu_file
         assert "COMMIT_DEFERRED" in call_args[0][2]
 
+    def test_git_ops_deferred_excludes_sentinel_rows_from_manifest_paths(self, tmp_path: Path) -> None:
+        """Sentinel Manifest rows must never reach ``git add``.
+
+        Regression: a verification-only unit whose Changes Manifest still
+        carried the ``<verification-only>`` sentinel row (alongside real files
+        appended by approved amendments) caused git-ops to run
+        ``git add -- <verification-only>``, which fails with exit 128
+        (pathspec did not match any files). ``_committable_manifest_paths``
+        must drop the sentinel row so both ``assert_staged_matches_manifest``
+        and ``commit_local`` receive only the real file paths.
+        """
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Verification unit\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `<verification-only>` | modify |\n"
+            "| `providers/aws/primitives/acm-certificate/test.config` | add |\n",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Verification unit",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_ops = MagicMock()
+        mock_assert = MagicMock()
+
+        with (
+            patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest", mock_assert),
+        ):
+            result = cli._git_ops_deferred(
+                "E0-F1-S1-T1",
+                unit,
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+            )
+
+        assert result == 0
+        expected_paths = ["providers/aws/primitives/acm-certificate/test.config"]
+        # commit_local receives the sentinel-filtered manifest path list.
+        passed_paths = mock_ops.commit_local.call_args[0][4]
+        assert passed_paths == expected_paths
+        assert "<verification-only>" not in passed_paths
+        # assert_staged_matches_manifest is also fed the filtered list.
+        assert mock_assert.call_args[0][1] == expected_paths
+
 
 class TestCmdGitOpsFinalize:
     """Test cmd_git_ops_finalize command."""

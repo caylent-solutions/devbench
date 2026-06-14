@@ -55,6 +55,11 @@ plugin/devbench-orchestrate/
     │                              bypass) writes to any plugin scripts/hooks dir, the
     │                              .devbench/plugin-shadow/ tree, .claude/settings*.json, and the
     │                              $BASH_ENV-named file. The guard layer must not be self-modifiable.
+    ├── guard-harness-write.sh   ← "guard the HARNESS" (ADR-30): PreToolUse on Write/Edit; hard-denies
+    │                              (no role bypass) writes to the devbench package source
+    │                              (src/devbench/**), its test tree (tests/**), pyproject.toml, the
+    │                              lockfile, and the Makefile. The orchestrate session must never edit
+    │                              the harness it runs; emits [HARNESS_SELF_EDIT_BLOCKED].
     ├── guard-review-supervisor-scope.sh
     │                            ← enforces read-only scope on the review-supervisor agent.
     │                              Blocks Bash mutations (git commit/push, rm, sed -i, > redirection, etc.)
@@ -151,6 +156,7 @@ The current `hooks.json` registers ten hook event types. Below shows the structu
         "matcher": "Write",
         "hooks": [
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-plugin-write.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-harness-write.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-work-unit-write.sh"}
         ]
       },
@@ -158,6 +164,7 @@ The current `hooks.json` registers ten hook event types. Below shows the structu
         "matcher": "Edit",
         "hooks": [
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-plugin-write.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-harness-write.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-work-unit-write.sh"}
         ]
       }
@@ -185,6 +192,10 @@ The current `hooks.json` registers ten hook event types. Below shows the structu
 For the full hook table (all ten event types and their scripts), see [Hooks layer](architecture.md#9-hooks-layer) in the architecture doc.
 
 The Write/Edit matchers run `guard-plugin-write.sh` first -- the "guard the guards" hook. It hard-denies (exit 2, no role bypass) any Write/Edit whose target is a plugin `scripts/` or `hooks/` file, anything under `.devbench/plugin-shadow/`, a `.claude/settings*.json` file, or the file named by `$BASH_ENV`. The guard layer must not be editable by the agents it constrains, so unlike `guard-work-unit-write.sh` it ignores `DEVBENCH_AGENT_ROLE` entirely. See [architecture.md → Guard-the-guards](architecture.md#9-hooks-layer) for the protected-category table.
+
+`guard-harness-write.sh` runs next -- the "guard the HARNESS" hook (ADR-30). The orchestrate session runs devbench from an editable source checkout, so the harness's own Python package is writable from inside the session; an autonomous session once self-patched `src/devbench/cli.py` mid-run, unreviewed and with no audit marker. This hook hard-denies (exit 2, **no role bypass** -- not even `DEVBENCH_AGENT_ROLE=orchestrator`) any Write/Edit whose target resolves under the devbench repo's protected harness surface: the package source tree (`src/devbench/**`), the package test tree (`tests/**`), `pyproject.toml`, the dependency lockfile, and the `Makefile`. The devbench repo root is resolved **generically** -- the script walks up from its own real location (resolving the shadow plugin's symlink back to canonical) to the directory holding both `src/devbench` and `pyproject.toml` -- so a target repo that merely contains a `src/devbench/`-shaped tree is never wrongly blocked. Every denial emits the deterministic `[HARNESS_SELF_EDIT_BLOCKED]` marker plus the sanctioned alternative: **the orchestrate role is forbidden from editing the harness** -- a harness bug must be surfaced by BLOCKing the unit and recording a `tracked-devbench-issues/*.md` for the operator to resolve at a stop-window, never self-patched.
+
+Complementing the runtime hook, `devbench start` runs a startup **harness-integrity check** (`orchestrate.harness_integrity_check`: `off` / `warn` (default) / `fail`). Before any SDK subprocess is spawned it compares the devbench checkout against committed git state and, on uncommitted edits under `src/devbench/**` (the signature of a prior self-edit or unreviewed manual change), emits a loud `[HARNESS_INTEGRITY]` warning (or fails fast under `fail`). This catches drift that pre-dates the run; the hook prevents new drift during it.
 
 ### The Stop hook circuit breaker
 

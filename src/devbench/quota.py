@@ -20,6 +20,7 @@ AC-234-1, AC-234a-1, AC-236-1.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -465,6 +466,77 @@ class BackoffConfig:
 _DEFAULT_BACKOFF: BackoffConfig = BackoffConfig()
 
 
+def _emit_polling_heartbeat(*, elapsed: float, probe: int, next_in: float) -> None:
+    """Emit one ``[QUOTA_POLLING]`` heartbeat line -- strictly best-effort.
+
+    A visible heartbeat lets an operator SEE the orchestrator is actively
+    waiting during a long quota pause, rather than the log looking dead between
+    ``[QUOTA_WAITING]`` and ``[QUOTA_RESUMED]``. It is emitted at the poll
+    interval on EVERY waiting path, including a pure provider-stated ``reset_at``
+    wait where no recovery probe runs (``probe`` is then ``0``).
+
+    Any logging failure is swallowed here: a heartbeat or its log handler must
+    NEVER break or delay the wait or the resume (the wait's correctness does not
+    depend on the line being written). This is the one place the module
+    deliberately suppresses an error, and only for the cosmetic liveness line.
+    """
+    # Heartbeat is best-effort: a logging/handler failure must never break or
+    # delay the wait or the resume -- the wait's correctness does not depend on
+    # this cosmetic liveness line being written, so any error is suppressed.
+    with contextlib.suppress(Exception):
+        logger.info(
+            "%s elapsed=%ds probe=%d next_in=%ds",
+            _QUOTA_POLLING_AUDIT_PREFIX,
+            int(elapsed),
+            probe,
+            int(next_in),
+        )
+
+
+async def _wait_toward_reset(
+    *,
+    reset_at: datetime | None,
+    poll_interval_seconds: int,
+    max_wait_seconds: int,
+) -> None:
+    """Sleep toward a provider-stated ``reset_at`` in poll-interval-bounded steps.
+
+    Used only on the production path where ``reset_at`` is known and still in the
+    future. Sleeps in ``poll_interval_seconds`` increments -- never one blind
+    long sleep -- emitting a ``[QUOTA_POLLING]`` heartbeat (``probe=0``, no probe
+    run) before each interval so a long wait is visibly alive in the log between
+    ``[QUOTA_WAITING]`` and ``[QUOTA_RESUMED]``. The recovery probe is NOT
+    consulted here: an elapsed provider reset is the authoritative readiness
+    signal (TDI-003a) and the probe tests a different auth channel that can never
+    confirm the subscription quota.
+
+    This is a pure side-effecting stepper: it returns ``None`` and never decides
+    the outcome. After it returns, ``wait_for_reset``'s probe loop is the single
+    source of truth -- it short-circuits to recovery on the now-elapsed reset,
+    returns ``False`` on the max-wait timeout, or consults the probe. The wait
+    window is bounded by whichever comes first, the reset or ``max_wait_seconds``,
+    and the step count is pre-computed so the loop terminates deterministically
+    regardless of whether the (mockable) clock advances during the sleeps.
+
+    Args:
+        reset_at: Expected UTC reset time, or ``None`` (no reset-wait performed).
+        poll_interval_seconds: Heartbeat/sleep cadence in seconds.
+        max_wait_seconds: Maximum total wait in seconds.
+    """
+    now = _get_current_utc()
+    if reset_at is None or now >= reset_at:
+        return
+    poll_step = max(1.0, float(poll_interval_seconds))
+    gap_to_reset = (reset_at - now).total_seconds()
+    window = min(gap_to_reset, float(max_wait_seconds))
+    elapsed = 0.0
+    while elapsed < window:
+        sleep_for = min(poll_step, window - elapsed)
+        _emit_polling_heartbeat(elapsed=elapsed, probe=0, next_in=sleep_for)
+        await asyncio.sleep(sleep_for)
+        elapsed += sleep_for
+
+
 async def wait_for_reset(
     *,
     reset_at: datetime | None,
@@ -529,16 +601,19 @@ async def wait_for_reset(
     if max_wait_seconds == 0:
         return False
 
-    now = _get_current_utc()
-    start_time = now
+    start_time = _get_current_utc()
 
-    if reset_at is not None and reset_at > now:
-        gap_seconds = (reset_at - now).total_seconds()
-        initial_sleep = min(float(max_wait_seconds), gap_seconds)
-    else:
-        initial_sleep = 0.0
-
-    await asyncio.sleep(initial_sleep)
+    # Provider-stated-reset_at wait (the common production path): step toward the
+    # reset time in poll-interval-bounded sleeps, emitting a [QUOTA_POLLING]
+    # heartbeat each interval so a long wait is visibly alive in the log. This is
+    # a pure stepper -- the probe loop below remains the single source of truth
+    # for the outcome (short-circuits to True on the now-elapsed reset per
+    # TDI-003a, returns False on the max-wait timeout, or consults the probe).
+    await _wait_toward_reset(
+        reset_at=reset_at,
+        poll_interval_seconds=poll_interval_seconds,
+        max_wait_seconds=max_wait_seconds,
+    )
 
     raw_delay = float(backoff_config.initial_seconds)
     rng = secrets.SystemRandom()
@@ -569,14 +644,9 @@ async def wait_for_reset(
         # Visible heartbeat: exactly one line per poll so an operator can SEE the
         # orchestrator is actively polling during a long wait, rather than the
         # log looking dead between [QUOTA_WAITING] and [QUOTA_RESUMED]. The
-        # backoff interval keeps this from being chatty.
-        logger.info(
-            "%s elapsed=%ds probe=%d next_in=%ds",
-            _QUOTA_POLLING_AUDIT_PREFIX,
-            int(elapsed),
-            probe_count,
-            int(delay),
-        )
+        # backoff interval keeps this from being chatty. Best-effort: a logging
+        # failure must never break the probe (same guarantee as the reset_at path).
+        _emit_polling_heartbeat(elapsed=elapsed, probe=probe_count, next_in=delay)
 
         try:
             if probe_fn():
@@ -659,7 +729,6 @@ def save_checkpoint(checkpoint: QuotaCheckpoint, workspace_root: Path) -> None:
         "saved_at": checkpoint.saved_at.isoformat(),
         "session_name": checkpoint.session_name,
     }
-    import contextlib
     import os as _os
 
     tmp_fd, tmp_path_str = tempfile.mkstemp(dir=str(dest.parent), suffix=".tmp")

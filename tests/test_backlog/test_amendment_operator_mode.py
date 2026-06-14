@@ -487,3 +487,178 @@ No manifest section here.
         with patch("devbench.backlog.amendment.ManifestRow", side_effect=_raise_value_error):
             with pytest.raises(AmendmentError, match="Operator amendment contains invalid manifest row"):
                 apply_operator_amendment(index, "EX-F1-S1-T1", req)
+
+
+# ---------------------------------------------------------------------------
+# apply_operator_amendment files_to_remove (AC-1)
+# ---------------------------------------------------------------------------
+
+
+# A work unit whose Changes Manifest carries two rows; removing the stale row
+# leaves a valid non-empty manifest (mirrors the E9-F7-S1-T1 incident where a
+# DONE sibling renamed terragrunt.hcl -> root.hcl).
+TWO_ROW_WORK_UNIT_TEMPLATE = """\
+# {task_id}: Sample Task
+
+## Status: {status}
+
+## Description
+
+Test task description.
+
+## Dependencies
+
+| ID | Title | Status |
+|----|-------|--------|
+| none | | |
+
+## Acceptance Criteria
+
+- [ ] AC-TEST-001 new test asserts something
+- [ ] AC-FUNC-001 something works end-to-end
+
+## Changes Manifest
+
+| File | Change |
+|------|--------|
+| `terragrunt/terragrunt.hcl` | modify version floor |
+| `terragrunt/root.hcl` | modify version floor |
+
+## Definition of Done
+
+- [ ] All AC checked
+
+## Comments
+"""
+
+
+@pytest.fixture()
+def tmp_backlog_two_rows(tmp_path: Path) -> Path:
+    """Build an in-progress backlog whose task has a two-row Changes Manifest."""
+    index = tmp_path / "BACKLOG.md"
+    index.write_text(BACKLOG_INDEX_TEMPLATE.format(status="in-progress"))
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir()
+    (backlog_dir / "EX-F1-S1-T1.md").write_text(
+        TWO_ROW_WORK_UNIT_TEMPLATE.format(task_id="EX-F1-S1-T1", status="in-progress"),
+        encoding="utf-8",
+    )
+    return index
+
+
+class TestApplyOperatorAmendmentFilesToRemove:
+    """AC-1: an operator-mode amendment with files_to_remove removes those rows."""
+
+    def test_removes_named_row(self, tmp_backlog_two_rows: Path) -> None:
+        from devbench.backlog.amendment import apply_operator_amendment
+        from devbench.backlog.manifest import parse_manifest
+
+        req = AmendmentRequest.from_dict(
+            _base_payload(
+                operator_mode=True,
+                files_to_add=[],
+                files_to_remove=["terragrunt/terragrunt.hcl"],
+                linked_acs=[],
+            )
+        )
+        rc = apply_operator_amendment(tmp_backlog_two_rows, "EX-F1-S1-T1", req)
+        assert rc == 0
+
+        wu_file = tmp_backlog_two_rows.parent / "backlog" / "EX-F1-S1-T1.md"
+        updated = wu_file.read_text(encoding="utf-8")
+        rows = parse_manifest(updated)
+        # Exactly the named row is gone; the sibling row remains.
+        assert [r.file for r in rows] == ["terragrunt/root.hcl"]
+
+    def test_writes_row_removed_audit_comment(self, tmp_backlog_two_rows: Path) -> None:
+        from devbench.backlog.amendment import (
+            MANIFEST_ROW_REMOVED_ACTION,
+            apply_operator_amendment,
+        )
+
+        req = AmendmentRequest.from_dict(
+            _base_payload(
+                operator_mode=True,
+                files_to_add=[],
+                files_to_remove=["terragrunt/terragrunt.hcl"],
+                linked_acs=[],
+            )
+        )
+        apply_operator_amendment(tmp_backlog_two_rows, "EX-F1-S1-T1", req)
+
+        wu_file = tmp_backlog_two_rows.parent / "backlog" / "EX-F1-S1-T1.md"
+        updated = wu_file.read_text(encoding="utf-8")
+        assert MANIFEST_ROW_REMOVED_ACTION in updated
+        # The audit comment names the removed row so the trail is actionable.
+        assert "terragrunt/terragrunt.hcl" in updated
+
+    def test_add_and_remove_in_one_request(self, tmp_backlog_two_rows: Path) -> None:
+        from devbench.backlog.amendment import apply_operator_amendment
+        from devbench.backlog.manifest import parse_manifest
+
+        req = AmendmentRequest.from_dict(
+            _base_payload(
+                operator_mode=True,
+                files_to_add=[{"path": "terragrunt/env.hcl", "change": "add env config"}],
+                files_to_remove=["terragrunt/terragrunt.hcl"],
+                linked_acs=[],
+            )
+        )
+        rc = apply_operator_amendment(tmp_backlog_two_rows, "EX-F1-S1-T1", req)
+        assert rc == 0
+
+        wu_file = tmp_backlog_two_rows.parent / "backlog" / "EX-F1-S1-T1.md"
+        rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+        files = {r.file for r in rows}
+        assert "terragrunt/terragrunt.hcl" not in files
+        assert "terragrunt/root.hcl" in files
+        assert "terragrunt/env.hcl" in files
+
+    def test_absent_row_raises_and_restores_file(self, tmp_backlog_two_rows: Path) -> None:
+        from devbench.backlog.amendment import apply_operator_amendment
+
+        wu_file = tmp_backlog_two_rows.parent / "backlog" / "EX-F1-S1-T1.md"
+        before = wu_file.read_text(encoding="utf-8")
+
+        req = AmendmentRequest.from_dict(
+            _base_payload(
+                operator_mode=True,
+                files_to_add=[],
+                files_to_remove=["terragrunt/does-not-exist.hcl"],
+                linked_acs=[],
+            )
+        )
+        with pytest.raises(AmendmentError) as exc:
+            apply_operator_amendment(tmp_backlog_two_rows, "EX-F1-S1-T1", req)
+        assert "terragrunt/does-not-exist.hcl" in str(exc.value)
+
+        # Fail-fast before any write: file is byte-for-byte unchanged.
+        assert wu_file.read_text(encoding="utf-8") == before
+
+    def test_post_check_rollback_on_integrity_violation(self, tmp_backlog_two_rows: Path) -> None:
+        from devbench.backlog.amendment import apply_operator_amendment
+
+        # Damage BACKLOG.md so validate-backlog fails after the removal write.
+        index = tmp_backlog_two_rows
+        damaged = index.read_text().replace(
+            "| EX-F1-S1-T1 | Sample Task | Task | in-progress | None |",
+            "| EX-F1-S1-T1 | Sample Task | Task | in-progress | NONEXISTENT-ID |",
+        )
+        index.write_text(damaged)
+
+        wu_file = index.parent / "backlog" / "EX-F1-S1-T1.md"
+        before = wu_file.read_text(encoding="utf-8")
+
+        req = AmendmentRequest.from_dict(
+            _base_payload(
+                operator_mode=True,
+                files_to_add=[],
+                files_to_remove=["terragrunt/terragrunt.hcl"],
+                linked_acs=[],
+            )
+        )
+        with pytest.raises(AmendmentError, match="Layer-3 post-check failed"):
+            apply_operator_amendment(index, "EX-F1-S1-T1", req)
+
+        # Rollback: work-unit file restored to pre-amendment content.
+        assert wu_file.read_text(encoding="utf-8") == before

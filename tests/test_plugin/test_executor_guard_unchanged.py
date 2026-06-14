@@ -37,8 +37,13 @@ EXPECTED_PRE_TOOL_USE: dict[str, list[str]] = {
     # plugin's own scripts/hooks, the workspace shadow plugin, .claude/settings*
     # files, and the $BASH_ENV target -- closing the self-modification gap that
     # let an orchestrator session edit guard-verdict-format.sh.
-    "Write": ["guard-plugin-write.sh", "guard-work-unit-write.sh"],
-    "Edit": ["guard-plugin-write.sh", "guard-work-unit-write.sh"],
+    # "Guard the HARNESS": guard-harness-write.sh runs next; it hard-denies
+    # (exit 2, no role bypass) Write/Edit to the devbench package source
+    # (src/devbench/**), its test tree (tests/**), pyproject.toml, the
+    # lockfile, and the Makefile -- closing the gap that let an orchestrate
+    # session self-patch src/devbench/cli.py mid-run.
+    "Write": ["guard-plugin-write.sh", "guard-harness-write.sh", "guard-work-unit-write.sh"],
+    "Edit": ["guard-plugin-write.sh", "guard-harness-write.sh", "guard-work-unit-write.sh"],
     ".*": ["hook-logger.sh"],
 }
 

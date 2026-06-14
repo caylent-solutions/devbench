@@ -394,7 +394,49 @@ compatibility with operators who run `devbench status` without `--session`).
 
 ---
 
+## Shared shadow plugin (per-agent model overrides)
+
+When `agents.*` model overrides are configured (ADR-25), `devbench start`
+materialises a workspace-local **shadow plugin** under
+`.devbench/plugin-shadow/devbench/`. The shadow content is a pure function of
+the canonical plugin plus the configured overrides, so every concurrent
+session on one workspace wants the **same** shadow.
+
+The shadow is therefore **shared, not per-session**:
+
+- On startup each session computes a stable fingerprint of its requested
+  overrides. If an up-to-date shadow already exists (its recorded fingerprint
+  matches), the session **reuses** it -- it registers as an additional owner
+  and skips the clear+rebuild. A second concurrent `devbench start` does **not**
+  rebuild or clear the shadow out from under a live sibling.
+- The shadow's owner sentinel (`.pid` inside the shadow tree) holds the **set**
+  of owning PIDs (one per line). Dead PIDs are pruned on every read. The tree
+  is eligible for clearing only when **no** recorded owner is alive.
+- If a session requests overrides that **differ** from a shadow a live sibling
+  is using, startup fails fast naming the live owner PID(s) rather than
+  silently rebuilding under the running orchestrator. Stop the named
+  session(s), or launch the new session with matching `agents.*` overrides.
+- A stray `devbench prepare-plugin-shadow` (or any operator clear) still refuses
+  to remove the shadow while any live owner holds it.
+
+Net effect: two or more sessions with identical `AGENT_MODELS` reach the claim
+loop concurrently, sharing one materialised shadow.
+
+---
+
 ## Common error messages
+
+### Shadow plugin override conflict on start
+
+```
+RuntimeError: Refusing to rebuild shadow plugin at '<ws>/.devbench/plugin-shadow':
+the requested per-agent model overrides differ from the running session(s)
+(owner PID 3903619), and rebuilding would clobber the shadow they are using.
+```
+
+**Fix:** stop the named session(s) (`devbench stop --session <name>`), or launch
+the new session with the same `agents.*` overrides so it can share the existing
+shadow.
 
 ### Scope overlap on start
 

@@ -382,6 +382,106 @@ class TestApplyAmendment:
 
 
 # ---------------------------------------------------------------------------
+# apply_amendment files_to_remove (approved-request path)
+# ---------------------------------------------------------------------------
+
+
+TWO_ROW_WORK_UNIT = """\
+# EX-F1-S1-T1: Sample Task
+
+## Status: in-progress
+
+## Description
+
+Test task description.
+
+## Dependencies
+
+| ID | Title | Status |
+|----|-------|--------|
+| none | | |
+
+## Acceptance Criteria
+
+- [ ] AC-TEST-001 new test asserts something
+- [ ] AC-FUNC-001 something works end-to-end
+
+## Changes Manifest
+
+| File | Change |
+|------|--------|
+| `terragrunt/terragrunt.hcl` | modify version floor |
+| `terragrunt/root.hcl` | modify version floor |
+
+## Definition of Done
+
+- [ ] All AC checked
+"""
+
+
+class TestApplyAmendmentFilesToRemove:
+    """An approved amendment carrying files_to_remove removes those manifest rows."""
+
+    def _write_two_row_workspace(self, tmp_workspace: Path) -> Path:
+        wu_file = tmp_workspace / "backlog" / "EX-F1-S1-T1.md"
+        wu_file.write_text(TWO_ROW_WORK_UNIT, encoding="utf-8")
+        return wu_file
+
+    def _remove_request_dict(self, files_to_remove: list[str]) -> dict[str, Any]:
+        return {
+            "task_id": "EX-F1-S1-T1",
+            "requested_at": "2026-04-18T00:00:00+00:00",
+            "reason": "tdd_green_production_fix",
+            "justification": "Stale manifest row superseded by a landed sibling rename.",
+            "files_to_add": [],
+            "files_to_remove": files_to_remove,
+            "linked_acs": ["AC-TEST-001"],
+        }
+
+    def test_removes_named_row(self, tmp_workspace: Path) -> None:
+        wu_file = self._write_two_row_workspace(tmp_workspace)
+        req = AmendmentRequest.from_dict(self._remove_request_dict(["terragrunt/terragrunt.hcl"]))
+        write_request(tmp_workspace, req)
+
+        apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", "EX-F1-S1-T1")
+
+        rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+        assert [r.file for r in rows] == ["terragrunt/root.hcl"]
+        # Request consumed on success.
+        assert not request_path(tmp_workspace, "EX-F1-S1-T1").exists()
+
+    def test_absent_row_raises_and_restores(self, tmp_workspace: Path) -> None:
+        wu_file = self._write_two_row_workspace(tmp_workspace)
+        before = wu_file.read_text(encoding="utf-8")
+        req = AmendmentRequest.from_dict(self._remove_request_dict(["terragrunt/ghost.hcl"]))
+        write_request(tmp_workspace, req)
+
+        with pytest.raises(AmendmentError) as exc:
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", "EX-F1-S1-T1")
+        assert "terragrunt/ghost.hcl" in str(exc.value)
+        # Fail-fast: file unchanged.
+        assert wu_file.read_text(encoding="utf-8") == before
+
+    def test_post_check_rollback_on_integrity_violation(self, tmp_workspace: Path) -> None:
+        wu_file = self._write_two_row_workspace(tmp_workspace)
+        before = wu_file.read_text(encoding="utf-8")
+        req = AmendmentRequest.from_dict(self._remove_request_dict(["terragrunt/terragrunt.hcl"]))
+        write_request(tmp_workspace, req)
+
+        backlog_md = tmp_workspace / "BACKLOG.md"
+        damaged = backlog_md.read_text().replace(
+            "| EX-F1-S1-T1 | Sample Task | Task | in-progress | None |",
+            "| EX-F1-S1-T1 | Sample Task | Task | in-progress | NONEXISTENT-ID |",
+        )
+        backlog_md.write_text(damaged)
+
+        with pytest.raises(AmendmentError, match="Post-check"):
+            apply_amendment(tmp_workspace, backlog_md, "EX-F1-S1-T1")
+
+        assert wu_file.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
 # reject_amendment
 # ---------------------------------------------------------------------------
 

@@ -41,8 +41,10 @@ from devbench.backlog.manifest import (
     EM_DASH,
     ManifestParseError,
     ManifestRow,
+    ManifestRowNotFoundError,
     append_rows,
     parse_manifest,
+    remove_rows,
 )
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
@@ -71,8 +73,21 @@ REVIEW_FAILURES_DIR_NAME = ".devbench/review-failures"
 #: ``manifest_amendment.allow_verification_directive_amendments``.
 REASON_VERIFICATION_DIRECTIVE_DEFECT: str = "verification_directive_defect"
 
+#: Executor-facing amendment reason for removing a Changes Manifest row whose
+#: file a DONE sibling renamed/deleted (a row the executor cannot otherwise
+#: clear, deterministically re-failing git-ops). Config-gated by
+#: ``manifest_amendment.allow_manifest_row_superseded_amendments``. Deterministic
+#: guards require the row's file ABSENT on disk, every cited unit ``done``, and
+#: the staged diff not touching the removed path; never removes a row whose file
+#: still exists.
+REASON_MANIFEST_ROW_SUPERSEDED: str = "manifest_row_superseded"
+
 ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset(
-    {"tdd_green_production_fix", REASON_VERIFICATION_DIRECTIVE_DEFECT}
+    {
+        "tdd_green_production_fix",
+        REASON_VERIFICATION_DIRECTIVE_DEFECT,
+        REASON_MANIFEST_ROW_SUPERSEDED,
+    }
 )
 
 #: Audit-comment action tag written when a verification-directive amendment is applied.
@@ -80,6 +95,10 @@ VERIFICATION_AMENDMENT_ACTION: str = "VERIFICATION_AMENDMENT"
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
 OPERATOR_AMENDMENT_ACTION = "OPERATOR_AMENDMENT"
+#: Audit-comment action tag written when an amendment removes a stale Changes
+#: Manifest row (a row whose file a DONE sibling renamed/deleted). The tag
+#: names the removed row(s) so the audit trail is actionable.
+MANIFEST_ROW_REMOVED_ACTION = "MANIFEST_ROW_REMOVED"
 AMENDER_AGENT_ID = "agent/manifest-amender"
 OPERATOR_AGENT_ID = "operator"
 COMMENTS_SECTION_HEADER = "## Comments"
@@ -151,6 +170,43 @@ class VerificationPatch:
 
 
 @dataclass(frozen=True)
+class ManifestRowSupersededClaim:
+    """One Changes Manifest row removal requested in a
+    ``manifest_row_superseded`` amendment.
+
+    ``row_path`` is the exact ``ManifestRow.file`` value to remove (the
+    bare repo-relative path -- not the repo-prefixed display form).
+    ``cited_done_units`` names the DONE unit(s) whose landed rename/delete
+    explains why the file is absent on disk (always required: only landed
+    sibling work justifies a manifest row removal). ``evidence`` is the
+    tool-captured proof (e.g. the ``git log`` line for the rename) and is
+    always mandatory.
+    """
+
+    row_path: str
+    cited_done_units: list[str] = dataclass_field(default_factory=list)
+    evidence: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.row_path or not self.row_path.strip():
+            raise ValueError("ManifestRowSupersededClaim.row_path must be non-empty")
+        if self.row_path != self.row_path.strip():
+            raise ValueError(
+                f"ManifestRowSupersededClaim.row_path must not have leading/trailing whitespace: {self.row_path!r}"
+            )
+        if not self.evidence or not self.evidence.strip():
+            raise ValueError("ManifestRowSupersededClaim.evidence must be non-empty")
+        if not self.cited_done_units:
+            raise ValueError(
+                "ManifestRowSupersededClaim.cited_done_units must name at least one DONE unit "
+                "(only landed sibling work justifies removing a manifest row)."
+            )
+        for unit_id in self.cited_done_units:
+            if not unit_id or not str(unit_id).strip():
+                raise ValueError("ManifestRowSupersededClaim.cited_done_units entries must be non-empty")
+
+
+@dataclass(frozen=True)
 class AmendmentRequest:
     """Serialised form of an amendment request emitted by the executor.
 
@@ -201,6 +257,10 @@ class AmendmentRequest:
     section_patches: dict[str, str] = dataclass_field(default_factory=dict)
     # Verification-directive amendment fields
     verification_patches: list[VerificationPatch] = dataclass_field(default_factory=list)
+    # Manifest-row-superseded amendment fields (executor self-removal of a
+    # row a DONE sibling renamed/deleted). Only valid (and required) when
+    # ``reason`` is ``manifest_row_superseded``.
+    manifest_row_superseded_claims: list[ManifestRowSupersededClaim] = dataclass_field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the request as a JSON-serialisable dict."""
@@ -255,6 +315,7 @@ class AmendmentRequest:
         dod_patch = _parse_string_field(data, "dod_patch")
         section_patches = _parse_section_patches(data)
         verification_patches = _parse_verification_patches(data)
+        manifest_row_superseded_claims = _parse_manifest_row_superseded_claims(data)
 
         return cls(
             task_id=task_id,
@@ -272,6 +333,7 @@ class AmendmentRequest:
             dod_patch=dod_patch,
             section_patches=section_patches,
             verification_patches=verification_patches,
+            manifest_row_superseded_claims=manifest_row_superseded_claims,
         )
 
 
@@ -390,6 +452,35 @@ def _parse_verification_patches(data: dict[str, Any]) -> list[VerificationPatch]
     return patches
 
 
+def _parse_manifest_row_superseded_claims(data: dict[str, Any]) -> list[ManifestRowSupersededClaim]:
+    """Parse the optional ``manifest_row_superseded_claims`` list from a request dict.
+
+    Raises ``ValueError`` on a non-list value or malformed entries.
+    """
+    raw = data.get("manifest_row_superseded_claims", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"manifest_row_superseded_claims must be a list, got {type(raw).__name__}")
+    claims: list[ManifestRowSupersededClaim] = []
+    for entry in raw:
+        if isinstance(entry, ManifestRowSupersededClaim):
+            claims.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"manifest_row_superseded_claims entries must be objects, got {type(entry).__name__}")
+        _require_keys(entry, ["row_path", "evidence"])
+        cited_raw = entry.get("cited_done_units", [])
+        if not isinstance(cited_raw, list):
+            raise ValueError(f"cited_done_units must be a list, got {type(cited_raw).__name__}")
+        claims.append(
+            ManifestRowSupersededClaim(
+                row_path=str(entry["row_path"]),
+                cited_done_units=[str(x) for x in cited_raw],
+                evidence=str(entry["evidence"]),
+            )
+        )
+    return claims
+
+
 def request_path(workspace_root: Path, task_id: str) -> Path:
     """Return the filesystem path for a pending amendment request JSON file."""
     return workspace_root / AMENDMENT_DIR_NAME / f"{task_id}.json"
@@ -461,7 +552,14 @@ def archive_rejected_request(workspace_root: Path, task_id: str) -> Path | None:
     return target
 
 
-def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> None:
+def apply_amendment(
+    workspace_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    *,
+    repo_path: Path | None = None,
+    staged_files: frozenset[str] | None = None,
+) -> None:
     """Apply an approved amendment atomically with Layer 3 post-check.
 
     Reads the pending amendment request, appends its rows to the work-unit's
@@ -470,6 +568,12 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
     failure the work-unit file is restored to its pre-amendment content and
     ``AmendmentError`` is raised -- the caller is expected to log a
     REVIEW_FAIL verdict.
+
+    ``repo_path`` and ``staged_files`` are required only for the
+    ``manifest_row_superseded`` reason, whose deterministic guards inspect the
+    target repo's working tree (the row's file must be absent on disk) and the
+    staged diff (it must not touch the removed path). The CLI resolves both
+    generically from the unit's target repo. Other reasons ignore them.
     """
     request = read_request(workspace_root, task_id)
     if request.task_id != task_id:
@@ -502,13 +606,37 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
         )
         return
 
+    if request.reason == REASON_MANIFEST_ROW_SUPERSEDED:
+        patched_content = _apply_manifest_row_superseded(
+            original_content, request, backlog_index, repo_path=repo_path, staged_files=staged_files
+        )
+        audit_entry = _build_manifest_row_superseded_audit_entry(request)
+        final_content = _append_audit_comment(patched_content, audit_entry)
+        atomic_write_text(wu_file, final_content)
+        try:
+            _post_check(final_content, backlog_index)
+        except AmendmentError:
+            atomic_write_text(wu_file, original_content)
+            raise
+        delete_request(workspace_root, task_id)
+        logger.info(
+            "Manifest-row-superseded amendment applied for %s: %d row(s) removed, reason=%s",
+            task_id,
+            len(request.manifest_row_superseded_claims),
+            request.reason,
+        )
+        return
+
     try:
         manifest_rows = [ManifestRow(file=f.path, change=f.change) for f in request.files_to_add]
     except ValueError as exc:
         raise AmendmentError(f"Amendment contains invalid manifest row: {exc}") from exc
 
+    # Remove stale rows first (fail-fast before any write when a path is absent).
+    working_content = _apply_files_to_remove(original_content, request)
+
     try:
-        content_with_rows = append_rows(original_content, manifest_rows)
+        content_with_rows = append_rows(working_content, manifest_rows)
     except ManifestParseError as exc:
         raise AmendmentError(f"Cannot apply amendment: {exc}") from exc
 
@@ -571,9 +699,13 @@ def _check_patch_invariants(patch: VerificationPatch) -> None:
         )
 
 
-def _check_citations_done(patches: list[VerificationPatch], backlog_index: Path) -> None:
-    """Every cited unit must exist in the backlog index with status ``done``."""
-    cited = {unit_id for patch in patches for unit_id in patch.cited_done_units}
+def _check_cited_units_done(cited: set[str], backlog_index: Path, *, context: str) -> None:
+    """Every cited unit must exist in the backlog index with status ``done``.
+
+    ``context`` names the citation source (``"Verification patch"`` /
+    ``"Manifest-row-superseded claim"``) so the error message is actionable.
+    A no-op when ``cited`` is empty.
+    """
     if not cited:
         return
     parser = BacklogParser(
@@ -587,12 +719,18 @@ def _check_citations_done(patches: list[VerificationPatch], backlog_index: Path)
     for unit_id in sorted(cited):
         unit = units.get(unit_id)
         if unit is None:
-            raise AmendmentError(f"Verification patch cites unit {unit_id} which does not exist in the backlog index.")
+            raise AmendmentError(f"{context} cites unit {unit_id} which does not exist in the backlog index.")
         if unit.status is not WorkUnitStatus.DONE:
             raise AmendmentError(
-                f"Verification patch cites unit {unit_id} with status {unit.status.value!r}; "
-                "cited units must be status done (only landed work justifies a directive edit)."
+                f"{context} cites unit {unit_id} with status {unit.status.value!r}; "
+                "cited units must be status done (only landed work justifies the edit)."
             )
+
+
+def _check_citations_done(patches: list[VerificationPatch], backlog_index: Path) -> None:
+    """Every cited unit in *patches* must be status ``done`` in the index."""
+    cited = {unit_id for patch in patches for unit_id in patch.cited_done_units}
+    _check_cited_units_done(cited, backlog_index, context="Verification patch")
 
 
 def _apply_verification_patches(content: str, request: AmendmentRequest, backlog_index: Path) -> str:
@@ -654,6 +792,82 @@ def _build_verification_audit_entry(request: AmendmentRequest) -> str:
     )
 
 
+def _apply_manifest_row_superseded(
+    content: str,
+    request: AmendmentRequest,
+    backlog_index: Path,
+    *,
+    repo_path: Path | None,
+    staged_files: frozenset[str] | None,
+) -> str:
+    """Remove each claimed stale row after enforcing the deterministic guards.
+
+    For every claim the guards require, BEFORE any removal:
+
+    * ``repo_path`` and ``staged_files`` were supplied (the CLI resolves both
+      from the unit's target repo). Missing either is a caller error.
+    * The row's file is ABSENT on disk in the target repo (never remove a row
+      whose file still exists).
+    * The staged diff does not touch the removed path (a path the executor is
+      actively staging is not "superseded").
+    * Every cited unit is status ``done`` in the backlog index.
+
+    Returns the content with the claimed rows removed (via
+    :func:`devbench.backlog.manifest.remove_rows`). Raises ``AmendmentError``
+    on any violation or missing row; the caller owns atomic write + rollback.
+    """
+    if repo_path is None:
+        raise AmendmentError(
+            "manifest_row_superseded amendment requires the target repo path to verify the row's "
+            "file is absent on disk; none was provided."
+        )
+    if staged_files is None:
+        raise AmendmentError(
+            "manifest_row_superseded amendment requires the staged-file set to verify the staged diff "
+            "does not touch the removed path; none was provided."
+        )
+
+    cited: set[str] = set()
+    for claim in request.manifest_row_superseded_claims:
+        row_path = claim.row_path.strip()
+        if (repo_path / row_path).exists():
+            raise AmendmentError(
+                f"manifest_row_superseded claim names row {row_path!r} but its file still exists on disk "
+                f"under {repo_path}; a row whose file is present is not superseded and is never removed."
+            )
+        if row_path in staged_files:
+            raise AmendmentError(
+                f"manifest_row_superseded claim names row {row_path!r} which appears in the staged diff; "
+                "a path the executor is actively staging cannot be superseded."
+            )
+        cited.update(claim.cited_done_units)
+
+    _check_cited_units_done(cited, backlog_index, context="Manifest-row-superseded claim")
+
+    paths_to_remove = [claim.row_path.strip() for claim in request.manifest_row_superseded_claims]
+    try:
+        return remove_rows(content, paths_to_remove)
+    except ManifestRowNotFoundError as exc:
+        raise AmendmentError(f"Cannot remove manifest row(s): {exc}") from exc
+    except ManifestParseError as exc:
+        raise AmendmentError(f"Cannot apply manifest_row_superseded amendment: {exc}") from exc
+
+
+def _build_manifest_row_superseded_audit_entry(request: AmendmentRequest) -> str:
+    """Render the ``[MANIFEST_ROW_REMOVED]`` audit comment for the work unit."""
+    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    parts: list[str] = []
+    for claim in request.manifest_row_superseded_claims:
+        cited = ", ".join(claim.cited_done_units) if claim.cited_done_units else "(none)"
+        parts.append(f"row: {claim.row_path.strip()} | cited: {cited} | evidence: {claim.evidence.strip()}")
+    body = " || ".join(parts)
+    return (
+        f"[{timestamp}] [{AMENDER_AGENT_ID}] [{MANIFEST_ROW_REMOVED_ACTION}] removed "
+        f"{len(request.manifest_row_superseded_claims)} superseded row(s); reason={request.reason}; "
+        f"justification: {request.justification}; {body}\n"
+    )
+
+
 def apply_operator_amendment(backlog_index: Path, task_id: str, request: AmendmentRequest) -> int:
     """Apply an operator-mode amendment synchronously with Layer-3 post-check.
 
@@ -675,6 +889,9 @@ def apply_operator_amendment(backlog_index: Path, task_id: str, request: Amendme
     original_content = wu_file.read_text(encoding="utf-8")
 
     working_content = original_content
+
+    # Remove stale rows first (fail-fast before any write when a path is absent).
+    working_content = _apply_files_to_remove(working_content, request)
 
     # Apply files_to_add rows when present.
     if request.files_to_add:
@@ -698,7 +915,8 @@ def apply_operator_amendment(backlog_index: Path, task_id: str, request: Amendme
     audit_entry = (
         f"[{timestamp}] [{OPERATOR_AGENT_ID}] [{OPERATOR_AMENDMENT_ACTION}] applied; "
         f"layer3=validate-backlog rc={audit_rc}; "
-        f"reason={request.reason}; justification: {request.justification}\n"
+        f"reason={request.reason}; justification: {request.justification}"
+        f"{_removed_rows_audit_fragment(request)}\n"
     )
     final_content = _append_audit_comment(working_content, audit_entry)
 
@@ -712,9 +930,10 @@ def apply_operator_amendment(backlog_index: Path, task_id: str, request: Amendme
         )
 
     logger.info(
-        "Operator amendment applied for %s: %d file(s) added, reason=%s",
+        "Operator amendment applied for %s: %d file(s) added, %d row(s) removed, reason=%s",
         task_id,
         len(request.files_to_add),
+        len(request.files_to_remove),
         request.reason,
     )
     return audit_rc
@@ -909,6 +1128,37 @@ def _resolve_task_file(backlog_index: Path, task_id: str) -> Path:
     raise AmendmentError(f"Task {task_id} not found in backlog index {backlog_index}")
 
 
+def _removed_rows_audit_fragment(request: AmendmentRequest) -> str:
+    """Render the ``[MANIFEST_ROW_REMOVED]`` audit fragment naming removed rows.
+
+    Returns an empty string when nothing was removed so callers can append it
+    unconditionally to their audit line.
+    """
+    if not request.files_to_remove:
+        return ""
+    rows = ", ".join(request.files_to_remove)
+    return f"; [{MANIFEST_ROW_REMOVED_ACTION}] {rows}"
+
+
+def _apply_files_to_remove(content: str, request: AmendmentRequest) -> str:
+    """Remove ``request.files_to_remove`` rows from the Changes Manifest.
+
+    Returns ``content`` unchanged when nothing is requested for removal.
+    Wraps :func:`devbench.backlog.manifest.remove_rows` so the manifest-layer
+    errors surface as :class:`AmendmentError` with an actionable message:
+    a missing section, a malformed manifest, or a requested path that is not
+    present all fail fast. No partial removal is applied.
+    """
+    if not request.files_to_remove:
+        return content
+    try:
+        return remove_rows(content, request.files_to_remove)
+    except ManifestRowNotFoundError as exc:
+        raise AmendmentError(f"Cannot remove manifest row(s): {exc}") from exc
+    except ManifestParseError as exc:
+        raise AmendmentError(f"Cannot apply amendment: {exc}") from exc
+
+
 def _build_audit_entry(
     request: AmendmentRequest,
     action: str,
@@ -918,7 +1168,10 @@ def _build_audit_entry(
     timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
     if action == AMENDMENT_APPLIED_ACTION:
         file_count = len(request.files_to_add)
-        message = f"{request.reason}; added {file_count} file(s); justification: {request.justification}"
+        message = (
+            f"{request.reason}; added {file_count} file(s); "
+            f"justification: {request.justification}{_removed_rows_audit_fragment(request)}"
+        )
     elif action == AMENDMENT_REJECTED_ACTION:
         message = f"{request.reason}; rejected: {rejection_reason}"
     else:
@@ -998,6 +1251,7 @@ class PreFilter:
         self.check_enabled()
         self.check_reason_allowed(request)
         self.check_verification_patch_shape(request)
+        self.check_manifest_row_superseded_shape(request)
         self.check_rate_limit(prior_applied_count)
         if not operator_mode:
             unit = self.check_task_exists_and_in_progress(request)
@@ -1030,6 +1284,14 @@ class PreFilter:
                     "in backlog/config/devbench.yaml to enable."
                 )
             return
+        if request.reason == REASON_MANIFEST_ROW_SUPERSEDED:
+            if not self._config.allow_manifest_row_superseded_amendments:
+                raise AmendmentError(
+                    "Manifest-row-superseded amendments are disabled for this backlog. "
+                    "Set manifest_amendment.allow_manifest_row_superseded_amendments: true "
+                    "in backlog/config/devbench.yaml to enable."
+                )
+            return
         if request.reason not in self._config.allowed_reasons:
             raise AmendmentError(
                 f"Amendment reason {request.reason!r} is not in allowed reasons for this backlog: "
@@ -1057,6 +1319,30 @@ class PreFilter:
             raise AmendmentError(
                 f"verification_patches are only valid with reason "
                 f"{REASON_VERIFICATION_DIRECTIVE_DEFECT!r}, got {request.reason!r}."
+            )
+
+    def check_manifest_row_superseded_shape(self, request: AmendmentRequest) -> None:
+        """Manifest-row-superseded claims and the reason imply each other.
+
+        A ``manifest_row_superseded`` request must carry at least one claim and
+        must NOT also touch the Manifest via ``files_to_add`` (the amendment
+        only removes rows); any other reason must not smuggle in
+        ``manifest_row_superseded_claims``.
+        """
+        if request.reason == REASON_MANIFEST_ROW_SUPERSEDED:
+            if not request.manifest_row_superseded_claims:
+                raise AmendmentError(
+                    "manifest_row_superseded amendments require at least one entry in manifest_row_superseded_claims."
+                )
+            if request.files_to_add:
+                raise AmendmentError(
+                    "manifest_row_superseded amendments must not carry files_to_add -- "
+                    "a row-removal amendment never also adds Changes Manifest rows."
+                )
+        elif request.manifest_row_superseded_claims:
+            raise AmendmentError(
+                f"manifest_row_superseded_claims are only valid with reason "
+                f"{REASON_MANIFEST_ROW_SUPERSEDED!r}, got {request.reason!r}."
             )
 
     def check_rate_limit(self, prior_applied_count: int) -> None:

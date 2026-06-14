@@ -9,8 +9,10 @@ from devbench.backlog.manifest import (
     MANIFEST_HEADER,
     ManifestParseError,
     ManifestRow,
+    ManifestRowNotFoundError,
     append_rows,
     parse_manifest,
+    remove_rows,
     render_manifest_rows,
 )
 
@@ -374,6 +376,97 @@ class TestAppendRows:
 """
         with pytest.raises(ManifestParseError, match="2 columns"):
             append_rows(bad, [ManifestRow(file="a", change="b")])
+
+
+# ---------------------------------------------------------------------------
+# remove_rows tests
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveRows:
+    """remove_rows splices named rows out of the Changes Manifest atomically."""
+
+    def test_remove_only_row_leaves_empty_manifest(self) -> None:
+        out = remove_rows(SAMPLE_ONE_ROW, ["src/example/parser.py"])
+        assert parse_manifest(out) == []
+
+    def test_remove_one_of_many(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py"])
+        parsed = parse_manifest(out)
+        assert parsed == [
+            ManifestRow(file="src/example/parser.py", change="add feature"),
+            ManifestRow(file="docs/example.md", change="document feature"),
+        ]
+
+    def test_remove_multiple_rows(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["src/example/parser.py", "docs/example.md"])
+        parsed = parse_manifest(out)
+        assert parsed == [ManifestRow(file="tests/test_example.py", change="cover feature")]
+
+    def test_remove_nothing_is_noop(self) -> None:
+        out = remove_rows(SAMPLE_ONE_ROW, [])
+        assert out == SAMPLE_ONE_ROW
+
+    def test_absent_path_raises_with_actionable_message(self) -> None:
+        with pytest.raises(ManifestRowNotFoundError) as exc:
+            remove_rows(SAMPLE_MANY_ROWS, ["src/not_present.py"])
+        msg = str(exc.value)
+        assert "src/not_present.py" in msg
+        # The error names what the manifest actually declares so the operator can act.
+        assert "src/example/parser.py" in msg
+
+    def test_absent_path_among_present_paths_raises(self) -> None:
+        # Even when some paths match, a single absent path fails the whole call (fail-fast).
+        with pytest.raises(ManifestRowNotFoundError) as exc:
+            remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py", "src/ghost.py"])
+        assert "src/ghost.py" in str(exc.value)
+
+    def test_missing_section_raises(self) -> None:
+        with pytest.raises(ManifestParseError, match=MANIFEST_HEADER):
+            remove_rows(SAMPLE_NO_MANIFEST, ["src/a.py"])
+
+    def test_preserves_content_before_section(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py"])
+        prefix = SAMPLE_MANY_ROWS.split("## Changes Manifest", 1)[0]
+        assert out.startswith(prefix)
+
+    def test_preserves_content_after_section(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py"])
+        suffix = "## Definition of Done" + SAMPLE_MANY_ROWS.split("## Definition of Done", 1)[1]
+        assert out.endswith(suffix)
+
+    def test_section_at_end_of_file(self) -> None:
+        out = remove_rows(SAMPLE_SECTION_AT_END, ["src/example/parser.py"])
+        assert parse_manifest(out) == []
+
+    def test_rejects_malformed_existing_manifest(self) -> None:
+        bad = """\
+# T: x
+
+## Changes Manifest
+
+| File | Change |
+|------|--------|
+| three | col | row |
+
+## Foo
+"""
+        with pytest.raises(ManifestParseError, match="2 columns"):
+            remove_rows(bad, ["three"])
+
+    def test_remove_repo_prefixed_row_by_plain_path(self) -> None:
+        # Repo-prefixed rows parse to the bare path; removal keys off that bare path.
+        content = (
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `caylent-solutions/repo` -- `terragrunt/terragrunt.hcl` | modify |\n"
+            "| `caylent-solutions/repo` -- `terragrunt/root.hcl` | modify |\n\n"
+            "## Definition of Done\n"
+        )
+        out = remove_rows(content, ["terragrunt/terragrunt.hcl"])
+        parsed = parse_manifest(out)
+        assert parsed == [ManifestRow(file="terragrunt/root.hcl", change="modify")]
 
 
 # ---------------------------------------------------------------------------

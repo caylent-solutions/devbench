@@ -176,6 +176,28 @@ Using the operator's answers, author `spec/<project-name>.md` following the cano
 3. Write Section 2 (Goals) -- ensure each goal has a worked operator example.
 4. Continue through Sections 3-15, applying the canonical depth at each section.
 
+**Canonical evidence rule (C4 -- repo-derived counts must be sound)**: every count or claim about the target repo that the spec asserts -- in Section 1 (Context / current verified state), Section 3 (existing primitives), Section 10 (testing requirements), or any AC -- MUST be produced by a sound, reproducible evidence command, not an improvised glob. Two silent failure modes corrupt such counts: *vendored contamination* (counting third-party copies under `.terraform/`, `node_modules/`, ... as first-party -- e.g. a "191 test files" figure where 117 were vendored) and *depth-blind globs* (a shallow `tests/*_test.go` glob missing the real `tests/<example>/module_test.go` layout and under-reporting by orders of magnitude). Both have flipped the same scope decision in a single day. For EVERY repo-derived count or claim:
+
+1. **Tracked-files-first**: derive the count from `git ls-files '<full-depth ** glob>'` (e.g. `git ls-files '**/*_test.go'`), NEVER a raw `find` or a bare shell glob, and NEVER a depth-1 glob (`'tests/*_test.go'`) that a nested layout can hide from. Use `find`/shell-glob ONLY when untracked files are explicitly the subject, and say so.
+2. **Always exclude vendored/generated dirs**: pipe every count through an exclusion of the canonical directories `.terraform/`, `node_modules/`, `.venv/`, `vendor/`, `__pycache__/`, `dist/`, `.git/`. A count without these exclusions is invalid evidence. Ready-made form:
+
+   ```bash
+   git ls-files '**/*_test.go' \
+     | grep -vE '(^|/)(\.terraform|node_modules|\.venv|vendor|__pycache__|dist|\.git)/' \
+     | wc -l
+   # untracked subject only: find . -type f -name '*_test.go' \( -path '*/.terraform/*' -o -path '*/node_modules/*' -o -path '*/.venv/*' -o -path '*/vendor/*' -o -path '*/__pycache__/*' -o -path '*/dist/*' -o -path '*/.git/*' \) -prune -o -print
+   ```
+
+3. **Print 5 sample matched paths with every count and eyeball them** against the claimed layout. Never write a bare number into the spec; the sample paths catch a depth-blind glob immediately (wrong samples, or zero where the layout says many):
+
+   ```bash
+   git ls-files '**/*_test.go' \
+     | grep -vE '(^|/)(\.terraform|node_modules|\.venv|vendor|__pycache__|dist|\.git)/' \
+     | sed -n '1,5p'
+   ```
+
+This is Pattern 7 (Canonical Repo-Evidence Collection) in `docs/workflow-authoring-patterns.md`; consult that doc for the full generic form. The dual-derivation reconciliation step is enforced by the self-critique rubric item "Evidence soundness (C4)" below.
+
 **Per-FR discipline**: for every functional requirement, the spec must state:
 - The happy-path behavior
 - The error-handling semantics (what error, what message, what exit code or exception)
@@ -267,6 +289,10 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 13. **Checkbox AC form (C1)**: every AC in the Section-6 list is a `- [ ] AC-N:` checkbox whose first token after the checkbox is the AC id; there are NO plain-bullet (`- AC-N ...`) ACs. FAIL if any AC is a plain bullet or lacks the `AC-N:` id immediately after the checkbox. Rationale: only checkbox ACs become registerable AC ids in the downstream backlog (the validator's `_CHECKBOX_RE`); a plain-bullet AC makes the backlog's DoD/AC-agreement contract fail under `validate-backlog --strict`.
 14. **Verifying command per executable AC (C2)**: every executable AC (one asserting a runnable/testable outcome) names its concrete verifying command and expected exit in the spec text, written so a path operand is relative to the checkout root (TDI-001) and a toolchain-runnable check is `type=command`-class, not deferred (TDI-004). FAIL if an executable AC asserts a runnable outcome but states no command + expected exit, prefixes a path with the checkout-directory name, or marks a toolchain-runnable check deferred. Rationale: `spec-to-backlog` copies the command into the `VERIFY` directive; inventing it is where TDI-001/004 errors originate.
 15. **Feasibility against stated tool versions (C3)**: no AC asserts a capability that the spec's own stated tool/runtime versions (Section 1 context / Section 6 version-interop) cannot provide. FAIL if an AC depends on a version-specific behaviour the spec's stated versions do not support, or depends on a version-specific behaviour without the spec citing the version and the mechanism that provides it. Rationale: an AC that mandates behaviour impossible on the project's pinned tool version is unsatisfiable-by-construction and can only be reconciled by a human after it reaches the backlog.
+
+**Evidence soundness (item 16)**
+
+16. **Evidence soundness (C4)**: every load-bearing repo-derived count or claim in the spec (Section 1 context, Section 3 primitives, Section 10 testing, any AC) was produced tracked-files-first via `git ls-files '<full-depth ** glob>'`, excluded the canonical vendored/generated dirs (`.terraform/`, `node_modules/`, `.venv/`, `vendor/`, `__pycache__/`, `dist/`, `.git/`), printed 5 sample matched paths eyeballed against the claimed layout, AND was re-derived a second independent way (`git ls-files` with exclusions versus `find`/tool-glob with the same exclusions). FAIL if any load-bearing count omits the vendored exclusion, uses a depth-1 glob a nested layout could hide from, ships a bare number with no eyeballed sample paths, or shows a material delta between the two derivations that was not reconciled. Rationale: a count that includes vendored copies or misses a nested layout is unauditable and has flipped the same scope decision twice in one day; the dual derivation forces a material discrepancy to surface and be reconciled rather than letting the agent pick the number that fits its preferred conclusion. See Pattern 7 (Canonical Repo-Evidence Collection) in `docs/workflow-authoring-patterns.md`.
 
 **Convergence protocol**: If the rubric score after revision is still > 0 and the loop count equals `skills.max_iterations`, emit a [BLOCKED] comment:
 
@@ -599,6 +625,7 @@ Then offer the spec-to-backlog handoff:
 - **Checkbox AC form (C1)**: every AC is a `- [ ] AC-N:` checkbox so the downstream backlog inherits registerable AC ids
 - **Verifying command per executable AC (C2)**: every executable AC names its concrete verifying command + expected exit (repo-root-relative per TDI-001; toolchain-runnable as `type=command`-class per TDI-004)
 - **Feasibility against stated versions (C3)**: no AC asserts a capability the spec's own stated tool/runtime versions cannot provide
+- **Evidence soundness (C4)**: every load-bearing repo-derived count is tracked-files-first (`git ls-files '<full-depth ** glob>'`), excludes the canonical vendored/generated dirs, prints 5 eyeballed sample paths, and is re-derived a second independent way with any material delta reconciled (Pattern 7, `docs/workflow-authoring-patterns.md`)
 - **Target Repository**: `Repo:` and `Branch:` fields are present
 - **Unit Inventory**: present for multi-unit specs; absent is acceptable for single-unit specs
 - **Readiness self-check**: `check_backlog_readiness` from `devbench.plugin_helpers.spec_backlog_contract` returns without raising before the spec is written

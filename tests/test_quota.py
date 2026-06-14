@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1521,6 +1521,199 @@ class TestWaitForReset:
         assert "elapsed=" in first
         assert "probe=" in first
         assert "next_in=" in first
+
+    def test_emits_polling_heartbeat_on_provider_reset_at_path(self, caplog: pytest.LogCaptureFixture) -> None:
+        """TDI: a provider-stated ``reset_at`` wait (the production path) emits a
+        ``[QUOTA_POLLING]`` heartbeat at the poll interval, even though no probe runs.
+
+        This reproduces the observed real-world bug: a long wait with a known
+        ``reset_at`` slept once in a single blind ``asyncio.sleep`` and resumed
+        the instant the reset elapsed, so ZERO heartbeats reached the log between
+        ``[QUOTA_WAITING]`` and ``[QUOTA_RESUMED]``. The wait must instead advance
+        in poll-interval steps, emitting a heartbeat each step, while never
+        consulting the probe (TDI-003a: an elapsed provider reset is authoritative).
+
+        A fast, simulated clock is driven by the cumulative patched-sleep
+        durations -- no real sleeping. ``reset_at`` is 5 poll intervals into the
+        future, so the wait crosses it after several heartbeats and resumes.
+        """
+        import logging
+
+        from devbench.quota import BackoffConfig
+
+        probe = MagicMock(return_value=True)
+        poll_interval = 30
+        start = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        reset_at = start + timedelta(seconds=poll_interval * 5)  # 150s ahead
+        # The provider reset is the only readiness signal; the probe must never
+        # be consulted on this path even once.
+        elapsed_holder = {"seconds": 0.0}
+
+        def fake_clock() -> datetime:
+            return start + timedelta(seconds=elapsed_holder["seconds"])
+
+        async def fake_sleep(seconds: float) -> None:
+            # Advancing the simulated clock by each requested sleep is what lets
+            # the interval-driven loop make progress without real time passing.
+            elapsed_holder["seconds"] += float(seconds)
+
+        backoff = BackoffConfig(initial_seconds=poll_interval, max_seconds=600, multiplier=2.0, jitter=0.2)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", side_effect=fake_clock):
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    return await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=poll_interval,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                        backoff_config=backoff,
+                    )
+
+        with caplog.at_level(logging.INFO, logger="devbench.quota"):
+            result = asyncio.run(run())
+
+        assert result is True
+        # TDI-003a: the elapsed provider reset is authoritative -- never probe.
+        probe.assert_not_called()
+        heartbeats = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert len(heartbeats) >= 1, (
+            "expected at least one [QUOTA_POLLING] heartbeat on the provider-stated "
+            f"reset_at wait path, got {heartbeats}"
+        )
+        first = heartbeats[0]
+        assert "elapsed=" in first
+        assert "next_in=" in first
+
+    def test_polling_heartbeat_reaches_root_handler_on_reset_at_path(self) -> None:
+        """AC-1: on the provider-stated ``reset_at`` path the heartbeat record
+        actually REACHES a handler attached to the root logger -- not just the
+        logger call -- mirroring how ``setup_logging`` wires the orchestrator
+        ``logs/orchestrator.log`` FileHandler on the root logger.
+
+        This rules out the second candidate root cause (records dropped because
+        the ``devbench.quota`` logger is not attached to the orchestrator log
+        handler): the ``devbench.quota`` logger propagates to root, so a record
+        emitted there must land in a root-attached handler.
+        """
+        import logging
+
+        from devbench.quota import BackoffConfig
+
+        probe = MagicMock(return_value=True)
+        poll_interval = 30
+        start = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        reset_at = start + timedelta(seconds=poll_interval * 4)
+        elapsed_holder = {"seconds": 0.0}
+
+        def fake_clock() -> datetime:
+            return start + timedelta(seconds=elapsed_holder["seconds"])
+
+        async def fake_sleep(seconds: float) -> None:
+            elapsed_holder["seconds"] += float(seconds)
+
+        captured: list[str] = []
+
+        class _CapturingHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record.getMessage())
+
+        backoff = BackoffConfig(initial_seconds=poll_interval, max_seconds=600, multiplier=2.0, jitter=0.2)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", side_effect=fake_clock):
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    return await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=poll_interval,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                        backoff_config=backoff,
+                    )
+
+        root = logging.getLogger()
+        handler = _CapturingHandler()
+        handler.setLevel(logging.INFO)
+        quota_logger = logging.getLogger("devbench.quota")
+        prev_root_level = root.level
+        prev_quota_level = quota_logger.level
+        prev_propagate = quota_logger.propagate
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+        quota_logger.setLevel(logging.INFO)
+        quota_logger.propagate = True
+        try:
+            result = asyncio.run(run())
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(prev_root_level)
+            quota_logger.setLevel(prev_quota_level)
+            quota_logger.propagate = prev_propagate
+
+        assert result is True
+        heartbeats = [m for m in captured if "[QUOTA_POLLING]" in m]
+        assert len(heartbeats) >= 1, (
+            "expected the [QUOTA_POLLING] heartbeat to reach a root-attached handler "
+            f"(the orchestrator-log wiring) on the reset_at path, captured={captured}"
+        )
+
+    def test_heartbeat_logging_failure_does_not_break_wait(self) -> None:
+        """AC-3: a heartbeat/logging failure must NEVER break or delay the wait or
+        resume -- the heartbeat is best-effort.
+
+        A handler attached to the ``devbench.quota`` logger raises on every emit.
+        The provider-stated ``reset_at`` still elapses and the wait must still
+        return ``True`` (recovery) without the logging error propagating.
+        """
+        import logging
+
+        from devbench.quota import BackoffConfig
+
+        probe = MagicMock(return_value=True)
+        poll_interval = 30
+        start = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+        reset_at = start + timedelta(seconds=poll_interval * 3)
+        elapsed_holder = {"seconds": 0.0}
+
+        def fake_clock() -> datetime:
+            return start + timedelta(seconds=elapsed_holder["seconds"])
+
+        async def fake_sleep(seconds: float) -> None:
+            elapsed_holder["seconds"] += float(seconds)
+
+        class _ExplodingHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                raise RuntimeError("log handler boom")
+
+        quota_logger = logging.getLogger("devbench.quota")
+        handler = _ExplodingHandler()
+        # raiseExceptions=True (the default) would still swallow handler errors via
+        # logging's own handleError, so force it surfacing by making the call site
+        # robust: the production code must not let a logging failure escape.
+        backoff = BackoffConfig(initial_seconds=poll_interval, max_seconds=600, multiplier=2.0, jitter=0.2)
+
+        async def run() -> bool:
+            with patch("devbench.quota._get_current_utc", side_effect=fake_clock):
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    return await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval_seconds=poll_interval,
+                        max_wait_seconds=18000,
+                        probe_fn=probe,
+                        backoff_config=backoff,
+                    )
+
+        prev_raise = logging.raiseExceptions
+        quota_logger.addHandler(handler)
+        logging.raiseExceptions = True
+        try:
+            result = asyncio.run(run())
+        finally:
+            logging.raiseExceptions = prev_raise
+            quota_logger.removeHandler(handler)
+
+        # The wait completed and resumed despite the logging handler raising.
+        assert result is True
 
     def test_max_wait_timeout_returns_false(self) -> None:
         """When max_wait is exceeded before the probe succeeds, returns False.

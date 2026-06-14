@@ -133,6 +133,18 @@ Trigger 2 follows a shorter flow because the executor itself emits the proposal 
 
 The key behavioural difference from Trigger 1 is that the source validation-gate task can still complete (`done`) if its own acceptance criteria passed -- for example, a gate whose AC is "43/46 scenarios pass with a documented diagnosis of the remaining 3" can ship while the three proposed fix tasks queue up as independent follow-ups. Trigger 1, by contrast, always leaves the source blocked because the amender rejected the in-scope implementation.
 
+## Cross-unit-defect escalation (`devbench escalate-proposal`)
+
+When a unit blocks with `NEEDS_ESCALATION` because its live acceptance check fails due to a defect in files OUTSIDE its own Changes Manifest -- i.e. another (already-done) unit's shipped code is the culprit -- the block previously dead-ended at an operator comment with no auto-resolution draft. `devbench escalate-proposal <source-id>` closes that autonomy gap by auto-decomposing a fix proposal:
+
+1. **Input.** The orchestrator pipes `{"attributed_files": [...]}` on stdin -- the files the executor attributed the failure to.
+2. **Out-of-scope filter.** `escalate-proposal` reads the blocked unit's own Changes Manifest and keeps only the attributed files that are NOT in it (the cross-unit defects). A file already in the unit's manifest is its own scope and is never decomposed.
+3. **Decomposition.** It allocates fix-unit ids (via `allocate_next_ids`) and builds a `Proposal` with one `proposed_tasks` entry per out-of-scope file. Each fix task owns exactly that one offending file, carries a corrective AC plus a re-run of the blocked unit's failing live AC (so the cascade re-validates the original failure), and the deterministic four-section approach narrative `materialise-proposal` requires. The proposal lands at `.devbench/proposals/<source-id>.json`.
+4. **Deterministic audit markers.** On success the blocked unit gains the `[ESCALATION_PROPOSAL_WRITTEN]` marker naming the fix unit(s) + out-of-scope files. When NO attributed file is out-of-scope (nothing to decompose), it instead emits `[ESCALATION_NO_PROPOSAL]` so a watching operator/loop can deterministically distinguish "blocked + proposal written" from "blocked + escalation-only" without reading prose.
+5. **Dep-wiring + cascade.** Promoting the proposal (`promote-proposal`, or the auto-accept sweep) writes the `[BLOCKED_PENDING_PROPOSAL]` marker that makes the blocked unit `depends-on` the fix unit(s); the ADR-07 cascade re-queues it once the fixes complete -- exactly like Triggers 1 and 2.
+
+This is the cross-unit analogue of Trigger 2: the difference is the failure is attributed to OTHER units' files, so the fix-units own those files (not the source's), and the source unit is the one wired to depend on the fixes.
+
 ## Proposal JSON schema
 
 Written by blocker-resolver, consumed by task-factory:

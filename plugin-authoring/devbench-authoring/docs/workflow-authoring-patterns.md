@@ -159,14 +159,91 @@ Section 1 robustness finding).
 
 ---
 
+## Pattern 7: Canonical Repo-Evidence Collection
+
+**Summary.** Every repo-derived count or claim a spec or backlog asserts (e.g.
+"N test files exist", "M modules have no apply-level test", "K examples are
+covered") must be produced by a sound, reproducible evidence command. The two
+failure modes that silently corrupt such counts are *vendored contamination*
+(counting third-party copies under `.terraform/`, `node_modules/`, ... as
+first-party) and *depth-blind globs* (a shallow `dir/*_test.go` glob missing the
+real `dir/<sub>/foo_test.go` layout). A count produced without guarding against
+both is invalid evidence, regardless of whether its headline conclusion happens
+to be right.
+
+**Generic form (the canonical evidence rule).**
+
+1. **Tracked-files-first.** Derive every repo count from
+   `git ls-files '<full-depth ** glob>'` -- never a raw `find` or a bare shell
+   glob -- unless untracked files are explicitly the subject. Use a full-depth
+   `**` glob (e.g. `'**/*_test.go'`, `'providers/**/*_test.go'`), never a
+   depth-1 glob (`'tests/*_test.go'`), so a nested layout cannot be missed. A
+   count from `find` or a shell glob is invalid evidence unless the claim is
+   explicitly about untracked files, in which case state that and use
+   `find ... ` with the same exclusions below.
+
+2. **Always exclude vendored/generated dirs.** Pipe every count through an
+   exclusion of these canonical directories:
+   `.terraform/`, `node_modules/`, `.venv/`, `vendor/`, `__pycache__/`,
+   `dist/`, `.git/`. A count without these exclusions is invalid evidence.
+   Ready-made forms:
+
+   ```bash
+   # tracked-files-first (preferred) -- count + exclusions in one pipe
+   git ls-files '**/*_test.go' \
+     | grep -vE '(^|/)(\.terraform|node_modules|\.venv|vendor|__pycache__|dist|\.git)/' \
+     | wc -l
+
+   # untracked subject only (state why find is used) -- same exclusions
+   find . -type f -name '*_test.go' \
+     \( -path '*/.terraform/*' -o -path '*/node_modules/*' -o -path '*/.venv/*' \
+        -o -path '*/vendor/*' -o -path '*/__pycache__/*' -o -path '*/dist/*' \
+        -o -path '*/.git/*' \) -prune -o -type f -name '*_test.go' -print \
+     | wc -l
+   # (or, with a tool that supports it, --exclude-dir=.terraform --exclude-dir=node_modules ...)
+   ```
+
+3. **Print 5 sample matched paths with every count and eyeball them.** Never
+   report a bare number. Print at least 5 sample matched paths next to every
+   count and compare them against the claimed repo layout. A count whose sample
+   paths are not eyeballed against the claimed layout is invalid -- this is the
+   check that catches a depth-blind glob immediately (the samples look wrong, or
+   there are zero samples where the layout says there should be many):
+
+   ```bash
+   git ls-files '**/*_test.go' \
+     | grep -vE '(^|/)(\.terraform|node_modules|\.venv|vendor|__pycache__|dist|\.git)/' \
+     | sed -n '1,5p'
+   ```
+
+4. **Evidence-soundness self-critique (dual derivation).** Re-derive every
+   load-bearing count a second, independent way -- `git ls-files` with
+   exclusions versus `find`/tool-glob with the same exclusions -- and reconcile.
+   A material delta between the two derivations blocks convergence until it is
+   reconciled and the discrepancy is explained; the agent must NOT pick the
+   number that fits its preferred conclusion.
+
+**Why it matters.** A repo-derived count drives scope decisions (which work
+units to author, which tests already exist). Two independently-flawed evidence
+passes -- one counting vendored copies, one using a depth-blind glob -- can
+flip the same decision back and forth, because the quality bar only verified
+that the claim *cited* a command, not that the command was *sound*. The
+canonical rule makes every repo count tracked-files-first, vendored-excluded,
+full-depth, sample-eyeballed, and dual-derived, removing the silent blind
+spots.
+
+---
+
 ## Usage in Skills
 
 Both `create-spec` and `spec-to-backlog` reference these patterns where
 applicable. See:
 
-- `skills/create-spec/SKILL.md` -- references this doc for Workflow mode
+- `skills/create-spec/SKILL.md` -- references this doc for Workflow mode and
+  Pattern 7 (Canonical Repo-Evidence Collection) for every repo-derived count
 - `skills/spec-to-backlog/SKILL.md` -- references this doc for fan-out and
-  parallel repair steps
+  parallel repair steps, and Pattern 7 (Canonical Repo-Evidence Collection) for
+  every repo-derived count that drives a decomposition decision
 
 Do not copy pattern body text into SKILL.md files. Instead, cite the relevant
 pattern by number and name, and link back to this file.

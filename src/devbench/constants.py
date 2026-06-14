@@ -701,6 +701,69 @@ ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR
 # because the distinct value (43 != 42) prevents misclassification.
 ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE: int = 43
 
+# Fatal, non-retryable SDK error handling (orchestrator runaway prevention).
+# A hard error such as ``model_not_found`` (the selected model does not exist /
+# the account lacks access) recurs identically every turn; feeding it into the
+# turn-end continuation loop re-prompts it forever. ``_run`` detects these via
+# ``detect_fatal_sdk_error`` and exits fast on the FIRST occurrence with this
+# distinct exit code, logging ``ORCHESTRATOR_FATAL_ERROR_AUDIT_PREFIX`` plus the
+# offending model/error and a remediation line. 46 is distinct from 42/43/44/45/127.
+ORCHESTRATOR_FATAL_ERROR_EXIT_CODE: int = 46
+ORCHESTRATOR_FATAL_ERROR_AUDIT_PREFIX: str = "[ORCHESTRATOR_FATAL_ERROR] reason="
+# Non-retryable SDK error classes. Matched case-insensitively against an SDK
+# message's ``error`` field (AssistantMessage.error) or a ResultMessage error
+# subtype. These cannot be resolved by retrying -- only by operator action
+# (fix the configured model / credentials), so the orchestrator must fail fast
+# rather than continuation-loop. Quota / rate-limit errors are deliberately
+# EXCLUDED: those route to the quota wait-and-resume path, not here.
+FATAL_SDK_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "model_not_found",
+        "authentication_error",
+        "permission_error",
+        "invalid_request_error",
+        "not_found_error",
+    }
+)
+
+# Within-claim convergence bound (repeated-identical-failure churn prevention).
+#
+# Neither the continuation budget (catches no-activity stalls) nor the cascade
+# circuit-breaker (counts claim re-queue cycles) bounds a single in-progress
+# claim that repeats the SAME unresolvable failure for hours while staying
+# "busy" (emitting tool-use, so the inactivity budget resets every turn). The
+# convergence tracker bounds it: it watches for a REPEATED IDENTICAL failing
+# AC-verify / TDD-RED / test signature within ONE claim and, when the same
+# signature recurs >= ``DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS`` times, BLOCKs the
+# unit with the ``CLAIM_NOT_CONVERGING`` audit marker. CRITICAL: keyed on the
+# REPEATED IDENTICAL signature (not raw duration) so a genuinely-progressing
+# long live run -- which emits a DIFFERENT signal each round, or no repeated
+# failure -- is never killed. A distinct new signature resets the per-signature
+# counts (variation = progress).
+#
+# Override via env ``DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS`` (int).
+# Unset-safe: the constant is the default when the env var is absent.
+DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS: int = 4
+
+# Secondary wall-clock backstop for a single claim, in seconds. Set well ABOVE
+# the observed-legit maximum (a 3.5h-class live firehose apply) so it only ever
+# fires on a claim that is genuinely stuck for an implausibly long time WITHOUT
+# a repeated-identical signature having already tripped the primary bound.
+# Default 6 hours (21600s). Override via
+# ``DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS`` (float). A value <= 0
+# disables the wall-clock backstop (the repeated-signature bound still applies).
+DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS: float = 21600.0
+
+# Whether the within-claim convergence bound is active. Default True (on), per
+# the operator decision that a busy-but-not-converging unit must BLOCK rather
+# than churn. Override via env ``DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK``.
+DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK: bool = True
+
+# Verbatim audit-log marker written to the unit's Comments + emitted to the
+# orchestrator log when the within-claim convergence bound trips. Names the
+# recurring failure so an operator/loop can act deterministically.
+CLAIM_NOT_CONVERGING_MARKER: str = "[CLAIM_NOT_CONVERGING]"
+
 # TDI: in-process quota-resume cap.
 #
 # When ``quota_handling.on_exhaustion == "wait"`` and a quota wait recovers,
@@ -815,15 +878,28 @@ BACKLOG_INDEX_CELL_COUNT: int = 9
 # and interactive modes share one mechanism.
 PLUGIN_SHADOW_DIR_NAME: str = ".devbench/plugin-shadow"
 
-# Filename of the PID sentinel written by ``cmd_start`` inside the shadow
+# Filename of the owner sentinel written by ``cmd_start`` inside the shadow
 # plugin tree at ``<workspace>/<PLUGIN_SHADOW_DIR_NAME>/devbench/<filename>``.
-# The sentinel records the orchestrator PID that owns the materialised tree;
-# ``clear_shadow_plugin`` refuses to delete the tree while the recorded PID
+# The sentinel records the SET of orchestrator PIDs that currently own the
+# materialised tree (one line per PID); dead PIDs are pruned on every read.
+# ``clear_shadow_plugin`` refuses to delete the tree while ANY recorded PID
 # is alive (raising ``RuntimeError``) so a concurrent ``devbench
 # prepare-plugin-shadow`` invocation cannot clear a running orchestrator's
-# plugin files out from under it. Lives inside the tree so ``rmtree`` of
-# the tree removes the sentinel atomically when a clean rebuild is allowed.
+# plugin files out from under it. Multi-owner so two concurrent
+# ``devbench start`` sessions can SHARE one identical shadow (each registers
+# as an additional owner) instead of the second session aborting. Lives
+# inside the tree so ``rmtree`` of the tree removes the sentinel atomically
+# when a clean rebuild is allowed.
 SHADOW_PID_SENTINEL_FILENAME: str = ".pid"
+
+# Filename of the overrides-fingerprint marker written inside the shadow tree
+# alongside the owner sentinel. Records a stable hash of the per-agent model
+# overrides the shadow was built for, so ``materialise_shadow_plugin`` can tell
+# whether an existing shadow is up-to-date for the requested overrides (reuse,
+# register an additional owner, skip clear+rebuild) or stale (rebuild only when
+# no live owner remains; otherwise fail fast). Lives inside the tree so a
+# clean rebuild removes it atomically with the rest of the shadow.
+SHADOW_OVERRIDES_FINGERPRINT_FILENAME: str = ".overrides-fingerprint"
 
 # Short-name model aliases accepted in ``agents.*`` YAML values when
 # ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic

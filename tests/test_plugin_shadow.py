@@ -16,8 +16,12 @@ from devbench.constants import PLUGIN_SHADOW_DIR_NAME, SHADOW_PID_SENTINEL_FILEN
 from devbench.plugin_shadow import (
     _atomic_write,
     _collect_overrides,
+    _fingerprint_path,
     _is_pid_alive,
-    _read_sentinel_pid,
+    _live_owner_pids,
+    _overrides_fingerprint,
+    _read_fingerprint,
+    _read_owner_pids,
     _rewrite_agent_model,
     _sentinel_path,
     clear_shadow_plugin,
@@ -374,14 +378,22 @@ class TestMaterialiseShadowPlugin:
 def _build_shadow_for_sentinel_tests(tmp_path: Path) -> Path:
     """Create a minimal canonical plugin + materialise a shadow at tmp_path/ws.
 
-    Returns the shadow_root path. Uses the executor: opus override so the
+    Returns the workspace path. Uses the executor: opus override so the
     shadow gets built (the only shape that matters for sentinel tests).
+
+    ``materialise_shadow_plugin`` auto-registers the *current* (test) process
+    as an owner. Sentinel tests want to drive ownership explicitly, so the
+    auto-registered owner sentinel is removed here, leaving a shadow tree with
+    no recorded owner -- the clean starting state these tests assume.
     """
     plugin_dir = _build_synthetic_plugin(tmp_path)
     workspace = tmp_path / "ws"
     cfg = AgentModelsConfig(executor="opus")
     shadow_root = materialise_shadow_plugin(plugin_dir, workspace, cfg)
     assert shadow_root is not None
+    sentinel = _sentinel_path(workspace)
+    if sentinel.exists():
+        sentinel.unlink()
     return workspace
 
 
@@ -398,18 +410,33 @@ class TestSentinelPath:
 
 
 class TestWritePidSentinel:
-    """``write_pid_sentinel`` records the orchestrator PID inside the shadow tree."""
+    """``write_pid_sentinel`` registers an owner PID inside the shadow tree (multi-owner)."""
 
     def test_round_trip(self, tmp_path: Path) -> None:
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
         write_pid_sentinel(workspace, 12345)
-        assert _read_sentinel_pid(workspace) == 12345
+        assert _read_owner_pids(workspace) == {12345}
 
-    def test_overwrites_previous(self, tmp_path: Path) -> None:
+    def test_accumulates_multiple_live_owners(self, tmp_path: Path) -> None:
+        # Two distinct LIVE owners both register and both survive: the second
+        # session shares the shadow rather than evicting the first (the
+        # multi-owner property the concurrent-session fix relies on).
+        import os
+
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
-        write_pid_sentinel(workspace, 1)
-        write_pid_sentinel(workspace, 2)
-        assert _read_sentinel_pid(workspace) == 2
+        write_pid_sentinel(workspace, os.getpid())
+        write_pid_sentinel(workspace, os.getppid())
+        assert {os.getpid(), os.getppid()} <= _read_owner_pids(workspace)
+
+    def test_prunes_dead_owners_on_write(self, tmp_path: Path) -> None:
+        # A dead PID already recorded is pruned when a new owner registers, so
+        # the sentinel does not accumulate stale PIDs across runs.
+        import os
+
+        workspace = _build_shadow_for_sentinel_tests(tmp_path)
+        _sentinel_path(workspace).write_text(f"{2**30}\n", encoding="utf-8")
+        write_pid_sentinel(workspace, os.getpid())
+        assert _read_owner_pids(workspace) == {os.getpid()}
 
     def test_no_tmp_file_left_behind(self, tmp_path: Path) -> None:
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
@@ -423,23 +450,30 @@ class TestWritePidSentinel:
             write_pid_sentinel(workspace, 1)
 
 
-class TestReadSentinelPid:
-    """``_read_sentinel_pid`` returns None when absent and raises on corrupt."""
+class TestReadOwnerPids:
+    """``_read_owner_pids`` returns the owner set; empty when absent, raises on corrupt."""
 
-    def test_returns_none_when_absent(self, tmp_path: Path) -> None:
-        assert _read_sentinel_pid(tmp_path) is None
+    def test_returns_empty_when_absent(self, tmp_path: Path) -> None:
+        assert _read_owner_pids(tmp_path) == set()
 
-    def test_returns_int_when_present(self, tmp_path: Path) -> None:
+    def test_returns_set_when_present(self, tmp_path: Path) -> None:
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
         write_pid_sentinel(workspace, 99999)
-        assert _read_sentinel_pid(workspace) == 99999
+        assert _read_owner_pids(workspace) == {99999}
 
     def test_raises_on_corrupt(self, tmp_path: Path) -> None:
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
         sentinel = _sentinel_path(workspace)
         sentinel.write_text("not-a-pid", encoding="utf-8")
         with pytest.raises(ValueError):
-            _read_sentinel_pid(workspace)
+            _read_owner_pids(workspace)
+
+    def test_live_owner_pids_prunes_dead(self, tmp_path: Path) -> None:
+        import os
+
+        workspace = _build_shadow_for_sentinel_tests(tmp_path)
+        _sentinel_path(workspace).write_text(f"{os.getpid()}\n{2**30}\n", encoding="utf-8")
+        assert _live_owner_pids(workspace) == {os.getpid()}
 
 
 class TestIsPidAlive:
@@ -472,7 +506,7 @@ class TestIsPidAlive:
 
 
 class TestClearShadowPluginRefusesWhileRunning:
-    """``clear_shadow_plugin`` fails fast when a live PID owns the shadow."""
+    """``clear_shadow_plugin`` fails fast when ANY live PID owns the shadow."""
 
     def test_refuses_when_sentinel_pid_alive(self, tmp_path: Path) -> None:
         import os
@@ -483,9 +517,20 @@ class TestClearShadowPluginRefusesWhileRunning:
             clear_shadow_plugin(workspace)
         # Tree + sentinel both survive.
         assert (workspace / PLUGIN_SHADOW_DIR_NAME).exists()
-        assert _read_sentinel_pid(workspace) == os.getpid()
+        assert _read_owner_pids(workspace) == {os.getpid()}
 
-    def test_succeeds_when_sentinel_pid_dead(self, tmp_path: Path) -> None:
+    def test_refuses_when_any_owner_alive_among_several(self, tmp_path: Path) -> None:
+        # Stray-clear guard with multiple owners: one dead, one live -> still
+        # refused (AC-4). The live sibling must not lose its shadow.
+        import os
+
+        workspace = _build_shadow_for_sentinel_tests(tmp_path)
+        _sentinel_path(workspace).write_text(f"{2**30}\n{os.getpid()}\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match=f"PID {os.getpid()}"):
+            clear_shadow_plugin(workspace)
+        assert (workspace / PLUGIN_SHADOW_DIR_NAME).exists()
+
+    def test_succeeds_when_all_owners_dead(self, tmp_path: Path) -> None:
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
         write_pid_sentinel(workspace, 2**30)
         assert clear_shadow_plugin(workspace) is True
@@ -495,7 +540,7 @@ class TestClearShadowPluginRefusesWhileRunning:
         # Existing shadow without a sentinel (e.g. a workspace materialised
         # before cmd_start had a chance to write the sentinel, or a
         # workspace that ran under a pre-sentinel devbench build) clears
-        # cleanly because the guard only fires when a sentinel exists.
+        # cleanly because the guard only fires when a live owner exists.
         workspace = _build_shadow_for_sentinel_tests(tmp_path)
         assert not _sentinel_path(workspace).exists()  # precondition
         assert clear_shadow_plugin(workspace) is True
@@ -507,14 +552,100 @@ class TestClearShadowPluginRefusesWhileRunning:
         with pytest.raises(ValueError):
             clear_shadow_plugin(workspace)
 
-    def test_materialise_refuses_to_rebuild_under_live_orchestrator(self, tmp_path: Path) -> None:
-        # The materialiser's "rebuild" path goes through clear_shadow_plugin;
-        # a live sentinel must block the rebuild too.
+
+class TestMaterialiseShadowPluginReentrant:
+    """Reentrancy / multi-session reuse (concurrent-session fix)."""
+
+    def test_second_session_reuses_identical_shadow_no_rebuild(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # AC-1 / AC-2: a sibling session whose PID is already a live owner with
+        # the SAME overrides REUSES the existing shadow -- no clear, no rebuild,
+        # no RuntimeError. Regression: on the pre-fix code the unconditional
+        # clear raised because the sentinel named a live process.
+        import os
+
+        plugin_dir = _build_synthetic_plugin(tmp_path)
+        workspace = tmp_path / "ws"
+        cfg = AgentModelsConfig(executor="opus")
+        shadow_root = materialise_shadow_plugin(plugin_dir, workspace, cfg)
+        assert shadow_root is not None
+
+        # Simulate a LIVE sibling owner already holding the shadow.
+        sibling_pid = os.getppid()
+        write_pid_sentinel(workspace, sibling_pid)
+
+        # Assert the rebuild path is NOT taken: monkeypatch clear_shadow_plugin
+        # to fail the test if called, and rglob (the rebuild walk) likewise.
+        import devbench.plugin_shadow as ps
+
+        def _no_clear(_ws: Path) -> bool:
+            raise AssertionError("clear_shadow_plugin must not be called on the reuse path")
+
+        monkeypatch.setattr(ps, "clear_shadow_plugin", _no_clear)
+
+        # Second concurrent session, identical overrides -> reuse.
+        reused = materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
+        assert reused == shadow_root
+        # Both the sibling and this process are recorded owners.
+        assert {sibling_pid, os.getpid()} <= _read_owner_pids(workspace)
+
+    def test_reuse_registers_additional_owner(self, tmp_path: Path) -> None:
+        # AC-1: the reusing session registers as an ADDITIONAL owner without
+        # evicting the sibling.
+        import os
+
+        plugin_dir = _build_synthetic_plugin(tmp_path)
+        workspace = tmp_path / "ws"
+        materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
+        sibling_pid = os.getppid()
+        write_pid_sentinel(workspace, sibling_pid)
+        materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
+        assert {sibling_pid, os.getpid()} <= _read_owner_pids(workspace)
+
+    def test_fingerprint_mismatch_with_live_owner_fails_fast(self, tmp_path: Path) -> None:
+        # AC-3: overrides differ AND a live owner holds the shadow -> fail fast
+        # naming the owner; the existing shadow is NOT cleared.
         import os
 
         plugin_dir = _build_synthetic_plugin(tmp_path)
         workspace = tmp_path / "ws"
         materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
         write_pid_sentinel(workspace, os.getpid())
+        fp_before = _read_fingerprint(workspace)
         with pytest.raises(RuntimeError, match=f"PID {os.getpid()}"):
             materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="sonnet"))
+        # Shadow + fingerprint unchanged: no clobber under the live sibling.
+        assert _read_fingerprint(workspace) == fp_before
+
+    def test_fingerprint_mismatch_no_live_owner_rebuilds(self, tmp_path: Path) -> None:
+        # When overrides differ but NO live owner remains (the orchestrator
+        # exited), the stale shadow is cleared + rebuilt for the new overrides.
+        plugin_dir = _build_synthetic_plugin(tmp_path)
+        workspace = tmp_path / "ws"
+        materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
+        # Replace the live owner with a dead PID -> stale, reclaimable.
+        _sentinel_path(workspace).write_text(f"{2**30}\n", encoding="utf-8")
+        fp_opus = _read_fingerprint(workspace)
+        materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="sonnet"))
+        assert _read_fingerprint(workspace) != fp_opus
+
+    def test_fingerprint_written_on_build(self, tmp_path: Path) -> None:
+        plugin_dir = _build_synthetic_plugin(tmp_path)
+        workspace = tmp_path / "ws"
+        materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
+        assert _fingerprint_path(workspace).is_file()
+        assert _read_fingerprint(workspace) == _overrides_fingerprint({"agents/executor.md": "opus"})
+
+    def test_overrides_fingerprint_is_order_independent(self) -> None:
+        a = _overrides_fingerprint({"agents/executor.md": "opus", "agents/task-factory.md": "sonnet"})
+        b = _overrides_fingerprint({"agents/task-factory.md": "sonnet", "agents/executor.md": "opus"})
+        assert a == b
+
+    def test_build_auto_registers_current_process(self, tmp_path: Path) -> None:
+        import os
+
+        plugin_dir = _build_synthetic_plugin(tmp_path)
+        workspace = tmp_path / "ws"
+        materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
+        assert os.getpid() in _read_owner_pids(workspace)

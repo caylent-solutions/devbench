@@ -197,6 +197,28 @@ Resolution order (implemented inside `extract_ac_section`):
 
 Record the FR list for coverage validation in the iterate-until-perfect loop.
 
+**Canonical evidence rule (E4 -- repo-derived counts must be sound)**: when decomposition depends on a count or claim about the target repo -- "does an apply-level test for module X already exist?", "how many examples are uncovered?", "is primitive Y already present?" -- that count decides which tasks to author (or NOT author). A wrong count whipsaws scope: a vendored-contaminated figure (third-party copies under `.terraform/`, `node_modules/`, ... counted as first-party) or a depth-blind glob (`tests/*_test.go` missing the real `tests/<example>/module_test.go` layout) has flipped the same "do these tests already exist?" decision twice in one day and nearly redirected dozens of work units to author tests that already existed. For EVERY repo-derived count or claim that drives a decomposition decision:
+
+1. **Tracked-files-first**: derive the count from `git ls-files '<full-depth ** glob>'` (e.g. `git ls-files 'providers/**/*_test.go'`), NEVER a raw `find` or a bare shell glob, and NEVER a depth-1 glob (`'tests/*_test.go'`) a nested layout can hide from. Use `find`/shell-glob ONLY when untracked files are explicitly the subject, and say so.
+2. **Always exclude vendored/generated dirs**: pipe every count through an exclusion of the canonical directories `.terraform/`, `node_modules/`, `.venv/`, `vendor/`, `__pycache__/`, `dist/`, `.git/`. A count without these exclusions is invalid evidence. Ready-made form:
+
+   ```bash
+   git ls-files '**/*_test.go' \
+     | grep -vE '(^|/)(\.terraform|node_modules|\.venv|vendor|__pycache__|dist|\.git)/' \
+     | wc -l
+   # untracked subject only: find . -type f -name '*_test.go' \( -path '*/.terraform/*' -o -path '*/node_modules/*' -o -path '*/.venv/*' -o -path '*/vendor/*' -o -path '*/__pycache__/*' -o -path '*/dist/*' -o -path '*/.git/*' \) -prune -o -print
+   ```
+
+3. **Print 5 sample matched paths with every count and eyeball them** against the claimed repo layout before letting the count drive a decision. Never act on a bare number; the sample paths catch a depth-blind glob immediately (wrong samples, or zero where the layout says many):
+
+   ```bash
+   git ls-files '**/*_test.go' \
+     | grep -vE '(^|/)(\.terraform|node_modules|\.venv|vendor|__pycache__|dist|\.git)/' \
+     | sed -n '1,5p'
+   ```
+
+This is Pattern 7 (Canonical Repo-Evidence Collection) in `docs/workflow-authoring-patterns.md`; consult that doc for the full generic form. Re-derive every load-bearing count a second independent way (`git ls-files` with exclusions versus `find`/tool-glob with the same exclusions) and reconcile any material delta before it drives a task to be authored or skipped -- the per-task rubric item "Evidence soundness (E4)" in Step 5b enforces this.
+
 ---
 
 ## Step 4 -- Epic decomposition (iterate-until-perfect granularity 1)
@@ -316,6 +338,7 @@ Score each item PASS or FAIL:
 19. **Command-vs-deferred classification (TDI-004)**: no `type=deferred` directive defers a check that runs with the project's standard toolchain (the environment `verify-ac` and the judges run in). FAIL if a `type=deferred` `reason` names a runnable tool (terraform/terragrunt/tofu/terratest/pytest/make/cdk/sam/...) or "at execution time" with no live/production/operator-only signal -- reclassify it as `type=command`. `validate-backlog --strict` enforces this as an ERROR.
 20. **AC referential integrity (TDI-005)**: every path an AC or `type=command` directive asserts must exist either already exists in the target repo, is `add`ed by some task's `## Changes Manifest`, or is an explicit external carve-out. FAIL if an AC requires an artifact that neither exists nor is created by any task and is not marked external. `validate-backlog --strict` enforces this as an ERROR when the checkout is present.
 21. **Checkbox AC form (G1)**: every `## Acceptance Criteria` entry is a `- [ ] AC-N:` checkbox whose first token after the checkbox is a unique, registerable AC id; there are NO plain-bullet (`- AC-N ...`) ACs. Inline references to spec-level requirement ids are written so they do not parse as local AC ids (e.g. `(spec requirement #N)`, not `(AC-N)`). FAIL if any AC is a plain bullet, lacks the `AC-N:` id immediately after the checkbox, or reuses an AC id. The validator registers an AC id ONLY from a `_CHECKBOX_RE` match (`src/devbench/backlog/manager.py`); a plain-bullet AC leaves `existing_ac_ids` empty and makes the DoD/AC-agreement contract (item 17) fail across every verb-bearing DoD item. `validate-backlog --strict` (which this skill runs as its gate, Step 5d / Step 7) surfaces that downstream failure as an ERROR.
+22. **Evidence soundness (E4)**: every repo-derived count or claim that justified authoring (or NOT authoring) this task -- "this module has no apply-level test yet", "primitive X already exists", "N of M examples are uncovered" -- was produced tracked-files-first via `git ls-files '<full-depth ** glob>'`, excluded the canonical vendored/generated dirs (`.terraform/`, `node_modules/`, `.venv/`, `vendor/`, `__pycache__/`, `dist/`, `.git/`), printed 5 sample matched paths eyeballed against the claimed layout, AND was re-derived a second independent way (`git ls-files` with exclusions versus `find`/tool-glob with the same exclusions). FAIL if a decomposition decision rested on a count that omitted the vendored exclusion, used a depth-1 glob a nested layout could hide from, was a bare number with no eyeballed sample paths, or showed a material delta between the two derivations that was not reconciled. Rationale: a vendored-contaminated or depth-blind count whipsaws scope -- it has redirected dozens of work units to author tests that already existed; the dual derivation forces a material discrepancy to surface and be reconciled. See Pattern 7 (Canonical Repo-Evidence Collection) in `docs/workflow-authoring-patterns.md`.
 
 **Out-of-authoring-scope checks (C2/C10)**: C2 (`_check_manifest_path_prefixes` -- checkout-directory prefix verification, which requires an on-disk repository checkout to resolve) and C10 (`_check_dep_file_exists` -- verifies that every dependency ID in `## Dependencies` resolves to a real work-unit file on disk, which requires the full backlog tree to be present) are runtime-only invariants enforced by `validate-backlog` at orchestrator time. Do NOT add rubric items for C2 or C10 here; they cannot be caught at authoring time and will be caught by the validator before any executor cycle begins.
 
@@ -833,6 +856,10 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 11. **validate-backlog --strict rc=0 (G2 deterministic gate)**: `uv run devbench validate-backlog --strict` returns zero findings. The strict run is the source of truth -- it promotes the verification contract, the committable-file-sentinel rule (24), TDI-001/004/005, and the draft/hold manifest-conflict findings from WARNING to ERROR. FAIL if any strict finding remains.
 
+**Evidence soundness (item 12)**
+
+12. **Evidence soundness (E4)**: every repo-derived count or claim that drove a decomposition decision (which tasks were authored or skipped) was produced tracked-files-first via `git ls-files '<full-depth ** glob>'`, excluded the canonical vendored/generated dirs (`.terraform/`, `node_modules/`, `.venv/`, `vendor/`, `__pycache__/`, `dist/`, `.git/`), printed 5 eyeballed sample matched paths, and was re-derived a second independent way (`git ls-files` versus `find`/tool-glob, both with exclusions) with any material delta reconciled. FAIL if a decision rested on a count that included vendored copies, used a depth-1 glob a nested layout could hide from, was a bare number with no eyeballed samples, or showed an unreconciled material delta between derivations. See Pattern 7 (Canonical Repo-Evidence Collection) in `docs/workflow-authoring-patterns.md`.
+
 ---
 
 ## Output contract
@@ -841,6 +868,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
 - **Per-task depth**: every task contains all 16 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog --strict` rc=0 (zero findings; the deterministic strict gate, G2) before the skill exits
+- **Evidence soundness (E4)**: every repo-derived count that drove a decomposition decision is tracked-files-first (`git ls-files '<full-depth ** glob>'`), excludes the canonical vendored/generated dirs, prints 5 eyeballed sample paths, and is re-derived a second independent way with any material delta reconciled (Pattern 7, `docs/workflow-authoring-patterns.md`)
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 
 ---

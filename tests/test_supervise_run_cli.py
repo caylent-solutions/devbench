@@ -188,6 +188,19 @@ class TestRecordToolVersion:
         with patch("devbench.cli.subprocess.run", return_value=completed):
             assert cli._record_tool_version("/usr/bin/claude") is None
 
+    def test_uses_config_command_invocation_timeout(self) -> None:
+        # FR-19 / Section 7.4: the version-probe safety timeout is config-driven.
+        from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
+
+        cfg = SuperviseConfig(timeouts=SuperviseTimeoutsConfig(command_invocation_seconds=99))
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="claude 1.2.3", stderr="")
+        with (
+            patch("devbench.cli._supervise_runtime_config", return_value=cfg),
+            patch("devbench.cli.subprocess.run", return_value=completed) as run,
+        ):
+            assert cli._record_tool_version("/usr/bin/claude") == "claude 1.2.3"
+        assert run.call_args.kwargs["timeout"] == 99
+
 
 @pytest.mark.unit
 class TestStartRunningConfirmation:

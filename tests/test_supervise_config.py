@@ -60,6 +60,17 @@ class TestSuperviseConfigDefaults:
 
         assert SuperviseConfig().timeouts.poll_interval_seconds == SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
 
+    def test_default_command_invocation_timeout(self) -> None:
+        # The safety timeout (seconds) bounding the short, non-interactive
+        # subprocess.run command invocations (screen -ls / screen -X quit /
+        # <tool> --version). Config-driven per FR-19 / Section 7.4 (no literals).
+        from devbench.constants import SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
+
+        assert (
+            SuperviseConfig().timeouts.command_invocation_seconds
+            == SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
+        )
+
     def test_default_restart_max_attempts(self) -> None:
         assert SuperviseConfig().restart.max_attempts == SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT
 
@@ -134,6 +145,14 @@ class TestSuperviseConfigParse:
     def test_poll_interval_below_minimum_fails_fast(self) -> None:
         with pytest.raises(ValueError, match="poll_interval_seconds"):
             _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"poll_interval_seconds": 0}})
+
+    def test_command_invocation_timeout_override(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_invocation_seconds": 45}})
+        assert cfg.timeouts.command_invocation_seconds == 45
+
+    def test_command_invocation_timeout_below_minimum_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="command_invocation_seconds"):
+            _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_invocation_seconds": 0}})
 
     def test_optional_quota_timeout_below_minimum_fails_fast(self) -> None:
         with pytest.raises(ValueError, match="quota_poll_interval_seconds"):
@@ -230,3 +249,15 @@ class TestSuperviseConfigSchema:
         _write_config(cfg_path)
         runtime = load_runtime_config(cfg_path, {})
         assert runtime.supervise.effort == SUPERVISE_EFFORT_DEFAULT
+
+    def test_command_invocation_timeout_loads_via_runtime_config(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    command_invocation_seconds: 90\n")
+        runtime = load_runtime_config(cfg_path, {})
+        assert runtime.supervise.timeouts.command_invocation_seconds == 90
+
+    def test_command_invocation_timeout_below_minimum_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    command_invocation_seconds: 0\n")
+        with pytest.raises(Exception, match=r"command_invocation_seconds|minimum|0"):
+            load_runtime_config(cfg_path, {})

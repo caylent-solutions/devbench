@@ -1118,6 +1118,14 @@ SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT: int = 900
 # supervisor to drain and reach a terminal; the read-only ``attach`` follow uses
 # the SAME cadence as its bounded ``tail -F`` re-read interval (Section 4.2, 4.7).
 SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT: int = 2
+# Safety timeout (seconds) bounding the short, non-interactive ``subprocess.run``
+# command invocations the supervisor shells out to: ``screen -ls`` (live-session
+# listing), ``screen -S <name> -X quit`` (teardown), and ``<tool> --version`` (the
+# claude/screen audit probe). These are command-invocation hang guards, NOT the
+# enumerated PTY/quota operational timeouts above; per FR-19 / Section 7.4 every
+# operational value -- including these -- is a config field with a documented
+# default, never a hardcoded literal in the supervisor.
+SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT: int = 30
 
 # Default bounded auto-restart attempts on the exit-42-equivalent (Section 5.1,
 # FR-12, Section 4.3). Override via ``DEVBENCH_SUPERVISE_RESTART_MAX_ATTEMPTS``.

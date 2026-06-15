@@ -594,6 +594,7 @@ supervise:
     quota_poll_interval_seconds: 60  # reuses quota_handling.poll_interval_seconds when null
     quota_max_wait_seconds: 18000    # reuses quota_handling.max_wait_seconds when null (5h)
     graceful_stop_seconds: 900       # graceful drain budget before escalating to hard stop
+    command_invocation_seconds: 30   # safety timeout bounding short subprocess shell-outs (screen -ls / -X quit / --version)
   restart:
     max_attempts: 5                  # bounded auto-restart on exit-42-equivalent
     resume_mode: continue            # continue | resume (resume uses captured session id)

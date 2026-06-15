@@ -159,6 +159,7 @@ quota_handling:
 #     quota_max_wait_seconds: null     # null reuses quota_handling.max_wait_seconds (5h)
 #     graceful_stop_seconds: 900       # graceful drain budget before escalating to hard stop
 #     poll_interval_seconds: 2         # registry-poll (stop wait) + attach tail re-read cadence (bounded select, no sleep)
+#     command_invocation_seconds: 30   # safety timeout bounding short subprocess shell-outs (screen -ls / -X quit / --version)
 #   restart:
 #     max_attempts: 5                  # bounded auto-restart on the exit-42-equivalent
 #     resume_mode: continue            # continue | resume (resume uses the captured session id)

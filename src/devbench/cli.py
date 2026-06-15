@@ -9727,8 +9727,9 @@ def _supervise_live_screen_names() -> set[str]:
             "cannot list screens: 'screen' is not installed "
             "(devcontainer: 'apt-get install -y screen'; macOS: 'brew install screen')."
         )
+    invocation_timeout = _supervise_runtime_config().timeouts.command_invocation_seconds
     try:
-        result = subprocess.run([screen_path, "-ls"], capture_output=True, text=True, timeout=30)
+        result = subprocess.run([screen_path, "-ls"], capture_output=True, text=True, timeout=invocation_timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         raise SuperviseError(f"failed to invoke 'screen -ls': {exc}") from exc
     return parse_screen_ls((result.stdout or "") + (result.stderr or ""))
@@ -9748,8 +9749,14 @@ def _supervise_screen_quit(*, screen_name: str, screen_path: str) -> None:
         screen_name: The ``screen`` session name (``<prefix><name>``).
         screen_path: The resolved ``screen`` executable path.
     """
+    invocation_timeout = _supervise_runtime_config().timeouts.command_invocation_seconds
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run([screen_path, "-S", screen_name, "-X", "quit"], capture_output=True, text=True, timeout=30)
+        subprocess.run(
+            [screen_path, "-S", screen_name, "-X", "quit"],
+            capture_output=True,
+            text=True,
+            timeout=invocation_timeout,
+        )
 
 
 def _supervise_wait_for_terminal(
@@ -9850,8 +9857,9 @@ def _record_tool_version(path: str, version_flag: str = "--version") -> str | No
     audit record degrades gracefully rather than blocking launch on a version
     probe (the path itself is the load-bearing audit value).
     """
+    invocation_timeout = _supervise_runtime_config().timeouts.command_invocation_seconds
     try:
-        result = subprocess.run([path, version_flag], capture_output=True, text=True, timeout=30)
+        result = subprocess.run([path, version_flag], capture_output=True, text=True, timeout=invocation_timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:

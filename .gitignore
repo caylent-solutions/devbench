@@ -39,6 +39,8 @@ tmp/
 !.env.example
 !.env.template
 .coverage
+coverage.json
+coverage.xml
 
 # Trace output occasionally produced by kanon's repo_trace module when a test
 # writes to cwd instead of a tmp dir. Never valuable in this repo.

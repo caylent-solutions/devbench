@@ -106,6 +106,7 @@ from devbench.constants import (
     SUPERVISE_RESUME_MODE_DEFAULT,
     SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT,
     SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT,
@@ -812,7 +813,11 @@ class SuperviseTimeoutsConfig:
     Every value is in seconds and must be >= 1. ``quota_poll_interval_seconds``
     and ``quota_max_wait_seconds`` are ``None`` by default and fall through to
     ``quota_handling.poll_interval_seconds`` / ``max_wait_seconds`` (Section 7.4,
-    Section 4.9) when unset.
+    Section 4.9) when unset. ``command_invocation_seconds`` bounds the short,
+    non-interactive ``subprocess.run`` shell-outs (``screen -ls``,
+    ``screen -X quit``, ``<tool> --version``) so a hung invocation cannot stall
+    the supervisor -- a config-driven hang guard, not a hardcoded literal
+    (FR-19, Section 7.4).
     """
 
     ready_prompt_seconds: int = SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT
@@ -822,6 +827,7 @@ class SuperviseTimeoutsConfig:
     quota_max_wait_seconds: int | None = None
     graceful_stop_seconds: int = SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT
     poll_interval_seconds: int = SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
+    command_invocation_seconds: int = SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -1284,6 +1290,9 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
         ),
         poll_interval_seconds=_require_supervise_timeout(
             path, timeouts_raw, "poll_interval_seconds", dt.poll_interval_seconds
+        ),
+        command_invocation_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "command_invocation_seconds", dt.command_invocation_seconds
         ),
     )
 

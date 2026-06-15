@@ -63,6 +63,21 @@ class TestScreenQuit:
         with patch("devbench.cli.subprocess.run", side_effect=OSError("boom")):
             cli._supervise_screen_quit(screen_name="devbench-supervise-x", screen_path="/usr/bin/screen")
 
+    def test_quit_uses_config_command_invocation_timeout(self) -> None:
+        # FR-19 / Section 7.4: the subprocess.run safety timeout is config-driven,
+        # NOT a hardcoded literal. Drive a distinct, non-default value through the
+        # supervise config and assert it reaches subprocess.run unchanged.
+        from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
+
+        cfg = SuperviseConfig(timeouts=SuperviseTimeoutsConfig(command_invocation_seconds=77))
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            patch("devbench.cli._supervise_runtime_config", return_value=cfg),
+            patch("devbench.cli.subprocess.run", return_value=completed) as run,
+        ):
+            cli._supervise_screen_quit(screen_name="devbench-supervise-n", screen_path="/usr/bin/screen")
+        assert run.call_args.kwargs["timeout"] == 77
+
 
 @pytest.mark.unit
 class TestWaitForTerminal:
@@ -214,3 +229,19 @@ class TestLiveScreenNamesFailFast:
         ):
             with pytest.raises(cli.SuperviseError, match="screen -ls"):
                 cli._supervise_live_screen_names()
+
+    def test_uses_config_command_invocation_timeout(self) -> None:
+        # FR-19 / Section 7.4: the screen -ls safety timeout is config-driven.
+        from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
+
+        cfg = SuperviseConfig(timeouts=SuperviseTimeoutsConfig(command_invocation_seconds=88))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="No Sockets found in /run/screen/S-user.\n", stderr=""
+        )
+        with (
+            patch("devbench.cli.shutil.which", lambda _n: "/usr/bin/screen"),
+            patch("devbench.cli._supervise_runtime_config", return_value=cfg),
+            patch("devbench.cli.subprocess.run", return_value=completed) as run,
+        ):
+            assert cli._supervise_live_screen_names() == set()
+        assert run.call_args.kwargs["timeout"] == 88

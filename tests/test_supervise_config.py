@@ -54,6 +54,12 @@ class TestSuperviseConfigDefaults:
     def test_default_ready_prompt_timeout(self) -> None:
         assert SuperviseConfig().timeouts.ready_prompt_seconds == SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT
 
+    def test_default_poll_interval(self) -> None:
+        # The stop-wait registry-poll / attach tail re-read cadence (Section 4.2/4.7).
+        from devbench.constants import SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
+
+        assert SuperviseConfig().timeouts.poll_interval_seconds == SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
+
     def test_default_restart_max_attempts(self) -> None:
         assert SuperviseConfig().restart.max_attempts == SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT
 
@@ -120,6 +126,14 @@ class TestSuperviseConfigParse:
         )
         assert cfg.timeouts.quota_poll_interval_seconds == 120
         assert cfg.timeouts.quota_max_wait_seconds == 7200
+
+    def test_poll_interval_override(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"poll_interval_seconds": 5}})
+        assert cfg.timeouts.poll_interval_seconds == 5
+
+    def test_poll_interval_below_minimum_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="poll_interval_seconds"):
+            _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"poll_interval_seconds": 0}})
 
     def test_optional_quota_timeout_below_minimum_fails_fast(self) -> None:
         with pytest.raises(ValueError, match="quota_poll_interval_seconds"):

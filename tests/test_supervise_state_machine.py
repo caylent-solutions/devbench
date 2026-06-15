@@ -12,10 +12,12 @@ import pytest
 
 from devbench.constants import (
     SUPERVISE_STATE_COMPLETED_CLEAN,
+    SUPERVISE_STATE_DRAINING,
     SUPERVISE_STATE_FAULTED,
     SUPERVISE_STATE_QUOTA_WAITING,
     SUPERVISE_STATE_RUNNING,
     SUPERVISE_STATE_STARTING,
+    SUPERVISE_STATE_STOPPED,
 )
 from devbench.supervise import (
     SuperviseTransitionError,
@@ -77,6 +79,39 @@ class TestRunningTransitions:
         sm.on_event("fault")
         assert sm.state == SUPERVISE_STATE_FAULTED
         assert sm.is_terminal()
+
+
+@pytest.mark.unit
+class TestGracefulDrainTransitions:
+    """Section 4.2/4.8: an operator stop drains then reaches stopped (exit 0)."""
+
+    def _running(self) -> SupervisorStateMachine:
+        sm = SupervisorStateMachine()
+        sm.on_event("ready")
+        sm.on_event("orchestrate-injected")
+        return sm
+
+    def test_drain_requested_enters_draining(self) -> None:
+        sm = self._running()
+        sm.on_event("drain-requested")
+        assert sm.state == SUPERVISE_STATE_DRAINING
+
+    def test_draining_drain_complete_reaches_stopped(self) -> None:
+        # The in-flight WU finished + /exit sent: the operator-initiated graceful
+        # stop completes in ``stopped`` (exit 0), NOT a spontaneous completed-clean.
+        sm = self._running()
+        sm.on_event("drain-requested")
+        sm.on_event("drain-complete")
+        assert sm.state == SUPERVISE_STATE_STOPPED
+        assert sm.is_terminal()
+        assert (SUPERVISE_STATE_DRAINING, SUPERVISE_STATE_STOPPED, "drain-complete") in sm.history
+
+    def test_draining_stop_hard_still_reaches_stopped(self) -> None:
+        # The escalate-to-hard edge (graceful timeout) remains valid (Section 4.8).
+        sm = self._running()
+        sm.on_event("drain-requested")
+        sm.on_event("stop-hard")
+        assert sm.state == SUPERVISE_STATE_STOPPED
 
 
 @pytest.mark.unit

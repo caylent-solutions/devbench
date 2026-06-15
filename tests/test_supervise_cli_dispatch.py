@@ -73,7 +73,7 @@ class TestSuperviseSubverbDispatch:
 
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._supervise_screen_names", return_value=set()),
+            patch("devbench.cli._supervise_live_screen_names", return_value=set()),
         ):
             rc = cli._dispatch_supervise_subverb(sub, [])
         assert rc == 0

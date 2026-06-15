@@ -108,6 +108,7 @@ from devbench.constants import (
     SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT,
     SUPERVISE_VALID_EFFORT_LEVELS,
     SUPERVISE_VALID_RESUME_MODES,
@@ -820,6 +821,7 @@ class SuperviseTimeoutsConfig:
     quota_poll_interval_seconds: int | None = None
     quota_max_wait_seconds: int | None = None
     graceful_stop_seconds: int = SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT
+    poll_interval_seconds: int = SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -1279,6 +1281,9 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
         quota_max_wait_seconds=_optional_supervise_timeout(path, timeouts_raw, "quota_max_wait_seconds"),
         graceful_stop_seconds=_require_supervise_timeout(
             path, timeouts_raw, "graceful_stop_seconds", dt.graceful_stop_seconds
+        ),
+        poll_interval_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "poll_interval_seconds", dt.poll_interval_seconds
         ),
     )
 

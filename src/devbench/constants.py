@@ -1113,6 +1113,11 @@ SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT: int = 120
 SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT: int = 1800
 SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT: int = 60
 SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT: int = 900
+# The graceful ``stop`` verb polls the registry on this cadence (event-driven,
+# bounded by ``graceful_stop_seconds``) while waiting for the in-screen ``__run``
+# supervisor to drain and reach a terminal; the read-only ``attach`` follow uses
+# the SAME cadence as its bounded ``tail -F`` re-read interval (Section 4.2, 4.7).
+SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT: int = 2
 
 # Default bounded auto-restart attempts on the exit-42-equivalent (Section 5.1,
 # FR-12, Section 4.3). Override via ``DEVBENCH_SUPERVISE_RESTART_MAX_ATTEMPTS``.

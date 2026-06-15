@@ -67,7 +67,9 @@ import json
 import logging
 import os
 import re
+import selectors
 import shutil
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -82,6 +84,7 @@ from devbench.constants import (
     SUPERVISE_BASE_DIR,
     SUPERVISE_BILLING_CHANNEL,
     SUPERVISE_EFFORT_DEFAULT,
+    SUPERVISE_EXIT_REASON_GRACEFUL_STOP,
     SUPERVISE_FAULT_AUDIT_PREFIX,
     SUPERVISE_FAULT_EXIT_CODE,
     SUPERVISE_INFO_STATE_STALE,
@@ -225,6 +228,47 @@ def supervise_pty_log_path(workspace_root: Path, name: str) -> Path:
 def supervise_stop_request_path(workspace_root: Path, name: str) -> Path:
     """Return the per-session ``stop.request`` control-file path (Section 4.2)."""
     return supervise_state_dir(workspace_root, name) / SUPERVISE_STOP_REQUEST_FILENAME
+
+
+def write_stop_request(workspace_root: Path, name: str, *, reason: str = "supervise stop") -> Path:
+    """Write the graceful-stop control file the in-screen ``__run`` polls (Section 4.2).
+
+    The operator-facing ``stop`` verb writes this file; the in-screen ``__run``
+    supervisor's event loop reads it (:func:`read_stop_request`) to transition
+    ``running -> draining`` and drain the in-flight work unit before exiting.
+
+    Args:
+        workspace_root: The devbench workspace root.
+        name: The supervise session name.
+        reason: A free-form reason recorded in the control file (audit only;
+            presence of the file is the signal, not its contents).
+
+    Returns:
+        The absolute path of the control file that was written.
+    """
+    path = supervise_stop_request_path(workspace_root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + SUPERVISE_REGISTRY_TMP_SUFFIX)
+    tmp.write_text(f"{reason}\n", encoding="utf-8")
+    tmp.rename(path)
+    return path
+
+
+def read_stop_request(workspace_root: Path, name: str) -> bool:
+    """Return ``True`` when the operator wrote a graceful ``stop.request`` (Section 4.2).
+
+    The control file's PRESENCE is the signal (its contents are advisory). The
+    in-screen ``__run`` event loop polls this each iteration so an operator
+    ``supervise stop`` drives it into ``draining`` deterministically.
+
+    Args:
+        workspace_root: The devbench workspace root.
+        name: The supervise session name.
+
+    Returns:
+        ``True`` when the per-session ``stop.request`` file exists.
+    """
+    return supervise_stop_request_path(workspace_root, name).exists()
 
 
 def supervise_supervisor_log_path(workspace_root: Path, name: str) -> Path:
@@ -1217,6 +1261,10 @@ _SUPERVISE_TRANSITIONS: dict[tuple[str, str], str] = {
     (SUPERVISE_STATE_RESTARTING, "restart-launched"): SUPERVISE_STATE_RUNNING,
     (SUPERVISE_STATE_RESTARTING, "fault"): SUPERVISE_STATE_FAULTED,
     (SUPERVISE_STATE_DRAINING, "terminal-clean"): SUPERVISE_STATE_COMPLETED_CLEAN,
+    # An operator-initiated graceful stop: the in-flight WU finished and ``/exit``
+    # was sent, so the session is brought down as ``stopped`` (operator-initiated
+    # -> exit 0, Section 4.8 note), distinct from a spontaneous ``completed-clean``.
+    (SUPERVISE_STATE_DRAINING, "drain-complete"): SUPERVISE_STATE_STOPPED,
     (SUPERVISE_STATE_DRAINING, "stop-hard"): SUPERVISE_STATE_STOPPED,
 }
 
@@ -2028,13 +2076,19 @@ def run_supervise_event_loop(
     quota_waiter: Any,
     log_poll: Callable[[], LogTailHit | None],
     relaunch: Callable[..., None],
+    stop_poll: Callable[[], bool] | None = None,
     state_machine: SupervisorStateMachine | None = None,
 ) -> EventLoopResult:
     """Drive the post-kickoff supervise event loop to a terminal (FR-13, FR-27).
 
-    Each iteration: poll the hybrid log-tail, then read the PTY for the next
-    terminal/quota/restart/working signal, classify it (Section 4.6), and act:
+    Each iteration: poll the operator stop-request, then the hybrid log-tail,
+    then read the PTY for the next terminal/quota/restart/working signal,
+    classify it (Section 4.6), and act:
 
+    - operator stop-request (``stop_poll`` returns True) -> ``draining``: let the
+      in-flight WU finish, send ``/exit`` (the ``drain_now`` registry command),
+      read to the child EOF, then ``stopped`` (operator-initiated -> exit 0,
+      Section 4.2 step 2).
     - clean -> ``completed-clean``, exit 0.
     - fault (crash / circuit-breaker / stop-reason / harness-block / prompt
       timeout) -> ``faulted``, exit non-zero (classified).
@@ -2054,6 +2108,11 @@ def run_supervise_event_loop(
         relaunch: A callable the loop invokes on a restart/quota-resume to
             re-spawn the child and re-run kickoff (keyword args carry the resume
             mode + reason). It must leave *driver* wrapping the fresh child.
+        stop_poll: A zero-arg predicate returning ``True`` once an operator
+            ``supervise stop`` has written the per-session ``stop.request``
+            control file (production passes a closure over
+            :func:`read_stop_request`). ``None`` (the default) disables the
+            graceful-drain edge (the SDK-style callers never stop mid-loop).
         state_machine: The :class:`SupervisorStateMachine` to drive (a fresh one
             in the ``running`` state is created when ``None``).
 
@@ -2067,6 +2126,12 @@ def run_supervise_event_loop(
     resumes_used = 0
 
     while True:
+        # Operator graceful stop (Section 4.2 step 2): a written stop.request
+        # drives running -> draining -> (drain in-flight WU) -> stopped. Checked
+        # before the PTY read so an operator stop is honoured promptly.
+        if stop_poll is not None and sm.state == SUPERVISE_STATE_RUNNING and stop_poll():
+            return _handle_graceful_drain(driver, config, sm, idle_timeout, restarts_used, resumes_used)
+
         # Hybrid detection: the deterministic log markers are checked first.
         log_hit = log_poll()
         if log_hit is not None:
@@ -2089,6 +2154,53 @@ def run_supervise_event_loop(
         result, restarts_used, resumes_used = terminal
         if result is not None:
             return result
+
+
+def _handle_graceful_drain(
+    driver: PtyDriver,
+    config: SuperviseConfig,
+    sm: SupervisorStateMachine,
+    idle_timeout: int,
+    restarts_used: int,
+    resumes_used: int,
+) -> EventLoopResult:
+    """Drain the in-flight WU on an operator stop, then reach ``stopped`` (Section 4.2).
+
+    Sequence (Section 4.2 step 2): transition ``running -> draining``, send
+    ``/exit`` (the configured ``drain_now`` injectable command) so ``claude``
+    wraps up the in-flight turn and then exits, read the PTY to the child EOF
+    (the in-flight WU finishing), and resolve to ``stopped`` (operator-initiated
+    -> exit 0). The session id is preserved on the driver's child for a resume.
+
+    A drain that hits a prompt-timeout while waiting for the child to wind down
+    still resolves to ``stopped`` (the operator asked to stop): the in-screen
+    teardown is the operator's intent, not a fault.
+    """
+    sm.on_event("drain-requested")
+    logger.info("%s state=%s reason=operator-drain", SUPERVISE_STATE_AUDIT_PREFIX, sm.state)
+
+    # Send /exit so the in-flight turn completes then the child exits cleanly.
+    injector = CommandInjector(
+        driver=driver,
+        registry=config.injectable_commands,
+        ack_timeout_seconds=config.timeouts.command_ack_seconds,
+    )
+    injector.send("drain_now")
+
+    # Read to the child EOF (the in-flight WU finishing + /exit taking effect).
+    # A bounded prompt-timeout while winding down is not a fault here: the
+    # operator-initiated stop completes regardless.
+    with contextlib.suppress(SupervisePromptTimeoutError):
+        while True:
+            _text, eof, _exitstatus = driver.read_chunk(timeout_seconds=idle_timeout)
+            if eof:
+                break
+
+    sm.on_event("drain-complete")
+    outcome = SuperviseOutcome(
+        exit_code=0, exit_reason=SUPERVISE_EXIT_REASON_GRACEFUL_STOP, is_clean=True, is_quota=False
+    )
+    return _terminal(sm, outcome, restarts_used, resumes_used)
 
 
 def _running_state_machine() -> SupervisorStateMachine:
@@ -2447,11 +2559,54 @@ def reconcile_info_rows(
 # ---------------------------------------------------------------------------
 
 
+def _block_until_readable(*, poll_interval_seconds: float, input_fd: int | None = None) -> None:
+    """Park the process until stdin is readable or *poll_interval_seconds* elapses.
+
+    This is the ``tail -F``-equivalent throttle for :func:`follow_pty_log`: rather
+    than spinning (re-reading the file with no pause), the follow loop calls this
+    between reads so the process is kernel-parked. It blocks on ``select`` over the
+    operator's input fd with a bounded timeout, so it wakes EITHER when the operator
+    presses a key / ``Ctrl-C`` (the input fd becomes readable / interrupts the
+    syscall) OR after the bounded poll interval (to re-read appended transcript).
+    It uses ``select`` (an event-driven syscall), never ``time.sleep`` (CLAUDE.md,
+    Section 7.5). A regular file cannot be registered for growth notifications, so
+    the bounded interval is the re-read cadence; the interval is config-driven.
+
+    Args:
+        poll_interval_seconds: Maximum seconds to park before returning so the
+            caller re-reads (the bounded re-read cadence). Config-driven; no
+            hardcoded value reaches here.
+        input_fd: The fd to watch for readiness (defaults to the real stdin fd).
+            When stdin has no fileno (e.g. redirected to a non-selectable object)
+            the wait still bounds itself on the interval via an empty selector.
+    """
+    fd = input_fd if input_fd is not None else _stdin_fileno()
+    selector = selectors.DefaultSelector()
+    try:
+        if fd is not None:
+            selector.register(fd, selectors.EVENT_READ)
+        # select() blocks the process (kernel-parked) until the fd is readable or
+        # the timeout elapses; an empty selector still honours the timeout.
+        selector.select(timeout=poll_interval_seconds)
+    finally:
+        selector.close()
+
+
+def _stdin_fileno() -> int | None:
+    """Return the real stdin fd, or ``None`` when stdin is not a selectable fd."""
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, ValueError, OSError):
+        return None
+    return fd
+
+
 def follow_pty_log(
     log_path: Path,
     *,
     write: Callable[[str], None],
     should_continue: Callable[[], bool],
+    block: Callable[[], None],
     wait_for_log: bool = False,
 ) -> None:
     """Follow the redacted ``pty.log`` read-only, streaming only NEW bytes (FR-26).
@@ -2461,10 +2616,12 @@ def follow_pty_log(
     to the ``claude`` TTY, so an observer cannot inject input or steal the PTY.
 
     The loop is event-driven and bounded by *should_continue* (the CLI passes a
-    predicate that returns ``False`` on ``KeyboardInterrupt``); it NEVER uses
-    ``time.sleep`` -- each iteration reads any bytes appended since the last
-    iteration via a byte offset, then consults *should_continue* to decide whether
-    to keep following (CLAUDE.md, Section 7.5).
+    predicate that returns ``False`` on ``KeyboardInterrupt``). Each iteration
+    reads any bytes appended since the last iteration via a byte offset, then
+    BLOCKS on *block* (the production path parks the process on stdin readiness
+    with a bounded poll interval, :func:`_block_until_readable`) so the follow is
+    a true ``tail -F`` and NOT a CPU-spinning busy-loop. It NEVER uses
+    ``time.sleep`` (CLAUDE.md, Section 7.5).
 
     Args:
         log_path: Absolute ``pty.log`` path.
@@ -2473,6 +2630,10 @@ def follow_pty_log(
         should_continue: Zero-arg predicate; the loop runs while it returns
             ``True``. It is the readiness gate (the CLI wires it to the live
             terminal so a ``KeyboardInterrupt`` ends the follow).
+        block: Zero-arg callable invoked once per iteration to PARK the process
+            between reads (the production path is a bounded ``select`` on stdin,
+            :func:`_block_until_readable`). This is what makes the follow
+            event-driven rather than a busy-loop.
         wait_for_log: When ``True``, a not-yet-created log is tolerated (the
             ``__run`` supervisor may not have flushed the first chunk); the loop
             keeps polling until it appears. When ``False`` (the default), an
@@ -2486,12 +2647,14 @@ def follow_pty_log(
 
     offset = 0
     while should_continue():
-        if not log_path.exists():
-            continue
-        data = log_path.read_text(encoding="utf-8", errors="replace")
-        if len(data) < offset:
-            # Truncated/rotated: re-follow from the new start.
-            offset = 0
-        if len(data) > offset:
-            write(data[offset:])
-            offset = len(data)
+        if log_path.exists():
+            data = log_path.read_text(encoding="utf-8", errors="replace")
+            if len(data) < offset:
+                # Truncated/rotated: re-follow from the new start.
+                offset = 0
+            if len(data) > offset:
+                write(data[offset:])
+                offset = len(data)
+        # Park the process until new bytes may have arrived (or the operator
+        # interacts), rather than spinning on a tight re-read loop.
+        block()

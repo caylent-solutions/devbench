@@ -21,9 +21,13 @@ import pytest
 from fixtures.supervise import FakePexpectChild, _ScriptStep
 
 from devbench.config_loader import SuperviseConfig
+from devbench.constants import SUPERVISE_INJECTABLE_COMMANDS_DEFAULT
 from devbench.supervise import (
+    SUPERVISE_EXIT_REASON_GRACEFUL_STOP,
     SUPERVISE_STATE_COMPLETED_CLEAN,
+    SUPERVISE_STATE_DRAINING,
     SUPERVISE_STATE_FAULTED,
+    SUPERVISE_STATE_STOPPED,
     DetectionPatterns,
     EventLoopResult,
     PtyDriver,
@@ -378,3 +382,87 @@ class TestEventLoopMidSessionFaultAndTimeout:
         assert len(relaunches) == 1
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+
+@pytest.mark.unit
+class TestEventLoopGracefulStop:
+    """An operator ``stop.request`` drives running -> draining -> stopped (Section 4.2)."""
+
+    def test_stop_request_drains_inflight_then_stops_exit_zero(self) -> None:
+        # The stop_poll fires True on the first iteration: the loop enters
+        # ``draining``, lets the in-flight turn finish (sends /exit), reads to the
+        # child EOF, and reaches ``stopped`` (operator-initiated -> exit 0). The
+        # /exit (drain_now) literal must have been injected into the child.
+        child = FakePexpectChild(
+            [
+                # After /exit the in-flight turn wraps up and the child EOFs clean.
+                _ScriptStep(emit="wrapping up current work unit", on_send="/exit"),
+                _ScriptStep(emit="", eof=True, exitstatus=0, on_send="/exit"),
+            ]
+        )
+        stop_calls = {"n": 0}
+
+        def _stop_poll() -> bool:
+            stop_calls["n"] += 1
+            return stop_calls["n"] == 1
+
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=SuperviseConfig(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **_k: None,
+            stop_poll=_stop_poll,
+        )
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_STOPPED
+        assert result.exit_reason == SUPERVISE_EXIT_REASON_GRACEFUL_STOP
+        # The graceful drain injected the configured /exit (drain_now) command.
+        assert SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["drain_now"] in child.sent
+
+    def test_stop_poll_default_none_does_not_drain(self) -> None:
+        # With no stop_poll supplied (the default), a clean ALL_DONE still wins:
+        # the absence of an operator stop must not perturb the normal terminal.
+        child = FakePexpectChild(
+            [
+                _ScriptStep(emit="esc to interrupt"),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
+            ]
+        )
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=SuperviseConfig(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **_k: None,
+        )
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+    def test_draining_state_is_observable_via_state_machine(self) -> None:
+        # The loop must drive the machine through ``draining`` (FR-27) on the way
+        # to ``stopped``; the recorded history is asserted so the edge is real.
+        from devbench.supervise import SupervisorStateMachine
+
+        sm = SupervisorStateMachine()
+        sm.on_event("ready")
+        sm.on_event("orchestrate-injected")
+        child = FakePexpectChild(
+            [
+                _ScriptStep(emit="finishing", on_send="/exit"),
+                _ScriptStep(emit="", eof=True, exitstatus=0, on_send="/exit"),
+            ]
+        )
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=SuperviseConfig(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **_k: None,
+            stop_poll=lambda: True,
+            state_machine=sm,
+        )
+        assert result.final_state == SUPERVISE_STATE_STOPPED
+        # The (running -> draining) edge fired before reaching stopped.
+        assert (SUPERVISE_STATE_DRAINING, SUPERVISE_STATE_STOPPED, "drain-complete") in sm.history
+        assert any(to == SUPERVISE_STATE_DRAINING for (_f, to, _e) in sm.history)

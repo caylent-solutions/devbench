@@ -941,7 +941,8 @@
             "command_ack_seconds": {"type": "integer", "minimum": 1, "description": "Wait for a slash command to be acknowledged. Default 60."},
             "quota_poll_interval_seconds": {"type": ["integer", "null"], "minimum": 1, "description": "Reuses quota_handling.poll_interval_seconds when null."},
             "quota_max_wait_seconds": {"type": ["integer", "null"], "minimum": 1, "description": "Reuses quota_handling.max_wait_seconds when null (5h)."},
-            "graceful_stop_seconds": {"type": "integer", "minimum": 1, "description": "Graceful drain budget before escalating to hard stop. Default 900."}
+            "graceful_stop_seconds": {"type": "integer", "minimum": 1, "description": "Graceful drain budget before escalating to hard stop. Default 900."},
+            "poll_interval_seconds": {"type": "integer", "minimum": 1, "description": "Registry-poll / attach tail re-read cadence (seconds) for stop wait + attach follow. Default 2."}
           }
         },
         "restart": {

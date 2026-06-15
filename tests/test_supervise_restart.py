@@ -155,7 +155,7 @@ class TestSuperviseRestartCli:
         from unittest.mock import patch
 
         from devbench import cli
-        from devbench.constants import SUPERVISE_STATE_RUNNING
+        from devbench.constants import SUPERVISE_STATE_RUNNING, SUPERVISE_STATE_STOPPED
         from devbench.supervise import SuperviseRegistry, new_session_state, supervise_stop_request_path
 
         reg = SuperviseRegistry(tmp_path)
@@ -170,11 +170,20 @@ class TestSuperviseRestartCli:
         st.state = SUPERVISE_STATE_RUNNING
         reg.write_state(st)
 
-        # The screen is live, so the graceful drain path runs (a stale screen
-        # would instead reconcile -- exercised in test_supervise_stop_reconcile).
+        # The screen is live, so the graceful drain path runs: stop signals __run
+        # and WAITS for it to reach a terminal. The injected wait stands in for the
+        # in-screen __run supervisor draining + recording the stop (Section 4.2).
+        def _fake_wait(*, name, registry, timeout_seconds):
+            inner = registry.read_state(name)
+            inner.state = SUPERVISE_STATE_STOPPED
+            inner.exit_reason = "graceful-stop"
+            registry.write_state(inner)
+            return True
+
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._supervise_screen_names", return_value={"devbench-supervise-nightly"}),
+            patch("devbench.cli._supervise_live_screen_names", return_value={"devbench-supervise-nightly"}),
+            patch("devbench.cli._supervise_wait_for_terminal", _fake_wait),
         ):
             rc = cli.cmd_supervise("stop", "--name", "nightly")
         assert rc == 0
@@ -205,14 +214,20 @@ class TestSuperviseRestartCli:
         st.state = SUPERVISE_STATE_RUNNING
         reg.write_state(st)
 
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._supervise_live_screen_names", return_value={"devbench-supervise-n"}),
+            patch("devbench.cli._supervise_screen_quit") as quit_mock,
+            patch("devbench.cli.shutil.which", lambda name: f"/usr/bin/{name}"),
+        ):
             rc = cli.cmd_supervise("stop", "--name", "n", "--hard")
         assert rc == 0
         after = reg.read_state("n")
         assert after is not None
         assert after.state == "stopped"
         assert after.exit_reason == "hard-stop"
-        # --hard does NOT write the graceful stop.request control file.
+        # --hard tears the screen down (and never writes the graceful stop.request).
+        assert quit_mock.called
         assert not supervise_stop_request_path(tmp_path, "n").exists()
 
     def test_restart_propagates_stop_failure(self, tmp_path) -> None:

@@ -225,7 +225,6 @@ from devbench.constants import (
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
     SUPERVISE_DEFAULT_NAME,
-    SUPERVISE_EXIT_REASON_GRACEFUL_STOP,
     SUPERVISE_EXIT_REASON_HARD_STOP,
     SUPERVISE_EXIT_REASON_STALE_RECONCILED,
     SUPERVISE_INTERNAL_RUN_SUBVERB,
@@ -282,6 +281,8 @@ from devbench.supervise import (
     SuperviseError,
     SuperviseReadyTimeoutError,
     SuperviseRegistry,
+    SuperviseSessionState,
+    _block_until_readable,
     build_claude_launch_argv,
     build_quota_waiter,
     build_resume_argv,
@@ -289,6 +290,7 @@ from devbench.supervise import (
     format_status_line,
     new_session_state,
     parse_screen_ls,
+    read_stop_request,
     reconcile_info_rows,
     require_claude,
     resolve_supervise_effort,
@@ -297,8 +299,8 @@ from devbench.supervise import (
     run_supervised_kickoff,
     screen_session_name,
     supervise_pty_log_path,
-    supervise_stop_request_path,
     write_session_scope,
+    write_stop_request,
 )
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
@@ -9702,24 +9704,105 @@ def _supervise_in_progress_id() -> str | None:
     return None
 
 
-def _supervise_screen_names() -> set[str]:
+def _supervise_live_screen_names() -> set[str]:
     """Return the set of live ``screen`` session names via ``screen -ls`` (FR-11).
 
-    ``screen -ls`` exits 1 when there are no sockets, so the return code is NOT
-    treated as a failure; the combined stdout/stderr is parsed by
-    :func:`parse_screen_ls`. When ``screen`` is not installed (``info`` is a
-    read-only verb that should still list the registry), an empty set is returned
-    so every registry session reconciles to ``stale`` rather than the verb
-    crashing.
+    ``screen -ls`` exits 1 when there are NO sockets, so a non-zero return code is
+    NOT treated as a failure -- the combined stdout/stderr is parsed by
+    :func:`parse_screen_ls`, yielding an empty set for the legitimate "no screens"
+    case. A REAL invocation failure (``screen`` not on ``PATH``, an ``OSError``, or
+    a ``subprocess`` error) is distinct from "no screens" and FAILS FAST with a
+    :class:`SuperviseError` (CLAUDE.md no-silent-failure): a teardown verb (``stop``)
+    must not mistake a broken ``screen -ls`` for "the session is gone" and skip the
+    drain/quit. Read-only callers (``info``) catch this and degrade with a clear
+    note rather than crashing.
+
+    Raises:
+        SuperviseError: ``screen`` is not installed, or ``screen -ls`` could not be
+            invoked (the distinct failure signal, NOT "no screens").
     """
     screen_path = shutil.which("screen")
     if screen_path is None:
-        return set()
+        raise SuperviseError(
+            "cannot list screens: 'screen' is not installed "
+            "(devcontainer: 'apt-get install -y screen'; macOS: 'brew install screen')."
+        )
     try:
         result = subprocess.run([screen_path, "-ls"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return set()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SuperviseError(f"failed to invoke 'screen -ls': {exc}") from exc
     return parse_screen_ls((result.stdout or "") + (result.stderr or ""))
+
+
+def _supervise_screen_quit(*, screen_name: str, screen_path: str) -> None:
+    """Tear down a supervise screen via ``screen -S <name> -X quit`` (Section 4.2).
+
+    Used by ``stop --hard`` and the graceful-stop escalation to force the screen
+    (and the ``__run`` supervisor + ``claude`` child it hosts) to exit. Quitting a
+    screen that is already gone exits non-zero ("No screen session found") -- that
+    is a NO-OP success for teardown, not a fault, so a non-zero return is tolerated.
+    A failure to INVOKE ``screen`` at all (``OSError``) is likewise non-fatal here:
+    the registry transition to ``stopped`` is the authoritative operator outcome.
+
+    Args:
+        screen_name: The ``screen`` session name (``<prefix><name>``).
+        screen_path: The resolved ``screen`` executable path.
+    """
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run([screen_path, "-S", screen_name, "-X", "quit"], capture_output=True, text=True, timeout=30)
+
+
+def _supervise_wait_for_terminal(
+    *,
+    name: str,
+    registry: SuperviseRegistry,
+    timeout_seconds: int,
+    _gate: Callable[[float], None] | None = None,
+    _now: Callable[[], float] | None = None,
+) -> bool:
+    """Wait (event-driven, bounded) for ``__run`` to drive *name* to a terminal (Section 4.2).
+
+    The operator-facing graceful ``stop`` writes the drain + ``stop.request``
+    control files, then DELEGATES the actual shutdown to the in-screen ``__run``
+    supervisor (it drains the in-flight WU, sends ``/exit``, and records the
+    terminal state). This polls the registry until the session reaches a terminal
+    state (``stopped`` / ``completed-clean`` / ``faulted``, reusing
+    :data:`_SUPERVISE_VACATED_STATES`) or the *timeout_seconds* budget elapses.
+
+    The wait is event-driven, NOT a ``time.sleep`` busy-loop: between reads it
+    parks the process on a bounded ``select`` (``poll_interval_seconds``) via the
+    injected *_gate* (defaults to :func:`_block_until_readable`), and bounds total
+    time with a monotonic clock (*_now*, defaults to ``time.monotonic``).
+
+    Args:
+        name: The supervise session name.
+        registry: The :class:`SuperviseRegistry` to read.
+        timeout_seconds: The graceful-stop budget; on expiry the caller escalates
+            to a hard stop (Section 4.2 step 3).
+        _gate: Test seam for the per-iteration bounded park; production uses the
+            config-driven :func:`_block_until_readable`.
+        _now: Test seam for the monotonic clock.
+
+    Returns:
+        ``True`` when the session reached a terminal within the budget; ``False``
+        on timeout (the caller escalates to hard).
+    """
+    now = _now if _now is not None else time.monotonic
+    if _gate is None:
+        poll_interval = _supervise_runtime_config().timeouts.poll_interval_seconds
+
+        def _gate(_remaining: float) -> None:
+            _block_until_readable(poll_interval_seconds=min(float(poll_interval), max(_remaining, 0.0)))
+
+    start = now()
+    while True:
+        state = registry.read_state(name)
+        if state is not None and state.state in _SUPERVISE_VACATED_STATES:
+            return True
+        elapsed = now() - start
+        if elapsed >= timeout_seconds:
+            return False
+        _gate(timeout_seconds - elapsed)
 
 
 def _supervise_launch_screen(
@@ -10092,6 +10175,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         quota_waiter=quota_waiter,
         log_poll=log_tail.poll,
         relaunch=relaunch,
+        stop_poll=lambda: read_stop_request(WORKSPACE_ROOT, parsed.name),
     )
 
     state.state = result.final_state
@@ -10154,31 +10238,45 @@ def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
         sys.stdout.flush()
 
     # The follow loop is event-driven and read-only: stdin is never wired to the
-    # child. Ctrl-C (KeyboardInterrupt) ends the follow with exit 0; the loop's
-    # readiness gate keeps following while no interrupt has arrived.
+    # child. Between reads it PARKS the process on a bounded ``select`` (the
+    # config-driven poll interval) via ``_block_until_readable`` rather than
+    # spinning -- a true ``tail -F``, not a CPU busy-loop (Section 4.7, CLAUDE.md
+    # Section 7.5). Ctrl-C (KeyboardInterrupt) ends the follow with exit 0; it
+    # interrupts the blocking ``select`` so the operator never waits a full
+    # interval to stop watching.
+    poll_interval = _supervise_runtime_config().timeouts.poll_interval_seconds
+
+    def _block() -> None:
+        _block_until_readable(poll_interval_seconds=float(poll_interval))
+
     try:
-        follow_pty_log(log_path, write=_write, should_continue=lambda: True)
+        follow_pty_log(log_path, write=_write, should_continue=lambda: True, block=_block)
     except KeyboardInterrupt:
         print("\n[supervise] stopped watching (orchestration continues).")
     return 0
 
 
 def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
-    """``supervise stop`` body: graceful drain-then-stop + stale reconcile (Section 4.2, FR-5).
+    """``supervise stop`` body: graceful drain-then-stop / hard / stale reconcile (Section 4.2, FR-5).
 
-    Graceful (default): when the screen IS live, request a per-session drain (so
-    the in-flight WU finishes) and write the ``stop.request`` control file the
-    ``__run`` supervisor polls, then mark the registry ``stopped``. ``--hard``
-    skips the drain entirely. An unknown ``--name`` exits 2 (fail-fast, FR-30).
+    Graceful (default): write the per-session ``drain.signal`` + the
+    ``stop.request`` control file the in-screen ``__run`` supervisor polls, then
+    WAIT (event-driven, bounded by ``supervise.timeouts.graceful_stop_seconds``)
+    for ``__run`` to drain the in-flight WU, send ``/exit``, and record a terminal
+    state. The operator stop does NOT stamp ``stopped`` itself -- the in-screen
+    supervisor owns the teardown. On timeout the verb ESCALATES to hard (Section
+    4.2 step 3).
 
-    Stale-screen reconcile (Section 4.2): when the registry says the session is
-    running but ``screen -ls`` no longer lists its screen, there is no supervisor
-    to drain -- the verb reconciles the registry to ``stopped`` (exit-reason
-    ``stale-screen-reconciled``) and returns 0 with a note instead of writing a
-    pointless drain signal. ``--hard`` bypasses this (it terminates regardless).
+    Hard (``--hard``): tear the screen down via ``screen -S <screen> -X quit`` (the
+    ``__run`` supervisor + ``claude`` child die with it), then record
+    ``stopped exit-reason=hard-stop``.
 
-    This body lands the drain + stop-request + registry transition the ``restart``
-    verb (Section 4.3) composes.
+    Stale-screen reconcile: when the registry says the session is running but
+    ``screen -ls`` no longer lists its screen, there is no supervisor to drain --
+    reconcile to ``stopped`` (``stale-screen-reconciled``) and return 0 with a
+    note. A failure to LIST screens (distinct from "no screens") fails fast (FR-30).
+
+    An unknown ``--name`` exits 2 (fail-fast, FR-30).
     """
     registry = SuperviseRegistry(WORKSPACE_ROOT)
     state = registry.read_state(parsed.name)
@@ -10186,31 +10284,71 @@ def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
         print(f"ERROR: no supervise session named {parsed.name!r}.", file=sys.stderr)
         return 2
 
-    if not parsed.hard:
-        # Stale-screen reconcile: a registry-running session whose screen is gone
-        # has no supervisor to drain; reconcile rather than drain (Section 4.2).
-        if state.screen_name not in _supervise_screen_names():
-            state.state = SUPERVISE_STATE_STOPPED
-            state.exit_reason = SUPERVISE_EXIT_REASON_STALE_RECONCILED
-            registry.write_state(state)
-            print(f"[supervise] state=stopped name={parsed.name} (stale screen reconciled; no live supervisor).")
-            return 0
+    try:
+        live_screens = _supervise_live_screen_names()
+    except SuperviseError as exc:
+        # A broken ``screen -ls`` must NOT be mistaken for "the session is gone"
+        # (that would skip the teardown); fail fast (FR-30, CLAUDE.md).
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
-        prev = os.environ.get("DEVBENCH_SESSION_NAME")
-        os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
-        try:
-            request_drain(WORKSPACE_ROOT, reason="supervise stop")
-        finally:
-            _restore_session_env_name(prev)
-        stop_request = supervise_stop_request_path(WORKSPACE_ROOT, parsed.name)
-        stop_request.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(stop_request, "supervise stop\n")
+    if parsed.hard:
+        return _supervise_stop_hard(parsed.name, state, registry)
+    return _supervise_stop_graceful(parsed.name, state, registry, live_screens)
 
+
+def _supervise_stop_hard(name: str, state: SuperviseSessionState, registry: SuperviseRegistry) -> int:
+    """Hard-stop *name*: quit the screen, then record ``stopped`` (Section 4.2)."""
+    screen_path = shutil.which("screen")
+    if screen_path is not None:
+        _supervise_screen_quit(screen_name=state.screen_name, screen_path=screen_path)
     state.state = SUPERVISE_STATE_STOPPED
-    state.exit_reason = SUPERVISE_EXIT_REASON_HARD_STOP if parsed.hard else SUPERVISE_EXIT_REASON_GRACEFUL_STOP
+    state.exit_reason = SUPERVISE_EXIT_REASON_HARD_STOP
     registry.write_state(state)
-    print(f"[supervise] state=stopped name={parsed.name} mode={'hard' if parsed.hard else 'graceful'}")
+    print(f"[supervise] state=stopped name={name} mode=hard (screen quit).")
     return 0
+
+
+def _supervise_stop_graceful(
+    name: str,
+    state: SuperviseSessionState,
+    registry: SuperviseRegistry,
+    live_screens: set[str],
+) -> int:
+    """Graceful-stop *name*: signal ``__run``, wait, escalate to hard on timeout (Section 4.2)."""
+    # Stale-screen reconcile: a registry-running session whose screen is gone has
+    # no supervisor to drain; reconcile rather than write a pointless drain signal.
+    if state.screen_name not in live_screens:
+        state.state = SUPERVISE_STATE_STOPPED
+        state.exit_reason = SUPERVISE_EXIT_REASON_STALE_RECONCILED
+        registry.write_state(state)
+        print(f"[supervise] state=stopped name={name} (stale screen reconciled; no live supervisor).")
+        return 0
+
+    # Signal __run: write the per-session drain signal + the stop.request the
+    # __run event loop polls to enter ``draining`` (Section 4.2 step 1-2).
+    prev = os.environ.get("DEVBENCH_SESSION_NAME")
+    os.environ["DEVBENCH_SESSION_NAME"] = name
+    try:
+        request_drain(WORKSPACE_ROOT, reason="supervise stop")
+    finally:
+        _restore_session_env_name(prev)
+    write_stop_request(WORKSPACE_ROOT, name)
+
+    # Delegate the teardown to __run: wait (bounded) for it to reach a terminal.
+    cfg = _supervise_runtime_config()
+    reached = _supervise_wait_for_terminal(
+        name=name, registry=registry, timeout_seconds=cfg.timeouts.graceful_stop_seconds
+    )
+    if reached:
+        final = registry.read_state(name)
+        final_state = final.state if final is not None else SUPERVISE_STATE_STOPPED
+        print(f"[supervise] state={final_state} name={name} mode=graceful (drained by supervisor).")
+        return 0
+
+    # Graceful budget expired without __run winding down: escalate to hard.
+    print(f"[supervise] graceful stop of {name!r} exceeded budget; escalating to hard stop.", file=sys.stderr)
+    return _supervise_stop_hard(name, state, registry)
 
 
 def _cmd_supervise_status(parsed: _SuperviseArgs, *, name_given: bool) -> int:
@@ -10251,12 +10389,23 @@ def _cmd_supervise_info(_parsed: _SuperviseArgs) -> int:
     with no registry entry is ``unknown`` (orphan); a registry entry with no live
     screen is ``stale``. The ATTACH column is the exact ``supervise attach
     --name N`` command. Always exit 0 (read-only listing).
+
+    Read-only degradation: ``info`` MUST still list the registry when ``screen
+    -ls`` cannot be invoked, but it surfaces a distinct ``screen list unavailable``
+    note so "screen unavailable" is NOT silently indistinguishable from "no live
+    screens" (every session would otherwise reconcile to ``stale``). The teardown
+    verb (``stop``) fails fast on the same condition; ``info`` does not.
     """
     registry = SuperviseRegistry(WORKSPACE_ROOT)
     cfg = _supervise_runtime_config()
+    try:
+        screen_names = _supervise_live_screen_names()
+    except SuperviseError as exc:
+        print(f"[supervise] screen list unavailable ({exc}); sessions shown from the registry only.")
+        screen_names = set()
     rows = reconcile_info_rows(
         sessions=registry.load(),
-        screen_names=_supervise_screen_names(),
+        screen_names=screen_names,
         prefix=cfg.screen_name_prefix,
     )
     if not rows:

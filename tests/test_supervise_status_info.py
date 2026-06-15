@@ -305,7 +305,7 @@ class TestSuperviseInfoCli:
         self._seed(tmp_path, "fast")
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._supervise_screen_names", return_value={"devbench-supervise-fast"}),
+            patch("devbench.cli._supervise_live_screen_names", return_value={"devbench-supervise-fast"}),
         ):
             rc = cli.cmd_supervise("info")
         assert rc == 0
@@ -319,7 +319,7 @@ class TestSuperviseInfoCli:
 
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._supervise_screen_names", return_value=set()),
+            patch("devbench.cli._supervise_live_screen_names", return_value=set()),
         ):
             rc = cli.cmd_supervise("info")
         assert rc == 0
@@ -331,11 +331,31 @@ class TestSuperviseInfoCli:
         self._seed(tmp_path, "ghost")
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._supervise_screen_names", return_value=set()),
+            patch("devbench.cli._supervise_live_screen_names", return_value=set()),
         ):
             rc = cli.cmd_supervise("info")
         assert rc == 0
         assert "stale" in capsys.readouterr().out
+
+    def test_info_degrades_with_note_when_screen_unavailable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # info is read-only: a real screen -ls failure must NOT crash it, but it
+        # MUST surface a distinct note so "screen unavailable" is not silently
+        # indistinguishable from "no screens" (the operator-decision the verifier
+        # flagged). Sessions still list (reconciled against an empty live set).
+        from unittest.mock import patch
+
+        self._seed(tmp_path, "ghost")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._supervise_live_screen_names", side_effect=cli.SuperviseError("screen -ls failed")),
+        ):
+            rc = cli.cmd_supervise("info")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "screen list unavailable" in out
+        assert "ghost" in out  # the registry row still lists
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +364,8 @@ class TestSuperviseInfoCli:
 
 
 @pytest.mark.unit
-class TestSuperviseScreenNamesSeam:
-    """_supervise_screen_names runs `screen -ls` and parses, degrading gracefully."""
+class TestSuperviseLiveScreenNamesSeam:
+    """_supervise_live_screen_names runs `screen -ls`; fails fast on a real error."""
 
     def test_parses_live_screens(self) -> None:
         import subprocess
@@ -361,7 +381,7 @@ class TestSuperviseScreenNamesSeam:
             patch("devbench.cli.shutil.which", return_value="/usr/bin/screen"),
             patch("devbench.cli.subprocess.run", return_value=completed),
         ):
-            assert cli._supervise_screen_names() == {"devbench-supervise-x"}
+            assert cli._supervise_live_screen_names() == {"devbench-supervise-x"}
 
     def test_no_sockets_returncode_1_is_not_a_failure(self) -> None:
         import subprocess
@@ -372,22 +392,24 @@ class TestSuperviseScreenNamesSeam:
             patch("devbench.cli.shutil.which", return_value="/usr/bin/screen"),
             patch("devbench.cli.subprocess.run", return_value=completed),
         ):
-            assert cli._supervise_screen_names() == set()
+            assert cli._supervise_live_screen_names() == set()
 
-    def test_screen_absent_returns_empty(self) -> None:
+    def test_screen_absent_fails_fast(self) -> None:
         from unittest.mock import patch
 
         with patch("devbench.cli.shutil.which", return_value=None):
-            assert cli._supervise_screen_names() == set()
+            with pytest.raises(cli.SuperviseError, match="screen"):
+                cli._supervise_live_screen_names()
 
-    def test_subprocess_error_returns_empty(self) -> None:
+    def test_subprocess_error_fails_fast(self) -> None:
         from unittest.mock import patch
 
         with (
             patch("devbench.cli.shutil.which", return_value="/usr/bin/screen"),
             patch("devbench.cli.subprocess.run", side_effect=OSError("boom")),
         ):
-            assert cli._supervise_screen_names() == set()
+            with pytest.raises(cli.SuperviseError, match="screen -ls"):
+                cli._supervise_live_screen_names()
 
 
 @pytest.mark.unit

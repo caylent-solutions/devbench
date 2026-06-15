@@ -764,6 +764,24 @@ DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK: bool = True
 # recurring failure so an operator/loop can act deterministically.
 CLAIM_NOT_CONVERGING_MARKER: str = "[CLAIM_NOT_CONVERGING]"
 
+# Aggregate safety valve for block-and-continue (TDI: claim-not-converging must
+# not halt the whole session).
+#
+# A single non-converging claim is BLOCKED with ``CLAIM_NOT_CONVERGING_MARKER``
+# and the orchestrate session CONTINUES to its next in-queue unit -- one bad
+# module no longer abandons the rest of a session's scope. This constant bounds
+# how many DISTINCT units may each hit the convergence bound in ONE session
+# before the session halts for operator attention, so a systemically-broken run
+# (e.g. an environment defect every unit hits) still stops fast instead of
+# blocking the entire backlog one unit at a time.
+#
+# Override via env ``DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS`` (int >= 1)
+# or YAML ``orchestrate.max_non_converging_claims``. Unset-safe: the constant is
+# the default when neither is set. Default 3: more than one defect is tolerated
+# in a sweep, but a session that cannot converge three distinct units is treated
+# as systemically broken.
+DEFAULT_MAX_NON_CONVERGING_CLAIMS: int = 3
+
 # TDI: in-process quota-resume cap.
 #
 # When ``quota_handling.on_exhaustion == "wait"`` and a quota wait recovers,

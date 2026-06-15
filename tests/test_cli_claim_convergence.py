@@ -147,6 +147,29 @@ class TestClaimConvergenceTrackerRepeatedFailure:
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         assert tracker.current_unit_id == "E1-F1-S1-T1"
 
+    def test_clear_current_claim_stops_retripping_blocked_unit(self) -> None:
+        # Block-and-continue: after a unit trips the bound and is blocked, the
+        # orchestrator clears the current claim so the SAME unit cannot re-trip
+        # the bound on every subsequent identical-failure message before the
+        # skill claims a new unit. ``observe`` must return None until note_claim.
+        tracker = ClaimConvergenceTracker(max_within_claim_attempts=2, max_claim_wall_clock_seconds=0)
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        first = None
+        for i in range(2):
+            first = tracker.observe(_verify_fail("E1-F1-S1-T1"), now=float(i))
+        assert first is not None, "the bound trips on the 2nd identical failure"
+        tracker.clear_current_claim()
+        assert tracker.current_unit_id is None
+        # Further identical failures for the just-blocked unit must NOT re-trip.
+        for i in range(5):
+            assert tracker.observe(_verify_fail("E1-F1-S1-T1"), now=float(10 + i)) is None
+        # A NEW claim resumes tracking normally.
+        tracker.note_claim("E1-F1-S1-T2", now=100.0)
+        again = None
+        for i in range(2):
+            again = tracker.observe(_verify_fail("E1-F1-S1-T2"), now=float(100 + i))
+        assert again is not None
+
 
 class TestClaimConvergenceTrackerWallClock:
     def test_wall_clock_backstop_trips(self) -> None:
@@ -207,7 +230,11 @@ class TestClaimedUnitId:
 
 
 class TestClassifyOrchestratorExit:
-    def test_claim_not_converging_routes_through_auto_restart(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def test_too_many_non_converging_routes_through_auto_restart(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        # Block-and-continue: a SINGLE non-converging claim no longer halts the
+        # session. Only the AGGREGATE valve -- K distinct non-converging units --
+        # produces a stop reason, and it routes through the normal auto-restart
+        # classification (so a restart picks up the remaining claimable units).
         from devbench import cli
 
         captured: dict[str, str] = {}
@@ -220,12 +247,31 @@ class TestClassifyOrchestratorExit:
         rc, reason = cli._classify_orchestrator_exit(
             fatal_error_code=None,
             continuation_exhausted=False,
-            claim_not_converging="verify-ac::E1-F1-S1-T1",
+            too_many_non_converging=3,
             sdk_result_text=None,
         )
         assert rc == 0
-        assert "claim not converging" in reason
-        assert "verify-ac::E1-F1-S1-T1" in captured["reason"]
+        assert "too many non-converging claims" in reason
+        assert "(3)" in reason
+        assert "(3)" in captured["reason"]
+
+    def test_single_non_converging_does_not_halt(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        # When the aggregate valve has NOT tripped (too_many_non_converging is 0)
+        # the exit is classified by the normal terminal-sentinel rules, NOT by a
+        # claim-not-converging stop reason. A session that blocked one unit and
+        # then reached NO_ACTIONABLE exits cleanly.
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "_check_auto_restart_and_notify", lambda reason: (0, reason))
+        rc, reason = cli._classify_orchestrator_exit(
+            fatal_error_code=None,
+            continuation_exhausted=False,
+            too_many_non_converging=0,
+            sdk_result_text="NO_ACTIONABLE -- 4/5 done, 1 blocked",
+        )
+        assert rc == 0
+        assert "too many non-converging" not in reason
+        assert reason.startswith("clean")
 
     def test_fatal_error_takes_precedence(self) -> None:
         from devbench import cli
@@ -234,7 +280,7 @@ class TestClassifyOrchestratorExit:
         rc, reason = cli._classify_orchestrator_exit(
             fatal_error_code="model_not_found",
             continuation_exhausted=True,
-            claim_not_converging="x",
+            too_many_non_converging=5,
             sdk_result_text=None,
         )
         assert rc == ORCHESTRATOR_FATAL_ERROR_EXIT_CODE
@@ -356,3 +402,36 @@ x
         monkeypatch.setattr(cli, "_find_unit", lambda _units, _uid: unit)
         monkeypatch.setattr(cli, "_resolve_unit_file", lambda _unit: None)
         cli._block_non_converging_claim("EX-F1-S1-T1", "verify-ac::EX-F1-S1-T1")
+
+
+class TestResolveMaxNonConvergingClaims:
+    """The aggregate safety-valve threshold K (env > YAML > constant default)."""
+
+    def test_defaults_to_constant_when_unset(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+        from devbench.constants import DEFAULT_MAX_NON_CONVERGING_CLAIMS
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", raising=False)
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "max_non_converging_claims", None)
+        assert cli._resolve_max_non_converging_claims() == DEFAULT_MAX_NON_CONVERGING_CLAIMS
+
+    def test_default_constant_is_sane(self) -> None:
+        from devbench.constants import DEFAULT_MAX_NON_CONVERGING_CLAIMS
+
+        # A sane operator-attention valve: more than one defect tolerated, but
+        # bounded so a systemically-broken run still halts.
+        assert DEFAULT_MAX_NON_CONVERGING_CLAIMS >= 2
+
+    def test_env_overrides_yaml_and_default(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "max_non_converging_claims", 7)
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "5")
+        assert cli._resolve_max_non_converging_claims() == 5
+
+    def test_yaml_overrides_default(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", raising=False)
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "max_non_converging_claims", 9)
+        assert cli._resolve_max_non_converging_claims() == 9

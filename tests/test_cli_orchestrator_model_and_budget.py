@@ -134,6 +134,23 @@ def _run_cmd_start(fake_sdk: Any, tmp_path: Path) -> int:
         return cli.cmd_start()
 
 
+def _run_cmd_start_capturing_reason(fake_sdk: Any, tmp_path: Path) -> tuple[int, list[str]]:
+    """Run cmd_start, returning ``(rc, captured_stop_reasons)``.
+
+    The always-fire ``_fire_orchestrator_stop_notification`` reason is captured
+    so the aggregate-valve stop reason can be asserted without a real Slack hop.
+    """
+    captured: list[str] = []
+    with (
+        patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
+        patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        patch("devbench.cli._fire_orchestrator_stop_notification", captured.append),
+    ):
+        rc = cli.cmd_start()
+    return rc, captured
+
+
 # ---------------------------------------------------------------------------
 # detect_fatal_sdk_error -- pure helper
 # ---------------------------------------------------------------------------
@@ -321,6 +338,105 @@ class TestWithinClaimConvergenceIntegration:
         _run_cmd_start(fake_sdk, tmp_path)
         assert not blocked, "a disabled convergence check must never block"
 
+    def test_block_and_continue_attempts_remaining_units(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Block-and-continue: a non-converging defect on unit 1 BLOCKS unit 1 but
+        # the session keeps working its remaining in-queue units (2..N) in the
+        # SAME session instead of halting the whole orchestrator.
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "3")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "3")
+
+        blocked: list[str] = []
+        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append(uid))
+
+        claims_seen: list[str] = []
+        real_claimed_unit_id = cli._claimed_unit_id
+
+        def _spy_claimed_unit_id(msg: Any) -> str | None:
+            uid = real_claimed_unit_id(msg)
+            if uid is not None:
+                claims_seen.append(uid)
+            return uid
+
+        monkeypatch.setattr(cli, "_claimed_unit_id", _spy_claimed_unit_id)
+
+        # Unit 1 repeats the same failure and trips the bound; unit 2 is then
+        # claimed and completes; ALL_DONE ends the session.
+        turns = [
+            [_claim_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_claim_block("E1-F1-S1-T2"), _FakeResultMsg(result="")],
+            [_FakeResultMsg(result="ALL_DONE")],
+        ]
+        fake_sdk = _make_scripted_fake_sdk(turns)
+        rc, reasons = _run_cmd_start_capturing_reason(fake_sdk, tmp_path)
+
+        assert blocked == ["E1-F1-S1-T1"], "exactly the non-converging unit is blocked"
+        assert "E1-F1-S1-T2" in claims_seen, "the session must keep claiming remaining units after a block"
+        # The session terminated on the clean ALL_DONE sentinel, NOT on a
+        # claim-not-converging stop reason.
+        assert reasons, "the always-fire stop notification must have a reason"
+        assert "too many non-converging" not in reasons[-1]
+        assert "claim not converging" not in reasons[-1]
+
+    def test_aggregate_valve_trips_after_k_distinct_units(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Safety valve: when K=2 DISTINCT units each hit the convergence bound in
+        # the same session, the session halts with the aggregate stop reason so a
+        # systemically-broken run still surfaces to the operator.
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "2")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "2")
+
+        blocked: list[str] = []
+        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append(uid))
+
+        # Unit 1 trips (2 identical failures), unit 2 trips (2 identical failures)
+        # -> the 2nd distinct non-converging unit trips the aggregate valve. The
+        # trailing ALL_DONE would only be reached on a non-halting code path.
+        turns = [
+            [_claim_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
+            [_claim_block("E1-F1-S1-T2"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T2"), _FakeResultMsg(result="")],
+            [_verify_block("E1-F1-S1-T2"), _FakeResultMsg(result="")],
+            [_FakeResultMsg(result="ALL_DONE")],
+        ]
+        fake_sdk = _make_scripted_fake_sdk(turns)
+        rc, reasons = _run_cmd_start_capturing_reason(fake_sdk, tmp_path)
+
+        assert blocked == ["E1-F1-S1-T1", "E1-F1-S1-T2"], "both distinct units are blocked before the valve trips"
+        assert reasons, "the always-fire stop notification must have a reason"
+        assert "too many non-converging claims" in reasons[-1]
+        assert "(2)" in reasons[-1]
+
+    def test_fully_non_actionable_scope_terminates_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A scope with nothing actionable left terminates on the NO_ACTIONABLE
+        # sentinel with no infinite loop and no aggregate-valve trip.
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "3")
+
+        blocked: list[str] = []
+        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append(uid))
+
+        turns = [[_FakeResultMsg(result="NO_ACTIONABLE -- 5/5 done, 0 blocked")]]
+        fake_sdk = _make_scripted_fake_sdk(turns)
+        rc, reasons = _run_cmd_start_capturing_reason(fake_sdk, tmp_path)
+
+        assert not blocked
+        assert reasons
+        assert "too many non-converging" not in reasons[-1]
+        assert reasons[-1].startswith("clean")
+
 
 # ---------------------------------------------------------------------------
 # config_loader: orchestrate.model parsing + validation
@@ -357,3 +473,16 @@ class TestOrchestrateModelConfig:
     def test_empty_string_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-empty"):
             self._load('orchestrate:\n  model: ""\n')
+
+    def test_max_non_converging_claims_none_when_absent(self) -> None:
+        assert self._load("orchestrate:\n  model: sonnet\n").orchestrate.max_non_converging_claims is None
+
+    def test_max_non_converging_claims_parsed_when_set(self) -> None:
+        rc = self._load("orchestrate:\n  model: sonnet\n  max_non_converging_claims: 5\n")
+        assert rc.orchestrate.max_non_converging_claims == 5
+
+    def test_max_non_converging_claims_below_one_rejected(self) -> None:
+        # The JSON-schema minimum (1) is the authoritative gate; the loader-level
+        # >= 1 check is a defense-in-depth backstop. Either way, 0 fails fast.
+        with pytest.raises(ValueError, match=r"max_non_converging_claims"):
+            self._load("orchestrate:\n  model: sonnet\n  max_non_converging_claims: 0\n")

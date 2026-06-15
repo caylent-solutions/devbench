@@ -470,6 +470,58 @@ $ devbench set-status E1-F2-S3-T9 in-queue
 ```
 
 
+## `[CLAIM_NOT_CONVERGING]` -- non-converging claim (block-and-continue)
+
+**What it is.**
+A unit force-blocked by the within-claim convergence bound. A single in-progress
+claim that repeats the SAME unresolvable AC-verify / TDD-RED / live-test signature
+beyond `orchestrate.max_within_claim_attempts` (or exceeds the
+`orchestrate.max_claim_wall_clock_seconds` backstop) -- while staying "busy" so
+the inactivity budget keeps resetting -- is set to `blocked` with a
+`[CLAIM_NOT_CONVERGING]` audit comment naming the recurring failure. The bound
+keys on the REPEATED IDENTICAL signature, never raw duration, so a
+genuinely-progressing long live run is never killed. See the
+[orchestrate config keys](devbench-yaml-reference.md#within-claim-convergence-bound--block-and-continue)
+for the four tuning knobs.
+
+**Which bucket.**
+A `[CLAIM_NOT_CONVERGING]` block carries no marker and no pending dependency, so
+`classify_blocked_task` places it in `OPERATOR_ACTION_REQUIRED` (above): the
+failure cannot be resolved in scope -- e.g. a vendored / target-repo defect a
+verification-only unit cannot fix -- so an operator must inspect it and either fix
+the root cause, decline the unit, or record a `tracked-devbench-issues/*.md`.
+
+**Block-and-continue (orchestrator-loop behaviour).**
+Blocking a non-converging claim does NOT stop the session. The orchestrate session
+**continues to its next in-queue unit in scope**, so one bad module no longer
+abandons the rest of a session's scope and a multi-session sweep no longer loses a
+whole session to its first defective module. The session keeps accumulating both
+completions and blocks in one pass and stops only when there is genuinely nothing
+actionable left (`NO_ACTIONABLE` / `ALL_DONE`).
+
+**Aggregate safety valve.**
+So a systemically-broken run still halts for the operator, the session stops once
+`orchestrate.max_non_converging_claims` (K, default 3) **distinct units** have each
+hit the convergence bound in the same session. The orchestrator log then carries
+`[ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K)`, and the
+`orchestrator_stop` notification classifies it as a `crash`-class stop (operator
+mention). Each individually-blocked unit still awaits operator review in the
+`OPERATOR_ACTION_REQUIRED` bucket regardless of whether the valve tripped.
+
+**Operator commands.**
+
+```bash
+# Inspect the recurring failure named in the audit comment:
+devbench show <task-id>
+
+# After fixing the root cause (or confirming it is environmental), requeue:
+devbench set-status <task-id> in-queue
+
+# Or decline a unit that can never converge in this backlog:
+devbench decline <task-id> --reason "<rationale>"
+```
+
+
 ## Recovery-Signal Heuristic Contract
 
 When `classify_blocked_task` reaches priority 5

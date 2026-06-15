@@ -191,7 +191,9 @@ Every `orchestrator_stop` notification carries a **reason** string and a derived
 | `drain` | Reason starts with `"drain"` | none |
 | `operator-interrupt` | Reason starts with `"interrupted by operator"` | `<!here>` |
 | `quota-exhausted` | Reason starts with `"quota"` | `<!here>` |
-| `crash` | Any other reason (e.g. `"crash: RuntimeError: ..."`) | `<!here>` |
+| `crash` | Any other reason (e.g. `"crash: RuntimeError: ..."`, `"too many non-converging claims (K)"`, `"continuation budget exhausted"`) | `<!here>` |
+
+> **Block-and-continue.** A single non-converging claim (the within-claim convergence bound) is BLOCKED and the session **continues** to its next in-queue unit -- it does not emit a stop reason. Only the *aggregate* safety valve produces a stop: when K distinct units (`orchestrate.max_non_converging_claims`, default 3) each hit the bound in one session, the orchestrator stops with `too many non-converging claims (K)`, which classifies as `crash` (operator attention). See [block-types.md](block-types.md#claim_not_converging----non-converging-claim-block-and-continue).
 
 ### Configurable mention mapping
 

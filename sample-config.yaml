@@ -301,6 +301,15 @@ orchestrate:
   # Default 21600 (6h); 0 disables the backstop (the signature bound still
   # applies). Override via DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS.
   max_claim_wall_clock_seconds: 21600
+  # Aggregate safety valve for block-and-continue. A single non-converging claim
+  # is BLOCKED (above) and the session CONTINUES to its next in-queue unit -- one
+  # bad module no longer abandons the rest of a session's scope. This caps how
+  # many DISTINCT units may each trip the convergence bound in ONE session before
+  # the session halts for operator attention with
+  # `[ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K)`.
+  # Default 3 (must be >= 1). Override via
+  # DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS.
+  max_non_converging_claims: 3
 
 # ---------------------------------------------------------------------------
 # Report / cost estimation

@@ -257,13 +257,32 @@ hook_tail:
 
 ```yaml
 orchestrate:
-  max_cascade_depth: 2       # recovery-of-recovery cascade depth cap
-  model: claude-opus-4-8     # REQUIRED to launch the orchestrator; see below
+  max_cascade_depth: 2                 # recovery-of-recovery cascade depth cap
+  model: claude-opus-4-8               # REQUIRED to launch the orchestrator; see below
+  within_claim_convergence_check: true # block a claim that repeats the SAME failure
+  max_within_claim_attempts: 4         # identical-failure recurrences before a block
+  max_claim_wall_clock_seconds: 21600  # 6h backstop; 0 disables
+  max_non_converging_claims: 3         # aggregate block-and-continue safety valve
 ```
 
 **`model`** is the model the top-level orchestrate SDK session runs on when devbench launches it non-interactively (`devbench start` / `--daemon`). devbench passes it into `ClaudeAgentOptions(model=...)`, so the session is **pinned** to this value and can never inherit the interactive Claude Code (`~/.claude/settings.json`) model. It is **required** for `devbench start` and has **no fallback** (not to `DEVBENCH_CLAUDE_MODEL`, not to the CLI settings) -- the orchestrator-launch path fails fast with an actionable error when it is unset. Short name (`opus` | `sonnet`) or a full Anthropic id when `use_bedrock: false`; a Bedrock ARN when `true`. Haiku is rejected (#198).
 
 Interactive vs non-interactive: this key governs ONLY the SDK-launched orchestrator. When an operator runs the `/devbench-orchestrate:orchestrate` slash command inside their own interactive Claude Code session, the skill runs on the **host session's selected model** -- devbench cannot and does not override the host session. (The work agents -- executor / judges / etc. -- get their model from each agent's plugin `.md` frontmatter, overridable via the `agents:` block.)
+
+### Within-claim convergence bound + block-and-continue
+
+A single in-progress claim that repeats the SAME unresolvable AC-verify / TDD-RED / live-test signature -- while staying "busy" so the inactivity budget keeps resetting -- is force-**BLOCKED** with a `[CLAIM_NOT_CONVERGING]` audit comment rather than churning for hours. The bound keys on the REPEATED IDENTICAL signature (never raw duration), so a genuinely-progressing long live run (a different signal each round) is never killed.
+
+| Key | Env override | Default | Meaning |
+|---|---|---|---|
+| `within_claim_convergence_check` | `DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK` | `true` | Master toggle for the bound. |
+| `max_within_claim_attempts` | `DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS` | `4` | How many times the SAME failing signature may recur within one claim before it is blocked (>= 1). |
+| `max_claim_wall_clock_seconds` | `DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS` | `21600` | Secondary wall-clock backstop in seconds (>= 0; `0` disables it, the signature bound still applies). |
+| `max_non_converging_claims` | `DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS` | `3` | Aggregate block-and-continue safety valve K (>= 1). See below. |
+
+**Block-and-continue.** A non-converging claim is BLOCKED and the orchestrate session **continues to its next in-queue unit in scope** -- one bad module no longer abandons the rest of a session's scope, and a multi-session sweep no longer loses a whole session to its first defective module. The session keeps accumulating both completions and blocks in one pass and only stops when there is genuinely nothing actionable left (the normal `NO_ACTIONABLE` / `ALL_DONE` termination).
+
+`max_non_converging_claims` is the aggregate safety valve so a systemically-broken run still halts for the operator: the session stops once **K distinct units** have each hit the convergence bound in the same session, emitting `[ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K)`. (Resolution order for all four keys is env > YAML > the `constants.py` default.)
 
 ---
 

@@ -356,6 +356,11 @@
           "type": "number",
           "minimum": 0,
           "description": "Secondary wall-clock backstop for a single claim, in seconds, for the within_claim_convergence_check bound. Set well above the observed-legit maximum (e.g. a 3.5h live firehose apply) so it only fires on an implausibly long stuck claim with no repeated-identical signature. Default 21600 (6h). 0 disables the backstop (the repeated-signature bound still applies). Override via DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS."
+        },
+        "max_non_converging_claims": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Aggregate safety valve for block-and-continue. A single non-converging claim is BLOCKED (within_claim_convergence_check) and the orchestrate session CONTINUES to its next in-queue unit -- one bad module no longer abandons the rest of a session's scope. This caps how many DISTINCT units may each trip the convergence bound in ONE session before the session halts for operator attention with [ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K). Default 3. Override via DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS."
         }
       }
     },

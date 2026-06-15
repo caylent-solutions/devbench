@@ -183,6 +183,7 @@ from devbench.constants import (
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
     DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS,
+    DEFAULT_MAX_NON_CONVERGING_CLAIMS,
     DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
@@ -7548,6 +7549,22 @@ class ClaimConvergenceTracker:
         self._claim_started_at = now
         self._signature_counts = {}
 
+    def clear_current_claim(self) -> None:
+        """Stop tracking the current claim after it has been force-blocked.
+
+        Block-and-continue: once a non-converging unit is BLOCKED the
+        orchestrator continues to the next in-queue unit rather than halting.
+        Clearing the current claim ensures the just-blocked unit cannot
+        re-trip the bound on every subsequent identical-failure message that
+        may still arrive before the skill claims the next unit (which would
+        otherwise inflate the aggregate-valve count for the SAME unit and
+        re-issue redundant force-blocks). ``observe`` returns ``None`` until
+        the next :meth:`note_claim`.
+        """
+        self.current_unit_id = None
+        self._claim_started_at = None
+        self._signature_counts = {}
+
     def observe(self, message: object, *, now: float) -> str | None:
         """Fold *message* into the bound; return the recurring failure when tripped.
 
@@ -8000,6 +8017,24 @@ _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX: str = "[ORCHESTRATOR_STOP_REASON] reason
 #: equals the legacy bare ``"clean"`` token.
 _STOP_REASON_PREMATURE_TURN_END: str = "premature-turn-end"
 
+#: Block-and-continue (TDI): stop-reason prefix emitted when the aggregate
+#: non-converging-claims safety valve trips -- K distinct units each hit the
+#: within-claim convergence bound in ONE session, signalling a systemically
+#: broken run that needs operator attention. A single non-converging claim is
+#: BLOCKED and the session continues; only this aggregate valve halts it. Routed
+#: to STOP_CLASS_CRASH (operator mention) by ``classify_stop_class``.
+_STOP_REASON_TOO_MANY_NON_CONVERGING: str = "too many non-converging claims"
+
+
+def _too_many_non_converging_reason(count: int) -> str:
+    """Build the aggregate non-converging-claims stop reason ``too many non-converging claims (K)``.
+
+    Single-sourced so the ``_run`` audit line and the
+    :func:`_classify_orchestrator_exit` stop reason never drift.
+    """
+    return f"{_STOP_REASON_TOO_MANY_NON_CONVERGING} ({count})"
+
+
 #: Issue #262 (E10-F1-S2): verbatim continuation prompt sent to the same
 #: ClaudeSDKClient session when a non-terminal ResultMessage is observed.
 #: Must not contain an em-dash (U+2014) per code standards; uses -- (double
@@ -8062,7 +8097,7 @@ def _classify_orchestrator_exit(
     *,
     fatal_error_code: str | None,
     continuation_exhausted: bool,
-    claim_not_converging: str | None,
+    too_many_non_converging: int,
     sdk_result_text: str | None,
 ) -> tuple[int, str]:
     """Map a normal (non-exception) SDK-loop exit to ``(restart_rc, stop_reason)``.
@@ -8076,20 +8111,24 @@ def _classify_orchestrator_exit(
        same error). Operator must fix the model.
     2. ``continuation_exhausted`` -- the turn-end continuation budget tripped:
        exit with the distinct continuations-exhausted code.
-    3. ``claim_not_converging`` set -- the within-claim convergence bound tripped
-       and the in-flight unit was force-blocked with ``[CLAIM_NOT_CONVERGING]``.
-       The blocked unit awaits operator review; remaining units are unaffected,
-       so the normal auto-restart classification applies (a restart picks up the
-       next claimable unit rather than re-churning the blocked one).
+    3. ``too_many_non_converging`` > 0 -- the AGGREGATE non-converging-claims
+       safety valve tripped: that many DISTINCT units each hit the within-claim
+       convergence bound in this session (block-and-continue did NOT halt on any
+       single one). The session stops for operator attention with the
+       ``too many non-converging claims (K)`` reason. The blocked units await
+       operator review; a restart picks up the next claimable units, so the
+       normal auto-restart classification applies.
     4. Otherwise -- classify the normal exit reason and run the auto-restart
-       check.
+       check. A session that blocked one or two non-converging units and then
+       drained its scope reaches this branch and exits cleanly (block-and-
+       continue): a single non-converging claim never produces a stop reason.
     """
     if fatal_error_code is not None:
         return ORCHESTRATOR_FATAL_ERROR_EXIT_CODE, f"fatal SDK error: {fatal_error_code}"
     if continuation_exhausted:
         return ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, "continuation budget exhausted"
-    if claim_not_converging is not None:
-        return _check_auto_restart_and_notify(f"claim not converging: {claim_not_converging}")
+    if too_many_non_converging > 0:
+        return _check_auto_restart_and_notify(_too_many_non_converging_reason(too_many_non_converging))
     return _check_auto_restart_and_notify(_classify_normal_exit_reason(sdk_result_text))
 
 
@@ -8260,6 +8299,26 @@ def _resolve_max_claim_wall_clock_seconds() -> float:
     if yaml_value is not None:
         return yaml_value
     return DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS
+
+
+def _resolve_max_non_converging_claims() -> int:
+    """Return the aggregate non-converging-claims valve threshold (env > YAML > default).
+
+    Block-and-continue: a single non-converging claim is BLOCKED and the session
+    continues. Once this many DISTINCT units have each tripped the within-claim
+    convergence bound in ONE session, the session halts for operator attention.
+    Reads ``DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS`` (int), then YAML
+    ``orchestrate.max_non_converging_claims``, falling through to
+    :data:`~devbench.constants.DEFAULT_MAX_NON_CONVERGING_CLAIMS` so the caller is
+    never left without a bound (no hard-coded magic number).
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "").strip()
+    if raw:
+        return int(raw)
+    yaml_value = RUNTIME_CONFIG.orchestrate.max_non_converging_claims
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_MAX_NON_CONVERGING_CLAIMS
 
 
 def _resolve_max_quota_resumes() -> int:
@@ -9103,9 +9162,25 @@ def cmd_start(*argv: str) -> int:
     # fatal-error exit code instead of looping. ``None`` when no fatal error.
     _fatal_error_code: str | None = None
 
-    # Set by ``_run`` when the within-claim convergence bound trips so the outer
-    # handler records the right stop reason. ``None`` when the bound never trips.
-    _claim_not_converging: str | None = None
+    # Block-and-continue (TDI): the within-claim convergence bound BLOCKS a
+    # non-converging unit and the orchestrate session CONTINUES to its next
+    # in-queue unit rather than halting -- one bad module no longer abandons the
+    # rest of a session's scope. ``_non_converging_unit_ids`` accumulates the
+    # DISTINCT units that tripped the bound across the WHOLE session (it survives
+    # quota-resume re-invocations of ``_run`` because it lives in this closure).
+    # When its size reaches the aggregate valve threshold K
+    # (:func:`_resolve_max_non_converging_claims`), ``_run`` stops the session and
+    # the outer handler emits the ``too many non-converging claims (K)`` stop
+    # reason for operator attention.
+    _non_converging_unit_ids: set[str] = set()
+    _max_non_converging_claims = _resolve_max_non_converging_claims()
+
+    # Set by ``_run`` when the aggregate non-converging-claims valve trips (K
+    # distinct units blocked in one session) so the outer handler records the
+    # ``too many non-converging claims (K)`` stop reason. ``False`` when the
+    # session drained its scope without tripping the valve (block-and-continue
+    # ran to a normal NO_ACTIONABLE / ALL_DONE exit).
+    _too_many_non_converging: bool = False
 
     async def _run() -> None:
         """Drive a stateful ClaudeSDKClient session with drain enforcement.
@@ -9151,7 +9226,7 @@ def cmd_start(*argv: str) -> int:
                 tool-use is observed.
             _QuotaDetected: A quota error is detected in the SDK message stream.
         """
-        nonlocal _sdk_result_text, _continuation_exhausted, _fatal_error_code, _claim_not_converging
+        nonlocal _sdk_result_text, _continuation_exhausted, _fatal_error_code, _too_many_non_converging
         # Pin the orchestrate session to the devbench.yaml-configured model
         # (resolved + fail-fast-checked in cmd_start). Passing model= here is
         # what prevents the session from inheriting the interactive Claude Code
@@ -9174,15 +9249,23 @@ def cmd_start(*argv: str) -> int:
         )
 
         def _check_convergence(msg: object) -> bool:
-            """Fold *msg* into the convergence tracker; block + return True when it trips.
+            """Fold *msg* into the convergence tracker; block-and-continue, halt only at the valve.
 
             Notes a new claim, then observes the message for a repeated failure
-            signature. When the bound trips, force-blocks the in-flight unit
-            with the ``[CLAIM_NOT_CONVERGING]`` marker and records the stop
-            reason. Returns True to signal ``_run`` to exit. A no-op (returns
-            False) when the bound is disabled.
+            signature. When the bound trips, force-blocks the in-flight unit with
+            the ``[CLAIM_NOT_CONVERGING]`` marker (as before) and records the unit
+            in the session-wide ``_non_converging_unit_ids`` set.
+
+            Block-and-continue: the just-blocked claim is then CLEARED from the
+            tracker and the function returns ``False`` so ``_run`` keeps driving
+            the SAME session on to its next in-queue unit -- one bad module no
+            longer abandons the rest of the scope. Only when the number of
+            DISTINCT non-converging units reaches the aggregate valve threshold K
+            does the function set ``_too_many_non_converging`` and return ``True``
+            to stop the session for operator attention. A no-op (returns False)
+            when the bound is disabled.
             """
-            nonlocal _claim_not_converging
+            nonlocal _too_many_non_converging
             if not _convergence_enabled:
                 return False
             now = time.monotonic()
@@ -9190,10 +9273,26 @@ def cmd_start(*argv: str) -> int:
             if claimed is not None:
                 _convergence_tracker.note_claim(claimed, now=now)
             recurring = _convergence_tracker.observe(msg, now=now)
-            if recurring is not None and _convergence_tracker.current_unit_id is not None:
-                _block_non_converging_claim(_convergence_tracker.current_unit_id, recurring)
-                _claim_not_converging = recurring
+            if recurring is None or _convergence_tracker.current_unit_id is None:
+                return False
+            unit_id = _convergence_tracker.current_unit_id
+            _block_non_converging_claim(unit_id, recurring)
+            _non_converging_unit_ids.add(unit_id)
+            # Clear the just-blocked claim so its lingering identical-failure
+            # messages cannot re-trip the bound for the SAME unit before the skill
+            # claims the next one (which would double-count it / re-block it).
+            _convergence_tracker.clear_current_claim()
+            if len(_non_converging_unit_ids) >= _max_non_converging_claims:
+                _too_many_non_converging = True
+                logger.warning(
+                    "%s%s -- %d distinct units could not converge in this session: %s",
+                    _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX,
+                    _too_many_non_converging_reason(len(_non_converging_unit_ids)),
+                    len(_non_converging_unit_ids),
+                    ", ".join(sorted(_non_converging_unit_ids)),
+                )
                 return True
+            # Block-and-continue: keep working the session's remaining units.
             return False
 
         async with ClaudeSDKClient(options=options) as client:
@@ -9250,11 +9349,14 @@ def cmd_start(*argv: str) -> int:
                         # no-progress / empty-turn loop (a fatal error exits earlier).
                         if _is_genuine_progress(message):
                             stall_count = 0
-                        # Within-claim convergence bound: a claim that repeats
-                        # the SAME unresolvable failure beyond the configured cap
-                        # (or exceeds the wall-clock backstop) is force-blocked
-                        # with [CLAIM_NOT_CONVERGING] and the loop exits, routing
-                        # the unit to the operator/stop-window path.
+                        # Within-claim convergence bound (block-and-continue): a
+                        # claim that repeats the SAME unresolvable failure beyond
+                        # the configured cap (or exceeds the wall-clock backstop)
+                        # is force-blocked with [CLAIM_NOT_CONVERGING] and the
+                        # session CONTINUES to its next in-queue unit. Only when
+                        # the aggregate valve trips (K distinct non-converging
+                        # units in one session) does _check_convergence return
+                        # True and the loop exit for operator attention.
                         if _check_convergence(message):
                             return
                         # Per-message quota detection (#236) + drain-on-claim
@@ -9336,7 +9438,7 @@ def cmd_start(*argv: str) -> int:
         restart_rc, _stop_reason = _classify_orchestrator_exit(
             fatal_error_code=_fatal_error_code,
             continuation_exhausted=_continuation_exhausted,
-            claim_not_converging=_claim_not_converging,
+            too_many_non_converging=(len(_non_converging_unit_ids) if _too_many_non_converging else 0),
             sdk_result_text=_sdk_result_text,
         )
         return restart_rc

@@ -646,6 +646,14 @@ class OrchestrateConfig:
     resolved by ``config.py`` (env > YAML > default). The bound keys on the
     REPEATED IDENTICAL signature, never raw duration, so a genuinely-progressing
     long live run is not killed.
+
+    ``max_non_converging_claims`` is the aggregate safety valve for
+    block-and-continue: a single non-converging claim is BLOCKED and the session
+    CONTINUES to its next in-queue unit, but once this many DISTINCT units have
+    each tripped the convergence bound in ONE session the session halts for
+    operator attention (``[ORCHESTRATOR_STOP_REASON] reason=too many
+    non-converging claims (K)``). ``None`` falls through to the constants.py
+    default (3) resolved by ``config.py`` (env > YAML > default).
     """
 
     max_cascade_depth: int | None = None
@@ -654,6 +662,7 @@ class OrchestrateConfig:
     within_claim_convergence_check: bool | None = None
     max_within_claim_attempts: int | None = None
     max_claim_wall_clock_seconds: float | None = None
+    max_non_converging_claims: int | None = None
 
 
 def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bool) -> OrchestrateConfig:
@@ -704,6 +713,14 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
             f"Config file '{path}': orchestrate.max_claim_wall_clock_seconds must be >= 0 "
             f"(0 disables the backstop); got {max_claim_wall_clock_seconds!r}."
         )
+    max_non_converging_claims = (
+        int(orchestrate_raw["max_non_converging_claims"]) if "max_non_converging_claims" in orchestrate_raw else None
+    )
+    if max_non_converging_claims is not None and max_non_converging_claims < 1:
+        raise ValueError(
+            f"Config file '{path}': orchestrate.max_non_converging_claims must be >= 1; "
+            f"got {max_non_converging_claims!r}."
+        )
     return OrchestrateConfig(
         max_cascade_depth=max_cascade_depth,
         model=model,
@@ -711,6 +728,7 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
         within_claim_convergence_check=within_claim_convergence_check,
         max_within_claim_attempts=max_within_claim_attempts,
         max_claim_wall_clock_seconds=max_claim_wall_clock_seconds,
+        max_non_converging_claims=max_non_converging_claims,
     )
 
 

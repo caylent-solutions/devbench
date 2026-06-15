@@ -65,11 +65,14 @@ class TestSuperviseSubverbDispatch:
         assert "frobnicate" in err
         assert "start" in err  # usage lists the valid sub-verbs
 
-    @pytest.mark.parametrize("sub", list(SUPERVISE_SUBVERBS))
-    def test_each_subverb_is_routed(self, sub: str) -> None:
-        # Each known sub-verb must be routed (NOT treated as "unknown").
-        # Phase 1 bodies fail fast with NotImplementedError for the unbuilt
-        # ones; the dispatcher must surface that, not the unknown-sub-verb path.
+    # The sub-verbs whose bodies are NOT yet implemented (Phase 2 implements
+    # start/__run/attach; stop/restart/status/info still fail fast).
+    _UNIMPLEMENTED_SUBVERBS = ("stop", "restart", "status", "info")
+
+    @pytest.mark.parametrize("sub", list(_UNIMPLEMENTED_SUBVERBS))
+    def test_unimplemented_subverb_is_routed(self, sub: str) -> None:
+        # Each not-yet-built sub-verb must be routed (NOT treated as "unknown")
+        # and fail fast with NotImplementedError (never a silent success).
         with pytest.raises(NotImplementedError):
             cli._dispatch_supervise_subverb(sub, [])
 
@@ -144,16 +147,16 @@ class TestSuperviseArgParsing:
 
 @pytest.mark.unit
 class TestSuperviseSubverbStubsFailFast:
-    """The not-yet-built sub-verb bodies fail fast (no silent success)."""
+    """The not-yet-built sub-verb bodies fail fast (no silent success).
 
-    @pytest.mark.parametrize("sub", ["start", "stop", "restart", "status", "info", "attach"])
+    Phase 2 implements ``start``/``__run``/``attach``; ``stop``/``restart``/
+    ``status``/``info`` land later and still fail fast until then.
+    """
+
+    @pytest.mark.parametrize("sub", ["stop", "restart", "status", "info"])
     def test_subverb_body_not_implemented(self, sub: str) -> None:
         with pytest.raises(NotImplementedError):
             cli._dispatch_supervise_subverb(sub, [])
-
-    def test_internal_run_subverb_not_implemented(self) -> None:
-        with pytest.raises(NotImplementedError):
-            cli._dispatch_supervise_subverb("__run", ["--name", "x"])
 
     def test_invalid_name_through_dispatch_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
         # A bad --name is caught before any body runs and surfaces as exit 2.
@@ -167,8 +170,8 @@ class TestSuperviseSubverbStubsFailFast:
         assert rc == 2
         assert "unknown flag" in capsys.readouterr().err
 
-    def test_valid_subverb_and_name_reaches_body(self) -> None:
-        # A valid sub-verb + valid name passes validation and reaches the body,
-        # which (Phase 1) fails fast with NotImplementedError through cmd_supervise.
-        with pytest.raises(NotImplementedError):
-            cli.cmd_supervise("start", "--name", "nightly")
+    def test_attach_screen_gated_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # Phase 2: attach --screen is fail-fast-disabled (AC-33) until DI-4.
+        rc = cli.cmd_supervise("attach", "--name", "nightly", "--screen")
+        assert rc == 2
+        assert "--screen attach is not enabled" in capsys.readouterr().err

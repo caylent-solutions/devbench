@@ -113,6 +113,11 @@ ignore = [
 # cli.py pre-parses --config before devbench imports so config.py loads the
 # correct YAML at import time; E402 is intentional here.
 "src/devbench/cli.py" = ["E402"]
+# stub-claude.py is an executable CLI fixture (the fake `claude` the supervise
+# functional layer drives, spec Section 10.0 / AC-13), NOT an importable module;
+# the hyphenated name mirrors the real `claude` binary, so N999 (invalid module
+# name) does not apply.
+"tests/fixtures/supervise/stub-claude.py" = ["N999"]
 
 [tool.ruff.format]
 quote-style = "double"

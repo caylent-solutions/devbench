@@ -75,6 +75,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, NamedTuple
 
+import pexpect
+
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
 # between frames. The fallback escape sequence ``\033c`` is the VT100 RIS
@@ -154,11 +156,13 @@ from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
     BLOCKED_RECOVERY_WINDOW_SECONDS,
+    CLAUDE_CREDENTIALS_FILE,
     MAX_CASCADE_DEPTH,
     ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
+    USE_BEDROCK,
     WORKSPACE_ROOT,
     _read_env,
     resolve_repo,
@@ -223,6 +227,10 @@ from devbench.constants import (
     SUPERVISE_DEFAULT_NAME,
     SUPERVISE_INTERNAL_RUN_SUBVERB,
     SUPERVISE_SESSION_NAME_PATTERN,
+    SUPERVISE_STATE_COMPLETED_CLEAN,
+    SUPERVISE_STATE_FAULTED,
+    SUPERVISE_STATE_RUNNING,
+    SUPERVISE_STATE_STOPPED,
     SUPERVISE_SUBVERBS,
     VALID_TDD_PHASES,
 )
@@ -260,6 +268,25 @@ from devbench.scope import (
     session_scope_file_path,
 )
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
+from devbench.supervise import (
+    AuthVerifier,
+    DetectionPatterns,
+    EnvSanitizer,
+    PtyDriver,
+    PtyLogWriter,
+    SuperviseError,
+    SuperviseReadyTimeoutError,
+    SuperviseRegistry,
+    build_claude_launch_argv,
+    new_session_state,
+    require_claude,
+    resolve_supervise_effort,
+    resolve_supervise_model,
+    run_supervised_kickoff,
+    screen_session_name,
+    supervise_pty_log_path,
+    write_session_scope,
+)
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
@@ -9615,26 +9642,376 @@ def _parse_supervise_args(args: list[str]) -> _SuperviseArgs:
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 wiring seams. These thin module-level functions isolate the
+# config/credentials/backlog dependencies the supervise bodies need so the tests
+# can inject deterministic values without a live config or a real backlog. They
+# read the SAME single sources of truth the rest of the CLI uses (no duplication).
+# ---------------------------------------------------------------------------
+
+#: The subscription credentials file the AuthVerifier checks (Section 3.6.1). A
+#: module-level alias so tests point it at a fixture without touching config.py.
+SUPERVISE_CREDENTIALS_FILE: Path = CLAUDE_CREDENTIALS_FILE
+
+
+def _supervise_runtime_config():
+    """Return the ``supervise`` config block (single source of truth)."""
+    return RUNTIME_CONFIG.supervise
+
+
+def _supervise_use_bedrock() -> bool:
+    """Return the resolved ``use_bedrock`` flag for model-format validation."""
+    return USE_BEDROCK
+
+
+def _supervise_backlog_ids() -> list[str]:
+    """Return every work-unit ID from the parsed backlog (for scope expansion)."""
+    units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
+    return [u.id for u in units]
+
+
+def _supervise_launch_screen(
+    *,
+    name: str,
+    screen_name: str,
+    env: dict[str, str],
+    run_argv: list[str],
+    screen_path: str,
+) -> int:
+    """Create the detached ``screen`` running the ``__run`` supervisor (FR-6).
+
+    ``screen -dmS <screen_name> <run_argv...>`` starts the in-screen supervisor
+    in the foreground of the detached session with the minimized *env*. Returns
+    the launched ``screen`` PID. The ``__run`` program writes the registry
+    ``running`` record once it reaches the running state (Section 4.1 step 4).
+
+    Args:
+        name: The supervise session name (for the error message).
+        screen_name: The ``screen`` session name (``<prefix><name>``).
+        env: The minimized session environment from :class:`EnvSanitizer`.
+        run_argv: The ``devbench supervise __run --name <name> ...`` argv.
+        screen_path: The resolved ``screen`` executable path.
+
+    Returns:
+        The PID of the spawned ``screen`` process.
+
+    Raises:
+        SuperviseError: ``screen -dmS`` exited non-zero (fail-fast, FR-30).
+    """
+    cmd = [screen_path, "-dmS", screen_name, *run_argv]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SuperviseError(
+            f"failed to create screen for supervise session {name!r}: "
+            f"'{' '.join(cmd)}' exited {result.returncode}: {result.stderr.strip()}"
+        )
+    return result.returncode
+
+
+def _record_tool_version(path: str, version_flag: str = "--version") -> str | None:
+    """Return ``<tool> <version_flag>`` output (first line) for the registry (FR-25).
+
+    Never raises: a tool that does not support the flag yields ``None`` so the
+    audit record degrades gracefully rather than blocking launch on a version
+    probe (the path itself is the load-bearing audit value).
+    """
+    try:
+        result = subprocess.run([path, version_flag], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or result.stderr).strip().splitlines()
+    return out[0] if out else None
+
+
+def _supervise_preflight(parsed: _SuperviseArgs) -> tuple[str, str, str, str] | int:
+    """Run the ``start`` preflight (Section 4.1 step 1); return resolved values or rc.
+
+    Returns ``(claude_path, screen_path, model, effort)`` on success, or an int
+    exit code (2) when a fail-fast preflight check tripped (the message is
+    already on stderr).
+    """
+    screen_path = shutil.which("screen")
+    if screen_path is None:
+        print(
+            "ERROR: 'screen' is not installed. Install it "
+            "(devcontainer: 'apt-get install -y screen'; macOS: 'brew install screen') and retry.",
+            file=sys.stderr,
+        )
+        return 2
+
+    verifier = AuthVerifier(credentials_file=SUPERVISE_CREDENTIALS_FILE)
+    try:
+        verifier.verify(source_env=dict(os.environ), euid=os.geteuid())
+    except SuperviseError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    cfg = _supervise_runtime_config()
+    try:
+        orchestrate_model = None
+        with contextlib.suppress(_OrchestratorModelUnsetError):
+            orchestrate_model = _resolve_orchestrator_model()
+        model = resolve_supervise_model(
+            cli_model=parsed.model,
+            supervise_model=cfg.model,
+            orchestrate_model=orchestrate_model,
+            use_bedrock=_supervise_use_bedrock(),
+        )
+        effort = resolve_supervise_effort(cli_effort=parsed.effort, supervise_effort=cfg.effort)
+    except (SuperviseError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        claude_path = require_claude(which=shutil.which)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    return claude_path, screen_path, model, effort
+
+
+# Registry states that mean a same-named session is no longer occupying the name
+# (a fresh ``start`` may reuse it). Anything else means "already running" (FR-2).
+_SUPERVISE_VACATED_STATES: frozenset[str] = frozenset(
+    {SUPERVISE_STATE_STOPPED, SUPERVISE_STATE_COMPLETED_CLEAN, SUPERVISE_STATE_FAULTED}
+)
+
+
+def _supervise_start_under_flock(
+    parsed: _SuperviseArgs,
+    *,
+    registry: SuperviseRegistry,
+    model: str,
+    screen_path: str,
+    cfg,
+) -> int:
+    """Run the flocked portion of ``start`` (Section 4.1 steps 2-5); return rc.
+
+    Holds ``flock_backlog`` while it checks for a same-named running session,
+    expands + persists the scope, arbitrates overlap against the SDK registry,
+    builds the minimized env, and launches the screen + ``__run``. Returns 0 when
+    the launch was issued, or a non-zero exit code on a fail-fast condition (the
+    message is already on stderr).
+    """
+    with flock_backlog(WORKSPACE_ROOT):
+        # A same-named session still occupying the name is a fail-fast error.
+        existing = registry.read_state(parsed.name)
+        if existing is not None and registry.is_alive(existing.pid) and existing.state not in _SUPERVISE_VACATED_STATES:
+            print(
+                f"ERROR: supervise session {parsed.name!r} already running (pid {existing.pid}); "
+                "use 'supervise restart' or a different --name.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Expand + persist the scope (Section 5.6, step 4a) BEFORE launch.
+        try:
+            scope_ids = write_session_scope(
+                workspace_root=WORKSPACE_ROOT,
+                session_name=parsed.name,
+                include=parsed.include,
+                exclude=parsed.exclude,
+                backlog_ids=_supervise_backlog_ids(),
+            )
+        except InvalidScopeError as exc:
+            print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
+            return 2
+
+        # Multi-session arbitration against the SDK SessionRegistry (FR-18).
+        if (overlap_rc := _check_scope_overlap(WORKSPACE_ROOT, scope_ids, parsed.allow_overlap)) is not None:
+            return overlap_rc
+
+        # Build the minimized screen env (Section 3.6.1, 5.6). The interactive
+        # billing model is the --model flag; DEVBENCH_CLAUDE_MODEL is the
+        # import-time model the in-session subprocesses need.
+        env = EnvSanitizer(extra_deny_vars=cfg.env.deny_vars).build(
+            source_env=dict(os.environ),
+            workspace_root=str(WORKSPACE_ROOT),
+            session_name=parsed.name,
+            import_model=model,
+        )
+        run_argv = [
+            "uv",
+            "run",
+            "devbench",
+            "supervise",
+            SUPERVISE_INTERNAL_RUN_SUBVERB,
+            "--name",
+            parsed.name,
+            "--model",
+            model,
+        ]
+        if parsed.effort:
+            run_argv += ["--effort", parsed.effort]
+
+        _supervise_launch_screen(
+            name=parsed.name,
+            screen_name=screen_session_name(parsed.name, prefix=cfg.screen_name_prefix),
+            env=env,
+            run_argv=run_argv,
+            screen_path=screen_path,
+        )
+    return 0
+
+
+def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
+    """``supervise start`` body: preflight -> scope -> screen+__run -> running (FR-3..8)."""
+    preflight = _supervise_preflight(parsed)
+    if isinstance(preflight, int):
+        return preflight
+    _claude_path, screen_path, model, _effort = preflight
+    cfg = _supervise_runtime_config()
+
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    try:
+        launch_rc = _supervise_start_under_flock(
+            parsed, registry=registry, model=model, screen_path=screen_path, cfg=cfg
+        )
+    except (TimeoutError, OSError, SuperviseError, ClaimRaceError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if launch_rc != 0:
+        return launch_rc
+
+    # Confirm __run reached state=running via the registry (Section 4.1 step 4).
+    state = registry.read_state(parsed.name)
+    if state is None or state.state == SUPERVISE_STATE_FAULTED:
+        reason = state.exit_reason if state is not None else "no registry record"
+        print(
+            f"ERROR: supervise session {parsed.name!r} failed to reach running ({reason}).",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"[supervise] state={state.state} pid={state.pid} screen={state.screen_name} "
+        f"claude-session={state.claude_session_id}",
+    )
+    return 0
+
+
+def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
+    """Hidden ``supervise __run`` body: the pexpect supervisor inside the screen (D-10).
+
+    Spawns the interactive ``claude`` child, drives launch -> ready -> kickoff ->
+    running (Section 4.1 steps 5-8), records the running state, and returns 0 once
+    the session is running. The full supervise event loop (quota/restart/drain)
+    lands in later phases; this phase establishes the running state.
+    """
+    cfg = _supervise_runtime_config()
+    try:
+        claude_path = require_claude(which=shutil.which)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    model = parsed.model or ""
+    effort = resolve_supervise_effort(cli_effort=parsed.effort, supervise_effort=cfg.effort)
+    plugin_dir = str(_resolve_plugin_path())
+    launch_argv = build_claude_launch_argv(
+        claude_path=claude_path,
+        model=model,
+        effort=effort,
+        plugin_dir=plugin_dir,
+    )
+
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    screen_name = screen_session_name(parsed.name, prefix=cfg.screen_name_prefix)
+    log_writer = PtyLogWriter(
+        path=supervise_pty_log_path(WORKSPACE_ROOT, parsed.name),
+        redact_patterns=cfg.logging.redact_patterns,
+    )
+    patterns = DetectionPatterns(cfg.detection_patterns)
+    child = pexpect.spawn(
+        launch_argv[0],
+        args=launch_argv[1:],
+        env=dict(os.environ),
+        encoding="utf-8",
+        timeout=cfg.timeouts.ready_prompt_seconds,
+    )
+    driver = PtyDriver(child=child, patterns=patterns, log_writer=log_writer)
+
+    state = new_session_state(
+        name=parsed.name,
+        pid=os.getpid(),
+        screen_name=screen_name,
+        model=model,
+        effort=effort,
+        started_by=getpass.getuser(),
+    )
+    state.claude_path = claude_path
+    state.claude_version = _record_tool_version(claude_path)
+    registry.write_state(state)
+
+    try:
+        run_supervised_kickoff(
+            driver=driver,
+            injectable_commands=cfg.injectable_commands,
+            ready_timeout_seconds=cfg.timeouts.ready_prompt_seconds,
+            command_ack_seconds=cfg.timeouts.command_ack_seconds,
+        )
+    except SuperviseReadyTimeoutError as exc:
+        state.state = SUPERVISE_STATE_FAULTED
+        state.exit_reason = "ready-prompt-timeout"
+        registry.write_state(state)
+        log_writer.close()
+        with contextlib.suppress(Exception):
+            child.terminate(force=True)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    state.state = SUPERVISE_STATE_RUNNING
+    state.last_activity = datetime.now(UTC)
+    registry.write_state(state)
+    log_writer.close()
+    return 0
+
+
+def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
+    """``supervise attach`` body: gate ``--screen`` (AC-33); read-only follow else.
+
+    The input-capable native ``screen -x`` path stays fail-fast-disabled until
+    DI-4 verifies its ACL blocks all input (Section 3.6.5, FR-26). The default
+    read-only PTY-log follow lands in Phase 4.
+    """
+    if parsed.screen:
+        print(
+            "ERROR: --screen attach is not enabled (input-blocking not yet verified; use read-only attach).",
+            file=sys.stderr,
+        )
+        return 2
+    raise NotImplementedError("supervise attach (read-only follow) lands in a later implementation phase.")
+
+
 def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
     """Route a validated supervise sub-verb to its body.
 
-    Phase 1 only validates the surface: every recognized sub-verb (the six
-    operator verbs plus the hidden internal ``__run``, D-10) is routed here and
-    its not-yet-built body raises :class:`NotImplementedError` (fail-fast, never
-    a silent success). The real bodies land in later phases per
-    ``IMPLEMENTATION-PLAN.md``.
+    Phase 2 implements ``start`` (the operator-facing launch pipeline) and the
+    hidden internal ``__run`` (the program ``screen`` runs, D-10), plus the
+    ``attach --screen`` fail-fast gate (AC-33). The ``stop``/``restart``/
+    ``status``/``info`` bodies and the read-only attach follow land in later
+    phases per ``IMPLEMENTATION-PLAN.md`` and still fail fast (never a silent
+    success) until then.
 
     Args:
         sub: The sub-verb token (already confirmed to be a known sub-verb).
         args: The remaining flag tokens.
 
     Returns:
-        The sub-verb's exit code (once implemented).
+        The sub-verb's exit code.
 
     Raises:
-        NotImplementedError: The sub-verb body is not yet implemented (Phase 1).
+        NotImplementedError: A sub-verb body not yet implemented (fail-fast).
     """
     parsed = _parse_supervise_args(args)
+    if sub == "start":
+        return _cmd_supervise_start(parsed)
+    if sub == SUPERVISE_INTERNAL_RUN_SUBVERB:
+        return _cmd_supervise_run(parsed)
+    if sub == "attach":
+        return _cmd_supervise_attach(parsed)
     raise NotImplementedError(
         f"supervise {sub!r} is not yet implemented (parsed name={parsed.name!r}); "
         "the body lands in a later implementation phase."

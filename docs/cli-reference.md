@@ -898,6 +898,79 @@ uv run devbench sessions --cleanup
 
 ---
 
+## Supervise (interactive subscription-billed orchestrator)
+
+`devbench supervise` launches the orchestrator as an interactive `claude` CLI session under a detached `screen` daemon driven by a `pexpect` supervisor, so the run is unattended, survives terminal detach, and bills against the Claude Code subscription's rolling 5-hour windows rather than the Anthropic API. It is a NEW, purely additive verb group; the `devbench start` SDK path is untouched. Full operator guide: [supervise.md](supervise.md). Design rationale: ADR-31 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md)).
+
+The dispatcher is `devbench supervise <sub-verb>`; an unknown sub-verb exits 2 with the usage listing the six sub-verbs.
+
+### `supervise start`
+
+```
+uv run devbench supervise start [--name N] [--include "<tokens>"] \
+    [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E]
+```
+
+Runs the preflight, writes the per-session `scope.json`, creates the `screen` (`devbench-supervise-<name>`), launches `claude --model <m> --effort <e> --dangerously-skip-permissions --plugin-dir <resolved>`, waits for the ready prompt, injects `/devbench-orchestrate:orchestrate`, and transitions the session to `running`.
+
+- `--name N` -- session name (default `default`); alphanumerics, `-`, `_` (rejects `..`).
+- `--include "<tokens>"` / `--exclude "<tokens>"` -- scope tokens (printer-pages syntax); empty include = the entire backlog.
+- `--allow-overlap` -- permit scope overlap with active sessions.
+- `--model M` -- model (`opus|sonnet|claude-opus-4-8|...`); resolves `--model` > `supervise.model` > `orchestrate.model`, fail-fast if all unset; `haiku` rejected.
+- `--effort E` -- `low|medium|high|xhigh|max` (default `supervise.effort`, `xhigh`).
+
+**Preflight (fail-fast, exit 2):** `screen` present, non-root, subscription auth present, NO `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` in env, model resolvable. Exit 0 only when the session reaches `state=running`.
+
+### `supervise stop`
+
+```
+uv run devbench supervise stop [--name N] [--hard]
+```
+
+Graceful (default): writes the per-session `drain.signal`, lets the in-flight work unit finish, captures the `claude` session id, sends the drain command, and quits the screen. `--hard`: terminates `claude` + screen immediately. Exit 0 on stop; exit 2 if no such session.
+
+### `supervise restart`
+
+```
+uv run devbench supervise restart [--name N]
+```
+
+Graceful `stop` then relaunch preserving context via `--continue` (or `--resume <id>` when a session id was captured). Bounded by `supervise.restart.max_attempts`. Exit 0 on relaunch; non-zero on relaunch failure.
+
+### `supervise status`
+
+```
+uv run devbench supervise status [--name N]
+```
+
+With `--name`: one session; without: all supervise sessions. Columns: `name`, `state` (`starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress`, `last-activity`, `screen`, `claude-session`, `billing-channel` (`subscription`), `exit-reason`; `quota-waiting` also shows `expected-resume` and `resumes-used`. Exit 0; exit 2 if `--name` unknown.
+
+### `supervise info`
+
+```
+uv run devbench supervise info
+```
+
+Joins `screen -ls` with the registry and lists every supervise screen with SCREEN, NAME, STATE, PID, CLAUDE-SESSION, BILLING, and the exact `supervise attach --name N` command. Exit 0.
+
+### `supervise attach`
+
+```
+uv run devbench supervise attach [--name N] [--screen]
+```
+
+Default: follow the redacted PTY transcript read-only (stdin is never wired to the child, so it cannot inject input or steal the PTY). Ctrl-C stops watching; the orchestration is untouched. `--screen` (input-capable `screen -x`) is gated off and fails fast (exit 2) until DI-4 verifies the write-removed ACL on the target `screen` build. Exit 0; exit 2 if no such session.
+
+**Exit codes (all supervise verbs):**
+
+| Scenario | rc |
+|----------|----|
+| `start` reaches `state=running`; `stop`/`restart`/`status`/`info`/`attach` succeed. | 0 |
+| Preflight/argument failure, unknown sub-verb, unknown `--name`, scope overlap without `--allow-overlap`, `--screen` while gated. | 2 |
+| Launch/runtime fault (crash, prompt-timeout, harness-self-edit block, restart/quota-resume cap exhausted). | non-zero classified code |
+
+---
+
 ## Scope selectors (printer-pages syntax)
 
 The `--include` and `--exclude` flags on `devbench start`, `devbench status`, `devbench report`, and `devbench next` all accept the same printer-pages-style token syntax described here. `devbench scope set` uses the same parser.

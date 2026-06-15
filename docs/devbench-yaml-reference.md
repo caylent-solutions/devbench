@@ -440,6 +440,77 @@ absent.
 
 ---
 
+## `supervise:` -- interactive subscription-billed orchestrator (ADR-31)
+
+Config for `devbench supervise`, which launches the orchestrator as an interactive `claude` CLI
+session under a detached `screen` daemon (billed against the Claude Code subscription's 5-hour
+windows, not the API). Every field has a documented default and is overridable by a
+`DEVBENCH_SUPERVISE_*` env var (env > yaml > default). The quota machinery REUSES the top-level
+`quota_handling:` block, so it is not duplicated here. Full operator guide: [supervise.md](supervise.md).
+
+```yaml
+supervise:
+  model: null                       # default model; null -> falls back to orchestrate.model -> fail-fast (D-3)
+  effort: xhigh                      # low|medium|high|xhigh|max (xhigh default; max is session-only)
+  screen_name_prefix: devbench-supervise-
+  timeouts:
+    ready_prompt_seconds: 120        # wait for the first interactive ready prompt
+    idle_seconds: 1800               # max silence before treating the session as hung
+    command_ack_seconds: 60          # wait for a slash command to be acknowledged
+    quota_poll_interval_seconds: 60  # reuses quota_handling.poll_interval_seconds when null
+    quota_max_wait_seconds: 18000    # reuses quota_handling.max_wait_seconds when null (5h)
+    graceful_stop_seconds: 900       # graceful drain budget before escalating to a hard stop
+    command_invocation_seconds: 30   # safety timeout bounding short screen subprocess shell-outs
+  restart:
+    max_attempts: 5                  # bounded auto-restart on the exit-42 restart signal
+    resume_mode: continue            # continue | resume (resume uses the captured session id)
+  quota:
+    max_quota_resumes: null          # null -> DEFAULT_MAX_QUOTA_RESUMES (1000) / DEVBENCH_MAX_QUOTA_RESUMES
+  detection_patterns:                # version-fragility hardening -- all PTY regexes centralized here
+    ready_prompt: '(?m)^\s*(>|│\s*>)\s*$'
+    working_prompt: '(?i)(esc to interrupt|tokens|thinking)'
+    quota_limit: "(You’ve hit your limit|You've hit your limit|rate.?limit.*(exceeded|reached|resets))"
+    quota_wait_prompt: '(?i)(wait.*reset|retry.*later|press.*to wait)'   # DI-5 placeholder (unverified)
+    reset_at: 'resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)'
+    circuit_breaker: '\[CIRCUIT_BREAKER\]|cascade depth exceeded'
+    harness_block: '\[HARNESS_INTEGRITY\]'
+    crash: '(?i)(panic|fatal error|traceback \(most recent call last\))'
+  log_tail:
+    orchestrator_log_relpath: logs/orchestrator.log
+    markers_clean: ["ALL_DONE", "NO_ACTIONABLE", "[ORCHESTRATOR_TERMINAL_EXIT]"]
+    markers_quota: ["[QUOTA_WAITING]", "[QUOTA_POLLING]", "[ORCHESTRATOR_QUOTA_RESUME]"]
+    markers_fault: ["[ORCHESTRATOR_STOP_REASON]", "[ORCHESTRATOR_FATAL_ERROR]", "[HARNESS_INTEGRITY]"]
+    markers_restart: ["[ORCHESTRATOR_AUTO_RESTART]"]
+  env:
+    deny_vars: ["AWS_PROFILE", "AWS_SESSION_TOKEN"]    # ADDITIONAL deny vars; the always-deny set is non-removable
+  logging:
+    pty_log_relpath: pty.log         # under the per-session state dir; created mode 0600
+    redact_patterns: ["sk-ant-[A-Za-z0-9_-]+", "AKIA[0-9A-Z]{16}", "(?i)aws_secret[^\\s]*", "Bearer\\s+[A-Za-z0-9._-]+"]
+  injectable_commands:               # extensible registry -- new slash commands added here need NO code change
+    orchestrate:    "/devbench-orchestrate:orchestrate"
+    effort_xhigh:   "/effort xhigh"
+    model_opus:     "/model opus"
+    quota_wait_choice: "1"           # DI-5 placeholder: the keystroke that selects "wait" at the quota prompt
+    drain_now:      "/exit"
+```
+
+Notes:
+
+- **`model` / `effort` resolution** mirrors the no-fallback orchestrate contract: model resolves
+  `--model` > `supervise.model` > `orchestrate.model`, fail-fast if all unset; `haiku` is rejected.
+  `DEVBENCH_CLAUDE_MODEL` is deliberately NOT consulted (it is the API-caller model and must not leak
+  into the subscription session).
+- **`env.deny_vars`** lists ADDITIONAL vars to strip; the always-deny API/Bedrock-routing set
+  (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`,
+  `DEVBENCH_USE_BEDROCK`, `AWS_*`) is non-removable. A config that tries to whitelist one of those by
+  negation fails fast at load.
+- **`detection_patterns.quota_wait_prompt`** and **`injectable_commands.quota_wait_choice`** are
+  PLACEHOLDERS until the real interactive usage-limit prompt is captured against a live quota event
+  (DI-5; see `spec/devbench-supervise-screen-orchestrator/QUOTA-VERIFICATION-TODO.md`). The
+  poll-and-restart path plus the stable log markers carry correctness meanwhile.
+
+---
+
 ## See also
 
 - `sample-config.yaml` -- annotated copy of every field at its default value; copy and edit as a

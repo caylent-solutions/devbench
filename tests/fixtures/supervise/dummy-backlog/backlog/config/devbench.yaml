@@ -1,0 +1,45 @@
+# DevBench runtime configuration for the supervise integration dummy backlog.
+#
+# Glyph note: this file uses ASCII double-hyphen `--` everywhere a dash is
+# needed. The em-dash glyph (U+2014) does not appear in this file.
+#
+# This is a minimal, TRIVIAL, NON-AWS config used ONLY by the `devbench
+# supervise` Phase-6 integration layer. It declares a single target repo and
+# the model-resolution fall-through value (`orchestrate.model`) the supervise
+# path uses when neither `--model` nor `supervise.model` is given (D-3), plus a
+# `supervise:` block demonstrating the feature's config on a real workspace.
+#
+# Validate with: `uv run devbench validate-backlog` from this workspace root.
+
+# ---------------------------------------------------------------------------
+# Required: target repo (single, trivial)
+# ---------------------------------------------------------------------------
+repos:
+  caylent-solutions/devbench:
+    default_branch: main
+    checkout_directory: devbench
+
+# LLM routing: the Anthropic subscription path (NOT Bedrock). The supervise
+# feature exists to bill the interactive session against the subscription, so
+# the dummy backlog never routes to API/Bedrock billing.
+use_bedrock: false
+
+# ---------------------------------------------------------------------------
+# orchestrate.model: the third tier of the supervise model-resolution chain
+# (`--model` > `supervise.model` > `orchestrate.model` > fail-fast, D-3).
+# Present here so a `supervise start` against this workspace with no `--model`
+# and no `supervise.model` resolves deterministically rather than failing fast.
+# ---------------------------------------------------------------------------
+orchestrate:
+  model: claude-opus-4-8
+
+# ---------------------------------------------------------------------------
+# supervise: the interactive-screen orchestrator config block (Section 5.1).
+# Only non-default values are set; every omitted field uses its documented
+# default (see docs/devbench-yaml-reference.md). The quota machinery reuses the
+# top-level quota_handling block, so it is not duplicated here.
+# ---------------------------------------------------------------------------
+supervise:
+  # model: null -> falls back to orchestrate.model above (D-3).
+  effort: xhigh
+  screen_name_prefix: devbench-supervise-

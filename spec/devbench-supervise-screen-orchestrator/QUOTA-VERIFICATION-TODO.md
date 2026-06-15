@@ -4,6 +4,19 @@
 
 Companion to: `spec/devbench-supervise-screen-orchestrator/devbench-supervise-screen-orchestrator.md` (Section 4.9, Section 7.3, DI-5, AC-29).
 
+## 0. Phase 6 status (Discovery-Item outcomes for operator review)
+
+The supervise feature is implemented through Phase 6 (real dummy-backlog integration + docs + ADR-31). The four discovery items the plan flagged for operator review are recorded here so the remaining live verification is unambiguous:
+
+| DI | Subject | Status after Phase 6 | What remains |
+|---|---|---|---|
+| DI-1 | `--effort xhigh` accepted alongside `--dangerously-skip-permissions` on the installed CLI | UNVERIFIED against a live CLI. The config ships BOTH forms: the launch flag is tried first; the `/effort xhigh` injection (`injectable_commands.effort_xhigh`) is the documented fallback (D-11). | A human confirms the installed `claude` accepts the flag, or switches the default to the slash form. |
+| DI-3 | Scope conveyance reaches the orchestrate skill + `devbench next` on the interactive path | VERIFIED in-CI: AC-30 drives the real `start` verb, asserts the session-routed `scope.json` + the three exported conveyance vars, and proves `DEVBENCH_SESSION_NAME=<n> devbench next` honours the scope. The live half (`/proc/<pid>/environ` of a real `claude`) is AC-34, deferred. | The live `/proc` inspection (AC-34) when a real subscription session is run. |
+| DI-4 | `--screen` (input-capable `screen -x`) ACL cannot inject any keystroke into the `claude` window | UNVERIFIED. `--screen` stays fail-fast-disabled (AC-33) until a human verifies the write-removed multiuser ACL on the target `screen` build. The default read-only PTY-log follow is unaffected. | A human verifies the ACL on the target `screen` build, then the gate is lifted. |
+| DI-5 | The EXACT interactive quota / usage-limit prompt text + wait/retry option | UNVERIFIED (HIGHEST RISK). `supervise.detection_patterns.quota_limit` / `quota_wait_prompt` and `injectable_commands.quota_wait_choice` are PLACEHOLDERS seeded from the SDK-surface markers (Section 2 below). The poll-and-restart path (4.9b) + the stable devbench log markers carry correctness meanwhile. | Capture the real strings via the procedure below against a live 5-hour-window event (AC-29), then finalize the patterns. |
+
+**Bottom line:** the only discovery item that gates a CORRECTNESS-critical path is DI-5 (the in-session-wait path 4.9a). It is still PENDING a real quota event. AC-29 is the deferred AC tracking it; the executable quota tests (AC-3, AC-9, AC-15, AC-32) exercise the machinery with the placeholder patterns so the wait/resume logic is proven independent of the exact wording.
+
 ## 1. Why this TODO exists (status: UNVERIFIED)
 
 The `devbench supervise` interactive quota state machine (spec Section 4.9) must detect a usage-limit ("5-hour-window exhaustion") event in the screen-scraped PTY output of an interactive `claude` CLI session, and then either inject an in-session wait/retry choice (path 4.9a) or fall back to poll-and-restart (path 4.9b).

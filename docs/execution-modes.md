@@ -186,6 +186,32 @@ Claude Code session (with devbench plugin active)
 
 The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply -- the executor does not commit until all judges pass.
 
+### Supervised interactive mode (`devbench supervise start`) -- subscription-billed
+
+A third execution mode launches the SAME interactive orchestrator, but unattended: under a detached `screen` daemon, driven by a `pexpect` supervisor, so it survives terminal detach and self-heals across quota windows and restarts. Its defining property is the billing channel -- the session is billed against the Claude Code subscription's rolling 5-hour usage windows, NOT the Anthropic API (the SDK `make start` path bills at API/Bedrock rates; see [llm-authentication.md](llm-authentication.md)).
+
+```text
+screen daemon (devbench-supervise-<name>)
+    │
+    └── pexpect supervisor runs claude --dangerously-skip-permissions --plugin-dir <resolved>
+            │
+            ├── waits for the ready prompt, then injects /devbench-orchestrate:orchestrate
+            ├── tails the orchestrator log markers (ALL_DONE / NO_ACTIONABLE / [QUOTA_WAITING] / ...)
+            ├── on a 5-hour-window exhaustion: state=quota-waiting (waits, never exits non-zero)
+            ├── on the exit-42 restart signal: bounded auto-restart via --continue
+            └── on ALL_DONE / operator-gated NO_ACTIONABLE: clean completion, exit 0
+```
+
+| Aspect | Supervised interactive (`devbench supervise`) |
+| --- | --- |
+| Billing | Subscription 5-hour windows (NOT API/Bedrock) -- `ANTHROPIC_API_KEY` is stripped + preflight-refused |
+| Unattended | Yes -- survives terminal detach via the `screen` daemon |
+| Quota | `quota-waiting` then auto-resume; never exits non-zero on exhaustion (ADR-24 semantics) |
+| Observation | Read-only redacted PTY-log follow (`supervise attach`); cannot inject input |
+| Best for | Overnight / unattended runs an operator wants billed to the Max subscription |
+
+The same ownership rules and lifecycle apply; only the launch wrapper and billing channel differ. Full guide: [supervise.md](supervise.md). Design rationale: [adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md).
+
 ---
 
 ## Status Source of Truth

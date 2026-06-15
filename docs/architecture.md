@@ -255,6 +255,15 @@ stateDiagram-v2
 - **Auto-rollup**: When a task is marked done and all sibling tasks of its parent story are done, the parent story is auto-rolled to done with an audit comment. This cascades up to features and epics.
 - **Stop hook intercepts**: If Claude Code attempts to stop while any task is in-progress in BACKLOG.md, `continue-orchestration.sh` blocks the stop and injects a continuation instruction (current task ID, file path, last action, recommended next step). After `stop_hook.max_blocks` blocks within `stop_hook.window_seconds`, the circuit breaker trips and allows the stop, logging an audit comment to the work unit.
 
+### Orchestrator launch paths (SDK vs interactive-screen)
+
+The orchestrate loop above is launched one of two ways, and the choice determines how the run is BILLED:
+
+- **Agent-SDK, non-interactive (`devbench start` / `--daemon`).** Drives a `ClaudeSDKClient`; inference authenticates by handing the Claude Code OAuth token to the Anthropic SDK as an `api_key`, so tokens are metered against the Anthropic API account (or AWS Bedrock under `DEVBENCH_USE_BEDROCK=1`) at per-token rates. See [llm-authentication.md](llm-authentication.md).
+- **Interactive-screen, subscription-billed (`devbench supervise`).** Launches the orchestrator as an interactive `claude` CLI session under a detached `screen` daemon driven by a `pexpect` supervisor. An interactive session authenticated via the Claude Code Max subscription draws from the subscription's rolling 5-hour usage windows instead of API/Bedrock per-token billing. The supervisor strips every API/Bedrock-routing env var (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, `AWS_*`) from the session and refuses to launch (exit 2) if any is present, so the subscription-billing guarantee holds. It is purely additive -- the SDK path is untouched.
+
+Both run the SAME orchestrate skill, executor, and judges; only the launch wrapper and billing channel differ. The interactive PTY path is version-fragile (the on-screen prompt wording changes between `claude` CLI versions), so the supervisor centralizes every prompt-detection regex in config and uses a HYBRID detector: it also tails the orchestrator's own stable log markers (`ALL_DONE`, `NO_ACTIONABLE`, `[QUOTA_WAITING]`, `[ORCHESTRATOR_QUOTA_RESUME]`, `[ORCHESTRATOR_AUTO_RESTART]`, `[ORCHESTRATOR_FATAL_ERROR]`, `[HARNESS_INTEGRITY]`) rather than relying on screen-scraping alone. Quota wait-and-resume, scope conveyance, and multi-session arbitration are REUSED from the existing SDK primitives (ADR-24 quota, the per-session `scope.json` + `DEVBENCH_SESSION_NAME` routing, `flock_backlog` + `detect_scope_overlap`). Full design rationale: ADR-31 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md)); operator guide: [supervise.md](supervise.md).
+
 ---
 
 ## 5. Multi-repo vs single-repo

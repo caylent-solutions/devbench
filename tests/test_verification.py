@@ -478,16 +478,138 @@ def test_sanitize_ac_label_empty_falls_back() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "cap", "expected"),
+    ("text", "cap"),
     [
-        ("short", 100, "short"),  # under cap -> unchanged
-        ("abcdef", 3, "def"),  # tail-biased trim
-        ("abcdef", 0, "abcdef"),  # non-positive cap disables trimming
-        ("abcdef", -1, "abcdef"),
+        ("short", 100),  # under cap -> unchanged
+        ("abcdef", 0),  # non-positive cap disables trimming
+        ("abcdef", -1),
+        ("a" * 100, 100),  # exactly at cap -> unchanged
     ],
 )
-def test_trim_log(text: str, cap: int, expected: str) -> None:
-    assert trim_log(text, cap) == expected
+def test_trim_log_within_budget_or_disabled_is_verbatim(text: str, cap: int) -> None:
+    """A log already within budget (or with trimming disabled) is returned as-is."""
+    assert trim_log(text, cap) == text
+
+
+def test_trim_log_no_sentinels_is_bounded_near_max_bytes() -> None:
+    """A sentinel-free log over budget is bounded to roughly *max_bytes* (head + tail)."""
+    text = "\n".join(f"plain line {i:04d} of filler output" for i in range(2000))
+    cap = 600
+    trimmed = trim_log(text, cap)
+    assert trimmed != text
+    # Bounded near the cap (head + tail windows + one elision marker), never blown.
+    assert len(trimmed) <= cap + len("[... 999999 bytes elided ...]")
+    # Head context survives (old tail-only slice dropped it entirely).
+    assert "plain line 0000" in trimmed
+    # Trailing summary survives.
+    assert "plain line 1999" in trimmed
+    # A gap marker records the dropped middle.
+    assert "bytes elided" in trimmed
+
+
+def test_trim_log_retains_head_apply_destroy_and_tail_summary() -> None:
+    """Apply/destroy/PASS sentinels at the HEAD survive even when the tail is plan-only.
+
+    Mirrors a terratest package that runs its real apply/idempotency/destroy
+    examples first and its plan-only negative tests last: the old tail-only
+    slice discarded the apply proof; the sentinel-aware trim must keep it while
+    still retaining the trailing package summary.
+    """
+    head = [
+        "=== RUN   TestExampleApply",
+        "    primitive_test.go:42: terraform apply",
+        "Apply complete! Resources: 7 added, 0 changed, 0 destroyed.",
+        "    primitive_test.go:58: idempotency re-plan",
+        "No changes. Your infrastructure matches the configuration.",
+        "    primitive_test.go:71: terraform destroy",
+        "Destroy complete! Resources: 7 destroyed.",
+        "--- PASS: TestExampleApply (93.43s)",
+    ]
+    # A large block of plan-only negative-test filler that pushes the apply
+    # sentinels out of any pure tail window.
+    middle = [f"    plan_only_test.go:{i}: negative validation assertion {i:04d}" for i in range(4000)]
+    tail = [
+        "--- PASS: TestEmptyNameValidationError (0.84s)",
+        "PASS",
+        "ok  \tgithub.com/example/module/tests/default\t93.430s",
+    ]
+    text = "\n".join(head + middle + tail)
+    cap = 2048
+    trimmed = trim_log(text, cap)
+
+    # AC-3 apply / idempotency / destroy proof retained from the HEAD.
+    assert "Apply complete! Resources: 7 added, 0 changed, 0 destroyed." in trimmed
+    assert "No changes. Your infrastructure matches the configuration." in trimmed
+    assert "Destroy complete! Resources: 7 destroyed." in trimmed
+    assert "--- PASS: TestExampleApply (93.43s)" in trimmed
+    # Trailing Go package summary retained from the TAIL.
+    assert "ok  \tgithub.com/example/module/tests/default\t93.430s" in trimmed
+    # The plan-only filler in the middle was elided.
+    assert "negative validation assertion 2000" not in trimmed
+    assert "bytes elided" in trimmed
+
+
+def test_trim_log_retains_fail_and_panic_sentinels() -> None:
+    """Failure sentinels (--- FAIL:, panic:, FAIL package summary) survive a trim."""
+    head = ["--- FAIL: TestSomething (1.20s)", "    panic: runtime error: index out of range"]
+    middle = [f"verbose trace frame {i:05d}" for i in range(3000)]
+    tail = ["FAIL\tgithub.com/example/module/tests/default\t1.230s", "exit status 1"]
+    text = "\n".join(head + middle + tail)
+    trimmed = trim_log(text, 1024)
+    assert "--- FAIL: TestSomething (1.20s)" in trimmed
+    assert "panic: runtime error: index out of range" in trimmed
+    assert "FAIL\tgithub.com/example/module/tests/default\t1.230s" in trimmed
+    assert "verbose trace frame 01500" not in trimmed
+
+
+def test_trim_log_is_pure() -> None:
+    """trim_log must not mutate its input."""
+    text = "\n".join(f"Apply complete! run {i}" for i in range(500))
+    before = text
+    trim_log(text, 200)
+    assert text == before
+
+
+def test_trim_log_head_and_tail_windows_are_disjoint_no_double_count() -> None:
+    """Head and tail windows never overlap, so no line is emitted twice.
+
+    For an over-budget sentinel-free log the head and tail windows together
+    stay within budget and a single elision marker bridges the dropped middle;
+    no line appears more than once.
+    """
+    lines = [f"line{i:03d}-payload" for i in range(400)]  # uniform short lines, no sentinels
+    text = "\n".join(lines)
+    cap = 400
+    trimmed = trim_log(text, cap)
+    out_lines = trimmed.split("\n")
+    payload_lines = [ln for ln in out_lines if ln.startswith("line")]
+    assert len(payload_lines) == len(set(payload_lines))  # no duplicates
+    assert "line000-payload" in trimmed  # head survives
+    assert "line399-payload" in trimmed  # tail survives
+    assert trimmed.count("bytes elided") == 1  # exactly one bridged gap
+
+
+def test_trim_log_skips_sentinel_that_exceeds_remaining_budget() -> None:
+    """A sentinel line that does not fit the remaining budget is dropped, not forced.
+
+    Exercises the sentinel-loop branch that skips an over-budget sentinel so the
+    result never blows past *max_bytes* just to keep one more marker.
+    """
+    # One short sentinel near the front fits; a second, very long sentinel cannot.
+    short_sentinel = "Apply complete!"
+    long_sentinel = "Error: " + ("x" * 5000)
+    middle = [f"filler {i:04d}" for i in range(2000)]
+    tail = ["ok  \tgithub.com/example/m\t1.0s"]
+    text = "\n".join([short_sentinel, *middle, long_sentinel, *middle, *tail])
+    cap = 400
+    trimmed = trim_log(text, cap)
+    # The affordable sentinel and the tail summary are kept.
+    assert short_sentinel in trimmed
+    assert "ok  \tgithub.com/example/m\t1.0s" in trimmed
+    # The oversized sentinel was skipped rather than forced in.
+    assert long_sentinel not in trimmed
+    # Result stays bounded near the cap despite the oversized sentinel existing.
+    assert len(trimmed) <= cap + len(short_sentinel) + len("[... 9999999 bytes elided ...]\n") * 4
 
 
 def test_next_attempt_number_starts_at_one(tmp_path: Path) -> None:

@@ -85,11 +85,17 @@ typecheck:
 test-unit:
 	uv run pytest tests/ -v --tb=short -q
 
-## test-coverage: Run tests with coverage report (fails below 98%)
-## --cov-precision=2 so the fail-under compares the real value (e.g. 97.70 < 98)
-## instead of the default precision=0 which rounds 97.70 -> 98 and never fails.
+## test-coverage: Run tests with coverage, then gate on the floor.
+## The gate is coverage.py's own CLI (not pytest-cov's --cov-fail-under), because
+## pytest-cov compares the rounded total for its pass/fail DECISION but the raw
+## float for its printed MESSAGE -- so at exactly the floor (e.g. 98.00% rounded
+## from 97.999..%) it prints "FAIL ... not reached" yet exits 0. coverage.py's
+## CLI uses the same rounded comparison for both, so the message and exit code
+## always agree. --precision=2 compares the real value (97.99 < 98 fails;
+## 98.00 >= 98 passes with no FAIL line).
 test-coverage:
-	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98 --cov-precision=2
+	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-precision=2
+	uv run coverage report --fail-under=98 --precision=2
 
 ## test: Run all tests
 test: test-unit

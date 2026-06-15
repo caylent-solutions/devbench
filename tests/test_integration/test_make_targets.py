@@ -287,8 +287,21 @@ class TestCoverageGate:
         output = _make_dry_run("test-coverage")
         assert "--cov=devbench" in output, f"Expected '--cov=devbench' in make -n test-coverage output, got:\n{output}"
 
-    def test_test_coverage_enforces_98_percent_floor(self) -> None:
+    def test_test_coverage_enforces_98_percent_floor_via_coverage_cli(self) -> None:
+        # The floor is gated by coverage.py's own CLI (``coverage report
+        # --fail-under``), NOT pytest-cov's ``--cov-fail-under``: pytest-cov
+        # rounds the total for its exit decision but compares the raw float for
+        # its message, printing a spurious ``FAIL ... not reached`` line on a
+        # passing run at exactly the floor. coverage.py's CLI keeps message and
+        # exit consistent.
         output = _make_dry_run("test-coverage")
-        assert "--cov-fail-under=98" in output, (
-            f"Expected '--cov-fail-under=98' in make -n test-coverage output, got:\n{output}"
+        assert "coverage report" in output, (
+            f"Expected 'coverage report' gate in make -n test-coverage output, got:\n{output}"
+        )
+        assert "--fail-under=98" in output, (
+            f"Expected '--fail-under=98' in make -n test-coverage output, got:\n{output}"
+        )
+        # The buggy pytest-cov gate must be gone (complete replacement).
+        assert "--cov-fail-under" not in output, (
+            f"pytest-cov's --cov-fail-under should be replaced by the coverage CLI gate, got:\n{output}"
         )

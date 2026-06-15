@@ -152,9 +152,14 @@ class TestLedgerAndArtifacts:
         assert "HELLO_FROM_AC" in artifact.read_text(encoding="utf-8")
 
     def test_artifact_trimmed_to_byte_cap(self, tmp_path: Path, repo_path: Path) -> None:
-        """A large output is tail-trimmed to the configured byte cap."""
+        """A large sentinel-free output is bounded near the cap, keeping head and tail.
+
+        The sentinel-aware trim keeps a leading head window and a trailing tail
+        window with an elision marker between, so both the first and the last
+        lines of an over-budget log survive (the old slice kept only the tail).
+        """
         workspace = tmp_path / "ws"
-        # Emit far more than the cap; the artifact keeps only the trailing cap bytes.
+        # Emit far more than the cap; the artifact keeps a head + tail window.
         _write_unit(
             workspace,
             "- VERIFY AC-1 | type=command | cmd=`for i in $(seq 1 5000); do echo LINE$i; done` | expect-exit=0",
@@ -164,10 +169,13 @@ class TestLedgerAndArtifacts:
         assert rc == 0
         artifact = verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log"
         text = artifact.read_text(encoding="utf-8")
-        assert len(text) <= 256
-        # Tail-biased: the LAST line survives, the first does not.
+        # Bounded near the cap (head + tail windows plus one elision marker).
+        assert len(text) <= 256 + len("[... 999999 bytes elided ...]\n")
+        # The LAST line survives (tail window) and the FIRST now survives too
+        # (head window) -- the middle is elided.
         assert "LINE5000" in text
-        assert "LINE1\n" not in text
+        assert "LINE1\n" in text
+        assert "bytes elided" in text
 
 
 class TestSkippedItems:

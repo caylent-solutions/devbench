@@ -764,16 +764,124 @@ def sanitize_ac_label(ac_ids: list[str] | tuple[str, ...]) -> str:
     return _SANITIZE_RE.sub("_", "-".join(ac_ids))
 
 
-def trim_log(text: str, max_bytes: int) -> str:
-    """Return *text* trimmed to its trailing *max_bytes* characters.
+#: Proof sentinels a trimmed log must retain regardless of position. These are
+#: generic CI/IaC/test markers (not coupled to any backlog or provider): a log
+#: that contains none of them falls back to a pure head+tail window, which is
+#: still strictly better than the old tail-only slice. Substrings are matched
+#: anywhere in a line; line-prefix markers (``ok ``/``FAIL ``) are the Go test
+#: per-package summary lines and are matched after stripping leading whitespace.
+_TRIM_SENTINEL_SUBSTRINGS: tuple[str, ...] = (
+    "Apply complete!",  # terraform/terratest real apply succeeded
+    "Destroy complete!",  # terraform/terratest cleanup succeeded
+    "No changes.",  # terraform idempotency re-plan (no drift)
+    "--- PASS:",  # go test per-test pass
+    "--- FAIL:",  # go test per-test fail
+    "panic:",  # go/runtime panic
+    "Error:",  # generic tool error line
+)
+_TRIM_SENTINEL_LINE_PREFIXES: tuple[str, ...] = (
+    "ok ",  # go test package summary (pass)
+    "FAIL ",  # go test package summary (fail)
+)
+#: Marker emitted between two non-contiguous retained regions. ``{n}`` is the
+#: number of bytes (characters) dropped between them.
+_TRIM_ELISION_TEMPLATE = "[... {n} bytes elided ...]"
 
-    Tail-biased to mirror the ``.devbench/ci-failures`` convention: the
-    actionable lines of an apply/plan/test log are almost always at the end.
-    A non-positive *max_bytes* disables trimming.
+
+def _line_is_sentinel(line: str) -> bool:
+    """Return ``True`` when *line* carries a proof sentinel worth retaining."""
+    if any(token in line for token in _TRIM_SENTINEL_SUBSTRINGS):
+        return True
+    stripped = line.lstrip()
+    return any(stripped.startswith(prefix) for prefix in _TRIM_SENTINEL_LINE_PREFIXES)
+
+
+def trim_log(text: str, max_bytes: int) -> str:
+    """Return *text* bounded near *max_bytes* characters, retaining proof sentinels.
+
+    Sentinel-aware trim. A non-positive *max_bytes* or a *text* already within
+    budget is returned verbatim. Otherwise the result is assembled, in original
+    order, from three sources so the size stays near *max_bytes* while the
+    actionable lines survive regardless of where they sit in the log:
+
+    1. a leading **head** window (so the run's setup/context is visible),
+    2. every **sentinel** line (see :data:`_TRIM_SENTINEL_SUBSTRINGS` and
+       :data:`_TRIM_SENTINEL_LINE_PREFIXES`) the byte budget can hold, and
+    3. a trailing **tail** window (the package summary / post-run lines).
+
+    This fixes the old tail-only slice, which discarded the head-of-log
+    ``Apply complete!`` / idempotency re-plan / ``Destroy complete!`` proof on
+    test packages that order plan-only negative tests after their apply tests.
+    Where retained regions are not contiguous in the original text a
+    ``[... N bytes elided ...]`` marker records how many characters were dropped.
+    A log carrying no sentinels degrades to a plain head+tail window.
     """
     if max_bytes <= 0 or len(text) <= max_bytes:
         return text
-    return text[-max_bytes:]
+
+    lines = text.split("\n")
+    # Per-line byte cost including the newline that joins it to the next line.
+    # The final line carries no trailing newline, matching ``"\n".join``.
+    line_costs = [len(line) + (1 if i < len(lines) - 1 else 0) for i, line in enumerate(lines)]
+
+    # Reserve roughly a quarter of the budget for head context and a quarter for
+    # the trailing summary; the middle half is spent on sentinel lines. The tail
+    # is favoured on ties so the package summary is never the casualty.
+    head_budget = max_bytes // 4
+    tail_budget = max_bytes // 4
+
+    keep: list[bool] = [False] * len(lines)
+
+    # (1) Head window: take whole lines from the front until the head budget runs
+    # out. ``head_kept`` is the count of retained leading lines, used to bound the
+    # tail loop so the two windows cannot collide.
+    used = 0
+    head_kept = 0
+    for i, cost in enumerate(line_costs):
+        if used + cost > head_budget and used > 0:
+            break
+        keep[i] = True
+        used += cost
+        head_kept = i + 1
+
+    # (3) Tail window: take whole lines from the back until the tail budget runs
+    # out. The head loop stops at <= max_bytes // 4 bytes, so with the over-budget
+    # guard above (len(text) > max_bytes) the head and tail windows are always
+    # disjoint and need no overlap check here.
+    used = 0
+    for i in range(len(lines) - 1, head_kept - 1, -1):
+        cost = line_costs[i]
+        if used + cost > tail_budget and used > 0:
+            break
+        keep[i] = True
+        used += cost
+
+    # Running total of everything already retained by head + tail.
+    retained = sum(cost for i, cost in enumerate(line_costs) if keep[i])
+
+    # (2) Sentinel lines, in original order, until the overall budget is reached.
+    for i, line in enumerate(lines):
+        if keep[i] or not _line_is_sentinel(line):
+            continue
+        cost = line_costs[i]
+        if retained + cost > max_bytes:
+            continue
+        keep[i] = True
+        retained += cost
+
+    # Re-assemble in original order, inserting an elision marker for every gap
+    # of dropped lines between two retained regions.
+    out: list[str] = []
+    gap_bytes = 0
+    for i, line in enumerate(lines):
+        if keep[i]:
+            if gap_bytes:
+                out.append(_TRIM_ELISION_TEMPLATE.format(n=gap_bytes))
+                gap_bytes = 0
+            out.append(line)
+        else:
+            gap_bytes += line_costs[i]
+    return "\n".join(out)
 
 
 def next_attempt_number(workspace_root: Path, task_id: str) -> int:

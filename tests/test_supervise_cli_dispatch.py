@@ -65,9 +65,9 @@ class TestSuperviseSubverbDispatch:
         assert "frobnicate" in err
         assert "start" in err  # usage lists the valid sub-verbs
 
-    # The sub-verbs whose bodies are NOT yet implemented (Phase 2 implements
-    # start/__run/attach; stop/restart/status/info still fail fast).
-    _UNIMPLEMENTED_SUBVERBS = ("stop", "restart", "status", "info")
+    # The sub-verbs whose bodies are NOT yet implemented (Phase 3 implements
+    # start/__run/stop/restart/attach; status/info land in Phase 4).
+    _UNIMPLEMENTED_SUBVERBS = ("status", "info")
 
     @pytest.mark.parametrize("sub", list(_UNIMPLEMENTED_SUBVERBS))
     def test_unimplemented_subverb_is_routed(self, sub: str) -> None:
@@ -75,6 +75,19 @@ class TestSuperviseSubverbDispatch:
         # and fail fast with NotImplementedError (never a silent success).
         with pytest.raises(NotImplementedError):
             cli._dispatch_supervise_subverb(sub, [])
+
+    @pytest.mark.parametrize("sub", ["stop", "restart"])
+    def test_implemented_subverb_fails_fast_on_missing_session(
+        self, sub: str, tmp_path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # stop/restart are now implemented; with no matching session they fail
+        # fast (exit 2), never a silent success.
+        from unittest.mock import patch
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli._dispatch_supervise_subverb(sub, [])
+        assert rc == 2
+        assert "no supervise session" in capsys.readouterr().err
 
 
 @pytest.mark.unit
@@ -149,11 +162,11 @@ class TestSuperviseArgParsing:
 class TestSuperviseSubverbStubsFailFast:
     """The not-yet-built sub-verb bodies fail fast (no silent success).
 
-    Phase 2 implements ``start``/``__run``/``attach``; ``stop``/``restart``/
-    ``status``/``info`` land later and still fail fast until then.
+    Phase 3 implements ``start``/``__run``/``stop``/``restart``/``attach``;
+    ``status``/``info`` land in Phase 4 and still fail fast until then.
     """
 
-    @pytest.mark.parametrize("sub", ["stop", "restart", "status", "info"])
+    @pytest.mark.parametrize("sub", ["status", "info"])
     def test_subverb_body_not_implemented(self, sub: str) -> None:
         with pytest.raises(NotImplementedError):
             cli._dispatch_supervise_subverb(sub, [])

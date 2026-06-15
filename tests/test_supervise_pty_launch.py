@@ -142,3 +142,48 @@ class TestPtyDriverTee:
         driver.wait_for_ready(timeout_seconds=1)
         writer.close()
         assert ">" in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestPtyDriverReadChunk:
+    """read_chunk feeds the event loop: text / EOF+exitstatus / prompt-timeout (Section 4.1 step 8)."""
+
+    def test_read_chunk_returns_text(self) -> None:
+        child = FakePexpectChild([_ScriptStep(emit="esc to interrupt -- thinking")])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        text, eof, exitstatus = driver.read_chunk(timeout_seconds=1)
+        assert eof is False
+        assert exitstatus is None
+        assert "thinking" in text
+        # last_text() surfaces the chunk for reset-time parsing.
+        assert "thinking" in driver.last_text()
+
+    def test_read_chunk_eof_carries_exitstatus(self, tmp_path) -> None:
+        from devbench.supervise import PtyLogWriter
+
+        log = tmp_path / "pty.log"
+        writer = PtyLogWriter(path=log, redact_patterns=())
+        child = FakePexpectChild([_ScriptStep(emit="bye", eof=True, exitstatus=7)])
+        driver = PtyDriver(
+            child=child,
+            patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()),
+            log_writer=writer,
+        )
+        text, eof, exitstatus = driver.read_chunk(timeout_seconds=1)
+        writer.close()
+        assert eof is True
+        assert exitstatus == 7
+        assert text == "bye"
+
+    def test_read_chunk_timeout_raises(self) -> None:
+        from devbench.supervise import SupervisePromptTimeoutError
+
+        child = FakePexpectChild([])  # no scripted output -> TIMEOUT
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        with pytest.raises(SupervisePromptTimeoutError, match="prompt-timeout-idle"):
+            driver.read_chunk(timeout_seconds=1)
+
+    def test_last_text_empty_before_any_read(self) -> None:
+        child = FakePexpectChild([])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        assert driver.last_text() == ""

@@ -1219,6 +1219,21 @@ SUPERVISE_INTERNAL_RUN_SUBVERB: str = "__run"
 # alphanumerics, hyphen, underscore. Path-traversal ``..`` is rejected separately.
 SUPERVISE_SESSION_NAME_PATTERN: str = r"^[A-Za-z0-9][A-Za-z0-9_-]*$"
 
+# Non-zero exit code the supervisor (``__run``) returns for every FAULT outcome
+# (Section 4.6, FR-13). Reuses the orchestrator's fatal-error code (46) so the
+# supervised fault and the SDK-path fatal error share a single non-zero class;
+# the specific cause is carried in the registry ``exit_reason`` field (and the
+# operator-visible ``[SUPERVISE_FAULT]`` audit line), not in the numeric code.
+SUPERVISE_FAULT_EXIT_CODE: int = ORCHESTRATOR_FATAL_ERROR_EXIT_CODE
+
+# Structured audit-line prefixes the in-screen ``__run`` supervisor writes to its
+# per-session ``supervisor.log`` (Section 7.2). ``[SUPERVISE_STATE]`` records each
+# state-machine transition; ``[SUPERVISE_FAULT]`` records a classified fault;
+# ``[SUPERVISE_RESTART]`` records each bounded auto-restart relaunch (FR-12).
+SUPERVISE_STATE_AUDIT_PREFIX: str = "[SUPERVISE_STATE]"
+SUPERVISE_FAULT_AUDIT_PREFIX: str = "[SUPERVISE_FAULT]"
+SUPERVISE_RESTART_AUDIT_PREFIX: str = "[SUPERVISE_RESTART]"
+
 # Audit-row tag emitted when a skill exhausts its iteration budget without
 # reaching SKILL_QUALITY_THRESHOLD. Operator-visible signal that the skill
 # needs human attention.

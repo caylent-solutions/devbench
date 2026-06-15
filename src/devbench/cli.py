@@ -272,19 +272,25 @@ from devbench.supervise import (
     AuthVerifier,
     DetectionPatterns,
     EnvSanitizer,
+    EventLoopResult,
+    LogTailDetector,
     PtyDriver,
     PtyLogWriter,
     SuperviseError,
     SuperviseReadyTimeoutError,
     SuperviseRegistry,
     build_claude_launch_argv,
+    build_quota_waiter,
+    build_resume_argv,
     new_session_state,
     require_claude,
     resolve_supervise_effort,
     resolve_supervise_model,
+    run_supervise_event_loop,
     run_supervised_kickoff,
     screen_session_name,
     supervise_pty_log_path,
+    supervise_stop_request_path,
     write_session_scope,
 )
 from devbench.utils.io import atomic_write_text
@@ -9892,13 +9898,69 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
     return 0
 
 
+def _supervise_spawn_child(*, launch_argv: list[str], cfg) -> Any:
+    """Spawn the interactive ``claude`` child via ``pexpect.spawn`` (Section 4.1 step 5)."""
+    return pexpect.spawn(
+        launch_argv[0],
+        args=launch_argv[1:],
+        env=dict(os.environ),
+        encoding="utf-8",
+        timeout=cfg.timeouts.ready_prompt_seconds,
+    )
+
+
+def _supervise_orchestrator_log_path(cfg) -> Path:
+    """Resolve the orchestrator log the hybrid log-tail detector watches (FR-14)."""
+    return WORKSPACE_ROOT / cfg.log_tail.orchestrator_log_relpath
+
+
+def _make_supervise_relaunch(
+    *,
+    cfg,
+    driver: PtyDriver,
+    claude_path: str,
+    model: str,
+    effort: str,
+    plugin_dir: str,
+    state,
+) -> Callable[..., None]:
+    """Return the relaunch closure the event loop calls on restart / quota-resume (Section 4.3).
+
+    Re-spawns ``claude`` with the resume flags (``--continue`` / ``--resume <id>``
+    per ``resume_mode``, via the REUSED ``build_resume_argv``), re-runs kickoff,
+    and rebinds *driver* to the fresh child so the loop continues against it. The
+    loop passes ``reason``/``resume`` kwargs (advisory audit context); the
+    relaunch always uses the resume flags, so they are accepted and not branched on.
+    """
+
+    def _relaunch(**_loop_context: object) -> None:
+        resume_argv = build_resume_argv(
+            claude_path=claude_path,
+            model=model,
+            effort=effort,
+            plugin_dir=plugin_dir,
+            restart_config=cfg.restart,
+            claude_session_id=state.claude_session_id,
+        )
+        driver.child = _supervise_spawn_child(launch_argv=resume_argv, cfg=cfg)
+        run_supervised_kickoff(
+            driver=driver,
+            injectable_commands=cfg.injectable_commands,
+            ready_timeout_seconds=cfg.timeouts.ready_prompt_seconds,
+            command_ack_seconds=cfg.timeouts.command_ack_seconds,
+        )
+
+    return _relaunch
+
+
 def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     """Hidden ``supervise __run`` body: the pexpect supervisor inside the screen (D-10).
 
     Spawns the interactive ``claude`` child, drives launch -> ready -> kickoff ->
-    running (Section 4.1 steps 5-8), records the running state, and returns 0 once
-    the session is running. The full supervise event loop (quota/restart/drain)
-    lands in later phases; this phase establishes the running state.
+    running (Section 4.1 steps 5-8), then runs the event loop (Section 4.8) until a
+    terminal: clean -> exit 0; fault -> classified non-zero; quota -> wait-and-resume
+    (NEVER an exit); restart-signal -> bounded relaunch. The final state + exit
+    reason are recorded in the registry (FR-13, FR-27).
     """
     cfg = _supervise_runtime_config()
     try:
@@ -9924,13 +9986,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         redact_patterns=cfg.logging.redact_patterns,
     )
     patterns = DetectionPatterns(cfg.detection_patterns)
-    child = pexpect.spawn(
-        launch_argv[0],
-        args=launch_argv[1:],
-        env=dict(os.environ),
-        encoding="utf-8",
-        timeout=cfg.timeouts.ready_prompt_seconds,
-    )
+    child = _supervise_spawn_child(launch_argv=launch_argv, cfg=cfg)
     driver = PtyDriver(child=child, patterns=patterns, log_writer=log_writer)
 
     state = new_session_state(
@@ -9965,8 +10021,43 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     state.state = SUPERVISE_STATE_RUNNING
     state.last_activity = datetime.now(UTC)
     registry.write_state(state)
+
+    # Run the event loop (Section 4.8) until a terminal. Quota/restart are handled
+    # inside the loop; quota NEVER exits non-zero (FR-13).
+    quota_waiter = build_quota_waiter(
+        patterns=patterns,
+        config=cfg,
+        workspace_root=WORKSPACE_ROOT,
+        session_name=parsed.name,
+    )
+    log_tail = LogTailDetector(log_path=_supervise_orchestrator_log_path(cfg), config=cfg.log_tail)
+    relaunch = _make_supervise_relaunch(
+        cfg=cfg,
+        driver=driver,
+        claude_path=claude_path,
+        model=model,
+        effort=effort,
+        plugin_dir=plugin_dir,
+        state=state,
+    )
+    result: EventLoopResult = run_supervise_event_loop(
+        driver=driver,
+        config=cfg,
+        quota_waiter=quota_waiter,
+        log_poll=log_tail.poll,
+        relaunch=relaunch,
+    )
+
+    state.state = result.final_state
+    state.exit_reason = result.exit_reason
+    state.restart_count = result.restarts_used
+    state.resumes_used = result.resumes_used
+    state.last_activity = datetime.now(UTC)
+    registry.write_state(state)
     log_writer.close()
-    return 0
+    with contextlib.suppress(Exception):
+        driver.child.terminate(force=True)
+    return result.exit_code
 
 
 def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
@@ -9985,14 +10076,72 @@ def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
     raise NotImplementedError("supervise attach (read-only follow) lands in a later implementation phase.")
 
 
+def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
+    """``supervise stop`` body: graceful drain-then-stop (Section 4.2, FR-5).
+
+    Graceful (default): request a per-session drain (so the in-flight WU finishes)
+    and write the ``stop.request`` control file the ``__run`` supervisor polls,
+    then mark the registry ``stopped``. ``--hard`` skips the drain. An unknown
+    ``--name`` exits 2 (fail-fast). A stale screen (registry running but no live
+    PID) reconciles to ``stopped`` and returns 0.
+
+    The full graceful-stop escalation + ``screen -X quit`` reconciliation is
+    expanded in Phase 4; this body lands the drain + stop-request + registry
+    transition the ``restart`` verb (Section 4.3) composes.
+    """
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    state = registry.read_state(parsed.name)
+    if state is None:
+        print(f"ERROR: no supervise session named {parsed.name!r}.", file=sys.stderr)
+        return 2
+
+    if not parsed.hard:
+        prev = os.environ.get("DEVBENCH_SESSION_NAME")
+        os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
+        try:
+            request_drain(WORKSPACE_ROOT, reason="supervise stop")
+        finally:
+            _restore_session_env_name(prev)
+        stop_request = supervise_stop_request_path(WORKSPACE_ROOT, parsed.name)
+        stop_request.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(stop_request, "supervise stop\n")
+
+    state.state = SUPERVISE_STATE_STOPPED
+    state.exit_reason = "hard-stop" if parsed.hard else "graceful-stop"
+    registry.write_state(state)
+    print(f"[supervise] state=stopped name={parsed.name} mode={'hard' if parsed.hard else 'graceful'}")
+    return 0
+
+
+def _cmd_supervise_restart(parsed: _SuperviseArgs) -> int:
+    """``supervise restart`` body: graceful stop then start, preserving context (Section 4.3, FR-12).
+
+    Performs ``stop --name N`` (graceful, capturing the claude session id from the
+    registry), then ``start --name N`` -- the start path relaunches via the resume
+    flags (``--continue``/``--resume``, REUSED from ``build_resume_argv``) so
+    orchestration context is preserved. A failed stop short-circuits (start is not
+    attempted). An unknown ``--name`` exits 2.
+    """
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    if registry.read_state(parsed.name) is None:
+        print(f"ERROR: no supervise session named {parsed.name!r}.", file=sys.stderr)
+        return 2
+
+    stop_rc = _cmd_supervise_stop(parsed)
+    if stop_rc != 0:
+        return stop_rc
+    return _cmd_supervise_start(parsed)
+
+
 def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
     """Route a validated supervise sub-verb to its body.
 
-    Phase 2 implements ``start`` (the operator-facing launch pipeline) and the
-    hidden internal ``__run`` (the program ``screen`` runs, D-10), plus the
-    ``attach --screen`` fail-fast gate (AC-33). The ``stop``/``restart``/
-    ``status``/``info`` bodies and the read-only attach follow land in later
-    phases per ``IMPLEMENTATION-PLAN.md`` and still fail fast (never a silent
+    Implemented: ``start`` (the operator-facing launch pipeline), the hidden
+    internal ``__run`` (the program ``screen`` runs, D-10, now with the full event
+    loop), ``stop`` (graceful drain-then-stop), ``restart`` (stop+start preserving
+    context, Section 4.3), and the ``attach --screen`` fail-fast gate (AC-33). The
+    read-only ``status``/``info`` bodies and the read-only attach follow land in
+    Phase 4 per ``IMPLEMENTATION-PLAN.md`` and still fail fast (never a silent
     success) until then.
 
     Args:
@@ -10010,6 +10159,10 @@ def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
         return _cmd_supervise_start(parsed)
     if sub == SUPERVISE_INTERNAL_RUN_SUBVERB:
         return _cmd_supervise_run(parsed)
+    if sub == "stop":
+        return _cmd_supervise_stop(parsed)
+    if sub == "restart":
+        return _cmd_supervise_restart(parsed)
     if sub == "attach":
         return _cmd_supervise_attach(parsed)
     raise NotImplementedError(

@@ -43,13 +43,15 @@ def _ctx(patches: list):
 
 @pytest.mark.unit
 class TestSuperviseRunReachesRunning:
-    """FR-7/FR-8: __run drives the spawned child to running + records the registry."""
+    """FR-7/FR-8/FR-13: __run drives ready -> kickoff -> event loop -> clean exit."""
 
-    def test_run_records_running(self, tmp_path: Path) -> None:
+    def test_run_records_running_then_clean(self, tmp_path: Path) -> None:
+        # ready -> ack -> (event loop reads working activity) -> ALL_DONE clean EOF.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="> "),  # ready prompt
                 _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # terminal clean
             ]
         )
         with _ctx(_patch_run(tmp_path, child)):
@@ -57,10 +59,42 @@ class TestSuperviseRunReachesRunning:
         assert rc == 0
         state = SuperviseRegistry(tmp_path).read_state("nightly")
         assert state is not None
-        assert state.state == "running"
+        # The event loop drove the session to its clean terminal (Section 4.6).
+        assert state.state == "completed-clean"
+        assert state.exit_reason == "all-done"
         assert state.claude_version == "claude 1.2.3"
         assert state.claude_path == "/usr/bin/claude"
         assert child.sent == ["/devbench-orchestrate:orchestrate"]
+
+
+@pytest.mark.unit
+class TestSuperviseRunRestartThroughRun:
+    """FR-12/Section 4.3: __run relaunches on exit-42 then completes clean (end-to-end)."""
+
+    def test_run_relaunches_on_exit_42(self, tmp_path: Path) -> None:
+        # One child double drives both the initial run and the post-relaunch run
+        # (pexpect.spawn is patched to return it again on relaunch, so its cursor
+        # walks the whole scripted sequence). exit-42 triggers the _relaunch closure.
+        restart_line = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks=1"
+        child = FakePexpectChild(
+            [
+                _ScriptStep(emit="> "),  # initial ready
+                _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                _ScriptStep(emit=restart_line, eof=True, exitstatus=42),  # restart signal
+                _ScriptStep(emit="> "),  # ready after relaunch
+                _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # clean terminal
+            ]
+        )
+        with _ctx(_patch_run(tmp_path, child)):
+            rc = cli.cmd_supervise("__run", "--name", "nightly", "--model", "claude-opus-4-8")
+        assert rc == 0
+        state = SuperviseRegistry(tmp_path).read_state("nightly")
+        assert state is not None
+        assert state.state == "completed-clean"
+        assert state.restart_count == 1
+        # The relaunch re-injected the kickoff a second time.
+        assert child.sent.count("/devbench-orchestrate:orchestrate") == 2
 
 
 @pytest.mark.unit

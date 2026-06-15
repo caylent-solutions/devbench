@@ -34,8 +34,25 @@ Phase 2 (this commit) lands the supervisor core (Section 4.0 decomposition):
   FR-19) and :func:`run_supervised_kickoff` (the launch->ready->kickoff->running
   pipeline the in-screen ``__run`` runs).
 
-The quota wait-and-resume adapter, restart loop, and the read-only verbs land in
-later phases per ``IMPLEMENTATION-PLAN.md``.
+Phase 3 (this commit) lands the quota wait-and-resume adapter, the hybrid
+log-tail detector, the bounded restart loop, the exit taxonomy classifier, and
+the ``__run`` event loop (Section 4.3/4.6/4.9):
+
+- :func:`classify_supervise_outcome` -- the Section 4.6 exit taxonomy (clean ->
+  exit 0; fault -> classified non-zero; quota -> NOT an exit).
+- :class:`LogTailDetector` -- tails the orchestrator log for the Section 1.6
+  terminal/quota/restart markers (hybrid detection alongside the PTY patterns).
+- :class:`QuotaWaiter` -- a THIN DRY ADAPTER over the shared quota primitives
+  (``quota.wait_for_reset`` / ``quota.detect_quota_error`` /
+  ``quota.QuotaCheckpoint`` / ``cli._resolve_max_quota_resumes``); the only new
+  logic is the interactive prompt detection + the resume-cap branch (FR-15).
+- :class:`RestartBudget` + :func:`build_resume_argv` -- the bounded auto-restart
+  loop honoring the exit-42 restart signal (FR-12, Section 4.3).
+- :func:`run_supervise_event_loop` -- the ``__run`` event loop wiring all of the
+  above onto the launch->running pipeline Phase 2 built (FR-13, FR-27).
+
+The read-only ``status``/``info``/``attach``/``stop`` verbs land in Phase 4 per
+``IMPLEMENTATION-PLAN.md``.
 
 All path/string literals are sourced from :mod:`devbench.constants`; no strings
 are hard-coded in this module.
@@ -43,8 +60,11 @@ are hard-coded in this module.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import enum
 import json
+import logging
 import os
 import re
 import shutil
@@ -57,14 +77,19 @@ from typing import TYPE_CHECKING, Any
 import pexpect
 
 from devbench.constants import (
+    ORCHESTRATOR_RESTART_EXIT_CODE,
     SUPERVISE_ALWAYS_DENY_ENV_VARS,
     SUPERVISE_BASE_DIR,
     SUPERVISE_BILLING_CHANNEL,
     SUPERVISE_EFFORT_DEFAULT,
+    SUPERVISE_FAULT_AUDIT_PREFIX,
+    SUPERVISE_FAULT_EXIT_CODE,
     SUPERVISE_PTY_LOG_FILENAME,
     SUPERVISE_REGISTRY_PATH,
     SUPERVISE_REGISTRY_TMP_SUFFIX,
+    SUPERVISE_RESTART_AUDIT_PREFIX,
     SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT,
+    SUPERVISE_STATE_AUDIT_PREFIX,
     SUPERVISE_STATE_COMPLETED_CLEAN,
     SUPERVISE_STATE_DRAINING,
     SUPERVISE_STATE_FAULTED,
@@ -82,7 +107,15 @@ from devbench.constants import (
 from devbench.scope import ScopeFilter, session_scope_file_path
 
 if TYPE_CHECKING:
-    from devbench.config_loader import SuperviseDetectionPatternsConfig
+    from devbench.config_loader import (
+        SuperviseConfig,
+        SuperviseDetectionPatternsConfig,
+        SuperviseLogTailConfig,
+        SuperviseRestartConfig,
+    )
+    from devbench.quota import QuotaExhaustedError
+
+logger = logging.getLogger("devbench.supervise")
 
 # ---------------------------------------------------------------------------
 # System-dependency preflight (FR-23): `screen` is a system/devcontainer
@@ -628,6 +661,14 @@ class SuperviseReadyTimeoutError(SuperviseError):
     """The interactive ready prompt did not appear within the timeout (FR-7)."""
 
 
+class SupervisePromptTimeoutError(SuperviseError):
+    """A required prompt did not arrive within its timeout mid-session (Section 4.6).
+
+    Classified as a FAULT (``prompt-timeout-<phase>``) by the event loop so a
+    stalled session exits non-zero rather than spinning forever.
+    """
+
+
 class SuperviseTransitionError(SuperviseError):
     """An illegal state-machine transition was requested (FR-27, Section 4.8)."""
 
@@ -1040,6 +1081,44 @@ class PtyDriver:
         self._tee()
         return True
 
+    @property
+    def patterns(self) -> DetectionPatterns:
+        """The compiled :class:`DetectionPatterns` this driver matches against."""
+        return self._patterns
+
+    def read_chunk(self, *, timeout_seconds: int) -> tuple[str, bool, int | None]:
+        """Read the next PTY chunk for the event loop (Section 4.1 step 8).
+
+        Returns ``(text, eof, exitstatus)``: ``text`` is the matched output (the
+        loop classifies it), ``eof`` is ``True`` when the child exited (carrying
+        its ``exitstatus``), and a prompt TIMEOUT raises
+        :class:`SupervisePromptTimeoutError` so the loop classifies a stall as a
+        fault (Section 4.6, ``prompt-timeout-<phase>``) rather than spinning.
+
+        The wildcard pattern ``.+`` matches any non-empty output chunk so the loop
+        can observe arbitrary terminal text (it is the loop, not the driver, that
+        decides whether the chunk is terminal).
+
+        Raises:
+            SupervisePromptTimeoutError: No output arrived within *timeout_seconds*.
+        """
+        try:
+            self.child.expect([r".+"], timeout=timeout_seconds)
+        except pexpect.EOF:
+            self._tee()
+            return getattr(self.child, "before", "") or "", True, getattr(self.child, "exitstatus", None)
+        except pexpect.TIMEOUT as exc:
+            raise SupervisePromptTimeoutError(
+                f"no PTY activity within {timeout_seconds}s (exit-reason=prompt-timeout-idle)."
+            ) from exc
+        self._tee()
+        self._last_text = getattr(self.child, "after", "") or getattr(self.child, "before", "") or ""
+        return self._last_text, False, None
+
+    def last_text(self) -> str:
+        """Return the most-recently-read PTY chunk (for reset-time parsing)."""
+        return getattr(self, "_last_text", "")
+
     def _tee(self) -> None:
         """Tee the most-recently-matched output to the redacted ``pty.log``."""
         if self._log_writer is not None:
@@ -1343,3 +1422,833 @@ def run_supervised_kickoff(
     injector.send("orchestrate")
     sm.on_event("orchestrate-injected")
     return sm
+
+
+# ===========================================================================
+# Phase 3 -- quota wait-and-resume adapter, log-tail, restart, exit taxonomy
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Exit taxonomy (Section 4.6, FR-13)
+# ---------------------------------------------------------------------------
+
+
+# Markers the event loop hands to :func:`classify_supervise_outcome`. These name
+# the DETECTION row of the Section 4.6 table, not a literal CLI string -- the
+# literal-to-marker mapping is the loop's job (PTY-pattern / log-tail match), so
+# the classifier stays a pure, exhaustively-tested function.
+_OUTCOME_MARKER_ALL_DONE = "ALL_DONE"
+_OUTCOME_MARKER_NO_ACTIONABLE = "NO_ACTIONABLE"
+_OUTCOME_MARKER_TERMINAL_EXIT = "[ORCHESTRATOR_TERMINAL_EXIT]"
+_OUTCOME_MARKER_CIRCUIT_BREAKER = "circuit_breaker"
+_OUTCOME_MARKER_HARNESS_BLOCK = "harness_block"
+_OUTCOME_MARKER_STOP_REASON = "stop_reason"
+_OUTCOME_MARKER_PROMPT_TIMEOUT = "prompt_timeout"
+_OUTCOME_MARKER_QUOTA_LIMIT = "quota_limit"
+_OUTCOME_MARKER_RESTART_CAP = "restart_cap_exhausted"
+_OUTCOME_MARKER_QUOTA_CAP = "quota_resume_cap_exhausted"
+
+# Markers that mean "clean terminal" (Section 4.6 rows 1-2). A clean marker only
+# yields a clean outcome when the child also exited 0 (defense in depth: a clean
+# sentinel cannot launder a non-zero process exit).
+_CLEAN_MARKERS: frozenset[str] = frozenset(
+    {_OUTCOME_MARKER_ALL_DONE, _OUTCOME_MARKER_NO_ACTIONABLE, _OUTCOME_MARKER_TERMINAL_EXIT}
+)
+
+
+@dataclass(frozen=True)
+class SuperviseOutcome:
+    """A classified supervised-session outcome (Section 4.6, FR-13).
+
+    Exactly one of the three dispositions holds:
+
+    - clean: ``is_clean`` True, ``exit_code == 0``.
+    - fault: ``is_clean``/``is_quota`` False, ``exit_code == SUPERVISE_FAULT_EXIT_CODE``.
+    - quota: ``is_quota`` True, ``exit_code is None`` (quota NEVER exits -- the
+      caller transitions to ``quota-waiting`` instead of returning a code).
+
+    Attributes:
+        exit_code: ``0`` (clean), :data:`SUPERVISE_FAULT_EXIT_CODE` (fault), or
+            ``None`` (quota -- not an exit).
+        exit_reason: The classified reason recorded in the registry.
+        is_clean: True for a clean completion.
+        is_quota: True for a quota holding state.
+    """
+
+    exit_code: int | None
+    exit_reason: str
+    is_clean: bool
+    is_quota: bool
+
+
+def _outcome_clean(reason: str) -> SuperviseOutcome:
+    return SuperviseOutcome(exit_code=0, exit_reason=reason, is_clean=True, is_quota=False)
+
+
+def _outcome_fault(reason: str) -> SuperviseOutcome:
+    return SuperviseOutcome(exit_code=SUPERVISE_FAULT_EXIT_CODE, exit_reason=reason, is_clean=False, is_quota=False)
+
+
+def _outcome_quota() -> SuperviseOutcome:
+    return SuperviseOutcome(exit_code=None, exit_reason="quota-waiting", is_clean=False, is_quota=True)
+
+
+# Fault markers whose classified exit-reason is a fixed literal (Section 4.6).
+# The dynamic fault reasons (stop-reason-<token>, prompt-timeout-<phase>,
+# claude-exit-<code>) are computed in-line; this table covers the static ones so
+# the classifier stays a flat lookup rather than a return-per-row cascade.
+_STATIC_FAULT_REASONS: dict[str, str] = {
+    _OUTCOME_MARKER_CIRCUIT_BREAKER: "circuit-breaker",
+    _OUTCOME_MARKER_HARNESS_BLOCK: "harness-self-edit-block",
+    _OUTCOME_MARKER_RESTART_CAP: "restart-cap-exhausted",
+    _OUTCOME_MARKER_QUOTA_CAP: "quota-resume-cap-exhausted",
+}
+
+
+def classify_supervise_outcome(
+    *,
+    marker: str | None,
+    child_exitstatus: int | None,
+    stop_reason: str | None = None,
+    phase: str | None = None,
+) -> SuperviseOutcome:
+    """Classify a supervised-session outcome into the Section 4.6 taxonomy (FR-13).
+
+    A non-zero child exit is ALWAYS a fault, even alongside a clean *marker* (a
+    clean sentinel cannot launder a non-zero process exit). Quota is detected
+    first among the non-clean markers because it is NOT a fault and must never
+    yield a non-zero exit (Section 4.6 last row).
+
+    Args:
+        marker: The detection marker (one of the ``_OUTCOME_MARKER_*`` tokens) or
+            ``None`` when the only signal is the child's exit status.
+        child_exitstatus: The ``claude`` child's exit status (``None`` when the
+            outcome was decided before/without a process exit, e.g. a cap or a
+            prompt timeout).
+        stop_reason: The ``[ORCHESTRATOR_STOP_REASON] reason=<token>`` token,
+            required when ``marker == "stop_reason"``.
+        phase: The phase a prompt timeout occurred in (e.g. ``"ready"``),
+            required when ``marker == "prompt_timeout"``.
+
+    Returns:
+        The classified :class:`SuperviseOutcome`.
+    """
+    # Quota is NOT a fault and must be recognized before the child-exit fault
+    # rule (a quota event may also carry a non-zero child exit on path 4.9b).
+    if marker == _OUTCOME_MARKER_QUOTA_LIMIT:
+        return _outcome_quota()
+
+    # A non-zero child exit is a fault regardless of any clean marker present.
+    if child_exitstatus is not None and child_exitstatus != 0:
+        return _outcome_fault(f"claude-exit-{child_exitstatus}")
+
+    if marker in _CLEAN_MARKERS:
+        reason = "no-actionable" if marker == _OUTCOME_MARKER_NO_ACTIONABLE else "all-done"
+        return _outcome_clean(reason)
+
+    fault_reason = _fault_reason_for_marker(marker, stop_reason=stop_reason, phase=phase)
+    if fault_reason is not None:
+        return _outcome_fault(fault_reason)
+
+    # No marker and a clean (0 / None) child exit: a bare clean process exit.
+    return _outcome_clean("all-done")
+
+
+def _fault_reason_for_marker(marker: str | None, *, stop_reason: str | None, phase: str | None) -> str | None:
+    """Return the classified fault reason for a fault *marker*, or ``None``.
+
+    Splits the marker->reason mapping out of :func:`classify_supervise_outcome`
+    so that function stays under the project's return-statement ceiling. Dynamic
+    reasons (stop-reason / prompt-timeout) embed a token/phase; the rest are a
+    table lookup (:data:`_STATIC_FAULT_REASONS`).
+    """
+    if marker == _OUTCOME_MARKER_STOP_REASON:
+        return f"stop-reason-{stop_reason or 'unknown'}"
+    if marker == _OUTCOME_MARKER_PROMPT_TIMEOUT:
+        return f"prompt-timeout-{phase or 'unknown'}"
+    return _STATIC_FAULT_REASONS.get(marker or "")
+
+
+# ---------------------------------------------------------------------------
+# LogTailDetector (Section 1.6, 4.9, FR-14, hybrid detection)
+# ---------------------------------------------------------------------------
+
+
+class LogTailKind(enum.Enum):
+    """The disposition a tailed orchestrator-log marker maps to (Section 1.6)."""
+
+    CLEAN = "clean"
+    QUOTA = "quota"
+    FAULT = "fault"
+    RESTART = "restart"
+
+
+@dataclass(frozen=True)
+class LogTailHit:
+    """One actionable orchestrator-log marker the tail detector observed."""
+
+    kind: LogTailKind
+    line: str
+
+
+class LogTailDetector:
+    """Tail the orchestrator's own log for the Section 1.6 terminal markers (FR-14).
+
+    Detection is HYBRID (Section 1.9): the supervisor watches the deterministic,
+    CLI-version-stable devbench log markers in addition to screen-scraping the
+    PTY, so a terminal/quota/restart signal is caught even when the on-screen
+    wording drifts. :meth:`poll` consumes only the bytes appended since the last
+    call (true tailing via a byte offset).
+
+    Fault markers take precedence over clean markers within a single poll batch
+    so a crash on the same poll as an earlier clean-looking line is never masked
+    (fail-fast).
+
+    Args:
+        log_path: Absolute path to the orchestrator log to tail.
+        config: The ``supervise.log_tail`` config (marker sets per disposition).
+    """
+
+    def __init__(self, *, log_path: Path, config: SuperviseLogTailConfig) -> None:
+        self._log_path = log_path
+        # Precedence order within a batch: fault, then restart, then quota, then
+        # clean (a fault must never be masked by an earlier benign line).
+        self._ordered: tuple[tuple[LogTailKind, tuple[str, ...]], ...] = (
+            (LogTailKind.FAULT, config.markers_fault),
+            (LogTailKind.RESTART, config.markers_restart),
+            (LogTailKind.QUOTA, config.markers_quota),
+            (LogTailKind.CLEAN, config.markers_clean),
+        )
+        self._offset = 0
+
+    def poll(self) -> LogTailHit | None:
+        """Return the highest-precedence actionable marker in the new log bytes.
+
+        Returns ``None`` when the log is absent, has no new bytes, or the new
+        bytes contain no configured marker. The byte offset advances each call so
+        a marker is reported at most once.
+        """
+        if not self._log_path.exists():
+            return None
+        data = self._log_path.read_text(encoding="utf-8", errors="replace")
+        if len(data) <= self._offset:
+            # No new bytes (or the file was truncated/rotated to a shorter size:
+            # reset the offset so a rotated log is re-read from its new start).
+            self._offset = min(self._offset, len(data))
+            return None
+        new_text = data[self._offset :]
+        self._offset = len(data)
+        for kind, markers in self._ordered:
+            for marker in markers:
+                idx = new_text.find(marker)
+                if idx != -1:
+                    line = new_text[idx:].splitlines()[0]
+                    return LogTailHit(kind=kind, line=line)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# QuotaWaiter (Section 4.9, FR-14/15/16) -- a THIN ADAPTER over quota.* (DRY)
+# ---------------------------------------------------------------------------
+
+
+class QuotaDecision(enum.Enum):
+    """The disposition :meth:`QuotaWaiter.wait_and_decide` returns (Section 4.9)."""
+
+    RESUME = "resume"  # window refreshed + under cap -> relaunch/continue (4.9a/4.9b)
+    WAIT = "wait"  # wait did not recover yet -> keep waiting (still NOT an exit)
+    FAULT = "fault"  # resume cap exhausted -> faulted (the ONLY quota fault path)
+
+
+@dataclass(frozen=True)
+class QuotaDecisionResult:
+    """The outcome of a quota wait (Section 4.9, FR-15/16).
+
+    Attributes:
+        action: The :class:`QuotaDecision` the caller acts on.
+        expected_resume: The provider-stated reset time surfaced by ``status``
+            (FR-16); ``None`` when the reset time was unknown.
+        exit_reason: Set only when ``action is FAULT`` (``quota-resume-cap-exhausted``).
+    """
+
+    action: QuotaDecision
+    expected_resume: datetime | None
+    exit_reason: str | None = None
+
+
+class QuotaWaiter:
+    """Interactive-path quota wait-and-resume adapter (Section 4.9, FR-14/15/16).
+
+    This is a THIN ADAPTER over the SHARED quota primitives -- it does NOT
+    reimplement the wait loop, the classifier, the resume cap, or the checkpoint
+    (FR-15, AC-32). Those are injected so the production wiring
+    (:func:`build_quota_waiter`) supplies the REAL ``quota.wait_for_reset`` /
+    ``quota.detect_quota_error`` / ``quota.save_checkpoint`` /
+    ``cli._resolve_max_quota_resumes`` callables.
+
+    The only genuinely-new logic is (i) recognizing the interactive usage-limit
+    PROMPT in screen-scraped PTY text (via the config detection patterns) and
+    (ii) the resume-cap branch. Everything about HOW LONG to wait, the cap, the
+    checkpoint, and the reset-time parse is the shared code.
+
+    Quota is NEVER a fault except when the resume cap is exhausted: a recovered
+    wait yields ``RESUME``; a not-yet-recovered wait yields ``WAIT`` (the caller
+    keeps waiting); only ``resumes_used >= cap`` yields ``FAULT``.
+
+    Args:
+        patterns: The compiled :class:`DetectionPatterns` (PTY prompt detection).
+        poll_interval_seconds: Wait cadence (``quota_handling.poll_interval_seconds``).
+        max_wait_seconds: Wait cap (``quota_handling.max_wait_seconds``).
+        wait_for_reset: The SHARED wait coroutine factory
+            (``quota.wait_for_reset``); awaited inside :meth:`wait_and_decide`.
+        detect_quota_error: The SHARED classifier (``quota.detect_quota_error``).
+        resolve_max_resumes: The SHARED resume-cap resolver
+            (``cli._resolve_max_quota_resumes``); called fresh each decision so
+            an env change is honored.
+        save_checkpoint: The SHARED checkpoint writer (``quota.save_checkpoint``).
+        workspace_root: Workspace root (passed to the checkpoint writer).
+        session_name: Session name (recorded in the checkpoint).
+        run_wait: Internal hook to run the (async) wait callable to completion;
+            defaults to :func:`asyncio.run`. Injectable for tests that supply a
+            synchronous ``wait_for_reset`` fake.
+    """
+
+    def __init__(
+        self,
+        *,
+        patterns: DetectionPatterns,
+        poll_interval_seconds: int,
+        max_wait_seconds: int,
+        wait_for_reset: Callable[..., Any],
+        detect_quota_error: Callable[[object], QuotaExhaustedError | None],
+        resolve_max_resumes: Callable[[], int],
+        save_checkpoint: Callable[..., None],
+        workspace_root: Any,
+        session_name: str,
+        run_wait: Callable[[Any], bool] | None = None,
+    ) -> None:
+        self._patterns = patterns
+        self._poll_interval = poll_interval_seconds
+        self._max_wait = max_wait_seconds
+        self._wait_for_reset = wait_for_reset
+        self._detect_quota_error = detect_quota_error
+        self._resolve_max_resumes = resolve_max_resumes
+        self._save_checkpoint = save_checkpoint
+        self._workspace_root = workspace_root
+        self._session_name = session_name
+        self._run_wait = run_wait
+
+    def is_quota_text(self, text: str) -> bool:
+        """Return True when *text* matches the interactive usage-limit prompt (FR-14)."""
+        return self._patterns.is_quota_limit(text)
+
+    def is_in_session_wait_prompt(self, text: str) -> bool:
+        """Return True when *text* offers an in-session wait/retry choice (4.9a)."""
+        return self._patterns.is_quota_wait_prompt(text)
+
+    def parse_reset_at(self, text: str) -> datetime | None:
+        """Parse the provider-stated reset time from PTY *text* (FR-16).
+
+        Delegates the H:MM(am/pm) (UTC) match to the configured ``reset_at``
+        pattern (seeded from ``quota._RESET_AT_RE``), then resolves it to the
+        next-future UTC-aware datetime.
+        """
+        from datetime import timedelta
+
+        from devbench.quota import _convert_to_24h
+
+        match = self._patterns.match_reset_at(text)
+        if match is None:
+            return None
+        raw_hour = int(match.group(1))
+        raw_minute = int(match.group(2))
+        meridiem = match.group(3).lower()
+        if raw_hour < 1 or raw_hour > 12 or raw_minute < 0 or raw_minute > 59:
+            return None
+        # Reuse the SHARED 12h->24h converter (quota._convert_to_24h) so the
+        # interactive path and the SDK path parse reset times identically (DRY).
+        hour_24 = _convert_to_24h(raw_hour, meridiem)
+        now = datetime.now(UTC)
+        candidate = now.replace(hour=hour_24, minute=raw_minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    def classify_exit(self, text: object) -> QuotaExhaustedError | None:
+        """Classify a claude exit/output as a quota signal via the SHARED classifier.
+
+        Delegates to the injected ``quota.detect_quota_error`` (no local copy);
+        used on path 4.9b to confirm a session that EXITED did so on a quota
+        condition rather than a fault.
+        """
+        return self._detect_quota_error(text)
+
+    def wait_and_decide(self, *, reset_at: datetime | None, resumes_used: int) -> QuotaDecisionResult:
+        """Persist a checkpoint, delegate the wait, and decide resume vs fault (FR-15/16).
+
+        The resume cap is checked FIRST (via the SHARED resolver): when
+        ``resumes_used >= cap`` no wait is started (a wait would be pointless when
+        no resume is permitted afterward) and the result is ``FAULT`` with
+        ``quota-resume-cap-exhausted``. Otherwise a :class:`QuotaCheckpoint` is
+        persisted (so the expected-resume survives a restart), the SHARED
+        ``quota.wait_for_reset`` is awaited, and a recovered wait yields
+        ``RESUME`` while a timed-out wait yields ``WAIT`` (keep waiting; still
+        never a non-zero exit).
+
+        Args:
+            reset_at: The parsed provider reset time (or ``None``).
+            resumes_used: Quota resumes already consumed this session.
+
+        Returns:
+            A :class:`QuotaDecisionResult`.
+        """
+        max_resumes = self._resolve_max_resumes()
+        if resumes_used >= max_resumes:
+            logger.info("%s resumes=%d/%d cap-exhausted", SUPERVISE_FAULT_AUDIT_PREFIX, resumes_used, max_resumes)
+            return QuotaDecisionResult(
+                action=QuotaDecision.FAULT,
+                expected_resume=reset_at,
+                exit_reason="quota-resume-cap-exhausted",
+            )
+
+        self._persist_checkpoint(reset_at)
+        recovered = self._delegate_wait(reset_at)
+        if recovered:
+            return QuotaDecisionResult(action=QuotaDecision.RESUME, expected_resume=reset_at)
+        return QuotaDecisionResult(action=QuotaDecision.WAIT, expected_resume=reset_at)
+
+    def _persist_checkpoint(self, reset_at: datetime | None) -> None:
+        """Persist the quota pause via the SHARED ``QuotaCheckpoint`` writer (FR-16)."""
+        from devbench.quota import QuotaCheckpoint
+
+        checkpoint = QuotaCheckpoint(
+            reason=SUPERVISE_BILLING_CHANNEL,
+            reset_at=reset_at,
+            saved_at=datetime.now(UTC),
+            session_name=self._session_name,
+        )
+        self._save_checkpoint(checkpoint, self._workspace_root)
+
+    def _delegate_wait(self, reset_at: datetime | None) -> bool:
+        """Run the SHARED ``quota.wait_for_reset`` to completion; return recovered.
+
+        The shared primitive is async; the default ``run_wait`` is
+        :func:`asyncio.run`. Tests that inject a synchronous ``wait_for_reset``
+        fake also inject a synchronous ``run_wait`` (or rely on the fake returning
+        a plain bool, in which case ``asyncio.run`` is bypassed).
+        """
+        result = self._wait_for_reset(
+            reset_at=reset_at,
+            poll_interval_seconds=self._poll_interval,
+            max_wait_seconds=self._max_wait,
+        )
+        if asyncio.iscoroutine(result):
+            runner = self._run_wait or asyncio.run
+            return bool(runner(result))
+        return bool(result)
+
+
+def build_quota_waiter(
+    *,
+    patterns: DetectionPatterns,
+    config: SuperviseConfig,
+    workspace_root: Path,
+    session_name: str,
+) -> QuotaWaiter:
+    """Wire a :class:`QuotaWaiter` to the REAL shared quota primitives (FR-15, AC-32).
+
+    This is the production wiring: it imports and injects the SHARED
+    ``quota.wait_for_reset`` / ``quota.detect_quota_error`` /
+    ``quota.save_checkpoint`` and the SHARED ``cli._resolve_max_quota_resumes`` so
+    the interactive path provably reuses the SDK path's primitives (no local
+    copy). The wait cadence/window fall through to ``quota_handling`` defaults
+    (Section 7.4) when the ``supervise.timeouts.quota_*`` overrides are unset.
+
+    Args:
+        patterns: The compiled :class:`DetectionPatterns`.
+        config: The ``supervise`` config block.
+        workspace_root: Workspace root.
+        session_name: The session name.
+
+    Returns:
+        A production-wired :class:`QuotaWaiter`.
+    """
+    from devbench import quota
+    from devbench.cli import _resolve_max_quota_resumes
+    from devbench.config import RUNTIME_CONFIG
+
+    qh = RUNTIME_CONFIG.quota_handling
+    poll = config.timeouts.quota_poll_interval_seconds
+    poll = poll if poll is not None else qh.poll_interval_seconds
+    max_wait = config.timeouts.quota_max_wait_seconds
+    max_wait = max_wait if max_wait is not None else qh.max_wait_seconds
+
+    def _resolve_cap() -> int:
+        # The supervise override (supervise.quota.max_quota_resumes), when set, is
+        # exported into the env the shared resolver reads so a single resolver
+        # (env > config > default) owns the precedence (no re-derive).
+        override = config.quota.max_quota_resumes
+        if override is not None:
+            os.environ["DEVBENCH_MAX_QUOTA_RESUMES"] = str(override)
+        return _resolve_max_quota_resumes()
+
+    return QuotaWaiter(
+        patterns=patterns,
+        poll_interval_seconds=poll,
+        max_wait_seconds=max_wait,
+        wait_for_reset=quota.wait_for_reset,
+        detect_quota_error=quota.detect_quota_error,
+        resolve_max_resumes=_resolve_cap,
+        save_checkpoint=quota.save_checkpoint,
+        workspace_root=workspace_root,
+        session_name=session_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Restart loop (Section 4.3, FR-12)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RestartBudget:
+    """Bounds auto-restarts by ``supervise.restart.max_attempts`` (FR-12, Section 4.3).
+
+    Attributes:
+        max_attempts: Maximum auto-restart relaunches before faulting with
+            ``restart-cap-exhausted``. ``0`` disables auto-restart entirely.
+    """
+
+    max_attempts: int
+
+    def may_restart(self, *, attempts_used: int) -> bool:
+        """Return True when another relaunch is within the bound."""
+        return attempts_used < self.max_attempts
+
+
+def build_resume_argv(
+    *,
+    claude_path: str,
+    model: str,
+    effort: str,
+    plugin_dir: str,
+    restart_config: SuperviseRestartConfig,
+    claude_session_id: str | None,
+) -> list[str]:
+    """Assemble the relaunch argv with resume flags per ``resume_mode`` (Section 4.3).
+
+    ``resume_mode == "resume"`` with a captured *claude_session_id* relaunches via
+    ``--resume <id>`` (resuming the exact transcript). ``resume_mode ==
+    "continue"`` (or ``"resume"`` with no captured id) relaunches via
+    ``--continue`` (the most-recent session in the project). Delegates the argv
+    shape to the Phase-2 :func:`build_claude_launch_argv` (no duplication).
+
+    Args:
+        claude_path: Resolved ``claude`` path.
+        model: Resolved interactive model.
+        effort: Resolved effort level.
+        plugin_dir: Resolved ``--plugin-dir`` target.
+        restart_config: The ``supervise.restart`` config (``resume_mode``).
+        claude_session_id: The captured session id (or ``None``).
+
+    Returns:
+        The relaunch argv.
+    """
+    use_resume_id = restart_config.resume_mode == "resume" and bool(claude_session_id)
+    return build_claude_launch_argv(
+        claude_path=claude_path,
+        model=model,
+        effort=effort,
+        plugin_dir=plugin_dir,
+        resume_session_id=claude_session_id if use_resume_id else None,
+        resume_continue=not use_resume_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# __run event loop (Section 4.1 step 8, 4.6, 4.8, 4.9)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EventLoopResult:
+    """The terminal result of :func:`run_supervise_event_loop` (FR-13, FR-27).
+
+    Attributes:
+        exit_code: The supervisor's exit code (``0`` clean, non-zero fault).
+        final_state: The state-machine state at termination.
+        exit_reason: The classified exit reason (registry + audit).
+        restarts_used: Auto-restart relaunches consumed (FR-12).
+        resumes_used: Quota resumes consumed (FR-15).
+    """
+
+    exit_code: int
+    final_state: str
+    exit_reason: str
+    restarts_used: int = 0
+    resumes_used: int = 0
+
+
+# The combined PTY pattern set the loop watches each iteration, ordered so a
+# fault/quota marker is checked before the benign working-activity prompt. Each
+# entry maps a DetectionPatterns predicate to the outcome marker the loop's
+# quota / fault handling consumes. (A crash surfaces as a non-zero child EOF, not
+# as on-screen text, so it is handled by the exit-status path, not here.)
+_PTY_WATCH_ORDER: tuple[tuple[str, str], ...] = (
+    ("is_quota_limit", _OUTCOME_MARKER_QUOTA_LIMIT),
+    ("is_circuit_breaker", _OUTCOME_MARKER_CIRCUIT_BREAKER),
+    ("is_harness_block", _OUTCOME_MARKER_HARNESS_BLOCK),
+)
+
+
+def _classify_pty_text(patterns: DetectionPatterns, text: str) -> str | None:
+    """Return the outcome marker a PTY *text* chunk matches, or ``None``.
+
+    Checks fault/quota predicates first (so a fault is never masked by the
+    working prompt). A bare working-activity match returns ``None`` (the loop
+    treats it as ongoing activity, not a terminal).
+    """
+    for predicate_name, marker in _PTY_WATCH_ORDER:
+        if getattr(patterns, predicate_name)(text):
+            return marker
+    if "ALL_DONE" in text:
+        return _OUTCOME_MARKER_ALL_DONE
+    if "NO_ACTIONABLE" in text:
+        return _OUTCOME_MARKER_NO_ACTIONABLE
+    return None
+
+
+def run_supervise_event_loop(
+    *,
+    driver: PtyDriver,
+    config: SuperviseConfig,
+    quota_waiter: Any,
+    log_poll: Callable[[], LogTailHit | None],
+    relaunch: Callable[..., None],
+    state_machine: SupervisorStateMachine | None = None,
+) -> EventLoopResult:
+    """Drive the post-kickoff supervise event loop to a terminal (FR-13, FR-27).
+
+    Each iteration: poll the hybrid log-tail, then read the PTY for the next
+    terminal/quota/restart/working signal, classify it (Section 4.6), and act:
+
+    - clean -> ``completed-clean``, exit 0.
+    - fault (crash / circuit-breaker / stop-reason / harness-block / prompt
+      timeout) -> ``faulted``, exit non-zero (classified).
+    - quota -> ``quota-waiting``; delegate to *quota_waiter*; on RESUME relaunch
+      and continue; on FAULT (cap) ``faulted``; on WAIT keep waiting (NEVER an
+      exit).
+    - restart signal (child exit 42) -> ``restarting``; relaunch within
+      ``supervise.restart.max_attempts`` else ``faulted`` (``restart-cap-exhausted``).
+
+    Args:
+        driver: The :class:`PtyDriver` wrapping the running child (kickoff done).
+        config: The ``supervise`` config block.
+        quota_waiter: A :class:`QuotaWaiter` (or compatible) for the quota path.
+        log_poll: A zero-arg callable returning the next :class:`LogTailHit` or
+            ``None`` (the hybrid log-tail; production passes
+            :meth:`LogTailDetector.poll`).
+        relaunch: A callable the loop invokes on a restart/quota-resume to
+            re-spawn the child and re-run kickoff (keyword args carry the resume
+            mode + reason). It must leave *driver* wrapping the fresh child.
+        state_machine: The :class:`SupervisorStateMachine` to drive (a fresh one
+            in the ``running`` state is created when ``None``).
+
+    Returns:
+        The terminal :class:`EventLoopResult`.
+    """
+    sm = state_machine or _running_state_machine()
+    budget = RestartBudget(max_attempts=config.restart.max_attempts)
+    idle_timeout = config.timeouts.idle_seconds
+    restarts_used = 0
+    resumes_used = 0
+
+    while True:
+        # Hybrid detection: the deterministic log markers are checked first.
+        log_hit = log_poll()
+        if log_hit is not None:
+            log_result = _handle_log_hit(log_hit, sm, restarts_used, resumes_used)
+            if log_result is not None:
+                return log_result
+            # A non-actionable (advisory) log hit falls through to the PTY read.
+
+        try:
+            observation = _observe_pty(driver, idle_timeout)
+        except SupervisePromptTimeoutError:
+            sm.on_event("fault")
+            outcome = classify_supervise_outcome(
+                marker=_OUTCOME_MARKER_PROMPT_TIMEOUT, child_exitstatus=None, phase="idle"
+            )
+            return _terminal(sm, outcome, restarts_used, resumes_used)
+        terminal = _handle_pty_observation(
+            observation, driver, sm, quota_waiter, budget, relaunch, restarts_used, resumes_used
+        )
+        result, restarts_used, resumes_used = terminal
+        if result is not None:
+            return result
+
+
+def _running_state_machine() -> SupervisorStateMachine:
+    """Return a state machine advanced to ``running`` (kickoff already happened)."""
+    sm = SupervisorStateMachine()
+    sm.on_event("ready")
+    sm.on_event("orchestrate-injected")
+    return sm
+
+
+@dataclass(frozen=True)
+class _PtyObservation:
+    """One PTY read: matched terminal *marker* and/or the child *exitstatus*."""
+
+    marker: str | None
+    exitstatus: int | None
+    eof: bool
+
+
+def _observe_pty(driver: PtyDriver, idle_timeout: int) -> _PtyObservation:
+    """Read the next PTY chunk and classify it (terminal marker / EOF / activity)."""
+    text, eof, exitstatus = driver.read_chunk(timeout_seconds=idle_timeout)
+    if eof:
+        return _PtyObservation(marker=None, exitstatus=exitstatus, eof=True)
+    marker = _classify_pty_text(driver.patterns, text)
+    return _PtyObservation(marker=marker, exitstatus=None, eof=False)
+
+
+def _handle_log_hit(
+    hit: LogTailHit,
+    sm: SupervisorStateMachine,
+    restarts_used: int,
+    resumes_used: int,
+) -> EventLoopResult | None:
+    """Act on a hybrid log-tail hit; return a terminal result or ``None``.
+
+    A CLEAN log marker terminates the loop with a clean exit; a FAULT marker
+    terminates with a classified non-zero exit. QUOTA / RESTART log markers are
+    advisory here -- their authoritative handling is the PTY path (a quota PTY
+    line or a child exit-42) -- so this returns ``None`` (the loop falls through
+    to the PTY read). This keeps a single authoritative quota/restart code path.
+    """
+    if hit.kind is LogTailKind.CLEAN:
+        sm.on_event("terminal-clean")
+        return _terminal(sm, _outcome_clean("all-done"), restarts_used, resumes_used)
+    if hit.kind is LogTailKind.FAULT:
+        sm.on_event("fault")
+        outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_STOP_REASON, child_exitstatus=None)
+        return _terminal(sm, outcome, restarts_used, resumes_used)
+    return None
+
+
+def _handle_pty_observation(
+    observation: _PtyObservation,
+    driver: PtyDriver,
+    sm: SupervisorStateMachine,
+    quota_waiter: Any,
+    budget: RestartBudget,
+    relaunch: Callable[..., None],
+    restarts_used: int,
+    resumes_used: int,
+) -> tuple[EventLoopResult | None, int, int]:
+    """Act on a PTY observation; return (result|None, restarts, resumes)."""
+    # A quota PTY marker (path 4.9a/4.9b): NEVER a non-zero exit.
+    if observation.marker == _OUTCOME_MARKER_QUOTA_LIMIT:
+        return _handle_quota(driver, sm, quota_waiter, relaunch, restarts_used, resumes_used)
+
+    # A child EOF: exit-42 is the restart signal; else classify the exit status.
+    if observation.eof:
+        if observation.exitstatus == ORCHESTRATOR_RESTART_EXIT_CODE:
+            return _handle_restart(sm, budget, relaunch, restarts_used, resumes_used)
+        outcome = classify_supervise_outcome(marker=None, child_exitstatus=observation.exitstatus)
+        sm.on_event("terminal-clean" if outcome.is_clean else "fault")
+        return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
+
+    # A fault PTY marker observed mid-session (circuit-breaker / harness-block).
+    if observation.marker in (_OUTCOME_MARKER_CIRCUIT_BREAKER, _OUTCOME_MARKER_HARNESS_BLOCK):
+        sm.on_event("fault")
+        outcome = classify_supervise_outcome(marker=observation.marker, child_exitstatus=None)
+        return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
+
+    # A clean PTY marker observed without an EOF (the child will EOF next): record
+    # working activity and keep reading until the child actually exits.
+    with contextlib.suppress(SuperviseTransitionError):
+        sm.on_event("working-activity")
+    return None, restarts_used, resumes_used
+
+
+def _handle_quota(
+    driver: PtyDriver,
+    sm: SupervisorStateMachine,
+    quota_waiter: Any,
+    relaunch: Callable[..., None],
+    restarts_used: int,
+    resumes_used: int,
+) -> tuple[EventLoopResult | None, int, int]:
+    """Handle a quota PTY marker (Section 4.9): wait, then resume / keep-waiting / fault.
+
+    Quota is a non-terminal HOLDING state (Section 4.8): the only outbound
+    transitions are ``quota-resumed``/``restarting`` (resume) or ``faulted``
+    (resume cap). A ``WAIT`` decision (the wait window elapsed without the quota
+    refreshing) is NOT an exit -- the supervisor stays in ``quota-waiting`` and
+    re-delegates the wait to the SHARED ``quota.wait_for_reset`` (event-driven,
+    no sleep). The loop is bounded: every re-wait that recovers consumes a resume
+    (FR-15), so once the resume cap is reached this faults with
+    ``quota-resume-cap-exhausted`` rather than looping forever.
+    """
+    sm.on_event("quota-detected")
+    text = driver.last_text()
+    reset_at = quota_waiter.parse_reset_at(text)
+    while True:
+        decision = quota_waiter.wait_and_decide(reset_at=reset_at, resumes_used=resumes_used)
+        if decision.action is QuotaDecision.FAULT:
+            sm.on_event("fault")
+            outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_QUOTA_CAP, child_exitstatus=None)
+            return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
+        if decision.action is QuotaDecision.RESUME:
+            # Poll-restart (4.9b): relaunch with resume flags; the same session id
+            # is retained where possible (the in-session-wait path 4.9a is
+            # best-effort until DI-5). quota-waiting -> restarting -> running.
+            sm.on_event("session-exited-on-quota")
+            relaunch(reason="quota-resume", resume=True)
+            sm.on_event("restart-launched")
+            logger.info("%s reason=quota-resume resumes=%d", SUPERVISE_RESTART_AUDIT_PREFIX, resumes_used + 1)
+            return None, restarts_used, resumes_used + 1
+        # WAIT: the window has not refreshed yet; re-delegate the bounded wait.
+        logger.info("%s state=%s reason=quota-keep-waiting", SUPERVISE_STATE_AUDIT_PREFIX, sm.state)
+
+
+def _handle_restart(
+    sm: SupervisorStateMachine,
+    budget: RestartBudget,
+    relaunch: Callable[..., None],
+    restarts_used: int,
+    resumes_used: int,
+) -> tuple[EventLoopResult | None, int, int]:
+    """Handle a child exit-42 restart signal (Section 4.3): bounded relaunch."""
+    if not budget.may_restart(attempts_used=restarts_used):
+        sm.on_event("fault")
+        outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_RESTART_CAP, child_exitstatus=None)
+        return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
+    sm.on_event("restart-signal")
+    relaunch(reason="auto-restart", resume=True)
+    sm.on_event("restart-launched")
+    logger.info("%s reason=auto-restart attempt=%d", SUPERVISE_RESTART_AUDIT_PREFIX, restarts_used + 1)
+    return None, restarts_used + 1, resumes_used
+
+
+def _terminal(
+    sm: SupervisorStateMachine,
+    outcome: SuperviseOutcome,
+    restarts_used: int,
+    resumes_used: int,
+) -> EventLoopResult:
+    """Build the terminal :class:`EventLoopResult` from a classified *outcome*."""
+    if not outcome.is_clean:
+        logger.info("%s reason=%s", SUPERVISE_FAULT_AUDIT_PREFIX, outcome.exit_reason)
+    logger.info("%s state=%s reason=%s", SUPERVISE_STATE_AUDIT_PREFIX, sm.state, outcome.exit_reason)
+    return EventLoopResult(
+        exit_code=outcome.exit_code if outcome.exit_code is not None else SUPERVISE_FAULT_EXIT_CODE,
+        final_state=sm.state,
+        exit_reason=outcome.exit_reason,
+        restarts_used=restarts_used,
+        resumes_used=resumes_used,
+    )

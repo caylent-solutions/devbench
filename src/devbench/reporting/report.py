@@ -74,6 +74,7 @@ from devbench.config import (
     WORKSPACE_ROOT,
 )
 from devbench.constants import (
+    DEFAULT_LOG_FILENAME,
     DEFAULT_SESSION_GAP_MINUTES,
     LOG_NOISE_LOGGER_NAME,
     MIN_PACE_SAMPLES,
@@ -81,12 +82,14 @@ from devbench.constants import (
     PERCENT_MULTIPLIER,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
+    SESSION_DRAIN_SIGNAL_FILENAME,
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
 from devbench.instances import is_pid_alive, pid_file_path, read_pid_file
 from devbench.reporting.event_index import EventIndex
 from devbench.scope import ScopeFilter
+from devbench.session import Session, SessionRegistry
 
 if TYPE_CHECKING:
     from devbench.backlog.proposal import BlockedTaskState
@@ -1342,6 +1345,214 @@ def _orchestrator_liveness_banner(
     if not _should_use_color():
         return line
     return f"{color}{line}{_COLOR_RESET}"
+
+
+def _session_drain_pending(session: Session) -> bool:
+    """Return ``True`` when *session* has a pending drain signal.
+
+    Reads the per-session drain signal file directly from the session's
+    ``state_dir`` (``<state_dir>/drain.signal``) -- the SAME file
+    ``devbench sessions`` consults via ``_session_drain_state_str`` and the
+    same per-session path :func:`devbench.drain.resolve_drain_signal_path`
+    writes for a named session.  The check is independent of
+    ``DEVBENCH_SESSION_NAME`` so it is accurate regardless of the reporting
+    process's environment (issue: report banner not session-aware).
+
+    Args:
+        session: The :class:`~devbench.session.Session` to inspect.
+
+    Returns:
+        ``True`` when a drain signal file exists in the session's state dir;
+        ``False`` otherwise.
+    """
+    return (session.state_dir / SESSION_DRAIN_SIGNAL_FILENAME).exists()
+
+
+def _session_log_path(session: Session) -> Path:
+    """Return the per-session orchestrator log path for *session*.
+
+    Mirrors ``cmd_report --session`` log resolution
+    (``<state_dir>/orchestrator.log``) so the banner's last-activity recency
+    is computed against the SAME per-session log the orchestrator writes,
+    never the shared aggregate log.
+
+    Args:
+        session: The :class:`~devbench.session.Session` to inspect.
+
+    Returns:
+        Absolute :class:`~pathlib.Path` of the session's orchestrator log.
+    """
+    return session.state_dir / DEFAULT_LOG_FILENAME
+
+
+def _render_one_session_banner(
+    session: Session,
+    *,
+    live_pid: bool,
+    drain_pending: bool,
+    threshold_seconds: int,
+    display_tz: tzinfo | None,
+    now: datetime,
+) -> str:
+    """Render ONE ``[SESSION <name> STATE]`` banner line for a single session.
+
+    The state machine mirrors :func:`_orchestrator_liveness_banner` but is
+    driven by THIS session's own PID liveness (already resolved by the caller
+    via :meth:`~devbench.session.SessionRegistry.is_alive`) and THIS session's
+    own per-session log recency, with an extra DRAINING state:
+
+      * **ALIVE** -- live PID + parseable log line, no drain pending.
+      * **DRAINING** -- live PID + drain signal present.  Surfaces the same
+        ``DRAIN=pending`` state ``devbench sessions`` shows.  The line carries
+        an explicit ``drain=pending`` marker.
+      * **STARTING** -- live PID but no parseable log line yet.
+      * **STOPPED** -- no live PID, regardless of log recency.
+
+    Args:
+        session: The session whose line to render.
+        live_pid: Whether this session's PID is alive (caller-resolved).
+        drain_pending: Whether this session has a pending drain signal.
+        threshold_seconds: Display-only lower bound for the STOPPED elapsed.
+        display_tz: Display timezone for the STOPPED last-seen timestamp.
+        now: Current wall-clock for elapsed-since math.
+
+    Returns:
+        A single banner line (ANSI-coloured only when colour is enabled).
+    """
+    last_ts = _read_last_log_timestamp(_session_log_path(session))
+    name = session.name
+
+    if not live_pid:
+        if last_ts is not None:
+            delta = max(0.0, (now - last_ts).total_seconds())
+            seen = _format_local_timestamp(last_ts, display_tz)
+            body = f"[SESSION {name} STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
+        else:
+            min_quiet = _format_duration(threshold_seconds)
+            body = f"[SESSION {name} STOPPED] no activity recorded; quiet for at least {min_quiet}"
+        color = _COLOR_RED_LIGHT
+    elif last_ts is None:
+        # Live PID but no parseable log line yet -- STARTING.  A pending drain
+        # is still surfaced so the operator sees it even before first activity.
+        body = f"[SESSION {name} STARTING] log file empty; no activity recorded yet"
+        if drain_pending:
+            body += " -- drain=pending"
+        color = _COLOR_YELLOW
+    else:
+        delta = max(0.0, (now - last_ts).total_seconds())
+        if drain_pending:
+            # Live + draining: DRAINING state with an explicit marker so the
+            # banner agrees with ``devbench sessions`` (DRAIN=pending).
+            body = f"[SESSION {name} DRAINING] last activity {_format_duration(delta)} ago -- drain=pending"
+            color = _COLOR_YELLOW
+        else:
+            body = f"[SESSION {name} ALIVE] last activity {_format_duration(delta)} ago"
+            color = _COLOR_GREEN
+
+    if not _should_use_color():
+        return body
+    return f"{color}{body}{_COLOR_RESET}"
+
+
+def _session_banner_lines(
+    workspace_root: Path,
+    threshold_seconds: int,
+    *,
+    display_tz: tzinfo | None = None,
+    now: datetime | None = None,
+) -> list[str] | None:
+    """Render one banner line per registered session, or ``None`` when none.
+
+    Reads the session registry that ``devbench sessions`` reads
+    (:class:`~devbench.session.SessionRegistry`, backed by
+    ``.devbench/sessions/registry.json``) and, for each registered session,
+    emits one ``[SESSION <name> STATE]`` line reflecting THAT session's own
+    PID liveness (:meth:`~devbench.session.SessionRegistry.is_alive`), its own
+    per-session log recency, and its own drain state.  This is the
+    session-aware replacement for the single global
+    :func:`_orchestrator_liveness_banner` line in multi-session runs: no
+    single aggregate ``[ORCHESTRATOR STOPPED]`` line appears while any session
+    daemon is alive, because each session is evaluated independently.
+
+    Liveness, registry, and drain reads all delegate to the SAME helpers the
+    ``devbench sessions`` command uses, so the banner cannot drift from
+    ``devbench sessions`` output.
+
+    Args:
+        workspace_root: Devbench workspace root (the registry lives under
+            ``<workspace_root>/.devbench/sessions/``).
+        threshold_seconds: Display-only lower bound for the STOPPED elapsed.
+        display_tz: Display timezone for STOPPED last-seen timestamps.
+        now: Override for the current wall-clock (test injection point).
+
+    Returns:
+        A list of per-session banner lines (one per registered session,
+        ordered as the registry stores them), or ``None`` when the registry
+        is absent or empty -- the signal for the caller to fall back to the
+        single-line :func:`_orchestrator_liveness_banner`.
+    """
+    registry = SessionRegistry(workspace_root)
+    sessions = registry.load()
+    if not sessions:
+        return None
+
+    current = now if now is not None else datetime.now(UTC)
+    lines: list[str] = []
+    for session in sessions:
+        lines.append(
+            _render_one_session_banner(
+                session,
+                live_pid=registry.is_alive(session.pid),
+                drain_pending=_session_drain_pending(session),
+                threshold_seconds=threshold_seconds,
+                display_tz=display_tz,
+                now=current,
+            )
+        )
+    return lines
+
+
+def _resolve_banner_lines(log_path: Path, display_tz: tzinfo | None) -> list[str]:
+    """Resolve the liveness banner line(s) prepended to ``devbench report``.
+
+    Session-aware: when the session registry holds >=1 session, returns one
+    ``[SESSION <name> ...]`` line per session (each reflecting that session's
+    own PID liveness, log recency, and drain state) so a single global
+    ``[ORCHESTRATOR STOPPED]`` line never appears while another session daemon
+    is alive.  When no registry exists, returns a one-element list with the
+    classic single-line ``[ORCHESTRATOR ...]`` banner (back-compat for
+    single-session / no-registry runs).
+
+    Extracted from :func:`generate_report` so the report body's branch count
+    stays under the lint ceiling and the banner-resolution policy lives in one
+    place (SRP).
+
+    Args:
+        log_path: Path to the orchestrator log used by the single-line
+            fallback's last-activity recency.
+        display_tz: Display timezone for STOPPED last-seen timestamps.
+
+    Returns:
+        A non-empty list of banner lines ready to prepend to the report.
+    """
+    session_lines = _session_banner_lines(
+        WORKSPACE_ROOT,
+        STOP_HOOK_WINDOW_SECONDS,
+        display_tz=display_tz,
+    )
+    if session_lines is not None:
+        return session_lines
+
+    session_id = os.environ.get("DEVBENCH_ORCHESTRATOR_SESSION_ID", "").strip() or None
+    return [
+        _orchestrator_liveness_banner(
+            log_path=log_path,
+            session_id=session_id,
+            threshold_seconds=STOP_HOOK_WINDOW_SECONDS,
+            pid_file=pid_file_path(WORKSPACE_ROOT),
+            display_tz=display_tz,
+        )
+    ]
 
 
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
@@ -2807,15 +3018,8 @@ def generate_report(
     # express "last activity Ns ago" -- if we cached it inside the
     # snapshot the elapsed-since string would freeze and a stalled
     # orchestrator would still appear ALIVE on every watch tick.
-    session_id = os.environ.get("DEVBENCH_ORCHESTRATOR_SESSION_ID", "").strip() or None
     banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
-    banner_line = _orchestrator_liveness_banner(
-        log_path=log_path,
-        session_id=session_id,
-        threshold_seconds=STOP_HOOK_WINDOW_SECONDS,
-        pid_file=pid_file_path(WORKSPACE_ROOT),
-        display_tz=banner_display_tz,
-    )
+    banner_lines = _resolve_banner_lines(log_path, banner_display_tz)
 
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
@@ -2943,7 +3147,7 @@ def generate_report(
         else None
     )
 
-    lines: list[str] = [banner_line, ""]
+    lines: list[str] = [*banner_lines, ""]
 
     # Spanning-row follow-up: thread the All-time cost (already paid in
     # lifetime_stats above) as the additive base for every narrower

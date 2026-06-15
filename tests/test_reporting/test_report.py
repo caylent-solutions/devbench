@@ -3516,6 +3516,8 @@ class TestOrchestratorAliveBanner:
             )
         )
         with (
+            # No registry -> single-line fallback path.
+            patch("devbench.reporting.report._session_banner_lines", return_value=None),
             patch(
                 "devbench.reporting.report._orchestrator_liveness_banner",
                 return_value="[ORCHESTRATOR FIXTURE] banner-line",
@@ -3525,6 +3527,36 @@ class TestOrchestratorAliveBanner:
             output = generate_report(log_path=log_file)
         first_nonempty = next(line for line in output.splitlines() if line.strip())
         assert first_nonempty == "[ORCHESTRATOR FIXTURE] banner-line"
+
+    def test_per_session_lines_prepended_when_registry_present(self, tmp_path: Path) -> None:
+        """When the session registry yields lines, ALL are prepended (not the single line)."""
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        session_lines = [
+            "[SESSION vpc ALIVE] last activity 4s ago",
+            "[SESSION p2 STOPPED] no activity for 6m (last seen ...)",
+        ]
+        with (
+            patch("devbench.reporting.report._session_banner_lines", return_value=session_lines),
+            # The single-line helper must NOT drive the banner when sessions exist.
+            patch(
+                "devbench.reporting.report._orchestrator_liveness_banner",
+                return_value="[ORCHESTRATOR FIXTURE] single-line",
+            ),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            output = generate_report(log_path=log_file)
+        nonempty = [line for line in output.splitlines() if line.strip()]
+        assert nonempty[0] == "[SESSION vpc ALIVE] last activity 4s ago"
+        assert nonempty[1] == "[SESSION p2 STOPPED] no activity for 6m (last seen ...)"
+        assert "[ORCHESTRATOR FIXTURE] single-line" not in output
 
     def test_banner_refreshes_under_watch_when_log_advances(self, tmp_path: Path) -> None:
         """Two successive renders against an advancing log produce different elapsed-since text."""

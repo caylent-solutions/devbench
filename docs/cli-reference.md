@@ -181,6 +181,15 @@ Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKE
 
 Every banner ends with the active session id when `DEVBENCH_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
 
+**Session-aware banner (multi-session runs):** when the session registry (`.devbench/sessions/registry.json` -- the same source `devbench sessions` reads) holds one or more registered sessions, the single global `[ORCHESTRATOR ...]` line is replaced by **one `[SESSION <name> ...]` line per registered session**. Each line is evaluated independently against THAT session's own per-session PID liveness (`SessionRegistry.is_alive`), its own per-session log (`.devbench/sessions/<name>/orchestrator.log`) recency, and its own drain signal (`.devbench/sessions/<name>/drain.signal`). The classic single global line therefore never reports `[ORCHESTRATOR STOPPED]` while another session daemon is alive. Per-session states:
+
+- `[SESSION <name> ALIVE]` (green) -- this session's PID is alive and its per-session log has a parseable timestamp (`last activity 4s ago`).
+- `[SESSION <name> DRAINING]` (yellow) -- this session's PID is alive AND a drain signal is pending for it; the line carries an explicit `-- drain=pending` marker. This surfaces the same `DRAIN=pending` state shown by `devbench sessions`.
+- `[SESSION <name> STARTING]` (yellow) -- this session's PID is alive but its per-session log has no parseable timestamp yet (a pending drain still appends `-- drain=pending`).
+- `[SESSION <name> STOPPED]` (red) -- this session's PID is dead, regardless of log recency (`no activity for 6m (last seen ...)`).
+
+When the registry is absent or empty (single classic session / no `--name` run), the banner falls back to the single-line `[ORCHESTRATOR ...]` behaviour above (back-compat). Both the daemon and foreground run modes use the same per-session rendering, since both register in the same registry.
+
 ANSI colour is emitted only when stdout is a TTY and `NO_COLOR` is unset (mirrors the existing colour rules elsewhere in the report). When piped to `cat`, redirected to a file, or running in CI, the banner renders as plain text.
 
 Refreshes on every `--watch N` tick alongside the rest of the table -- no separate clear sequence, so no flicker.

@@ -205,6 +205,29 @@ mid      42201  E11-E20       2026-05-17T10:00Z     none      ACTIVE
 late     42302  E21-E30       2026-05-17T10:00Z     none      ACTIVE
 ```
 
+**Session-aware report banner.** In a multi-session run the liveness banner at the
+top of `devbench report` (and `devbench status`) is **per session**: instead of a
+single global `[ORCHESTRATOR ...]` line, the report prints one `[SESSION <name> ...]`
+line for each session in the registry, each reflecting THAT session's own PID
+liveness, its own per-session `orchestrator.log` recency, and its own drain state.
+A draining session is shown as `DRAINING` with an explicit `drain=pending` marker,
+mirroring the `DRAIN` column of `devbench sessions`:
+
+```
+[SESSION early ALIVE] last activity 4s ago
+[SESSION mid   ALIVE] last activity 7s ago
+[SESSION late  DRAINING] last activity 3s ago -- drain=pending
+```
+
+Because each line is evaluated independently, the banner never prints a global
+`[ORCHESTRATOR STOPPED]` while any session daemon is still alive. The banner reads
+the same registry (`.devbench/sessions/registry.json`), liveness check, and
+per-session `drain.signal` that `devbench sessions` reads, so the two surfaces can
+never disagree. The per-session lines appear for both daemon and foreground sessions
+(both register in the same registry). A single classic session with no registry falls
+back to the single `[ORCHESTRATOR ...]` line (see [`report`](cli-reference.md#report)
+for the full state list).
+
 ### Step 5 -- Monitor a single session
 
 **AC-192-12** -- Session-filtered status and report work correctly.

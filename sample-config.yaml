@@ -135,6 +135,62 @@ quota_handling:
   log_structured_events: true
 
 # ---------------------------------------------------------------------------
+# Supervise: interactive `claude` CLI orchestrator under a detached `screen`
+# daemon (devbench supervise start|stop|restart|status|info|attach).
+#
+# This is the SUBSCRIPTION-billed launch channel: token consumption draws from
+# the Claude Code Max plan's rolling 5-hour windows, NOT the Anthropic API.
+# It is purely additive -- it does not change `devbench start` (the SDK path).
+# All values are optional with the documented defaults below; each is also
+# overridable via a DEVBENCH_SUPERVISE_* env var (env > yaml > default).
+# The quota wait-and-resume REUSES the quota_handling block above (DRY).
+#
+# Uncomment and edit to override. `screen` must be installed (system dep).
+# ---------------------------------------------------------------------------
+# supervise:
+#   model: null                       # null falls back to orchestrate.model then fail-fast (D-3); DEVBENCH_CLAUDE_MODEL is NOT used
+#   effort: xhigh                      # low|medium|high|xhigh|max (xhigh default; max is session-only)
+#   screen_name_prefix: devbench-supervise-
+#   timeouts:
+#     ready_prompt_seconds: 120        # wait for the first interactive ready prompt
+#     idle_seconds: 1800               # max silence before treating the session as hung
+#     command_ack_seconds: 60          # wait for a slash command to be acknowledged
+#     quota_poll_interval_seconds: null  # null reuses quota_handling.poll_interval_seconds
+#     quota_max_wait_seconds: null     # null reuses quota_handling.max_wait_seconds (5h)
+#     graceful_stop_seconds: 900       # graceful drain budget before escalating to hard stop
+#   restart:
+#     max_attempts: 5                  # bounded auto-restart on the exit-42-equivalent
+#     resume_mode: continue            # continue | resume (resume uses the captured session id)
+#   quota:
+#     max_quota_resumes: null          # null falls through to DEFAULT_MAX_QUOTA_RESUMES (1000) / DEVBENCH_MAX_QUOTA_RESUMES
+#   detection_patterns:                # version-fragility hardening -- all Claude-CLI-output regexes centralized here
+#     ready_prompt: '(?m)^\s*(>|.\s*>)\s*$'
+#     working_prompt: '(?i)(esc to interrupt|tokens|thinking)'
+#     quota_limit: '(?i)(You have hit your limit|rate.?limit.*(exceeded|reached|resets))'  # DI-5 placeholder
+#     quota_wait_prompt: '(?i)(wait.*reset|retry.*later|press.*to wait)'                    # DI-5 placeholder
+#     reset_at: 'resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)'
+#     circuit_breaker: '\[CIRCUIT_BREAKER\]|cascade depth exceeded'
+#     harness_block: '\[HARNESS_INTEGRITY\]'
+#     crash: '(?i)(panic|fatal error|traceback \(most recent call last\))'
+#   log_tail:                          # devbench's own log markers (stable across CLI versions) for hybrid detection
+#     orchestrator_log_relpath: logs/orchestrator.log
+#     markers_clean: ["ALL_DONE", "NO_ACTIONABLE", "[ORCHESTRATOR_TERMINAL_EXIT]"]
+#     markers_quota: ["[QUOTA_WAITING]", "[QUOTA_POLLING]", "[ORCHESTRATOR_QUOTA_RESUME]"]
+#     markers_fault: ["[ORCHESTRATOR_STOP_REASON]", "[ORCHESTRATOR_FATAL_ERROR]", "[HARNESS_INTEGRITY]"]
+#     markers_restart: ["[ORCHESTRATOR_AUTO_RESTART]"]
+#   env:
+#     deny_vars: []                    # ADDITIONAL deny vars; the ANTHROPIC_*/AWS_*/DEVBENCH_USE_BEDROCK set is always stripped (non-removable)
+#   logging:
+#     pty_log_relpath: pty.log         # under the session state dir; created mode 0600
+#     redact_patterns: ["sk-ant-[A-Za-z0-9_-]+", "AKIA[0-9A-Z]{16}", "(?i)aws_secret[^\\s]*", "Bearer\\s+[A-Za-z0-9._-]+"]
+#   injectable_commands:               # extensible name->literal map; add capabilities via config, no code change
+#     orchestrate: "/devbench-orchestrate:orchestrate"
+#     effort_xhigh: "/effort xhigh"
+#     model_opus: "/model opus"
+#     quota_wait_choice: "1"           # DI-5 placeholder
+#     drain_now: "/exit"
+
+# ---------------------------------------------------------------------------
 # Timeouts (seconds)
 # ---------------------------------------------------------------------------
 timeouts:

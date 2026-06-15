@@ -91,6 +91,26 @@ from devbench.constants import (
     OPTIONAL_JUDGE_NAMES,
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
+    SUPERVISE_ALWAYS_DENY_ENV_VARS,
+    SUPERVISE_DETECTION_PATTERNS_DEFAULT,
+    SUPERVISE_EFFORT_DEFAULT,
+    SUPERVISE_INJECTABLE_COMMANDS_DEFAULT,
+    SUPERVISE_LOG_PTY_LOG_RELPATH_DEFAULT,
+    SUPERVISE_LOG_REDACT_PATTERNS_DEFAULT,
+    SUPERVISE_LOG_TAIL_MARKERS_CLEAN_DEFAULT,
+    SUPERVISE_LOG_TAIL_MARKERS_FAULT_DEFAULT,
+    SUPERVISE_LOG_TAIL_MARKERS_QUOTA_DEFAULT,
+    SUPERVISE_LOG_TAIL_MARKERS_RESTART_DEFAULT,
+    SUPERVISE_LOG_TAIL_ORCHESTRATOR_LOG_RELPATH_DEFAULT,
+    SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT,
+    SUPERVISE_RESUME_MODE_DEFAULT,
+    SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT,
+    SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT,
+    SUPERVISE_VALID_EFFORT_LEVELS,
+    SUPERVISE_VALID_RESUME_MODES,
     ModelRates,
 )
 
@@ -113,6 +133,15 @@ _QUOTA_HANDLING_VALID_RESUME_STRATEGY: frozenset[str] = frozenset(
 _QUOTA_HANDLING_POLL_INTERVAL_MIN: int = 30
 _QUOTA_HANDLING_POLL_INTERVAL_MAX: int = 3600
 _QUOTA_HANDLING_MAX_WAIT_MIN: int = 1
+
+# Supervise (devbench-supervise-screen-orchestrator). Every timeout and the
+# restart-attempt count must be >= 1 (Section 5.2). Effort + resume-mode enums
+# and the always-deny env set come from constants. A config attempting to
+# whitelist an always-deny env var via negation (``!ANTHROPIC_API_KEY``) is a
+# fail-fast error (Section 3.6.1, FR-21).
+_SUPERVISE_MIN_TIMEOUT_SECONDS: int = 1
+_SUPERVISE_MIN_RESTART_ATTEMPTS: int = 1
+_SUPERVISE_DENY_NEGATION_PREFIX: str = "!"
 
 # Harness self-edit integrity check (trust-gap fix). When ``devbench start``
 # launches the orchestrator it can warn (or fail fast) if there are uncommitted
@@ -776,6 +805,123 @@ class QuotaHandlingConfig:
 
 
 @dataclass(frozen=True)
+class SuperviseTimeoutsConfig:
+    """``supervise.timeouts`` block (Section 5.1).
+
+    Every value is in seconds and must be >= 1. ``quota_poll_interval_seconds``
+    and ``quota_max_wait_seconds`` are ``None`` by default and fall through to
+    ``quota_handling.poll_interval_seconds`` / ``max_wait_seconds`` (Section 7.4,
+    Section 4.9) when unset.
+    """
+
+    ready_prompt_seconds: int = SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT
+    idle_seconds: int = SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT
+    command_ack_seconds: int = SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT
+    quota_poll_interval_seconds: int | None = None
+    quota_max_wait_seconds: int | None = None
+    graceful_stop_seconds: int = SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT
+
+
+@dataclass(frozen=True)
+class SuperviseRestartConfig:
+    """``supervise.restart`` block (Section 5.1, FR-12)."""
+
+    max_attempts: int = SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT
+    resume_mode: str = SUPERVISE_RESUME_MODE_DEFAULT
+
+
+@dataclass(frozen=True)
+class SuperviseQuotaConfig:
+    """``supervise.quota`` block (Section 5.1, FR-15).
+
+    ``max_quota_resumes`` is ``None`` by default and falls through to
+    ``DEFAULT_MAX_QUOTA_RESUMES`` / ``DEVBENCH_MAX_QUOTA_RESUMES`` resolved by
+    ``cli._resolve_max_quota_resumes`` (the supervisor does not re-derive it).
+    """
+
+    max_quota_resumes: int | None = None
+
+
+@dataclass(frozen=True)
+class SuperviseDetectionPatternsConfig:
+    """``supervise.detection_patterns`` block (Section 5.1, 6.3, FR-29).
+
+    All Claude-CLI-output detection regexes are centralized here so a CLI
+    prompt-text change is fixed by editing config, not code. ``quota_limit`` /
+    ``quota_wait_prompt`` are PLACEHOLDERS pending DI-5.
+    """
+
+    ready_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["ready_prompt"]
+    working_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["working_prompt"]
+    quota_limit: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["quota_limit"]
+    quota_wait_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["quota_wait_prompt"]
+    reset_at: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["reset_at"]
+    circuit_breaker: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["circuit_breaker"]
+    harness_block: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["harness_block"]
+    crash: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["crash"]
+
+
+@dataclass(frozen=True)
+class SuperviseLogTailConfig:
+    """``supervise.log_tail`` block (Section 5.1, FR-14, FR-29).
+
+    These are devbench's OWN log markers (Section 1.6), stable across CLI
+    versions, used as the hybrid-detection fallback to screen-scraping.
+    """
+
+    orchestrator_log_relpath: str = SUPERVISE_LOG_TAIL_ORCHESTRATOR_LOG_RELPATH_DEFAULT
+    markers_clean: tuple[str, ...] = SUPERVISE_LOG_TAIL_MARKERS_CLEAN_DEFAULT
+    markers_quota: tuple[str, ...] = SUPERVISE_LOG_TAIL_MARKERS_QUOTA_DEFAULT
+    markers_fault: tuple[str, ...] = SUPERVISE_LOG_TAIL_MARKERS_FAULT_DEFAULT
+    markers_restart: tuple[str, ...] = SUPERVISE_LOG_TAIL_MARKERS_RESTART_DEFAULT
+
+
+@dataclass(frozen=True)
+class SuperviseEnvConfig:
+    """``supervise.env`` block (Section 5.1, FR-21).
+
+    ``deny_vars`` are ADDITIONAL deny vars layered on top of the non-removable
+    ``SUPERVISE_ALWAYS_DENY_ENV_VARS`` set.
+    """
+
+    deny_vars: tuple[str, ...] = SUPERVISE_ALWAYS_DENY_ENV_VARS  # overwritten by parser default
+
+
+@dataclass(frozen=True)
+class SuperviseLoggingConfig:
+    """``supervise.logging`` block (Section 3.6.3, FR-24)."""
+
+    pty_log_relpath: str = SUPERVISE_LOG_PTY_LOG_RELPATH_DEFAULT
+    redact_patterns: tuple[str, ...] = SUPERVISE_LOG_REDACT_PATTERNS_DEFAULT
+
+
+@dataclass(frozen=True)
+class SuperviseConfig:
+    """The ``supervise:`` config block (Section 5.1).
+
+    Drives the interactive ``claude`` orchestrator under ``screen``. Every
+    operational value is a config field with a documented default, each
+    overridable by a ``DEVBENCH_SUPERVISE_*`` env var (resolution happens in
+    ``config.py`` / the supervisor, env > yaml > default, Section 7.4).
+
+    ``model`` is ``None`` by default and falls through to ``orchestrate.model``
+    -> fail-fast (D-3); ``DEVBENCH_CLAUDE_MODEL`` is NOT consulted.
+    """
+
+    model: str | None = None
+    effort: str = SUPERVISE_EFFORT_DEFAULT
+    screen_name_prefix: str = SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT
+    timeouts: SuperviseTimeoutsConfig = field(default_factory=SuperviseTimeoutsConfig)
+    restart: SuperviseRestartConfig = field(default_factory=SuperviseRestartConfig)
+    quota: SuperviseQuotaConfig = field(default_factory=SuperviseQuotaConfig)
+    detection_patterns: SuperviseDetectionPatternsConfig = field(default_factory=SuperviseDetectionPatternsConfig)
+    log_tail: SuperviseLogTailConfig = field(default_factory=SuperviseLogTailConfig)
+    env: SuperviseEnvConfig = field(default_factory=lambda: SuperviseEnvConfig(deny_vars=()))
+    logging: SuperviseLoggingConfig = field(default_factory=SuperviseLoggingConfig)
+    injectable_commands: dict[str, str] = field(default_factory=lambda: dict(SUPERVISE_INJECTABLE_COMMANDS_DEFAULT))
+
+
+@dataclass(frozen=True)
 class BacklogConfig:
     """Backlog lifecycle settings loaded from the ``backlog:`` YAML section.
 
@@ -1043,6 +1189,185 @@ def _parse_quota_handling_config(path: Path, raw: dict) -> QuotaHandlingConfig:
         audit_comment_on_wait=bool(raw.get("audit_comment_on_wait", defaults.audit_comment_on_wait)),
         audit_comment_on_resume=bool(raw.get("audit_comment_on_resume", defaults.audit_comment_on_resume)),
         log_structured_events=bool(raw.get("log_structured_events", defaults.log_structured_events)),
+    )
+
+
+def _require_supervise_timeout(path: Path, raw: dict, key: str, default: int) -> int:
+    """Resolve + validate one ``supervise.timeouts`` integer (>= 1).
+
+    Args:
+        path: Config file path (for error messages).
+        raw: The ``supervise.timeouts`` dict.
+        key: The field name.
+        default: The documented default.
+
+    Returns:
+        The validated integer.
+
+    Raises:
+        ValueError: The value is below ``_SUPERVISE_MIN_TIMEOUT_SECONDS``.
+    """
+    value = int(raw.get(key, default))
+    if value < _SUPERVISE_MIN_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"Config file '{path}': supervise.timeouts.{key} {value!r} must be >= {_SUPERVISE_MIN_TIMEOUT_SECONDS}."
+        )
+    return value
+
+
+def _optional_supervise_timeout(path: Path, raw: dict, key: str) -> int | None:
+    """Resolve + validate an OPTIONAL ``supervise.timeouts`` integer (>= 1 or None).
+
+    Returns ``None`` when absent so the field falls through to ``quota_handling``
+    (Section 7.4). When present it must be >= 1.
+
+    Raises:
+        ValueError: A present value is below ``_SUPERVISE_MIN_TIMEOUT_SECONDS``.
+    """
+    if raw.get(key) is None:
+        return None
+    value = int(raw[key])
+    if value < _SUPERVISE_MIN_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"Config file '{path}': supervise.timeouts.{key} {value!r} must be >= {_SUPERVISE_MIN_TIMEOUT_SECONDS}."
+        )
+    return value
+
+
+def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
+    """Parse and validate the ``supervise:`` YAML section (Section 5.1, FR-19).
+
+    Modeled on :func:`_parse_quota_handling_config`. Applies the field defaults
+    from :mod:`devbench.constants`, validates enums + integer bounds, and
+    fail-fast rejects any attempt to whitelist an always-deny env var by
+    negation (Section 3.6.1, FR-21). Unknown ``supervise.*`` keys are rejected
+    upstream by ``jsonschema.validate`` (the schema sets
+    ``additionalProperties: false`` on the block).
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw ``supervise`` dict from YAML. May be empty.
+
+    Returns:
+        ``SuperviseConfig`` populated from *raw* with documented defaults.
+
+    Raises:
+        ValueError: An enum field is invalid, an integer is out of bounds, or a
+            config tries to whitelist an always-deny env var.
+    """
+    defaults = SuperviseConfig()
+
+    effort = raw.get("effort", defaults.effort)
+    if effort not in SUPERVISE_VALID_EFFORT_LEVELS:
+        valid = ", ".join(sorted(SUPERVISE_VALID_EFFORT_LEVELS))
+        raise ValueError(f"Config file '{path}': supervise.effort {effort!r} is not one of [{valid}].")
+
+    model = raw.get("model")
+    model = model.strip() if isinstance(model, str) and model.strip() else None
+
+    timeouts_raw = raw.get("timeouts") or {}
+    dt = defaults.timeouts
+    timeouts = SuperviseTimeoutsConfig(
+        ready_prompt_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "ready_prompt_seconds", dt.ready_prompt_seconds
+        ),
+        idle_seconds=_require_supervise_timeout(path, timeouts_raw, "idle_seconds", dt.idle_seconds),
+        command_ack_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "command_ack_seconds", dt.command_ack_seconds
+        ),
+        quota_poll_interval_seconds=_optional_supervise_timeout(path, timeouts_raw, "quota_poll_interval_seconds"),
+        quota_max_wait_seconds=_optional_supervise_timeout(path, timeouts_raw, "quota_max_wait_seconds"),
+        graceful_stop_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "graceful_stop_seconds", dt.graceful_stop_seconds
+        ),
+    )
+
+    restart_raw = raw.get("restart") or {}
+    resume_mode = restart_raw.get("resume_mode", defaults.restart.resume_mode)
+    if resume_mode not in SUPERVISE_VALID_RESUME_MODES:
+        valid = ", ".join(sorted(SUPERVISE_VALID_RESUME_MODES))
+        raise ValueError(
+            f"Config file '{path}': supervise.restart.resume_mode {resume_mode!r} is not one of [{valid}]."
+        )
+    max_attempts = int(restart_raw.get("max_attempts", defaults.restart.max_attempts))
+    if max_attempts < _SUPERVISE_MIN_RESTART_ATTEMPTS:
+        raise ValueError(
+            f"Config file '{path}': supervise.restart.max_attempts {max_attempts!r} "
+            f"must be >= {_SUPERVISE_MIN_RESTART_ATTEMPTS}."
+        )
+    restart = SuperviseRestartConfig(max_attempts=max_attempts, resume_mode=resume_mode)
+
+    quota_raw = raw.get("quota") or {}
+    max_quota_resumes = quota_raw.get("max_quota_resumes")
+    if max_quota_resumes is not None:
+        max_quota_resumes = int(max_quota_resumes)
+        if max_quota_resumes < 1:
+            raise ValueError(
+                f"Config file '{path}': supervise.quota.max_quota_resumes {max_quota_resumes!r} must be >= 1."
+            )
+    quota = SuperviseQuotaConfig(max_quota_resumes=max_quota_resumes)
+
+    dp_raw = raw.get("detection_patterns") or {}
+    dp_def = defaults.detection_patterns
+    detection_patterns = SuperviseDetectionPatternsConfig(
+        ready_prompt=dp_raw.get("ready_prompt", dp_def.ready_prompt),
+        working_prompt=dp_raw.get("working_prompt", dp_def.working_prompt),
+        quota_limit=dp_raw.get("quota_limit", dp_def.quota_limit),
+        quota_wait_prompt=dp_raw.get("quota_wait_prompt", dp_def.quota_wait_prompt),
+        reset_at=dp_raw.get("reset_at", dp_def.reset_at),
+        circuit_breaker=dp_raw.get("circuit_breaker", dp_def.circuit_breaker),
+        harness_block=dp_raw.get("harness_block", dp_def.harness_block),
+        crash=dp_raw.get("crash", dp_def.crash),
+    )
+
+    lt_raw = raw.get("log_tail") or {}
+    lt_def = defaults.log_tail
+    log_tail = SuperviseLogTailConfig(
+        orchestrator_log_relpath=lt_raw.get("orchestrator_log_relpath", lt_def.orchestrator_log_relpath),
+        markers_clean=tuple(lt_raw.get("markers_clean", lt_def.markers_clean)),
+        markers_quota=tuple(lt_raw.get("markers_quota", lt_def.markers_quota)),
+        markers_fault=tuple(lt_raw.get("markers_fault", lt_def.markers_fault)),
+        markers_restart=tuple(lt_raw.get("markers_restart", lt_def.markers_restart)),
+    )
+
+    env_raw = raw.get("env") or {}
+    deny_vars = tuple(env_raw.get("deny_vars", ()))
+    # FR-21 / Section 3.6.1: the always-deny set is non-removable. A config that
+    # tries to whitelist one (by negation, e.g. "!ANTHROPIC_API_KEY") is a
+    # fail-fast config error.
+    for var in deny_vars:
+        if var.startswith(_SUPERVISE_DENY_NEGATION_PREFIX):
+            target = var[len(_SUPERVISE_DENY_NEGATION_PREFIX) :]
+            if target in SUPERVISE_ALWAYS_DENY_ENV_VARS:
+                raise ValueError(
+                    f"Config file '{path}': supervise.env.deny_vars cannot whitelist the always-deny "
+                    f"variable {target!r}. An interactive supervised session must bill against the Claude "
+                    f"Code subscription, not the API; the {target!r} routing var is always stripped."
+                )
+    env_cfg = SuperviseEnvConfig(deny_vars=deny_vars)
+
+    log_raw = raw.get("logging") or {}
+    log_def = defaults.logging
+    logging_cfg = SuperviseLoggingConfig(
+        pty_log_relpath=log_raw.get("pty_log_relpath", log_def.pty_log_relpath),
+        redact_patterns=tuple(log_raw.get("redact_patterns", log_def.redact_patterns)),
+    )
+
+    injectable = dict(SUPERVISE_INJECTABLE_COMMANDS_DEFAULT)
+    injectable.update(raw.get("injectable_commands") or {})
+
+    return SuperviseConfig(
+        model=model,
+        effort=effort,
+        screen_name_prefix=raw.get("screen_name_prefix", defaults.screen_name_prefix),
+        timeouts=timeouts,
+        restart=restart,
+        quota=quota,
+        detection_patterns=detection_patterns,
+        log_tail=log_tail,
+        env=env_cfg,
+        logging=logging_cfg,
+        injectable_commands=injectable,
     )
 
 
@@ -1641,6 +1966,7 @@ class RuntimeConfig:
     debug: DebugConfig = field(default_factory=DebugConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
+    supervise: SuperviseConfig = field(default_factory=SuperviseConfig)
     auto_resolve: AutoResolveConfig = field(default_factory=AutoResolveConfig)
     done_gate: DoneGateConfig = field(default_factory=DoneGateConfig)
     allowed_orgs: list[str] = field(default_factory=list)
@@ -2187,6 +2513,13 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     quota_handling_raw = raw.get("quota_handling") or {}
     quota_handling = _parse_quota_handling_config(path, quota_handling_raw)
 
+    # Populate SuperviseConfig from YAML supervise block
+    # (devbench-supervise-screen-orchestrator, Section 5.1). The schema enforces
+    # enums/bounds/unknown-key rejection; the parser re-validates with clear
+    # messages and fail-fast rejects always-deny env whitelist attempts (FR-21).
+    supervise_raw = raw.get("supervise") or {}
+    supervise = _parse_supervise_config(path, supervise_raw)
+
     # Populate AutoResolveConfig from YAML auto_resolve block (issue #263, E11-F1-S1).
     # Schema enforces correct types; absent fields yield the unset-safe defaults.
     auto_resolve_raw = raw.get("auto_resolve") or {}
@@ -2220,6 +2553,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         debug=debug,
         notifications=notifications,
         quota_handling=quota_handling,
+        supervise=supervise,
         auto_resolve=auto_resolve,
         done_gate=done_gate,
         allowed_orgs=allowed_orgs,

@@ -914,6 +914,102 @@
         }
       }
     },
+    "supervise": {
+      "type": "object",
+      "description": "Interactive `claude` CLI orchestrator under a detached `screen` daemon (devbench-supervise-screen-orchestrator, Section 5.1). Subscription-billed; reuses quota_handling. All operational values are config fields with DEVBENCH_SUPERVISE_* env overrides.",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": ["string", "null"],
+          "description": "Default interactive model. null falls through to orchestrate.model then fail-fast (D-3). DEVBENCH_CLAUDE_MODEL is NOT consulted."
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "description": "Effort level. Default 'xhigh'; 'max' is session-only."
+        },
+        "screen_name_prefix": {
+          "type": "string",
+          "description": "Prefix for the screen session name (<prefix><name>). Default 'devbench-supervise-'."
+        },
+        "timeouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ready_prompt_seconds": {"type": "integer", "minimum": 1, "description": "Wait for the first interactive ready prompt. Default 120."},
+            "idle_seconds": {"type": "integer", "minimum": 1, "description": "Max silence before treating the session as hung. Default 1800."},
+            "command_ack_seconds": {"type": "integer", "minimum": 1, "description": "Wait for a slash command to be acknowledged. Default 60."},
+            "quota_poll_interval_seconds": {"type": ["integer", "null"], "minimum": 1, "description": "Reuses quota_handling.poll_interval_seconds when null."},
+            "quota_max_wait_seconds": {"type": ["integer", "null"], "minimum": 1, "description": "Reuses quota_handling.max_wait_seconds when null (5h)."},
+            "graceful_stop_seconds": {"type": "integer", "minimum": 1, "description": "Graceful drain budget before escalating to hard stop. Default 900."}
+          }
+        },
+        "restart": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_attempts": {"type": "integer", "minimum": 1, "description": "Bounded auto-restart on exit-42-equivalent. Default 5."},
+            "resume_mode": {"type": "string", "enum": ["continue", "resume"], "description": "continue | resume (resume uses captured session id). Default 'continue'."}
+          }
+        },
+        "quota": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_quota_resumes": {"type": ["integer", "null"], "minimum": 1, "description": "null falls through to DEFAULT_MAX_QUOTA_RESUMES (1000) / DEVBENCH_MAX_QUOTA_RESUMES."}
+          }
+        },
+        "detection_patterns": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Version-fragility hardening (Section 6.3). All Claude-CLI-output regexes centralized here. quota_limit/quota_wait_prompt are DI-5 placeholders.",
+          "properties": {
+            "ready_prompt": {"type": "string"},
+            "working_prompt": {"type": "string"},
+            "quota_limit": {"type": "string"},
+            "quota_wait_prompt": {"type": "string"},
+            "reset_at": {"type": "string"},
+            "circuit_breaker": {"type": "string"},
+            "harness_block": {"type": "string"},
+            "crash": {"type": "string"}
+          }
+        },
+        "log_tail": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "devbench's own log markers (Section 1.6), stable across CLI versions, for hybrid detection.",
+          "properties": {
+            "orchestrator_log_relpath": {"type": "string"},
+            "markers_clean": {"type": "array", "items": {"type": "string"}},
+            "markers_quota": {"type": "array", "items": {"type": "string"}},
+            "markers_fault": {"type": "array", "items": {"type": "string"}},
+            "markers_restart": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "ADDITIONAL deny vars; the always-deny ANTHROPIC_*/AWS_*/DEVBENCH_USE_BEDROCK set is non-removable (FR-21).",
+          "properties": {
+            "deny_vars": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "logging": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "PTY-log redaction config (Section 3.6.3, FR-24).",
+          "properties": {
+            "pty_log_relpath": {"type": "string"},
+            "redact_patterns": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "injectable_commands": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "description": "Extensible name->literal map of slash commands the supervisor can inject (Section 5.3, FR-28). New capabilities are added via config, no code change."
+        }
+      }
+    },
     "auto_resolve": {
       "type": "object",
       "description": "Auto-resolve engine configuration (issue #263, E11-F1-S1). When enabled, the engine auto-applies a whitelisted non-destructive remediation without operator intervention. Default: disabled (advise-only mode preserved). Override enabled via DEVBENCH_AUTO_RESOLVE_ENABLED.",

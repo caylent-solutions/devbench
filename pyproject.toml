@@ -17,6 +17,11 @@ dependencies = [
     "botocore>=1.35.0",
     "claude-agent-sdk>=0.2.87",
     "jsonschema>=4.0.0",
+    # devbench-supervise-screen-orchestrator (FR-22): pexpect drives the
+    # interactive `claude` CLI session inside the screen daemon via a PTY.
+    # `screen` itself is a system/devcontainer dependency probed at launch
+    # (FR-23), not a Python dependency.
+    "pexpect>=4.9.0",
 ]
 
 # Issue #162 Phase 7 (ADR-21): opt-in Parquet cold archive. The mainline
@@ -42,6 +47,9 @@ dev = [
     "mypy>=1.15.0",
     "types-pyyaml>=6.0.12.20250915",
     "types-jsonschema>=4.23.0.20241208",
+    # devbench-supervise-screen-orchestrator (FR-22): mypy stubs for the new
+    # pexpect runtime dependency so the supervisor + its tests type-check.
+    "types-pexpect>=4.9.0",
     # Issue #162 Phase 7: tests exercise the [archive] extra's
     # round-trip behaviour. Mainline `pip install devbench` does NOT
     # carry pyarrow; only `pip install devbench[archive]` does. The

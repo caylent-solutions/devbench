@@ -220,6 +220,10 @@ from devbench.constants import (
     STATUS_PROPOSED,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
+    SUPERVISE_DEFAULT_NAME,
+    SUPERVISE_INTERNAL_RUN_SUBVERB,
+    SUPERVISE_SESSION_NAME_PATTERN,
+    SUPERVISE_SUBVERBS,
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
@@ -9487,6 +9491,198 @@ def cmd_prepare_plugin_shadow() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# supervise: interactive `claude` CLI orchestrator under a detached `screen`
+# daemon (devbench-supervise-screen-orchestrator). Phase 1 lands the verb
+# surface + arg parsing + dispatch; the sub-verb bodies land in later phases.
+# ---------------------------------------------------------------------------
+
+_SUPERVISE_SESSION_NAME_RE = re.compile(SUPERVISE_SESSION_NAME_PATTERN)
+
+_SUPERVISE_USAGE: str = (
+    "usage: devbench supervise <start|stop|restart|status|info|attach> [options]\n"
+    "Supervise an interactive `claude` CLI orchestrator inside a detached `screen`\n"
+    "daemon, driven by a pexpect supervisor. Token consumption bills against the\n"
+    "Claude Code subscription's rolling 5-hour windows (NOT the Anthropic API).\n"
+    "\n"
+    "sub-verbs:\n"
+    "  start     Launch a supervised interactive orchestrator under screen\n"
+    "  stop      Stop a supervised session (graceful drain, or --hard)\n"
+    "  restart   Stop then relaunch preserving session context (--continue)\n"
+    "  status    Show per-session state (running/quota-waiting/draining/...)\n"
+    "  info      List all supervise screens and how to attach\n"
+    "  attach    Observe a running session read-only (no input injection)"
+)
+
+
+@dataclass(frozen=True)
+class _SuperviseArgs:
+    """Parsed ``devbench supervise <sub>`` flags (FR-2).
+
+    The same flag set serves every sub-verb; each sub-verb consumes the subset
+    it needs (``--hard`` for stop, ``--screen`` for attach, scope/model/effort
+    for start). Defaults mirror Section 14's ``--help`` snapshots.
+    """
+
+    name: str = SUPERVISE_DEFAULT_NAME
+    include: str = ""
+    exclude: str = ""
+    allow_overlap: bool = False
+    model: str | None = None
+    effort: str | None = None
+    hard: bool = False
+    screen: bool = False
+
+
+def _validate_supervise_name(name: str) -> None:
+    """Validate a supervise ``--name`` against the ADR-23 grammar (FR-2).
+
+    Accepts non-empty names matching ``^[A-Za-z0-9][A-Za-z0-9_-]*$`` and rejects
+    path-traversal ``..`` segments. Fail-fast with a clear, actionable message.
+
+    Args:
+        name: The candidate session name.
+
+    Raises:
+        ValueError: *name* is empty, contains a ``..`` segment, or does not
+            match the grammar.
+    """
+    if ".." in Path(name).parts or not _SUPERVISE_SESSION_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid session name {name!r}: use alphanumerics, hyphen, underscore "
+            "(must start with an alphanumeric; no path separators or '..')."
+        )
+
+
+# Flag tokens that take a value, mapped to the ``_SuperviseArgs`` field they set.
+_SUPERVISE_VALUE_FLAGS: dict[str, str] = {
+    "--name": "name",
+    "--include": "include",
+    "--exclude": "exclude",
+    "--model": "model",
+    "--effort": "effort",
+}
+# Boolean flag tokens, mapped to the ``_SuperviseArgs`` field they set ``True``.
+_SUPERVISE_BOOL_FLAGS: dict[str, str] = {
+    "--allow-overlap": "allow_overlap",
+    "--hard": "hard",
+    "--screen": "screen",
+}
+
+
+def _parse_supervise_args(args: list[str]) -> _SuperviseArgs:
+    """Parse the shared ``supervise`` sub-verb flags (FR-2).
+
+    Table-driven over ``_SUPERVISE_VALUE_FLAGS`` (flags taking a value) and
+    ``_SUPERVISE_BOOL_FLAGS`` (boolean flags) so the parser stays flat and a new
+    flag is added by extending a table, not the control flow.
+
+    Args:
+        args: The flag tokens following the sub-verb.
+
+    Returns:
+        A populated :class:`_SuperviseArgs`.
+
+    Raises:
+        ValueError: A flag is missing its value or is unknown (fail-fast).
+    """
+    values: dict[str, str] = {}
+    bools: dict[str, bool] = {}
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _SUPERVISE_VALUE_FLAGS:
+            if i + 1 >= len(args):
+                raise ValueError(f"{arg} requires a value")
+            values[_SUPERVISE_VALUE_FLAGS[arg]] = args[i + 1]
+            i += 2
+        elif arg in _SUPERVISE_BOOL_FLAGS:
+            bools[_SUPERVISE_BOOL_FLAGS[arg]] = True
+            i += 1
+        else:
+            raise ValueError(f"unknown flag for 'supervise': {arg!r}")
+
+    return _SuperviseArgs(
+        name=values.get("name", SUPERVISE_DEFAULT_NAME),
+        include=values.get("include", ""),
+        exclude=values.get("exclude", ""),
+        allow_overlap=bools.get("allow_overlap", False),
+        model=values.get("model"),
+        effort=values.get("effort"),
+        hard=bools.get("hard", False),
+        screen=bools.get("screen", False),
+    )
+
+
+def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
+    """Route a validated supervise sub-verb to its body.
+
+    Phase 1 only validates the surface: every recognized sub-verb (the six
+    operator verbs plus the hidden internal ``__run``, D-10) is routed here and
+    its not-yet-built body raises :class:`NotImplementedError` (fail-fast, never
+    a silent success). The real bodies land in later phases per
+    ``IMPLEMENTATION-PLAN.md``.
+
+    Args:
+        sub: The sub-verb token (already confirmed to be a known sub-verb).
+        args: The remaining flag tokens.
+
+    Returns:
+        The sub-verb's exit code (once implemented).
+
+    Raises:
+        NotImplementedError: The sub-verb body is not yet implemented (Phase 1).
+    """
+    parsed = _parse_supervise_args(args)
+    raise NotImplementedError(
+        f"supervise {sub!r} is not yet implemented (parsed name={parsed.name!r}); "
+        "the body lands in a later implementation phase."
+    )
+
+
+def cmd_supervise(*argv: str) -> int:
+    """Dispatch the ``devbench supervise`` verb group (FR-1).
+
+    Sub-verbs: ``start``, ``stop``, ``restart``, ``status``, ``info``,
+    ``attach`` (plus the hidden internal ``__run`` the screen daemon runs,
+    D-10). Dispatches on ``argv[0]``; an unknown sub-verb (or none) exits 2 with
+    a usage message listing the six operator sub-verbs. ``--name`` is validated
+    against the ADR-23 grammar (FR-2) before any body runs.
+
+    Args:
+        *argv: The sub-verb followed by its flags.
+
+    Returns:
+        2 on unknown sub-verb / invalid argument; otherwise the sub-verb's exit
+        code (later phases). Phase 1 sub-verb bodies raise ``NotImplementedError``.
+    """
+    if not argv:
+        print(_SUPERVISE_USAGE, file=sys.stderr)
+        return 2
+
+    sub = argv[0]
+    rest = list(argv[1:])
+
+    known = (*SUPERVISE_SUBVERBS, SUPERVISE_INTERNAL_RUN_SUBVERB)
+    if sub not in known:
+        print(
+            f"ERROR: unknown 'supervise' sub-verb {sub!r}. Use: {'|'.join(SUPERVISE_SUBVERBS)}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Validate --name (FR-2) before any body runs so a crafted name fails fast.
+    try:
+        parsed = _parse_supervise_args(rest)
+        _validate_supervise_name(parsed.name)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    return _dispatch_supervise_subverb(sub, rest)
+
+
 def cmd_quota_watcher(*argv: str) -> int:
     """Inspect the quota pause checkpoint.
 
@@ -12872,6 +13068,22 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             'use for interactive launchers (claude --plugin-dir "$(devbench prepare-plugin-shadow)")'
         ),
     ),
+    "supervise": (
+        cmd_supervise,
+        0,
+        (
+            "Supervise an interactive `claude` CLI orchestrator under a detached screen daemon "
+            "(subscription-billed, NOT the API). Sub-verbs: "
+            "start | stop | restart | status | info | attach. "
+            "start [--name N] [--include '<tokens>'] [--exclude '<tokens>'] [--allow-overlap] "
+            "[--model M] [--effort E]; "
+            "stop [--name N] [--hard]; "
+            "restart [--name N]; "
+            "status [--name N]; "
+            "info; "
+            "attach [--name N] [--screen]."
+        ),
+    ),
     "quota-watcher": (
         cmd_quota_watcher,
         0,
@@ -13042,6 +13254,9 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "stop",
         # Issue #236: quota wait-and-resume -- optional --once/--daemon flag
         "quota-watcher",
+        # devbench-supervise-screen-orchestrator (FR-1): the supervise verb group
+        # owns its sub-verb + flag parsing, so it needs the raw trailing argv.
+        "supervise",
     }
 )
 

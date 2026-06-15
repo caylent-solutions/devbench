@@ -1023,6 +1023,202 @@ SKILL_QUALITY_THRESHOLD: int = 0
 # files. Full path: ``<workspace_root>/.devbench/<SKILL_STATE_DIR_NAME>/<skill>.json``.
 SKILL_STATE_DIR_NAME: str = ".devbench/skill-state"
 
+# ---------------------------------------------------------------------------
+# Supervise: interactive `claude` CLI orchestrator under a detached `screen`
+# daemon (spec devbench-supervise-screen-orchestrator, FR-17, Section 5.5).
+#
+# The supervise path runs the orchestrator as an interactive `claude` session
+# billed against the Claude Code subscription's rolling 5-hour windows (NOT the
+# Anthropic API). State lives under ``<workspace_root>/.devbench/supervise/``,
+# parallel to (and intentionally separate from, D-8) the SDK session tree under
+# ``.devbench/sessions/``. Consumed by ``src/devbench/supervise.py`` and the
+# ``cmd_supervise`` verb wiring in ``src/devbench/cli.py``.
+# ---------------------------------------------------------------------------
+
+# Workspace-relative base directory for all supervise per-session state.
+# Full path: ``<workspace_root>/<SUPERVISE_BASE_DIR>/<name>/``.
+SUPERVISE_BASE_DIR: str = ".devbench/supervise"
+
+# Workspace-relative path to the supervise registry JSON file (a JSON array
+# mirroring SESSION_REGISTRY_PATH). Full path:
+# ``<workspace_root>/<SUPERVISE_REGISTRY_PATH>``.
+SUPERVISE_REGISTRY_PATH: str = ".devbench/supervise/registry.json"
+
+# Filename of the per-session state JSON written inside each supervise session's
+# state directory (``<workspace>/.devbench/supervise/<name>/<SUPERVISE_STATE_FILENAME>``).
+SUPERVISE_STATE_FILENAME: str = "state.json"
+
+# Filename of the redacted PTY transcript log written inside each supervise
+# session's state directory. Created mode 0600 (FR-24).
+SUPERVISE_PTY_LOG_FILENAME: str = "pty.log"
+
+# Filename of the stop-request control file the operator-facing ``stop`` verb
+# writes and the in-screen ``__run`` supervisor polls (Section 4.2, Section 5.5).
+SUPERVISE_STOP_REQUEST_FILENAME: str = "stop.request"
+
+# Filename of the structured supervisor log the in-screen ``__run`` supervisor
+# writes (Section 7.2). Carries the ``[SUPERVISE_STATE]`` transition lines.
+SUPERVISE_SUPERVISOR_LOG_FILENAME: str = "supervisor.log"
+
+# Suffix appended to the supervise registry path for the intermediate temp file
+# used during atomic registry writes (write-then-rename pattern).
+SUPERVISE_REGISTRY_TMP_SUFFIX: str = ".tmp"
+
+# Default ``screen`` session-name prefix (Section 5.1, ``screen_name_prefix``).
+# The screen for session ``N`` is ``<prefix><N>``. Override via
+# ``DEVBENCH_SUPERVISE_SCREEN_NAME_PREFIX`` env or ``supervise.screen_name_prefix``.
+SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT: str = "devbench-supervise-"
+
+# Default supervise session name when ``--name`` is not supplied (Section 4.0, FR-2).
+SUPERVISE_DEFAULT_NAME: str = "default"
+
+# Default effort level for the interactive session (Section 5.4, FR-19, D-11).
+# One of low|medium|high|xhigh|max; ``xhigh`` is the operator default.
+SUPERVISE_EFFORT_DEFAULT: str = "xhigh"
+
+# Valid effort levels accepted by ``--effort`` / ``supervise.effort`` (Section 1.9,
+# Section 5.2). ``max`` is session-only; all are accepted by the resolver.
+SUPERVISE_VALID_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+# Valid resume modes for ``supervise.restart.resume_mode`` (Section 5.1, 5.2).
+SUPERVISE_VALID_RESUME_MODES: frozenset[str] = frozenset({"continue", "resume"})
+
+# The billing channel a supervise session always reports (Section 0.2, FR-9).
+SUPERVISE_BILLING_CHANNEL: str = "subscription"
+
+# Always-deny environment variables stripped from EVERY supervise session env
+# (Section 3.6.1, FR-21). These route inference to API/Bedrock billing and
+# defeat the subscription-billing goal; they are NON-REMOVABLE -- a config that
+# tries to whitelist any of these via ``supervise.env.deny_vars`` fails fast.
+# Consumed by ``EnvSanitizer`` and the ``_parse_supervise_config`` guard.
+SUPERVISE_ALWAYS_DENY_ENV_VARS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_BASE_URL",
+    "DEVBENCH_USE_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+)
+
+# Default ADDITIONAL deny vars for ``supervise.env.deny_vars`` (Section 5.1).
+# The always-deny set above is layered on top and cannot be removed.
+SUPERVISE_DEFAULT_EXTRA_DENY_VARS: tuple[str, ...] = ("AWS_PROFILE", "AWS_SESSION_TOKEN")
+
+# Default per-field timeouts (seconds) for ``supervise.timeouts`` (Section 5.1).
+# Every value is overridable via ``DEVBENCH_SUPERVISE_*`` env or YAML.
+SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT: int = 120
+SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT: int = 1800
+SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT: int = 60
+SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT: int = 900
+
+# Default bounded auto-restart attempts on the exit-42-equivalent (Section 5.1,
+# FR-12, Section 4.3). Override via ``DEVBENCH_SUPERVISE_RESTART_MAX_ATTEMPTS``.
+SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT: int = 5
+
+# Default resume mode for ``supervise.restart.resume_mode`` (Section 5.1).
+SUPERVISE_RESUME_MODE_DEFAULT: str = "continue"
+
+# Default detection-pattern regexes (Section 5.1, 6.3, FR-29). These are
+# CONFIG defaults; every one is overridable via YAML so a CLI prompt-text change
+# is fixed without code change. The quota_limit / quota_wait_prompt patterns are
+# PLACEHOLDERS pending DI-5 (QUOTA-VERIFICATION-TODO.md) -- the in-session-wait
+# path is best-effort until a real quota event is captured. ``reset_at`` mirrors
+# ``quota._RESET_AT_RE``. Keys map to ``SuperviseDetectionPatternsConfig`` fields.
+SUPERVISE_DETECTION_PATTERNS_DEFAULT: dict[str, str] = {
+    # The box-drawing bar (U+2502) and the verbatim Unicode apostrophe (U+2019,
+    # which appears in the real CLI line "You've hit your limit") are written as
+    # explicit escapes so the source stays ASCII; see ``quota._QUOTA_MARKERS``.
+    "ready_prompt": "(?m)^\\s*(>|│\\s*>)\\s*$",
+    "working_prompt": r"(?i)(esc to interrupt|tokens|thinking)",
+    "quota_limit": "(?i)(You(\u2019ve|'ve| have) hit your limit|rate.?limit.*(exceeded|reached|resets))",
+    "quota_wait_prompt": r"(?i)(wait.*reset|retry.*later|press.*to wait)",
+    "reset_at": r"resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)",
+    "circuit_breaker": r"\[CIRCUIT_BREAKER\]|cascade depth exceeded",
+    "harness_block": r"\[HARNESS_INTEGRITY\]",
+    "crash": r"(?i)(panic|fatal error|traceback \(most recent call last\))",
+}
+
+# Default log-tail marker sets (Section 5.1, FR-14, FR-29). These are devbench's
+# OWN log markers (Section 1.6), stable across CLI versions. Keys map to
+# ``SuperviseLogTailConfig`` fields.
+SUPERVISE_LOG_TAIL_ORCHESTRATOR_LOG_RELPATH_DEFAULT: str = "logs/orchestrator.log"
+SUPERVISE_LOG_TAIL_MARKERS_CLEAN_DEFAULT: tuple[str, ...] = (
+    "ALL_DONE",
+    "NO_ACTIONABLE",
+    "[ORCHESTRATOR_TERMINAL_EXIT]",
+)
+SUPERVISE_LOG_TAIL_MARKERS_QUOTA_DEFAULT: tuple[str, ...] = (
+    "[QUOTA_WAITING]",
+    "[QUOTA_POLLING]",
+    "[ORCHESTRATOR_QUOTA_RESUME]",
+)
+SUPERVISE_LOG_TAIL_MARKERS_FAULT_DEFAULT: tuple[str, ...] = (
+    "[ORCHESTRATOR_STOP_REASON]",
+    "[ORCHESTRATOR_FATAL_ERROR]",
+    "[HARNESS_INTEGRITY]",
+)
+SUPERVISE_LOG_TAIL_MARKERS_RESTART_DEFAULT: tuple[str, ...] = ("[ORCHESTRATOR_AUTO_RESTART]",)
+
+# Default redaction regexes applied to every chunk written to ``pty.log``
+# (Section 3.6.3, FR-24). Override via ``supervise.logging.redact_patterns``.
+SUPERVISE_LOG_PTY_LOG_RELPATH_DEFAULT: str = "pty.log"
+SUPERVISE_LOG_REDACT_PATTERNS_DEFAULT: tuple[str, ...] = (
+    r"sk-ant-[A-Za-z0-9_-]+",
+    r"AKIA[0-9A-Z]{16}",
+    r"(?i)aws_secret[^\s]*",
+    r"Bearer\s+[A-Za-z0-9._-]+",
+)
+
+# Default injectable-command registry (Section 5.3, FR-28). A name->literal map;
+# new operator capabilities are added by adding a config entry, NO code change.
+# ``quota_wait_choice`` is a PLACEHOLDER pending DI-5. Override/extend via
+# ``supervise.injectable_commands``.
+SUPERVISE_INJECTABLE_COMMANDS_DEFAULT: dict[str, str] = {
+    "orchestrate": "/devbench-orchestrate:orchestrate",
+    "effort_xhigh": "/effort xhigh",
+    "model_opus": "/model opus",
+    "quota_wait_choice": "1",
+    "drain_now": "/exit",
+}
+
+# The set of supervise lifecycle states (Section 4.8, FR-27). Persisted in
+# ``state.json``'s ``state`` field and surfaced by ``status``/``info``.
+SUPERVISE_STATE_STARTING: str = "starting"
+SUPERVISE_STATE_RUNNING: str = "running"
+SUPERVISE_STATE_QUOTA_WAITING: str = "quota-waiting"
+SUPERVISE_STATE_QUOTA_RESUMED: str = "quota-resumed"
+SUPERVISE_STATE_DRAINING: str = "draining"
+SUPERVISE_STATE_COMPLETED_CLEAN: str = "completed-clean"
+SUPERVISE_STATE_FAULTED: str = "faulted"
+SUPERVISE_STATE_RESTARTING: str = "restarting"
+SUPERVISE_STATE_STOPPED: str = "stopped"
+SUPERVISE_VALID_STATES: frozenset[str] = frozenset(
+    {
+        SUPERVISE_STATE_STARTING,
+        SUPERVISE_STATE_RUNNING,
+        SUPERVISE_STATE_QUOTA_WAITING,
+        SUPERVISE_STATE_QUOTA_RESUMED,
+        SUPERVISE_STATE_DRAINING,
+        SUPERVISE_STATE_COMPLETED_CLEAN,
+        SUPERVISE_STATE_FAULTED,
+        SUPERVISE_STATE_RESTARTING,
+        SUPERVISE_STATE_STOPPED,
+    }
+)
+
+# The six operator-facing supervise sub-verbs + the hidden internal ``__run``
+# sub-verb (D-10) that the screen runs in the foreground. ``__run`` is NOT in
+# ``supervise --help``. Consumed by ``cmd_supervise`` (FR-1).
+SUPERVISE_SUBVERBS: tuple[str, ...] = ("start", "stop", "restart", "status", "info", "attach")
+SUPERVISE_INTERNAL_RUN_SUBVERB: str = "__run"
+
+# Session-name grammar (ADR-23, FR-2): non-empty, leading alphanumeric, then
+# alphanumerics, hyphen, underscore. Path-traversal ``..`` is rejected separately.
+SUPERVISE_SESSION_NAME_PATTERN: str = r"^[A-Za-z0-9][A-Za-z0-9_-]*$"
+
 # Audit-row tag emitted when a skill exhausts its iteration budget without
 # reaching SKILL_QUALITY_THRESHOLD. Operator-visible signal that the skill
 # needs human attention.

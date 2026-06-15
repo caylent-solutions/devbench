@@ -71,3 +71,6 @@ infra/terragrunt/**/ami_lookup.tf
 # surfaced by `make lint-no-duplicates` if one slips through.
 * (1).*
 * (1)
+
+# devbench supervise feature workflow driver (local tooling artifact)
+.supervise-workflow.mjs

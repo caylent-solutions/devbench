@@ -6,6 +6,8 @@ Covers:
 - pass: genuine RED (exit code non-zero, production files changed)
 - pass: test-only Task Type header exempts empty production-file check
 - pass: coverage-only Task Type header exempts empty production-file check
+- pass: verification-only Changes Manifest (sentinel-only) exempts BOTH the
+  zero-exit check (rule 1) and the empty production-file check (rule 2)
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from devbench.tdd_gate import (
     check_tdd_gate,
     extract_red_exit_code,
     extract_task_type,
+    is_verification_only,
     parse_production_files,
 )
 
@@ -97,6 +100,10 @@ _WU_TEMPLATE = """\
 
 ## Status: in-progress
 {task_type_line}
+## Changes Manifest
+
+{manifest}
+
 ## TDD Cycle Log
 
 {tdd_entries}
@@ -104,10 +111,41 @@ _WU_TEMPLATE = """\
 ## Comments
 """
 
+# Default Changes Manifest with a single real production file -- the normal
+# (non-verification-only) shape that exercises rules 1 and 2 unchanged.
+_MANIFEST_REAL_FILE = """\
+| File | Change |
+|------|--------|
+| `src/devbench/tdd_gate.py` | add |"""
 
-def _make_wu(tdd_entries: str = "", task_type: str = "") -> str:
+# A verification-only manifest: the single row is the `<verification-only>`
+# sentinel, so the unit authors no source and is structurally exempt from
+# the TDD RED/GREEN cycle (mirrors the per-module live-terratest units).
+_MANIFEST_VERIFICATION_ONLY = """\
+| File | Change |
+|------|--------|
+| `<verification-only>` | modify |"""
+
+# A manifest that mixes a sentinel row with a real file path. NOT
+# verification-only -- the real file means the gate still applies in full.
+_MANIFEST_MIXED_SENTINEL_AND_REAL = """\
+| File | Change |
+|------|--------|
+| `<verification-only>` | modify |
+| `src/devbench/tdd_gate.py` | add |"""
+
+
+def _make_wu(
+    tdd_entries: str = "",
+    task_type: str = "",
+    manifest: str = _MANIFEST_REAL_FILE,
+) -> str:
     task_type_line = f"\n## Task Type: {task_type}\n" if task_type else ""
-    return _WU_TEMPLATE.format(task_type_line=task_type_line, tdd_entries=tdd_entries)
+    return _WU_TEMPLATE.format(
+        task_type_line=task_type_line,
+        manifest=manifest,
+        tdd_entries=tdd_entries,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +387,115 @@ class TestCheckTddGateExemptions:
         result = check_tdd_gate(
             wu_content=wu_content,
             diff_output=_DIFF_WITH_ONLY_TEST_FILES,
+        )
+        assert result.passed is False
+        assert result.message == TDD_CYCLE_MISSING_ZERO_EXIT
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: is_verification_only
+# ---------------------------------------------------------------------------
+
+
+class TestIsVerificationOnly:
+    """A unit whose Changes Manifest contains only sentinel rows is exempt."""
+
+    def test_true_for_verification_only_sentinel_manifest(self) -> None:
+        content = _make_wu(manifest=_MANIFEST_VERIFICATION_ONLY)
+        assert is_verification_only(content) is True
+
+    def test_false_for_real_file_manifest(self) -> None:
+        content = _make_wu(manifest=_MANIFEST_REAL_FILE)
+        assert is_verification_only(content) is False
+
+    def test_false_when_sentinel_mixed_with_real_file(self) -> None:
+        """A real path alongside the sentinel means the unit authors source."""
+        content = _make_wu(manifest=_MANIFEST_MIXED_SENTINEL_AND_REAL)
+        assert is_verification_only(content) is False
+
+    def test_false_when_manifest_has_no_rows(self) -> None:
+        """An empty manifest authors nothing claimed but is not verification-only."""
+        empty_manifest = "| File | Change |\n|------|--------|"
+        content = _make_wu(manifest=empty_manifest)
+        assert is_verification_only(content) is False
+
+    def test_false_when_manifest_section_absent(self) -> None:
+        """No Changes Manifest section at all is not a verification-only waiver."""
+        content = "# E0-F1-S1-T1: Sample\n\n## Status: in-progress\n\n## TDD Cycle Log\n"
+        assert is_verification_only(content) is False
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        [
+            "<verification-only>",
+            "<verification-only:E10-F1-S6-T4>",
+            "<no-op>",
+            "<decision-only>",
+        ],
+    )
+    def test_true_for_any_sentinel_only_manifest(self, sentinel: str) -> None:
+        manifest = f"| File | Change |\n|------|--------|\n| `{sentinel}` | modify |"
+        content = _make_wu(manifest=manifest)
+        assert is_verification_only(content) is True
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: check_tdd_gate -- verification-only waiver
+# ---------------------------------------------------------------------------
+
+
+class TestCheckTddGateVerificationOnlyWaiver:
+    """A verification-only manifest waives BOTH rule 1 and rule 2."""
+
+    def test_passes_verification_only_with_red_exit_zero(self) -> None:
+        """RED exit 0 is legitimate for a verification-only unit (pre-green)."""
+        wu_content = _make_wu(
+            tdd_entries=_FAKE_RED_ZERO_EXIT_COMMENT,
+            manifest=_MANIFEST_VERIFICATION_ONLY,
+        )
+        result = check_tdd_gate(
+            wu_content=wu_content,
+            diff_output=_DIFF_EMPTY,
+        )
+        assert result.passed is True, result.message
+        assert result.rejection_code is None
+        assert result.message == ""
+
+    def test_passes_verification_only_with_empty_diff(self) -> None:
+        """Rule 2 (empty production files) is waived for verification-only."""
+        wu_content = _make_wu(
+            tdd_entries=_GENUINE_RED_COMMENT,
+            manifest=_MANIFEST_VERIFICATION_ONLY,
+        )
+        result = check_tdd_gate(
+            wu_content=wu_content,
+            diff_output=_DIFF_EMPTY,
+        )
+        assert result.passed is True, result.message
+
+    def test_normal_unit_with_red_exit_zero_still_rejected(self) -> None:
+        """The waiver must NOT leak to normal units that author source."""
+        wu_content = _make_wu(
+            tdd_entries=_FAKE_RED_ZERO_EXIT_COMMENT,
+            manifest=_MANIFEST_REAL_FILE,
+        )
+        result = check_tdd_gate(
+            wu_content=wu_content,
+            diff_output=_DIFF_WITH_PROD_FILES,
+        )
+        assert result.passed is False
+        assert result.rejection_code == "TDD_CYCLE_MISSING"
+        assert result.message == TDD_CYCLE_MISSING_ZERO_EXIT
+
+    def test_mixed_manifest_with_red_exit_zero_still_rejected(self) -> None:
+        """A sentinel row beside a real file does not grant the waiver."""
+        wu_content = _make_wu(
+            tdd_entries=_FAKE_RED_ZERO_EXIT_COMMENT,
+            manifest=_MANIFEST_MIXED_SENTINEL_AND_REAL,
+        )
+        result = check_tdd_gate(
+            wu_content=wu_content,
+            diff_output=_DIFF_WITH_PROD_FILES,
         )
         assert result.passed is False
         assert result.message == TDD_CYCLE_MISSING_ZERO_EXIT

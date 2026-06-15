@@ -9,9 +9,18 @@ Parses the ``log-tdd RED`` comment from a work-unit file and rejects
    behavior-fix task (the implementation changed nothing outside
    ``tests/``).
 
-Exception: when the work unit carries a ``## Task Type: test-only``
-or ``## Task Type: coverage-only`` header, rule 2 is waived.  Rule 1
-(exit-code check) always applies regardless of Task Type.
+Exceptions:
+
+- When the work unit carries a ``## Task Type: test-only`` or
+  ``## Task Type: coverage-only`` header, rule 2 is waived.  Rule 1
+  (exit-code check) still applies for these units.
+- When the work unit's ``## Changes Manifest`` is verification-only
+  (every row is a sentinel value such as ``<verification-only>``, so
+  the unit authors no source), BOTH rule 1 and rule 2 are waived.
+  Such a unit only runs live verification against an already-green
+  target; a genuine RED is unsatisfiable by design (the recorded RED
+  may legitimately have ``Exit: 0``), so the genuine-RED requirement
+  does not apply.
 """
 
 from __future__ import annotations
@@ -19,6 +28,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+
+from devbench.backlog.manifest import ManifestParseError, parse_manifest
+from devbench.backlog.sentinels import is_sentinel_manifest_value
 
 # ---------------------------------------------------------------------------
 # Public constants: verbatim rejection strings (spec AC-257-1)
@@ -165,17 +177,58 @@ def extract_task_type(wu_content: str) -> TaskTypeHeader | None:
     return TaskTypeHeader(raw_value)
 
 
+def is_verification_only(wu_content: str) -> bool:
+    """Return ``True`` when the work unit's Changes Manifest is verification-only.
+
+    A verification-only unit's ``## Changes Manifest`` carries at least one row
+    and EVERY row is a sentinel value (e.g. ``<verification-only>``,
+    ``<no-op>``; see :func:`devbench.backlog.sentinels.is_sentinel_manifest_value`).
+    Such a unit authors no source file -- it only runs live verification against
+    an already-green target -- so it is structurally exempt from the TDD
+    RED/GREEN cycle.
+
+    Returns ``False`` when:
+
+    - any Manifest row names a real (non-sentinel) file path -- the unit
+      authors source, so the genuine-RED requirement applies in full;
+    - the Manifest has no data rows; or
+    - the ``## Changes Manifest`` section is absent or unparsable.
+
+    Args:
+        wu_content: Full text of the work-unit ``.md`` file, including the
+            ``## Changes Manifest`` table.
+
+    Returns:
+        ``True`` only when the Manifest exists, has at least one row, and
+        every row is a sentinel value.
+    """
+    try:
+        rows = parse_manifest(wu_content)
+    except ManifestParseError:
+        return False
+    if not rows:
+        return False
+    return all(is_sentinel_manifest_value(row.file) for row in rows)
+
+
 def check_tdd_gate(
     wu_content: str,
     diff_output: str,
 ) -> TddGateResult:
     """Run the deterministic genuine-RED gate for a work unit.
 
-    Applies two checks in order:
+    A **verification-only** unit -- one whose ``## Changes Manifest`` is made
+    up entirely of sentinel rows (e.g. ``<verification-only>``) and therefore
+    authors no source -- is structurally exempt from the TDD RED/GREEN cycle.
+    Such a unit only runs live verification against an already-green target, so
+    a genuine RED is unsatisfiable by design; the gate passes immediately,
+    waiving BOTH checks below. The waiver is granted ONLY by the sentinel-only
+    Manifest -- a unit that lists any real file path is judged in full.
 
-    1. **Exit-code check (always applied):** if the last recorded RED
-       entry has ``Exit: 0``, the gate rejects with
-       :data:`TDD_CYCLE_MISSING_ZERO_EXIT`.
+    Otherwise applies two checks in order:
+
+    1. **Exit-code check:** if the last recorded RED entry has ``Exit: 0``,
+       the gate rejects with :data:`TDD_CYCLE_MISSING_ZERO_EXIT`.
 
     2. **Production-file check (waived for test-only / coverage-only):**
        if the diff contains zero production source files (files outside
@@ -185,15 +238,22 @@ def check_tdd_gate(
 
     Args:
         wu_content: Full text of the work-unit ``.md`` file, including the
-            TDD Cycle Log and any optional ``## Task Type:`` header.
+            ``## Changes Manifest``, the TDD Cycle Log, and any optional
+            ``## Task Type:`` header.
         diff_output: Combined output of ``devbench get-diff`` for this work
             unit (staged + unstaged + untracked hunks).
 
     Returns:
-        A :class:`TddGateResult` with ``passed=True`` when both checks pass,
-        or ``passed=False`` with the appropriate rejection code and verbatim
-        message when either check fails.
+        A :class:`TddGateResult` with ``passed=True`` when the unit is
+        verification-only or both checks pass, or ``passed=False`` with the
+        appropriate rejection code and verbatim message when either check
+        fails.
     """
+    # Verification-only units author no source: the genuine-RED requirement
+    # does not apply, so waive both rule 1 and rule 2.
+    if is_verification_only(wu_content):
+        return TddGateResult(passed=True, rejection_code=None, message="")
+
     # Check 1: exit code must be non-zero.
     exit_code = extract_red_exit_code(wu_content)
     if exit_code is not None and exit_code == 0:

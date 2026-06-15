@@ -386,7 +386,7 @@ Accepted sentinel values (canonical list in
 
 | Sentinel | Semantics |
 |----------|-----------|
-| `<verification-only>` | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
+| `<verification-only>` | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. A Manifest made up entirely of sentinel rows is verification-only and is structurally exempt from the deterministic TDD genuine-RED gate (both the zero-exit and the empty-production-file checks are waived), since the unit authors no source and a genuine RED is unsatisfiable by design. |
 | `<decision-only>` | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
 | `<no changes>` | The task is a placeholder or audit-flip with no executor work. Rare. |
 | `<no-op>` | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |

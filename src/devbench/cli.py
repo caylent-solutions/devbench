@@ -225,6 +225,9 @@ from devbench.constants import (
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
     SUPERVISE_DEFAULT_NAME,
+    SUPERVISE_EXIT_REASON_GRACEFUL_STOP,
+    SUPERVISE_EXIT_REASON_HARD_STOP,
+    SUPERVISE_EXIT_REASON_STALE_RECONCILED,
     SUPERVISE_INTERNAL_RUN_SUBVERB,
     SUPERVISE_SESSION_NAME_PATTERN,
     SUPERVISE_STATE_COMPLETED_CLEAN,
@@ -282,7 +285,11 @@ from devbench.supervise import (
     build_claude_launch_argv,
     build_quota_waiter,
     build_resume_argv,
+    follow_pty_log,
+    format_status_line,
     new_session_state,
+    parse_screen_ls,
+    reconcile_info_rows,
     require_claude,
     resolve_supervise_effort,
     resolve_supervise_model,
@@ -9676,6 +9683,45 @@ def _supervise_backlog_ids() -> list[str]:
     return [u.id for u in units]
 
 
+def _supervise_in_progress_id() -> str | None:
+    """Return the id of the single in-progress work unit, or ``None`` (FR-9).
+
+    Reads the SAME backlog the SDK ``status`` path reads (no claim-audit
+    duplication): ``status`` surfaces the currently-claimed work unit so an
+    operator can see what the supervised session is working on. A backlog that
+    cannot be parsed (none present yet) yields ``None`` rather than failing the
+    read-only status verb (a transient absence is not a fault for an observer).
+    """
+    try:
+        units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
+    except (OSError, ValueError):
+        return None
+    for unit in units:
+        if unit.status is WorkUnitStatus.IN_PROGRESS:
+            return unit.id
+    return None
+
+
+def _supervise_screen_names() -> set[str]:
+    """Return the set of live ``screen`` session names via ``screen -ls`` (FR-11).
+
+    ``screen -ls`` exits 1 when there are no sockets, so the return code is NOT
+    treated as a failure; the combined stdout/stderr is parsed by
+    :func:`parse_screen_ls`. When ``screen`` is not installed (``info`` is a
+    read-only verb that should still list the registry), an empty set is returned
+    so every registry session reconciles to ``stale`` rather than the verb
+    crashing.
+    """
+    screen_path = shutil.which("screen")
+    if screen_path is None:
+        return set()
+    try:
+        result = subprocess.run([screen_path, "-ls"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return parse_screen_ls((result.stdout or "") + (result.stderr or ""))
+
+
 def _supervise_launch_screen(
     *,
     name: str,
@@ -10061,11 +10107,21 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
 
 
 def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
-    """``supervise attach`` body: gate ``--screen`` (AC-33); read-only follow else.
+    """``supervise attach`` body: read-only PTY-log follow (Section 4.7, FR-26).
 
-    The input-capable native ``screen -x`` path stays fail-fast-disabled until
-    DI-4 verifies its ACL blocks all input (Section 3.6.5, FR-26). The default
-    read-only PTY-log follow lands in Phase 4.
+    The default (no flags) is the ALWAYS-SAFE read-only follow of the redacted
+    ``pty.log`` -- a pure read of a file the ``__run`` supervisor writes, with the
+    attaching process's stdin NEVER connected to the ``claude`` TTY, so an
+    observer cannot inject input or steal the PTY (AC-18). ``Ctrl-C`` stops the
+    tail (the supervisor and orchestration are untouched), returning 0.
+
+    The input-capable native ``screen -x`` path (``--screen``) stays
+    fail-fast-disabled until DI-4 verifies its ACL blocks all input (AC-33,
+    Section 3.6.5); the supervisor never silently upgrades a read-only attach to a
+    writable one.
+
+    Errors: unknown ``--name`` -> exit 2; no ``pty.log`` yet -> exit 2 (fail-fast,
+    FR-30, rather than hanging on a transcript that does not exist).
     """
     if parsed.screen:
         print(
@@ -10073,21 +10129,56 @@ def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
             file=sys.stderr,
         )
         return 2
-    raise NotImplementedError("supervise attach (read-only follow) lands in a later implementation phase.")
+
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    if registry.read_state(parsed.name) is None:
+        print(f"ERROR: no supervise session named {parsed.name!r}.", file=sys.stderr)
+        return 2
+
+    log_path = supervise_pty_log_path(WORKSPACE_ROOT, parsed.name)
+    if not log_path.exists():
+        print(
+            f"ERROR: no PTY transcript to follow for supervise session {parsed.name!r} yet (expected at '{log_path}').",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        f"[supervise] read-only observation of {parsed.name!r}. The pexpect supervisor owns stdin; "
+        "you are watching the PTY transcript tail. Press Ctrl-C to stop watching "
+        "(this does NOT stop the orchestration).",
+    )
+
+    def _write(chunk: str) -> None:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
+    # The follow loop is event-driven and read-only: stdin is never wired to the
+    # child. Ctrl-C (KeyboardInterrupt) ends the follow with exit 0; the loop's
+    # readiness gate keeps following while no interrupt has arrived.
+    try:
+        follow_pty_log(log_path, write=_write, should_continue=lambda: True)
+    except KeyboardInterrupt:
+        print("\n[supervise] stopped watching (orchestration continues).")
+    return 0
 
 
 def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
-    """``supervise stop`` body: graceful drain-then-stop (Section 4.2, FR-5).
+    """``supervise stop`` body: graceful drain-then-stop + stale reconcile (Section 4.2, FR-5).
 
-    Graceful (default): request a per-session drain (so the in-flight WU finishes)
-    and write the ``stop.request`` control file the ``__run`` supervisor polls,
-    then mark the registry ``stopped``. ``--hard`` skips the drain. An unknown
-    ``--name`` exits 2 (fail-fast). A stale screen (registry running but no live
-    PID) reconciles to ``stopped`` and returns 0.
+    Graceful (default): when the screen IS live, request a per-session drain (so
+    the in-flight WU finishes) and write the ``stop.request`` control file the
+    ``__run`` supervisor polls, then mark the registry ``stopped``. ``--hard``
+    skips the drain entirely. An unknown ``--name`` exits 2 (fail-fast, FR-30).
 
-    The full graceful-stop escalation + ``screen -X quit`` reconciliation is
-    expanded in Phase 4; this body lands the drain + stop-request + registry
-    transition the ``restart`` verb (Section 4.3) composes.
+    Stale-screen reconcile (Section 4.2): when the registry says the session is
+    running but ``screen -ls`` no longer lists its screen, there is no supervisor
+    to drain -- the verb reconciles the registry to ``stopped`` (exit-reason
+    ``stale-screen-reconciled``) and returns 0 with a note instead of writing a
+    pointless drain signal. ``--hard`` bypasses this (it terminates regardless).
+
+    This body lands the drain + stop-request + registry transition the ``restart``
+    verb (Section 4.3) composes.
     """
     registry = SuperviseRegistry(WORKSPACE_ROOT)
     state = registry.read_state(parsed.name)
@@ -10096,6 +10187,15 @@ def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
         return 2
 
     if not parsed.hard:
+        # Stale-screen reconcile: a registry-running session whose screen is gone
+        # has no supervisor to drain; reconcile rather than drain (Section 4.2).
+        if state.screen_name not in _supervise_screen_names():
+            state.state = SUPERVISE_STATE_STOPPED
+            state.exit_reason = SUPERVISE_EXIT_REASON_STALE_RECONCILED
+            registry.write_state(state)
+            print(f"[supervise] state=stopped name={parsed.name} (stale screen reconciled; no live supervisor).")
+            return 0
+
         prev = os.environ.get("DEVBENCH_SESSION_NAME")
         os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
         try:
@@ -10107,9 +10207,72 @@ def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
         atomic_write_text(stop_request, "supervise stop\n")
 
     state.state = SUPERVISE_STATE_STOPPED
-    state.exit_reason = "hard-stop" if parsed.hard else "graceful-stop"
+    state.exit_reason = SUPERVISE_EXIT_REASON_HARD_STOP if parsed.hard else SUPERVISE_EXIT_REASON_GRACEFUL_STOP
     registry.write_state(state)
     print(f"[supervise] state=stopped name={parsed.name} mode={'hard' if parsed.hard else 'graceful'}")
+    return 0
+
+
+def _cmd_supervise_status(parsed: _SuperviseArgs, *, name_given: bool) -> int:
+    """``supervise status`` body: per-session or all-session state (Section 4.4, FR-9/FR-10).
+
+    With an explicit ``--name`` (``name_given``), prints exactly that session's
+    line and exits 2 on an unknown name (fail-fast). Without ``--name``, lists
+    every supervise session (``No supervise sessions.`` when none exist). Each
+    line surfaces ``billing-channel: subscription`` and, for ``quota-waiting``,
+    the ``expected-resume`` + ``resumes-used=<n>/<cap>`` (FR-10), reusing
+    :func:`_resolve_max_quota_resumes` for the cap (DRY).
+    """
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    max_resumes = _resolve_max_quota_resumes()
+
+    if name_given:
+        state = registry.read_state(parsed.name)
+        if state is None:
+            print(f"ERROR: no supervise session named {parsed.name!r}.", file=sys.stderr)
+            return 2
+        print(format_status_line(state, max_resumes=max_resumes, in_progress=_supervise_in_progress_id()))
+        return 0
+
+    sessions = sorted(registry.load(), key=lambda s: s.name)
+    if not sessions:
+        print("No supervise sessions.")
+        return 0
+    in_progress = _supervise_in_progress_id()
+    for state in sessions:
+        print(format_status_line(state, max_resumes=max_resumes, in_progress=in_progress))
+    return 0
+
+
+def _cmd_supervise_info(_parsed: _SuperviseArgs) -> int:
+    """``supervise info`` body: join ``screen -ls`` with the registry (Section 4.5, FR-11).
+
+    Lists every supervise screen reconciled against the registry: a live screen
+    with no registry entry is ``unknown`` (orphan); a registry entry with no live
+    screen is ``stale``. The ATTACH column is the exact ``supervise attach
+    --name N`` command. Always exit 0 (read-only listing).
+    """
+    registry = SuperviseRegistry(WORKSPACE_ROOT)
+    cfg = _supervise_runtime_config()
+    rows = reconcile_info_rows(
+        sessions=registry.load(),
+        screen_names=_supervise_screen_names(),
+        prefix=cfg.screen_name_prefix,
+    )
+    if not rows:
+        print("No supervise screens.")
+        return 0
+
+    header = f"{'SCREEN':<32} {'NAME':<16} {'STATE':<14} {'PID':>8}  {'CLAUDE-SESSION':<18} {'BILLING':<13} ATTACH"
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        pid_str = str(row.pid) if row.pid is not None else "-"
+        claude_session = row.claude_session if row.claude_session else "-"
+        print(
+            f"{row.screen:<32} {row.name:<16} {row.state:<14} {pid_str:>8}  "
+            f"{claude_session:<18} {row.billing:<13} {row.attach}"
+        )
     return 0
 
 
@@ -10136,13 +10299,16 @@ def _cmd_supervise_restart(parsed: _SuperviseArgs) -> int:
 def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
     """Route a validated supervise sub-verb to its body.
 
-    Implemented: ``start`` (the operator-facing launch pipeline), the hidden
-    internal ``__run`` (the program ``screen`` runs, D-10, now with the full event
-    loop), ``stop`` (graceful drain-then-stop), ``restart`` (stop+start preserving
-    context, Section 4.3), and the ``attach --screen`` fail-fast gate (AC-33). The
-    read-only ``status``/``info`` bodies and the read-only attach follow land in
-    Phase 4 per ``IMPLEMENTATION-PLAN.md`` and still fail fast (never a silent
-    success) until then.
+    All six operator sub-verbs are implemented: ``start`` (the launch pipeline),
+    ``stop`` (graceful drain-then-stop + stale reconcile), ``restart`` (stop+start
+    preserving context, Section 4.3), ``status`` (per/all-session state, FR-9/10),
+    ``info`` (screen-ls join + reconcile, FR-11), ``attach`` (read-only PTY-log
+    follow, with ``--screen`` fail-fast-gated on DI-4, FR-26/AC-33), plus the
+    hidden internal ``__run`` (the program ``screen`` runs, D-10).
+
+    ``status`` distinguishes an explicit ``--name`` (one session, unknown -> exit
+    2) from no ``--name`` (list all), so the operator-facing ``--name`` default
+    does not mask a missing single session.
 
     Args:
         sub: The sub-verb token (already confirmed to be a known sub-verb).
@@ -10150,25 +10316,23 @@ def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
 
     Returns:
         The sub-verb's exit code.
-
-    Raises:
-        NotImplementedError: A sub-verb body not yet implemented (fail-fast).
     """
     parsed = _parse_supervise_args(args)
-    if sub == "start":
-        return _cmd_supervise_start(parsed)
-    if sub == SUPERVISE_INTERNAL_RUN_SUBVERB:
-        return _cmd_supervise_run(parsed)
-    if sub == "stop":
-        return _cmd_supervise_stop(parsed)
-    if sub == "restart":
-        return _cmd_supervise_restart(parsed)
-    if sub == "attach":
-        return _cmd_supervise_attach(parsed)
-    raise NotImplementedError(
-        f"supervise {sub!r} is not yet implemented (parsed name={parsed.name!r}); "
-        "the body lands in a later implementation phase."
-    )
+    # ``status`` is the only body that needs the "explicit --name" distinction
+    # (one session vs list all), so it is handled outside the single-arg table.
+    if sub == "status":
+        return _cmd_supervise_status(parsed, name_given="--name" in args)
+    # A name->handler table keeps the dispatcher flat (one return) and DRY: a new
+    # single-arg sub-verb is added by extending the table, not the control flow.
+    handlers: dict[str, Callable[[_SuperviseArgs], int]] = {
+        "start": _cmd_supervise_start,
+        SUPERVISE_INTERNAL_RUN_SUBVERB: _cmd_supervise_run,
+        "stop": _cmd_supervise_stop,
+        "restart": _cmd_supervise_restart,
+        "info": _cmd_supervise_info,
+        "attach": _cmd_supervise_attach,
+    }
+    return handlers[sub](parsed)
 
 
 def cmd_supervise(*argv: str) -> int:

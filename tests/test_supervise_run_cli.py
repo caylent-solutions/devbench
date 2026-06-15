@@ -369,12 +369,14 @@ class TestPreflightModelAndClaude:
 
 
 @pytest.mark.unit
-class TestAttachReadOnlyDeferred:
-    """attach (no flags) read-only follow is deferred (fails fast, not silent)."""
+class TestAttachReadOnlyFollow:
+    """attach (no flags) is the read-only PTY-log follow (FR-26); unknown name -> 2."""
 
-    def test_attach_no_flags_not_implemented(self) -> None:
-        with pytest.raises(NotImplementedError):
-            cli.cmd_supervise("attach", "--name", "nightly")
+    def test_attach_unknown_name_returns_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_supervise("attach", "--name", "nightly")
+        assert rc == 2
+        assert "no supervise session" in capsys.readouterr().err
 
 
 @pytest.mark.unit

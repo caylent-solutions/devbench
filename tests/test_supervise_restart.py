@@ -170,7 +170,12 @@ class TestSuperviseRestartCli:
         st.state = SUPERVISE_STATE_RUNNING
         reg.write_state(st)
 
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+        # The screen is live, so the graceful drain path runs (a stale screen
+        # would instead reconcile -- exercised in test_supervise_stop_reconcile).
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._supervise_screen_names", return_value={"devbench-supervise-nightly"}),
+        ):
             rc = cli.cmd_supervise("stop", "--name", "nightly")
         assert rc == 0
         after = reg.read_state("nightly")

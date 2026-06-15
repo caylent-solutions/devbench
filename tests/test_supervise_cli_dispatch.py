@@ -65,16 +65,18 @@ class TestSuperviseSubverbDispatch:
         assert "frobnicate" in err
         assert "start" in err  # usage lists the valid sub-verbs
 
-    # The sub-verbs whose bodies are NOT yet implemented (Phase 3 implements
-    # start/__run/stop/restart/attach; status/info land in Phase 4).
-    _UNIMPLEMENTED_SUBVERBS = ("status", "info")
+    @pytest.mark.parametrize("sub", ["status", "info"])
+    def test_readonly_subverb_lists_empty_registry(self, sub: str, tmp_path) -> None:
+        # status/info are read-only listings (Phase 4): on an empty registry they
+        # are routed and return 0 (NOT "unknown", NOT NotImplementedError).
+        from unittest.mock import patch
 
-    @pytest.mark.parametrize("sub", list(_UNIMPLEMENTED_SUBVERBS))
-    def test_unimplemented_subverb_is_routed(self, sub: str) -> None:
-        # Each not-yet-built sub-verb must be routed (NOT treated as "unknown")
-        # and fail fast with NotImplementedError (never a silent success).
-        with pytest.raises(NotImplementedError):
-            cli._dispatch_supervise_subverb(sub, [])
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._supervise_screen_names", return_value=set()),
+        ):
+            rc = cli._dispatch_supervise_subverb(sub, [])
+        assert rc == 0
 
     @pytest.mark.parametrize("sub", ["stop", "restart"])
     def test_implemented_subverb_fails_fast_on_missing_session(
@@ -159,17 +161,13 @@ class TestSuperviseArgParsing:
 
 
 @pytest.mark.unit
-class TestSuperviseSubverbStubsFailFast:
-    """The not-yet-built sub-verb bodies fail fast (no silent success).
+class TestSuperviseSubverbFailFast:
+    """The sub-verb bodies fail fast on bad input (no silent success).
 
-    Phase 3 implements ``start``/``__run``/``stop``/``restart``/``attach``;
-    ``status``/``info`` land in Phase 4 and still fail fast until then.
+    All six operator sub-verbs + ``__run`` are implemented (Phase 4 lands
+    ``status``/``info`` + the read-only attach follow); a bad ``--name`` or an
+    unknown flag still surfaces as exit 2 before any body runs.
     """
-
-    @pytest.mark.parametrize("sub", ["status", "info"])
-    def test_subverb_body_not_implemented(self, sub: str) -> None:
-        with pytest.raises(NotImplementedError):
-            cli._dispatch_supervise_subverb(sub, [])
 
     def test_invalid_name_through_dispatch_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
         # A bad --name is caught before any body runs and surfaces as exit 2.

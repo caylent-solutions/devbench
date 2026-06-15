@@ -1209,6 +1209,19 @@ SUPERVISE_VALID_STATES: frozenset[str] = frozenset(
     }
 )
 
+# Reconcile-only display states surfaced by ``supervise info`` (Section 4.5,
+# FR-11) -- they are NOT persisted lifecycle states. A live screen with no
+# registry entry is shown ``unknown``; a registry entry with no live screen is
+# shown ``stale``. (A stale entry hit by ``stop`` is reconciled to the persisted
+# ``stopped`` state with the ``SUPERVISE_EXIT_REASON_STALE_RECONCILED`` reason.)
+SUPERVISE_INFO_STATE_UNKNOWN: str = "unknown"
+SUPERVISE_INFO_STATE_STALE: str = "stale"
+
+# Exit reasons the operator-facing ``stop`` verb records (Section 4.2, FR-5).
+SUPERVISE_EXIT_REASON_GRACEFUL_STOP: str = "graceful-stop"
+SUPERVISE_EXIT_REASON_HARD_STOP: str = "hard-stop"
+SUPERVISE_EXIT_REASON_STALE_RECONCILED: str = "stale-screen-reconciled"
+
 # The six operator-facing supervise sub-verbs + the hidden internal ``__run``
 # sub-verb (D-10) that the screen runs in the foreground. ``__run`` is NOT in
 # ``supervise --help``. Consumed by ``cmd_supervise`` (FR-1).

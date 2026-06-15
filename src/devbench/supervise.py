@@ -84,6 +84,8 @@ from devbench.constants import (
     SUPERVISE_EFFORT_DEFAULT,
     SUPERVISE_FAULT_AUDIT_PREFIX,
     SUPERVISE_FAULT_EXIT_CODE,
+    SUPERVISE_INFO_STATE_STALE,
+    SUPERVISE_INFO_STATE_UNKNOWN,
     SUPERVISE_PTY_LOG_FILENAME,
     SUPERVISE_REGISTRY_PATH,
     SUPERVISE_REGISTRY_TMP_SUFFIX,
@@ -2252,3 +2254,244 @@ def _terminal(
         restarts_used=restarts_used,
         resumes_used=resumes_used,
     )
+
+
+# ===========================================================================
+# Phase 4 -- read-only observation helpers (status / info / attach follow)
+# ===========================================================================
+#
+# These are PURE (status-line formatting, screen-ls parsing, info reconcile) or
+# I/O-bounded-by-an-injected-predicate (the PTY-log follow) so they are fully
+# unit-testable without a live screen, and the CLI ``status``/``info``/``attach``
+# verbs only wire them onto the registry. The follow is event-driven (re-read on
+# a readiness predicate), never ``time.sleep`` (CLAUDE.md, Section 7.5).
+
+
+# ---------------------------------------------------------------------------
+# status -- per-session line (Section 4.4, FR-9, FR-10)
+# ---------------------------------------------------------------------------
+
+
+def _format_dt(value: datetime | None) -> str:
+    """Render a UTC datetime as ``YYYY-MM-DDTHH:MM:SSZ`` or ``(none)`` when unset."""
+    if value is None:
+        return "(none)"
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_status_line(state: SuperviseSessionState, *, max_resumes: int, in_progress: str | None) -> str:
+    """Render the one-line ``status`` view for one session (FR-9, FR-10).
+
+    Always surfaces ``name``, ``state``, ``billing-channel`` (the
+    subscription-vs-API audit, Section 0.2), the current claimed work unit
+    (``in-progress``, read from the backlog by the caller), ``last-activity``,
+    ``screen`` and ``claude-session``. When ``state == quota-waiting`` the line
+    additionally carries ``expected-resume`` (the parsed provider reset time) and
+    ``resumes-used=<n>/<cap>`` (FR-10/FR-16). A stopped/faulted session surfaces
+    its ``exit-reason``.
+
+    Args:
+        state: The persisted :class:`SuperviseSessionState`.
+        max_resumes: The resolved quota-resume cap (for the ``resumes-used``
+            denominator); the caller passes ``cli._resolve_max_quota_resumes()``
+            so the cap precedence is owned by the shared resolver (DRY).
+        in_progress: The current claimed work-unit id (or ``None``).
+
+    Returns:
+        A single status line.
+    """
+    parts = [
+        f"name={state.name}",
+        f"state={state.state}",
+        f"billing-channel={state.billing_channel}",
+        f"in-progress={in_progress if in_progress else '(none)'}",
+        f"last-activity={_format_dt(state.last_activity)}",
+        f"screen={state.screen_name}",
+        f"claude-session={state.claude_session_id if state.claude_session_id else '(none)'}",
+    ]
+    if state.state == SUPERVISE_STATE_QUOTA_WAITING:
+        parts.append(f"expected-resume={_format_dt(state.expected_resume)}")
+        parts.append(f"resumes-used={state.resumes_used}/{max_resumes}")
+    if state.exit_reason:
+        parts.append(f"exit-reason={state.exit_reason}")
+    return "  ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# info -- screen -ls join + reconcile (Section 4.5, FR-11)
+# ---------------------------------------------------------------------------
+
+
+# ``screen -ls`` rows look like ``\t<pid>.<session-name>\t(Detached)``. The
+# session name is the dot-suffix of the first whitespace-delimited token. This
+# regex centralizes that parse so a screen-output format quirk is fixed in one
+# place (mirrors the centralized-detection-patterns principle, Section 6.3).
+_SCREEN_LS_ROW_RE = re.compile(r"^\s*\d+\.(?P<name>\S+)\s")
+
+
+def parse_screen_ls(output: str) -> set[str]:
+    """Parse ``screen -ls`` *output* into the set of live screen session names (FR-11).
+
+    Only the ``<pid>.<name>`` socket rows contribute; the header/footer lines
+    (``There are screens on:``, ``N Sockets in ...``) are ignored. Returns an
+    empty set when no screens are listed.
+
+    Args:
+        output: The combined stdout/stderr of ``screen -ls``.
+
+    Returns:
+        The set of screen session names (the part after ``<pid>.``).
+    """
+    names: set[str] = set()
+    for line in output.splitlines():
+        match = _SCREEN_LS_ROW_RE.match(line)
+        if match is not None:
+            names.add(match.group("name"))
+    return names
+
+
+@dataclass(frozen=True)
+class InfoRow:
+    """One reconciled ``supervise info`` row (Section 4.5, FR-11).
+
+    Attributes:
+        screen: The ``screen`` session name (``<prefix><name>``).
+        name: The supervise session name.
+        state: The lifecycle state, or ``unknown`` (orphan screen, no registry
+            entry) / ``stale`` (registry entry, no live screen).
+        pid: The supervisor PID (``None`` for an orphan screen).
+        claude_session: The captured claude session id (``None`` when unknown).
+        billing: The billing channel (always ``subscription`` for a known entry).
+        attach: The exact ``supervise attach --name N`` command to observe it.
+    """
+
+    screen: str
+    name: str
+    state: str
+    pid: int | None
+    claude_session: str | None
+    billing: str
+    attach: str
+
+
+def _attach_command(name: str) -> str:
+    """Return the exact operator command that read-only-attaches *name* (FR-11)."""
+    return f"supervise attach --name {name}"
+
+
+def reconcile_info_rows(
+    *,
+    sessions: list[SuperviseSessionState],
+    screen_names: set[str],
+    prefix: str,
+) -> list[InfoRow]:
+    """Join registry *sessions* with live *screen_names* into ``info`` rows (FR-11).
+
+    Reconciliation (Section 4.5):
+
+    - A registry session whose screen IS live -> its persisted state.
+    - A registry session whose screen is ABSENT -> ``state=stale``.
+    - A live screen (matching *prefix*) with NO registry entry -> ``state=unknown``
+      (an orphan), surfaced so the operator can clean it up.
+
+    Screens not matching *prefix* are ignored (they are not supervise screens).
+    Rows are sorted by session name for deterministic output.
+
+    Args:
+        sessions: The :class:`SuperviseRegistry` sessions.
+        screen_names: The live screen session names (from :func:`parse_screen_ls`).
+        prefix: The configured ``supervise.screen_name_prefix``.
+
+    Returns:
+        The reconciled rows, sorted by ``name``.
+    """
+    rows: list[InfoRow] = []
+    known_screens = {s.screen_name for s in sessions}
+
+    for state in sessions:
+        live = state.screen_name in screen_names
+        display_state = state.state if live else SUPERVISE_INFO_STATE_STALE
+        rows.append(
+            InfoRow(
+                screen=state.screen_name,
+                name=state.name,
+                state=display_state,
+                pid=state.pid,
+                claude_session=state.claude_session_id,
+                billing=state.billing_channel,
+                attach=_attach_command(state.name),
+            )
+        )
+
+    for screen_name in screen_names:
+        if screen_name in known_screens or not screen_name.startswith(prefix):
+            continue
+        orphan_name = screen_name[len(prefix) :]
+        rows.append(
+            InfoRow(
+                screen=screen_name,
+                name=orphan_name,
+                state=SUPERVISE_INFO_STATE_UNKNOWN,
+                pid=None,
+                claude_session=None,
+                billing=SUPERVISE_BILLING_CHANNEL,
+                attach=_attach_command(orphan_name),
+            )
+        )
+
+    return sorted(rows, key=lambda r: r.name)
+
+
+# ---------------------------------------------------------------------------
+# attach -- read-only PTY-log follow (Section 4.7, FR-26)
+# ---------------------------------------------------------------------------
+
+
+def follow_pty_log(
+    log_path: Path,
+    *,
+    write: Callable[[str], None],
+    should_continue: Callable[[], bool],
+    wait_for_log: bool = False,
+) -> None:
+    """Follow the redacted ``pty.log`` read-only, streaming only NEW bytes (FR-26).
+
+    This is the ALWAYS-SAFE attach mechanism (Section 4.7): a pure read of a file
+    the ``__run`` supervisor writes. The attaching process's stdin is NEVER wired
+    to the ``claude`` TTY, so an observer cannot inject input or steal the PTY.
+
+    The loop is event-driven and bounded by *should_continue* (the CLI passes a
+    predicate that returns ``False`` on ``KeyboardInterrupt``); it NEVER uses
+    ``time.sleep`` -- each iteration reads any bytes appended since the last
+    iteration via a byte offset, then consults *should_continue* to decide whether
+    to keep following (CLAUDE.md, Section 7.5).
+
+    Args:
+        log_path: Absolute ``pty.log`` path.
+        write: Sink for each new chunk of transcript text (the CLI passes a stdout
+            writer).
+        should_continue: Zero-arg predicate; the loop runs while it returns
+            ``True``. It is the readiness gate (the CLI wires it to the live
+            terminal so a ``KeyboardInterrupt`` ends the follow).
+        wait_for_log: When ``True``, a not-yet-created log is tolerated (the
+            ``__run`` supervisor may not have flushed the first chunk); the loop
+            keeps polling until it appears. When ``False`` (the default), an
+            absent log fails fast (FR-30).
+
+    Raises:
+        FileNotFoundError: *log_path* does not exist and ``wait_for_log`` is False.
+    """
+    if not wait_for_log and not log_path.exists():
+        raise FileNotFoundError(f"no PTY transcript log to follow at '{log_path}'")
+
+    offset = 0
+    while should_continue():
+        if not log_path.exists():
+            continue
+        data = log_path.read_text(encoding="utf-8", errors="replace")
+        if len(data) < offset:
+            # Truncated/rotated: re-follow from the new start.
+            offset = 0
+        if len(data) > offset:
+            write(data[offset:])
+            offset = len(data)

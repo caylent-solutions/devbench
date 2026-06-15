@@ -1,9 +1,13 @@
-"""Read-only PTY-log follow for ``supervise attach`` (FR-26, Section 4.7).
+"""``follow_pty_log`` primitive + bounded-select mechanics (FR-26, Section 4.7).
 
-The default ``supervise attach`` is a follow of the redacted ``pty.log`` -- a pure
-read of a file the ``__run`` supervisor writes. The attaching process's stdin is
-NEVER connected to the ``claude`` TTY, so an observer cannot inject input or steal
-the PTY. ``--screen`` stays fail-fast-disabled (AC-33, covered separately).
+These tests cover the read-only-follow PRIMITIVE that ``supervise attach`` builds
+on: ``follow_pty_log`` streams only NEW bytes of the redacted ``pty.log`` (a pure
+read of a file the ``__run`` supervisor writes; the observer's stdin is NEVER
+connected to the ``claude`` TTY), and ``_block_until_readable`` parks the follow
+loop on a bounded ``select`` (never ``time.sleep``). The CLI-dispatch-level attach
+behavior (the ``supervise attach`` verb, the ``--screen`` gate, and the
+read-only-follow end-to-end through the real CLI body) is asserted in
+``test_supervise_attach_screen_gated.py`` (the AC-33-named verification command).
 
 ``follow_pty_log`` is event-driven (it re-reads on a readiness predicate, never
 ``time.sleep``) and bounded by an injectable ``should_continue`` predicate so the
@@ -17,14 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from devbench import cli
-from devbench.constants import SUPERVISE_STATE_RUNNING
-from devbench.supervise import (
-    SuperviseRegistry,
-    follow_pty_log,
-    new_session_state,
-    supervise_pty_log_path,
-)
+from devbench.supervise import follow_pty_log
 
 
 @pytest.mark.unit
@@ -158,8 +155,6 @@ class TestFollowBlockUntilReadable:
         _block_until_readable(poll_interval_seconds=0.01)
 
     def test_block_until_readable_returns_promptly_when_fd_readable(self) -> None:
-        import os as _os
-
         from devbench.supervise import _block_until_readable
 
         # A readable pipe fd stands in for the operator's stdin: select wakes
@@ -173,7 +168,6 @@ class TestFollowBlockUntilReadable:
             _os.close(write_fd)
 
     def test_block_until_readable_uses_real_stdin_when_fd_omitted(self) -> None:
-        import os as _os
         from unittest.mock import patch
 
         from devbench import supervise
@@ -192,7 +186,6 @@ class TestFollowBlockUntilReadable:
 
     def test_stdin_fileno_returns_int_for_real_fd(self) -> None:
         import io
-        import os as _os
         from unittest.mock import patch
 
         from devbench import supervise
@@ -208,118 +201,3 @@ class TestFollowBlockUntilReadable:
         finally:
             _os.close(read_fd)
             _os.close(write_fd)
-
-
-@pytest.mark.unit
-class TestSuperviseAttachCli:
-    """`supervise attach` (no flags) follows pty.log read-only (FR-26, AC-18 unit)."""
-
-    def _seed(self, tmp_path: Path, name: str) -> SuperviseRegistry:
-        reg = SuperviseRegistry(tmp_path)
-        st = new_session_state(
-            name=name,
-            pid=_os.getpid(),
-            screen_name=f"devbench-supervise-{name}",
-            model="claude-opus-4-8",
-            effort="xhigh",
-            started_by="t",
-        )
-        st.state = SUPERVISE_STATE_RUNNING
-        reg.write_state(st)
-        # Seed a pty.log the follow reads.
-        log = supervise_pty_log_path(tmp_path, name)
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text("live transcript line\n", encoding="utf-8")
-        return reg
-
-    def test_attach_follows_and_returns_0_on_keyboard_interrupt(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from unittest.mock import patch
-
-        self._seed(tmp_path, "nightly")
-
-        # The follow loop is interrupted by Ctrl-C (KeyboardInterrupt) -> exit 0
-        # (stopping the tail never stops the orchestration, Section 4.7).
-        def _fake_follow(path, *, write, should_continue, block, wait_for_log=False):
-            write(path.read_text(encoding="utf-8"))
-            raise KeyboardInterrupt
-
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.follow_pty_log", _fake_follow),
-        ):
-            rc = cli.cmd_supervise("attach", "--name", "nightly")
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "live transcript line" in out
-        assert "read-only" in out  # the banner reminds the operator it is read-only
-
-    def test_attach_real_follow_blocks_via_bounded_select(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        # Exercise the production attach path: the REAL follow_pty_log runs, so the
-        # CLI's _block closure (which parks on the config-driven _block_until_readable)
-        # is invoked once per iteration. _block_until_readable is patched to raise
-        # KeyboardInterrupt on the first park, ending the follow with exit 0 and
-        # proving the loop blocks (event-driven) rather than spinning.
-        from unittest.mock import patch
-
-        self._seed(tmp_path, "nightly")
-        parked: dict[str, float] = {}
-
-        def _fake_block(*, poll_interval_seconds: float) -> None:
-            parked["interval"] = poll_interval_seconds
-            raise KeyboardInterrupt
-
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._block_until_readable", _fake_block),
-        ):
-            rc = cli.cmd_supervise("attach", "--name", "nightly")
-        assert rc == 0
-        out = capsys.readouterr().out
-        # The existing transcript streamed before the first park.
-        assert "live transcript line" in out
-        assert "stopped watching" in out
-        # The block used the config-driven poll interval (the default is a small int).
-        assert parked["interval"] >= 1
-
-    def test_attach_unknown_name_returns_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        from unittest.mock import patch
-
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            rc = cli.cmd_supervise("attach", "--name", "ghost")
-        assert rc == 2
-        assert "no supervise session" in capsys.readouterr().err
-
-    def test_attach_no_pty_log_yet_returns_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        from unittest.mock import patch
-
-        reg = SuperviseRegistry(tmp_path)
-        st = new_session_state(
-            name="fresh",
-            pid=_os.getpid(),
-            screen_name="devbench-supervise-fresh",
-            model="claude-opus-4-8",
-            effort="xhigh",
-            started_by="t",
-        )
-        st.state = SUPERVISE_STATE_RUNNING
-        reg.write_state(st)
-        # No pty.log file written -> attach fails fast (FR-30) rather than hanging.
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            rc = cli.cmd_supervise("attach", "--name", "fresh")
-        assert rc == 2
-        assert "no PTY transcript" in capsys.readouterr().err
-
-    def test_attach_screen_still_gated(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        # AC-33 regression: --screen stays fail-fast-disabled even after the
-        # read-only follow lands.
-        from unittest.mock import patch
-
-        self._seed(tmp_path, "nightly")
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            rc = cli.cmd_supervise("attach", "--name", "nightly", "--screen")
-        assert rc == 2
-        assert "--screen attach is not enabled" in capsys.readouterr().err

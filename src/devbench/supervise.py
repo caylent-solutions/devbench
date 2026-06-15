@@ -63,6 +63,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import fcntl
+import itertools
 import json
 import logging
 import os
@@ -70,7 +72,9 @@ import re
 import selectors
 import shutil
 import sys
-from collections.abc import Callable
+import threading
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,6 +94,9 @@ from devbench.constants import (
     SUPERVISE_INFO_STATE_STALE,
     SUPERVISE_INFO_STATE_UNKNOWN,
     SUPERVISE_PTY_LOG_FILENAME,
+    SUPERVISE_REGISTRY_LOCK_POLL_SECONDS,
+    SUPERVISE_REGISTRY_LOCK_SUFFIX,
+    SUPERVISE_REGISTRY_LOCK_TIMEOUT_SECONDS,
     SUPERVISE_REGISTRY_PATH,
     SUPERVISE_REGISTRY_TMP_SUFFIX,
     SUPERVISE_RESTART_AUDIT_PREFIX,
@@ -121,6 +128,17 @@ if TYPE_CHECKING:
     from devbench.quota import QuotaExhaustedError
 
 logger = logging.getLogger("devbench.supervise")
+
+# Serializes the supervise-registry read-modify-write WITHIN a process. Advisory
+# ``fcntl`` flock locks are per-open-file-description, so they serialize separate
+# PROCESSES but not threads in one process holding independent descriptors; this
+# module-level lock covers the in-process (multi-thread) case, paired with the
+# flock for the cross-process case (see :meth:`SuperviseRegistry._index_lock`).
+_REGISTRY_INDEX_THREAD_LOCK = threading.Lock()
+
+# Per-process counter making each registry temp-file name unique (paired with the
+# pid) so concurrent atomic writes never collide on a shared temp path.
+_REGISTRY_TMP_COUNTER = itertools.count()
 
 # ---------------------------------------------------------------------------
 # System-dependency preflight (FR-23): `screen` is a system/devcontainer
@@ -479,7 +497,13 @@ class SuperviseRegistry:
         """Serialise and atomically write *sessions* to the registry file.
 
         Creates ``.devbench/supervise/`` if absent. Write-to-tmp-then-rename so
-        readers never see a partial file.
+        readers never see a partial file. The temp file name is UNIQUE per writer
+        (pid + a monotonic counter): two parallel supervise sessions (FR-32) write
+        the registry concurrently from separate processes, so a SHARED temp name
+        would let one writer's rename fire between another's write and rename and
+        crash with ``FileNotFoundError``. A unique temp removes that collision; the
+        per-name index merge that keeps both entries is serialized by
+        :meth:`_index_lock` in :meth:`upsert` / :meth:`remove`.
 
         Args:
             sessions: States to persist.
@@ -489,7 +513,7 @@ class SuperviseRegistry:
         """
         self._registry_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps([s.to_dict() for s in sessions], indent=2)
-        tmp = self._registry_path.with_suffix(SUPERVISE_REGISTRY_TMP_SUFFIX)
+        tmp = self._unique_tmp_path()
         try:
             tmp.write_text(payload, encoding="utf-8")
         except Exception:
@@ -498,16 +522,61 @@ class SuperviseRegistry:
             raise
         tmp.replace(self._registry_path)
 
+    def _unique_tmp_path(self) -> Path:
+        """Return a writer-unique temp path so concurrent writers never collide."""
+        token = f".{os.getpid()}.{next(_REGISTRY_TMP_COUNTER)}{SUPERVISE_REGISTRY_TMP_SUFFIX}"
+        return self._registry_path.with_name(self._registry_path.name + token)
+
     def upsert(self, state: SuperviseSessionState) -> None:
-        """Insert or replace *state* in the registry by name (atomic save)."""
-        sessions = [s for s in self.load() if s.name != state.name]
-        sessions.append(state)
-        self.save(sessions)
+        """Insert or replace *state* in the registry by name (atomically, FR-17/FR-32).
+
+        The load-merge-save is a read-modify-write on the shared index, so it runs
+        under :meth:`_index_lock` (an inter-process ``fcntl`` lock + an in-process
+        thread lock): two parallel supervise sessions each upsert their OWN entry,
+        and without serialization the last writer's whole-array save would clobber
+        the other session's entry (Section 5.7).
+        """
+        with self._index_lock():
+            sessions = [s for s in self.load() if s.name != state.name]
+            sessions.append(state)
+            self.save(sessions)
 
     def remove(self, name: str) -> None:
-        """Drop the registry entry for *name* if present (idempotent)."""
-        sessions = [s for s in self.load() if s.name != name]
-        self.save(sessions)
+        """Drop the registry entry for *name* if present (idempotent, serialized)."""
+        with self._index_lock():
+            sessions = [s for s in self.load() if s.name != name]
+            self.save(sessions)
+
+    @contextlib.contextmanager
+    def _index_lock(self) -> Iterator[None]:
+        """Serialize a registry read-modify-write across processes AND threads.
+
+        ``fcntl.flock`` serializes separate PROCESSES (two ``__run`` supervisors),
+        but advisory flock locks are per-open-file-description and do NOT serialize
+        THREADS in one process holding independent descriptors, so a module-level
+        :data:`_REGISTRY_INDEX_THREAD_LOCK` serializes the in-process case too. The
+        flock is taken on a dedicated lock file beside the registry so it never
+        contends with the workspace ``BACKLOG.lock``. Both are released on exit.
+        """
+        self._registry_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._registry_path.with_name(self._registry_path.name + SUPERVISE_REGISTRY_LOCK_SUFFIX)
+        with _REGISTRY_INDEX_THREAD_LOCK, lock_path.open("w") as lock_fd:
+            deadline = time.monotonic() + SUPERVISE_REGISTRY_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"could not acquire supervise registry lock at {lock_path} within "
+                            f"{SUPERVISE_REGISTRY_LOCK_TIMEOUT_SECONDS}s."
+                        ) from None
+                    _block_until_readable(poll_interval_seconds=SUPERVISE_REGISTRY_LOCK_POLL_SECONDS)
+            try:
+                yield None
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
 
     # ------------------------------------------------------------------
     # Per-session state.json
@@ -1087,6 +1156,14 @@ class PtyDriver:
         self.child = child
         self._patterns = patterns
         self._log_writer = log_writer
+        # PTY text observed by a non-loop ``expect`` (the command-ack wait) that
+        # the event loop has not yet classified. A FAST child can echo its kickoff
+        # and print its terminal sentinel (or crash) entirely within the ack
+        # window; that text lands in ``child.before`` there and would otherwise be
+        # lost before the loop's first ``read_chunk``. Capturing it into a pending
+        # buffer (and prepending it to the next ``read_chunk``) makes terminal
+        # detection independent of where the PTY chunk boundaries fall.
+        self._pending = ""
 
     def wait_for_ready(self, *, timeout_seconds: int) -> None:
         """Block until the interactive ready prompt appears (FR-7).
@@ -1119,12 +1196,20 @@ class PtyDriver:
 
         Returns ``True`` when the working prompt appeared, ``False`` on timeout
         (the caller decides whether a missing ack is fatal).
+
+        On EVERY outcome the buffered PTY text is tee'd to ``pty.log`` and retained
+        in the pending buffer (the loop's next ``read_chunk`` prepends it): a fast
+        child can emit its kickoff echo AND its terminal sentinel within this ack
+        window, so dropping the buffered text here would lose both the transcript
+        (FR-24) and the terminal signal. A missing ack is not fatal -- the hybrid
+        log-tail also confirms activity (FR-29) -- but the text is never discarded.
         """
         try:
             self.child.expect([self._patterns.working_prompt_raw], timeout=timeout_seconds)
         except (pexpect.TIMEOUT, pexpect.EOF):
+            self._capture_before()
             return False
-        self._tee()
+        self._capture_matched()
         return True
 
     @property
@@ -1151,26 +1236,69 @@ class PtyDriver:
         try:
             self.child.expect([r".+"], timeout=timeout_seconds)
         except pexpect.EOF:
-            self._tee()
-            return getattr(self.child, "before", "") or "", True, getattr(self.child, "exitstatus", None)
+            text = self._drain_pending() + self._tee_before()
+            self._last_text = text
+            return text, True, getattr(self.child, "exitstatus", None)
         except pexpect.TIMEOUT as exc:
             raise SupervisePromptTimeoutError(
                 f"no PTY activity within {timeout_seconds}s (exit-reason=prompt-timeout-idle)."
             ) from exc
-        self._tee()
-        self._last_text = getattr(self.child, "after", "") or getattr(self.child, "before", "") or ""
-        return self._last_text, False, None
+        text = self._drain_pending() + self._tee_matched()
+        self._last_text = text
+        return text, False, None
 
     def last_text(self) -> str:
         """Return the most-recently-read PTY chunk (for reset-time parsing)."""
         return getattr(self, "_last_text", "")
 
+    def _capture_before(self) -> None:
+        """Tee ``child.before`` and retain it for the loop (TIMEOUT/EOF buffer)."""
+        self._pending += self._tee_before()
+
+    def _capture_matched(self) -> None:
+        """Tee the matched ``before + after`` text and retain it for the loop."""
+        self._pending += self._tee_matched()
+
+    def _drain_pending(self) -> str:
+        """Return and clear the pending (already-tee'd) buffer (no re-tee)."""
+        pending = self._pending
+        self._pending = ""
+        return pending
+
+    def _tee_before(self) -> str:
+        """Tee + return ``child.before`` (the text read up to an EOF/TIMEOUT)."""
+        text = self._as_text(getattr(self.child, "before", ""))
+        if text and self._log_writer is not None:
+            self._log_writer.write(text)
+        return text
+
+    def _tee_matched(self) -> str:
+        """Tee + return the matched ``before + after`` PTY text.
+
+        ``pexpect`` populates ``before`` with the text read up to a match and
+        ``after`` with the matched text -- but on an EOF (or TIMEOUT) it sets
+        ``after`` to the ``pexpect.EOF`` / ``pexpect.TIMEOUT`` SENTINEL CLASS, not
+        a string (and ``before`` may be ``None`` before the first read). Only the
+        string-valued buffers are real PTY text; a non-string contributes ``""``.
+        """
+        text = self._matched_text(self.child)
+        if text and self._log_writer is not None:
+            self._log_writer.write(text)
+        return text
+
     def _tee(self) -> None:
         """Tee the most-recently-matched output to the redacted ``pty.log``."""
-        if self._log_writer is not None:
-            before = getattr(self.child, "before", "") or ""
-            after = getattr(self.child, "after", "") or ""
-            self._log_writer.write(before + after)
+        self._tee_matched()
+
+    @staticmethod
+    def _as_text(value: object) -> str:
+        """Return *value* when it is a real PTY string, else ``""`` (ignore sentinels)."""
+        return value if isinstance(value, str) else ""
+
+    @classmethod
+    def _matched_text(cls, child: Any) -> str:
+        """Return ``before + after`` as PTY text, ignoring pexpect sentinel classes."""
+        return cls._as_text(getattr(child, "before", "")) + cls._as_text(getattr(child, "after", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -2078,6 +2206,7 @@ def run_supervise_event_loop(
     relaunch: Callable[..., None],
     stop_poll: Callable[[], bool] | None = None,
     state_machine: SupervisorStateMachine | None = None,
+    on_quota_wait: Callable[[datetime | None, int], None] | None = None,
 ) -> EventLoopResult:
     """Drive the post-kickoff supervise event loop to a terminal (FR-13, FR-27).
 
@@ -2115,6 +2244,13 @@ def run_supervise_event_loop(
             graceful-drain edge (the SDK-style callers never stop mid-loop).
         state_machine: The :class:`SupervisorStateMachine` to drive (a fresh one
             in the ``running`` state is created when ``None``).
+        on_quota_wait: Optional callback invoked with ``(reset_at, resumes_used)``
+            the instant the loop enters ``quota-waiting`` (before delegating the
+            wait), so the caller can PERSIST ``state=quota-waiting`` +
+            ``expected-resume`` to the registry while the wait is in progress -- so
+            ``supervise status`` from another process surfaces ``quota-waiting``
+            with the expected resume time (FR-10, FR-16). ``None`` skips persistence
+            (the SDK-style in-process callers do not need mid-wait status).
 
     Returns:
         The terminal :class:`EventLoopResult`.
@@ -2122,6 +2258,17 @@ def run_supervise_event_loop(
     sm = state_machine or _running_state_machine()
     budget = RestartBudget(max_attempts=config.restart.max_attempts)
     idle_timeout = config.timeouts.idle_seconds
+    # When an operator stop CAN arrive (``stop_poll`` set), each PTY read is bounded
+    # by the (shorter) stop-poll cadence so the loop re-checks the stop request
+    # during a quiet session instead of blocking up to the full idle window: a
+    # supervised session that is silently working must still honour ``supervise
+    # stop`` promptly, and a quiet session must NOT fault on an idle timeout while a
+    # stop is pending (Section 4.2, Section 7.5). The cumulative-silence idle
+    # timeout is preserved across these short reads.
+    read_timeout = idle_timeout
+    if stop_poll is not None:
+        read_timeout = min(idle_timeout, config.timeouts.poll_interval_seconds)
+    cumulative_idle = 0
     restarts_used = 0
     resumes_used = 0
 
@@ -2141,15 +2288,23 @@ def run_supervise_event_loop(
             # A non-actionable (advisory) log hit falls through to the PTY read.
 
         try:
-            observation = _observe_pty(driver, idle_timeout)
+            observation = _observe_pty(driver, read_timeout)
         except SupervisePromptTimeoutError:
+            # A single short read elapsed with no PTY activity. Only the CUMULATIVE
+            # silence (re-checked against the full idle window) is a fault, so a
+            # quiet-but-healthy session whose operator is about to stop it is not
+            # mistaken for a hung one; the loop re-checks the stop request first.
+            cumulative_idle += read_timeout
+            if cumulative_idle < idle_timeout:
+                continue
             sm.on_event("fault")
             outcome = classify_supervise_outcome(
                 marker=_OUTCOME_MARKER_PROMPT_TIMEOUT, child_exitstatus=None, phase="idle"
             )
             return _terminal(sm, outcome, restarts_used, resumes_used)
+        cumulative_idle = 0
         terminal = _handle_pty_observation(
-            observation, driver, sm, quota_waiter, budget, relaunch, restarts_used, resumes_used
+            observation, driver, sm, quota_waiter, budget, relaunch, restarts_used, resumes_used, on_quota_wait
         )
         result, restarts_used, resumes_used = terminal
         if result is not None:
@@ -2221,11 +2376,19 @@ class _PtyObservation:
 
 
 def _observe_pty(driver: PtyDriver, idle_timeout: int) -> _PtyObservation:
-    """Read the next PTY chunk and classify it (terminal marker / EOF / activity)."""
+    """Read the next PTY chunk and classify it (terminal marker / EOF / activity).
+
+    The text returned by :meth:`PtyDriver.read_chunk` already includes any output
+    buffered during the command-ack wait, so a terminal sentinel a FAST child
+    prints immediately before exiting is classified here even when it shares the
+    final (EOF) read. On EOF both the classified marker AND the child exit status
+    are carried so the handler can prefer an exact clean sentinel reason
+    (ALL_DONE vs NO_ACTIONABLE) over the bare exit code (Section 4.6 rows 1-2).
+    """
     text, eof, exitstatus = driver.read_chunk(timeout_seconds=idle_timeout)
-    if eof:
-        return _PtyObservation(marker=None, exitstatus=exitstatus, eof=True)
     marker = _classify_pty_text(driver.patterns, text)
+    if eof:
+        return _PtyObservation(marker=marker, exitstatus=exitstatus, eof=True)
     return _PtyObservation(marker=marker, exitstatus=None, eof=False)
 
 
@@ -2262,17 +2425,21 @@ def _handle_pty_observation(
     relaunch: Callable[..., None],
     restarts_used: int,
     resumes_used: int,
+    on_quota_wait: Callable[[datetime | None, int], None] | None = None,
 ) -> tuple[EventLoopResult | None, int, int]:
     """Act on a PTY observation; return (result|None, restarts, resumes)."""
     # A quota PTY marker (path 4.9a/4.9b): NEVER a non-zero exit.
     if observation.marker == _OUTCOME_MARKER_QUOTA_LIMIT:
-        return _handle_quota(driver, sm, quota_waiter, relaunch, restarts_used, resumes_used)
+        return _handle_quota(driver, sm, quota_waiter, relaunch, restarts_used, resumes_used, on_quota_wait)
 
-    # A child EOF: exit-42 is the restart signal; else classify the exit status.
+    # A child EOF: exit-42 is the restart signal; else classify the exit status,
+    # preferring an exact clean sentinel (ALL_DONE / NO_ACTIONABLE) seen in the
+    # final read when the child exited cleanly so the recorded reason is exact.
     if observation.eof:
         if observation.exitstatus == ORCHESTRATOR_RESTART_EXIT_CODE:
             return _handle_restart(sm, budget, relaunch, restarts_used, resumes_used)
-        outcome = classify_supervise_outcome(marker=None, child_exitstatus=observation.exitstatus)
+        eof_marker = observation.marker if observation.marker in _CLEAN_MARKERS else None
+        outcome = classify_supervise_outcome(marker=eof_marker, child_exitstatus=observation.exitstatus)
         sm.on_event("terminal-clean" if outcome.is_clean else "fault")
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
 
@@ -2282,8 +2449,20 @@ def _handle_pty_observation(
         outcome = classify_supervise_outcome(marker=observation.marker, child_exitstatus=None)
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
 
-    # A clean PTY marker observed without an EOF (the child will EOF next): record
-    # working activity and keep reading until the child actually exits.
+    # A clean terminal sentinel (ALL_DONE / NO_ACTIONABLE) observed on the PTY is
+    # the authoritative clean-completion signal (Section 4.6 rows 1-2: the marker
+    # in PTY). It frequently arrives in a chunk just BEFORE the child EOF (the CLI
+    # prints the sentinel, then exits), and at that instant the child has not yet
+    # been reaped so its ``exitstatus`` reads ``None`` -- relying on the EOF exit
+    # status alone would lose the ALL_DONE-vs-NO_ACTIONABLE distinction. Classify
+    # on the sentinel itself so the recorded ``exit-reason`` is exact and stable.
+    if observation.marker in (_OUTCOME_MARKER_ALL_DONE, _OUTCOME_MARKER_NO_ACTIONABLE):
+        sm.on_event("terminal-clean")
+        outcome = classify_supervise_outcome(marker=observation.marker, child_exitstatus=0)
+        return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
+
+    # No terminal marker and no EOF: ongoing working activity (refresh state) and
+    # keep reading until the child reaches a terminal.
     with contextlib.suppress(SuperviseTransitionError):
         sm.on_event("working-activity")
     return None, restarts_used, resumes_used
@@ -2296,6 +2475,7 @@ def _handle_quota(
     relaunch: Callable[..., None],
     restarts_used: int,
     resumes_used: int,
+    on_quota_wait: Callable[[datetime | None, int], None] | None = None,
 ) -> tuple[EventLoopResult | None, int, int]:
     """Handle a quota PTY marker (Section 4.9): wait, then resume / keep-waiting / fault.
 
@@ -2311,6 +2491,12 @@ def _handle_quota(
     sm.on_event("quota-detected")
     text = driver.last_text()
     reset_at = quota_waiter.parse_reset_at(text)
+    # Persist quota-waiting + expected-resume BEFORE the (possibly long) wait so a
+    # concurrent ``supervise status`` surfaces the holding state and the provider
+    # reset time (FR-10, FR-16). The callback is best-effort observability, never a
+    # control point: a persistence failure must not break the quota wait.
+    if on_quota_wait is not None:
+        on_quota_wait(reset_at, resumes_used)
     while True:
         decision = quota_waiter.wait_and_decide(reset_at=reset_at, resumes_used=resumes_used)
         if decision.action is QuotaDecision.FAULT:

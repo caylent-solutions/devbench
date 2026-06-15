@@ -197,6 +197,28 @@ Gate: `make validate` GREEN. Commit + push.
 
 ## Phase 5 -- Functional layer: stub `claude` + screen-less functional tests
 
+**Status: implemented this run.** The functional layer drives the FULL start /
+__run / stop / restart / status / info / attach + quota-wait + auto-restart flows
+against the executable stub-claude through the REAL `pexpect` supervisor (no real
+claude / subscription / tokens; screen bypassed by driving the in-screen `__run`
+body directly). The real-pexpect/real-stub path surfaced four production defects the
+`FakePexpectChild` double had masked, all fixed at the root (no bypass annotations):
+(1) `PtyDriver._tee` crashed on a real pexpect EOF because `child.after` is the
+`pexpect.EOF` sentinel CLASS, not a string -- the driver now coerces non-string
+buffers and tees/retains the ack-window buffer so no PTY text is lost; (2) a fast
+child's terminal sentinel (printed just before EOF, when `exitstatus` is still
+`None`) lost the ALL_DONE-vs-NO_ACTIONABLE distinction -- the loop now classifies on
+the sentinel in the PTY text; (3) the event loop never persisted `quota-waiting` +
+`expected-resume` mid-wait so `supervise status` could not surface it -- an
+`on_quota_wait` persistence hook now stamps the registry before the wait (FR-16); (4)
+`SuperviseRegistry` used a SHARED temp file and an unserialized read-modify-write, so
+two parallel sessions (FR-32) crashed on the rename race / clobbered each other's
+index entry -- the temp file is now writer-unique and the index update runs under a
+process + thread lock (Section 5.7). The loop also bounds each PTY read by the
+stop-poll cadence so an operator `stop` is honored promptly on a quiet session
+instead of waiting out (or faulting on) the full idle window. supervise.py stays at
+100% line coverage.
+
 Files: `tests/fixtures/supervise/stub-claude.py` (executable real CLI fixture),
 `tests/functional/test_supervise_*.py`.
 

@@ -1061,8 +1061,18 @@ SUPERVISE_STOP_REQUEST_FILENAME: str = "stop.request"
 SUPERVISE_SUPERVISOR_LOG_FILENAME: str = "supervisor.log"
 
 # Suffix appended to the supervise registry path for the intermediate temp file
-# used during atomic registry writes (write-then-rename pattern).
+# used during atomic registry writes (write-then-rename pattern). The writer makes
+# the FULL temp name unique (pid + counter) on top of this suffix so two parallel
+# supervise sessions (FR-32) never collide on a shared temp path.
 SUPERVISE_REGISTRY_TMP_SUFFIX: str = ".tmp"
+
+# The dedicated lock file (beside the registry) + timeout/poll cadence serializing
+# the registry read-modify-write across parallel supervise sessions (FR-17/FR-32,
+# Section 5.7). A separate lock file so it never contends with the workspace
+# ``BACKLOG.lock``. The poll cadence bounds a bounded ``select`` park (no sleep).
+SUPERVISE_REGISTRY_LOCK_SUFFIX: str = ".lock"
+SUPERVISE_REGISTRY_LOCK_TIMEOUT_SECONDS: int = 30
+SUPERVISE_REGISTRY_LOCK_POLL_SECONDS: float = 0.05
 
 # Default ``screen`` session-name prefix (Section 5.1, ``screen_name_prefix``).
 # The screen for session ``N`` is ``<prefix><N>``. Override via

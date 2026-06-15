@@ -231,6 +231,7 @@ from devbench.constants import (
     SUPERVISE_SESSION_NAME_PATTERN,
     SUPERVISE_STATE_COMPLETED_CLEAN,
     SUPERVISE_STATE_FAULTED,
+    SUPERVISE_STATE_QUOTA_WAITING,
     SUPERVISE_STATE_RUNNING,
     SUPERVISE_STATE_STOPPED,
     SUPERVISE_SUBVERBS,
@@ -10090,6 +10091,28 @@ def _make_supervise_relaunch(
     return _relaunch
 
 
+def _make_supervise_quota_wait_persister(
+    *, registry: SuperviseRegistry, state: SuperviseSessionState
+) -> Callable[[datetime | None, int], None]:
+    """Return the callback the event loop invokes when it enters ``quota-waiting``.
+
+    It persists ``state=quota-waiting`` with the parsed ``expected-resume`` and the
+    current ``resumes-used`` to the registry BEFORE the (possibly long) wait begins, so
+    a concurrent ``supervise status`` from another process surfaces the holding state
+    and the provider reset time (FR-10, FR-16, Goal G-3). It mutates the same in-memory
+    ``state`` the run body re-stamps with the terminal result afterward.
+    """
+
+    def _persist(reset_at: datetime | None, resumes_used: int) -> None:
+        state.state = SUPERVISE_STATE_QUOTA_WAITING
+        state.expected_resume = reset_at
+        state.resumes_used = resumes_used
+        state.last_activity = datetime.now(UTC)
+        registry.write_state(state)
+
+    return _persist
+
+
 def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     """Hidden ``supervise __run`` body: the pexpect supervisor inside the screen (D-10).
 
@@ -10177,6 +10200,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         plugin_dir=plugin_dir,
         state=state,
     )
+    on_quota_wait = _make_supervise_quota_wait_persister(registry=registry, state=state)
     result: EventLoopResult = run_supervise_event_loop(
         driver=driver,
         config=cfg,
@@ -10184,6 +10208,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         log_poll=log_tail.poll,
         relaunch=relaunch,
         stop_poll=lambda: read_stop_request(WORKSPACE_ROOT, parsed.name),
+        on_quota_wait=on_quota_wait,
     )
 
     state.state = result.final_state

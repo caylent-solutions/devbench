@@ -8,8 +8,10 @@ stale-reaping, per-session state-dir + path helpers, and multi-session listing.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -313,3 +315,64 @@ class TestNewSessionState:
             scope=["E1-F1-S1-T1"],
         )
         assert state.scope == ["E1-F1-S1-T1"]
+
+
+@pytest.mark.unit
+class TestRegistryConcurrency:
+    """Concurrent-write safety for two parallel supervise sessions (FR-17, FR-32)."""
+
+    def test_unique_tmp_path_per_writer(self, tmp_path: Path) -> None:
+        # The atomic-write temp name is unique per writer (pid + counter) so two
+        # parallel sessions' renames never collide on a shared temp path.
+        reg = SuperviseRegistry(tmp_path)
+        first = reg._unique_tmp_path()
+        second = reg._unique_tmp_path()
+        assert first != second
+        assert str(first).startswith(str(reg._registry_path))
+        assert str(first).endswith(".tmp")
+
+    def test_concurrent_upserts_keep_both_entries(self, tmp_path: Path) -> None:
+        # Two threads each upsert their OWN session concurrently; the index lock
+        # serializes the read-modify-write so neither entry is clobbered (FR-32).
+        reg = SuperviseRegistry(tmp_path)
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def _writer(name: str) -> None:
+            try:
+                barrier.wait(timeout=10)
+                for _ in range(20):
+                    reg.upsert(_state(name, pid=1))
+            except (OSError, ValueError, TimeoutError, threading.BrokenBarrierError) as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_writer, args=(name,)) for name in ("alpha", "beta")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert not errors
+        names = {s.name for s in SuperviseRegistry(tmp_path).load()}
+        assert names == {"alpha", "beta"}
+
+    def test_index_lock_times_out_when_held(self, tmp_path: Path) -> None:
+        # An external holder of the inter-process flock makes the contention branch
+        # park then fail fast with a TimeoutError (Section 5.7, FR-30).
+        from devbench import supervise
+
+        reg = SuperviseRegistry(tmp_path)
+        reg.save([_state("seed", 1)])  # create the registry dir
+        lock_path = reg._registry_path.with_name(reg._registry_path.name + ".lock")
+
+        with (
+            lock_path.open("w") as holder,
+            patch.object(supervise, "SUPERVISE_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.2),
+            patch.object(supervise, "SUPERVISE_REGISTRY_LOCK_POLL_SECONDS", 0.05),
+        ):
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            try:
+                with pytest.raises(TimeoutError, match="supervise registry lock"):
+                    reg.upsert(_state("late", 1))
+            finally:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN)

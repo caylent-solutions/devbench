@@ -38,6 +38,23 @@ class TestCleanOutcomes:
         assert outcome.is_clean is True
         assert outcome.exit_code == 0
 
+    def test_bare_clean_exit_no_marker_is_clean(self) -> None:
+        # A child that exits 0 with NO terminal sentinel on the PTY is a bare clean
+        # process exit -> clean "all-done" (Section 4.6: 0 = clean). This is the
+        # fallthrough after the quota / non-zero-exit / clean-marker / fault-marker
+        # rules, exercised when the CLI exits silently.
+        outcome = classify_supervise_outcome(marker=None, child_exitstatus=0)
+        assert outcome.is_clean is True
+        assert outcome.exit_code == 0
+        assert outcome.exit_reason == "all-done"
+
+    def test_clean_exit_unknown_exitstatus_is_clean(self) -> None:
+        # The child EOF was observed before the OS reaped it (exitstatus None) and no
+        # marker is present: still a bare clean exit (not a fault).
+        outcome = classify_supervise_outcome(marker=None, child_exitstatus=None)
+        assert outcome.is_clean is True
+        assert outcome.exit_reason == "all-done"
+
 
 @pytest.mark.unit
 class TestFaultOutcomes:

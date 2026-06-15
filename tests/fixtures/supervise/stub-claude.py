@@ -24,6 +24,18 @@ Behavior (all input-driven, nothing hardcoded into the supervisor):
       then exits with the configured code (the poll-restart path 4.9b input).
     - ``restart`` -> prints the auto-restart marker then exits 42.
 
+Each named script carries a DEFAULT exit code (``clean``/``no_actionable`` -> 0,
+``crash`` -> 1, ``quota`` -> ``STUB_CLAUDE_QUOTA_EXIT_CODE`` (default 1), ``restart``
+-> 42); ``STUB_CLAUDE_EXIT_CODE`` overrides the default for the single-script form.
+
+Multi-launch sequences (auto-restart / quota-resume): the supervisor RELAUNCHES the
+same ``claude`` invocation across exit-42 / quota events. To drive those flows
+deterministically, ``STUB_CLAUDE_SCRIPT_SEQUENCE`` is a comma-separated list of scripts;
+each launch consumes the NEXT entry (the last entry repeats once the list is exhausted),
+the position tracked in ``STUB_CLAUDE_STATE_FILE``. Example
+``STUB_CLAUDE_SCRIPT_SEQUENCE=restart,clean`` exits 42 on the first launch then ALL_DONE
+on the relaunch, so a test can assert a bounded auto-restart that RECOVERS.
+
 Every behavioral knob is an environment variable so a test parametrizes the stub
 without editing it (CLAUDE.md: input-driven, no hardcoded test data).
 """
@@ -32,6 +44,16 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+
+#: Default exit code per named script (the single-script ``STUB_CLAUDE_EXIT_CODE``
+#: env var overrides it; a sequence entry uses the default for its script).
+_SCRIPT_DEFAULT_EXIT_CODE = {
+    "clean": 0,
+    "no_actionable": 0,
+    "crash": 1,
+    "restart": 42,
+}
 
 
 def _emit(text: str) -> None:
@@ -54,23 +76,94 @@ def _terminal_output(script: str) -> str:
     return table.get(script, "ALL_DONE")
 
 
+def _script_exit_code(script: str) -> int:
+    """Return the exit code for *script*.
+
+    ``quota`` reads ``STUB_CLAUDE_QUOTA_EXIT_CODE`` (default 1: a quota-classified
+    non-zero exit drives the poll-restart path 4.9b). Other scripts use the
+    per-script default table.
+    """
+    if script == "quota":
+        return int(os.environ.get("STUB_CLAUDE_QUOTA_EXIT_CODE", "1"))
+    return _SCRIPT_DEFAULT_EXIT_CODE.get(script, 0)
+
+
+def _resolve_launch() -> tuple[str, int]:
+    """Resolve this launch's (script, exit_code) from the single or sequence form.
+
+    Single form: ``STUB_CLAUDE_SCRIPT`` (default ``clean``) with ``STUB_CLAUDE_EXIT_CODE``
+    overriding the per-script default when set. Sequence form: the next entry of
+    ``STUB_CLAUDE_SCRIPT_SEQUENCE`` (position persisted in ``STUB_CLAUDE_STATE_FILE``);
+    the last entry repeats once the list is exhausted. The sequence form ignores
+    ``STUB_CLAUDE_EXIT_CODE`` so each entry uses its own per-script exit code.
+    """
+    sequence = os.environ.get("STUB_CLAUDE_SCRIPT_SEQUENCE", "").strip()
+    if sequence:
+        scripts = [s.strip() for s in sequence.split(",") if s.strip()]
+        index = _next_sequence_index(len(scripts))
+        script = scripts[min(index, len(scripts) - 1)]
+        return script, _script_exit_code(script)
+
+    script = os.environ.get("STUB_CLAUDE_SCRIPT", "clean")
+    override = os.environ.get("STUB_CLAUDE_EXIT_CODE")
+    exit_code = int(override) if override is not None else _script_exit_code(script)
+    return script, exit_code
+
+
+def _next_sequence_index(length: int) -> int:
+    """Return this launch's 0-based sequence index, advancing the state file.
+
+    The state file holds the count of launches consumed so far; this launch reads
+    it as its index and writes back ``index + 1``. A missing/blank/corrupt file is
+    treated as the first launch (index 0) -- a fresh sequence, not a silent error,
+    because each test uses a fresh temp state file.
+    """
+    state_file = os.environ.get("STUB_CLAUDE_STATE_FILE")
+    if not state_file:
+        return 0
+    state_path = Path(state_file)
+    try:
+        index = int(state_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        index = 0
+    state_path.write_text(str(index + 1), encoding="utf-8")
+    return index
+
+
 def main() -> int:
-    """Run the stub interactive session; return the configured exit code."""
+    """Run the stub interactive session; return the configured exit code.
+
+    The ``idle`` script models a session that stays alive AFTER the kickoff (it
+    emits no terminal sentinel) and exits 0 only when it receives the drain command
+    (``STUB_CLAUDE_DRAIN_COMMAND``, default ``/exit``). This drives the graceful-stop
+    path (Section 4.2): the supervisor injects ``/exit`` and reads to the child EOF.
+    Every other script emits its terminal sentinel immediately on the kickoff and
+    exits with its resolved code.
+    """
     ready_prompt = os.environ.get("STUB_CLAUDE_READY_PROMPT", "> ")
     kickoff = os.environ.get("STUB_CLAUDE_KICKOFF", "/devbench-orchestrate:orchestrate")
-    script = os.environ.get("STUB_CLAUDE_SCRIPT", "clean")
-    exit_code = int(os.environ.get("STUB_CLAUDE_EXIT_CODE", "0"))
+    drain_command = os.environ.get("STUB_CLAUDE_DRAIN_COMMAND", "/exit")
+    script, exit_code = _resolve_launch()
 
     _emit(ready_prompt)
 
+    kickoff_seen = False
     for raw in sys.stdin:
         line = raw.rstrip("\n")
         _emit(f"[stub-claude] received: {line}")
-        if line.strip() == kickoff:
+        stripped = line.strip()
+        if script == "idle":
+            # Stay alive until the drain command arrives (the operator stop path).
+            if kickoff_seen and stripped == drain_command:
+                return exit_code
+            if stripped == kickoff:
+                kickoff_seen = True
+            continue
+        if stripped == kickoff:
             _emit(_terminal_output(script))
             return exit_code
 
-    # stdin closed before the kickoff arrived: exit cleanly so the supervisor
+    # stdin closed before the kickoff/drain arrived: exit cleanly so the supervisor
     # observes an EOF rather than hanging (the supervisor's timeout still bounds
     # this path).
     return exit_code

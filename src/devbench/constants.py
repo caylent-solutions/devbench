@@ -1249,10 +1249,13 @@ SUPERVISE_RESUME_MODE_DEFAULT: str = "continue"
 # path is best-effort until a real quota event is captured. ``reset_at`` mirrors
 # ``quota._RESET_AT_RE``. Keys map to ``SuperviseDetectionPatternsConfig`` fields.
 SUPERVISE_DETECTION_PATTERNS_DEFAULT: dict[str, str] = {
-    # The box-drawing bar (U+2502) and the verbatim Unicode apostrophe (U+2019,
-    # which appears in the real CLI line "You've hit your limit") are written as
-    # explicit escapes so the source stays ASCII; see ``quota._QUOTA_MARKERS``.
-    "ready_prompt": "(?m)^\\s*(>|│\\s*>)\\s*$",
+    # Claude Code (>=2.1.x) renders its interactive input prompt as the arrow
+    # glyph U+276F (the line "<arrow> Try ..."), framed in a box, NOT a bare ">".
+    # The detector matches that arrow (literal U+276F), keeping the legacy ">" and
+    # box-framed "U+2502 >" forms as a fallback for older CLIs / custom prompts.
+    # The Unicode apostrophe (U+2019, in the real CLI line "You've hit your
+    # limit") stays an explicit \u escape; see ``quota._QUOTA_MARKERS``.
+    "ready_prompt": "(?m)\u276f|^\\s*│?\\s*>(?:\\s|$)",
     "working_prompt": r"(?i)(esc to interrupt|tokens|thinking)",
     "quota_limit": "(?i)(You(\u2019ve|'ve| have) hit your limit|rate.?limit.*(exceeded|reached|resets))",
     "quota_wait_prompt": r"(?i)(wait.*reset|retry.*later|press.*to wait)",

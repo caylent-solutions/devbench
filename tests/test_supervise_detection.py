@@ -69,6 +69,23 @@ class TestReadyAndWorkingPatterns:
         patterns = DetectionPatterns(SuperviseDetectionPatternsConfig())
         assert patterns.is_ready_prompt("> ")
 
+    def test_ready_prompt_matches_claude_arrow_prompt(self) -> None:
+        # Claude Code (>=2.1.x) renders its interactive input prompt as the arrow
+        # glyph U+276F ("> Try ..." with the arrow, not a bare ">"), framed in a
+        # box; the detector must match the real CLI prompt or the supervisor hangs
+        # forever in the "starting" state waiting for a ready prompt that the
+        # legacy "^>$" pattern can never see.
+        patterns = DetectionPatterns(SuperviseDetectionPatternsConfig())
+        assert patterns.is_ready_prompt('\u276f Try "how do I log an error?"')
+        assert patterns.is_ready_prompt("│ \u276f │")
+
+    def test_ready_prompt_not_matched_by_working_text(self) -> None:
+        # Ready and working states must stay distinct: the supervisor injects the
+        # orchestrate command only after the ready prompt, then waits for work.
+        patterns = DetectionPatterns(SuperviseDetectionPatternsConfig())
+        assert not patterns.is_ready_prompt("esc to interrupt")
+        assert not patterns.is_ready_prompt("thinking")
+
     def test_working_prompt_matches(self) -> None:
         patterns = DetectionPatterns(SuperviseDetectionPatternsConfig())
         assert patterns.is_working_prompt("esc to interrupt")

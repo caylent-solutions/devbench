@@ -303,7 +303,11 @@ What happens:
 
 The interrupted work unit remains in `blocked` state. Run
 `uv run devbench sync-blocked` after restarting to re-examine whether it can be
-re-queued.
+re-queued. If the unit was interrupted mid-git-ops (after `git add` but before
+the commit), the force-block also unstages any WIP it left in the target
+checkout's index -- the edits stay in the working tree (recoverable when the unit
+is re-claimed), but a later commit in the same checkout cannot sweep those staged
+files in under the wrong unit/message.
 
 ### Step 8 -- Clean up stale sessions
 

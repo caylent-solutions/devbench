@@ -869,7 +869,7 @@ Send SIGTERM to a running session's orchestrator process, forcing it to exit aft
 
 1. `devbench stop` reads the session's `pid` file.
 2. Sends SIGTERM to the process.
-3. The SIGTERM handler in `cmd_start` intercepts the signal, writes a `[FORCED_BLOCKED_ON_STOP] session=<name>` audit comment to the in-flight work unit, marks the work unit `blocked`, and exits with rc=0.
+3. The SIGTERM handler in `cmd_start` intercepts the signal, writes a `[FORCED_BLOCKED_ON_STOP] session=<name>` audit comment to the in-flight work unit, marks the work unit `blocked`, and exits with rc=0. If the unit was interrupted mid-git-ops (after `git add` but before the commit), any staged WIP left in the target checkout's index is unstaged (edits stay in the working tree, recoverable when the unit is re-claimed) so a subsequent commit in the same checkout cannot sweep those files in under the wrong unit/message.
 4. The session directory is NOT cleaned up automatically -- run `devbench sessions --cleanup` afterward to remove the stale entry.
 
 **Flags:**

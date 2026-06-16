@@ -11819,7 +11819,7 @@ def _recover_orphaned_units_from_dead_sessions(
                 "orchestrator",
                 f"{REQUEUED_AFTER_DEAD_SESSION_AUDIT_PREFIX}{claiming}",
             )
-            _flag_orphaned_staged_wip(unit, claiming)
+            _flag_orphaned_staged_wip(unit, f"dead session {claiming}")
             recovered.append(unit.id)
             logger.info(
                 "dead-session recovery: re-queued %s orphaned in-progress by dead session %s",
@@ -11836,20 +11836,30 @@ def _recover_orphaned_units_from_dead_sessions(
     return sorted(recovered)
 
 
-def _flag_orphaned_staged_wip(unit: WorkUnit, session_name: str) -> None:
-    """Coordinate a re-queued unit's recovery with the staged-WIP invariant.
+def _flag_orphaned_staged_wip(unit: WorkUnit, reason: str) -> None:
+    """Coordinate an interrupted unit's recovery with the staged-WIP invariant.
 
-    A session that died mid-git-ops can leave staged changes in the target
-    checkout's index. Re-queuing the unit's status is not enough: a later commit
-    in the same checkout could sweep those staged files in under the wrong unit.
-    This unstages the dead session's orphaned staged WIP so a subsequent commit
-    cannot include it. Best-effort and shared with the drain/stop path (the
-    companion tracked issue ``drain-leaves-interrupted-unit-staged-wip-in-index``).
+    An interrupted unit (dead session, drain, or SIGTERM stop) can leave staged
+    changes in its target checkout's index. Resetting the unit's status is not
+    enough: a later commit in the same checkout could sweep those staged files in
+    under the wrong unit/message. This unstages the orphaned staged WIP so a
+    subsequent commit cannot include it (edits stay in the working tree). Shared
+    by the dead-session recovery and the drain/stop force-block path (tracked
+    issue ``drain-leaves-interrupted-unit-staged-wip-in-index``). Best-effort:
+    no-op when the unit's repo has no configured local checkout.
     """
-    repo_path = REPO_LOCAL_PATHS.get(resolve_repo(unit.repo)) if unit.repo else None
+    if not unit.repo:
+        return
+    try:
+        canonical_repo = resolve_repo(unit.repo)
+    except ValueError:
+        # Unrecognised repo: nothing to clean up here. Best-effort -- never let a
+        # repo-resolution quirk break the unit's status recovery.
+        return
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
     if repo_path is None:
         return
-    _unstage_interrupted_wip(Path(repo_path), unit_id=unit.id, reason=f"dead session {session_name}")
+    _unstage_interrupted_wip(Path(repo_path), unit_id=unit.id, reason=reason)
 
 
 def _unstage_interrupted_wip(repo_path: Path, *, unit_id: str, reason: str) -> bool:
@@ -12037,6 +12047,13 @@ def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
         "orchestrator",
         f"{_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX}{session_name}",
     )
+    # The unit may have been interrupted mid-git-ops -- after the executor ran
+    # ``git add`` but before the commit. Force-blocking its status is not enough:
+    # the staged changes sit in the target checkout's index and a later commit in
+    # the same checkout would sweep them in under the wrong unit/message (tracked
+    # issue: drain-leaves-interrupted-unit-staged-wip-in-index). Unstage them
+    # (edits stay in the working tree, recoverable when the unit is re-claimed).
+    _flag_orphaned_staged_wip(wu, f"interrupted on stop session={session_name}")
 
 
 def _block_non_converging_claim(unit_id: str, recurring_failure: str) -> None:

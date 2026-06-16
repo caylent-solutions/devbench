@@ -1003,6 +1003,16 @@ SESSION_FLOCK_POLL_INTERVAL_SECONDS: float = 0.1
 # ``src/devbench/cli.py`` (_session_drain_state_str).
 SESSION_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
 
+# Audit-comment prefix written by ``devbench sessions --cleanup`` when it
+# auto-recovers a work unit left ``in-progress`` by a session that died without
+# a clean stop (crash, OOM, host reboot, ``kill -9``). The unit's most recent
+# ``[WU_CLAIMED] ... session=<name>`` audit attributes it to the now-dead
+# session; cleanup re-queues it and appends ``[REQUEUED_AFTER_DEAD_SESSION]
+# session=<name>`` so the recovery is explicit (no manual ``set-status``). The
+# recovery cross-checks pid liveness against the registry so a unit a LIVE
+# session is actively working is never re-queued.
+REQUEUED_AFTER_DEAD_SESSION_AUDIT_PREFIX: str = "[REQUEUED_AFTER_DEAD_SESSION] session="
+
 # Relative path (from workspace root) of the orchestrator restart marker
 # file written by ``cmd_start`` on every startup.  Issue #215: bounds the
 # audit-row scan window in

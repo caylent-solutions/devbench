@@ -210,6 +210,7 @@ from devbench.constants import (
     ORCHESTRATOR_RESTART_EXIT_CODE,
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
+    REQUEUED_AFTER_DEAD_SESSION_AUDIT_PREFIX,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -11717,6 +11718,23 @@ def cmd_sessions(*argv: str) -> int:
         removed = registry.cleanup_stale_sessions()
         if removed:
             print(f"Removed {len(removed)} stale session(s): {', '.join(removed)}")
+            # A session that died without a clean SIGTERM stop leaves any unit it
+            # had set to ``in-progress`` stuck there forever (tracked issue:
+            # dead-session-leaves-claimed-unit-stuck-in-progress). cleanup already
+            # knows which sessions are dead; re-queue each orphaned in-progress
+            # unit it claimed, cross-checking pid liveness against the surviving
+            # registry so a unit a LIVE session is actively working is never
+            # touched. ``registry.load()`` now returns only the survivors (cleanup
+            # rewrote the registry).
+            recovered = _recover_orphaned_units_from_dead_sessions(
+                dead_session_names=set(removed),
+                surviving_sessions=registry.load(),
+            )
+            if recovered:
+                print(
+                    f"Re-queued {len(recovered)} orphaned in-progress unit(s) "
+                    f"from dead session(s): {', '.join(recovered)}"
+                )
         else:
             print("No stale sessions found -- nothing to clean up.")
         return 0
@@ -11741,6 +11759,166 @@ def cmd_sessions(*argv: str) -> int:
         print(f"{session.name:<20} {session.pid:>8}  {liveness:<8}  {drain_str:<8}  {started_str:<25}  {scope_str}")
 
     return 0
+
+
+def _recover_orphaned_units_from_dead_sessions(
+    *,
+    dead_session_names: set[str],
+    surviving_sessions: list[Session],
+) -> list[str]:
+    """Re-queue every ``in-progress`` unit orphaned by a now-dead session.
+
+    A session that dies without a clean SIGTERM stop leaves the unit it had set
+    to ``in-progress`` ([WU_CLAIMED] session=<name>) stuck there indefinitely.
+    This is called from ``sessions --cleanup`` after the dead sessions' registry
+    entries are removed. For every Task in ``in-progress`` whose most recent
+    [WU_CLAIMED] audit names one of *dead_session_names*, the unit is re-queued
+    (``force_status`` -> in-queue) with an explicit
+    ``[REQUEUED_AFTER_DEAD_SESSION] session=<name>`` audit comment.
+
+    Liveness cross-check (AC): a unit that appears in ANY surviving (live)
+    session's scope is NEVER re-queued, even if its claim audit names a dead
+    session -- a live session may legitimately have re-claimed it. The pid
+    liveness was already established by ``cleanup_stale_sessions`` (the survivors
+    are exactly the sessions whose pid is alive).
+
+    Returns the sorted list of re-queued unit ids (empty when nothing matched).
+    Best-effort per unit: a read/parse/write failure on one unit is logged and
+    skipped so a single bad file cannot block recovery of the others.
+    """
+    if not dead_session_names:
+        return []
+
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning("dead-session recovery: cannot read backlog index: %s", exc)
+        return []
+
+    # Any unit a surviving (live) session holds in scope is off-limits.
+    live_scoped: set[str] = set()
+    for session in surviving_sessions:
+        live_scoped.update(session.scope)
+
+    mgr = BacklogManager()
+    recovered: list[str] = []
+    for unit in units:
+        if unit.status is not WorkUnitStatus.IN_PROGRESS:
+            continue
+        if unit.id in live_scoped:
+            # A live session may have re-claimed this unit; never re-queue it.
+            continue
+        claiming = _extract_session_from_wu(unit)
+        if claiming is None or claiming not in dead_session_names:
+            continue
+        try:
+            mgr.force_status(unit.file_path, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
+            mgr._append_agent_comment(
+                unit.file_path,
+                "orchestrator",
+                f"{REQUEUED_AFTER_DEAD_SESSION_AUDIT_PREFIX}{claiming}",
+            )
+            _flag_orphaned_staged_wip(unit, claiming)
+            recovered.append(unit.id)
+            logger.info(
+                "dead-session recovery: re-queued %s orphaned in-progress by dead session %s",
+                unit.id,
+                claiming,
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "dead-session recovery: failed to re-queue %s (claimed by %s): %s",
+                unit.id,
+                claiming,
+                exc,
+            )
+    return sorted(recovered)
+
+
+def _flag_orphaned_staged_wip(unit: WorkUnit, session_name: str) -> None:
+    """Coordinate a re-queued unit's recovery with the staged-WIP invariant.
+
+    A session that died mid-git-ops can leave staged changes in the target
+    checkout's index. Re-queuing the unit's status is not enough: a later commit
+    in the same checkout could sweep those staged files in under the wrong unit.
+    This unstages the dead session's orphaned staged WIP so a subsequent commit
+    cannot include it. Best-effort and shared with the drain/stop path (the
+    companion tracked issue ``drain-leaves-interrupted-unit-staged-wip-in-index``).
+    """
+    repo_path = REPO_LOCAL_PATHS.get(resolve_repo(unit.repo)) if unit.repo else None
+    if repo_path is None:
+        return
+    _unstage_interrupted_wip(Path(repo_path), unit_id=unit.id, reason=f"dead session {session_name}")
+
+
+def _unstage_interrupted_wip(repo_path: Path, *, unit_id: str, reason: str) -> bool:
+    """Unstage any staged WIP left in *repo_path*'s index by an interrupted unit.
+
+    When a session is drained / stopped / dies after the executor ran
+    ``git add`` but BEFORE the commit, the staged changes sit in the checkout's
+    index. A later ``git commit`` in the same checkout (the next unit's git-ops
+    or a follow-up offline fix) would sweep those orphaned staged files in under
+    the wrong unit/message -- cross-unit commit contamination (tracked issue:
+    ``drain-leaves-interrupted-unit-staged-wip-in-index``).
+
+    This unstages everything currently staged (``git reset -q`` -- the universal
+    unstage that leaves the edits in the working tree, so the WIP is recoverable
+    when the unit is re-claimed and is never silently lost). It is a no-op when
+    the index is clean. Best-effort: a non-git directory or a git error is logged
+    and swallowed so recovery of the unit's status is never blocked by a git
+    quirk. Returns ``True`` when staged changes were found and unstaged.
+
+    Args:
+        repo_path: Target repo working-directory checkout.
+        unit_id: The interrupted unit (for the audit log line).
+        reason: Why the unit was interrupted (e.g. ``"drain"``, ``"dead session X"``).
+    """
+    if not repo_path.is_dir():
+        return False
+    # `git diff --cached --quiet` exits 0 when nothing is staged, 1 when the
+    # index differs from HEAD. Any other exit (e.g. not a git repo) is treated
+    # as "nothing to do" so this never raises into the recovery path.
+    probe = subprocess.run(
+        ["git", "-C", str(repo_path), "diff", "--cached", "--quiet"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return False
+    if probe.returncode != 1:
+        logger.warning(
+            "_unstage_interrupted_wip: cannot probe index for '%s' (unit %s, %s): %s",
+            repo_path,
+            unit_id,
+            reason,
+            probe.stderr.strip(),
+        )
+        return False
+    reset_result = subprocess.run(
+        ["git", "-C", str(repo_path), "reset", "-q"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if reset_result.returncode != 0:
+        logger.warning(
+            "_unstage_interrupted_wip: git reset (unstage) failed for '%s' (unit %s, %s): %s",
+            repo_path,
+            unit_id,
+            reason,
+            reset_result.stderr.strip(),
+        )
+        return False
+    logger.info(
+        "_unstage_interrupted_wip: unstaged orphaned WIP in '%s' left by interrupted unit %s (%s); "
+        "edits remain in the working tree, recoverable when the unit is re-claimed.",
+        repo_path,
+        unit_id,
+        reason,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

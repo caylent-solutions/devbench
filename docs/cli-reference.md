@@ -833,6 +833,8 @@ List all registered orchestrator sessions and their liveness state. Each row in 
 
 - **`devbench sessions --cleanup`** -- remove session directories whose `pid` file references a non-running process. Stale session entries are removed from `registry.json` and the corresponding `<workspace>/.devbench/sessions/<name>/` directory is deleted. Active sessions are left untouched. Prints one line per removed session (`[CLEANED] session <name> (pid <N>)`). Exits 0 on success.
 
+  **Dead-session orphan recovery.** A session that dies without a clean SIGTERM stop (crash, OOM, host reboot, `kill -9`) leaves the unit it had set to `in-progress` (`[WU_CLAIMED] session=<name>`) stuck there forever, blocking dependents and tripping the Stop hook on every later session. After removing the stale entries, `--cleanup` re-queues every `in-progress` Task whose most recent `[WU_CLAIMED]` audit names a now-dead session, appending an explicit `[REQUEUED_AFTER_DEAD_SESSION] session=<name>` audit comment (no manual `set-status` needed). The recovery cross-checks pid liveness against the surviving registry, so a unit a **live** session holds in scope is never re-queued. Any staged WIP the dead session left in the target checkout's index is unstaged (edits stay in the working tree) so a later commit cannot sweep it in. Prints `Re-queued N orphaned in-progress unit(s) from dead session(s): <ids>` when any unit is recovered.
+
 **Exit codes:**
 
 | Command | rc=0 | rc!=0 |

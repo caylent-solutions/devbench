@@ -323,6 +323,14 @@ The cleanup command only removes STALE sessions -- those where `os.kill(pid, 0)`
 returns `ProcessLookupError` (ESRCH). Sessions where the liveness check raises
 `PermissionError` (EPERM) are treated as ACTIVE and left untouched.
 
+`--cleanup` also auto-recovers any unit a dead session left stuck `in-progress`:
+it re-queues every `in-progress` Task whose most recent `[WU_CLAIMED]` audit names a
+removed (dead) session, appending a `[REQUEUED_AFTER_DEAD_SESSION] session=<name>`
+audit comment. A unit a still-live session holds in scope is never re-queued
+(liveness cross-check), and any staged WIP the dead session left in the target
+checkout is unstaged so a later commit cannot sweep it in. This means a crashed
+daemon no longer leaves an orphaned `in-progress` unit blocking its dependents.
+
 ---
 
 ## Overlap detection and --allow-overlap

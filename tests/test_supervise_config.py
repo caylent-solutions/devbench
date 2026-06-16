@@ -21,6 +21,10 @@ from devbench.config_loader import (
 )
 from devbench.constants import (
     SUPERVISE_ALWAYS_DENY_ENV_VARS,
+    SUPERVISE_AWS_PASSTHROUGH_ENV_VARS,
+    SUPERVISE_BILLING_MODE_BEDROCK,
+    SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+    SUPERVISE_DEFAULT_BILLING_MODE,
     SUPERVISE_DETECTION_PATTERNS_DEFAULT,
     SUPERVISE_EFFORT_DEFAULT,
     SUPERVISE_INJECTABLE_COMMANDS_DEFAULT,
@@ -212,13 +216,56 @@ class TestSuperviseEnvDenyGuard:
     @pytest.mark.parametrize("always_deny", list(SUPERVISE_ALWAYS_DENY_ENV_VARS))
     def test_whitelist_always_deny_via_negation_fails_fast(self, always_deny: str) -> None:
         # A config that tries to remove an always-deny var by negating it in the
-        # deny-list is a fail-fast config error (Section 3.6.1).
+        # deny-list is a fail-fast config error (Section 3.6.1). The always-deny set
+        # is the UNION of both billing modes' routing vars; it is non-removable
+        # regardless of the active billing mode.
         with pytest.raises(ValueError, match="always-deny"):
             _parse_supervise_config(Path("cfg.yaml"), {"env": {"deny_vars": [f"!{always_deny}"]}})
+
+    @pytest.mark.parametrize("aws_var", list(SUPERVISE_AWS_PASSTHROUGH_ENV_VARS))
+    def test_aws_creds_are_not_in_the_non_removable_guard(self, aws_var: str) -> None:
+        # AWS workload creds + region are in NEITHER mode's deny set, so they are
+        # NOT non-removable: a config may list them in deny_vars without tripping
+        # the whitelist guard (they pass through by default).
+        assert aws_var not in SUPERVISE_ALWAYS_DENY_ENV_VARS
 
     def test_extra_deny_vars_accepted(self) -> None:
         cfg = _parse_supervise_config(Path("cfg.yaml"), {"env": {"deny_vars": ["MY_SECRET_VAR"]}})
         assert "MY_SECRET_VAR" in cfg.env.deny_vars
+
+
+@pytest.mark.unit
+class TestSuperviseBillingMode:
+    """supervise.billing_mode parses, validates, and defaults to subscription."""
+
+    def test_default_billing_mode_is_subscription(self) -> None:
+        assert SuperviseConfig().billing_mode == SUPERVISE_DEFAULT_BILLING_MODE
+        assert SUPERVISE_DEFAULT_BILLING_MODE == SUPERVISE_BILLING_MODE_SUBSCRIPTION
+
+    def test_absent_block_yields_subscription(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {})
+        assert cfg.billing_mode == SUPERVISE_BILLING_MODE_SUBSCRIPTION
+
+    @pytest.mark.parametrize("mode", [SUPERVISE_BILLING_MODE_SUBSCRIPTION, SUPERVISE_BILLING_MODE_BEDROCK])
+    def test_valid_billing_mode_parsed(self, mode: str) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"billing_mode": mode})
+        assert cfg.billing_mode == mode
+
+    def test_invalid_billing_mode_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="billing_mode"):
+            _parse_supervise_config(Path("cfg.yaml"), {"billing_mode": "free-lunch"})
+
+    def test_billing_mode_loads_via_runtime_config(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  billing_mode: bedrock\n")
+        runtime = load_runtime_config(cfg_path, {})
+        assert runtime.supervise.billing_mode == SUPERVISE_BILLING_MODE_BEDROCK
+
+    def test_invalid_billing_mode_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  billing_mode: ludicrous\n")
+        with pytest.raises(Exception, match=r"ludicrous|billing_mode|enum"):
+            load_runtime_config(cfg_path, {})
 
 
 @pytest.mark.unit

@@ -84,9 +84,15 @@ import pexpect
 
 from devbench.constants import (
     ORCHESTRATOR_RESTART_EXIT_CODE,
-    SUPERVISE_ALWAYS_DENY_ENV_VARS,
     SUPERVISE_BASE_DIR,
+    SUPERVISE_BEDROCK_DEFAULT_REGION_VAR,
+    SUPERVISE_BEDROCK_MODEL_VAR,
+    SUPERVISE_BEDROCK_REGION_VAR,
+    SUPERVISE_BEDROCK_USE_FLAG_VAR,
     SUPERVISE_BILLING_CHANNEL,
+    SUPERVISE_BILLING_MODE_BEDROCK,
+    SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+    SUPERVISE_DEFAULT_BILLING_MODE,
     SUPERVISE_EFFORT_DEFAULT,
     SUPERVISE_EXIT_REASON_GRACEFUL_STOP,
     SUPERVISE_FAULT_AUDIT_PREFIX,
@@ -114,7 +120,9 @@ from devbench.constants import (
     SUPERVISE_STATE_STOPPED,
     SUPERVISE_STOP_REQUEST_FILENAME,
     SUPERVISE_SUPERVISOR_LOG_FILENAME,
+    SUPERVISE_VALID_BILLING_MODES,
     SUPERVISE_VALID_EFFORT_LEVELS,
+    resolve_supervise_deny_vars,
 )
 from devbench.scope import ScopeFilter, session_scope_file_path
 
@@ -304,8 +312,9 @@ class SuperviseSessionState:
     """All persisted metadata for one supervise session (Section 5.5).
 
     Serialised to ``.devbench/supervise/<name>/state.json`` and indexed in
-    ``.devbench/supervise/registry.json``. ``billing_channel`` is always
-    ``"subscription"`` (Section 0.2, FR-9).
+    ``.devbench/supervise/registry.json``. ``billing_channel`` is mode-derived:
+    it equals the active billing mode (``"subscription"`` | ``"bedrock"``),
+    Section 0.2, FR-9.
 
     Attributes:
         name: Supervise session name (the ``--name`` value).
@@ -318,7 +327,7 @@ class SuperviseSessionState:
         effort: Resolved effort level.
         scope: Expanded work-unit IDs for this session (the scope.json
             ``expanded_ids``), recorded for ``status``/``info``.
-        billing_channel: Always ``"subscription"`` (FR-9).
+        billing_channel: The active billing mode (``"subscription"`` | ``"bedrock"``, FR-9).
         claude_session_id: The captured ``claude`` session id (for ``--resume``).
         claude_path: Resolved ``claude`` executable path (FR-25).
         claude_version: Recorded ``claude --version`` (FR-25).
@@ -700,6 +709,7 @@ def new_session_state(
     effort: str,
     started_by: str,
     scope: list[str] | None = None,
+    billing_mode: str = SUPERVISE_DEFAULT_BILLING_MODE,
 ) -> SuperviseSessionState:
     """Construct a fresh ``starting``-state session record (helper for ``start``).
 
@@ -711,10 +721,18 @@ def new_session_state(
         effort: Resolved effort level.
         started_by: OS username starting the session.
         scope: Expanded work-unit IDs (defaults to empty = whole backlog).
+        billing_mode: The active billing mode; the persisted ``billing_channel``
+            equals it (subscription | bedrock). Defaults to subscription.
 
     Returns:
         A :class:`SuperviseSessionState` in the ``starting`` state.
+
+    Raises:
+        ValueError: *billing_mode* is not recognized (fail-fast).
     """
+    if billing_mode not in SUPERVISE_VALID_BILLING_MODES:
+        valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+        raise ValueError(f"supervise billing_mode {billing_mode!r} is not one of [{valid}].")
     return SuperviseSessionState(
         name=name,
         pid=pid,
@@ -725,7 +743,7 @@ def new_session_state(
         model=model,
         effort=effort,
         scope=list(scope or []),
-        billing_channel=SUPERVISE_BILLING_CHANNEL,
+        billing_channel=billing_mode,
     )
 
 
@@ -758,6 +776,16 @@ class SuperviseApiKeyPresentError(SuperviseError):
 
 class SuperviseAuthError(SuperviseError):
     """Subscription auth is absent or invalid (FR-20, Section 3.6.1)."""
+
+
+class SuperviseBedrockPrereqError(SuperviseError):
+    """A bedrock-billing prerequisite is absent (Section 3.6.1, design point 4).
+
+    In bedrock mode the session bills via AWS Bedrock, so the AWS workload creds
+    (access key + secret) and an AWS region must be present in the operator env;
+    without them the ``claude`` CLI cannot route inference to Bedrock and the
+    session cannot bill. Fail fast rather than launch an unbillable session.
+    """
 
 
 class SuperviseRootError(SuperviseError):
@@ -820,19 +848,39 @@ def require_claude(*, which: Callable[[str], str | None] = shutil.which) -> str:
 class EnvSanitizer:
     """Build the minimized ``screen`` session environment (Section 3.6.1, FR-21).
 
-    Starts from a copy of the operator's environment, removes the non-removable
-    always-deny set (:data:`SUPERVISE_ALWAYS_DENY_ENV_VARS`) plus the configured
-    additional ``deny_vars``, and exports the three scope-conveyance vars
-    (Section 5.6). The always-deny set routes inference to API/Bedrock billing,
-    so stripping it is a correctness requirement, not a preference.
+    Starts from a copy of the operator's environment, removes the mode-resolved
+    non-removable deny set (:func:`resolve_supervise_deny_vars`) plus the
+    configured additional ``deny_vars``, exports the three scope-conveyance vars
+    (Section 5.6), and -- in bedrock mode -- exports the claude-CLI Bedrock
+    routing vars so inference bills via Bedrock.
+
+    The deny set is a function of ``billing_mode`` (design point 5, one
+    mode-resolved helper):
+
+    - subscription: strips the direct-Anthropic-API vars AND the Bedrock/Vertex
+      routing vars so inference bills against the Claude Code subscription.
+    - bedrock:      strips only the direct-Anthropic-API vars and EXPORTS
+      ``CLAUDE_CODE_USE_BEDROCK`` + the region + the Bedrock model id.
+
+    AWS workload creds + region pass through in BOTH modes (they do not route
+    Claude billing); stripping the routing set is a correctness requirement.
 
     Args:
         extra_deny_vars: Additional env-var names to strip (``supervise.env.deny_vars``).
+        billing_mode: One of :data:`SUPERVISE_VALID_BILLING_MODES`.
+
+    Raises:
+        ValueError: *billing_mode* is not a recognized mode (fail-fast).
     """
 
-    def __init__(self, *, extra_deny_vars: tuple[str, ...]) -> None:
-        # The always-deny set is layered on top and cannot be removed (FR-21).
-        self._deny: frozenset[str] = frozenset(SUPERVISE_ALWAYS_DENY_ENV_VARS) | frozenset(extra_deny_vars)
+    def __init__(self, *, extra_deny_vars: tuple[str, ...], billing_mode: str) -> None:
+        if billing_mode not in SUPERVISE_VALID_BILLING_MODES:
+            valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+            raise ValueError(f"supervise billing_mode {billing_mode!r} is not one of [{valid}].")
+        self._billing_mode = billing_mode
+        # The mode-resolved deny set is non-removable; the configured extras are
+        # layered on top (FR-21).
+        self._deny: frozenset[str] = frozenset(resolve_supervise_deny_vars(billing_mode)) | frozenset(extra_deny_vars)
 
     def build(
         self,
@@ -851,15 +899,19 @@ class EnvSanitizer:
             session_name: Exported as ``DEVBENCH_SESSION_NAME`` (per-session routing).
             import_model: The import-time model exported as ``DEVBENCH_CLAUDE_MODEL``
                 (the in-session ``devbench`` subprocesses need it to import
-                ``config.py``; it is NOT the interactive billing model, D-3).
+                ``config.py``; it is NOT the interactive billing model, D-3). In
+                bedrock mode it is ALSO the Bedrock model id exported via
+                ``ANTHROPIC_MODEL`` so the CLI routes inference to that model.
 
         Returns:
-            A new dict (the source is never mutated) with every deny var removed
-            and the three scope-conveyance vars set.
+            A new dict (the source is never mutated) with every deny var removed,
+            the three scope-conveyance vars set, and -- in bedrock mode -- the
+            claude-CLI Bedrock routing vars exported.
 
         Raises:
             ValueError: ``workspace_root`` or ``import_model`` is empty (fail-fast;
-                the in-session ``devbench`` would otherwise ``sys.exit(2)``).
+                the in-session ``devbench`` would otherwise ``sys.exit(2)``), or
+                bedrock mode is active but no AWS region is present to route to.
         """
         if not workspace_root:
             raise ValueError("workspace_root is required to export DEVBENCH_WORKSPACE_ROOT")
@@ -868,14 +920,40 @@ class EnvSanitizer:
 
         # Build the session env by EXCLUDING every deny var: a comprehension that
         # omits the deny keys cannot, by construction, leave a denied var behind,
-        # so the subscription-billing guarantee (Section 0.2, FR-21) holds without
-        # a fallible second pass. The AuthVerifier additionally fails fast at
+        # so the billing-routing guarantee (Section 0.2, FR-21) holds without a
+        # fallible second pass. The AuthVerifier additionally fails fast at
         # preflight if a deny var is even present in the operator env.
         env = {k: v for k, v in source_env.items() if k not in self._deny}
         env["DEVBENCH_WORKSPACE_ROOT"] = workspace_root
         env["DEVBENCH_SESSION_NAME"] = session_name
         env["DEVBENCH_CLAUDE_MODEL"] = import_model
+
+        if self._billing_mode == SUPERVISE_BILLING_MODE_BEDROCK:
+            self._export_bedrock_routing(env, source_env=source_env, import_model=import_model)
         return env
+
+    def _export_bedrock_routing(self, env: dict[str, str], *, source_env: dict[str, str], import_model: str) -> None:
+        """Export the claude-CLI Bedrock routing vars (bedrock mode, Section 3.6.1).
+
+        Routes the interactive ``claude`` CLI to Bedrock: sets
+        ``CLAUDE_CODE_USE_BEDROCK=1``, the Bedrock model id (``ANTHROPIC_MODEL``),
+        and the AWS region (from the operator's ``AWS_REGION`` /
+        ``AWS_DEFAULT_REGION``, which already passed through). AWS creds are not
+        re-exported here (they pass through untouched).
+
+        Raises:
+            ValueError: Neither ``AWS_REGION`` nor ``AWS_DEFAULT_REGION`` is set;
+                there is no region to route Bedrock to (fail-fast).
+        """
+        region = source_env.get(SUPERVISE_BEDROCK_REGION_VAR) or source_env.get(SUPERVISE_BEDROCK_DEFAULT_REGION_VAR)
+        if not region:
+            raise ValueError(
+                f"bedrock billing mode requires an AWS region: set {SUPERVISE_BEDROCK_REGION_VAR} "
+                f"or {SUPERVISE_BEDROCK_DEFAULT_REGION_VAR} so the claude CLI can route inference to Bedrock."
+            )
+        env[SUPERVISE_BEDROCK_USE_FLAG_VAR] = "1"
+        env[SUPERVISE_BEDROCK_REGION_VAR] = region
+        env[SUPERVISE_BEDROCK_MODEL_VAR] = import_model
 
 
 # ---------------------------------------------------------------------------
@@ -884,51 +962,96 @@ class EnvSanitizer:
 
 
 class AuthVerifier:
-    """Preflight that confirms the session will bill against the subscription.
+    """Preflight that confirms the session will bill via the chosen channel.
 
-    Three independent fail-fast checks (Section 3.6.1, 3.6.2):
+    The checks are mode-aware (Section 3.6.1, 3.6.2, design point 3/4):
 
-    1. No always-deny API/Bedrock-routing var is present in the operator env
-       (FR-21) -- else the session would silently route to API billing.
-    2. Subscription auth is present: the credentials file parses to a
-       ``claudeAiOauth.accessToken`` whose ``scopes`` include ``user:inference``
-       (FR-20).
-    3. The process is non-root (Section 3.6.2) -- defense in depth around
-       ``claude``'s own root refusal.
+    SUBSCRIPTION mode (default):
+      1. No mode-deny routing var is present in the operator env (FR-21) -- else
+         the session would route off-subscription. AWS workload creds are NOT a
+         violation (they do not route Claude billing).
+      2. Subscription auth is present: the credentials file parses to a
+         ``claudeAiOauth.accessToken`` whose ``scopes`` include ``user:inference``
+         (FR-20).
+      3. The process is non-root (Section 3.6.2).
+
+    BEDROCK mode:
+      1. No direct-Anthropic-API var is present (it would route to the direct
+         API, not Bedrock).
+      2. NO subscription auth required; instead the AWS Bedrock prerequisites
+         (AWS creds + an AWS region) must be present.
+      3. The process is still non-root.
 
     Args:
         credentials_file: Path to ``~/.claude/.credentials.json`` (overridable
-            via ``DEVBENCH_CLAUDE_CREDENTIALS_FILE``).
+            via ``DEVBENCH_CLAUDE_CREDENTIALS_FILE``). Only consulted in
+            subscription mode.
     """
 
     _REQUIRED_SCOPE = "user:inference"
+    #: The AWS creds (any one of these) a bedrock-mode session needs to sign
+    #: Bedrock requests. A bearer token is the SigV4-free alternative.
+    _BEDROCK_CRED_VARS: tuple[str, ...] = (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    )
 
     def __init__(self, *, credentials_file: Path) -> None:
         self._credentials_file = credentials_file
 
-    def verify(self, *, source_env: dict[str, str], euid: int) -> None:
-        """Run the three preflight checks; raise on the first failure.
+    def verify(self, *, source_env: dict[str, str], euid: int, billing_mode: str) -> None:
+        """Run the mode-aware preflight checks; raise on the first failure.
 
         Args:
             source_env: The operator's environment.
             euid: The effective UID (``os.geteuid()``).
+            billing_mode: One of :data:`SUPERVISE_VALID_BILLING_MODES`.
 
         Raises:
-            SuperviseApiKeyPresentError: An always-deny var is present (FR-21).
-            SuperviseAuthError: Subscription auth absent/invalid (FR-20).
+            SuperviseApiKeyPresentError: A mode-deny routing var is present (FR-21).
+            SuperviseAuthError: Subscription auth absent/invalid (subscription
+                mode only, FR-20).
+            SuperviseBedrockPrereqError: A bedrock prerequisite is absent
+                (bedrock mode only).
             SuperviseRootError: Running as root (Section 3.6.2).
+            ValueError: *billing_mode* is not recognized (fail-fast).
         """
-        self._assert_no_api_key(source_env)
-        self._assert_subscription_auth()
+        if billing_mode not in SUPERVISE_VALID_BILLING_MODES:
+            valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+            raise ValueError(f"supervise billing_mode {billing_mode!r} is not one of [{valid}].")
+        self._assert_no_routing_var(source_env, billing_mode)
+        if billing_mode == SUPERVISE_BILLING_MODE_SUBSCRIPTION:
+            self._assert_subscription_auth()
+        else:
+            self._assert_bedrock_prereqs(source_env)
         self._assert_non_root(euid)
 
-    def _assert_no_api_key(self, source_env: dict[str, str]) -> None:
-        present = [var for var in SUPERVISE_ALWAYS_DENY_ENV_VARS if source_env.get(var)]
+    def _assert_no_routing_var(self, source_env: dict[str, str], billing_mode: str) -> None:
+        # The mode-resolved deny set excludes AWS workload creds in both modes, so
+        # a present AWS cred is never flagged here.
+        deny = resolve_supervise_deny_vars(billing_mode)
+        present = [var for var in deny if source_env.get(var)]
         if present:
             offending = present[0]
+            channel = (
+                "the Claude Code subscription" if billing_mode == SUPERVISE_BILLING_MODE_SUBSCRIPTION else "Bedrock"
+            )
             raise SuperviseApiKeyPresentError(
-                f"{offending} is set; an interactive supervised session must bill against the "
-                "Claude Code subscription, not the API. Unset it and retry."
+                f"{offending} is set; an interactive supervised session in {billing_mode} mode must bill "
+                f"via {channel}, not the direct API. Unset it and retry."
+            )
+
+    def _assert_bedrock_prereqs(self, source_env: dict[str, str]) -> None:
+        if not any(source_env.get(var) for var in self._BEDROCK_CRED_VARS):
+            raise SuperviseBedrockPrereqError(
+                "bedrock billing mode requires AWS credentials (AWS_ACCESS_KEY_ID, AWS_PROFILE, or "
+                "AWS_BEARER_TOKEN_BEDROCK); none are set. Configure AWS access and retry."
+            )
+        if not (source_env.get(SUPERVISE_BEDROCK_REGION_VAR) or source_env.get(SUPERVISE_BEDROCK_DEFAULT_REGION_VAR)):
+            raise SuperviseBedrockPrereqError(
+                f"bedrock billing mode requires an AWS region: set {SUPERVISE_BEDROCK_REGION_VAR} or "
+                f"{SUPERVISE_BEDROCK_DEFAULT_REGION_VAR} so the claude CLI can route inference to Bedrock."
             )
 
     def _assert_subscription_auth(self) -> None:
@@ -1887,9 +2010,16 @@ class QuotaWaiter:
         save_checkpoint: The SHARED checkpoint writer (``quota.save_checkpoint``).
         workspace_root: Workspace root (passed to the checkpoint writer).
         session_name: Session name (recorded in the checkpoint).
+        billing_mode: The active billing mode. In bedrock mode the 5-hour
+            subscription wait is DISABLED (Bedrock has no subscription windows);
+            a subscription usage-limit prompt is anomalous there and faults fast.
+            Defaults to subscription.
         run_wait: Internal hook to run the (async) wait callable to completion;
             defaults to :func:`asyncio.run`. Injectable for tests that supply a
             synchronous ``wait_for_reset`` fake.
+
+    Raises:
+        ValueError: *billing_mode* is not recognized (fail-fast).
     """
 
     def __init__(
@@ -1904,8 +2034,12 @@ class QuotaWaiter:
         save_checkpoint: Callable[..., None],
         workspace_root: Any,
         session_name: str,
+        billing_mode: str = SUPERVISE_DEFAULT_BILLING_MODE,
         run_wait: Callable[[Any], bool] | None = None,
     ) -> None:
+        if billing_mode not in SUPERVISE_VALID_BILLING_MODES:
+            valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+            raise ValueError(f"supervise billing_mode {billing_mode!r} is not one of [{valid}].")
         self._patterns = patterns
         self._poll_interval = poll_interval_seconds
         self._max_wait = max_wait_seconds
@@ -1915,6 +2049,7 @@ class QuotaWaiter:
         self._save_checkpoint = save_checkpoint
         self._workspace_root = workspace_root
         self._session_name = session_name
+        self._billing_mode = billing_mode
         self._run_wait = run_wait
 
     def is_quota_text(self, text: str) -> bool:
@@ -1981,6 +2116,20 @@ class QuotaWaiter:
         Returns:
             A :class:`QuotaDecisionResult`.
         """
+        # Bedrock has NO 5-hour subscription windows: the wait is DISABLED. A
+        # subscription usage-limit prompt is anomalous in bedrock mode (Bedrock
+        # throttling is handled by the shared quota.py path in the SDK
+        # orchestrator subprocess, not here), so fault fast with a classified
+        # reason rather than persisting a subscription checkpoint or waiting an
+        # imaginary window (design point 4).
+        if self._billing_mode == SUPERVISE_BILLING_MODE_BEDROCK:
+            logger.info("%s reason=quota-wait-disabled-bedrock", SUPERVISE_FAULT_AUDIT_PREFIX)
+            return QuotaDecisionResult(
+                action=QuotaDecision.FAULT,
+                expected_resume=reset_at,
+                exit_reason="quota-wait-disabled-bedrock",
+            )
+
         max_resumes = self._resolve_max_resumes()
         if resumes_used >= max_resumes:
             logger.info("%s resumes=%d/%d cap-exhausted", SUPERVISE_FAULT_AUDIT_PREFIX, resumes_used, max_resumes)
@@ -2033,6 +2182,7 @@ def build_quota_waiter(
     config: SuperviseConfig,
     workspace_root: Path,
     session_name: str,
+    billing_mode: str = SUPERVISE_DEFAULT_BILLING_MODE,
 ) -> QuotaWaiter:
     """Wire a :class:`QuotaWaiter` to the REAL shared quota primitives (FR-15, AC-32).
 
@@ -2048,6 +2198,8 @@ def build_quota_waiter(
         config: The ``supervise`` config block.
         workspace_root: Workspace root.
         session_name: The session name.
+        billing_mode: The active billing mode; in bedrock mode the 5-hour wait is
+            disabled (design point 4). Defaults to subscription.
 
     Returns:
         A production-wired :class:`QuotaWaiter`.
@@ -2081,6 +2233,7 @@ def build_quota_waiter(
         save_checkpoint=quota.save_checkpoint,
         workspace_root=workspace_root,
         session_name=session_name,
+        billing_mode=billing_mode,
     )
 
 

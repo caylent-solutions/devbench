@@ -92,6 +92,7 @@ from devbench.constants import (
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
     SUPERVISE_ALWAYS_DENY_ENV_VARS,
+    SUPERVISE_DEFAULT_BILLING_MODE,
     SUPERVISE_DETECTION_PATTERNS_DEFAULT,
     SUPERVISE_EFFORT_DEFAULT,
     SUPERVISE_INJECTABLE_COMMANDS_DEFAULT,
@@ -111,6 +112,7 @@ from devbench.constants import (
     SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT,
+    SUPERVISE_VALID_BILLING_MODES,
     SUPERVISE_VALID_EFFORT_LEVELS,
     SUPERVISE_VALID_RESUME_MODES,
     ModelRates,
@@ -889,7 +891,8 @@ class SuperviseEnvConfig:
     """``supervise.env`` block (Section 5.1, FR-21).
 
     ``deny_vars`` are ADDITIONAL deny vars layered on top of the non-removable
-    ``SUPERVISE_ALWAYS_DENY_ENV_VARS`` set.
+    mode-resolved deny set (the union of which is
+    ``SUPERVISE_ALWAYS_DENY_ENV_VARS``).
     """
 
     deny_vars: tuple[str, ...] = SUPERVISE_ALWAYS_DENY_ENV_VARS  # overwritten by parser default
@@ -914,10 +917,15 @@ class SuperviseConfig:
 
     ``model`` is ``None`` by default and falls through to ``orchestrate.model``
     -> fail-fast (D-3); ``DEVBENCH_CLAUDE_MODEL`` is NOT consulted.
+
+    ``billing_mode`` selects the billing channel (``subscription`` | ``bedrock``,
+    default subscription). It governs the mode-resolved env deny/export set and
+    whether the 5-hour quota wait is engaged (Section 3.6.1).
     """
 
     model: str | None = None
     effort: str = SUPERVISE_EFFORT_DEFAULT
+    billing_mode: str = SUPERVISE_DEFAULT_BILLING_MODE
     screen_name_prefix: str = SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT
     timeouts: SuperviseTimeoutsConfig = field(default_factory=SuperviseTimeoutsConfig)
     restart: SuperviseRestartConfig = field(default_factory=SuperviseRestartConfig)
@@ -1270,6 +1278,11 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
         valid = ", ".join(sorted(SUPERVISE_VALID_EFFORT_LEVELS))
         raise ValueError(f"Config file '{path}': supervise.effort {effort!r} is not one of [{valid}].")
 
+    billing_mode = raw.get("billing_mode", defaults.billing_mode)
+    if billing_mode not in SUPERVISE_VALID_BILLING_MODES:
+        valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+        raise ValueError(f"Config file '{path}': supervise.billing_mode {billing_mode!r} is not one of [{valid}].")
+
     model = raw.get("model")
     model = model.strip() if isinstance(model, str) and model.strip() else None
 
@@ -1373,6 +1386,7 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
     return SuperviseConfig(
         model=model,
         effort=effort,
+        billing_mode=billing_mode,
         screen_name_prefix=raw.get("screen_name_prefix", defaults.screen_name_prefix),
         timeouts=timeouts,
         restart=restart,

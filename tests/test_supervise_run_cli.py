@@ -294,6 +294,40 @@ class TestStartRunningConfirmation:
         assert "--effort" in run_argv
         assert run_argv[run_argv.index("--effort") + 1] == "high"
 
+    def test_billing_mode_forwarded_into_run_argv(self, tmp_path: Path) -> None:
+        # The resolved billing mode is forwarded into the in-screen __run argv so
+        # the supervisor's quota/env handling matches the operator's choice.
+        creds = self._creds(tmp_path)
+        spawned: dict[str, Any] = {}
+
+        def _fake_launch(*, name, screen_name, env, run_argv, screen_path):
+            spawned["run_argv"] = run_argv
+            spawned["env"] = dict(env)
+            from devbench.constants import SUPERVISE_STATE_RUNNING
+            from devbench.supervise import new_session_state
+
+            reg = SuperviseRegistry(tmp_path)
+            st = new_session_state(
+                name=name,
+                pid=1,
+                screen_name=screen_name,
+                model="claude-opus-4-8",
+                effort="xhigh",
+                started_by="t",
+            )
+            st.state = SUPERVISE_STATE_RUNNING
+            reg.write_state(st)
+            return 0
+
+        patches = self._common(tmp_path, creds)
+        patches.append(patch("devbench.cli._supervise_launch_screen", _fake_launch))
+        with _ctx(patches), patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            rc = cli.cmd_supervise("start", "--name", "n", "--billing-mode", "subscription")
+        assert rc == 0
+        run_argv = spawned["run_argv"]
+        assert "--billing-mode" in run_argv
+        assert run_argv[run_argv.index("--billing-mode") + 1] == "subscription"
+
     def test_invalid_scope_token_returns_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         creds = self._creds(tmp_path)
         patches = self._common(tmp_path, creds)

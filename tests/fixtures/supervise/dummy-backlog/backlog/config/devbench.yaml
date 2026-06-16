@@ -42,4 +42,9 @@ orchestrate:
 supervise:
   # model: null -> falls back to orchestrate.model above (D-3).
   effort: xhigh
+  # billing_mode: the interactive session bills against the Claude Code Max
+  # subscription (the default; the 5-hour wait-and-resume is engaged). The
+  # alternative is `bedrock` (bills via AWS Bedrock, no 5-hour windows). AWS
+  # workload creds pass through in BOTH modes.
+  billing_mode: subscription
   screen_name_prefix: devbench-supervise-

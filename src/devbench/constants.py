@@ -1093,29 +1093,127 @@ SUPERVISE_VALID_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "hig
 # Valid resume modes for ``supervise.restart.resume_mode`` (Section 5.1, 5.2).
 SUPERVISE_VALID_RESUME_MODES: frozenset[str] = frozenset({"continue", "resume"})
 
-# The billing channel a supervise session always reports (Section 0.2, FR-9).
-SUPERVISE_BILLING_CHANNEL: str = "subscription"
+# ---------------------------------------------------------------------------
+# Supervise billing mode (Section 0.2, 3.6.1, FR-9, FR-20, FR-21)
+# ---------------------------------------------------------------------------
+# A supervised interactive session bills via one of two channels, selected by
+# ``billing_mode`` (flag > env > config > default):
+#   - subscription: bills against the Claude Code Max subscription (5-hour
+#     rolling windows). The QuotaWaiter 5-hour wait-and-resume is engaged.
+#   - bedrock:       bills via AWS Bedrock (always-on; NO 5-hour windows). The
+#     QuotaWaiter 5-hour wait is DISABLED; Bedrock throttling is handled by the
+#     shared quota.py path in the SDK orchestrator subprocess.
+# AWS workload creds NEVER route Claude billing (only the Bedrock route flag
+# does), so they pass through in BOTH modes (the orchestrator runs live AWS
+# terratests).
+SUPERVISE_BILLING_MODE_SUBSCRIPTION: str = "subscription"
+SUPERVISE_BILLING_MODE_BEDROCK: str = "bedrock"
+SUPERVISE_VALID_BILLING_MODES: frozenset[str] = frozenset(
+    {SUPERVISE_BILLING_MODE_SUBSCRIPTION, SUPERVISE_BILLING_MODE_BEDROCK}
+)
+SUPERVISE_DEFAULT_BILLING_MODE: str = SUPERVISE_BILLING_MODE_SUBSCRIPTION
+# Env override for the billing mode (precedence: flag > this env > config > default).
+SUPERVISE_BILLING_MODE_ENV_VAR: str = "DEVBENCH_SUPERVISE_BILLING_MODE"
 
-# Always-deny environment variables stripped from EVERY supervise session env
-# (Section 3.6.1, FR-21). These route inference to API/Bedrock billing and
-# defeat the subscription-billing goal; they are NON-REMOVABLE -- a config that
-# tries to whitelist any of these via ``supervise.env.deny_vars`` fails fast.
-# Consumed by ``EnvSanitizer`` and the ``_parse_supervise_config`` guard.
-SUPERVISE_ALWAYS_DENY_ENV_VARS: tuple[str, ...] = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_URL",
-    "ANTHROPIC_BASE_URL",
-    "DEVBENCH_USE_BEDROCK",
+# The billing channel a subscription supervise session reports (Section 0.2,
+# FR-9). The persisted ``billing_channel`` is mode-derived (it equals the active
+# billing_mode); this constant is the subscription value + the back-compat
+# default for records that predate the billing_mode field.
+SUPERVISE_BILLING_CHANNEL: str = SUPERVISE_BILLING_MODE_SUBSCRIPTION
+
+# ---------------------------------------------------------------------------
+# claude-CLI Bedrock routing var names (Section 3.6.1)
+# ---------------------------------------------------------------------------
+# The interactive ``claude`` CLI routes inference to Bedrock when
+# ``CLAUDE_CODE_USE_BEDROCK`` is set; it reads ``ANTHROPIC_MODEL`` for the
+# primary (Bedrock) model id, ``ANTHROPIC_SMALL_FAST_MODEL`` for the small/fast
+# model, and an AWS region (``AWS_REGION`` / ``AWS_DEFAULT_REGION``). These are
+# EXPORTED by ``EnvSanitizer`` in bedrock mode and DENIED in subscription mode
+# (so they cannot route inference off-subscription).
+SUPERVISE_BEDROCK_USE_FLAG_VAR: str = "CLAUDE_CODE_USE_BEDROCK"
+SUPERVISE_BEDROCK_VERTEX_FLAG_VAR: str = "CLAUDE_CODE_USE_VERTEX"
+SUPERVISE_BEDROCK_BASE_URL_VAR: str = "ANTHROPIC_BEDROCK_BASE_URL"
+SUPERVISE_BEDROCK_MODEL_VAR: str = "ANTHROPIC_MODEL"
+SUPERVISE_BEDROCK_SMALL_FAST_MODEL_VAR: str = "ANTHROPIC_SMALL_FAST_MODEL"
+SUPERVISE_BEDROCK_BEARER_TOKEN_VAR: str = "AWS_BEARER_TOKEN_BEDROCK"
+SUPERVISE_BEDROCK_REGION_VAR: str = "AWS_REGION"
+SUPERVISE_BEDROCK_DEFAULT_REGION_VAR: str = "AWS_DEFAULT_REGION"
+
+# AWS WORKLOAD creds + region that ALWAYS pass through to the supervised session
+# env (Section 3.6.1, design point 1). AWS creds do NOT route Claude billing;
+# the supervised orchestrator needs them to run live AWS terratests. They are in
+# NEITHER billing mode's deny set.
+SUPERVISE_AWS_PASSTHROUGH_ENV_VARS: tuple[str, ...] = (
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AWS_PROFILE",
+    SUPERVISE_BEDROCK_REGION_VAR,
+    SUPERVISE_BEDROCK_DEFAULT_REGION_VAR,
 )
 
-# Default ADDITIONAL deny vars for ``supervise.env.deny_vars`` (Section 5.1).
-# The always-deny set above is layered on top and cannot be removed.
-SUPERVISE_DEFAULT_EXTRA_DENY_VARS: tuple[str, ...] = ("AWS_PROFILE", "AWS_SESSION_TOKEN")
+# BASE deny set stripped in BOTH billing modes (Section 3.6.1, FR-21): the
+# direct-Anthropic-API routing vars. Present in either mode they would route
+# inference to the direct Anthropic API (billing neither the subscription nor
+# Bedrock), so they are always stripped.
+SUPERVISE_BASE_DENY_ENV_VARS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_BASE_URL",
+)
+
+# ADDITIONAL deny set stripped ONLY in SUBSCRIPTION mode (Section 3.6.1): the
+# Bedrock/Vertex routing vars + the model-override env that would push inference
+# off-subscription. In bedrock mode these (the Bedrock subset) are EXPORTED
+# instead, so they must not be denied there.
+SUPERVISE_SUBSCRIPTION_EXTRA_DENY_ENV_VARS: tuple[str, ...] = (
+    "DEVBENCH_USE_BEDROCK",
+    SUPERVISE_BEDROCK_USE_FLAG_VAR,
+    SUPERVISE_BEDROCK_VERTEX_FLAG_VAR,
+    SUPERVISE_BEDROCK_BASE_URL_VAR,
+    SUPERVISE_BEDROCK_MODEL_VAR,
+    SUPERVISE_BEDROCK_SMALL_FAST_MODEL_VAR,
+    SUPERVISE_BEDROCK_BEARER_TOKEN_VAR,
+)
+
+# The UNION of every routing var denied in EITHER mode (Section 3.6.1, FR-21).
+# This is the NON-REMOVABLE guard set: a config that tries to whitelist any of
+# these via ``supervise.env.deny_vars`` (by negation) fails fast, regardless of
+# the active billing mode. AWS workload creds are intentionally NOT in this set
+# (they pass through in both modes). Consumed by the ``_parse_supervise_config``
+# whitelist guard.
+SUPERVISE_ALWAYS_DENY_ENV_VARS: tuple[str, ...] = (
+    *SUPERVISE_BASE_DENY_ENV_VARS,
+    *SUPERVISE_SUBSCRIPTION_EXTRA_DENY_ENV_VARS,
+)
+
+
+def resolve_supervise_deny_vars(billing_mode: str) -> tuple[str, ...]:
+    """Return the env-var deny tuple for *billing_mode* (Section 3.6.1, FR-21).
+
+    DRY single source of the mode-resolved deny set (design point 5: one helper,
+    not copy-paste). Both modes strip the direct-Anthropic-API base set;
+    subscription mode additionally strips the Bedrock/Vertex routing vars so
+    inference cannot route off-subscription. AWS workload creds + region are in
+    NEITHER mode's deny set.
+
+    Args:
+        billing_mode: One of :data:`SUPERVISE_VALID_BILLING_MODES`.
+
+    Returns:
+        The ordered tuple of env-var names to strip for *billing_mode*.
+
+    Raises:
+        ValueError: *billing_mode* is not a recognized mode (fail-fast).
+    """
+    if billing_mode == SUPERVISE_BILLING_MODE_SUBSCRIPTION:
+        return SUPERVISE_ALWAYS_DENY_ENV_VARS
+    if billing_mode == SUPERVISE_BILLING_MODE_BEDROCK:
+        return SUPERVISE_BASE_DENY_ENV_VARS
+    valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+    raise ValueError(f"supervise billing_mode {billing_mode!r} is not one of [{valid}].")
+
 
 # Default per-field timeouts (seconds) for ``supervise.timeouts`` (Section 5.1).
 # Every value is overridable via ``DEVBENCH_SUPERVISE_*`` env or YAML.

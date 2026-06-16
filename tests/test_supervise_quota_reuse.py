@@ -176,3 +176,34 @@ class TestSuperviseQuotaConfigFallthrough:
         # resolved cap is 7 (6 < 7 -> RESUME permitted).
         assert os.environ.get("DEVBENCH_MAX_QUOTA_RESUMES") == "7"
         assert decision.action is QuotaDecision.RESUME
+
+
+@pytest.mark.unit
+class TestBuildQuotaWaiterBedrockMode:
+    """build_quota_waiter propagates billing_mode; bedrock disables the wait."""
+
+    def test_bedrock_mode_disables_subscription_wait(self, tmp_path: Path) -> None:
+        from devbench.constants import SUPERVISE_BILLING_MODE_BEDROCK
+        from devbench.supervise import QuotaDecision
+
+        with (
+            patch("devbench.quota.wait_for_reset") as mock_wait,
+            patch("devbench.cli._resolve_max_quota_resumes", return_value=1000),
+            patch("devbench.quota.save_checkpoint") as mock_save,
+        ):
+            waiter = build_quota_waiter(
+                patterns=_patterns(),
+                config=SuperviseConfig(),
+                workspace_root=tmp_path,
+                session_name="nightly",
+                billing_mode=SUPERVISE_BILLING_MODE_BEDROCK,
+            )
+            decision = waiter.wait_and_decide(
+                reset_at=datetime.now(UTC) + timedelta(hours=1),
+                resumes_used=0,
+            )
+        # The 5-hour subscription wait + checkpoint are NOT engaged in bedrock mode.
+        assert not mock_wait.called
+        assert not mock_save.called
+        assert decision.action is QuotaDecision.FAULT
+        assert decision.exit_reason == "quota-wait-disabled-bedrock"

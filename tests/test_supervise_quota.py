@@ -16,6 +16,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from devbench.config_loader import SuperviseConfig
+from devbench.constants import (
+    SUPERVISE_BILLING_MODE_BEDROCK,
+    SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+)
 from devbench.supervise import (
     DetectionPatterns,
     QuotaDecision,
@@ -35,6 +39,7 @@ def _waiter(
     max_wait: int = 18000,
     saved: list | None = None,
     waited: list | None = None,
+    billing_mode: str = SUPERVISE_BILLING_MODE_SUBSCRIPTION,
 ) -> QuotaWaiter:
     """Build a QuotaWaiter wired to deterministic fakes for the delegated work."""
 
@@ -64,6 +69,7 @@ def _waiter(
         save_checkpoint=fake_save,
         workspace_root="/tmp/ws",
         session_name="nightly",
+        billing_mode=billing_mode,
     )
 
 
@@ -177,7 +183,54 @@ class TestQuotaResumeCapBound:
         reset_at = datetime.now(UTC) + timedelta(hours=1)
         decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=1)
         assert decision.action is QuotaDecision.FAULT
+
+
+@pytest.mark.unit
+class TestQuotaWaitDisabledInBedrockMode:
+    """Bedrock mode has NO 5-hour subscription windows: the wait is DISABLED.
+
+    Bedrock throttling is handled by the shared quota.py path
+    (``_BEDROCK_THROTTLE_CODES``) in the SDK orchestrator subprocess, not by the
+    supervisor's interactive 5-hour-window wait. A subscription usage-limit
+    prompt is anomalous in bedrock mode, so the QuotaWaiter must NOT delegate the
+    subscription wait nor persist a subscription checkpoint; it fails fast with a
+    classified reason instead of waiting an imaginary window forever.
+    """
+
+    def test_bedrock_does_not_delegate_subscription_wait(self) -> None:
+        waited: list = []
+        saved: list = []
+        waiter = _waiter(
+            wait_recovered=True,
+            max_resumes=3,
+            saved=saved,
+            waited=waited,
+            billing_mode=SUPERVISE_BILLING_MODE_BEDROCK,
+        )
+        reset_at = datetime.now(UTC) + timedelta(hours=1)
+        decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=0)
+        # The 5-hour subscription wait must NOT have been delegated.
         assert waited == []
+        # No subscription checkpoint was persisted.
+        assert saved == []
+        # It fails fast (a quota window does not exist for Bedrock) rather than
+        # looping; the SDK path's Bedrock throttle handling is the real mechanism.
+        assert decision.action is QuotaDecision.FAULT
+        assert decision.exit_reason == "quota-wait-disabled-bedrock"
+
+    def test_subscription_mode_still_engages_wait(self) -> None:
+        # Guard against a regression that disables the wait in subscription mode.
+        waited: list = []
+        waiter = _waiter(
+            wait_recovered=True,
+            max_resumes=3,
+            waited=waited,
+            billing_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+        )
+        reset_at = datetime.now(UTC) + timedelta(hours=1)
+        decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=0)
+        assert waited == [(reset_at, 60, 18000)]
+        assert decision.action is QuotaDecision.RESUME
 
 
 @pytest.mark.unit

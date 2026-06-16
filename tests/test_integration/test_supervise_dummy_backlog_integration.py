@@ -39,8 +39,10 @@ from functional.harness import functional_supervise_config, supervised_stub
 from devbench import cli
 from devbench.backlog.parser import BacklogParser
 from devbench.constants import (
-    SUPERVISE_ALWAYS_DENY_ENV_VARS,
+    SUPERVISE_AWS_PASSTHROUGH_ENV_VARS,
     SUPERVISE_BILLING_CHANNEL,
+    SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+    resolve_supervise_deny_vars,
 )
 from devbench.scope import session_scope_file_path
 from devbench.supervise import EnvSanitizer, SuperviseRegistry
@@ -120,21 +122,27 @@ class TestDummyBacklogCleanRun:
 class TestSubscriptionBillingNoApiKeyInSessionEnv:
     """The in-CI half of AC-24: no ANTHROPIC_API_KEY in the session env (FR-21)."""
 
-    def test_env_sanitizer_strips_all_api_key_routing_vars(self) -> None:
-        # The supervisor hands `claude` a minimized env. Even when the operator's
-        # environment carries every API/Bedrock-routing var, NONE survive into the
-        # session env -- so inference bills the subscription, not the API.
-        polluted = dict.fromkeys(SUPERVISE_ALWAYS_DENY_ENV_VARS, "leaked-secret-value")
+    def test_env_sanitizer_strips_routing_vars_but_keeps_aws_creds(self) -> None:
+        # The supervisor hands `claude` a minimized env. In subscription mode every
+        # API/Bedrock-routing var is stripped (so inference bills the subscription,
+        # not the API) BUT the AWS workload creds + region pass through untouched
+        # (the supervised orchestrator runs live AWS terratests).
+        deny = resolve_supervise_deny_vars(SUPERVISE_BILLING_MODE_SUBSCRIPTION)
+        polluted = dict.fromkeys(deny, "leaked-secret-value")
+        polluted.update({var: f"aws-{var}" for var in SUPERVISE_AWS_PASSTHROUGH_ENV_VARS})
         polluted["PATH"] = "/usr/bin"
-        sanitizer = EnvSanitizer(extra_deny_vars=())
+        sanitizer = EnvSanitizer(extra_deny_vars=(), billing_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
         session_env = sanitizer.build(
             source_env=polluted,
             workspace_root="/tmp/ws",
             session_name="dummy1",
             import_model="claude-opus-4-8",
         )
-        for var in SUPERVISE_ALWAYS_DENY_ENV_VARS:
+        for var in deny:
             assert var not in session_env, f"{var} must be stripped from the supervised session env (FR-21)"
+        # AWS workload creds + region survive: they do not route Claude billing.
+        for var in SUPERVISE_AWS_PASSTHROUGH_ENV_VARS:
+            assert session_env.get(var) == f"aws-{var}", f"{var} must pass through to the session env"
         # The non-billing scope-conveyance vars ARE exported.
         assert session_env["DEVBENCH_WORKSPACE_ROOT"] == "/tmp/ws"
         assert session_env["DEVBENCH_SESSION_NAME"] == "dummy1"
@@ -188,7 +196,7 @@ class TestSubscriptionBillingNoApiKeyInSessionEnv:
 
         assert rc == 0
         env = captured["env"]
-        for var in SUPERVISE_ALWAYS_DENY_ENV_VARS:
+        for var in resolve_supervise_deny_vars(SUPERVISE_BILLING_MODE_SUBSCRIPTION):
             assert var not in env, f"{var} must never reach the supervised screen session (FR-21)"
         # Scope.json was written at the canonical session-tree path (whole backlog,
         # no --include): the integration cold-start AC-23 depends on this file.

@@ -16,7 +16,13 @@ from unittest.mock import patch
 import pytest
 
 from devbench import cli
-from devbench.constants import SUPERVISE_DEFAULT_NAME, SUPERVISE_SUBVERBS
+from devbench.constants import (
+    SUPERVISE_BILLING_MODE_BEDROCK,
+    SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+    SUPERVISE_DEFAULT_BILLING_MODE,
+    SUPERVISE_DEFAULT_NAME,
+    SUPERVISE_SUBVERBS,
+)
 
 
 @pytest.mark.unit
@@ -121,6 +127,17 @@ class TestSuperviseArgParsing:
         assert args.effort is None
         assert args.hard is False
         assert args.screen is False
+        # --billing-mode is unset on the parsed args (resolved later, flag > env >
+        # config > default); an unset flag is None so the resolver can fall through.
+        assert args.billing_mode is None
+
+    def test_billing_mode_flag_parsed(self) -> None:
+        args = cli._parse_supervise_args(["--billing-mode", "bedrock"])
+        assert args.billing_mode == "bedrock"
+
+    def test_billing_mode_flag_requires_value(self) -> None:
+        with pytest.raises(ValueError, match="requires a value"):
+            cli._parse_supervise_args(["--billing-mode"])
 
     def test_all_flags(self) -> None:
         args = cli._parse_supervise_args(
@@ -186,3 +203,47 @@ class TestSuperviseSubverbFailFast:
         rc = cli.cmd_supervise("attach", "--name", "nightly", "--screen")
         assert rc == 2
         assert "--screen attach is not enabled" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+class TestSuperviseBillingModeResolution:
+    """The billing-mode resolver honours flag > env > config > default (fail-fast)."""
+
+    def test_default_when_all_unset(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert (
+                cli._resolve_supervise_billing_mode(cli_mode=None, config_mode=SUPERVISE_DEFAULT_BILLING_MODE)
+                == SUPERVISE_BILLING_MODE_SUBSCRIPTION
+            )
+
+    def test_config_overrides_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert (
+                cli._resolve_supervise_billing_mode(cli_mode=None, config_mode=SUPERVISE_BILLING_MODE_BEDROCK)
+                == SUPERVISE_BILLING_MODE_BEDROCK
+            )
+
+    def test_env_overrides_config(self) -> None:
+        with patch.dict("os.environ", {"DEVBENCH_SUPERVISE_BILLING_MODE": "bedrock"}, clear=True):
+            assert (
+                cli._resolve_supervise_billing_mode(cli_mode=None, config_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
+                == SUPERVISE_BILLING_MODE_BEDROCK
+            )
+
+    def test_flag_overrides_env_and_config(self) -> None:
+        with patch.dict("os.environ", {"DEVBENCH_SUPERVISE_BILLING_MODE": "bedrock"}, clear=True):
+            assert (
+                cli._resolve_supervise_billing_mode(cli_mode="subscription", config_mode=SUPERVISE_BILLING_MODE_BEDROCK)
+                == SUPERVISE_BILLING_MODE_SUBSCRIPTION
+            )
+
+    def test_invalid_flag_fails_fast(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), pytest.raises(ValueError, match="billing_mode"):
+            cli._resolve_supervise_billing_mode(cli_mode="bogus", config_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
+
+    def test_invalid_env_fails_fast(self) -> None:
+        with (
+            patch.dict("os.environ", {"DEVBENCH_SUPERVISE_BILLING_MODE": "bogus"}, clear=True),
+            pytest.raises(ValueError, match="billing_mode"),
+        ):
+            cli._resolve_supervise_billing_mode(cli_mode=None, config_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)

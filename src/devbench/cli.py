@@ -224,6 +224,8 @@ from devbench.constants import (
     STATUS_PROPOSED,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
+    SUPERVISE_BILLING_MODE_ENV_VAR,
+    SUPERVISE_DEFAULT_BILLING_MODE,
     SUPERVISE_DEFAULT_NAME,
     SUPERVISE_EXIT_REASON_HARD_STOP,
     SUPERVISE_EXIT_REASON_STALE_RECONCILED,
@@ -235,6 +237,7 @@ from devbench.constants import (
     SUPERVISE_STATE_RUNNING,
     SUPERVISE_STATE_STOPPED,
     SUPERVISE_SUBVERBS,
+    SUPERVISE_VALID_BILLING_MODES,
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
@@ -9573,6 +9576,7 @@ class _SuperviseArgs:
     allow_overlap: bool = False
     model: str | None = None
     effort: str | None = None
+    billing_mode: str | None = None
     hard: bool = False
     screen: bool = False
 
@@ -9604,6 +9608,7 @@ _SUPERVISE_VALUE_FLAGS: dict[str, str] = {
     "--exclude": "exclude",
     "--model": "model",
     "--effort": "effort",
+    "--billing-mode": "billing_mode",
 }
 # Boolean flag tokens, mapped to the ``_SuperviseArgs`` field they set ``True``.
 _SUPERVISE_BOOL_FLAGS: dict[str, str] = {
@@ -9653,6 +9658,7 @@ def _parse_supervise_args(args: list[str]) -> _SuperviseArgs:
         allow_overlap=bools.get("allow_overlap", False),
         model=values.get("model"),
         effort=values.get("effort"),
+        billing_mode=values.get("billing_mode"),
         hard=bools.get("hard", False),
         screen=bools.get("screen", False),
     )
@@ -9678,6 +9684,36 @@ def _supervise_runtime_config():
 def _supervise_use_bedrock() -> bool:
     """Return the resolved ``use_bedrock`` flag for model-format validation."""
     return USE_BEDROCK
+
+
+def _resolve_supervise_billing_mode(*, cli_mode: str | None, config_mode: str) -> str:
+    """Resolve the supervise billing mode: flag > env > config > default (fail-fast).
+
+    Mirrors the project's ``_resolve_*`` precedence helpers (Section 5.4): the
+    ``--billing-mode`` flag wins, else ``DEVBENCH_SUPERVISE_BILLING_MODE`` env,
+    else ``supervise.billing_mode`` config, else the documented default. The
+    resolved value MUST be a recognized mode; an invalid value at any tier fails
+    fast (no silent fallback).
+
+    Args:
+        cli_mode: The ``--billing-mode`` flag value (or ``None`` when unset).
+        config_mode: ``supervise.billing_mode`` from the config (already
+            validated by the loader).
+
+    Returns:
+        The resolved billing mode (one of :data:`SUPERVISE_VALID_BILLING_MODES`).
+
+    Raises:
+        ValueError: The flag or env value is not a recognized billing mode.
+    """
+    env_mode = os.environ.get(SUPERVISE_BILLING_MODE_ENV_VAR, "").strip() or None
+    for candidate in (cli_mode, env_mode, config_mode):
+        if candidate:
+            if candidate not in SUPERVISE_VALID_BILLING_MODES:
+                valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
+                raise ValueError(f"supervise billing_mode {candidate!r} is not one of [{valid}].")
+            return candidate
+    return SUPERVISE_DEFAULT_BILLING_MODE
 
 
 def _supervise_backlog_ids() -> list[str]:
@@ -9869,12 +9905,14 @@ def _record_tool_version(path: str, version_flag: str = "--version") -> str | No
     return out[0] if out else None
 
 
-def _supervise_preflight(parsed: _SuperviseArgs) -> tuple[str, str, str, str] | int:
+def _supervise_preflight(parsed: _SuperviseArgs) -> tuple[str, str, str, str, str] | int:
     """Run the ``start`` preflight (Section 4.1 step 1); return resolved values or rc.
 
-    Returns ``(claude_path, screen_path, model, effort)`` on success, or an int
-    exit code (2) when a fail-fast preflight check tripped (the message is
-    already on stderr).
+    Returns ``(claude_path, screen_path, model, effort, billing_mode)`` on
+    success, or an int exit code (2) when a fail-fast preflight check tripped (the
+    message is already on stderr). The AuthVerifier checks are mode-aware: in
+    subscription mode they require subscription auth + reject routing vars; in
+    bedrock mode they require the AWS Bedrock prerequisites instead.
     """
     screen_path = shutil.which("screen")
     if screen_path is None:
@@ -9885,14 +9923,20 @@ def _supervise_preflight(parsed: _SuperviseArgs) -> tuple[str, str, str, str] | 
         )
         return 2
 
+    cfg = _supervise_runtime_config()
+    try:
+        billing_mode = _resolve_supervise_billing_mode(cli_mode=parsed.billing_mode, config_mode=cfg.billing_mode)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
     verifier = AuthVerifier(credentials_file=SUPERVISE_CREDENTIALS_FILE)
     try:
-        verifier.verify(source_env=dict(os.environ), euid=os.geteuid())
+        verifier.verify(source_env=dict(os.environ), euid=os.geteuid(), billing_mode=billing_mode)
     except SuperviseError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    cfg = _supervise_runtime_config()
     try:
         orchestrate_model = None
         with contextlib.suppress(_OrchestratorModelUnsetError):
@@ -9914,7 +9958,7 @@ def _supervise_preflight(parsed: _SuperviseArgs) -> tuple[str, str, str, str] | 
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    return claude_path, screen_path, model, effort
+    return claude_path, screen_path, model, effort, billing_mode
 
 
 # Registry states that mean a same-named session is no longer occupying the name
@@ -9929,6 +9973,7 @@ def _supervise_start_under_flock(
     *,
     registry: SuperviseRegistry,
     model: str,
+    billing_mode: str,
     screen_path: str,
     cfg,
 ) -> int:
@@ -9971,7 +10016,7 @@ def _supervise_start_under_flock(
         # Build the minimized screen env (Section 3.6.1, 5.6). The interactive
         # billing model is the --model flag; DEVBENCH_CLAUDE_MODEL is the
         # import-time model the in-session subprocesses need.
-        env = EnvSanitizer(extra_deny_vars=cfg.env.deny_vars).build(
+        env = EnvSanitizer(extra_deny_vars=cfg.env.deny_vars, billing_mode=billing_mode).build(
             source_env=dict(os.environ),
             workspace_root=str(WORKSPACE_ROOT),
             session_name=parsed.name,
@@ -9987,6 +10032,8 @@ def _supervise_start_under_flock(
             parsed.name,
             "--model",
             model,
+            "--billing-mode",
+            billing_mode,
         ]
         if parsed.effort:
             run_argv += ["--effort", parsed.effort]
@@ -10006,13 +10053,13 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
     preflight = _supervise_preflight(parsed)
     if isinstance(preflight, int):
         return preflight
-    _claude_path, screen_path, model, _effort = preflight
+    _claude_path, screen_path, model, _effort, billing_mode = preflight
     cfg = _supervise_runtime_config()
 
     registry = SuperviseRegistry(WORKSPACE_ROOT)
     try:
         launch_rc = _supervise_start_under_flock(
-            parsed, registry=registry, model=model, screen_path=screen_path, cfg=cfg
+            parsed, registry=registry, model=model, billing_mode=billing_mode, screen_path=screen_path, cfg=cfg
         )
     except (TimeoutError, OSError, SuperviseError, ClaimRaceError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -10129,6 +10176,15 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    # The billing mode was resolved at ``start`` and forwarded via --billing-mode;
+    # re-resolve here (flag > env > config > default) so __run honours the same
+    # precedence even if invoked directly, and fail fast on an invalid value.
+    try:
+        billing_mode = _resolve_supervise_billing_mode(cli_mode=parsed.billing_mode, config_mode=cfg.billing_mode)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
     model = parsed.model or ""
     effort = resolve_supervise_effort(cli_effort=parsed.effort, supervise_effort=cfg.effort)
     plugin_dir = str(_resolve_plugin_path())
@@ -10156,6 +10212,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         model=model,
         effort=effort,
         started_by=getpass.getuser(),
+        billing_mode=billing_mode,
     )
     state.claude_path = claude_path
     state.claude_version = _record_tool_version(claude_path)
@@ -10189,6 +10246,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         config=cfg,
         workspace_root=WORKSPACE_ROOT,
         session_name=parsed.name,
+        billing_mode=billing_mode,
     )
     log_tail = LogTailDetector(log_path=_supervise_orchestrator_log_path(cfg), config=cfg.log_tail)
     relaunch = _make_supervise_relaunch(

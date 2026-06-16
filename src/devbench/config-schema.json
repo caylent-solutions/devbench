@@ -916,7 +916,7 @@
     },
     "supervise": {
       "type": "object",
-      "description": "Interactive `claude` CLI orchestrator under a detached `screen` daemon (devbench-supervise-screen-orchestrator, Section 5.1). Subscription-billed; reuses quota_handling. All operational values are config fields with DEVBENCH_SUPERVISE_* env overrides.",
+      "description": "Interactive `claude` CLI orchestrator under a detached `screen` daemon (devbench-supervise-screen-orchestrator, Section 5.1). billing_mode selects subscription (5-hour windows, reuses quota_handling) or bedrock (always-on, no 5-hour wait). All operational values are config fields with DEVBENCH_SUPERVISE_* env overrides.",
       "additionalProperties": false,
       "properties": {
         "model": {
@@ -927,6 +927,11 @@
           "type": "string",
           "enum": ["low", "medium", "high", "xhigh", "max"],
           "description": "Effort level. Default 'xhigh'; 'max' is session-only."
+        },
+        "billing_mode": {
+          "type": "string",
+          "enum": ["subscription", "bedrock"],
+          "description": "Billing channel: 'subscription' (default; bills the Claude Code Max subscription over 5-hour windows; the 5-hour quota wait is engaged) or 'bedrock' (bills via AWS Bedrock; always-on, no 5-hour windows, the 5-hour wait is disabled). Precedence: --billing-mode flag > DEVBENCH_SUPERVISE_BILLING_MODE env > this config > default. AWS workload creds pass through in BOTH modes."
         },
         "screen_name_prefix": {
           "type": "string",
@@ -991,7 +996,7 @@
         "env": {
           "type": "object",
           "additionalProperties": false,
-          "description": "ADDITIONAL deny vars; the always-deny ANTHROPIC_*/AWS_*/DEVBENCH_USE_BEDROCK set is non-removable (FR-21).",
+          "description": "ADDITIONAL deny vars layered on the mode-resolved deny set. The non-removable routing-var set (direct-Anthropic-API vars in both modes + the Bedrock/Vertex routing vars in subscription mode) cannot be whitelisted (FR-21). AWS workload creds are NOT denied; they pass through in both modes.",
           "properties": {
             "deny_vars": {"type": "array", "items": {"type": "string"}}
           }

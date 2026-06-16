@@ -466,6 +466,8 @@ supervise:
     command_invocation_seconds: 30   # safety timeout bounding short screen subprocess shell-outs
     command_submit_quiet_seconds: 1  # slash-command submit: no-output quiet window signalling the autocomplete menu render has settled before Enter
     command_submit_settle_seconds: 8 # slash-command submit: max render-settle wait before Enter is sent regardless (the / menu swallows a premature newline)
+    progress_stall_seconds: 600      # progress watchdog: max time the orchestrator log may go without growing (and no long-op heartbeat) before a work-progress stall -> auto-restart. Also env-overridable via DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS
+    long_op_heartbeat_seconds: 60    # verify-ac emits a benign [LONG_OP_HEARTBEAT] line on this cadence during a long terraform/go-test so the watchdog does not false-stall (MUST be < progress_stall_seconds)
   restart:
     max_attempts: 5                  # bounded auto-restart on the exit-42 restart signal
     resume_mode: continue            # continue | resume (resume uses the captured session id)
@@ -474,6 +476,7 @@ supervise:
   detection_patterns:                # version-fragility hardening -- all PTY regexes centralized here
     ready_prompt: '(?m)^\s*(>|│\s*>)\s*$'
     working_prompt: '(?i)(esc to interrupt|tokens|thinking)'
+    idle_input_prompt: '(?i)(how would you like to proceed|what would you like to do|awaiting your input)'  # turn-end-awaiting-input prompt: triggers the loop_continuation re-inject
     quota_limit: "(You’ve hit your limit|You've hit your limit|rate.?limit.*(exceeded|reached|resets))"
     quota_wait_prompt: '(?i)(wait.*reset|retry.*later|press.*to wait)'   # DI-5 placeholder (unverified)
     reset_at: 'resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)'
@@ -497,6 +500,7 @@ supervise:
     model_opus:     "/model opus"
     quota_wait_choice: "1"           # DI-5 placeholder: the keystroke that selects "wait" at the quota prompt
     drain_now:      "/exit"
+    loop_continuation: "/devbench-orchestrate:orchestrate"  # re-injected to re-drive the orchestrate loop when a turn ends awaiting input (design point 6)
 ```
 
 Notes:
@@ -523,6 +527,20 @@ Notes:
   PLACEHOLDERS until the real interactive usage-limit prompt is captured against a live quota event
   (DI-5; see `spec/devbench-supervise-screen-orchestrator/QUOTA-VERIFICATION-TODO.md`). The
   poll-and-restart path plus the stable log markers carry correctness meanwhile.
+- **`timeouts.progress_stall_seconds`** is the PROGRESS WATCHDOG window: the supervisor watches whether
+  `logs/orchestrator.log` GROWS (every real orchestrator action appends to it). If it does not grow for
+  this window AND no long op is heartbeating, the supervisor terminates the hung `claude` child and
+  auto-restarts it (bounded by `restart.max_attempts`; cap-exhaust faults with
+  `progress-stall-restart-cap-exhausted`). This catches the hang the PTY-silence `idle_seconds` timer
+  cannot (a turn that ended while the CLI spinner keeps emitting bytes). Unlike the other timeouts it IS
+  env-overridable, via `DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS` (env > yaml > default); a non-integer
+  or `< 1` value fails fast so the watchdog is never silently disabled. `timeouts.long_op_heartbeat_seconds`
+  (default 60, MUST be `< progress_stall_seconds`) is the cadence the in-session `verify-ac` runner emits a
+  benign `[LONG_OP_HEARTBEAT]` line during a long `terraform apply`/`go test`, so a genuinely-long op keeps
+  the watchdog's log-growth signal advancing and is never false-stalled. The launch env also always sets
+  `DISABLE_AUTOUPDATER=1` + `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` so the CLI auto-updater cannot hang
+  the session, and `detection_patterns.idle_input_prompt` + `injectable_commands.loop_continuation` drive
+  the turn-continuation re-inject (verified by the working-prompt ack; a missing ack escalates to a restart).
 
 ---
 

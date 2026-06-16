@@ -159,6 +159,56 @@ class TestEnvSanitizerBedrockMode:
 
 
 @pytest.mark.unit
+class TestEnvSanitizerCliHangGuards:
+    """The CLI-hang guards are ALWAYS set in the launch env (design point 5).
+
+    The root-cause hang was claude hanging on the CLI auto-updater
+    ("Checking for updates"). The supervise launch env must UNCONDITIONALLY set
+    DISABLE_AUTOUPDATER=1 and CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 so that
+    hang cannot occur -- in BOTH billing modes, regardless of the operator env, and
+    they must NOT be stripped by the deny comprehension (they are not billing
+    routing vars).
+    """
+
+    @pytest.mark.parametrize(
+        "billing_mode",
+        [SUPERVISE_BILLING_MODE_SUBSCRIPTION, SUPERVISE_BILLING_MODE_BEDROCK],
+    )
+    def test_cli_hang_guards_always_set(self, billing_mode: str) -> None:
+        # Bedrock mode needs a region to export; subscription does not. Provide one
+        # unconditionally so the single parametrized case covers both modes.
+        sanitizer = EnvSanitizer(extra_deny_vars=(), billing_mode=billing_mode)
+        result = sanitizer.build(
+            source_env={"PATH": "/usr/bin", "AWS_REGION": "us-east-1"},
+            workspace_root="/ws",
+            session_name="n",
+            import_model="us.anthropic.claude-opus-4-1-v1",
+        )
+        assert result["DISABLE_AUTOUPDATER"] == "1"
+        assert result["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+    def test_cli_hang_guards_set_even_when_absent_from_source(self) -> None:
+        # The operator env does NOT carry them; the sanitizer must inject them.
+        sanitizer = EnvSanitizer(extra_deny_vars=(), billing_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
+        result = sanitizer.build(
+            source_env={"PATH": "/usr/bin"},
+            workspace_root="/ws",
+            session_name="n",
+            import_model="opus",
+        )
+        assert result["DISABLE_AUTOUPDATER"] == "1"
+        assert result["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+    def test_cli_hang_guards_not_in_any_deny_set(self) -> None:
+        # They must survive the deny comprehension in both modes (they are not
+        # billing-routing vars, so they are never denied).
+        for mode in (SUPERVISE_BILLING_MODE_SUBSCRIPTION, SUPERVISE_BILLING_MODE_BEDROCK):
+            deny = resolve_supervise_deny_vars(mode)
+            assert "DISABLE_AUTOUPDATER" not in deny
+            assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in deny
+
+
+@pytest.mark.unit
 class TestEnvSanitizerExtraDeny:
     """Configured extra deny vars are stripped on top of the mode deny set."""
 

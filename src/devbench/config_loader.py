@@ -103,6 +103,7 @@ from devbench.constants import (
     SUPERVISE_LOG_TAIL_MARKERS_QUOTA_DEFAULT,
     SUPERVISE_LOG_TAIL_MARKERS_RESTART_DEFAULT,
     SUPERVISE_LOG_TAIL_ORCHESTRATOR_LOG_RELPATH_DEFAULT,
+    SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT,
     SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT,
     SUPERVISE_RESUME_MODE_DEFAULT,
     SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT,
@@ -113,6 +114,7 @@ from devbench.constants import (
     SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT,
     SUPERVISE_VALID_BILLING_MODES,
     SUPERVISE_VALID_EFFORT_LEVELS,
@@ -825,6 +827,18 @@ class SuperviseTimeoutsConfig:
     ``command_submit_settle_seconds`` bound the slash-command render-settle
     submission (type -> wait-for-quiescent-menu -> single Enter), since the ``/``
     autocomplete menu swallows a premature ``sendline`` newline.
+    ``progress_stall_seconds`` is the progress-watchdog stall window: the max time
+    the orchestrator's own log may go WITHOUT growing (and with no long-op
+    heartbeat) before the supervisor classifies a work-progress stall and
+    auto-restarts (design point 2, the primary "is work happening?" gate, distinct
+    from ``idle_seconds`` which is the secondary dead-PTY safeguard); it is ALSO
+    overridable via ``DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS`` (env > yaml >
+    default, resolved in ``cli._resolve_supervise_progress_stall_seconds``).
+    ``long_op_heartbeat_seconds`` is the cadence the in-session ``verify-ac`` runner
+    emits a benign ``[LONG_OP_HEARTBEAT]`` line to the orchestrator log on while a
+    genuine long op (terraform apply / go test) blocks, so the watchdog's
+    log-growth signal advances and a real long op does NOT false-stall (design
+    point 4); it MUST be strictly less than ``progress_stall_seconds``.
     """
 
     ready_prompt_seconds: int = SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT
@@ -837,6 +851,8 @@ class SuperviseTimeoutsConfig:
     command_invocation_seconds: int = SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
     command_submit_quiet_seconds: int = SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT
     command_submit_settle_seconds: int = SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT
+    progress_stall_seconds: int = SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
+    long_op_heartbeat_seconds: int = SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -870,6 +886,7 @@ class SuperviseDetectionPatternsConfig:
 
     ready_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["ready_prompt"]
     working_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["working_prompt"]
+    idle_input_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["idle_input_prompt"]
     quota_limit: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["quota_limit"]
     quota_wait_prompt: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["quota_wait_prompt"]
     reset_at: str = SUPERVISE_DETECTION_PATTERNS_DEFAULT["reset_at"]
@@ -1320,6 +1337,12 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
         command_submit_settle_seconds=_require_supervise_timeout(
             path, timeouts_raw, "command_submit_settle_seconds", dt.command_submit_settle_seconds
         ),
+        progress_stall_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "progress_stall_seconds", dt.progress_stall_seconds
+        ),
+        long_op_heartbeat_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "long_op_heartbeat_seconds", dt.long_op_heartbeat_seconds
+        ),
     )
 
     restart_raw = raw.get("restart") or {}
@@ -1352,6 +1375,7 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
     detection_patterns = SuperviseDetectionPatternsConfig(
         ready_prompt=dp_raw.get("ready_prompt", dp_def.ready_prompt),
         working_prompt=dp_raw.get("working_prompt", dp_def.working_prompt),
+        idle_input_prompt=dp_raw.get("idle_input_prompt", dp_def.idle_input_prompt),
         quota_limit=dp_raw.get("quota_limit", dp_def.quota_limit),
         quota_wait_prompt=dp_raw.get("quota_wait_prompt", dp_def.quota_wait_prompt),
         reset_at=dp_raw.get("reset_at", dp_def.reset_at),

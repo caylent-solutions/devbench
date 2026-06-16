@@ -108,6 +108,14 @@ class TestReadyAndWorkingPatterns:
         assert patterns.is_quota_wait_prompt("please wait for the reset window")
         assert not patterns.is_quota_wait_prompt("ordinary output")
 
+    def test_idle_input_prompt_pattern(self) -> None:
+        # The turn-end-awaiting-input prompt (design point 6): claude finished its
+        # turn and is asking how to proceed. Distinct from the working prompt.
+        patterns = DetectionPatterns(SuperviseDetectionPatternsConfig())
+        assert patterns.is_idle_input_prompt("How would you like to proceed?")
+        assert not patterns.is_idle_input_prompt("esc to interrupt")
+        assert not patterns.is_idle_input_prompt("thinking")
+
     def test_invalid_regex_fails_fast(self) -> None:
         bad = SuperviseDetectionPatternsConfig(ready_prompt="(unterminated")
         with pytest.raises(re.error):

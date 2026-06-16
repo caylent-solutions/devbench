@@ -95,6 +95,38 @@ class TestSuperviseConfigDefaults:
             == SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT
         )
 
+    def test_default_progress_stall_timeout(self) -> None:
+        # The progress watchdog stall window: how long the orchestrator log may go
+        # without growing (and no long-op heartbeat) before the supervisor
+        # classifies a work-progress stall and auto-restarts (design point 2).
+        from devbench.constants import SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
+
+        assert SuperviseConfig().timeouts.progress_stall_seconds == SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
+
+    def test_default_progress_stall_timeout_is_ten_minutes(self) -> None:
+        from devbench.constants import SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
+
+        assert SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT == 600
+
+    def test_default_long_op_heartbeat_interval(self) -> None:
+        # The long-running-command heartbeat cadence: the verify-ac runner emits a
+        # benign [LONG_OP_HEARTBEAT] line to the orchestrator log on this interval
+        # so a genuine 30-60 min terraform apply / go test keeps the progress
+        # watchdog's log-growth signal advancing (design point 4, mechanism a).
+        from devbench.constants import SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT
+
+        assert SuperviseConfig().timeouts.long_op_heartbeat_seconds == SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT
+
+    def test_long_op_heartbeat_is_strictly_below_progress_stall(self) -> None:
+        # The heartbeat MUST fire before the watchdog trips, else a genuine long op
+        # would false-stall. The defaults must satisfy heartbeat < progress_stall.
+        from devbench.constants import (
+            SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT,
+            SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT,
+        )
+
+        assert SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT < SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
+
     def test_default_restart_max_attempts(self) -> None:
         assert SuperviseConfig().restart.max_attempts == SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT
 
@@ -110,6 +142,22 @@ class TestSuperviseConfigDefaults:
     def test_default_injectable_commands(self) -> None:
         cmds = SuperviseConfig().injectable_commands
         assert cmds["orchestrate"] == SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["orchestrate"]
+
+    def test_default_injectable_commands_include_loop_continuation(self) -> None:
+        # The turn-continuation re-inject (design point 6): when claude's
+        # interactive turn ends with a unit still in progress, the supervisor
+        # re-injects this command to deterministically re-drive the orchestrate loop
+        # across the turn boundary (the root-cause gap was no re-inject at all).
+        cmds = SuperviseConfig().injectable_commands
+        assert "loop_continuation" in cmds
+        assert cmds["loop_continuation"] == SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["loop_continuation"]
+
+    def test_default_detection_patterns_include_idle_input_prompt(self) -> None:
+        # The idle-input / turn-end-awaiting-input prompt (design point 6): distinct
+        # from working_prompt (esc to interrupt). Recognizing it lets the supervisor
+        # re-inject the continuation instead of silently waiting for the watchdog.
+        patterns = SuperviseConfig().detection_patterns
+        assert patterns.idle_input_prompt == SUPERVISE_DETECTION_PATTERNS_DEFAULT["idle_input_prompt"]
 
 
 @pytest.mark.unit
@@ -161,6 +209,22 @@ class TestSuperviseConfigParse:
         )
         assert cfg.timeouts.quota_poll_interval_seconds == 120
         assert cfg.timeouts.quota_max_wait_seconds == 7200
+
+    def test_progress_stall_override(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"progress_stall_seconds": 1200}})
+        assert cfg.timeouts.progress_stall_seconds == 1200
+
+    def test_progress_stall_below_minimum_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="progress_stall_seconds"):
+            _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"progress_stall_seconds": 0}})
+
+    def test_long_op_heartbeat_override(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"long_op_heartbeat_seconds": 90}})
+        assert cfg.timeouts.long_op_heartbeat_seconds == 90
+
+    def test_long_op_heartbeat_below_minimum_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="long_op_heartbeat_seconds"):
+            _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"long_op_heartbeat_seconds": 0}})
 
     def test_poll_interval_override(self) -> None:
         cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"poll_interval_seconds": 5}})
@@ -367,4 +431,28 @@ class TestSuperviseConfigSchema:
         cfg_path = tmp_path / "devbench.yaml"
         _write_config(cfg_path, "supervise:\n  timeouts:\n    command_submit_settle_seconds: 0\n")
         with pytest.raises(Exception, match=r"command_submit_settle_seconds|minimum|0"):
+            load_runtime_config(cfg_path, {})
+
+    def test_progress_stall_timeout_loads_via_runtime_config(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    progress_stall_seconds: 1500\n")
+        runtime = load_runtime_config(cfg_path, {})
+        assert runtime.supervise.timeouts.progress_stall_seconds == 1500
+
+    def test_progress_stall_timeout_below_minimum_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    progress_stall_seconds: 0\n")
+        with pytest.raises(Exception, match=r"progress_stall_seconds|minimum|0"):
+            load_runtime_config(cfg_path, {})
+
+    def test_long_op_heartbeat_loads_via_runtime_config(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    long_op_heartbeat_seconds: 120\n")
+        runtime = load_runtime_config(cfg_path, {})
+        assert runtime.supervise.timeouts.long_op_heartbeat_seconds == 120
+
+    def test_long_op_heartbeat_below_minimum_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    long_op_heartbeat_seconds: 0\n")
+        with pytest.raises(Exception, match=r"long_op_heartbeat_seconds|minimum|0"):
             load_runtime_config(cfg_path, {})

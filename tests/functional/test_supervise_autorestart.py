@@ -10,6 +10,7 @@ exits 42 is bounded by ``supervise.restart.max_attempts`` and faults with
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -59,4 +60,56 @@ class TestStubAutoRestart:
         assert state is not None
         assert state.state == "faulted"
         assert state.exit_reason == "restart-cap-exhausted"
+        assert state.restart_count == 2
+
+
+@pytest.mark.functional
+class TestStubProgressStallAutoRestart:
+    """The progress watchdog catches the spinner hang the idle timer cannot.
+
+    A ``spin`` stub emits the working spinner FOREVER after kickoff (the root-cause
+    hang): the PTY never goes silent so the idle timer can NEVER fire, while the
+    orchestrator log never grows (no real work). With a SHORT progress_stall_seconds
+    and a LONG idle_seconds, only the PROGRESS WATCHDOG can catch it -- proving the
+    watchdog, not the idle timer, self-heals the hang (design points 1-3).
+    """
+
+    @staticmethod
+    def _watchdog_config(*, max_attempts: int) -> SuperviseConfig:
+        # idle_seconds is far larger than progress_stall_seconds so a stall trip can
+        # ONLY have come from the progress watchdog, never the PTY-silence timer.
+        base = functional_supervise_config(idle_seconds=120, poll_interval_seconds=1)
+        timeouts = replace(base.timeouts, progress_stall_seconds=2, long_op_heartbeat_seconds=1)
+        return replace(base, timeouts=timeouts, restart=SuperviseRestartConfig(max_attempts=max_attempts))
+
+    def test_spin_hang_is_caught_by_watchdog_then_recovers(self, tmp_path: Path) -> None:
+        # spin forever on launch 1 (watchdog trips -> restart), clean on the relaunch.
+        config = self._watchdog_config(max_attempts=3)
+        state_file = tmp_path / "stub-seq.state"
+        stub_env = stub_sequence_env(sequence="spin,clean", state_file=state_file)
+        with supervised_stub(workspace_root=tmp_path, config=config, stub_env=stub_env):
+            rc = cli.cmd_supervise("__run", "--name", "ps1", "--model", "claude-opus-4-8")
+
+        assert rc == 0
+        state = SuperviseRegistry(tmp_path).read_state("ps1")
+        assert state is not None
+        # The watchdog terminated the hung child and relaunched once; the relaunch
+        # completed clean. The idle timer (120s) never had a chance to fire.
+        assert state.state == "completed-clean"
+        assert state.restart_count == 1
+        assert state.exit_reason == "all-done"
+
+    def test_persistent_spin_hang_exhausts_restart_cap(self, tmp_path: Path) -> None:
+        # Every launch spins forever: the watchdog restarts up to the cap then faults
+        # with the progress-stall-specific reason (distinct from the exit-42 cap).
+        config = self._watchdog_config(max_attempts=2)
+        stub_env = {"STUB_CLAUDE_SCRIPT": "spin", "STUB_CLAUDE_SPIN_INTERVAL_SECONDS": "0.1"}
+        with supervised_stub(workspace_root=tmp_path, config=config, stub_env=stub_env):
+            rc = cli.cmd_supervise("__run", "--name", "ps2", "--model", "claude-opus-4-8")
+
+        assert rc == SUPERVISE_FAULT_EXIT_CODE
+        state = SuperviseRegistry(tmp_path).read_state("ps2")
+        assert state is not None
+        assert state.state == "faulted"
+        assert state.exit_reason == "progress-stall-restart-cap-exhausted"
         assert state.restart_count == 2

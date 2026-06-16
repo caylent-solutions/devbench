@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pexpect
 import pytest
 from fixtures.supervise import FakePexpectChild, _ScriptStep
 
@@ -36,8 +37,87 @@ from devbench.supervise import (
 )
 
 
-def _driver(child: FakePexpectChild) -> PtyDriver:
+def _driver(child) -> PtyDriver:
     return PtyDriver(child=child, patterns=DetectionPatterns(SuperviseConfig().detection_patterns))
+
+
+class _SpinnerChild:
+    """A pexpect double that emits the working-prompt spinner FOREVER (no terminal).
+
+    This reproduces the root-cause hang class (design point 1): claude's turn
+    ended and the loop hung repeating the CLI auto-updater spinner -- the PTY kept
+    emitting bytes so the PTY-silence idle timer NEVER fires, while NO real
+    orchestrator work happens. Every ``expect`` matches the working-prompt pattern,
+    so the loop classifies pure working-activity on every read (cumulative_idle is
+    reset to 0 each iteration) and would spin forever absent the progress watchdog.
+
+    When ``release`` is set True (e.g. by a relaunch callback simulating a resumed,
+    healthy session) the NEXT ``expect`` raises EOF with ``exitstatus`` so the loop
+    can reach a clean terminal -- letting a single stall+recover be asserted.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.before = ""
+        self.after = ""
+        self.exitstatus: int | None = None
+        self.release = False
+        self.terminated = False
+        self.terminate_force: bool | None = None
+        self._alive = True
+
+    def expect(self, patterns: list[str], timeout: int | None = None) -> int:
+        import re as _re
+
+        if self.release:
+            self._alive = False
+            self.exitstatus = 0
+            self.before = "ALL_DONE"
+            self.after = ""
+            raise pexpect.EOF("released to clean terminal")
+        emit = "esc to interrupt"
+        for index, pattern in enumerate(patterns):
+            if _re.search(pattern, emit):
+                self.before = emit
+                self.after = emit
+                return index
+        raise pexpect.TIMEOUT("spinner emitted no requested pattern")
+
+    def sendline(self, payload: str = "") -> int:
+        self.sent.append(payload)
+        return len(payload) + 1
+
+    def send(self, payload: str = "") -> int:
+        self.sent.append(payload)
+        return len(payload)
+
+    def terminate(self, force: bool = False) -> bool:
+        self.terminated = True
+        self.terminate_force = force
+        self._alive = False
+        return True
+
+    def isalive(self) -> bool:
+        return self._alive
+
+
+class _FakeClock:
+    """A deterministic monotonic clock: each ``__call__`` advances by ``step``.
+
+    The progress watchdog reads the clock once per loop iteration, so advancing a
+    fixed ``step`` per call makes the stall arithmetic exact and NEEDS NO real
+    sleep (CLAUDE.md Section 7.5): after ``ceil(progress_stall_seconds / step)``
+    iterations of no log growth the watchdog trips.
+    """
+
+    def __init__(self, *, step: float) -> None:
+        self._step = step
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        now = self._now
+        self._now += self._step
+        return now
 
 
 class _StubQuotaWaiter:
@@ -474,3 +554,266 @@ class TestEventLoopGracefulStop:
         # The (running -> draining) edge fired before reaching stopped.
         assert (SUPERVISE_STATE_DRAINING, SUPERVISE_STATE_STOPPED, "drain-complete") in sm.history
         assert any(to == SUPERVISE_STATE_DRAINING for (_f, to, _e) in sm.history)
+
+
+@pytest.mark.unit
+class TestEventLoopProgressWatchdog:
+    """The progress watchdog catches a work-progress stall the idle timer cannot.
+
+    Design points 1-4: the root-cause hang has the PTY emitting spinner bytes
+    forever (so the cumulative-idle timer NEVER fires) while the orchestrator's own
+    log does NOT grow (no real orchestrate work). The watchdog watches log GROWTH,
+    not PTY silence, so it trips within ``progress_stall_seconds`` and auto-restarts
+    -- whereas a genuine long op (heartbeating the log) must NOT trip.
+    """
+
+    @staticmethod
+    def _short_stall_config(**extra: int):
+        # A tight stall window keeps the deterministic fake-clock arithmetic small.
+        from dataclasses import replace
+
+        from devbench.config_loader import SuperviseConfig
+
+        base = SuperviseConfig()
+        timeouts = replace(base.timeouts, progress_stall_seconds=600, **extra)
+        return replace(base, timeouts=timeouts)
+
+    def test_stall_trips_when_log_quiet_and_pty_spins(self) -> None:
+        # The orchestrator log never grows (progress_poll always False) while the
+        # PTY spins forever. The idle timer can NEVER fire (every read is working
+        # activity). The progress watchdog must trip and auto-restart; the relaunch
+        # releases the child to a clean terminal so a single stall+recover is seen.
+        child = _SpinnerChild()
+        relaunches: list = []
+
+        def _relaunch(**k):
+            relaunches.append(k)
+            child.release = True  # the resumed session makes progress -> clean exit
+
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=self._short_stall_config(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=_relaunch,
+            progress_poll=lambda: False,  # the orchestrator log NEVER grows
+            clock=_FakeClock(step=100),
+        )
+        # The watchdog tripped exactly once and auto-restarted with resume context.
+        assert len(relaunches) == 1
+        assert relaunches[0].get("reason") == "progress-stall"
+        assert relaunches[0].get("resume") is True
+        # The hung child was terminated before the relaunch (unlike exit-42 EOF).
+        assert child.terminated is True
+        assert child.terminate_force is True
+        # The restart was counted (persisted to registry.restart_count by the CLI).
+        assert result.restarts_used == 1
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+    def test_no_stall_when_long_op_heartbeats_the_log(self) -> None:
+        # The orchestrator log is quiet ONLY because a genuine long op is running --
+        # but the long-op heartbeat keeps GROWING the log (progress_poll True), so
+        # the watchdog must NOT trip. The op then finishes clean. This is the
+        # no-false-stall-on-long-op proof (design point 4): same spinner PTY, same
+        # fake clock, but BECAUSE the log grows the watchdog never fires.
+        child = _SpinnerChild()
+        relaunches: list = []
+        # The heartbeat arrives for many iterations (well past the stall window),
+        # then the op completes and the child is released to a clean terminal.
+        heartbeats = iter([True] * 50)
+
+        def _progress_poll() -> bool:
+            grew = next(heartbeats, False)
+            if not grew:
+                # The long op finished: release the child so the loop can terminate
+                # cleanly (the test asserts the watchdog never tripped meanwhile).
+                child.release = True
+            return grew
+
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=self._short_stall_config(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **k: relaunches.append(k),
+            progress_poll=_progress_poll,
+            clock=_FakeClock(step=100),
+        )
+        # The watchdog NEVER tripped: the heartbeat-driven log growth kept resetting
+        # the progress timer for the full (simulated) long op.
+        assert relaunches == []
+        assert child.terminated is False
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+    def test_stall_restart_cap_exhausted_faults(self) -> None:
+        # Every relaunch re-stalls (the resumed session immediately hangs again).
+        # Bounded by max_attempts=2 the watchdog faults with
+        # progress-stall-restart-cap-exhausted rather than restarting forever.
+        from devbench.config_loader import SuperviseRestartConfig
+
+        cfg = self._short_stall_config()
+        from dataclasses import replace
+
+        cfg = replace(cfg, restart=SuperviseRestartConfig(max_attempts=2))
+        child = _SpinnerChild()
+        relaunches: list = []
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=cfg,
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **k: relaunches.append(k),  # never releases -> keeps stalling
+            progress_poll=lambda: False,
+            clock=_FakeClock(step=100),
+        )
+        assert result.exit_code != 0
+        assert result.final_state == SUPERVISE_STATE_FAULTED
+        assert result.exit_reason == "progress-stall-restart-cap-exhausted"
+        # Exactly max_attempts relaunches were attempted before giving up.
+        assert len(relaunches) == 2
+        assert result.restarts_used == 2
+
+    def test_watchdog_disabled_when_progress_poll_is_none(self) -> None:
+        # The SDK-style callers do not supply progress_poll; the watchdog must then
+        # be inert (no behaviour change). A normal clean ALL_DONE still wins.
+        child = FakePexpectChild(
+            [
+                _ScriptStep(emit="esc to interrupt"),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
+            ]
+        )
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=self._short_stall_config(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **_k: None,
+            clock=_FakeClock(step=100000),  # would trip instantly IF the watchdog ran
+        )
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+    def test_log_growth_resets_progress_timer_before_stall(self) -> None:
+        # A single late heartbeat (log growth) just before the stall window elapses
+        # resets the timer, so the watchdog does NOT trip on that window. Proves the
+        # reset-on-growth branch (not merely the never-grows case).
+        child = _SpinnerChild()
+        relaunches: list = []
+        # Grow on iterations 1-5, then go quiet; with step=100 and a 600 window the
+        # reset on iter 5 pushes the next possible trip out, and the child is
+        # released shortly after so no stall is reached.
+        growth = iter([True, True, True, True, True])
+        polls = {"n": 0}
+
+        def _progress_poll() -> bool:
+            polls["n"] += 1
+            grew = next(growth, False)
+            if polls["n"] >= 9:
+                child.release = True
+            return grew
+
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=self._short_stall_config(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **k: relaunches.append(k),
+            progress_poll=_progress_poll,
+            clock=_FakeClock(step=100),
+        )
+        assert relaunches == []
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+
+@pytest.mark.unit
+class TestEventLoopTurnContinuation:
+    """A turn that ends awaiting input is deterministically re-driven (design point 6).
+
+    The root-cause gap: after TDD GREEN claude's interactive turn ended printing
+    "how would you like to proceed" and NOTHING re-drove it. The supervisor must
+    detect the turn-end-awaiting-input prompt, re-inject the loop_continuation, and
+    VERIFY it took (working-prompt ack). If the ack never comes (claude stayed
+    idle), it is treated as a stall and the session is restarted -- NOT a
+    fire-and-forget injection.
+    """
+
+    def test_turn_end_reinjects_continuation_then_continues(self) -> None:
+        from devbench.constants import SUPERVISE_INJECTABLE_COMMANDS_DEFAULT
+
+        loop_cont = SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["loop_continuation"]
+        child = FakePexpectChild(
+            [
+                # Turn ended awaiting input: the supervisor must re-inject.
+                _ScriptStep(emit="How would you like to proceed?"),
+                # After the continuation is SUBMITTED (\r), claude resumes working
+                # then finishes clean. Gate on \r so the type->settle->Enter ack flow
+                # works exactly like the orchestrate kickoff.
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0, on_send=r"\r"),
+            ]
+        )
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=SuperviseConfig(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **_k: None,
+        )
+        # The continuation literal was injected to re-drive the loop across the turn.
+        assert loop_cont in child.sent
+        assert result.exit_code == 0
+        assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
+
+    def test_turn_end_no_ack_is_stall_and_restarts(self) -> None:
+        # The continuation is injected but NO working ack comes back (claude stays
+        # idle): a fire-and-forget would hang forever. The supervisor must treat the
+        # missing ack as a progress stall and restart (bounded). The relaunch
+        # releases a fresh child to a clean terminal so the recover is asserted.
+        child = FakePexpectChild(
+            [
+                # Turn ended awaiting input; after the submit \r NO ack arrives (no
+                # further step matches the working pattern) -> expect_working False.
+                _ScriptStep(emit="How would you like to proceed?"),
+            ]
+        )
+        relaunches: list = []
+
+        def _relaunch(**k):
+            relaunches.append(k)
+
+        run_supervise_event_loop(
+            driver=_driver(child),
+            config=SuperviseConfig(),
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=_relaunch,
+        )
+        # A no-ack continuation was escalated to a restart (not left hanging).
+        assert len(relaunches) >= 1
+        assert relaunches[0].get("reason") == "progress-stall"
+
+    def test_turn_end_no_ack_at_restart_cap_faults(self) -> None:
+        # With the restart budget already exhausted (max_attempts=0), a no-ack
+        # continuation cannot restart -> it faults terminally with the
+        # progress-stall cap reason (the cont_result-is-not-None branch).
+        from dataclasses import replace
+
+        from devbench.config_loader import SuperviseRestartConfig
+
+        cfg = replace(SuperviseConfig(), restart=SuperviseRestartConfig(max_attempts=0))
+        child = FakePexpectChild([_ScriptStep(emit="How would you like to proceed?")])
+        relaunches: list = []
+        result = run_supervise_event_loop(
+            driver=_driver(child),
+            config=cfg,
+            quota_waiter=_StubQuotaWaiter(),
+            log_poll=lambda: None,
+            relaunch=lambda **k: relaunches.append(k),
+        )
+        assert relaunches == []  # the cap was already reached: no relaunch attempted
+        assert result.exit_code != 0
+        assert result.final_state == SUPERVISE_STATE_FAULTED
+        assert result.exit_reason == "progress-stall-restart-cap-exhausted"

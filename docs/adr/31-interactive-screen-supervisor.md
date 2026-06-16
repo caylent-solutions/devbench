@@ -100,6 +100,47 @@ Key decisions:
    file shape but is intentionally kept separate so `status`/`info` keep the
    subscription-billed and API-billed channels distinct.
 
+6. **A PROGRESS WATCHDOG self-heals a work-progress stall (SDK-equivalent).** The
+   interactive supervisor has a hang class the SDK path is structurally immune to:
+   after a unit reaches TDD GREEN, `claude`'s interactive turn ENDS (it prints
+   "how would you like to proceed...") and the CLI can then sit repeating the
+   auto-updater spinner ("Checking for updates"). The spinner keeps emitting PTY
+   bytes, so the PTY-silence idle timer (`idle_seconds`) NEVER fires, while no real
+   orchestrate work happens. SDK mode cannot hang this way because it drives the
+   agent loop programmatically (it owns turn boundaries + continuation). We close
+   the gap with four pieces:
+   - **Progress watchdog (primary gate):** the supervisor watches whether the
+     orchestrator's OWN log (`logs/orchestrator.log` -- written by the in-session
+     `devbench` subprocesses on every real action) GROWS. No growth for
+     `supervise.timeouts.progress_stall_seconds` (default 600) with no long op in
+     flight is a work-progress stall: the hung child is terminated and relaunched
+     with resume, bounded by the SAME `restart.max_attempts` budget (cap-exhaust
+     faults with `progress-stall-restart-cap-exhausted`). The progress signal reuses
+     the hybrid log-tail detector (a cheap `stat`-based growth probe on a SEPARATE
+     offset, no full re-read). `idle_seconds` stays a secondary dead-PTY safeguard.
+   - **No false stall on a genuine long op:** the in-session `verify-ac` runner
+     (which shells out to `terraform apply`/`go test`, legitimately quiet for tens
+     of minutes) emits a benign `[LONG_OP_HEARTBEAT]` line to the orchestrator log
+     every `supervise.timeouts.long_op_heartbeat_seconds` (default 60, MUST be
+     `< progress_stall_seconds`), so a real long op keeps the watchdog's log-growth
+     signal advancing. We chose this log-heartbeat (mechanism a) over active-long-op
+     detection (mechanism b) because the supervise pexpect loop has NO structured
+     visibility into which tool the in-session `claude` is running (the orchestrate
+     work happens out-of-band inside the child); the orchestrator log is already the
+     watchdog's signal, so a heartbeat needs no new IPC channel.
+   - **CLI-hang guards (always on):** `EnvSanitizer.build` unconditionally sets
+     `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (both
+     billing modes) so the auto-updater stall cannot occur. These are not
+     billing-routing vars and are never stripped.
+   - **Deterministic turn continuation:** when a turn ends awaiting input
+     (`supervise.detection_patterns.idle_input_prompt`), the supervisor re-injects
+     `supervise.injectable_commands.loop_continuation` to re-drive the orchestrate
+     loop AND verifies it took (the working-prompt ack); a missing ack is escalated
+     to the bounded restart path, never a fire-and-forget injection.
+   `supervise.timeouts.progress_stall_seconds` is additionally env-overridable via
+   `DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS` (env > yaml > default; fail-fast on a
+   non-integer or `< 1` so the watchdog is never silently disabled).
+
 ## Version-fragility tradeoff and the hybrid log-tail mitigation
 
 Driving an interactive `claude` CLI over a PTY is NOT officially recommended and
@@ -146,6 +187,12 @@ poll-and-restart path plus the stable log markers carry correctness meanwhile.
 - The interactive PTY path is version-fragile; the hybrid log-tail and
   config-driven regexes mitigate it, but a `claude` CLI upgrade may require
   updating `supervise.detection_patterns`.
+- The progress watchdog makes the interactive loop self-heal a work-progress stall
+  the way SDK mode never stalls: a hung-but-alive `claude` (e.g. a turn that ended
+  while the CLI spinner keeps the PTY busy) is detected by log non-growth and
+  auto-restarted, bounded by `restart.max_attempts`. A genuine long op is exempt via
+  the `[LONG_OP_HEARTBEAT]` log line, and the CLI-hang guards prevent the
+  auto-updater stall up front.
 - The full operator guide is [../supervise.md](../supervise.md); the config block
   is documented in [../devbench-yaml-reference.md](../devbench-yaml-reference.md).
 

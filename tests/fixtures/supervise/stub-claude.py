@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 #: Default exit code per named script (the single-script ``STUB_CLAUDE_EXIT_CODE``
@@ -137,6 +138,15 @@ def main() -> int:
     emits no terminal sentinel) and exits 0 only when it receives the drain command
     (``STUB_CLAUDE_DRAIN_COMMAND``, default ``/exit``). This drives the graceful-stop
     path (Section 4.2): the supervisor injects ``/exit`` and reads to the child EOF.
+
+    The ``spin`` script models the ROOT-CAUSE HANG (design point 1): after the
+    kickoff it emits the working spinner ("esc to interrupt") FOREVER without ever
+    finishing a unit, so the PTY never goes silent (defeating the idle timer) while
+    the orchestrator log never grows (no real work). This is the exact hang the
+    PROGRESS WATCHDOG exists to catch -- the supervisor must terminate + restart
+    this child, NOT spin with it. ``STUB_CLAUDE_SPIN_INTERVAL_SECONDS`` controls the
+    spinner cadence (default 0.2s) so the PTY stays busy without busy-looping.
+
     Every other script emits its terminal sentinel immediately on the kickoff and
     exits with its resolved code.
     """
@@ -158,6 +168,16 @@ def main() -> int:
                 return exit_code
             if stripped == kickoff:
                 kickoff_seen = True
+            continue
+        if script == "spin":
+            # The root-cause hang: spin the working prompt forever after kickoff.
+            # The progress watchdog must terminate this child (the parent kills it),
+            # so this loop is exited only by SIGTERM from the supervisor.
+            if stripped == kickoff:
+                spin_interval = float(os.environ.get("STUB_CLAUDE_SPIN_INTERVAL_SECONDS", "0.2"))
+                while True:
+                    _emit("esc to interrupt")
+                    time.sleep(spin_interval)
             continue
         if stripped == kickoff:
             _emit(_terminal_output(script))

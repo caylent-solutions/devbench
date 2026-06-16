@@ -160,3 +160,71 @@ class TestLogTailFromEnd:
         hit = detector.poll()
         assert hit is not None
         assert hit.kind is LogTailKind.CLEAN
+
+
+@pytest.mark.unit
+class TestLogTailProgressed:
+    """progressed() is the progress watchdog's log-growth signal (design point 2).
+
+    It reports whether the orchestrator log GREW since the previous call, using a
+    cheap ``stat`` size comparison against a retained offset SEPARATE from poll()'s
+    marker offset -- so the watchdog and the marker detector never consume each
+    other's growth. It reads NO content (a multi-hundred-MB log must never be read
+    whole every poll). ANY appended bytes count as progress, including a benign
+    [LONG_OP_HEARTBEAT] line that matches no marker family.
+    """
+
+    def test_no_growth_returns_false(self, tmp_path: Path) -> None:
+        detector, _log_path = _detector(tmp_path)
+        # Seeded to the current size at construction; an unchanged file has no growth.
+        assert detector.progressed() is False
+        assert detector.progressed() is False
+
+    def test_growth_returns_true_once_then_false(self, tmp_path: Path) -> None:
+        detector, log_path = _detector(tmp_path)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("[USER] claimed E1-F1-S1-T1\n")
+        # The append grew the file -> True; with no further growth the next call is
+        # False (the offset advanced to the new size).
+        assert detector.progressed() is True
+        assert detector.progressed() is False
+
+    def test_heartbeat_line_counts_as_growth(self, tmp_path: Path) -> None:
+        # A [LONG_OP_HEARTBEAT] line matches NO marker family (poll() ignores it) but
+        # MUST register as progress so a genuine long op does not false-stall.
+        detector, log_path = _detector(tmp_path)
+        from devbench.constants import SUPERVISE_LONG_OP_HEARTBEAT_MARKER
+
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{SUPERVISE_LONG_OP_HEARTBEAT_MARKER} verb=verify-ac unit=E1-F1-S1-T1 elapsed=60s\n")
+        assert detector.progressed() is True
+        # The heartbeat is NOT misclassified as a terminal/quota/fault/restart marker.
+        assert detector.poll() is None
+
+    def test_progressed_is_independent_of_poll_offset(self, tmp_path: Path) -> None:
+        # Growth observed by progressed() must NOT consume poll()'s view and vice
+        # versa: a marker appended after a progressed() call is still detected.
+        detector, log_path = _detector(tmp_path)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("ALL_DONE backlog complete\n")
+        assert detector.progressed() is True
+        # poll() still sees the appended ALL_DONE marker (separate offset).
+        hit = detector.poll()
+        assert hit is not None
+        assert hit.kind is LogTailKind.CLEAN
+
+    def test_missing_file_is_no_progress(self, tmp_path: Path) -> None:
+        detector = LogTailDetector(
+            log_path=tmp_path / "logs" / "orchestrator.log",
+            config=SuperviseLogTailConfig(),
+        )
+        assert detector.progressed() is False
+
+    def test_truncation_then_growth_is_progress(self, tmp_path: Path) -> None:
+        detector, log_path = _detector(tmp_path)
+        log_path.write_text("x" * 500, encoding="utf-8")
+        assert detector.progressed() is True
+        # Rotation to a shorter file then fresh growth still registers as progress
+        # (the offset resets to the new, smaller size).
+        log_path.write_text("y" * 10, encoding="utf-8")
+        assert detector.progressed() is True

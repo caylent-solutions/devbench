@@ -169,6 +169,8 @@ quota_handling:
 #     command_invocation_seconds: 30   # safety timeout bounding short subprocess shell-outs (screen -ls / -X quit / --version)
 #     command_submit_quiet_seconds: 1  # slash-command submit: no-output quiet window signalling the autocomplete menu render has settled before Enter
 #     command_submit_settle_seconds: 8 # slash-command submit: max render-settle wait before Enter is sent regardless (the / menu swallows a premature newline)
+#     progress_stall_seconds: 600      # progress watchdog: max time the orchestrator log may go without growing (no real work, no long-op heartbeat) before a work-progress stall -> auto-restart. Also env-overridable via DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS
+#     long_op_heartbeat_seconds: 60    # verify-ac emits a benign [LONG_OP_HEARTBEAT] line on this cadence during a long terraform/go-test so the watchdog does not false-stall (MUST be < progress_stall_seconds)
 #   restart:
 #     max_attempts: 5                  # bounded auto-restart on the exit-42-equivalent
 #     resume_mode: continue            # continue | resume (resume uses the captured session id)
@@ -177,6 +179,7 @@ quota_handling:
 #   detection_patterns:                # version-fragility hardening -- all Claude-CLI-output regexes centralized here
 #     ready_prompt: '(?m)^\s*(>|.\s*>)\s*$'
 #     working_prompt: '(?i)(esc to interrupt|tokens|thinking)'
+#     idle_input_prompt: '(?i)(how would you like to proceed|what would you like to do|awaiting your input)'  # turn-end-awaiting-input prompt -> triggers the loop_continuation re-inject
 #     quota_limit: '(?i)(You have hit your limit|rate.?limit.*(exceeded|reached|resets))'  # DI-5 placeholder
 #     quota_wait_prompt: '(?i)(wait.*reset|retry.*later|press.*to wait)'                    # DI-5 placeholder
 #     reset_at: 'resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)'
@@ -200,6 +203,7 @@ quota_handling:
 #     model_opus: "/model opus"
 #     quota_wait_choice: "1"           # DI-5 placeholder
 #     drain_now: "/exit"
+#     loop_continuation: "/devbench-orchestrate:orchestrate"  # re-injected to re-drive the orchestrate loop when a turn ends awaiting input
 
 # ---------------------------------------------------------------------------
 # Timeouts (seconds)

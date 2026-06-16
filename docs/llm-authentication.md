@@ -256,3 +256,7 @@ The same interactive session routes inference through AWS Bedrock. The superviso
 ### AWS workload creds pass through in both modes
 
 The AWS workload credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region (`AWS_REGION` / `AWS_DEFAULT_REGION`) are in NEITHER mode's deny set: AWS creds do NOT route Claude billing (only the Bedrock route flag does), and the supervised orchestrator runs live AWS terratests that cannot work without them. They pass through unchanged and are never treated as a billing-routing violation. The non-root preflight assertion applies in both modes.
+
+### CLI-hang guards are always set (not billing-routing vars)
+
+In BOTH billing modes the supervise launch env additionally sets `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` unconditionally, so the interactive `claude` child cannot hang on the CLI auto-updater ("Checking for updates") -- a hang that the PTY-silence idle timer cannot catch (the spinner keeps the PTY busy). These are NOT billing-routing vars: they are absent from every deny set and are never stripped. They work alongside the progress watchdog (`supervise.timeouts.progress_stall_seconds`), which auto-restarts a session whose orchestrator log stops growing; see [supervise.md](supervise.md).

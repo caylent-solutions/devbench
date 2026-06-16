@@ -199,6 +199,7 @@ screen daemon (devbench-supervise-<name>)
             ├── tails the orchestrator log markers (ALL_DONE / NO_ACTIONABLE / [QUOTA_WAITING] / ...)
             ├── on a 5-hour-window exhaustion: state=quota-waiting (waits, never exits non-zero)
             ├── on the exit-42 restart signal: bounded auto-restart via --continue
+            ├── progress watchdog: if the orchestrator log stops growing (no real work, no long-op heartbeat) for progress_stall_seconds, terminate the hung child + bounded auto-restart (self-heal the SDK-immune spinner hang)
             └── on ALL_DONE / operator-gated NO_ACTIONABLE: clean completion, exit 0
 ```
 
@@ -208,6 +209,7 @@ screen daemon (devbench-supervise-<name>)
 | Unattended | Yes -- survives terminal detach via the `screen` daemon |
 | Quota | `subscription`: `quota-waiting` then auto-resume, never exits non-zero on exhaustion (ADR-24 semantics). `bedrock`: 5-hour wait disabled (no windows); throttling handled by the shared `quota.py` path |
 | Observation | Read-only redacted PTY-log follow (`supervise attach`); cannot inject input |
+| Self-heal | Progress watchdog: a hung-but-alive `claude` (e.g. a turn that ended while the CLI spinner keeps the PTY busy) is caught by orchestrator-log non-growth and auto-restarted within `restart.max_attempts`; a genuine long op is exempt via `[LONG_OP_HEARTBEAT]`, and `DISABLE_AUTOUPDATER`/`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` are always set to prevent the auto-updater stall |
 | Best for | Overnight / unattended runs an operator wants billed to the Max subscription (or to Bedrock via `--billing-mode bedrock`) |
 
 The same ownership rules and lifecycle apply; only the launch wrapper and billing channel differ. Full guide: [supervise.md](supervise.md). Design rationale: [adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md).

@@ -102,6 +102,7 @@ from devbench.constants import (
     SUPERVISE_BILLING_CHANNEL,
     SUPERVISE_BILLING_MODE_BEDROCK,
     SUPERVISE_BILLING_MODE_SUBSCRIPTION,
+    SUPERVISE_CLI_HANG_GUARD_ENV_VARS,
     SUPERVISE_DEFAULT_BILLING_MODE,
     SUPERVISE_EFFORT_DEFAULT,
     SUPERVISE_EXIT_REASON_GRACEFUL_STOP,
@@ -939,6 +940,15 @@ class EnvSanitizer:
         env["DEVBENCH_SESSION_NAME"] = session_name
         env["DEVBENCH_CLAUDE_MODEL"] = import_model
 
+        # CLI-hang guards (design point 5): ALWAYS set so the interactive claude
+        # child cannot hang on the CLI auto-updater ("Checking for updates"), the
+        # exact stall that defeated the PTY-silence idle timer (the spinner keeps
+        # emitting PTY bytes). Set unconditionally on the RETURNED env (not relying
+        # on an operator-supplied value) so the initial launch and every relaunch
+        # carry them; they are not billing-routing vars, so the deny comprehension
+        # above never strips them.
+        env.update(SUPERVISE_CLI_HANG_GUARD_ENV_VARS)
+
         if self._billing_mode == SUPERVISE_BILLING_MODE_BEDROCK:
             self._export_bedrock_routing(env, source_env=source_env, import_model=import_model)
         return env
@@ -1120,9 +1130,11 @@ class DetectionPatterns:
     def __init__(self, config: SuperviseDetectionPatternsConfig) -> None:
         self.ready_prompt_raw = config.ready_prompt
         self.working_prompt_raw = config.working_prompt
+        self.idle_input_prompt_raw = config.idle_input_prompt
         self.quota_limit_raw = config.quota_limit
         self._ready = re.compile(config.ready_prompt)
         self._working = re.compile(config.working_prompt)
+        self._idle_input = re.compile(config.idle_input_prompt)
         self._quota_limit = re.compile(config.quota_limit)
         self._quota_wait_prompt = re.compile(config.quota_wait_prompt)
         self._reset_at = re.compile(config.reset_at)
@@ -1137,6 +1149,16 @@ class DetectionPatterns:
     def is_working_prompt(self, text: str) -> bool:
         """Return ``True`` when *text* matches the working/activity prompt."""
         return self._working.search(text) is not None
+
+    def is_idle_input_prompt(self, text: str) -> bool:
+        """Return ``True`` when *text* matches the turn-end-awaiting-input prompt.
+
+        Design point 6: claude finished its turn and is asking how to proceed
+        (distinct from the working prompt). The supervisor re-injects the
+        ``loop_continuation`` on this signal so the orchestrate loop is re-driven
+        across the turn boundary instead of stalling silently.
+        """
+        return self._idle_input.search(text) is not None
 
     def is_quota_limit(self, text: str) -> bool:
         """Return ``True`` when *text* matches the usage-limit marker (FR-14)."""
@@ -1538,6 +1560,17 @@ class CommandInjector:
         self._ack_timeout = ack_timeout_seconds
         self._submit_quiet = command_submit_quiet_seconds
         self._submit_settle = command_submit_settle_seconds
+        # Whether the most recent :meth:`send` saw a working-prompt ack. A missing
+        # ack is non-fatal for most callers (the hybrid log-tail also confirms
+        # activity, FR-29), but the turn-continuation re-inject (design point 6)
+        # READS this to decide whether the turn actually resumed (ack) or claude
+        # stayed idle (no ack -> escalate to a bounded restart).
+        self._last_ack_succeeded = False
+
+    @property
+    def last_ack_succeeded(self) -> bool:
+        """Return whether the most recent :meth:`send` saw the working-prompt ack."""
+        return self._last_ack_succeeded
 
     def send(self, name: str, /, **subst: str) -> str:
         """Send the registry command *name* (with optional ``{placeholder}`` subst).
@@ -1572,9 +1605,11 @@ class CommandInjector:
         else:
             # Non-slash literal: no autocomplete menu, so the newline submits.
             self._driver.sendline(literal)
-        # Wait for the working-prompt ack; a missing ack is not fatal here (the
-        # supervise loop's hybrid log-tail also confirms activity, FR-29).
-        self._driver.expect_working(timeout_seconds=self._ack_timeout)
+        # Wait for the working-prompt ack; a missing ack is not fatal for most
+        # callers (the supervise loop's hybrid log-tail also confirms activity,
+        # FR-29) but the result is retained so the turn-continuation re-inject can
+        # verify the turn actually resumed (design point 6).
+        self._last_ack_succeeded = self._driver.expect_working(timeout_seconds=self._ack_timeout)
         return literal
 
 
@@ -1852,6 +1887,20 @@ _OUTCOME_MARKER_PROMPT_TIMEOUT = "prompt_timeout"
 _OUTCOME_MARKER_QUOTA_LIMIT = "quota_limit"
 _OUTCOME_MARKER_RESTART_CAP = "restart_cap_exhausted"
 _OUTCOME_MARKER_QUOTA_CAP = "quota_resume_cap_exhausted"
+# The progress watchdog (design point 2): the orchestrator's own log stopped
+# growing for ``progress_stall_seconds`` with no long-op heartbeat in flight, so
+# the still-alive-but-hung claude child is auto-restarted (bounded by the SAME
+# restart budget as the exit-42 path). The recoverable trip reuses the exit-42
+# restart machinery (restart-signal -> RESTARTING) and needs no classifier marker;
+# only the terminal CAP outcome flows through ``classify_supervise_outcome``, so
+# ``_PROGRESS_STALL_CAP`` is the sole marker (the cap fault, with a reason distinct
+# from the exit-42 ``restart-cap-exhausted`` so a hung session is told apart from a
+# crash-looping one).
+_OUTCOME_MARKER_PROGRESS_STALL_CAP = "progress_stall_restart_cap_exhausted"
+# The turn ended awaiting input (design point 6): claude printed its idle-input
+# prompt with the backlog not done. NOT a terminal -- the loop re-injects the
+# loop_continuation and verifies the working ack; a missing ack is a stall.
+_OUTCOME_MARKER_TURN_ENDED = "turn_ended"
 
 # Markers that mean "clean terminal" (Section 4.6 rows 1-2). A clean marker only
 # yields a clean outcome when the child also exited 0 (defense in depth: a clean
@@ -1907,6 +1956,7 @@ _STATIC_FAULT_REASONS: dict[str, str] = {
     _OUTCOME_MARKER_HARNESS_BLOCK: "harness-self-edit-block",
     _OUTCOME_MARKER_RESTART_CAP: "restart-cap-exhausted",
     _OUTCOME_MARKER_QUOTA_CAP: "quota-resume-cap-exhausted",
+    _OUTCOME_MARKER_PROGRESS_STALL_CAP: "progress-stall-restart-cap-exhausted",
 }
 
 
@@ -2032,6 +2082,34 @@ class LogTailDetector:
         # cheap stat, not a full read) gives tail-from-end semantics and avoids
         # reading the entire (potentially huge) log into memory on every poll.
         self._offset = log_path.stat().st_size if log_path.exists() else 0
+        # A SEPARATE byte offset for the progress watchdog's growth signal
+        # (:meth:`progressed`), independent of the marker-detection offset above:
+        # the watchdog and the marker detector are distinct consumers and must not
+        # consume each other's growth. Seeded to the current size so only bytes
+        # appended AFTER construction count as progress (design point 2).
+        self._progress_offset = self._offset
+
+    def progressed(self) -> bool:
+        """Return ``True`` when the log GREW since the previous call (FR-14, watchdog).
+
+        The progress watchdog's "is real orchestrate work happening?" signal
+        (design point 2): every real orchestrator action (claim / TDD RED-GREEN /
+        status-to / git-op) and every long-op heartbeat appends to this log, so log
+        growth == work happening. A cheap ``stat`` size comparison ONLY -- no
+        content is read (a multi-hundred-MB log must never be loaded whole every
+        poll). A truncation/rotation to a SHORTER size also counts as progress (the
+        offset resets to the new size so subsequent appends are seen). Uses the
+        dedicated ``_progress_offset`` so it never disturbs :meth:`poll`.
+        """
+        if not self._log_path.exists():
+            return False
+        size = self._log_path.stat().st_size
+        if size == self._progress_offset:
+            return False
+        # Any change (growth OR truncation/rotation) advances the offset and counts
+        # as progress: a freshly rotated log carrying new content is real activity.
+        self._progress_offset = size
+        return True
 
     def poll(self) -> LogTailHit | None:
         """Return the highest-precedence actionable marker in the new log bytes.
@@ -2453,7 +2531,9 @@ def _classify_pty_text(patterns: DetectionPatterns, text: str) -> str | None:
     """Return the outcome marker a PTY *text* chunk matches, or ``None``.
 
     Checks fault/quota predicates first (so a fault is never masked by the
-    working prompt). A bare working-activity match returns ``None`` (the loop
+    working prompt). A clean sentinel (ALL_DONE / NO_ACTIONABLE) is checked before
+    the turn-end-awaiting-input prompt so a finished backlog is never mistaken for
+    a turn to re-drive. A bare working-activity match returns ``None`` (the loop
     treats it as ongoing activity, not a terminal).
     """
     for predicate_name, marker in _PTY_WATCH_ORDER:
@@ -2463,6 +2543,10 @@ def _classify_pty_text(patterns: DetectionPatterns, text: str) -> str | None:
         return _OUTCOME_MARKER_ALL_DONE
     if "NO_ACTIONABLE" in text:
         return _OUTCOME_MARKER_NO_ACTIONABLE
+    # The turn ended awaiting input with the backlog not done (design point 6): the
+    # loop re-injects the loop_continuation and verifies the ack (not a terminal).
+    if patterns.is_idle_input_prompt(text):
+        return _OUTCOME_MARKER_TURN_ENDED
     return None
 
 
@@ -2476,6 +2560,8 @@ def run_supervise_event_loop(
     stop_poll: Callable[[], bool] | None = None,
     state_machine: SupervisorStateMachine | None = None,
     on_quota_wait: Callable[[datetime | None, int], None] | None = None,
+    progress_poll: Callable[[], bool] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> EventLoopResult:
     """Drive the post-kickoff supervise event loop to a terminal (FR-13, FR-27).
 
@@ -2495,6 +2581,16 @@ def run_supervise_event_loop(
       exit).
     - restart signal (child exit 42) -> ``restarting``; relaunch within
       ``supervise.restart.max_attempts`` else ``faulted`` (``restart-cap-exhausted``).
+    - PROGRESS STALL (the primary self-heal, design point 2): the orchestrator's
+      OWN log stopped growing for ``supervise.timeouts.progress_stall_seconds``
+      with no long-op heartbeat in flight (``progress_poll`` returns ``False`` for
+      the whole window) -> the still-alive-but-hung child is terminated and the
+      session ``restarting`` -> relaunched with resume context, bounded by the SAME
+      ``RestartBudget`` as the exit-42 path; on the budget being exhausted the
+      session ``faulted`` (``progress-stall-restart-cap-exhausted``). This catches
+      the hang class the PTY-silence idle timer structurally CANNOT (the spinner /
+      "Checking for updates" keeps emitting PTY bytes so the PTY is never silent).
+      The idle timer stays a secondary safeguard for a truly dead/silent PTY.
 
     Args:
         driver: The :class:`PtyDriver` wrapping the running child (kickoff done).
@@ -2520,6 +2616,18 @@ def run_supervise_event_loop(
             ``supervise status`` from another process surfaces ``quota-waiting``
             with the expected resume time (FR-10, FR-16). ``None`` skips persistence
             (the SDK-style in-process callers do not need mid-wait status).
+        progress_poll: A zero-arg predicate returning ``True`` once the
+            orchestrator's own log has GROWN since the previous call (production
+            passes a closure over the :class:`LogTailDetector`'s byte offset). It is
+            the PROGRESS WATCHDOG's signal: every real orchestrator action (claim,
+            TDD RED/GREEN, status-to, git-op) and every long-op heartbeat appends to
+            that log, so log growth == real work happening. ``None`` (the default)
+            DISABLES the watchdog entirely -- the SDK-style callers own their turn
+            boundaries and cannot hang this way, so they do not need it.
+        clock: A zero-arg monotonic-seconds source the progress watchdog measures
+            the stall window against (defaults to :func:`time.monotonic`). Injected
+            so the watchdog is deterministic + sleep-free under test (a fake clock
+            advances per call; no real time passes, CLAUDE.md Section 7.5).
 
     Returns:
         The terminal :class:`EventLoopResult`.
@@ -2540,6 +2648,13 @@ def run_supervise_event_loop(
     cumulative_idle = 0
     restarts_used = 0
     resumes_used = 0
+    # PROGRESS WATCHDOG state (design point 2). ``last_progress_at`` is the clock
+    # reading at the last observed orchestrator-log growth; the window elapses when
+    # ``now - last_progress_at >= progress_stall_seconds``. ``progress_poll is None``
+    # disables the watchdog (SDK-style callers). The clock is read ONCE per iteration
+    # so the stall arithmetic is deterministic under an injected fake clock.
+    progress_stall_seconds = config.timeouts.progress_stall_seconds
+    last_progress_at = clock()
 
     while True:
         # Operator graceful stop (Section 4.2 step 2): a written stop.request
@@ -2547,6 +2662,30 @@ def run_supervise_event_loop(
         # before the PTY read so an operator stop is honoured promptly.
         if stop_poll is not None and sm.state == SUPERVISE_STATE_RUNNING and stop_poll():
             return _handle_graceful_drain(driver, config, sm, idle_timeout, restarts_used, resumes_used)
+
+        # PROGRESS WATCHDOG (design point 2): is REAL orchestrate work happening?
+        # Checked BEFORE the PTY read because the hang class keeps the PTY busy
+        # (spinner bytes), so a PTY-silence check would never see it. The step
+        # helper resets the timer on log growth, classifies a stall after the
+        # window, and (on a recoverable stall) relaunches and asks the loop to
+        # restart its iteration; a terminal result (the cap) returns immediately.
+        watchdog = _progress_watchdog_step(
+            progress_poll,
+            clock,
+            last_progress_at,
+            progress_stall_seconds,
+            driver,
+            sm,
+            budget,
+            relaunch,
+            restarts_used,
+            resumes_used,
+        )
+        last_progress_at, restarts_used, resumes_used = watchdog.last_progress_at, watchdog.restarts, watchdog.resumes
+        if watchdog.result is not None:
+            return watchdog.result
+        if watchdog.restarted:
+            continue
 
         # Hybrid detection: the deterministic log markers are checked first.
         log_hit = log_poll()
@@ -2572,6 +2711,19 @@ def run_supervise_event_loop(
             )
             return _terminal(sm, outcome, restarts_used, resumes_used)
         cumulative_idle = 0
+        # TURN CONTINUATION (design point 6): the interactive turn ended awaiting
+        # input with the backlog not done. Deterministically re-drive the loop --
+        # re-inject the continuation AND verify it took (working ack); a missing ack
+        # means claude did not resume, which is escalated to the SAME bounded
+        # restart path as a progress stall (NOT a fire-and-forget injection). On a
+        # successful re-inject the timer is reset (the re-drive is real progress).
+        if observation.marker == _OUTCOME_MARKER_TURN_ENDED and not observation.eof:
+            cont = _handle_turn_continuation(driver, config, sm, budget, relaunch, restarts_used, resumes_used)
+            cont_result, restarts_used, resumes_used = cont
+            if cont_result is not None:
+                return cont_result
+            last_progress_at = clock()
+            continue
         terminal = _handle_pty_observation(
             observation, driver, sm, quota_waiter, budget, relaunch, restarts_used, resumes_used, on_quota_wait
         )
@@ -2789,6 +2941,64 @@ def _handle_quota(
         logger.info("%s state=%s reason=quota-keep-waiting", SUPERVISE_STATE_AUDIT_PREFIX, sm.state)
 
 
+@dataclass(frozen=True)
+class _WatchdogStep:
+    """One progress-watchdog check result (design point 2).
+
+    Attributes:
+        result: A terminal :class:`EventLoopResult` (the stall-restart cap), or
+            ``None`` when the loop continues.
+        restarted: ``True`` when a recoverable stall was relaunched -- the loop
+            must restart its iteration (the timer was reset).
+        last_progress_at: The (possibly reset) last-progress clock reading.
+        restarts: Updated auto-restart count.
+        resumes: Updated quota-resume count (unchanged here).
+    """
+
+    result: EventLoopResult | None
+    restarted: bool
+    last_progress_at: float
+    restarts: int
+    resumes: int
+
+
+def _progress_watchdog_step(
+    progress_poll: Callable[[], bool] | None,
+    clock: Callable[[], float],
+    last_progress_at: float,
+    progress_stall_seconds: int,
+    driver: PtyDriver,
+    sm: SupervisorStateMachine,
+    budget: RestartBudget,
+    relaunch: Callable[..., None],
+    restarts_used: int,
+    resumes_used: int,
+) -> _WatchdogStep:
+    """Run one progress-watchdog check (design point 2); see :func:`run_supervise_event_loop`.
+
+    Disabled (a no-op) when *progress_poll* is ``None`` (SDK-style callers). Reads
+    the clock once, resets the timer on orchestrator-log growth (real work or a
+    long-op heartbeat), and -- after a full stall window with no growth -- routes a
+    recoverable stall to :func:`_handle_progress_stall` (terminate the hung child +
+    bounded relaunch) or returns the terminal cap result.
+    """
+    if progress_poll is None:
+        return _WatchdogStep(None, False, last_progress_at, restarts_used, resumes_used)
+    now = clock()
+    if progress_poll():
+        return _WatchdogStep(None, False, now, restarts_used, resumes_used)
+    if now - last_progress_at < progress_stall_seconds:
+        return _WatchdogStep(None, False, last_progress_at, restarts_used, resumes_used)
+    stall_result, restarts_used, resumes_used = _handle_progress_stall(
+        driver, sm, budget, relaunch, restarts_used, resumes_used
+    )
+    if stall_result is not None:
+        return _WatchdogStep(stall_result, False, last_progress_at, restarts_used, resumes_used)
+    # Relaunched: the resumed session starts fresh -> reset the timer so the
+    # just-relaunched child is not instantly re-classified as stalled.
+    return _WatchdogStep(None, True, clock(), restarts_used, resumes_used)
+
+
 def _handle_restart(
     sm: SupervisorStateMachine,
     budget: RestartBudget,
@@ -2806,6 +3016,92 @@ def _handle_restart(
     sm.on_event("restart-launched")
     logger.info("%s reason=auto-restart attempt=%d", SUPERVISE_RESTART_AUDIT_PREFIX, restarts_used + 1)
     return None, restarts_used + 1, resumes_used
+
+
+def _handle_progress_stall(
+    driver: PtyDriver,
+    sm: SupervisorStateMachine,
+    budget: RestartBudget,
+    relaunch: Callable[..., None],
+    restarts_used: int,
+    resumes_used: int,
+) -> tuple[EventLoopResult | None, int, int]:
+    """Handle a work-progress stall (design point 2/3): bounded resume-restart.
+
+    The orchestrator log stopped growing for the full stall window with no long-op
+    heartbeat, so the still-alive-but-hung ``claude`` child made no real progress.
+    Unlike the exit-42 restart path (where the child has ALREADY exited), the child
+    here is STILL ALIVE, so it MUST be terminated before the relaunch -- the
+    production relaunch closure (:func:`cli._make_supervise_relaunch`) reassigns
+    ``driver.child`` to a fresh process but does NOT kill the old one, so leaving it
+    running would orphan a hung claude session holding the PTY/session id.
+
+    Bounded by the SAME :class:`RestartBudget` as the exit-42 path (design point 3:
+    reuse ``supervise.restart.max_attempts`` and persist ``restart_count``). On the
+    budget being exhausted -> ``faulted`` with
+    ``progress-stall-restart-cap-exhausted`` (a distinct exit reason from the
+    exit-42 ``restart-cap-exhausted`` so the operator can tell a hung session from a
+    crash-looping one). The state-machine path reuses the existing
+    ``running -> restart-signal -> RESTARTING -> restart-launched -> RUNNING`` edges.
+    """
+    if not budget.may_restart(attempts_used=restarts_used):
+        sm.on_event("fault")
+        outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_PROGRESS_STALL_CAP, child_exitstatus=None)
+        return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
+    # Kill the hung child BEFORE relaunch (it is still alive -- the defining
+    # difference from the exit-42 EOF path). Best-effort: a teardown error must not
+    # block the self-heal (the relaunch rebinds driver.child regardless).
+    with contextlib.suppress(Exception):
+        driver.child.terminate(force=True)
+    sm.on_event("restart-signal")
+    relaunch(reason="progress-stall", resume=True)
+    sm.on_event("restart-launched")
+    logger.info("%s reason=progress-stall attempt=%d", SUPERVISE_RESTART_AUDIT_PREFIX, restarts_used + 1)
+    return None, restarts_used + 1, resumes_used
+
+
+def _handle_turn_continuation(
+    driver: PtyDriver,
+    config: SuperviseConfig,
+    sm: SupervisorStateMachine,
+    budget: RestartBudget,
+    relaunch: Callable[..., None],
+    restarts_used: int,
+    resumes_used: int,
+) -> tuple[EventLoopResult | None, int, int]:
+    """Re-drive a turn that ended awaiting input, verifying it took (design point 6).
+
+    The root-cause gap: after a unit reached TDD GREEN, claude's interactive turn
+    ENDED (it printed its idle-input prompt) and NOTHING re-drove the orchestrate
+    loop. This re-injects the configured ``loop_continuation`` command via the
+    REUSED :class:`CommandInjector` (the same type -> render-settle -> Enter flow as
+    the kickoff) and VERIFIES it took via the working-prompt ack
+    (:attr:`CommandInjector.last_ack_succeeded`).
+
+    A successful ack means the turn resumed -> the loop continues. A MISSING ack
+    means claude stayed idle (it did not resume) -- a fire-and-forget injection
+    would hang forever, so the missing ack is escalated to the SAME bounded
+    resume-restart path as a progress stall (:func:`_handle_progress_stall`), never
+    silently dropped.
+    """
+    injector = CommandInjector(
+        driver=driver,
+        registry=config.injectable_commands,
+        ack_timeout_seconds=config.timeouts.command_ack_seconds,
+        command_submit_quiet_seconds=config.timeouts.command_submit_quiet_seconds,
+        command_submit_settle_seconds=config.timeouts.command_submit_settle_seconds,
+    )
+    injector.send("loop_continuation")
+    if injector.last_ack_succeeded:
+        # The turn resumed: refresh activity and keep the loop running.
+        with contextlib.suppress(SuperviseTransitionError):
+            sm.on_event("working-activity")
+        logger.info("%s reason=turn-continuation-acked", SUPERVISE_STATE_AUDIT_PREFIX)
+        return None, restarts_used, resumes_used
+    # No ack: claude did not resume on the re-inject -> treat as a stall and restart
+    # (bounded) rather than leaving the orchestrate loop dead.
+    logger.info("%s reason=turn-continuation-no-ack", SUPERVISE_STATE_AUDIT_PREFIX)
+    return _handle_progress_stall(driver, sm, budget, relaunch, restarts_used, resumes_used)
 
 
 def _terminal(

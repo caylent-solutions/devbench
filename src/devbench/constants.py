@@ -1114,6 +1114,21 @@ SUPERVISE_VALID_BILLING_MODES: frozenset[str] = frozenset(
 SUPERVISE_DEFAULT_BILLING_MODE: str = SUPERVISE_BILLING_MODE_SUBSCRIPTION
 # Env override for the billing mode (precedence: flag > this env > config > default).
 SUPERVISE_BILLING_MODE_ENV_VAR: str = "DEVBENCH_SUPERVISE_BILLING_MODE"
+# Env override for the progress-watchdog stall window (precedence: this env > yaml
+# > default). Resolved in ``cli._resolve_supervise_progress_stall_seconds`` so an
+# operator can widen/narrow the stall window for a single run without editing YAML.
+SUPERVISE_PROGRESS_STALL_SECONDS_ENV_VAR: str = "DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS"
+# CLI-hang guard env vars (design point 5). The supervise launch env ALWAYS sets
+# these so the interactive ``claude`` child cannot hang on the CLI auto-updater
+# ("Checking for updates") -- the exact stall that defeated the idle timer (the
+# spinner kept emitting PTY bytes so the PTY was never silent). They are NOT
+# billing-routing vars (absent from every deny set), so they are never stripped.
+# Set on the env the EnvSanitizer returns so both the initial launch AND every
+# relaunch (which inherit the screen env) carry them.
+SUPERVISE_CLI_HANG_GUARD_ENV_VARS: dict[str, str] = {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+}
 
 # The billing channel a subscription supervise session reports (Section 0.2,
 # FR-9). The persisted ``billing_channel`` is mode-derived (it equals the active
@@ -1248,6 +1263,31 @@ SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT: int = 30
 # hardcoded literals (FR-19, Section 7.4).
 SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT: int = 1
 SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT: int = 8
+# Progress-watchdog stall window (seconds): the maximum time the orchestrator's
+# OWN log (logs/orchestrator.log) may go WITHOUT growing -- and with no long-op
+# heartbeat in flight -- before the supervisor classifies a WORK-PROGRESS STALL
+# and auto-restarts the (still-alive but hung) claude child (design point 2).
+# This is the PRIMARY "is real orchestrate work happening?" gate; the PTY-silence
+# idle timeout (idle_seconds) stays a secondary safeguard for a truly dead PTY.
+# The hang class this catches: claude's interactive turn ended and the loop hung
+# repeating the CLI auto-updater spinner -- the PTY kept emitting bytes (so
+# idle_seconds never tripped) while NO real orchestrator action was logged.
+# Overridable via the YAML field supervise.timeouts.progress_stall_seconds AND
+# the env var DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS (env > yaml > default).
+SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT: int = 600
+# Long-running-command heartbeat cadence (seconds): the in-session verify-ac
+# runner (which shells out to terraform apply / go test -- legitimately quiet on
+# the orchestrator log for 30-60 min) emits a benign "[LONG_OP_HEARTBEAT]" line
+# to the orchestrator log on THIS interval so the progress watchdog's log-growth
+# signal keeps advancing during a genuine long op and does NOT false-stall
+# (design point 4, mechanism a). MUST be strictly < progress_stall_seconds so the
+# log grows before the watchdog window elapses (validated in config + tests).
+SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT: int = 60
+# The benign orchestrator-log line the long-op heartbeat writer emits. It matches
+# NO log_tail marker set (clean/quota/fault/restart) so LogTailDetector.poll never
+# misclassifies it; it only needs to GROW the log so the progress watchdog's byte
+# offset advances. The "--" (not an em-dash) keeps the RUF001 glyph discipline.
+SUPERVISE_LONG_OP_HEARTBEAT_MARKER: str = "[LONG_OP_HEARTBEAT]"
 
 # Default bounded auto-restart attempts on the exit-42-equivalent (Section 5.1,
 # FR-12, Section 4.3). Override via ``DEVBENCH_SUPERVISE_RESTART_MAX_ATTEMPTS``.
@@ -1271,6 +1311,12 @@ SUPERVISE_DETECTION_PATTERNS_DEFAULT: dict[str, str] = {
     # limit") stays an explicit \u escape; see ``quota._QUOTA_MARKERS``.
     "ready_prompt": "(?m)\u276f|^\\s*│?\\s*>(?:\\s|$)",
     "working_prompt": r"(?i)(esc to interrupt|tokens|thinking)",
+    # The turn-end-awaiting-input prompt (design point 6): claude finished its turn
+    # and is asking how to proceed (the root-cause line was "how would you like to
+    # proceed..."). DISTINCT from working_prompt -- recognizing it lets the
+    # supervisor deterministically re-inject the loop_continuation across the turn
+    # boundary instead of leaving the orchestrate loop dead until the watchdog.
+    "idle_input_prompt": r"(?i)(how would you like to proceed|what would you like to do|awaiting your input)",
     "quota_limit": "(?i)(You(\u2019ve|'ve| have) hit your limit|rate.?limit.*(exceeded|reached|resets))",
     "quota_wait_prompt": r"(?i)(wait.*reset|retry.*later|press.*to wait)",
     "reset_at": r"resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)",
@@ -1320,6 +1366,13 @@ SUPERVISE_INJECTABLE_COMMANDS_DEFAULT: dict[str, str] = {
     "model_opus": "/model opus",
     "quota_wait_choice": "1",
     "drain_now": "/exit",
+    # The turn-continuation re-inject (design point 6): when claude's interactive
+    # turn ends with the backlog not done, the supervisor re-injects this to
+    # deterministically re-drive the orchestrate loop across the turn boundary
+    # (the same slash command as the kickoff -- re-running orchestrate picks up the
+    # next actionable unit). Verified by a working-prompt ack; a missing ack is
+    # treated as a progress stall (restart), never a fire-and-forget.
+    "loop_continuation": "/devbench-orchestrate:orchestrate",
 }
 
 # The set of supervise lifecycle states (Section 4.8, FR-27). Persisted in

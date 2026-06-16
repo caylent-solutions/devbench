@@ -68,9 +68,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Coroutine, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, NamedTuple
@@ -230,6 +231,7 @@ from devbench.constants import (
     SUPERVISE_EXIT_REASON_HARD_STOP,
     SUPERVISE_EXIT_REASON_STALE_RECONCILED,
     SUPERVISE_INTERNAL_RUN_SUBVERB,
+    SUPERVISE_PROGRESS_STALL_SECONDS_ENV_VAR,
     SUPERVISE_SESSION_NAME_PATTERN,
     SUPERVISE_STATE_COMPLETED_CLEAN,
     SUPERVISE_STATE_FAULTED,
@@ -4591,6 +4593,73 @@ def cmd_run_tests(unit_id: str) -> int:
     return rc
 
 
+def _format_long_op_heartbeat(*, verb: str, unit: str, elapsed_seconds: int) -> str:
+    """Build the benign long-op heartbeat log line (design point 4, mechanism a).
+
+    The line is prefixed with :data:`SUPERVISE_LONG_OP_HEARTBEAT_MARKER`, which
+    matches NO ``supervise.log_tail`` marker family (clean/quota/fault/restart), so
+    the :class:`~devbench.supervise.LogTailDetector` never misclassifies it -- it
+    only needs to GROW the orchestrator log so the progress watchdog's byte offset
+    advances during a genuinely-quiet long op (terraform apply / go test).
+    """
+    from devbench.constants import SUPERVISE_LONG_OP_HEARTBEAT_MARKER
+
+    return f"{SUPERVISE_LONG_OP_HEARTBEAT_MARKER} verb={verb} unit={unit} elapsed={elapsed_seconds}s"
+
+
+def run_with_long_op_heartbeat(
+    *,
+    run: "Callable[[], Any]",
+    heartbeat_interval_seconds: int,
+    emit_heartbeat: "Callable[..., None]",
+) -> Any:
+    """Run a BLOCKING op while emitting periodic heartbeats (design point 4).
+
+    The in-session ``verify-ac`` runner blocks in ``subprocess.run`` for the whole
+    of a 30-60 min terraform apply / go test with ZERO orchestrator-log output.
+    This wrapper runs *run* on the calling thread and, on a separate daemon thread,
+    invokes *emit_heartbeat(elapsed=<seconds>)* every *heartbeat_interval_seconds*
+    until *run* returns (or raises), so the progress watchdog's log-growth signal
+    keeps advancing and a healthy long op is NOT classified as a stall.
+
+    The cadence is driven by an interruptible :class:`threading.Event` wait (NOT a
+    fixed ``time.sleep``): the heartbeat thread wakes IMMEDIATELY when the op
+    completes (the event is set in the ``finally``), so no heartbeat is emitted
+    after the op returns and the thread is always joined (no leaked daemon, even on
+    an exception). *heartbeat_interval_seconds* MUST be strictly less than the
+    supervisor's ``progress_stall_seconds`` so the log grows before the watchdog
+    window elapses (validated in config + documented).
+
+    Args:
+        run: The zero-arg blocking callable to execute; its return value is
+            passed through unchanged.
+        heartbeat_interval_seconds: Seconds between heartbeats (the cadence).
+        emit_heartbeat: Invoked as ``emit_heartbeat(elapsed=<int seconds>)`` on
+            each beat (production writes the heartbeat line to the orchestrator
+            logger; tests capture the calls).
+
+    Returns:
+        Whatever *run* returns.
+    """
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def _beat() -> None:
+        # Event-driven cadence: wait returns True the instant the op finishes
+        # (stop.set in the finally) -> loop exits; False on the interval timeout
+        # -> emit one beat. No fixed sleep, no busy-wait (CLAUDE.md Section 7.5).
+        while not stop.wait(heartbeat_interval_seconds):
+            emit_heartbeat(elapsed=int(time.monotonic() - started))
+
+    thread = threading.Thread(target=_beat, name="devbench-long-op-heartbeat", daemon=True)
+    thread.start()
+    try:
+        return run()
+    finally:
+        stop.set()
+        thread.join()
+
+
 def _run_verification_item(
     item: "verification.VerificationItem",
     repo_path: Path,
@@ -4653,7 +4722,22 @@ def _run_verification_item(
         gate_env = verification.deterministic_gate_env(
             dict(os.environ), seed=VERIFY_AC_PYTEST_SEED, pin_randomly=pin_randomly
         )
-        rc, stdout, stderr = run_command(["bash", "-c", command], cwd=repo_path, timeout=timeout, env=gate_env)
+        # The command can be a 30-60 min terraform apply / go test that produces
+        # NO orchestrator-log output while it blocks. Wrap it in the long-op
+        # heartbeat (design point 4): a benign [LONG_OP_HEARTBEAT] line is written
+        # to THIS process's logger (which IS the orchestrator log the supervise
+        # progress watchdog tails) on the configured cadence, so a healthy long op
+        # keeps the watchdog's log-growth signal advancing and is never false-stalled.
+        heartbeat_interval = RUNTIME_CONFIG.supervise.timeouts.long_op_heartbeat_seconds
+
+        def _emit_heartbeat(*, elapsed: int) -> None:
+            logger.info(_format_long_op_heartbeat(verb="verify-ac", unit=task_id, elapsed_seconds=elapsed))
+
+        rc, stdout, stderr = run_with_long_op_heartbeat(
+            run=lambda: run_command(["bash", "-c", command], cwd=repo_path, timeout=timeout, env=gate_env),
+            heartbeat_interval_seconds=heartbeat_interval,
+            emit_heartbeat=_emit_heartbeat,
+        )
     finished_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
 
     combined = "\n".join(part for part in (stdout, stderr) if part.strip())
@@ -9717,6 +9801,46 @@ def _resolve_supervise_billing_mode(*, cli_mode: str | None, config_mode: str) -
     return SUPERVISE_DEFAULT_BILLING_MODE
 
 
+def _resolve_supervise_progress_stall_seconds(*, config_value: int) -> int:
+    """Resolve the progress-watchdog stall window: env > config (fail-fast).
+
+    Mirrors the project's ``_resolve_*`` precedence helpers (Section 5.4): the
+    ``DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS`` env var wins, else the
+    ``supervise.timeouts.progress_stall_seconds`` config value (already validated
+    >= 1 by the loader). An env value that is not a parseable integer >= 1 fails
+    fast -- a typo must never silently disable the progress watchdog (design point
+    2: this is the primary "is real work happening?" gate, so a fail-open here
+    would re-open the exact hang class the feature exists to close).
+
+    Unlike the sibling supervise timeouts (which are parse/validate-only and NOT
+    env-resolved despite their docstrings -- the only pre-existing
+    ``DEVBENCH_SUPERVISE_*`` env override is the billing mode), this resolver makes
+    ``progress_stall_seconds`` explicitly env-overridable so an operator can
+    widen/narrow the stall window for a single run without editing YAML.
+
+    Args:
+        config_value: ``supervise.timeouts.progress_stall_seconds`` from config.
+
+    Returns:
+        The resolved stall window in seconds (>= 1).
+
+    Raises:
+        ValueError: The env override is set but not a parseable integer >= 1.
+    """
+    raw = os.environ.get(SUPERVISE_PROGRESS_STALL_SECONDS_ENV_VAR, "").strip()
+    if not raw:
+        return config_value
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{SUPERVISE_PROGRESS_STALL_SECONDS_ENV_VAR}={raw!r} is not an integer (expected seconds >= 1)."
+        ) from exc
+    if parsed < 1:
+        raise ValueError(f"{SUPERVISE_PROGRESS_STALL_SECONDS_ENV_VAR}={parsed!r} must be >= 1 (seconds).")
+    return parsed
+
+
 def _supervise_backlog_ids() -> list[str]:
     """Return every work-unit ID from the parsed backlog (for scope expansion)."""
     units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
@@ -10173,6 +10297,17 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     reason are recorded in the registry (FR-13, FR-27).
     """
     cfg = _supervise_runtime_config()
+    # Resolve the progress-watchdog stall window (env > yaml > default) and fold the
+    # result back into cfg so the event loop reads the env-overridden value (design
+    # point 2). A bad env value fails fast -- the watchdog must never be silently
+    # disabled (it is the primary "is real work happening?" gate).
+    try:
+        resolved_stall = _resolve_supervise_progress_stall_seconds(config_value=cfg.timeouts.progress_stall_seconds)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if resolved_stall != cfg.timeouts.progress_stall_seconds:
+        cfg = replace(cfg, timeouts=replace(cfg.timeouts, progress_stall_seconds=resolved_stall))
     try:
         claude_path = require_claude(which=shutil.which)
     except FileNotFoundError as exc:
@@ -10272,6 +10407,12 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         relaunch=relaunch,
         stop_poll=lambda: read_stop_request(WORKSPACE_ROOT, parsed.name),
         on_quota_wait=on_quota_wait,
+        # PROGRESS WATCHDOG (design point 2): the same LogTailDetector that scrapes
+        # the orchestrator log for terminal markers also reports whether that log
+        # GREW (progressed), which is the watchdog's "is real work happening?"
+        # signal. The watched file (_supervise_orchestrator_log_path) is the SAME
+        # file the in-session devbench subprocesses' setup_logging writes to.
+        progress_poll=log_tail.progressed,
     )
 
     state.state = result.final_state

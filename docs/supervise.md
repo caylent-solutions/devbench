@@ -323,6 +323,59 @@ relaunches `claude` with `--continue` (bounded by `supervise.restart.max_attempt
 | 5-hour-window exhaustion | `quota-waiting`, NO exit (waits and resumes) |
 | restart cap exhausted | faulted, `exit-reason=restart-cap-exhausted` |
 | quota resume cap exhausted | faulted, `exit-reason=quota-resume-cap-exhausted` |
+| progress stall (no log growth) recovered within the budget | restarting, `restart-count` incremented |
+| progress stall restart cap exhausted | faulted, `exit-reason=progress-stall-restart-cap-exhausted` |
+
+### Progress watchdog (self-heal a work-progress stall)
+
+The PTY-silence idle timer (`supervise.timeouts.idle_seconds`) only catches a
+session whose PTY went fully silent. It CANNOT catch the hang class where the
+interactive `claude` turn ended (e.g. after a unit hit TDD GREEN it printed "how
+would you like to proceed...") and the CLI then sat repeating the auto-updater
+spinner ("Checking for updates"): the spinner keeps emitting PTY bytes, so the
+PTY is never silent and the idle timer never fires, while NO real orchestrate work
+is happening.
+
+The PROGRESS WATCHDOG is the primary "is real work happening?" gate. It watches
+whether the orchestrator's OWN log (`logs/orchestrator.log`, the same file the
+in-session `devbench` subprocesses write on every real action -- claim, TDD
+RED/GREEN, status-to, git-op) GROWS. If the log has not grown for
+`supervise.timeouts.progress_stall_seconds` (default 600s / 10 min) AND no
+long-running operation is heartbeating (see below), the supervisor classifies a
+work-progress stall: it terminates the still-alive-but-hung `claude` child and
+relaunches with `--continue`/`--resume`, bounded by the SAME
+`supervise.restart.max_attempts` budget as the exit-42 path (the `restart-count`
+is incremented). If the stall recurs past the budget the session faults with
+`exit-reason=progress-stall-restart-cap-exhausted` (distinct from the exit-42
+`restart-cap-exhausted` so a hung session is told apart from a crash-looping one).
+This is the interactive-path equivalent of the SDK mode's structural immunity (SDK
+mode owns its turn boundaries programmatically, so this hang cannot occur there).
+
+Two further guards close the hang:
+
+- **CLI-hang guards (always on):** the supervise launch env unconditionally sets
+  `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (in both
+  billing modes) so the "Checking for updates" stall cannot occur in the first
+  place. These are not billing-routing vars and are never stripped.
+- **Turn continuation (re-inject + verify):** when a turn ends awaiting input with
+  the backlog not done (the `supervise.detection_patterns.idle_input_prompt` is
+  seen), the supervisor re-injects the `supervise.injectable_commands.loop_continuation`
+  command to re-drive the orchestrate loop AND verifies it took (the working-prompt
+  ack). A missing ack means `claude` did not resume; it is escalated to the same
+  bounded restart path, never left as a fire-and-forget injection.
+
+#### No false stall on a genuine long operation
+
+A real live terratest (`terraform apply` / `go test`) legitimately runs for tens
+of minutes during which the orchestrator log is quiet. To prevent a false stall,
+the in-session `verify-ac` runner emits a benign `[LONG_OP_HEARTBEAT]` line to the
+orchestrator log every `supervise.timeouts.long_op_heartbeat_seconds` (default
+60s, which MUST be strictly less than `progress_stall_seconds`) while the long
+command blocks. That log growth keeps the watchdog's progress timer reset, so a
+genuinely-progressing long op is never classified as a stall, while a session with
+NO progress and NO active op DOES trip within `progress_stall_seconds`. The
+heartbeat line matches no log marker family, so it only advances the watchdog's
+byte offset and is never misclassified as a terminal/quota/fault/restart signal.
 
 ## Configuration
 
@@ -331,7 +384,11 @@ each overridable by a `DEVBENCH_SUPERVISE_*` env var (env > yaml > default). The
 billing channel is `supervise.billing_mode` (`subscription` | `bedrock`, default
 `subscription`), overridable by `--billing-mode` (flag wins) or
 `DEVBENCH_SUPERVISE_BILLING_MODE` (env > config). The quota timeouts fall through
-to the top-level `quota_handling` block when null. The full field set, defaults,
+to the top-level `quota_handling` block when null. The progress-watchdog stall
+window `supervise.timeouts.progress_stall_seconds` (default 600) is additionally
+env-overridable via `DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS` (env > yaml >
+default; a non-integer or `< 1` value fails fast -- the watchdog is never silently
+disabled). The full field set, defaults,
 and env overrides are documented in
 [devbench-yaml-reference.md](devbench-yaml-reference.md) under the `supervise:`
 block. New injectable operator commands (future slash commands) are added via the
@@ -394,6 +451,16 @@ like every other timeout.
   `spec/devbench-supervise-screen-orchestrator/QUOTA-VERIFICATION-TODO.md` and
   set `supervise.detection_patterns.quota_wait_prompt` /
   `supervise.injectable_commands.quota_wait_choice` to match.
+- **The session faults with `exit-reason=progress-stall-restart-cap-exhausted`**
+  -- the progress watchdog tripped repeatedly: the orchestrator log stopped
+  growing for `supervise.timeouts.progress_stall_seconds` and the bounded restarts
+  did not recover it. Inspect `logs/orchestrator.log` and the per-session `pty.log`
+  to see WHY work stopped advancing. If a legitimate long op was falsely flagged,
+  confirm `supervise.timeouts.long_op_heartbeat_seconds` is set below
+  `progress_stall_seconds` (the `verify-ac` runner emits `[LONG_OP_HEARTBEAT]`
+  lines on that cadence); if a slow-but-healthy live run needs a wider window,
+  raise `progress_stall_seconds` (or set
+  `DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS` for a single run).
 
 ## See also
 

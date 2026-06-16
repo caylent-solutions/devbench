@@ -950,7 +950,9 @@
             "poll_interval_seconds": {"type": "integer", "minimum": 1, "description": "Registry-poll / attach tail re-read cadence (seconds) for stop wait + attach follow. Default 2."},
             "command_invocation_seconds": {"type": "integer", "minimum": 1, "description": "Safety timeout (seconds) bounding short non-interactive subprocess.run shell-outs (screen -ls, screen -X quit, <tool> --version). Default 30."},
             "command_submit_quiet_seconds": {"type": "integer", "minimum": 1, "description": "Slash-command submission: no-output quiet window (seconds) that signals the autocomplete menu render has settled before Enter is sent. Default 1."},
-            "command_submit_settle_seconds": {"type": "integer", "minimum": 1, "description": "Slash-command submission: max render-settle wait (seconds) before Enter is sent regardless (the / autocomplete menu swallows a premature newline). Default 8."}
+            "command_submit_settle_seconds": {"type": "integer", "minimum": 1, "description": "Slash-command submission: max render-settle wait (seconds) before Enter is sent regardless (the / autocomplete menu swallows a premature newline). Default 8."},
+            "progress_stall_seconds": {"type": "integer", "minimum": 1, "description": "Progress-watchdog stall window (seconds): max time the orchestrator log may go without growing (and no long-op heartbeat) before the supervisor classifies a work-progress stall and auto-restarts. Primary 'is work happening?' gate (idle_seconds is the secondary dead-PTY safeguard). Also overridable via DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS (env > yaml > default). Default 600."},
+            "long_op_heartbeat_seconds": {"type": "integer", "minimum": 1, "description": "Cadence (seconds) the in-session verify-ac runner emits a benign [LONG_OP_HEARTBEAT] line to the orchestrator log while a genuine long op (terraform apply / go test) blocks, so the progress watchdog does not false-stall. Must be strictly less than progress_stall_seconds. Default 60."}
           }
         },
         "restart": {
@@ -975,6 +977,7 @@
           "properties": {
             "ready_prompt": {"type": "string"},
             "working_prompt": {"type": "string"},
+            "idle_input_prompt": {"type": "string", "description": "Turn-end-awaiting-input prompt (e.g. 'how would you like to proceed'); distinct from working_prompt. Recognizing it lets the supervisor re-inject loop_continuation across a turn boundary (design point 6)."},
             "quota_limit": {"type": "string"},
             "quota_wait_prompt": {"type": "string"},
             "reset_at": {"type": "string"},

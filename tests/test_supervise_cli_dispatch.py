@@ -247,3 +247,36 @@ class TestSuperviseBillingModeResolution:
             pytest.raises(ValueError, match="billing_mode"),
         ):
             cli._resolve_supervise_billing_mode(cli_mode=None, config_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
+
+
+@pytest.mark.unit
+class TestSuperviseProgressStallResolution:
+    """The progress-stall resolver honours env > config > default (fail-fast).
+
+    Unlike the sibling supervise timeouts (which are parse/validate-only and not
+    actually env-resolved), progress_stall_seconds is explicitly overridable via
+    DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS (design point 2): the operator can
+    widen/narrow the stall window for a single run without editing YAML.
+    """
+
+    def test_default_when_env_unset_uses_config(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert cli._resolve_supervise_progress_stall_seconds(config_value=600) == 600
+
+    def test_env_overrides_config(self) -> None:
+        with patch.dict("os.environ", {"DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS": "900"}, clear=True):
+            assert cli._resolve_supervise_progress_stall_seconds(config_value=600) == 900
+
+    def test_invalid_env_fails_fast(self) -> None:
+        with (
+            patch.dict("os.environ", {"DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS": "notint"}, clear=True),
+            pytest.raises(ValueError, match="PROGRESS_STALL"),
+        ):
+            cli._resolve_supervise_progress_stall_seconds(config_value=600)
+
+    def test_env_below_minimum_fails_fast(self) -> None:
+        with (
+            patch.dict("os.environ", {"DEVBENCH_SUPERVISE_PROGRESS_STALL_SECONDS": "0"}, clear=True),
+            pytest.raises(ValueError, match="PROGRESS_STALL"),
+        ):
+            cli._resolve_supervise_progress_stall_seconds(config_value=600)

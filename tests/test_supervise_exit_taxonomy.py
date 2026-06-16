@@ -104,6 +104,18 @@ class TestFaultOutcomes:
         assert outcome.exit_code == SUPERVISE_FAULT_EXIT_CODE
         assert outcome.exit_reason == "quota-resume-cap-exhausted"
 
+    def test_progress_stall_restart_cap_exhausted_is_fault(self) -> None:
+        # The progress watchdog tripped, the loop restarted within the budget, but
+        # the stall recurred past supervise.restart.max_attempts: a classified
+        # non-zero fault (design point 3), distinct from the exit-42 restart-cap.
+        from devbench.supervise import _OUTCOME_MARKER_PROGRESS_STALL_CAP
+
+        outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_PROGRESS_STALL_CAP, child_exitstatus=None)
+        assert outcome.is_clean is False
+        assert outcome.is_quota is False
+        assert outcome.exit_code == SUPERVISE_FAULT_EXIT_CODE
+        assert outcome.exit_reason == "progress-stall-restart-cap-exhausted"
+
     def test_clean_marker_but_nonzero_child_exit_is_fault(self) -> None:
         # ALL_DONE marker but the child still exited non-zero: a clean sentinel
         # cannot launder a non-zero process exit (defense in depth).

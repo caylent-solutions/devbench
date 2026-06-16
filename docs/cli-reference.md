@@ -1489,6 +1489,38 @@ Output JSON:
 }
 ```
 
+### `remove-dep`
+
+```
+uv run devbench remove-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
+```
+
+Exact inverse of [`add-dep`](#add-dep). Removes the `## Dependencies`-table row for `<blocker-task-id>` from `<blocked-task-id>`'s work-unit file (collapsing the table to the canonical `| none | | |` row when it empties) AND strips the open `[BLOCKED_PENDING_PROPOSAL] <blocker-task-id>` marker so the ADR-07 cascade, the `add-dep` reverse-cycle guard, and every other marker reader stop treating the edge as live. A `[DEP_REMOVED]` audit comment recording the cut + operator reason is appended to the blocked task's append-only Comments history.
+
+Use this to undo a dependency wired by `add-dep` (or by `promote-proposal`) when the edge is no longer correct -- for example, after re-scoping the work so the blocked task no longer needs to wait on the blocker.
+
+Fail-fast:
+
+- Both IDs must match the `E<N>-F<N>-S<N>-T<N>` task-ID format.
+- `<blocked-task-id>` must exist in the backlog index.
+- `<blocker-task-id>` must exist in the backlog index.
+- `<blocked-task-id>` and `<blocker-task-id>` cannot be the same.
+
+Idempotent: removing an edge that does not exist is a clean no-op (it prints a `no such dependency` info line to stderr and writes nothing). `removed: false` in the output JSON means there was no such dependency; `removed: true` means the dep row and/or the marker was actually removed on this call.
+
+The marker is closed by physically stripping the `[BLOCKED_PENDING_PROPOSAL]` line (the same mechanism `reject-proposal` uses), not by the `[CASCADE_RESOLVED]` close the auto-requeue cascade writes -- that close only flips the blocker's *status* and leaves the marker text in place, so it would not clear the substring readers that `remove-dep` must satisfy.
+
+Output JSON:
+
+```json
+{
+  "blocked": "E1-F1-S16-T1",
+  "blocker": "E1-F1-S16-T2",
+  "removed": true,
+  "reason": "re-scoped: T1 no longer depends on T2"
+}
+```
+
 ### `reject-proposal`
 
 ```

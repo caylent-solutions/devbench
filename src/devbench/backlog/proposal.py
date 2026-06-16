@@ -2386,6 +2386,175 @@ def add_dep(
     return wrote_row or wrote_marker
 
 
+# Matches a single ``## Dependencies`` data row whose first cell is the dep ID.
+# The header row (``| ID | Title | Status |``) and separator (``|----|...``)
+# never match because their first cell is the literal ``ID`` / a dash run, not
+# a task ID. Group 1 captures the first-cell ID so the substituter can drop only
+# the row whose ID equals the blocker being removed.
+_DEP_ROW_RE: re.Pattern[str] = re.compile(r"^\|\s*([^|\s][^|]*?)\s*\|[^\n]*\|\s*$", re.MULTILINE)
+
+# Canonical empty Dependencies placeholder row written when the table empties.
+_DEP_NONE_ROW: str = "| none | | |"
+
+
+def _remove_dependency_from_source(
+    backlog_root: Path,
+    backlog_index: Path,
+    source_task_id: str,
+    dep_id: str,
+) -> bool:
+    """Remove ``dep_id``'s row from ``source_task_id``'s Dependencies table.
+
+    Inverse of :func:`_append_dependency_to_source`. Removes only the data row
+    whose first cell equals ``dep_id`` exactly (header/separator rows are never
+    matched). When removing the row leaves the table with no data rows, the
+    canonical ``| none | | |`` placeholder is re-inserted so the Dependencies
+    table is never left header-only.
+
+    Returns ``True`` when a row was removed, ``False`` when no matching row was
+    present (idempotent no-op).
+    """
+    source_unit = _find_source_task_file(backlog_root, backlog_index, source_task_id)
+    if source_unit is None:
+        raise ProposalError(f"Cannot find source task file for {source_task_id}")
+    content = source_unit.read_text(encoding="utf-8")
+    marker = "## Dependencies"
+    idx = content.find(marker)
+    if idx == -1:
+        raise ProposalError(f"Source task file {source_unit} has no '## Dependencies' section")
+    next_section = content.find("\n## ", idx + 1)
+    section = content[idx : next_section if next_section != -1 else len(content)]
+    remainder = content[next_section:] if next_section != -1 else ""
+
+    separator_re = re.compile(r"^\|[\s\-|]+\|\s*$", re.MULTILINE)
+
+    def _drop_if_match(match: re.Match[str]) -> str:
+        first_cell = match.group(1).strip()
+        if first_cell == "ID":
+            return match.group(0)  # header row -- keep
+        if separator_re.match(match.group(0)):
+            return match.group(0)  # separator row -- keep
+        return "" if first_cell == dep_id else match.group(0)
+
+    updated_section = _DEP_ROW_RE.sub(_drop_if_match, section)
+    if updated_section == section:
+        return False
+
+    # Collapse any blank-line run left by the removed row.
+    updated_section = re.sub(r"\n{3,}", "\n\n", updated_section)
+
+    # Re-insert the canonical placeholder when no data rows remain. A data row
+    # is any pipe-delimited line that is neither the header nor the separator.
+    data_rows = [
+        line
+        for line in updated_section.splitlines()
+        if line.lstrip().startswith("|")
+        and not separator_re.match(line)
+        and not line.replace(" ", "").startswith("|ID|")
+    ]
+    if not data_rows:
+        updated_section = updated_section.rstrip("\n") + f"\n{_DEP_NONE_ROW}\n"
+
+    atomic_write_text(source_unit, content[:idx] + updated_section + remainder)
+    return True
+
+
+def _append_remove_dep_comment(
+    source_file: Path,
+    blocked_task_id: str,
+    blocker_task_id: str,
+    reason: str,
+) -> None:
+    """Append a ``[DEP_REMOVED]`` audit line recording a cut dependency edge.
+
+    Parallels :func:`_append_manual_dep_comment` (the add-dep audit writer) and
+    is signed ``name="operator"`` so reviewers see the ad-hoc cut alongside the
+    original ``[WU_WIRED]`` line in the append-only Comments history.
+    """
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    reason_body = f": {reason}" if reason else ""
+    entry = COMMENT_AGENT_TEMPLATE.format(
+        timestamp=timestamp,
+        name="operator",
+        message=(
+            f"[DEP_REMOVED] {blocked_task_id} dependency on {blocker_task_id} "
+            f"cut via `devbench remove-dep`{reason_body}."
+        ),
+    )
+    content = source_file.read_text(encoding="utf-8")
+    if COMMENTS_SECTION_HEADER in content:
+        content = content.rstrip("\n") + "\n\n" + entry
+    else:
+        content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+    atomic_write_text(source_file, content)
+
+
+def remove_dep(
+    *,
+    backlog_root: Path,
+    backlog_index: Path,
+    blocked_task_id: str,
+    blocker_task_id: str,
+    reason: str = "",
+) -> bool:
+    """Cut the dependency of ``blocked_task_id`` on ``blocker_task_id``. Idempotent.
+
+    Exact inverse of :func:`add_dep`. After this call the edge is GONE from every
+    reader:
+
+    - the ``## Dependencies`` table row for ``blocker_task_id`` is removed from
+      the blocked task's file (collapsing to the canonical ``| none | | |`` row
+      when the table empties); and
+    - the open ``[BLOCKED_PENDING_PROPOSAL] <blocker>`` marker is stripped via
+      :func:`_strip_pending_proposal_marker` -- the SAME mechanism the reject
+      flow uses to make ``_comments_have_marker`` / ``_has_open_proposal_marker``
+      / the add_dep reverse-cycle guard stop treating the edge as live. (The
+      ``[CASCADE_RESOLVED]`` close used by the auto-requeue cascade only flips
+      the *target's status* and does not remove the marker text, so it would NOT
+      clear the substring readers; the strip is the correct close here.)
+
+    A ``[DEP_REMOVED]`` audit comment recording the cut + operator reason is
+    appended to the blocked task's append-only Comments history.
+
+    Fail-fast:
+      - ``blocked_task_id`` and ``blocker_task_id`` cannot be the same task.
+      - Both IDs must be present in the backlog index.
+
+    Returns ``True`` when at least one of (dep row, marker) was removed,
+    ``False`` when the call was a complete no-op (the edge did not exist). A
+    no-op never writes the audit comment, so removing a non-existent edge leaves
+    the file byte-identical.
+    """
+    if blocked_task_id == blocker_task_id:
+        raise ProposalError(f"remove-dep: blocked and blocker cannot be the same task ({blocked_task_id})")
+
+    blocker_file = _find_source_task_file(backlog_root, backlog_index, blocker_task_id)
+    if blocker_file is None:
+        raise ProposalError(
+            f"remove-dep: blocker task '{blocker_task_id}' not found in backlog index; cannot cut dependency."
+        )
+
+    blocked_file = _find_source_task_file(backlog_root, backlog_index, blocked_task_id)
+    if blocked_file is None:
+        raise ProposalError(
+            f"remove-dep: blocked task '{blocked_task_id}' not found in backlog index; cannot cut dependency."
+        )
+
+    removed_row = False
+    if _dep_row_has_task(blocked_file, blocker_task_id):
+        removed_row = _remove_dependency_from_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)
+
+    removed_marker = False
+    if _comments_have_marker(blocked_file, blocker_task_id):
+        _strip_pending_proposal_marker(blocked_file, blocker_task_id)
+        removed_marker = True
+
+    if removed_row or removed_marker:
+        _append_remove_dep_comment(blocked_file, blocked_task_id, blocker_task_id, reason)
+
+    return removed_row or removed_marker
+
+
 def _find_originating_source_task(workspace_root: Path, promoted_task_id: str) -> str | None:
     """Return the source_task_id that originated ``promoted_task_id``, or ``None``.
 

@@ -141,6 +141,7 @@ from devbench.backlog.proposal import (
     promote_proposal,
     read_proposal,
     reject_proposal,
+    remove_dep,
     write_proposal,
 )
 from devbench.backlog.review_feedback_vocabulary import (
@@ -13711,8 +13712,11 @@ def cmd_add_dep(*argv: str) -> int:
     return 0
 
 
-def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
-    """Parse the add-dep flag grammar.
+def _parse_dep_edge_argv(argv: tuple[str, ...], verb: str) -> tuple[str | None, str, str]:
+    """Parse the shared ``<blocked-id> <blocker-id> [--reason <msg>]`` grammar.
+
+    Used by both ``add-dep`` and ``remove-dep`` (their CLI grammar is identical).
+    ``verb`` only feeds the error messages so each command names itself.
 
     Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
     after printing a usage error to stderr so the caller can ``return 1``.
@@ -13741,7 +13745,7 @@ def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
 
     if len(positional) != 2:
         print(
-            "ERROR: add-dep requires exactly two task ids: <blocked-task-id> <blocker-task-id>",
+            f"ERROR: {verb} requires exactly two task ids: <blocked-task-id> <blocker-task-id>",
             file=sys.stderr,
         )
         return None, "", ""
@@ -13749,11 +13753,89 @@ def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
     for label, tid in (("blocked", blocked_id), ("blocker", blocker_id)):
         if not task_id_re.match(tid):
             print(
-                f"ERROR: add-dep: {label} task id '{tid}' does not match E<N>-F<N>-S<N>-T<N> format",
+                f"ERROR: {verb}: {label} task id '{tid}' does not match E<N>-F<N>-S<N>-T<N> format",
                 file=sys.stderr,
             )
             return None, "", ""
     return blocked_id, blocker_id, reason
+
+
+def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
+    """Parse the add-dep flag grammar.
+
+    Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
+    after printing a usage error to stderr so the caller can ``return 1``.
+    """
+    return _parse_dep_edge_argv(argv, "add-dep")
+
+
+def cmd_remove_dep(*argv: str) -> int:
+    """Cut a cross-task dependency + close its marker on an existing work unit.
+
+    Usage::
+
+        remove-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
+
+    Exact inverse of ``add-dep``. Removes the Dependencies-table row for
+    ``<blocker-task-id>`` from ``<blocked-task-id>``'s file (collapsing to the
+    canonical ``| none | | |`` row when the table empties) AND strips the open
+    ``[BLOCKED_PENDING_PROPOSAL] <blocker>`` marker so the ADR-07 cascade, the
+    ``add-dep`` reverse-cycle guard, and every other marker reader stop treating
+    the edge as live. A ``[DEP_REMOVED]`` audit comment records the cut.
+
+    Fail-fast:
+      - Both IDs must match the task-ID regex.
+      - Both IDs must exist in the backlog index.
+      - Blocked and blocker cannot be the same.
+
+    Idempotent: removing an edge that does not exist is a clean no-op.
+    ``removed: true`` in the output JSON means the dep row and/or the marker was
+    actually removed on this call; ``removed: false`` means there was no such
+    dependency and nothing was written.
+    """
+    blocked_task_id, blocker_task_id, reason = _parse_dep_edge_argv(argv, "remove-dep")
+    if blocked_task_id is None:
+        return 1
+
+    rc = _reject_em_dash("reason", reason) if reason else None
+    if rc is not None:
+        return rc
+
+    try:
+        removed = remove_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=blocked_task_id,
+            blocker_task_id=blocker_task_id,
+            reason=reason,
+        )
+    except ProposalError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not removed:
+        print(
+            f"INFO: remove-dep: no such dependency ({blocked_task_id} -> {blocker_task_id}); nothing to remove.",
+            file=sys.stderr,
+        )
+
+    logger.info(
+        "remove-dep: %s no longer blocked on %s (removed=%s)",
+        blocked_task_id,
+        blocker_task_id,
+        removed,
+    )
+    print(
+        json.dumps(
+            {
+                "blocked": blocked_task_id,
+                "blocker": blocker_task_id,
+                "removed": removed,
+                "reason": reason,
+            }
+        )
+    )
+    return 0
 
 
 def cmd_reject_proposal(*argv: str) -> int:
@@ -14244,6 +14326,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Wire a cross-task BLOCKED_PENDING_PROPOSAL marker: add-dep <blocked-id> <blocker-id> [--reason <msg>]",
     ),
+    "remove-dep": (
+        cmd_remove_dep,
+        2,
+        "Remove a cross-task dependency/BLOCKED_PENDING_PROPOSAL marker: "
+        "remove-dep <blocked-id> <blocker-id> [--reason <msg>]",
+    ),
     "materialise-proposal": (
         cmd_materialise_proposal,
         1,
@@ -14292,6 +14380,7 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "watchdog",
         "notify-test",
         "add-dep",
+        "remove-dep",
         "decline",
         "hold",
         "unhold",

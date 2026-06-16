@@ -337,6 +337,32 @@ and env overrides are documented in
 block. New injectable operator commands (future slash commands) are added via the
 `supervise.injectable_commands` config map with NO supervisor code change.
 
+### Slash-command submission (type -> render-settle -> Enter)
+
+Slash commands (e.g. `/devbench-orchestrate:orchestrate`, the orchestrate
+kickoff, and `/exit`, the graceful-drain `drain_now`) are NOT submitted with a
+single `sendline`. The instant `/` is typed, Claude Code (>= 2.1.x) opens an
+autocomplete menu, and the trailing newline a `sendline` would send is SWALLOWED
+by that menu -- the command then sits unparsed in the input box and never runs
+(the session stalls with `stop-reason-unknown`). The supervisor instead:
+
+1. **types** the command literal with NO trailing newline (the menu opens but no
+   premature Enter is sent);
+2. **waits for the autocomplete render to go quiescent** -- it watches the PTY and
+   treats a `command_submit_quiet_seconds` window with no new output as "render
+   settled" (readiness detection, NOT a fixed sleep), bounded by
+   `command_submit_settle_seconds` so a continuously-rendering menu cannot block
+   forever (it submits anyway once that budget is hit);
+3. **sends a single Enter** (`\r`) to submit the now-fully-rendered command.
+
+Back-to-back double-Enter (with no render gap) does NOT work -- the render-settle
+wait is essential. Non-slash injectable literals have no autocomplete menu and are
+still submitted with the legacy `sendline`. The two render-settle timeouts
+(`supervise.timeouts.command_submit_quiet_seconds`, default 1, and
+`command_submit_settle_seconds`, default 8) are documented in
+[devbench-yaml-reference.md](devbench-yaml-reference.md) and are env-overridable
+like every other timeout.
+
 ## Troubleshooting
 
 - **`ERROR: 'screen' is not installed`** -- install `screen`

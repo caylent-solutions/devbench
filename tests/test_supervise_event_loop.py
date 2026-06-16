@@ -395,9 +395,14 @@ class TestEventLoopGracefulStop:
         # /exit (drain_now) literal must have been injected into the child.
         child = FakePexpectChild(
             [
-                # After /exit the in-flight turn wraps up and the child EOFs clean.
-                _ScriptStep(emit="wrapping up current work unit", on_send="/exit"),
-                _ScriptStep(emit="", eof=True, exitstatus=0, on_send="/exit"),
+                # /exit is a SLASH command: it is typed (no newline), the menu
+                # render settles, then a single Enter (\r) submits it. Gate the
+                # post-submit output on that \r so wait_until_quiescent's
+                # expect([r".+"]) settles (sees no available step -> TIMEOUT)
+                # BEFORE the Enter, and the in-flight wind-down + clean EOF only
+                # become visible after submission.
+                _ScriptStep(emit="wrapping up current work unit", on_send=r"\r"),
+                _ScriptStep(emit="", eof=True, exitstatus=0, on_send=r"\r"),
             ]
         )
         stop_calls = {"n": 0}
@@ -449,8 +454,11 @@ class TestEventLoopGracefulStop:
         sm.on_event("orchestrate-injected")
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="finishing", on_send="/exit"),
-                _ScriptStep(emit="", eof=True, exitstatus=0, on_send="/exit"),
+                # Gate on the submit Enter (\r): /exit is typed then submitted, so
+                # the wind-down output only appears after the single Enter (the
+                # quiescence wait settles on the unmet gate before submission).
+                _ScriptStep(emit="finishing", on_send=r"\r"),
+                _ScriptStep(emit="", eof=True, exitstatus=0, on_send=r"\r"),
             ]
         )
         result = run_supervise_event_loop(

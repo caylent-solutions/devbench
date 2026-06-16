@@ -10134,6 +10134,8 @@ def _make_supervise_relaunch(
             injectable_commands=cfg.injectable_commands,
             ready_timeout_seconds=cfg.timeouts.ready_prompt_seconds,
             command_ack_seconds=cfg.timeouts.command_ack_seconds,
+            command_submit_quiet_seconds=cfg.timeouts.command_submit_quiet_seconds,
+            command_submit_settle_seconds=cfg.timeouts.command_submit_settle_seconds,
         )
 
     return _relaunch
@@ -10225,6 +10227,8 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
             injectable_commands=cfg.injectable_commands,
             ready_timeout_seconds=cfg.timeouts.ready_prompt_seconds,
             command_ack_seconds=cfg.timeouts.command_ack_seconds,
+            command_submit_quiet_seconds=cfg.timeouts.command_submit_quiet_seconds,
+            command_submit_settle_seconds=cfg.timeouts.command_submit_settle_seconds,
         )
     except SuperviseReadyTimeoutError as exc:
         state.state = SUPERVISE_STATE_FAULTED

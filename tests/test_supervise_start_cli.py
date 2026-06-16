@@ -151,7 +151,11 @@ class TestRunDrivesPexpectToRunning:
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="> "),  # ready prompt
-                _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                # The orchestrate literal is a SLASH command: it is typed (no
+                # newline), the autocomplete render settles, then a single Enter
+                # (\r) submits it. Gate the ack on that submit \r so the
+                # render-settle quiescence wait does NOT prematurely consume it.
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),  # ack
             ]
         )
         driver = PtyDriver(
@@ -163,9 +167,12 @@ class TestRunDrivesPexpectToRunning:
             injectable_commands={"orchestrate": "/devbench-orchestrate:orchestrate"},
             ready_timeout_seconds=5,
             command_ack_seconds=5,
+            command_submit_quiet_seconds=1,
+            command_submit_settle_seconds=8,
         )
         assert sm.state == "running"
-        assert child.sent == ["/devbench-orchestrate:orchestrate"]
+        # Slash submission: type the literal then submit a single Enter.
+        assert child.sent == ["/devbench-orchestrate:orchestrate", "\r"]
 
 
 # ---------------------------------------------------------------------------

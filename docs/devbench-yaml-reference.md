@@ -464,6 +464,8 @@ supervise:
     quota_max_wait_seconds: 18000    # reuses quota_handling.max_wait_seconds when null (5h)
     graceful_stop_seconds: 900       # graceful drain budget before escalating to a hard stop
     command_invocation_seconds: 30   # safety timeout bounding short screen subprocess shell-outs
+    command_submit_quiet_seconds: 1  # slash-command submit: no-output quiet window signalling the autocomplete menu render has settled before Enter
+    command_submit_settle_seconds: 8 # slash-command submit: max render-settle wait before Enter is sent regardless (the / menu swallows a premature newline)
   restart:
     max_attempts: 5                  # bounded auto-restart on the exit-42 restart signal
     resume_mode: continue            # continue | resume (resume uses the captured session id)

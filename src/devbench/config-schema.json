@@ -948,7 +948,9 @@
             "quota_max_wait_seconds": {"type": ["integer", "null"], "minimum": 1, "description": "Reuses quota_handling.max_wait_seconds when null (5h)."},
             "graceful_stop_seconds": {"type": "integer", "minimum": 1, "description": "Graceful drain budget before escalating to hard stop. Default 900."},
             "poll_interval_seconds": {"type": "integer", "minimum": 1, "description": "Registry-poll / attach tail re-read cadence (seconds) for stop wait + attach follow. Default 2."},
-            "command_invocation_seconds": {"type": "integer", "minimum": 1, "description": "Safety timeout (seconds) bounding short non-interactive subprocess.run shell-outs (screen -ls, screen -X quit, <tool> --version). Default 30."}
+            "command_invocation_seconds": {"type": "integer", "minimum": 1, "description": "Safety timeout (seconds) bounding short non-interactive subprocess.run shell-outs (screen -ls, screen -X quit, <tool> --version). Default 30."},
+            "command_submit_quiet_seconds": {"type": "integer", "minimum": 1, "description": "Slash-command submission: no-output quiet window (seconds) that signals the autocomplete menu render has settled before Enter is sent. Default 1."},
+            "command_submit_settle_seconds": {"type": "integer", "minimum": 1, "description": "Slash-command submission: max render-settle wait (seconds) before Enter is sent regardless (the / autocomplete menu swallows a premature newline). Default 8."}
           }
         },
         "restart": {

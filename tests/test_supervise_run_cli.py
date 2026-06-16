@@ -50,7 +50,10 @@ class TestSuperviseRunReachesRunning:
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="> "),  # ready prompt
-                _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                # orchestrate is a SLASH command: typed (no newline) -> menu render
+                # settles -> single Enter (\r). Gate the ack on the submit \r so the
+                # render-settle quiescence wait does NOT prematurely consume it.
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),  # ack
                 _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # terminal clean
             ]
         )
@@ -64,7 +67,8 @@ class TestSuperviseRunReachesRunning:
         assert state.exit_reason == "all-done"
         assert state.claude_version == "claude 1.2.3"
         assert state.claude_path == "/usr/bin/claude"
-        assert child.sent == ["/devbench-orchestrate:orchestrate"]
+        # Slash submission: type the literal then submit a single Enter.
+        assert child.sent == ["/devbench-orchestrate:orchestrate", "\r"]
 
 
 @pytest.mark.unit
@@ -79,10 +83,14 @@ class TestSuperviseRunRestartThroughRun:
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="> "),  # initial ready
-                _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                # orchestrate is a SLASH command (type -> render-settle -> Enter).
+                # Gate each cycle's ack on its OWN submit Enter (\r): the first ack
+                # on the 1st \r, the post-relaunch ack on the 2nd \r, so neither is
+                # prematurely consumed by the render-settle quiescence wait.
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),  # ack (cycle 1)
                 _ScriptStep(emit=restart_line, eof=True, exitstatus=42),  # restart signal
                 _ScriptStep(emit="> "),  # ready after relaunch
-                _ScriptStep(emit="esc to interrupt", on_send="orchestrate"),  # ack
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r", on_send_count=2),  # ack (cycle 2)
                 _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # clean terminal
             ]
         )

@@ -19,10 +19,17 @@ class _ScriptStep:
     """One scripted interaction in a :class:`FakePexpectChild` session.
 
     Attributes:
-        on_send: When set, this step only becomes active once a ``sendline``
-            whose payload matches this regex has been issued (so a step can be
-            gated on the supervisor injecting a specific command). ``None`` means
-            the step is available from the start.
+        on_send: When set, this step only becomes active once a ``sendline`` /
+            ``send`` whose payload matches this regex has been issued (so a step
+            can be gated on the supervisor injecting a specific command, or on the
+            submit Enter ``\\r`` of the slash-command flow). ``None`` means the
+            step is available from the start.
+        on_send_count: The minimum number of distinct ``sent`` payloads that must
+            match ``on_send`` before the step becomes active (default 1). A later
+            cycle's step can require ``on_send_count=2`` to gate on the SECOND
+            matching send (e.g. the second submit Enter of a relaunch), since the
+            submit payload (``\\r``) is identical across cycles. Ignored when
+            ``on_send`` is ``None``.
         emit: The text the child "prints"; it is matched against the pattern an
             :meth:`FakePexpectChild.expect` call supplies. The matched span lands
             in ``before``/``after`` exactly as ``pexpect`` populates them.
@@ -34,6 +41,7 @@ class _ScriptStep:
 
     emit: str
     on_send: str | None = None
+    on_send_count: int = 1
     eof: bool = False
     exitstatus: int | None = None
 
@@ -137,13 +145,21 @@ class FakePexpectChild:
     # ------------------------------------------------------------------
 
     def _next_available_step(self) -> _ScriptStep | None:
-        """Return the next step whose ``on_send`` gate (if any) has been met."""
+        """Return the next step whose ``on_send`` gate (if any) has been met.
+
+        A step gated on ``on_send`` becomes available once at least
+        ``on_send_count`` distinct ``sent`` payloads have matched the gate regex
+        (so a later cycle can gate on the Nth identical submit, e.g. the second
+        ``\\r`` of a relaunch).
+        """
         while self._cursor < len(self._script):
             step = self._script[self._cursor]
-            if step.on_send is not None and not any(re.search(step.on_send, s) for s in self.sent):
-                # The gate is unmet: this expect cannot consume the gated step
-                # yet, so it sees nothing -> the caller will time out.
-                return None
+            if step.on_send is not None:
+                matches = sum(1 for s in self.sent if re.search(step.on_send, s))
+                if matches < step.on_send_count:
+                    # The gate is unmet: this expect cannot consume the gated step
+                    # yet, so it sees nothing -> the caller will time out.
+                    return None
             return step
         return None
 

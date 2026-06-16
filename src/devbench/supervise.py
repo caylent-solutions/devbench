@@ -76,6 +76,7 @@ import fcntl
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import selectors
@@ -1324,6 +1325,61 @@ class PtyDriver:
         """Send *payload* + newline to the child."""
         self.child.sendline(payload)
 
+    def type_text(self, payload: str) -> None:
+        """Type *payload* into the child with NO trailing newline.
+
+        Used for the slash-command submission flow (Section 5.3): typing ``/``
+        opens the Claude Code autocomplete menu, and a trailing newline from
+        ``sendline`` is SWALLOWED by that menu. Typing the literal alone lets the
+        menu render without a premature Enter; :meth:`submit` sends the Enter once
+        the render has settled (see :meth:`wait_until_quiescent`).
+        """
+        self.child.send(payload)
+
+    def submit(self) -> None:
+        """Send a single Enter (carriage return) to submit a typed command."""
+        self.child.send("\r")
+
+    def wait_until_quiescent(self, *, quiet_seconds: int, max_seconds: int) -> bool:
+        """Wait for the PTY render to go QUIESCENT (no new output), then return.
+
+        Readiness detection -- NOT a fixed sleep. Each iteration waits up to
+        *quiet_seconds* for any non-empty output (``expect([r".+"])``):
+
+        - a match means the menu is still rendering: the matched text is tee'd +
+          retained via :meth:`_capture_matched` (so the transcript / FR-24 and the
+          terminal text are never lost) and the loop continues;
+        - a :class:`pexpect.TIMEOUT` (no output for *quiet_seconds*) means the
+          render has SETTLED -> return ``True``;
+        - a :class:`pexpect.EOF` means the child exited mid-render: the buffered
+          text is captured and ``False`` is returned.
+
+        The loop is bounded to ``max(1, ceil(max_seconds / quiet_seconds))``
+        iterations so a continuously-rendering menu cannot block forever; if the
+        cap is hit before quiescence, ``False`` is returned (the caller submits
+        anyway). There is NO wall-clock and NO ``time.sleep`` -- the bound is the
+        per-iteration ``expect`` timeout times the iteration cap.
+
+        Args:
+            quiet_seconds: The no-output quiet window signalling a settled render.
+            max_seconds: The total render-settle budget bounding the loop.
+
+        Returns:
+            ``True`` when the render settled (a quiet TIMEOUT), ``False`` on EOF or
+            when the iteration cap was exhausted by continuous output.
+        """
+        max_iterations = max(1, math.ceil(max_seconds / quiet_seconds))
+        for _ in range(max_iterations):
+            try:
+                self.child.expect([r".+"], timeout=quiet_seconds)
+            except pexpect.TIMEOUT:
+                return True
+            except pexpect.EOF:
+                self._capture_before()
+                return False
+            self._capture_matched()
+        return False
+
     def expect_working(self, *, timeout_seconds: int) -> bool:
         """Wait for the working/activity prompt (command ack); return success.
 
@@ -1440,17 +1496,32 @@ class PtyDriver:
 
 
 class CommandInjector:
-    """Send a named slash command from the registry through the PTY (FR-28).
+    """Send a named command from the registry through the PTY (FR-28).
 
-    ``send(name)`` looks the literal up in the config registry, ``sendline``s it
-    through the :class:`PtyDriver`, and waits for the working-prompt ack. A new
-    operator capability is added by adding a registry entry -- NO supervisor code
-    change. An unknown name fails fast (Section 5.3).
+    ``send(name)`` looks the literal up in the config registry, drives it through
+    the :class:`PtyDriver`, and waits for the working-prompt ack. A new operator
+    capability is added by adding a registry entry -- NO supervisor code change.
+    An unknown name fails fast (Section 5.3).
+
+    Dispatch depends on whether the literal is a SLASH command (Section 5.3):
+
+    - SLASH literal (``"/devbench-orchestrate:orchestrate"``, ``"/exit"``, ...):
+      typing ``/`` opens the Claude Code autocomplete menu, which SWALLOWS a
+      trailing ``sendline`` newline (the command would sit unparsed and never
+      run). So the literal is TYPED with no newline, the menu render is allowed to
+      go quiescent (:meth:`PtyDriver.wait_until_quiescent` -- readiness, not a
+      sleep), then a SINGLE Enter submits it.
+    - NON-slash literal: there is no autocomplete menu, so the legacy
+      ``sendline`` (payload + newline) is used unchanged.
 
     Args:
         driver: The :class:`PtyDriver`.
         registry: The ``supervise.injectable_commands`` name->literal map.
         ack_timeout_seconds: ``supervise.timeouts.command_ack_seconds``.
+        command_submit_quiet_seconds: ``supervise.timeouts.command_submit_quiet_seconds``
+            -- the no-output quiet window signalling the menu render has settled.
+        command_submit_settle_seconds: ``supervise.timeouts.command_submit_settle_seconds``
+            -- the max render-settle wait before Enter is sent regardless.
     """
 
     def __init__(
@@ -1459,10 +1530,14 @@ class CommandInjector:
         driver: PtyDriver,
         registry: dict[str, str],
         ack_timeout_seconds: int,
+        command_submit_quiet_seconds: int,
+        command_submit_settle_seconds: int,
     ) -> None:
         self._driver = driver
         self._registry = dict(registry)
         self._ack_timeout = ack_timeout_seconds
+        self._submit_quiet = command_submit_quiet_seconds
+        self._submit_settle = command_submit_settle_seconds
 
     def send(self, name: str, /, **subst: str) -> str:
         """Send the registry command *name* (with optional ``{placeholder}`` subst).
@@ -1487,7 +1562,16 @@ class CommandInjector:
         literal = self._registry[name]
         if subst:
             literal = literal.format(**subst)
-        self._driver.sendline(literal)
+        if literal.lstrip().startswith("/"):
+            # Slash command: type (no newline), let the autocomplete menu render
+            # settle, then submit a single Enter (a premature sendline newline is
+            # swallowed by the menu and never submits the command).
+            self._driver.type_text(literal)
+            self._driver.wait_until_quiescent(quiet_seconds=self._submit_quiet, max_seconds=self._submit_settle)
+            self._driver.submit()
+        else:
+            # Non-slash literal: no autocomplete menu, so the newline submits.
+            self._driver.sendline(literal)
         # Wait for the working-prompt ack; a missing ack is not fatal here (the
         # supervise loop's hybrid log-tail also confirms activity, FR-29).
         self._driver.expect_working(timeout_seconds=self._ack_timeout)
@@ -1700,19 +1784,26 @@ def run_supervised_kickoff(
     injectable_commands: dict[str, str],
     ready_timeout_seconds: int,
     command_ack_seconds: int,
+    command_submit_quiet_seconds: int,
+    command_submit_settle_seconds: int,
 ) -> SupervisorStateMachine:
     """Drive launch -> ready -> orchestrate-injected -> running (Section 4.1).
 
     Assumes the ``claude`` child has already been spawned and wired into *driver*.
     Waits for the ready prompt (FR-7), injects ``/devbench-orchestrate:orchestrate``
     (FR-8, scope is already authoritative via the exported env + scope.json), and
-    advances the state machine to ``running``.
+    advances the state machine to ``running``. The orchestrate literal is a SLASH
+    command, so it is submitted via the type -> render-settle -> Enter flow (the
+    autocomplete menu swallows a premature ``sendline`` newline, see
+    :class:`CommandInjector`).
 
     Args:
         driver: The :class:`PtyDriver` wrapping the spawned child.
         injectable_commands: The ``supervise.injectable_commands`` registry.
         ready_timeout_seconds: ``supervise.timeouts.ready_prompt_seconds``.
         command_ack_seconds: ``supervise.timeouts.command_ack_seconds``.
+        command_submit_quiet_seconds: ``supervise.timeouts.command_submit_quiet_seconds``.
+        command_submit_settle_seconds: ``supervise.timeouts.command_submit_settle_seconds``.
 
     Returns:
         The :class:`SupervisorStateMachine` in the ``running`` state.
@@ -1729,6 +1820,8 @@ def run_supervised_kickoff(
         driver=driver,
         registry=injectable_commands,
         ack_timeout_seconds=command_ack_seconds,
+        command_submit_quiet_seconds=command_submit_quiet_seconds,
+        command_submit_settle_seconds=command_submit_settle_seconds,
     )
     injector.send("orchestrate")
     sm.on_event("orchestrate-injected")
@@ -2498,10 +2591,14 @@ def _handle_graceful_drain(
     logger.info("%s state=%s reason=operator-drain", SUPERVISE_STATE_AUDIT_PREFIX, sm.state)
 
     # Send /exit so the in-flight turn completes then the child exits cleanly.
+    # ``drain_now`` is the slash literal ``/exit``, so this exercises the same
+    # type -> render-settle -> Enter submission flow as the orchestrate kickoff.
     injector = CommandInjector(
         driver=driver,
         registry=config.injectable_commands,
         ack_timeout_seconds=config.timeouts.command_ack_seconds,
+        command_submit_quiet_seconds=config.timeouts.command_submit_quiet_seconds,
+        command_submit_settle_seconds=config.timeouts.command_submit_settle_seconds,
     )
     injector.send("drain_now")
 

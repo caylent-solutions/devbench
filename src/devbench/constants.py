@@ -1234,6 +1234,20 @@ SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT: int = 2
 # operational value -- including these -- is a config field with a documented
 # default, never a hardcoded literal in the supervisor.
 SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT: int = 30
+# Slash-command submission render-settle timeouts (seconds). A SLASH command
+# (e.g. "/devbench-orchestrate:orchestrate") opens the Claude Code autocomplete
+# menu the instant "/" is typed, and a trailing newline from ``sendline`` is
+# SWALLOWED by that menu (it does not submit the command). The supervisor instead
+# types the literal (no newline), waits for the menu render to go QUIESCENT
+# (readiness detection -- no new PTY output for ``command_submit_quiet_seconds``),
+# then sends a single Enter to submit. ``command_submit_quiet_seconds`` is the
+# no-output quiet window that signals the render has settled;
+# ``command_submit_settle_seconds`` bounds the total render-settle wait so a
+# continuously-rendering menu cannot block forever (the supervisor submits anyway
+# once this budget is hit). Both are config fields with documented defaults, never
+# hardcoded literals (FR-19, Section 7.4).
+SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT: int = 1
+SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT: int = 8
 
 # Default bounded auto-restart attempts on the exit-42-equivalent (Section 5.1,
 # FR-12, Section 4.3). Override via ``DEVBENCH_SUPERVISE_RESTART_MAX_ATTEMPTS``.

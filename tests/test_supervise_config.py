@@ -75,6 +75,26 @@ class TestSuperviseConfigDefaults:
             == SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
         )
 
+    def test_default_command_submit_quiet_timeout(self) -> None:
+        # The no-output quiet window (seconds) the slash-command submission waits
+        # for the autocomplete menu render to settle before sending Enter.
+        from devbench.constants import SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT
+
+        assert (
+            SuperviseConfig().timeouts.command_submit_quiet_seconds
+            == SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT
+        )
+
+    def test_default_command_submit_settle_timeout(self) -> None:
+        # The max render-settle wait (seconds) bounding the slash-command submission
+        # quiescence loop before Enter is sent regardless.
+        from devbench.constants import SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT
+
+        assert (
+            SuperviseConfig().timeouts.command_submit_settle_seconds
+            == SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT
+        )
+
     def test_default_restart_max_attempts(self) -> None:
         assert SuperviseConfig().restart.max_attempts == SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT
 
@@ -157,6 +177,22 @@ class TestSuperviseConfigParse:
     def test_command_invocation_timeout_below_minimum_fails_fast(self) -> None:
         with pytest.raises(ValueError, match="command_invocation_seconds"):
             _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_invocation_seconds": 0}})
+
+    def test_command_submit_quiet_timeout_override(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_submit_quiet_seconds": 3}})
+        assert cfg.timeouts.command_submit_quiet_seconds == 3
+
+    def test_command_submit_quiet_timeout_below_minimum_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="command_submit_quiet_seconds"):
+            _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_submit_quiet_seconds": 0}})
+
+    def test_command_submit_settle_timeout_override(self) -> None:
+        cfg = _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_submit_settle_seconds": 15}})
+        assert cfg.timeouts.command_submit_settle_seconds == 15
+
+    def test_command_submit_settle_timeout_below_minimum_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="command_submit_settle_seconds"):
+            _parse_supervise_config(Path("cfg.yaml"), {"timeouts": {"command_submit_settle_seconds": 0}})
 
     def test_optional_quota_timeout_below_minimum_fails_fast(self) -> None:
         with pytest.raises(ValueError, match="quota_poll_interval_seconds"):
@@ -307,4 +343,28 @@ class TestSuperviseConfigSchema:
         cfg_path = tmp_path / "devbench.yaml"
         _write_config(cfg_path, "supervise:\n  timeouts:\n    command_invocation_seconds: 0\n")
         with pytest.raises(Exception, match=r"command_invocation_seconds|minimum|0"):
+            load_runtime_config(cfg_path, {})
+
+    def test_command_submit_quiet_timeout_loads_via_runtime_config(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    command_submit_quiet_seconds: 4\n")
+        runtime = load_runtime_config(cfg_path, {})
+        assert runtime.supervise.timeouts.command_submit_quiet_seconds == 4
+
+    def test_command_submit_quiet_timeout_below_minimum_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    command_submit_quiet_seconds: 0\n")
+        with pytest.raises(Exception, match=r"command_submit_quiet_seconds|minimum|0"):
+            load_runtime_config(cfg_path, {})
+
+    def test_command_submit_settle_timeout_loads_via_runtime_config(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    command_submit_settle_seconds: 20\n")
+        runtime = load_runtime_config(cfg_path, {})
+        assert runtime.supervise.timeouts.command_submit_settle_seconds == 20
+
+    def test_command_submit_settle_timeout_below_minimum_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg_path = tmp_path / "devbench.yaml"
+        _write_config(cfg_path, "supervise:\n  timeouts:\n    command_submit_settle_seconds: 0\n")
+        with pytest.raises(Exception, match=r"command_submit_settle_seconds|minimum|0"):
             load_runtime_config(cfg_path, {})

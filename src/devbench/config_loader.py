@@ -108,6 +108,8 @@ from devbench.constants import (
     SUPERVISE_SCREEN_NAME_PREFIX_DEFAULT,
     SUPERVISE_TIMEOUT_COMMAND_ACK_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT,
+    SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_IDLE_SECONDS_DEFAULT,
     SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT,
@@ -819,7 +821,10 @@ class SuperviseTimeoutsConfig:
     non-interactive ``subprocess.run`` shell-outs (``screen -ls``,
     ``screen -X quit``, ``<tool> --version``) so a hung invocation cannot stall
     the supervisor -- a config-driven hang guard, not a hardcoded literal
-    (FR-19, Section 7.4).
+    (FR-19, Section 7.4). ``command_submit_quiet_seconds`` /
+    ``command_submit_settle_seconds`` bound the slash-command render-settle
+    submission (type -> wait-for-quiescent-menu -> single Enter), since the ``/``
+    autocomplete menu swallows a premature ``sendline`` newline.
     """
 
     ready_prompt_seconds: int = SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT
@@ -830,6 +835,8 @@ class SuperviseTimeoutsConfig:
     graceful_stop_seconds: int = SUPERVISE_TIMEOUT_GRACEFUL_STOP_SECONDS_DEFAULT
     poll_interval_seconds: int = SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
     command_invocation_seconds: int = SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
+    command_submit_quiet_seconds: int = SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT
+    command_submit_settle_seconds: int = SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -1306,6 +1313,12 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
         ),
         command_invocation_seconds=_require_supervise_timeout(
             path, timeouts_raw, "command_invocation_seconds", dt.command_invocation_seconds
+        ),
+        command_submit_quiet_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "command_submit_quiet_seconds", dt.command_submit_quiet_seconds
+        ),
+        command_submit_settle_seconds=_require_supervise_timeout(
+            path, timeouts_raw, "command_submit_settle_seconds", dt.command_submit_settle_seconds
         ),
     )
 

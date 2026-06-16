@@ -125,6 +125,77 @@ class TestReadyDetection:
 
 
 @pytest.mark.unit
+class TestPtyDriverSlashSubmission:
+    """type_text / submit / wait_until_quiescent: the slash-submit primitives.
+
+    A SLASH command opens the Claude Code autocomplete menu the instant ``/`` is
+    typed; the trailing newline of a ``sendline`` is swallowed by that menu. The
+    driver instead types the literal (no newline), waits for the menu render to
+    settle (readiness, not a fixed sleep), then sends a single Enter.
+    """
+
+    def test_type_text_sends_payload_without_newline(self) -> None:
+        child = FakePexpectChild([])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        driver.type_text("/devbench-orchestrate:orchestrate")
+        # No trailing newline: the raw payload is recorded exactly as typed.
+        assert child.sent == ["/devbench-orchestrate:orchestrate"]
+
+    def test_submit_sends_single_enter(self) -> None:
+        child = FakePexpectChild([])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        driver.submit()
+        assert child.sent == ["\r"]
+
+    def test_wait_until_quiescent_returns_true_on_quiet_timeout(self) -> None:
+        # No scripted output -> the FakePexpectChild raises TIMEOUT on the first
+        # expect, which means the render has settled (no new output): return True.
+        child = FakePexpectChild([])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=8) is True
+
+    def test_wait_until_quiescent_consumes_render_then_settles(self, tmp_path) -> None:
+        # Two menu-render chunks then quiet (a third expect finds no step ->
+        # TIMEOUT). The rendered text is tee'd to pty.log (FR-24) and the loop
+        # settles (returns True) once output stops.
+        from devbench.supervise import PtyLogWriter
+
+        log = tmp_path / "pty.log"
+        writer = PtyLogWriter(path=log, redact_patterns=())
+        child = FakePexpectChild(
+            [
+                _ScriptStep(emit="menu line one"),
+                _ScriptStep(emit="menu line two"),
+            ]
+        )
+        driver = PtyDriver(
+            child=child,
+            patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()),
+            log_writer=writer,
+        )
+        assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=8) is True
+        writer.close()
+        contents = log.read_text(encoding="utf-8")
+        assert "menu line one" in contents
+        assert "menu line two" in contents
+
+    def test_wait_until_quiescent_returns_false_on_eof(self) -> None:
+        child = FakePexpectChild([_ScriptStep(emit="dying", eof=True, exitstatus=1)])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=8) is False
+
+    def test_wait_until_quiescent_returns_false_when_iteration_cap_exhausted(self) -> None:
+        # Continuous output never goes quiet: every expect matches a ``.+`` step,
+        # so the bounded iteration cap (max(1, ceil(max/quiet))) is exhausted and
+        # the method returns False (the caller submits anyway). With quiet=1,
+        # max=3 the cap is 3 iterations; supply 4 always-matching steps so the
+        # cap (not a TIMEOUT/EOF) is what stops the loop.
+        child = FakePexpectChild([_ScriptStep(emit=f"chunk {i}") for i in range(4)])
+        driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
+        assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=3) is False
+
+
+@pytest.mark.unit
 class TestPtyDriverTee:
     """The driver tees matched output to the redacted pty.log when configured."""
 

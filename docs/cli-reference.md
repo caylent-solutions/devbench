@@ -1398,7 +1398,9 @@ uv run devbench materialise-proposal <source-id>
 
 Turn a proposal JSON into draft `.md` files with status `proposed` under the matching story directory. Each proposed task also gets a row appended to `BACKLOG.md`.
 
-**Idempotent (ADR-09).** Every task classifies through `classify_proposed_task` first; the call skips anything in state `PROPOSED`, `PROMOTED`, `DONE`, `DECLINED`, or `REJECTED`. Only `UNMATERIALISED` tasks are created. Safe to re-run after a partial materialisation or after rejecting a draft from the same JSON. Output JSON includes a `skipped` map so the operator sees why a no-op call was a no-op.
+**Idempotent (ADR-09).** Every task classifies through `classify_proposed_task` first; the call skips anything in state `PROPOSED`, `PROMOTED`, `DONE`, `DECLINED`, or `REJECTED` **that THIS proposal authored** (provenance-checked). Only `UNMATERIALISED` tasks are created. Safe to re-run after a partial materialisation or after rejecting a draft from the same JSON. Output JSON includes a `skipped` map so the operator sees why a no-op call was a no-op.
+
+**Collision re-home (ADR-32).** When a `suggested_id` collides with an UNRELATED pre-existing unit (not a draft this proposal authored), the proposed fix unit is NOT silently skipped: it is materialised under the next free id in the Story, the proposal is re-pointed so `promote-proposal` wiring targets the real fix unit, and the colliding unit is left untouched. The output JSON's `remapped` map associates each original `suggested_id` to the free id it was re-homed to.
 
 ### `sweep-proposals`
 

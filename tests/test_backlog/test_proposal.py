@@ -667,8 +667,14 @@ class TestMaterialiseProposal:
                 repo="caylent-solutions/example",
             )
 
-    def test_skips_task_when_draft_file_already_exists(self, tmp_path: Path) -> None:
-        """ADR-09: materialise is idempotent. A pre-existing draft is left alone."""
+    def test_rehomes_when_id_collides_with_unrelated_unit(self, tmp_path: Path) -> None:
+        """A suggested_id occupied by an UNRELATED pre-existing unit is re-homed, not dropped.
+
+        Tracked issue: materialise-proposal-skips-by-id-on-collision. The
+        pre-existing draft has no provenance citing this proposal's source task,
+        so it is a genuine collision: the proposed fix unit must be materialised
+        under a free id and the unrelated unit left untouched.
+        """
         workspace = _build_workspace(tmp_path)
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         existing_path = story_dir / "E0-F1-S1-T2.md"
@@ -683,10 +689,13 @@ class TestMaterialiseProposal:
             repo="caylent-solutions/example",
         )
 
-        # No draft was created -- the existing file classifies as PROPOSED and is skipped.
-        assert drafts == []
-        # Existing file content preserved (no overwrite).
+        # The fix unit is materialised under the next free id (T3), not dropped.
+        assert len(drafts) == 1
+        assert drafts[0].name == "E0-F1-S1-T3.md"
+        # The unrelated pre-existing unit is left untouched (no overwrite).
         assert "existing" in existing_path.read_text()
+        # The proposal's suggested_id is re-pointed so promote wiring follows it.
+        assert proposal.proposed_tasks[0].suggested_id == "E0-F1-S1-T3"
 
 
 class TestMaterialiseProposalIdempotent:
@@ -721,8 +730,14 @@ class TestMaterialiseProposalIdempotent:
         assert "E0-F1-S1-T2" not in (workspace / "BACKLOG.md").read_text()
 
     @pytest.mark.parametrize("status_value", ["in-queue", "in-progress", "in-review", "blocked", "done", "declined"])
-    def test_skips_promoted_done_declined_states(self, tmp_path: Path, status_value: str) -> None:
-        """Any non-PROPOSED / non-UNMATERIALISED state -> skip, no recreation."""
+    def test_rehomes_when_unrelated_unit_in_any_state_collides(self, tmp_path: Path, status_value: str) -> None:
+        """An UNRELATED unit in ANY state occupying the suggested_id is re-homed, not dropped.
+
+        Tracked issue: materialise-proposal-skips-by-id-on-collision. A draft with
+        no provenance for this proposal's source task is a collision regardless of
+        its status: the fix unit is materialised under a free id and the unrelated
+        unit is left untouched.
+        """
         workspace = _build_workspace(tmp_path)
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         draft = story_dir / "E0-F1-S1-T2.md"
@@ -736,7 +751,9 @@ class TestMaterialiseProposalIdempotent:
             proposal=_sample_proposal(task_ids=["E0-F1-S1-T2"]),
             repo="caylent-solutions/example",
         )
-        assert drafts == []
+        # The fix unit is re-homed to the next free id; the unrelated unit untouched.
+        assert len(drafts) == 1
+        assert drafts[0].name == "E0-F1-S1-T3.md"
         assert draft.read_text() == original_body
 
     def test_creates_remaining_tasks_when_others_skipped(self, tmp_path: Path) -> None:

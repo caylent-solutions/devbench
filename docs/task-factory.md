@@ -257,20 +257,23 @@ Calling `materialise-proposal <source-id>` (or the sweep step 0 in the orchestra
 | Task state | Action |
 |------------|--------|
 | `UNMATERIALISED` | Create draft `.md` and BACKLOG.md row. |
-| `PROPOSED` / `PROMOTED` / `DONE` / `DECLINED` | Skip; leave existing draft untouched. |
+| `PROPOSED` / `PROMOTED` / `DONE` / `DECLINED` **for a draft this proposal authored** (provenance comment cites this source task) | Skip; leave existing draft untouched (idempotent re-materialise). |
+| `PROPOSED` / `PROMOTED` / `DONE` / `DECLINED` **for an UNRELATED pre-existing unit** that merely occupies the `suggested_id` (a genuine id collision) | Re-home: allocate the next free id in the Story, materialise the proposed fix unit there, and re-point the proposal so promote-proposal wiring targets the real fix unit. The colliding unit is left untouched. NEVER a silent skip. |
 | `REJECTED` (archive exists under `rejected-proposals/<id>-*.md`) | Skip; do NOT recreate the draft. The operator's rejection decision is preserved across sweeps, orchestrator restarts, and replay attempts. |
 
 Practical consequences:
 
 - **Rejected drafts do not resurrect.** A draft you reject today stays rejected on tomorrow's sweep tick, next orchestrator loop, or any future manual materialise call.
 - **Retry is safe after a partial failure.** If a previous materialise run crashed halfway through (e.g. filesystem error on task 2 of 3), re-running materialise skips the already-materialised tasks and creates the rest.
-- **Concurrent sweep + manual-materialise calls do not fight.** Whichever call creates a given draft first wins; the other classifies the same task as PROPOSED and skips.
+- **Concurrent sweep + manual-materialise calls do not fight.** Whichever call creates a given draft first wins; the other classifies the same task as PROPOSED (authored by this proposal) and skips.
+- **An id collision never drops a fix unit.** A `suggested_id` that collides with an unrelated unit no longer silently no-ops (the old by-id skip): the fix unit the orchestrator proposed is materialised under a free id and the proposal JSON + downstream wiring follow the new id.
 
-CLI output distinguishes the two outcomes per task:
-- `"materialised"` list contains paths that were just created on this call.
-- `"skipped"` map associates every skipped task ID to its current classifier state.
+CLI output distinguishes the outcomes per task:
+- `"materialised"` list contains paths that were just created on this call (including any re-homed fix unit, under its allocated id).
+- `"skipped"` map associates every skipped task ID (own already-materialised / rejected work) to its current classifier state.
+- `"remapped"` map associates every collided original `suggested_id` to the free id it was re-homed to.
 
-See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and rejected alternatives.
+See [ADR-09](adr/09-idempotent-materialise-proposal.md) and [ADR-32](adr/32-materialise-collision-rehome.md) for the rationale and rejected alternatives.
 
 ## Rejected proposals are archived, not deleted
 

@@ -29,7 +29,7 @@ import logging
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -1830,27 +1830,68 @@ def materialise_proposal(
             )
 
     drafts: list[Path] = []
+    remapped = False
     mgr = BacklogManager()
-    for proposed, state in classifications:
+    for index, (proposed, state) in enumerate(classifications):
+        # ``task`` is the (possibly re-homed) unit materialised this iteration.
+        # A collision re-home rebinds it to a free id without mutating the
+        # loop variable (ProposedTask is frozen; the loop var is read-only).
+        task = proposed
         if state is not ProposalTaskState.UNMATERIALISED:
-            # Classify-aware skip. The task is already in one of the
-            # terminal-for-materialise states: a draft exists (PROPOSED,
-            # PROMOTED, DONE, DECLINED) or a reject archive exists
-            # (REJECTED). Recreating the draft would resurrect rejected
-            # work or duplicate in-flight work.
-            logger.info(
-                "materialise_proposal: skipping %s in state %s "
-                "(already materialised, rejected, promoted, done, or declined)",
-                proposed.suggested_id,
-                state.value,
+            # A draft (or reject archive) already exists for this id. Two very
+            # different situations land here:
+            #
+            #   (a) Idempotent re-materialise of THIS proposal's own work -- a
+            #       draft we authored (provenance cites this source task) or a
+            #       draft we materialised and the operator later rejected
+            #       (REJECTED via archive, no live draft). Skipping is correct:
+            #       recreating would resurrect rejected work or duplicate
+            #       in-flight work.
+            #
+            #   (b) COLLISION with an UNRELATED pre-existing unit that merely
+            #       occupies the suggested id. Silently skipping here is the bug
+            #       (tracked issue: materialise-proposal-skips-by-id-on-collision):
+            #       the orchestrator-proposed fix unit would be dropped and the
+            #       blocked unit it unblocks would stay blocked forever. Instead,
+            #       allocate the next free id and materialise the fix unit there,
+            #       re-pointing the proposal so downstream promote-proposal wiring
+            #       targets the real fix unit.
+            existing_draft = _find_draft_file(backlog_root, proposed.suggested_id)
+            is_own_work = existing_draft is not None and _draft_authored_by_source(
+                existing_draft, proposal.source_task_id
             )
-            continue
-        story_id = _extract_story_id(proposed.suggested_id)
+            if existing_draft is None or is_own_work:
+                logger.info(
+                    "materialise_proposal: skipping %s in state %s "
+                    "(already materialised, rejected, promoted, done, or declined)",
+                    proposed.suggested_id,
+                    state.value,
+                )
+                continue
+            colliding_id = proposed.suggested_id
+            free_id = allocate_next_ids(workspace_root, backlog_root, _extract_story_id(colliding_id), 1)[0]
+            logger.warning(
+                "materialise_proposal: suggested_id %s collides with a pre-existing unrelated "
+                "unit (state %s); re-homing the proposed fix unit to free id %s so it is not "
+                "silently dropped.",
+                colliding_id,
+                state.value,
+                free_id,
+            )
+            # Re-point the proposal so the materialised draft's provenance and the
+            # downstream wiring (promote-proposal matches the proposal's
+            # suggested_id against the live draft id) follow the new id.
+            # ProposedTask is frozen, so build a replacement and swap it back into
+            # the shared list the caller holds (so it can re-persist the JSON).
+            task = replace(proposed, suggested_id=free_id)
+            proposal.proposed_tasks[index] = task
+            remapped = True
+        story_id = _extract_story_id(task.suggested_id)
         story_dir = _story_dir(backlog_root, story_id)
         story_dir.mkdir(parents=True, exist_ok=True)
-        target = story_dir / f"{proposed.suggested_id}.md"
+        target = story_dir / f"{task.suggested_id}.md"
         content = generate_draft_md(
-            proposed,
+            task,
             repo=repo,
             source_task_id=proposal.source_task_id,
             generated_at=proposal.generated_at,
@@ -1859,26 +1900,49 @@ def materialise_proposal(
         atomic_write_text(target, content)
         rel_path = target.relative_to(workspace_root).as_posix()
         row = _render_backlog_row(
-            task_id=proposed.suggested_id,
-            title=proposed.title,
+            task_id=task.suggested_id,
+            title=task.title,
             status=new_wu_status,
             repo=repo,
             rel_path=rel_path,
         )
         _append_backlog_row(backlog_index, row)
         drafts.append(target)
-        logger.info("Materialised proposed task %s -> %s", proposed.suggested_id, target)
+        logger.info("Materialised proposed task %s -> %s", task.suggested_id, target)
         # Operator-block Slack-gap spec F-proposal / AC-3: fire the
         # ``work_unit_materialised`` event once per draft created from the
         # proposal.  Best-effort + per-event-toggle gated inside the helper;
         # never breaks materialisation on a notification failure.
-        _notify_materialised(target, proposed.suggested_id, proposal.source_task_id)
+        _notify_materialised(target, task.suggested_id, proposal.source_task_id)
     if drafts:
         # Rebuild Status Summary counts so the `proposed` rows appear.
         # Skipped entirely when no drafts were created -- the summary is
         # already correct.
         mgr._update_status_summary(backlog_index)
+    if remapped:
+        # A collision re-homed at least one proposed task to a free id. Persist
+        # the updated proposal JSON (keyed by source_task_id, which is unchanged)
+        # so the downstream promote-proposal wiring -- which matches the on-disk
+        # proposal's suggested_id against the live draft id -- targets the real
+        # fix unit rather than the colliding pre-existing one. Only re-persist
+        # when the JSON actually exists on disk (some call paths pass an
+        # in-memory proposal that was never written).
+        _persist_proposal_if_present(workspace_root, proposal)
     return drafts
+
+
+def _persist_proposal_if_present(workspace_root: Path, proposal: Proposal) -> None:
+    """Overwrite the pending proposal JSON in place, if one exists on disk.
+
+    Companion to :func:`write_proposal` (which refuses to overwrite). Used by
+    :func:`materialise_proposal` after a collision re-home so the persisted
+    ``proposed_tasks[].suggested_id`` follows the allocated free id. No-op when
+    no proposal JSON exists for this source task.
+    """
+    target = proposal_path(workspace_root, proposal.source_task_id)
+    if not target.exists():
+        return
+    atomic_write_text(target, json.dumps(proposal.to_dict(), indent=2) + "\n")
 
 
 def _has_unresolved_proposals(backlog_index: Path, *, exclude_task_ids: frozenset[str] = frozenset()) -> bool:
@@ -1941,6 +2005,24 @@ def _find_draft_file(backlog_root: Path, task_id: str) -> Path | None:
     story_dir = _story_dir(backlog_root, story_id)
     target = story_dir / f"{task_id}.md"
     return target if target.is_file() else None
+
+
+def _draft_authored_by_source(draft: Path, source_task_id: str) -> bool:
+    """Return ``True`` when ``draft`` was materialised from ``source_task_id``'s proposal.
+
+    Every draft :func:`generate_draft_md` writes embeds a provenance comment
+    naming the originating source task (``from proposal for <source_task_id>.``).
+    This is the signal that distinguishes a legitimate idempotent re-materialise
+    of THIS proposal's own draft (skip) from a collision with an UNRELATED
+    pre-existing unit that merely happens to occupy the suggested id (re-home).
+    Any read error is treated as "not ours" so a collision is never silently
+    skipped on an unreadable file.
+    """
+    try:
+        content = draft.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return f"from proposal for {source_task_id}." in content
 
 
 def _notify_materialised(draft_path: Path, task_id: str, source_task_id: str) -> None:

@@ -53,9 +53,10 @@ Thin-approach refusal and unresolved-prior-proposals guard still run before any 
 - `src/devbench/cli.py` -- `cmd_materialise_proposal` emits `skipped` map; `cmd_sweep_proposals` uses pre-classify to report "N new, M skipped" and fast-path no-op when nothing unmaterialised remains.
 
 ### Tests
-- `tests/test_backlog/test_proposal.py::TestMaterialiseProposalIdempotent` -- five idempotency tests (rejected-archive skip, promoted/done/declined skip parametrised, partial-materialise happy path, double-call no-op, reject-then-remateralise).
-- `tests/test_backlog/test_proposal.py::TestMaterialiseProposal::test_skips_task_when_draft_file_already_exists` -- migrated from the prior raise-on-duplicate test.
+- `tests/test_backlog/test_proposal.py::TestMaterialiseProposalIdempotent` -- idempotency tests (rejected-archive skip, partial-materialise happy path, double-call no-op, reject-then-remateralise). The pre-existing-draft "skip by-id" tests were migrated to collision re-home by [ADR-32](32-materialise-collision-rehome.md): an UNRELATED unit occupying the id is re-homed, while THIS proposal's own drafts still skip.
 - `tests/test_cli.py::TestCmdSweepAutoAccept::test_rejected_draft_not_recreated_by_sweep` -- end-to-end guard.
+
+> **Refined by [ADR-32](32-materialise-collision-rehome.md):** the by-id skip in this ADR applies only to a draft THIS proposal authored (provenance-based). A `suggested_id` that collides with an unrelated pre-existing unit is re-homed to a free id rather than silently skipped, so an orchestrator-proposed fix unit is never dropped.
 
 ### Docs
 - `docs/adr/09-idempotent-materialise-proposal.md` (this file).

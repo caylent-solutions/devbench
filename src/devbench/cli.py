@@ -12728,9 +12728,11 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     # Pre-classify each proposed task so the CLI output can distinguish
     # "skipped because already resolved" from "materialised just now".
     # materialise_proposal itself logs the same skip rationale at INFO.
+    # Capture the original ids in declaration order so a collision re-home
+    # (suggested_id reassigned by materialise_proposal) is observable here.
+    original_ids = [task.suggested_id for task in proposal.proposed_tasks]
     pre_states = {
-        task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
-        for task in proposal.proposed_tasks
+        tid: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, tid) for tid in original_ids
     }
 
     try:
@@ -12744,12 +12746,29 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     except ProposalError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    skipped = {tid: state.value for tid, state in pre_states.items() if state is not ProposalTaskState.UNMATERIALISED}
+
+    # A collision re-home reassigns proposed_tasks[i].suggested_id to a free id.
+    # Surface every old -> new mapping so the operator can see the fix unit was
+    # created under a new id (never silently dropped on an id collision).
+    remapped = {
+        old: task.suggested_id
+        for old, task in zip(original_ids, proposal.proposed_tasks, strict=True)
+        if old != task.suggested_id
+    }
+    # A task that was re-homed is NOT skipped -- it was materialised under a new
+    # id. Only report a task as skipped when its pre-state was terminal AND it
+    # was not re-homed.
+    skipped = {
+        tid: state.value
+        for tid, state in pre_states.items()
+        if state is not ProposalTaskState.UNMATERIALISED and tid not in remapped
+    }
     logger.info(
-        "Materialised %d proposed task(s) from %s (skipped %d)",
+        "Materialised %d proposed task(s) from %s (skipped %d, re-homed %d)",
         len(drafts),
         source_task_id,
         len(skipped),
+        len(remapped),
     )
     print(
         json.dumps(
@@ -12757,6 +12776,7 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
                 "source_task_id": source_task_id,
                 "materialised": [str(p) for p in drafts],
                 "skipped": skipped,
+                "remapped": remapped,
             }
         )
     )

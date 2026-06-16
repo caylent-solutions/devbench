@@ -2024,25 +2024,38 @@ class LogTailDetector:
             (LogTailKind.QUOTA, config.markers_quota),
             (LogTailKind.CLEAN, config.markers_clean),
         )
-        self._offset = 0
+        # Tail from the CURRENT END so historical markers from PRIOR runs in a
+        # long-lived orchestrator log (the workspace logs/orchestrator.log persists
+        # across runs and accumulates [ORCHESTRATOR_STOP_REASON] / ALL_DONE / ...
+        # markers) are NEVER re-detected -- only markers appended AFTER this
+        # detector starts. Seeding the byte offset to the file's current size (a
+        # cheap stat, not a full read) gives tail-from-end semantics and avoids
+        # reading the entire (potentially huge) log into memory on every poll.
+        self._offset = log_path.stat().st_size if log_path.exists() else 0
 
     def poll(self) -> LogTailHit | None:
         """Return the highest-precedence actionable marker in the new log bytes.
 
         Returns ``None`` when the log is absent, has no new bytes, or the new
-        bytes contain no configured marker. The byte offset advances each call so
-        a marker is reported at most once.
+        bytes contain no configured marker. Only the bytes appended since the last
+        call are read (a ``seek`` to the retained byte offset -- never a full-file
+        read), so a marker is reported at most once and a multi-hundred-MB log is
+        never loaded whole.
         """
         if not self._log_path.exists():
             return None
-        data = self._log_path.read_text(encoding="utf-8", errors="replace")
-        if len(data) <= self._offset:
-            # No new bytes (or the file was truncated/rotated to a shorter size:
-            # reset the offset so a rotated log is re-read from its new start).
-            self._offset = min(self._offset, len(data))
+        size = self._log_path.stat().st_size
+        if size < self._offset:
+            # The log was truncated/rotated to a shorter size: re-read from its
+            # new start so a rotated log's fresh content is not skipped.
+            self._offset = 0
+        if size <= self._offset:
             return None
-        new_text = data[self._offset :]
-        self._offset = len(data)
+        with self._log_path.open("rb") as fh:
+            fh.seek(self._offset)
+            new_bytes = fh.read(size - self._offset)
+        self._offset += len(new_bytes)
+        new_text = new_bytes.decode("utf-8", errors="replace")
         for kind, markers in self._ordered:
             for marker in markers:
                 idx = new_text.find(marker)

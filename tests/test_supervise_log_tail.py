@@ -118,3 +118,45 @@ class TestLogTailPrecedence:
         hit = detector.poll()
         assert hit is not None
         assert hit.kind is LogTailKind.FAULT
+
+
+@pytest.mark.unit
+class TestLogTailFromEnd:
+    """poll() tails from the END at construction: historical markers from PRIOR
+    runs in a long-lived log are NEVER re-detected (the false-fault-on-startup
+    regression: the workspace logs/orchestrator.log persists across runs and is
+    full of old [ORCHESTRATOR_STOP_REASON] markers; seeding the offset to 0 made
+    the first poll fault the fresh session on ancient history)."""
+
+    def test_preexisting_markers_not_detected(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "logs" / "orchestrator.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # A long-lived log ALREADY holding fault + clean markers from prior runs.
+        log_path.write_text(
+            "[ORCHESTRATOR_STOP_REASON] reason=old-run\nALL_DONE old backlog\n",
+            encoding="utf-8",
+        )
+        detector = LogTailDetector(log_path=log_path, config=SuperviseLogTailConfig())
+        # Tail-from-end: the pre-existing history must NOT be reported.
+        assert detector.poll() is None
+        # Only a marker appended AFTER construction is detected.
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("[ORCHESTRATOR_STOP_REASON] reason=new-run\n")
+        hit = detector.poll()
+        assert hit is not None
+        assert hit.kind is LogTailKind.FAULT
+        assert "new-run" in hit.line
+
+    def test_rotated_log_reread_from_new_start(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "logs" / "orchestrator.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Long-lived history (no actionable marker) -> offset seeded past it.
+        log_path.write_text("x" * 200 + "\n", encoding="utf-8")
+        detector = LogTailDetector(log_path=log_path, config=SuperviseLogTailConfig())
+        assert detector.poll() is None
+        # Rotation/truncation to shorter, fresh content carrying a marker: the
+        # detector resets to the new start and reads it.
+        log_path.write_text("ALL_DONE fresh\n", encoding="utf-8")
+        hit = detector.poll()
+        assert hit is not None
+        assert hit.kind is LogTailKind.CLEAN

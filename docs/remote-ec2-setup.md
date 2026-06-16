@@ -1,5 +1,13 @@
 # Remote EC2 setup guide
 
+> **Maturity: this EC2 / remote-execution mode is BETA and not fully tested.**
+> Treat it as experimental. The PREFERRED, most stable, ENTERPRISE-grade way to
+> run devbench is the SDK mode (`devbench start --daemon`) in a local
+> devcontainer; the headless screen-daemon interactive (`devbench supervise`)
+> mode is likewise still beta (see [supervise.md](supervise.md)). See
+> [execution-modes.md Mode maturity](execution-modes.md#mode-maturity-read-this-before-choosing-a-mode)
+> for the full ranking.
+
 This guide walks an operator from `aws sso login` to a running orchestrator on a remote EC2 dev box. It sequences the existing material under `infra/`, `infra/docs/`, and `tools/devbench_session.py` into a linear reader flow; each step links to the authoritative source rather than duplicating it.
 
 ## Table of contents

@@ -28,6 +28,18 @@ it sits beside the SDK and foreground-interactive modes, and ADR-31
 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md))
 for the design rationale.
 
+> **Maturity: this headless screen-daemon interactive (supervise) mode is BETA
+> and not yet fully refined.** It exists specifically to work within the Claude
+> Code Max-plan rolling 5-hour quota windows on a subscription. It is still being
+> hardened: the interactive prompt-detection is version-fragile, and the exact
+> usage-limit prompt strings are still being verified against a real quota event
+> (see [Troubleshooting](#troubleshooting)). The SDK mode (`devbench start
+> --daemon`) is the PREFERRED, most stable, ENTERPRISE-grade way to run devbench
+> and is recommended unless you specifically need subscription billing; the EC2 /
+> remote-execution mode (see [remote-ec2-setup.md](remote-ec2-setup.md)) is also
+> beta and not fully tested. See
+> [execution-modes.md Mode maturity](execution-modes.md#mode-maturity-read-this-before-choosing-a-mode).
+
 ## Table of contents
 
 - [Billing modes (the raison d'etre)](#billing-modes-the-raison-detre)

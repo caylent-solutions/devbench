@@ -53,6 +53,18 @@ The ADR-07 cascade itself is unchanged: it already iterates per-marker correctly
 4. Write the Dependencies row and the `[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>` marker comment (signed `[agent/operator]`, distinguishable from task-factory-written markers).
 5. Idempotent: if either the row or the marker is already present, the corresponding write is skipped; `wired: false` in the output JSON means the call was a complete no-op.
 
+### When `devbench remove-dep <blocked> <blocker>` runs (the inverse of `add-dep`)
+
+The `remove-dep` verb (shipped after this ADR landed; see [Follow-up shipped](#follow-up-shipped)) is the exact inverse of `add-dep` -- it cuts the edge `add-dep` (or `promote-proposal`) wired:
+
+1. Validate both IDs match the task-ID regex and are not the same task; confirm both exist in the backlog index (fail-fast otherwise).
+2. Remove the `## Dependencies`-table row for `<blocker>` from `<blocked>`'s file (collapsing the table to the canonical `| none | | |` row when it empties).
+3. Strip the open `[BLOCKED_PENDING_PROPOSAL] <blocker>` marker via the same strip mechanism `reject-proposal` uses, so `_has_open_proposal_marker`, `_comments_have_marker`, and the `add-dep` reverse-cycle guard all stop treating the edge as live. (The `[CASCADE_RESOLVED]` close the auto-requeue cascade writes only flips the blocker's *status* and leaves the marker text in place, so it would not clear those substring readers; the physical strip is the correct close here.)
+4. Append a `[DEP_REMOVED]` audit comment recording the cut + operator reason to the blocked task's append-only Comments history.
+5. Idempotent: removing an edge that does not exist is a clean no-op that writes nothing; `removed: false` in the output JSON means there was no such dependency.
+
+See the full reference in [cli-reference.md `remove-dep`](../cli-reference.md#remove-dep).
+
 ## Consequences
 
 - **Cross-task blocker-fixes are a first-class workflow.** One `promote-proposal` call wires every task the fix unblocks; no operator ever has to hand-edit a sibling task's file.
@@ -74,23 +86,29 @@ The blocked-split UX is the current state; operator alerting of attention-class 
 
 **Multi-source proposal JSON.** Allow `source_task_id` to be a list. Rejected: `source_task_id` has well-defined semantics in the existing surface (the "task whose amendment was rejected") and changing it to a list creates churn across every downstream reader (task-factory, classify, FAQ wording) for a gain already covered by `affected_task_ids`.
 
-**`remove-dep` command.** Covered under "what this ADR does NOT do" -- see the plan document. Operators can still hand-edit a single row + comment line when needed; the recurring failure mode was addition, not removal.
+**`remove-dep` command (at the time of this ADR).** This ADR deliberately scoped out the inverse cut, because the recurring failure mode was addition, not removal. That scoping was later revisited and the verb was shipped -- see [Follow-up shipped](#follow-up-shipped).
+
+## Follow-up shipped
+
+The `remove-dep` verb that this ADR scoped out was subsequently implemented as the exact inverse of `add-dep`: it removes the Dependencies-table row and strips the open `[BLOCKED_PENDING_PROPOSAL]` marker (the same strip mechanism `reject-proposal` uses), appends a `[DEP_REMOVED]` audit comment, and is idempotent on a non-existent edge. See [When `devbench remove-dep` runs](#when-devbench-remove-dep-blocked-blocker-runs-the-inverse-of-add-dep) above and the [cli-reference.md `remove-dep`](../cli-reference.md#remove-dep) reference. It does not change any wiring semantics in this ADR; it only provides a CLI path to undo an edge.
 
 ## Related files
 
 ### Python
-- `src/devbench/backlog/proposal.py` -- `Proposal.affected_task_ids` field; `from_dict` validation; `PromoteResult` dataclass; `_find_originating_proposal`; `promote_proposal` wiring loop; `_append_manual_dep_comment`; `add_dep` helper.
-- `src/devbench/cli.py` -- `cmd_promote_proposal` emits `wired_targets`; new `cmd_add_dep` + `_parse_add_dep_argv`; `_COMMANDS` registration.
+- `src/devbench/backlog/proposal.py` -- `Proposal.affected_task_ids` field; `from_dict` validation; `PromoteResult` dataclass; `_find_originating_proposal`; `promote_proposal` wiring loop; `_append_manual_dep_comment`; `add_dep` helper; `remove_dep` helper + `_append_remove_dep_comment` (the inverse cut shipped as a follow-up).
+- `src/devbench/cli.py` -- `cmd_promote_proposal` emits `wired_targets`; `cmd_add_dep` + `cmd_remove_dep` sharing `_parse_dep_edge_argv`; `_COMMANDS` registration.
 
 ### Plugin prompts
-- `plugin/devbench/agents/blocker-resolver.md` -- `affected_task_ids` evidence rubric and example payload.
-- `plugin/devbench/agents/executor.md` -- validation-gate section cross-reference.
+- `plugin/devbench-orchestrate/agents/blocker-resolver.md` -- `affected_task_ids` evidence rubric and example payload.
+- `plugin/devbench-orchestrate/agents/executor.md` -- validation-gate section cross-reference.
 
 ### Tests
 - `tests/test_backlog/test_proposal.py::TestProposalAffectedTaskIds` (schema).
 - `tests/test_backlog/test_proposal.py::TestPromoteProposalAffectedWiring` (wiring loop).
 - `tests/test_backlog/test_proposal.py::TestAddDepCoreHelper` (add_dep helper).
 - `tests/test_cli.py::TestCmdAddDep` (CLI surface).
+- `tests/test_backlog/test_proposal_remove_dep.py` (remove_dep helper: row removal, marker close, idempotent no-op, fail-fast, none-row collapse).
+- `tests/test_cli_remove_dep.py` (remove-dep CLI surface: happy path, no-op, fail-fast).
 - `tests/test_cli.py::TestCmdPromoteProposal` (wired_targets in JSON output).
 - `tests/test_integration/test_task_factory_lifecycle.py::TestAffectedTaskIdsLifecycle` (end-to-end cascade across source + 2 peers).
 - `tests/test_plugin/test_agent_structure.py::TestBlockerResolverAffectedTaskIdsInstruction` (prompt regression pin).

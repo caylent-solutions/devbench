@@ -75,6 +75,8 @@ Pick the doc closest to your role.
 
 See [docs/execution-modes.md](docs/execution-modes.md) for the full step-by-step lifecycle (claim, implement, review, retry, security, git-ops, mark-done) and ownership rules.
 
+> **Choosing an execution mode (maturity ranking).** The SDK mode (`devbench start --daemon`) is the PREFERRED, most stable, ENTERPRISE-grade way to run devbench and is recommended for any production or unattended run. The headless screen-daemon interactive (`devbench supervise`) mode -- which exists specifically to run within the Claude Code Max-plan rolling 5-hour quota windows on a subscription -- is BETA and not yet fully refined (see [docs/supervise.md](docs/supervise.md)). The EC2 / remote-execution mode (see [docs/remote-ec2-setup.md](docs/remote-ec2-setup.md)) is also BETA and not fully tested. In short: SDK = stable and recommended; supervise = beta; EC2 / remote = beta and not fully tested. See [docs/execution-modes.md Mode maturity](docs/execution-modes.md#mode-maturity-read-this-before-choosing-a-mode).
+
 ```
 Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
   |
@@ -85,7 +87,7 @@ Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
   |     |-- Optional: manifest-amender judges a `tdd_green_production_fix`
   |     |   amendment when the executor needs to expand the Manifest mid-cycle
   |-- Run repo's task runners (make test, make validate)
-  |-- Stage files, submit to judge review  [review-supervisor agent]
+  |-- Stage files, submit to judge review  [4 reviewers dispatched directly by the orchestrate skill, ADR-28]
   |     |-- code-reviewer       -- SOLID, DRY, fail-fast, security, 12-factor
   |     |-- test-reviewer       -- TDD discipline, test quality, real assertions
   |     |-- doc-reviewer        -- accuracy, completeness, sync with code
@@ -153,7 +155,7 @@ Full per-command details, flags, and examples live in [docs/cli-reference.md](do
 | **Backlog write** | `claim`, `set-status`, `mark-done`, `decline`, `start`, `promote` |
 | **Orchestrator helpers** | `log`, `log-verdict`, `log-comment`, `log-tdd`, `get-diff`, `run-tests`, `ensure-branch`, `git-ops`, `git-ops-finalize` |
 | **Amendment workflow** | `request-amendment`, `apply-amendment`, `reject-amendment` |
-| **Proposal workflow** | `write-proposal`, `materialise-proposal`, `sweep-proposals`, `promote-proposal`, `reject-proposal`, `add-dep` |
+| **Proposal workflow** | `write-proposal`, `materialise-proposal`, `sweep-proposals`, `promote-proposal`, `reject-proposal`, `add-dep`, `remove-dep` |
 
 All commands run from the parent workspace root (the directory containing the `devbench` checkout):
 
@@ -444,6 +446,8 @@ make start-interactive
 Both start modes authenticate with GitHub (or skip when `GH_TOKEN` is set), grant required scopes (repo, workflow, read:org, admin:repo_hook, security_events), and launch the orchestrator.
 
 ## Remote EC2 dev environments
+
+> **Maturity: BETA, not fully tested.** The EC2 / remote-execution mode is beta and not yet fully tested. Prefer running the SDK mode (`devbench start --daemon`, the stable enterprise-grade default) in a local devcontainer until the remote path matures.
 
 For unattended runs, multi-operator workflows, or multiple parallel orchestrate sessions per operator, run the orchestrator on a remote EC2 dev box instead of in your local devcontainer. The provisioning stack (Terraform + Terragrunt + Ansible + a per-user multi-session launcher) is documented end-to-end in [`docs/remote-ec2-setup.md`](docs/remote-ec2-setup.md). It covers prerequisites, shared-infra provisioning, per-user instance stamping, Ansible bootstrap, the `devbench-session` launcher, environment configuration (including the E230 `DEVBENCH_ORCHESTRATOR_SESSION_ID` filter), and refresh / teardown workflows.
 

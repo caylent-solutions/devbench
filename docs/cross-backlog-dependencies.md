@@ -39,6 +39,8 @@ DEVBENCH_WORKSPACE_ROOT=... DEVBENCH_CLAUDE_MODEL=... \
 
 `add-dep` writes the manual blocker into the dependent's `## Dependencies` table with status `proposed`. When `devbench report` runs, the dependent appears under "Blocked tasks (auto-clearing via proposal)" rather than "needs operator attention" because the cascade-classifier sees a `proposed` blocker as resolvable. Once the operator flips the manual blocker to `done`, every dependent that has only this blocker becomes claimable.
 
+To undo a wire (for example, when a dependent task no longer needs the external gate), run the inverse verb: `uv run --project ... devbench remove-dep <dependent-task-id> <blocker-task-id> --reason "<why>"`. It removes the Dependencies-table row AND strips the open `[BLOCKED_PENDING_PROPOSAL]` marker so the cascade and every other marker reader stop treating the edge as live, and is idempotent on a non-existent edge. See [cli-reference.md `remove-dep`](cli-reference.md#remove-dep).
+
 ### Step 3 -- Document the unblock procedure
 
 The manual-blocker Task's description MUST list the exact verification commands the operator runs to confirm the external work is complete, plus the `devbench set-status <id> done` invocation that clears the gate. See the example in `manual-blockers.md`.

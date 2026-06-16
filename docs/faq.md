@@ -146,7 +146,7 @@ The proposal's `affected_task_ids` list was empty. By default `promote-proposal`
 Two fixes, depending on where you are in the lifecycle:
 
 1. **Before promote.** Populate the proposal's `affected_task_ids: list[str]` field with the peer task IDs. The `blocker-resolver` prompt now instructs the agent to populate this field when a shared-root-cause signature is evident (same failing test name, same production file in both blocker comments, etc.). If the agent missed a peer, you can also edit the JSON on disk at `.devbench/proposals/<source-id>.json` before `materialise-proposal` runs.
-2. **After promote.** Run `uv run devbench add-dep <peer-task-id> <promoted-task-id> --reason "..."`. This wires the marker + Dependencies row on the peer task idempotently; the ADR-07 cascade picks the peer up when the promoted fix completes. See the [cli-reference entry](cli-reference.md#add-dep).
+2. **After promote.** Run `uv run devbench add-dep <peer-task-id> <promoted-task-id> --reason "..."`. This wires the marker + Dependencies row on the peer task idempotently; the ADR-07 cascade picks the peer up when the promoted fix completes. See the [cli-reference entry](cli-reference.md#add-dep). Wired the wrong peer, or want to cut an edge later? `uv run devbench remove-dep <peer-task-id> <blocker-task-id> --reason "..."` is the exact inverse (removes the row + strips the marker, idempotent on a missing edge) -- see [`remove-dep`](cli-reference.md#remove-dep).
 
 See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md) for the full design and the alternatives that were rejected.
 

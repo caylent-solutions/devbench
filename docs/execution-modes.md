@@ -1,13 +1,24 @@
 # Execution Modes
 
-DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules -- the difference is whether the orchestrate skill runs non-interactively (background/unattended, the **recommended default**) or interactively (a live Claude Code session, intended for **observation only**).
+DevBench launches the SAME orchestrate skill, executor, and judges in one of a few ways. Every mode follows the same lifecycle and the same ownership rules -- the modes differ only in the launch wrapper and (for `supervise`) the billing channel. The two everyday modes are the **non-interactive Agent SDK** path (`make start` / `devbench start --daemon`, the **recommended default**) and the **foreground interactive** path (a live Claude Code session, intended for **observation only**). A third, BETA, path -- `devbench supervise` -- runs the interactive orchestrator unattended under a detached `screen` daemon (see [Supervised interactive mode](#supervised-interactive-mode-devbench-supervise-start----billing-mode-selected)).
 
-**Recommendation:** use non-interactive (`make start`) for production runs. DevBench's review judges + manifest amender + blocker resolver are stable enough that the backlog is the right place to manage the run -- not a live console. **Live observation is fully available in non-interactive mode** via `devbench hook-tail` (every tool call streamed), `devbench report` (live progress dashboard), and `devbench status`, so you do not need interactive mode just to see what's happening. When you do need to change something, stop the run and apply the change through two complementary tools: the **`devbench` CLI** for state transitions and dep wiring (`decline`, `hold`, `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`, `validate-backlog`), and **Claude** (separate session) for editing the work-unit `.md` content (Approach, Manifest, Acceptance Criteria, or authoring new work units). The CLI never edits prose; Claude does. Live mid-claim intervention typically does more harm than good. See [`zero-to-ready.md`](zero-to-ready.md) Step 10 for the full two-track workflow.
+## Mode maturity (read this before choosing a mode)
+
+The launch modes are NOT at the same level of maturity. Choose accordingly:
+
+- **SDK mode (`devbench start --daemon`) -- PREFERRED, most stable, ENTERPRISE-grade.** This is the recommended way to run devbench for any production or unattended run. The SDK owns its turn boundaries programmatically, so the whole class of interactive-PTY hangs cannot occur. Use this unless you have a specific reason not to.
+- **Supervised interactive mode (`devbench supervise`) -- BETA, not yet fully refined.** This headless `screen`-daemon interactive path exists specifically so an operator can run the orchestrator within the Claude Code Max-plan rolling 5-hour quota windows on a subscription. It is still being hardened (interactive prompt-detection is version-fragile and the quota-prompt strings are still being verified against a real event) and should be treated as beta.
+- **EC2 / remote-execution mode -- BETA, not fully tested.** The remote EC2 provisioning stack (see [remote-ec2-setup.md](remote-ec2-setup.md)) is beta and not fully tested. Prefer running the SDK mode in a local devcontainer until the remote path matures.
+
+In short: SDK = stable and recommended; supervise = beta; EC2 / remote = beta and not fully tested.
+
+**Recommendation:** use non-interactive (`make start` / `devbench start --daemon`) for production runs. DevBench's review judges + manifest amender + blocker resolver are stable enough that the backlog is the right place to manage the run -- not a live console. **Live observation is fully available in non-interactive mode** via `devbench hook-tail` (every tool call streamed), `devbench report` (live progress dashboard), and `devbench status`, so you do not need interactive mode just to see what's happening. When you do need to change something, stop the run and apply the change through two complementary tools: the **`devbench` CLI** for state transitions and dep wiring (`decline`, `hold`, `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`, `validate-backlog`), and **Claude** (separate session) for editing the work-unit `.md` content (Approach, Manifest, Acceptance Criteria, or authoring new work units). The CLI never edits prose; Claude does. Live mid-claim intervention typically does more harm than good. See [`zero-to-ready.md`](zero-to-ready.md) Step 10 for the full two-track workflow.
 
 For the wider context (component architecture, judge tier, multi-PR vs single-PR mode), see the [architecture overview](architecture.md). This doc focuses on the per-step lifecycle and ownership rules.
 
 ## Table of contents
 
+- [Mode maturity (read this before choosing a mode)](#mode-maturity-read-this-before-choosing-a-mode)
 - [Modes at a Glance](#modes-at-a-glance)
 - [Lifecycle: Step-by-Step](#lifecycle-step-by-step)
 - [Ownership rules](#ownership-rules)
@@ -187,6 +198,8 @@ Claude Code session (with devbench plugin active)
 The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply -- the executor does not commit until all judges pass.
 
 ### Supervised interactive mode (`devbench supervise start`) -- billing-mode-selected
+
+> **Maturity: BETA, not yet fully refined.** This headless `screen`-daemon interactive mode exists specifically to run within the Claude Code Max-plan rolling 5-hour quota windows on a subscription. Prefer the SDK mode (`devbench start --daemon`) -- it is the stable, enterprise-grade default -- unless you specifically need subscription billing. See [Mode maturity](#mode-maturity-read-this-before-choosing-a-mode).
 
 A third execution mode launches the SAME interactive orchestrator, but unattended: under a detached `screen` daemon, driven by a `pexpect` supervisor, so it survives terminal detach and self-heals across quota windows and restarts. Its defining property is the billing channel, selected by `--billing-mode` (default `subscription`): the session bills either against the Claude Code subscription's rolling 5-hour usage windows (`subscription`) or via AWS Bedrock with no 5-hour windows (`bedrock`). In both modes the AWS workload creds pass through (the orchestrator runs live AWS terratests). The SDK `make start` path bills at API/Bedrock rates; see [llm-authentication.md](llm-authentication.md).
 

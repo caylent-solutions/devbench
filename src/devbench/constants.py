@@ -566,7 +566,16 @@ SIDE_BY_SIDE_GAP_CHARS: int = 4
 
 # Timeout defaults (seconds)
 DEFAULT_GH_API_TIMEOUT: int = 30
-DEFAULT_TEST_TIMEOUT: int = 300
+# Generic per-AC verification-command budget. A backlog whose ACs run live
+# infrastructure tests (terraform/terragrunt apply + idempotency re-plan +
+# cleanup destroy, or any long-running ``go test``) needs far more than the
+# former 5-minute value, which spuriously killed such a test at 300s. This is a
+# GENERIC long-operation budget (1 hour), not a backlog-specific value: any
+# individual directive that needs a different bound declares ``timeout=<seconds>``
+# on its own VERIFY line, and the operator can still override the global default
+# via ``DEVBENCH_TEST_TIMEOUT``. A short unit-test AC simply finishes long before
+# this bound, so the larger default is harmless for fast suites.
+DEFAULT_TEST_TIMEOUT: int = 3600
 DEFAULT_SECURITY_FETCH_TIMEOUT: int = 120
 DEFAULT_LLM_TIMEOUT: int = 300
 DEFAULT_COMMAND_TIMEOUT: int = 120

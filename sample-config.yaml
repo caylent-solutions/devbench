@@ -210,7 +210,13 @@ quota_handling:
 # ---------------------------------------------------------------------------
 timeouts:
   gh_api: 30
-  test: 300
+  # Per-AC command budget verify-ac applies to every executable VERIFY directive.
+  # Defaults to a generic 1-hour long-operation budget so a backlog whose ACs run
+  # live infrastructure tests is not killed at 5 minutes; a single directive can
+  # override it with `timeout=<seconds>` on its own VERIFY line, and the env var
+  # DEVBENCH_TEST_TIMEOUT overrides it globally. Short unit-test ACs finish long
+  # before the bound, so the larger default is harmless for fast suites.
+  test: 3600
   security_fetch: 120
   llm: 300
   command: 120

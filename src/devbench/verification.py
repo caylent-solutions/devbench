@@ -12,9 +12,14 @@ without creating import cycles.
 
 Directive grammar (one per AC, inside ``## Verification``)::
 
-    - VERIFY AC-3 | type=terratest | tool=terragrunt | cmd=`make tf-test UNIT=...` | expect-exit=0
+    - VERIFY AC-3 | type=terratest | tool=terragrunt | cmd=`make tf-test UNIT=...` | expect-exit=0 | timeout=5400
     - VERIFY AC-7 | type=smoke | cmd=`make smoke URL=$URL` | expect-exit=0
     - VERIFY AC-9 | type=deferred | owner=operator | reason="prod apply is operator-only"
+
+The optional ``timeout=<seconds>`` field overrides the global per-command budget
+(``DEVBENCH_TEST_TIMEOUT`` / ``DEFAULT_TEST_TIMEOUT``) for that one directive, so a
+backlog can derive a long-running directive's bound from the test's own declared
+timeout without raising the global default for fast unit-test ACs.
 
 ``type`` is one of :class:`VerificationType`. ACs with no executable claim default to
 ``type=judge`` (qualitative -- left to the core review judges, never gated here).
@@ -445,6 +450,11 @@ class VerificationItem:
     expect_exit: int = 0
     owner: str | None = None
     reason: str | None = None
+    #: Per-AC command-execution timeout override (seconds). ``None`` means the
+    #: runner falls back to the global ``DEVBENCH_TEST_TIMEOUT`` / default.
+    #: Lets a backlog derive a directive's bound from the test's own declared
+    #: timeout (e.g. a 90-minute live terratest) without changing the global.
+    timeout: int | None = None
     raw: str = ""
 
     def is_executable(self) -> bool:
@@ -530,6 +540,21 @@ def parse_verification_item(line_body: str) -> VerificationItem:
                 f"VERIFY directive has non-integer expect-exit {fields['expect-exit']!r}: {raw.strip()!r}."
             ) from exc
 
+    timeout: int | None = None
+    if "timeout" in fields:
+        try:
+            timeout = int(fields["timeout"])
+        except ValueError as exc:
+            raise ValueError(
+                f"VERIFY directive has non-integer timeout {fields['timeout']!r}: {raw.strip()!r}. "
+                "timeout= must be a positive integer number of seconds."
+            ) from exc
+        if timeout <= 0:
+            raise ValueError(
+                f"VERIFY directive has non-positive timeout {timeout!r}: {raw.strip()!r}. "
+                "timeout= must be a positive integer number of seconds."
+            )
+
     return VerificationItem(
         ac_ids=ac_ids,
         vtype=vtype,
@@ -538,6 +563,7 @@ def parse_verification_item(line_body: str) -> VerificationItem:
         expect_exit=expect_exit,
         owner=fields.get("owner"),
         reason=fields.get("reason"),
+        timeout=timeout,
         raw=raw.strip(),
     )
 

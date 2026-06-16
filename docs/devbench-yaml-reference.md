@@ -172,13 +172,20 @@ uv run devbench promote --all --yes
 ```yaml
 timeouts:
   gh_api: 30
-  test: 300
+  test: 3600
   security_fetch: 120
   llm: 300
   command: 120
   orchestrator_poll_interval: 10
   github_check: 600
 ```
+
+`test` is the per-AC command budget `verify-ac` applies to every executable
+`VERIFY` directive (also overridable per-directive via `timeout=<seconds>` on the
+directive itself, and globally via `DEVBENCH_TEST_TIMEOUT`). It defaults to a
+generic long-operation budget (1 hour) so a backlog whose ACs run live
+infrastructure tests is not killed at 5 minutes; short unit-test ACs finish long
+before the bound, so the larger default is harmless for fast suites.
 
 Environment variable overrides are applied by `config.py` (not this module).
 

@@ -175,9 +175,10 @@ make/cdk/sam/... or "passes" / "succeeds" / "smoke"). Each maps to a command who
 exit code `devbench verify-ac` captures (never self-reported); `mark-done` is blocked
 until every executable AC has a tool-captured exit-0 record. Grammar:
 
-  VERIFY AC-N | type=[terratest|apply|plan|destroy|deploy|smoke|command] | tool=[optional] | cmd=`[command]` | expect-exit=0
+  VERIFY AC-N | type=[terratest|apply|plan|destroy|deploy|smoke|command] | tool=[optional] | cmd=`[command]` | expect-exit=0 | timeout=[optional-seconds]
 
-Use 'type=deferred | owner=operator | reason="..."' for operator-only steps (these block
+Add 'timeout=<seconds>' to a directive to override the global per-AC command budget for that
+one line (e.g. a live terratest that runs 90 min: 'timeout=5400'). Use 'type=deferred | owner=operator | reason="..."' for operator-only steps (these block
 mark-done by default unless done_gate.allow_deferred_evidence is true). Use 'type=judge'
 for qualitative ACs (left to the core review judges; never gated). See
 docs/backlog-contract.md 'Verification Contract'.

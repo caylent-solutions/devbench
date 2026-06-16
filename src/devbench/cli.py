@@ -4843,7 +4843,7 @@ def cmd_verify_ac(unit_id: str) -> int:
                 unit_id,
                 attempt,
                 log_bytes=CI_FAILURE_LOG_BYTES,
-                timeout=TEST_TIMEOUT,
+                timeout=item.timeout if item.timeout is not None else TEST_TIMEOUT,
                 pin_randomly=pin_randomly,
             )
         )

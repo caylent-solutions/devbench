@@ -499,7 +499,7 @@ DevBench anchors deterministic completion proof on **Acceptance Criteria**. The 
 The `## Verification` section contains one `- VERIFY` directive per AC, in this exact grammar (one per line):
 
 ```
-- VERIFY AC-N | type=<terratest|apply|plan|destroy|deploy|smoke|command> | tool=<optional> | cmd=`<command>` | expect-exit=0
+- VERIFY AC-N | type=<terratest|apply|plan|destroy|deploy|smoke|command> | tool=<optional> | cmd=`<command>` | expect-exit=0 | timeout=<optional-seconds>
 - VERIFY AC-N | type=deferred | owner=operator | reason="<why a human must run this>"
 - VERIFY AC-N | type=judge
 ```
@@ -511,6 +511,7 @@ The `## Verification` section contains one `- VERIFY` directive per AC, in this 
 | `tool` | Optional. Auto-detected from `cmd` when omitted (e.g. `terragrunt`, `cdk`, `aws-cli` via the IaC tool matrix in `src/devbench/verification.py`). |
 | `cmd` | Backtick-wrapped command. A literal `\|` inside the command does not break field splitting because `cmd` is parsed first. Required for executable types. |
 | `expect-exit` | The exit code that counts as success. Defaults to `0`. |
+| `timeout` | Optional. Per-AC command timeout in seconds; a positive integer. Overrides the global `timeouts.test` / `DEVBENCH_TEST_TIMEOUT` budget for this one directive only. Use it to derive a long-running directive's bound from the test's own declared timeout (e.g. a 90-minute live terratest: `timeout=5400`) without raising the global default for fast unit-test ACs. A non-integer or non-positive value is an error. |
 | `owner` / `reason` | Used by `type=deferred` to record who must run the step and why it cannot be executed in the run. |
 
 A malformed directive (no `AC-N` id, or an unknown `type`) is **always an error** -- it would make the done-gate unparseable.

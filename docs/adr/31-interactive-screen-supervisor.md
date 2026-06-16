@@ -1,4 +1,4 @@
-# ADR-31: Interactive `screen` + `pexpect` Supervisor (Subscription-Billed Orchestrator)
+# ADR-31: Interactive `screen` + `pexpect` Supervisor (Billing-Mode Orchestrator)
 
 **Status:** Accepted
 
@@ -26,12 +26,20 @@ An operator running on a Claude Code **Max subscription** wants the
 orchestrator's token consumption to draw from the subscription's rolling 5-hour
 usage windows instead of being metered as per-token API spend. An interactive
 `claude` CLI session authenticated via the subscription login does exactly that.
-But the foreground-interactive path is not unattended: it dies when the terminal
+Some operators instead want the same interactive session billed via **AWS
+Bedrock** (which is always-on and has no 5-hour windows). Either way the
+foreground-interactive path is not unattended: it dies when the terminal
 detaches and has no quota-wait, auto-restart, or multi-session arbitration.
 
-We need an orchestrator launch that is (a) billed against the subscription, (b)
-unattended and detach-surviving, and (c) self-healing across quota windows and
-restarts -- without changing any existing launch path.
+We need an orchestrator launch that is (a) billed against the operator-selected
+channel (subscription or Bedrock), (b) unattended and detach-surviving, and (c)
+self-healing across quota windows and restarts -- without changing any existing
+launch path.
+
+Crucially, the supervised orchestrator runs **live AWS terratests**, so the AWS
+workload credentials MUST reach the session in every mode. AWS creds do not route
+Claude billing (only the Bedrock route flag does), so stripping them was a
+mistake that forced subscription billing and broke the live AWS path.
 
 ## Decision
 
@@ -42,15 +50,31 @@ supervisor.
 
 Key decisions:
 
-1. **Interactive CLI + subscription billing, over the SDK/API path.** The
-   supervised session is a real interactive `claude` session billed against the
-   subscription's 5-hour windows, not the API. The correctness guard is
-   environment minimization: the supervisor strips `ANTHROPIC_API_KEY`,
-   `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`,
-   `DEVBENCH_USE_BEDROCK`, and the `AWS_*` Bedrock-routing vars from the session
-   environment (the always-deny set is non-removable), and fails fast at
-   preflight if any is present in the operator environment. It also verifies the
-   subscription OAuth credential (`user:inference` scope) before launch.
+1. **Interactive CLI + operator-selected billing mode, over the SDK/API path.**
+   The supervised session is a real interactive `claude` session whose billing
+   channel is selected by `--billing-mode` (flag > `DEVBENCH_SUPERVISE_BILLING_MODE`
+   env > `supervise.billing_mode` config > default `subscription`; invalid value
+   fails fast). The deny set is a function of the mode (one DRY helper,
+   `resolve_supervise_deny_vars`):
+   - **`subscription`** strips the Claude-to-API/Bedrock ROUTING vars
+     (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`,
+     `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, and the claude-CLI Bedrock/Vertex
+     routing vars `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`/`ANTHROPIC_BEDROCK_BASE_URL`/`ANTHROPIC_MODEL`/`ANTHROPIC_SMALL_FAST_MODEL`/`AWS_BEARER_TOKEN_BEDROCK`)
+     so inference cannot route off-subscription, verifies the subscription OAuth
+     credential (`user:inference` scope), and engages the 5-hour quota wait.
+   - **`bedrock`** strips only the direct-Anthropic-API vars and EXPORTS the
+     claude-CLI Bedrock route (`CLAUDE_CODE_USE_BEDROCK=1` + `AWS_REGION` +
+     `ANTHROPIC_MODEL`), requires the AWS Bedrock prerequisites instead of
+     subscription auth, and disables the 5-hour wait (Bedrock has no windows).
+
+   The routing-var deny set (the union across modes) is non-removable -- a config
+   that tries to whitelist one fails fast -- and the supervisor fails fast at
+   preflight if a denied routing var is present in the operator environment.
+   **The AWS workload creds (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+   `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region (`AWS_REGION` /
+   `AWS_DEFAULT_REGION`) are in NEITHER mode's deny set and ALWAYS pass through**
+   (the orchestrator runs live AWS terratests). The non-root assertion applies in
+   both modes.
 
 2. **NOT `claude -p` / `--print`.** `-p`/`--print` is a non-interactive batch
    mode. It would reintroduce the wrong UX and is excluded by operator
@@ -106,10 +130,14 @@ poll-and-restart path plus the stable log markers carry correctness meanwhile.
 
 ## Consequences
 
-- DevBench can run the orchestrator unattended and detach-surviving on
-  subscription billing, complementing (not replacing) the SDK and
-  foreground-interactive paths. All three coexist; see
-  [../execution-modes.md](../execution-modes.md).
+- DevBench can run the orchestrator unattended and detach-surviving on either
+  subscription or Bedrock billing (selected by `--billing-mode`), complementing
+  (not replacing) the SDK and foreground-interactive paths. All three coexist;
+  see [../execution-modes.md](../execution-modes.md).
+- AWS workload creds always reach the supervised session, so the live AWS
+  terratests run in both billing modes. The 5-hour quota wait is engaged in
+  `subscription` mode and disabled in `bedrock` mode (which relies on the shared
+  `quota.py` Bedrock-throttle handling).
 - A new hard dependency (`pexpect`) and a new system dependency (`screen`) are
   introduced. Missing `screen` fails fast with an install message.
 - Observation is read-only by default (a redacted PTY-log follow that cannot

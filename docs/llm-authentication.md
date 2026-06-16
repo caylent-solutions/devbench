@@ -7,7 +7,7 @@ DevBench supports two LLM backends for judge evaluation. Choose one based on you
 - [Option 1: Anthropic API via Claude Code OAuth (default)](#option-1-anthropic-api-via-claude-code-oauth-default)
 - [Option 2: AWS Bedrock](#option-2-aws-bedrock)
 - [Per-agent model overrides (quota management)](#per-agent-model-overrides-quota-management)
-- [The supervise path: subscription-billed interactive orchestrator](#the-supervise-path-subscription-billed-interactive-orchestrator)
+- [The supervise path: billing-mode interactive orchestrator](#the-supervise-path-billing-mode-interactive-orchestrator)
 
 ## Option 1: Anthropic API via Claude Code OAuth (default)
 
@@ -229,17 +229,30 @@ claude --plugin-dir "$(uv run devbench prepare-plugin-shadow)"
 
 Workspaces without an `agents:` block build no shadow and use the canonical plugin path -- behaviour is bit-identical to pre-feature releases.
 
-## The supervise path: subscription-billed interactive orchestrator
+## The supervise path: billing-mode interactive orchestrator
 
 Both options above bill the orchestrator's inference at **API rates**: the SDK path (`devbench start`) hands the Claude Code OAuth `accessToken` to the Anthropic SDK as an `api_key` (Option 1), or routes to AWS Bedrock (Option 2). Either way, tokens are metered per-token against the API/Bedrock account.
 
-`devbench supervise` is the **subscription-billed** alternative. It launches the orchestrator as an interactive `claude` CLI session (under a detached `screen` daemon driven by a `pexpect` supervisor) authenticated via the Claude Code Max subscription login, so the session draws from the subscription's rolling 5-hour usage windows instead of per-token API/Bedrock billing. See [supervise.md](supervise.md) and ADR-31 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md)).
+`devbench supervise` launches the orchestrator as an interactive `claude` CLI session (under a detached `screen` daemon driven by a `pexpect` supervisor). Its `--billing-mode` flag (default `subscription`; precedence `--billing-mode` > `DEVBENCH_SUPERVISE_BILLING_MODE` env > `supervise.billing_mode` config > default) selects the channel. See [supervise.md](supervise.md) and ADR-31 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md)).
 
-**No-API-key requirement (correctness, not a preference).** An interactive `claude` session whose environment carries `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, or `AWS_*` Bedrock-routing vars) silently routes inference back to API billing and defeats the entire purpose. The supervisor therefore strips every one of those vars from the session environment (the always-deny set is non-removable) and FAILS FAST at preflight (exit 2) if any is present in the operator's environment:
+### `subscription` mode (default)
+
+Authenticated via the Claude Code Max subscription login, so the session draws from the subscription's rolling 5-hour usage windows instead of per-token API/Bedrock billing.
+
+**No-routing-var requirement (correctness, not a preference).** An interactive `claude` session whose environment carries `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, or the claude-CLI Bedrock/Vertex routing vars `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`/`ANTHROPIC_BEDROCK_BASE_URL`/`ANTHROPIC_MODEL`/`ANTHROPIC_SMALL_FAST_MODEL`/`AWS_BEARER_TOKEN_BEDROCK`) silently routes inference off-subscription and defeats the entire purpose. In `subscription` mode the supervisor strips every one of those routing vars from the session environment (the routing deny set is non-removable) and FAILS FAST at preflight (exit 2) if any is present in the operator's environment:
 
 ```
-ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session must bill
-against the Claude Code subscription, not the API. Unset it and retry.
+ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session in
+subscription mode must bill via the Claude Code subscription, not the direct
+API. Unset it and retry.
 ```
 
-It also verifies the same `~/.claude/.credentials.json` `user:inference` OAuth credential Option 1 documents (the supervisor verifies, but never manages, the login), and surfaces `billing-channel: subscription` in `supervise status`/`info` so an operator can audit the channel at a glance.
+It also verifies the same `~/.claude/.credentials.json` `user:inference` OAuth credential Option 1 documents (the supervisor verifies, but never manages, the login), and surfaces `billing-channel: subscription` in `supervise status`/`info`.
+
+### `bedrock` mode
+
+The same interactive session routes inference through AWS Bedrock. The supervisor strips only the direct-Anthropic-API vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`) and EXPORTS the claude-CLI Bedrock route the CLI needs (`CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`, and the resolved `ANTHROPIC_MODEL` Bedrock model id), consistent with the SDK Bedrock handling in Option 2. It does NOT require subscription auth; it FAILS FAST at preflight if the AWS Bedrock prerequisites are absent (no AWS credential among `AWS_ACCESS_KEY_ID`/`AWS_PROFILE`/`AWS_BEARER_TOKEN_BEDROCK`, or no `AWS_REGION`/`AWS_DEFAULT_REGION`). It surfaces `billing-channel: bedrock` in `supervise status`/`info`. Because Bedrock has no 5-hour subscription windows, the supervisor's 5-hour quota wait is disabled (throttling is handled by the shared `quota.py` path).
+
+### AWS workload creds pass through in both modes
+
+The AWS workload credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region (`AWS_REGION` / `AWS_DEFAULT_REGION`) are in NEITHER mode's deny set: AWS creds do NOT route Claude billing (only the Bedrock route flag does), and the supervised orchestrator runs live AWS terratests that cannot work without them. They pass through unchanged and are never treated as a billing-routing violation. The non-root preflight assertion applies in both modes.

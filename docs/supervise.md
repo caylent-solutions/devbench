@@ -6,10 +6,20 @@
 `devbench supervise` launches the orchestrator as an interactive `claude` CLI
 session, wrapped in a detached `screen` daemon and driven by a Python `pexpect`
 supervisor, so the run is unattended, survives terminal detach, and
-self-heals across restarts and quota windows. Its single reason to exist is the
-billing channel: an interactive subscription session draws from the Claude Code
-Max subscription's rolling 5-hour usage windows instead of being metered at
-per-token API/Bedrock rates.
+self-heals across restarts and quota windows. Its reason to exist is the billing
+channel, selected by `--billing-mode` (default `subscription`):
+
+- **`subscription`** (default) -- an interactive subscription session draws from
+  the Claude Code Max subscription's rolling 5-hour usage windows instead of the
+  direct Anthropic API.
+- **`bedrock`** -- the same interactive session routes inference through AWS
+  Bedrock (always-on; there are NO 5-hour windows for Bedrock).
+
+In BOTH modes the AWS workload credentials (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region
+(`AWS_REGION` / `AWS_DEFAULT_REGION`) pass through to the session unchanged: AWS
+creds do NOT route Claude billing (only the Bedrock route flag does), and the
+supervised orchestrator runs live AWS terratests that cannot work without them.
 
 This is a NEW, purely additive command group. It does not change, deprecate, or
 remove any existing launch path (`devbench start`, `devbench start --daemon`,
@@ -20,7 +30,7 @@ for the design rationale.
 
 ## Table of contents
 
-- [Why subscription billing (the raison d'etre)](#why-subscription-billing-the-raison-detre)
+- [Billing modes (the raison d'etre)](#billing-modes-the-raison-detre)
 - [The six verbs](#the-six-verbs)
 - [Preflight requirements](#preflight-requirements)
 - [Scope conveyance and multi-session](#scope-conveyance-and-multi-session)
@@ -31,7 +41,7 @@ for the design rationale.
 - [Troubleshooting](#troubleshooting)
 - [See also](#see-also)
 
-## Why subscription billing (the raison d'etre)
+## Billing modes (the raison d'etre)
 
 The existing `devbench start` path drives a `ClaudeSDKClient`. Per
 [llm-authentication.md](llm-authentication.md), that path authenticates by
@@ -40,29 +50,66 @@ handing the Claude Code OAuth `accessToken` to the Anthropic SDK as an
 Bedrock under `DEVBENCH_USE_BEDROCK=1`). Either way the orchestrator's tokens
 bill at API/Bedrock per-token rates.
 
-An interactive `claude` CLI session authenticated via the Claude Code Max
-subscription login draws from the subscription's rolling 5-hour usage windows
-instead. `devbench supervise` therefore launches the orchestrator as that
-interactive session (NOT the SDK, and explicitly NOT `claude -p`/`--print`,
-which is a non-interactive batch mode).
+`devbench supervise` launches the orchestrator as an interactive `claude` CLI
+session instead (NOT the SDK, and explicitly NOT `claude -p`/`--print`, which is
+a non-interactive batch mode). The session's billing channel is selected by
+`--billing-mode` (precedence: `--billing-mode` flag > `DEVBENCH_SUPERVISE_BILLING_MODE`
+env > `supervise.billing_mode` config > default `subscription`; an invalid value
+fails fast):
 
-**Correctness requirement (the feature is pointless if violated):** an
-interactive session whose environment contains `ANTHROPIC_API_KEY` (or
-`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, or the
-`DEVBENCH_USE_BEDROCK`/`AWS_*` Bedrock-routing vars) silently routes inference
-to API billing and defeats the entire purpose. The supervisor:
+### `subscription` mode (default)
 
-1. **Strips** every API/Bedrock-routing var from the environment handed to the
-   `screen` session (the always-deny set is non-removable; a config that tries
-   to whitelist one fails fast).
-2. **Fails fast** at preflight (exit 2) if any always-deny var is even present
-   in the operator's environment:
-   `ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session must bill
-   against the Claude Code subscription, not the API. Unset it and retry.`
+An interactive `claude` session authenticated via the Claude Code Max
+subscription login draws from the subscription's rolling 5-hour usage windows.
+The supervisor:
+
+1. **Strips** the Claude-to-API/Bedrock ROUTING vars from the environment handed
+   to the `screen` session -- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+   `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, and the
+   claude-CLI Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`,
+   `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_MODEL`,
+   `ANTHROPIC_SMALL_FAST_MODEL`, `AWS_BEARER_TOKEN_BEDROCK`) -- so inference
+   cannot route off-subscription. This routing-var deny set is non-removable; a
+   config that tries to whitelist one fails fast.
+2. **Fails fast** at preflight (exit 2) if any of those routing vars is even
+   present in the operator's environment:
+   `ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session in
+   subscription mode must bill via the Claude Code subscription, not the direct
+   API. Unset it and retry.`
 3. **Verifies subscription auth** before launch (`~/.claude/.credentials.json`
    carries a `claudeAiOauth.accessToken` with the `user:inference` scope).
-4. **Surfaces the billing channel** in `status`/`info` as
+4. **Engages the 5-hour-window quota wait-and-resume** (see
+   [Quota wait-and-resume](#quota-wait-and-resume)).
+5. **Surfaces the billing channel** in `status`/`info` as
    `billing-channel: subscription` so an operator can audit at a glance.
+
+### `bedrock` mode
+
+The same interactive session routes inference through AWS Bedrock. The supervisor:
+
+1. **Strips** only the direct-Anthropic-API vars (`ANTHROPIC_API_KEY`,
+   `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`) and
+   **exports** the claude-CLI Bedrock route the CLI needs:
+   `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION` (from the operator's `AWS_REGION` /
+   `AWS_DEFAULT_REGION`), and `ANTHROPIC_MODEL` (the resolved Bedrock model id).
+2. Does NOT require subscription auth. Instead it **fails fast** at preflight if
+   the AWS Bedrock prerequisites are absent (no AWS credential among
+   `AWS_ACCESS_KEY_ID` / `AWS_PROFILE` / `AWS_BEARER_TOKEN_BEDROCK`, or no
+   `AWS_REGION` / `AWS_DEFAULT_REGION`).
+3. **Disables the 5-hour-window quota wait** -- Bedrock has no subscription
+   windows; Bedrock throttling is handled by the shared `quota.py` path in the
+   orchestrator subprocess (see [Quota wait-and-resume](#quota-wait-and-resume)).
+4. **Surfaces the billing channel** in `status`/`info` as
+   `billing-channel: bedrock`.
+
+### AWS workload creds pass through in both modes
+
+The AWS workload credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region (`AWS_REGION` /
+`AWS_DEFAULT_REGION`) are in NEITHER mode's deny set: they pass through to the
+session unchanged. AWS creds do NOT route Claude billing (only the Bedrock route
+flag does), and the supervised orchestrator runs live AWS terratests that cannot
+work without them. The non-root preflight assertion applies in both modes.
 
 ## The six verbs
 
@@ -75,11 +122,15 @@ usage: devbench supervise <start|stop|restart|status|info|attach> [options]
 
 ```
 uv run devbench supervise start [--name N] [--include "<tokens>"] \
-    [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E]
+    [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E] \
+    [--billing-mode {subscription,bedrock}]
 ```
 
-Runs the preflight (screen present, non-root, subscription auth present, no
-API-key env var, model resolvable), writes the per-session `scope.json`, creates
+`--billing-mode` selects the billing channel (default `subscription`); see
+[Billing modes](#billing-modes-the-raison-detre). Runs the mode-aware preflight
+(screen present, non-root, model resolvable, plus -- in `subscription` mode --
+subscription auth present and no routing-var env, or -- in `bedrock` mode --
+AWS Bedrock prerequisites present), writes the per-session `scope.json`, creates
 the detached `screen` (`devbench-supervise-<name>`), launches `claude` inside it,
 waits for the ready prompt, injects `/devbench-orchestrate:orchestrate`, and
 transitions the session to `running`. Exits 0 only once the session reaches
@@ -126,9 +177,10 @@ uv run devbench supervise status [--name N]
 With `--name`, prints one session; without, prints all supervise sessions.
 Fields: `name`, `state` (`starting|running|quota-waiting|draining|stopped|errored|restarting`),
 `in-progress` (current claimed work unit), `last-activity`, `screen`,
-`claude-session`, `billing-channel: subscription`, and (when stopped/errored)
-`exit-reason`. When `state=quota-waiting` it also shows `expected-resume` and
-`resumes-used=<n>/<cap>`.
+`claude-session`, `billing-channel` (`subscription` or `bedrock`, mirroring the
+active billing mode), and (when stopped/errored) `exit-reason`. When
+`state=quota-waiting` it also shows `expected-resume` and `resumes-used=<n>/<cap>`
+(subscription mode only -- bedrock mode never enters `quota-waiting`).
 
 ### `supervise info`
 
@@ -155,14 +207,19 @@ cannot inject input or steal the PTY. See
 
 `supervise start` fails fast (exit 2) with an actionable message unless ALL of:
 
-| Requirement | Failure message |
-|---|---|
-| `screen` is installed | `ERROR: 'screen' is not installed. Install it (devcontainer: 'apt-get install -y screen'; macOS: 'brew install screen') and retry.` |
-| `claude` is on PATH | `ERROR: 'claude' not found on PATH.` |
-| The process is non-root | `ERROR: refusing to launch claude --dangerously-skip-permissions as root.` |
-| No API-key env var present | `ERROR: ANTHROPIC_API_KEY is set; ... bill against the subscription, not the API. Unset it and retry.` |
-| Subscription auth present | `ERROR: Claude Code subscription auth not found. Run 'claude' and complete the browser login, then retry.` |
-| A model resolves | `ERROR: no model: set --model, supervise.model, or orchestrate.model.` |
+| Requirement | Mode | Failure message |
+|---|---|---|
+| `screen` is installed | both | `ERROR: 'screen' is not installed. Install it (devcontainer: 'apt-get install -y screen'; macOS: 'brew install screen') and retry.` |
+| `claude` is on PATH | both | `ERROR: 'claude' not found on PATH.` |
+| The process is non-root | both | `ERROR: refusing to launch claude --dangerously-skip-permissions as root.` |
+| A model resolves | both | `ERROR: no model: set --model, supervise.model, or orchestrate.model.` |
+| No routing-var env present | subscription | `ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session in subscription mode must bill via the Claude Code subscription, not the direct API. Unset it and retry.` |
+| Subscription auth present | subscription | `ERROR: Claude Code subscription auth not found. Run 'claude' and complete the browser login, then retry.` |
+| AWS Bedrock prerequisites present | bedrock | `bedrock billing mode requires AWS credentials (AWS_ACCESS_KEY_ID, AWS_PROFILE, or AWS_BEARER_TOKEN_BEDROCK); none are set. Configure AWS access and retry.` / `bedrock billing mode requires an AWS region: set AWS_REGION or AWS_DEFAULT_REGION ...` |
+
+AWS workload creds (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region are NEVER treated as a routing
+violation: they pass through in both modes.
 
 The supervised session launches `claude --dangerously-skip-permissions`. This
 is safe only inside the recognized devcontainer sandbox, non-root; the
@@ -203,8 +260,17 @@ devbench-supervise-bulk         bulk    running   44755   supervise attach --nam
 
 ## Quota wait-and-resume
 
-A 5-hour-window exhaustion is NOT an error: the supervisor transitions to
-`quota-waiting` and never exits non-zero, mirroring the SDK semantics in ADR-24
+This section applies to `subscription` mode. In `bedrock` mode there are NO
+5-hour subscription windows, so the 5-hour wait is DISABLED: a subscription
+usage-limit prompt is anomalous and faults fast with
+`exit-reason=quota-wait-disabled-bedrock`. Bedrock throttling is instead handled
+by the shared `quota.py` path (the `_BEDROCK_THROTTLE_CODES` handling) in the
+orchestrator subprocess; the supervisor's subscription quota markers and the
+5-hour window-reset logic do not fire in bedrock mode.
+
+In `subscription` mode, a 5-hour-window exhaustion is NOT an error: the
+supervisor transitions to `quota-waiting` and never exits non-zero, mirroring the
+SDK semantics in ADR-24
 ([adr/24-quota-wait-and-resume.md](adr/24-quota-wait-and-resume.md)). The wait
 REUSES the shared quota primitives (`quota.wait_for_reset`, the
 `quota_handling` config, the resume cap, and the `quota_pause.json` checkpoint);
@@ -262,8 +328,11 @@ relaunches `claude` with `--continue` (bounded by `supervise.restart.max_attempt
 
 Every operational value is a `supervise:` config field with a documented default,
 each overridable by a `DEVBENCH_SUPERVISE_*` env var (env > yaml > default). The
-quota timeouts fall through to the top-level `quota_handling` block when null. The
-full field set, defaults, and env overrides are documented in
+billing channel is `supervise.billing_mode` (`subscription` | `bedrock`, default
+`subscription`), overridable by `--billing-mode` (flag wins) or
+`DEVBENCH_SUPERVISE_BILLING_MODE` (env > config). The quota timeouts fall through
+to the top-level `quota_handling` block when null. The full field set, defaults,
+and env overrides are documented in
 [devbench-yaml-reference.md](devbench-yaml-reference.md) under the `supervise:`
 block. New injectable operator commands (future slash commands) are added via the
 `supervise.injectable_commands` config map with NO supervisor code change.
@@ -276,9 +345,16 @@ block. New injectable operator commands (future slash commands) are added via th
 - **`ERROR: Claude Code subscription auth not found`** -- run `claude` and
   complete the browser login once, then retry. The supervisor verifies but never
   manages or automates the login.
-- **`ERROR: ANTHROPIC_API_KEY is set ...`** -- unset the API-key env var; the
-  supervised session must bill against the subscription. Run
-  `env | grep -E 'ANTHROPIC|AWS|BEDROCK'` to find the offending var.
+- **`ERROR: ANTHROPIC_API_KEY is set ...`** -- in `subscription` mode, unset the
+  Claude-to-API/Bedrock routing var; the supervised session must bill against the
+  subscription. Run `env | grep -E 'ANTHROPIC|CLAUDE_CODE_USE|DEVBENCH_USE_BEDROCK'`
+  to find the offending routing var. (AWS workload creds are NOT routing vars and
+  are never flagged -- they pass through in both modes.)
+- **`bedrock billing mode requires AWS credentials ...` / `... an AWS region ...`**
+  -- you launched with `--billing-mode bedrock` (or `supervise.billing_mode: bedrock`)
+  but the AWS Bedrock prerequisites are missing. Set an AWS credential
+  (`AWS_ACCESS_KEY_ID` / `AWS_PROFILE` / `AWS_BEARER_TOKEN_BEDROCK`) and a region
+  (`AWS_REGION` / `AWS_DEFAULT_REGION`), then retry.
 - **The session faults with `exit-reason=ready-prompt-timeout`** -- the `claude`
   CLI prompt-detection is version-fragile (the interactive ready/working prompt
   text changes between CLI versions). All prompt-detection regexes are

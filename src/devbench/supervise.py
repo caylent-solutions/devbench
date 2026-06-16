@@ -3,9 +3,12 @@
 This module implements the ``devbench supervise`` feature (spec
 ``devbench-supervise-screen-orchestrator``): it runs the orchestrator as an
 interactive ``claude`` session inside a ``screen`` daemon, driven by a
-``pexpect`` supervisor, authenticated against the Claude Code subscription so
-token consumption draws from the rolling 5-hour windows rather than the
-Anthropic API (Section 0.2).
+``pexpect`` supervisor. The billing channel is selected by ``billing_mode``
+(Section 0.2): ``subscription`` (default) authenticates against the Claude Code
+subscription so token consumption draws from the rolling 5-hour windows rather
+than the Anthropic API; ``bedrock`` routes inference through AWS Bedrock
+(always-on; no 5-hour windows). AWS workload creds pass through in both modes
+(the orchestrator runs live AWS terratests).
 
 Phase 1 landed the persistence substrate:
 
@@ -13,17 +16,23 @@ Phase 1 landed the persistence substrate:
 - :class:`SuperviseRegistry` -- read/write ``.devbench/supervise/registry.json``
   and per-session ``state.json``; PID liveness; stale-reaping. It MIRRORS
   :class:`devbench.session.SessionRegistry`'s file/atomic-write shape but is a
-  SEPARATE registry (D-8) so the subscription-billed supervise channel stays
-  distinct from the API-billed SDK channel in ``status``/``info``.
+  SEPARATE registry (D-8) so the interactive billing-mode supervise channel
+  (subscription or bedrock) stays distinct from the API-billed SDK channel in
+  ``status``/``info``.
 - path helpers for the per-session state dir, ``pty.log``, and ``stop.request``.
 
 Phase 2 (this commit) lands the supervisor core (Section 4.0 decomposition):
 
-- :class:`EnvSanitizer` -- builds the minimized screen env, stripping the
-  always-deny API/Bedrock vars (Section 3.6.1, FR-21) so the session bills
-  against the subscription, and exporting the three scope-conveyance vars.
-- :class:`AuthVerifier` -- subscription-auth + API-key-guard + non-root preflight
-  (FR-20, FR-21, Section 3.6.2).
+- :class:`EnvSanitizer` -- builds the minimized screen env from the
+  mode-resolved deny set (Section 3.6.1, FR-21): both billing modes strip the
+  direct-Anthropic-API routing vars; ``subscription`` mode also strips the
+  Bedrock/Vertex routing vars (so the session bills the subscription), while
+  ``bedrock`` mode exports the claude-CLI Bedrock route instead. The AWS workload
+  creds pass through in BOTH modes. It also exports the three scope-conveyance
+  vars.
+- :class:`AuthVerifier` -- mode-aware preflight (FR-20, FR-21, Section 3.6.2):
+  ``subscription`` requires subscription auth + no routing var; ``bedrock``
+  requires the AWS Bedrock prerequisites; both refuse root.
 - :class:`DetectionPatterns` -- compiled, config-driven prompt/quota/fault
   regexes (FR-29).
 - :class:`PtyLogWriter` -- the redacted ``pty.log`` tee, mode 0600 (FR-24).
@@ -464,8 +473,9 @@ class SuperviseRegistry:
     :class:`devbench.session.SessionRegistry`).
 
     This is INTENTIONALLY separate from :class:`SessionRegistry` (D-8): the
-    supervise path is the subscription-billed channel and the SDK path is the
-    API-billed channel, and ``status``/``info`` must keep these distinct.
+    supervise path is the interactive billing-mode channel (subscription or
+    bedrock) and the SDK path is the API-billed channel, and ``status``/``info``
+    must keep these distinct.
 
     Args:
         workspace_root: Root directory of the devbench workspace.

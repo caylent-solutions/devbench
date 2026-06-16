@@ -4,6 +4,8 @@
 
 Companion to: `spec/devbench-supervise-screen-orchestrator/devbench-supervise-screen-orchestrator.md` (Section 4.9, Section 7.3, DI-5, AC-29).
 
+> **Billing-mode scope:** this verification applies to `--billing-mode subscription` ONLY. The 5-hour usage windows are a SUBSCRIPTION construct; **`--billing-mode bedrock` has no 5-hour quota event** (Bedrock is always-on), so the supervisor's 5-hour `QuotaWaiter` wait is DISABLED in bedrock mode (it faults fast with `quota-wait-disabled-bedrock`) and Bedrock API throttling is handled by the shared `quota.py` path (`_BEDROCK_THROTTLE_CODES`) in the orchestrator subprocess. There is nothing to capture for bedrock mode here -- the verbatim interactive usage-limit prompt below is only ever produced by a subscription session.
+
 ## 0. Phase 6 status (Discovery-Item outcomes for operator review)
 
 The supervise feature is implemented through Phase 6 (real dummy-backlog integration + docs + ADR-31). The four discovery items the plan flagged for operator review are recorded here so the remaining live verification is unambiguous:

@@ -898,9 +898,9 @@ uv run devbench sessions --cleanup
 
 ---
 
-## Supervise (interactive subscription-billed orchestrator)
+## Supervise (interactive billing-mode orchestrator)
 
-`devbench supervise` launches the orchestrator as an interactive `claude` CLI session under a detached `screen` daemon driven by a `pexpect` supervisor, so the run is unattended, survives terminal detach, and bills against the Claude Code subscription's rolling 5-hour windows rather than the Anthropic API. It is a NEW, purely additive verb group; the `devbench start` SDK path is untouched. Full operator guide: [supervise.md](supervise.md). Design rationale: ADR-31 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md)).
+`devbench supervise` launches the orchestrator as an interactive `claude` CLI session under a detached `screen` daemon driven by a `pexpect` supervisor, so the run is unattended, survives terminal detach, and bills via the channel selected by `--billing-mode`: `subscription` (default; the Claude Code subscription's rolling 5-hour windows) or `bedrock` (AWS Bedrock, always-on, no 5-hour windows). AWS workload creds pass through in both modes. It is a NEW, purely additive verb group; the `devbench start` SDK path is untouched. Full operator guide: [supervise.md](supervise.md). Design rationale: ADR-31 ([adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md)).
 
 The dispatcher is `devbench supervise <sub-verb>`; an unknown sub-verb exits 2 with the usage listing the six sub-verbs.
 
@@ -908,7 +908,8 @@ The dispatcher is `devbench supervise <sub-verb>`; an unknown sub-verb exits 2 w
 
 ```
 uv run devbench supervise start [--name N] [--include "<tokens>"] \
-    [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E]
+    [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E] \
+    [--billing-mode {subscription,bedrock}]
 ```
 
 Runs the preflight, writes the per-session `scope.json`, creates the `screen` (`devbench-supervise-<name>`), launches `claude --model <m> --effort <e> --dangerously-skip-permissions --plugin-dir <resolved>`, waits for the ready prompt, injects `/devbench-orchestrate:orchestrate`, and transitions the session to `running`.
@@ -918,8 +919,9 @@ Runs the preflight, writes the per-session `scope.json`, creates the `screen` (`
 - `--allow-overlap` -- permit scope overlap with active sessions.
 - `--model M` -- model (`opus|sonnet|claude-opus-4-8|...`); resolves `--model` > `supervise.model` > `orchestrate.model`, fail-fast if all unset; `haiku` rejected.
 - `--effort E` -- `low|medium|high|xhigh|max` (default `supervise.effort`, `xhigh`).
+- `--billing-mode {subscription,bedrock}` -- billing channel; resolves `--billing-mode` > `DEVBENCH_SUPERVISE_BILLING_MODE` env > `supervise.billing_mode` config > default `subscription`. `subscription` bills the Claude Code Max subscription (5-hour windows, quota wait engaged); `bedrock` bills via AWS Bedrock (no 5-hour windows, quota wait disabled). An invalid value fails fast.
 
-**Preflight (fail-fast, exit 2):** `screen` present, non-root, subscription auth present, NO `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` in env, model resolvable. Exit 0 only when the session reaches `state=running`.
+**Preflight (fail-fast, exit 2):** `screen` present, non-root, model resolvable, plus mode-specific checks. In `subscription` mode: subscription auth present and NO Claude-to-API/Bedrock routing var (`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/...) in env. In `bedrock` mode: AWS Bedrock prerequisites present (an AWS credential among `AWS_ACCESS_KEY_ID`/`AWS_PROFILE`/`AWS_BEARER_TOKEN_BEDROCK`, plus `AWS_REGION`/`AWS_DEFAULT_REGION`). AWS workload creds pass through in both modes and are never a routing violation. Exit 0 only when the session reaches `state=running`.
 
 ### `supervise stop`
 
@@ -943,7 +945,7 @@ Graceful `stop` then relaunch preserving context via `--continue` (or `--resume 
 uv run devbench supervise status [--name N]
 ```
 
-With `--name`: one session; without: all supervise sessions. Columns: `name`, `state` (`starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress`, `last-activity`, `screen`, `claude-session`, `billing-channel` (`subscription`), `exit-reason`; `quota-waiting` also shows `expected-resume` and `resumes-used`. Exit 0; exit 2 if `--name` unknown.
+With `--name`: one session; without: all supervise sessions. Columns: `name`, `state` (`starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress`, `last-activity`, `screen`, `claude-session`, `billing-channel` (`subscription` or `bedrock`), `exit-reason`; `quota-waiting` also shows `expected-resume` and `resumes-used` (subscription mode only). Exit 0; exit 2 if `--name` unknown.
 
 ### `supervise info`
 

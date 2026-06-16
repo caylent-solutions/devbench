@@ -186,9 +186,9 @@ Claude Code session (with devbench plugin active)
 
 The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply -- the executor does not commit until all judges pass.
 
-### Supervised interactive mode (`devbench supervise start`) -- subscription-billed
+### Supervised interactive mode (`devbench supervise start`) -- billing-mode-selected
 
-A third execution mode launches the SAME interactive orchestrator, but unattended: under a detached `screen` daemon, driven by a `pexpect` supervisor, so it survives terminal detach and self-heals across quota windows and restarts. Its defining property is the billing channel -- the session is billed against the Claude Code subscription's rolling 5-hour usage windows, NOT the Anthropic API (the SDK `make start` path bills at API/Bedrock rates; see [llm-authentication.md](llm-authentication.md)).
+A third execution mode launches the SAME interactive orchestrator, but unattended: under a detached `screen` daemon, driven by a `pexpect` supervisor, so it survives terminal detach and self-heals across quota windows and restarts. Its defining property is the billing channel, selected by `--billing-mode` (default `subscription`): the session bills either against the Claude Code subscription's rolling 5-hour usage windows (`subscription`) or via AWS Bedrock with no 5-hour windows (`bedrock`). In both modes the AWS workload creds pass through (the orchestrator runs live AWS terratests). The SDK `make start` path bills at API/Bedrock rates; see [llm-authentication.md](llm-authentication.md).
 
 ```text
 screen daemon (devbench-supervise-<name>)
@@ -204,11 +204,11 @@ screen daemon (devbench-supervise-<name>)
 
 | Aspect | Supervised interactive (`devbench supervise`) |
 | --- | --- |
-| Billing | Subscription 5-hour windows (NOT API/Bedrock) -- `ANTHROPIC_API_KEY` is stripped + preflight-refused |
+| Billing | `--billing-mode` selects it: `subscription` (5-hour windows; routing vars stripped + preflight-refused) or `bedrock` (AWS Bedrock; direct-API vars stripped, Bedrock route exported). AWS workload creds pass through in BOTH modes |
 | Unattended | Yes -- survives terminal detach via the `screen` daemon |
-| Quota | `quota-waiting` then auto-resume; never exits non-zero on exhaustion (ADR-24 semantics) |
+| Quota | `subscription`: `quota-waiting` then auto-resume, never exits non-zero on exhaustion (ADR-24 semantics). `bedrock`: 5-hour wait disabled (no windows); throttling handled by the shared `quota.py` path |
 | Observation | Read-only redacted PTY-log follow (`supervise attach`); cannot inject input |
-| Best for | Overnight / unattended runs an operator wants billed to the Max subscription |
+| Best for | Overnight / unattended runs an operator wants billed to the Max subscription (or to Bedrock via `--billing-mode bedrock`) |
 
 The same ownership rules and lifecycle apply; only the launch wrapper and billing channel differ. Full guide: [supervise.md](supervise.md). Design rationale: [adr/31-interactive-screen-supervisor.md](adr/31-interactive-screen-supervisor.md).
 

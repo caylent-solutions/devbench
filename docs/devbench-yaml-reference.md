@@ -440,18 +440,21 @@ absent.
 
 ---
 
-## `supervise:` -- interactive subscription-billed orchestrator (ADR-31)
+## `supervise:` -- interactive billing-mode orchestrator (ADR-31)
 
 Config for `devbench supervise`, which launches the orchestrator as an interactive `claude` CLI
-session under a detached `screen` daemon (billed against the Claude Code subscription's 5-hour
-windows, not the API). Every field has a documented default and is overridable by a
-`DEVBENCH_SUPERVISE_*` env var (env > yaml > default). The quota machinery REUSES the top-level
-`quota_handling:` block, so it is not duplicated here. Full operator guide: [supervise.md](supervise.md).
+session under a detached `screen` daemon. `billing_mode` selects the billing channel:
+`subscription` (default; billed against the Claude Code Max subscription's 5-hour windows) or
+`bedrock` (billed via AWS Bedrock; always-on, no 5-hour windows). Every field has a documented
+default and is overridable by a `DEVBENCH_SUPERVISE_*` env var (env > yaml > default). The quota
+machinery REUSES the top-level `quota_handling:` block, so it is not duplicated here. Full operator
+guide: [supervise.md](supervise.md).
 
 ```yaml
 supervise:
   model: null                       # default model; null -> falls back to orchestrate.model -> fail-fast (D-3)
   effort: xhigh                      # low|medium|high|xhigh|max (xhigh default; max is session-only)
+  billing_mode: subscription         # subscription (default; 5-hour windows, quota wait engaged) | bedrock (AWS Bedrock, no windows, quota wait disabled). Precedence: --billing-mode flag > DEVBENCH_SUPERVISE_BILLING_MODE env > this > default
   screen_name_prefix: devbench-supervise-
   timeouts:
     ready_prompt_seconds: 120        # wait for the first interactive ready prompt
@@ -482,7 +485,7 @@ supervise:
     markers_fault: ["[ORCHESTRATOR_STOP_REASON]", "[ORCHESTRATOR_FATAL_ERROR]", "[HARNESS_INTEGRITY]"]
     markers_restart: ["[ORCHESTRATOR_AUTO_RESTART]"]
   env:
-    deny_vars: ["AWS_PROFILE", "AWS_SESSION_TOKEN"]    # ADDITIONAL deny vars; the always-deny set is non-removable
+    deny_vars: []                     # ADDITIONAL deny vars layered on the mode-resolved routing deny set (non-removable). AWS workload creds are NOT denied (they pass through in both modes)
   logging:
     pty_log_relpath: pty.log         # under the per-session state dir; created mode 0600
     redact_patterns: ["sk-ant-[A-Za-z0-9_-]+", "AKIA[0-9A-Z]{16}", "(?i)aws_secret[^\\s]*", "Bearer\\s+[A-Za-z0-9._-]+"]
@@ -500,10 +503,20 @@ Notes:
   `--model` > `supervise.model` > `orchestrate.model`, fail-fast if all unset; `haiku` is rejected.
   `DEVBENCH_CLAUDE_MODEL` is deliberately NOT consulted (it is the API-caller model and must not leak
   into the subscription session).
-- **`env.deny_vars`** lists ADDITIONAL vars to strip; the always-deny API/Bedrock-routing set
-  (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`,
-  `DEVBENCH_USE_BEDROCK`, `AWS_*`) is non-removable. A config that tries to whitelist one of those by
-  negation fails fast at load.
+- **`billing_mode`** selects the billing channel (`subscription` | `bedrock`, default `subscription`).
+  Resolution: `--billing-mode` flag > `DEVBENCH_SUPERVISE_BILLING_MODE` env > this config > default;
+  an invalid value fails fast. `subscription` engages the 5-hour quota wait-and-resume and requires
+  subscription auth; `bedrock` disables the 5-hour wait (no windows), exports the claude-CLI Bedrock
+  route (`CLAUDE_CODE_USE_BEDROCK`/`AWS_REGION`/`ANTHROPIC_MODEL`), and requires the AWS Bedrock
+  prerequisites (an AWS credential + region) instead.
+- **`env.deny_vars`** lists ADDITIONAL vars to strip, layered on the mode-resolved routing deny set.
+  Both modes always strip the direct-Anthropic-API vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`); `subscription` mode additionally strips the
+  Bedrock/Vertex routing vars (`DEVBENCH_USE_BEDROCK`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+  `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `AWS_BEARER_TOKEN_BEDROCK`).
+  That routing-var set is non-removable -- a config that tries to whitelist one of those by negation fails
+  fast at load. The AWS workload creds (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+  `AWS_PROFILE`) and region are NOT in either deny set; they pass through in both modes.
 - **`detection_patterns.quota_wait_prompt`** and **`injectable_commands.quota_wait_choice`** are
   PLACEHOLDERS until the real interactive usage-limit prompt is captured against a live quota event
   (DI-5; see `spec/devbench-supervise-screen-orchestrator/QUOTA-VERIFICATION-TODO.md`). The

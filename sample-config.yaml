@@ -138,8 +138,14 @@ quota_handling:
 # Supervise: interactive `claude` CLI orchestrator under a detached `screen`
 # daemon (devbench supervise start|stop|restart|status|info|attach).
 #
-# This is the SUBSCRIPTION-billed launch channel: token consumption draws from
-# the Claude Code Max plan's rolling 5-hour windows, NOT the Anthropic API.
+# The billing channel is selected by billing_mode (default subscription):
+#   - subscription: token consumption draws from the Claude Code Max plan's
+#     rolling 5-hour windows (the 5-hour quota wait-and-resume is engaged).
+#   - bedrock: inference routes through AWS Bedrock (always-on; no 5-hour
+#     windows; the 5-hour wait is disabled).
+# In BOTH modes the AWS workload creds (AWS_ACCESS_KEY_ID/.../AWS_PROFILE) and
+# region pass through -- they do not route Claude billing, and the orchestrator
+# runs live AWS terratests that need them.
 # It is purely additive -- it does not change `devbench start` (the SDK path).
 # All values are optional with the documented defaults below; each is also
 # overridable via a DEVBENCH_SUPERVISE_* env var (env > yaml > default).
@@ -150,6 +156,7 @@ quota_handling:
 # supervise:
 #   model: null                       # null falls back to orchestrate.model then fail-fast (D-3); DEVBENCH_CLAUDE_MODEL is NOT used
 #   effort: xhigh                      # low|medium|high|xhigh|max (xhigh default; max is session-only)
+#   billing_mode: subscription         # subscription (default; 5-hour windows) | bedrock (AWS Bedrock, no windows). Precedence: --billing-mode flag > DEVBENCH_SUPERVISE_BILLING_MODE env > this > default
 #   screen_name_prefix: devbench-supervise-
 #   timeouts:
 #     ready_prompt_seconds: 120        # wait for the first interactive ready prompt
@@ -181,7 +188,7 @@ quota_handling:
 #     markers_fault: ["[ORCHESTRATOR_STOP_REASON]", "[ORCHESTRATOR_FATAL_ERROR]", "[HARNESS_INTEGRITY]"]
 #     markers_restart: ["[ORCHESTRATOR_AUTO_RESTART]"]
 #   env:
-#     deny_vars: []                    # ADDITIONAL deny vars; the ANTHROPIC_*/AWS_*/DEVBENCH_USE_BEDROCK set is always stripped (non-removable)
+#     deny_vars: []                    # ADDITIONAL deny vars layered on the mode-resolved routing deny set (non-removable). AWS workload creds are NOT denied (they pass through in both modes)
 #   logging:
 #     pty_log_relpath: pty.log         # under the session state dir; created mode 0600
 #     redact_patterns: ["sk-ant-[A-Za-z0-9_-]+", "AKIA[0-9A-Z]{16}", "(?i)aws_secret[^\\s]*", "Bearer\\s+[A-Za-z0-9._-]+"]

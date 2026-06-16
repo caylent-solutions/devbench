@@ -9548,8 +9548,9 @@ _SUPERVISE_SESSION_NAME_RE = re.compile(SUPERVISE_SESSION_NAME_PATTERN)
 _SUPERVISE_USAGE: str = (
     "usage: devbench supervise <start|stop|restart|status|info|attach> [options]\n"
     "Supervise an interactive `claude` CLI orchestrator inside a detached `screen`\n"
-    "daemon, driven by a pexpect supervisor. Token consumption bills against the\n"
-    "Claude Code subscription's rolling 5-hour windows (NOT the Anthropic API).\n"
+    "daemon, driven by a pexpect supervisor. --billing-mode selects the channel:\n"
+    "subscription (default; the Claude Code subscription's rolling 5-hour windows)\n"
+    "or bedrock (AWS Bedrock; no 5-hour windows). AWS creds pass through in both.\n"
     "\n"
     "sub-verbs:\n"
     "  start     Launch a supervised interactive orchestrator under screen\n"
@@ -14007,10 +14008,10 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         (
             "Supervise an interactive `claude` CLI orchestrator under a detached screen daemon "
-            "(subscription-billed, NOT the API). Sub-verbs: "
+            "(--billing-mode subscription [default] | bedrock; AWS creds pass through in both). Sub-verbs: "
             "start | stop | restart | status | info | attach. "
             "start [--name N] [--include '<tokens>'] [--exclude '<tokens>'] [--allow-overlap] "
-            "[--model M] [--effort E]; "
+            "[--model M] [--effort E] [--billing-mode {subscription,bedrock}]; "
             "stop [--name N] [--hard]; "
             "restart [--name N]; "
             "status [--name N]; "

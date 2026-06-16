@@ -23,21 +23,24 @@ This feature is **net-new and purely additive**. It introduces a NEW command ver
 | `devbench restart`, `devbench stop`, `devbench sessions`, `devbench status` | UNCHANGED | New `supervise` verbs are siblings, not replacements. |
 | `quota_handling:` config block | UNCHANGED, REUSED | The new path reuses the exact same `QuotaHandlingConfig` semantics (`config_loader.py:736`). |
 
-The ONLY change a reviewer must scrutinize for policy concerns: the supervised session launches `claude` with `--dangerously-skip-permissions` (Section 3.6 establishes this is safe only inside the recognized devcontainer sandbox, non-root) and **deliberately strips `ANTHROPIC_API_KEY` from the session environment** (Section 0.2 establishes why this is a correctness requirement, not a regression).
+The ONLY change a reviewer must scrutinize for policy concerns: the supervised session launches `claude` with `--dangerously-skip-permissions` (Section 3.6 establishes this is safe only inside the recognized devcontainer sandbox, non-root) and **deliberately strips the Claude-to-API/Bedrock routing vars (e.g. `ANTHROPIC_API_KEY`) from the session environment** so the session bills the selected channel (Section 0.2 establishes why this is a correctness requirement, not a regression). The AWS workload creds are NOT stripped -- they pass through in both billing modes so the orchestrator's live AWS terratests can run.
 
-### 0.2 PRIMARY GOAL -- the raison d'etre: subscription billing, not API billing
+### 0.2 PRIMARY GOAL -- the raison d'etre: an operator-selected billing channel for the interactive orchestrator
 
-The single reason this feature exists is to change **how the orchestrator's token consumption is billed**.
+The single reason this feature exists is to control **how the orchestrator's token consumption is billed**, selected by a `--billing-mode` (default `subscription`).
 
 - **The current SDK path bills at API rates.** `devbench start` drives a `ClaudeSDKClient` (`cli.py:9298`). Per `docs/llm-authentication.md:11-39`, that path authenticates by reading the Claude Code OAuth `accessToken` (scope `user:inference`) out of `~/.claude/.credentials.json` and handing it to the Anthropic SDK as an `api_key`. Inference is metered against the **Anthropic API account** (or, under `DEVBENCH_USE_BEDROCK=1`, against AWS Bedrock; `docs/llm-authentication.md:108-138`). Either way, the orchestrator's tokens are billed per-token at API/Bedrock rates.
-- **An interactive `claude` CLI session billed against the Max subscription draws from rolling 5-hour budget windows instead.** When an operator runs `claude` interactively, authenticated via their Claude Code subscription login (the Max plan), the session's token consumption is drawn from the subscription's rolling 5-hour usage windows -- it is NOT metered as per-token API spend.
+- **`subscription` mode: an interactive `claude` CLI session billed against the Max subscription draws from rolling 5-hour budget windows instead.** When an operator runs `claude` interactively, authenticated via their Claude Code subscription login (the Max plan), the session's token consumption is drawn from the subscription's rolling 5-hour usage windows -- it is NOT metered as per-token API spend.
+- **`bedrock` mode: the same interactive session routes inference through AWS Bedrock** (always-on; there are NO 5-hour windows for Bedrock). The supervisor exports the claude-CLI Bedrock route the CLI needs and disables the 5-hour wait.
 - **Therefore this feature launches the orchestrator as an interactive `claude` CLI session** (not the SDK, and explicitly NOT `claude -p`/`--print`, which is a non-interactive batch mode the operator has excluded), wrapped in a `screen` daemon so it survives terminal detach, and driven by a Python `pexpect` supervisor so the run is unattended and self-healing.
 
-**CRITICAL CORRECTNESS REQUIREMENT (the feature is pointless if violated):** an interactive `claude` session whose environment contains `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`, or other API-key vars) silently routes inference to **API billing** and defeats the entire purpose. The supervisor MUST:
+**AWS workload creds are NOT a billing-routing concern.** The AWS workload credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region (`AWS_REGION` / `AWS_DEFAULT_REGION`) do NOT route Claude billing -- only the Bedrock route flag (`DEVBENCH_USE_BEDROCK` / `CLAUDE_CODE_USE_BEDROCK`) does. The supervised orchestrator runs **live AWS terratests** and cannot work without these creds, so they pass through in BOTH billing modes and are in NEITHER mode's deny set.
 
-1. **Unset / strip** `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, and `DEVBENCH_USE_BEDROCK`/`AWS_*` Bedrock-routing vars from the environment handed to the `screen` session (so neither `screen` nor `claude` nor any child sees them). See FR-21.
-2. **Verify subscription auth before/at launch:** confirm `~/.claude/.credentials.json` exists and carries a `claudeAiOauth.accessToken` with the `user:inference` scope (the same file `docs/llm-authentication.md:17-23` documents), failing fast with a clear, actionable error if it is absent or if any forbidden API-key var is present. See FR-20, FR-21.
-3. **Surface the billing channel in `status`/`info`** so the operator can confirm at a glance the session is subscription-authed, not API-keyed. See FR-9, FR-11.
+**CRITICAL CORRECTNESS REQUIREMENT (the feature is pointless if violated):** an interactive `claude` session in `subscription` mode whose environment contains a Claude-to-API/Bedrock ROUTING var (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, or a claude-CLI Bedrock/Vertex routing var) silently routes inference off-subscription and defeats the purpose. The supervisor MUST:
+
+1. **Strip the mode-resolved routing-var deny set** from the environment handed to the `screen` session (so neither `screen` nor `claude` nor any child sees them): both modes strip the direct-Anthropic-API vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`); `subscription` mode additionally strips the Bedrock/Vertex routing vars (`DEVBENCH_USE_BEDROCK`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `AWS_BEARER_TOKEN_BEDROCK`), while `bedrock` mode EXPORTS the Bedrock route instead. The AWS workload creds are NOT stripped in either mode. See FR-21.
+2. **Run the mode-aware auth preflight.** In `subscription` mode, confirm `~/.claude/.credentials.json` exists and carries a `claudeAiOauth.accessToken` with the `user:inference` scope (the same file `docs/llm-authentication.md:17-23` documents), failing fast if it is absent or if any forbidden routing var is present. In `bedrock` mode, do NOT require subscription auth; instead fail fast if the AWS Bedrock prerequisites (an AWS credential + region) are absent. See FR-20, FR-21.
+3. **Surface the billing channel in `status`/`info`** so the operator can confirm at a glance which channel the session bills (`subscription` or `bedrock`). See FR-9, FR-11.
 
 This goal is restated in Section 2 (worked examples), Section 3.6 (trust/billing model), and Section 13 (resolved decisions D-1).
 
@@ -196,21 +199,35 @@ Verified on this tree:
 
 ## Section 2 -- Goals (with Worked Operator Examples)
 
-### Goal G-1: Bill orchestration against the Max subscription's 5-hour windows, not API rates.
+### Goal G-1: Bill orchestration against the operator-selected channel (subscription by default, or Bedrock).
 
 ```bash
 # Operator has logged into Claude Code (subscription) once: `claude` -> browser OAuth.
-# No ANTHROPIC_API_KEY is exported in this shell.
-$ uv run devbench supervise start --name nightly
+# No ANTHROPIC_API_KEY is exported in this shell. AWS workload creds (for the live
+# terratests) MAY be exported -- they pass through and are not a billing violation.
+$ uv run devbench supervise start --name nightly        # --billing-mode subscription (default)
 [supervise] preflight: screen 4.09.01 found
+[supervise] preflight: billing-mode=subscription
 [supervise] preflight: subscription auth OK (~/.claude/.credentials.json, scope user:inference)
-[supervise] preflight: no API-key env vars present (ANTHROPIC_API_KEY unset)
+[supervise] preflight: no routing env vars present (ANTHROPIC_API_KEY unset)
 [supervise] launching screen 'devbench-supervise-nightly'
 [supervise] claude ready; injecting /devbench-orchestrate:orchestrate (scope: all)
 [supervise] state=running  pid=44310  screen=devbench-supervise-nightly  claude-session=018f...-a1
 ```
 
 Expected: the orchestrator runs interactively inside `screen`, billed against the subscription window. `status` later shows `billing-channel: subscription`.
+
+To bill via AWS Bedrock instead (always-on, no 5-hour windows), pass `--billing-mode bedrock` with AWS creds + region present:
+
+```bash
+$ AWS_REGION=us-east-1 uv run devbench supervise start --name nightly --billing-mode bedrock
+[supervise] preflight: billing-mode=bedrock
+[supervise] preflight: AWS Bedrock prerequisites OK (credential + region present)
+[supervise] exporting CLAUDE_CODE_USE_BEDROCK=1 AWS_REGION=us-east-1 ANTHROPIC_MODEL=<bedrock model id>
+...
+```
+
+Expected: `status` shows `billing-channel: bedrock`; the 5-hour quota wait is disabled.
 
 ### Goal G-2: Survive terminal detach and run unattended.
 
@@ -335,11 +352,16 @@ $ uv run devbench supervise restart --name nightly
 
 ### 3.6.1 Billing channel (the core trust boundary)
 
-The supervisor's correctness hinges on the session being billed to the subscription, not the API. Trust decisions:
+The supervisor's correctness hinges on the session billing the operator-selected channel. The channel is `billing_mode` (`subscription` | `bedrock`, default `subscription`), resolved `--billing-mode` flag > `DEVBENCH_SUPERVISE_BILLING_MODE` env > `supervise.billing_mode` config > default; an invalid value fails fast. The deny set is a function of `billing_mode`, produced by a single DRY helper (`resolve_supervise_deny_vars(billing_mode)`). Trust decisions:
 
-1. **Environment minimization (FR-21).** The supervisor constructs the `screen` session environment from a copy of the operator's environment with a deny-list applied: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE` (Bedrock routing). The deny-list is configurable (`supervise.env.deny_vars`, Section 5.2) but the four `ANTHROPIC_*` API-routing vars are ALWAYS stripped and cannot be removed from the deny-list (a config attempting to whitelist `ANTHROPIC_API_KEY` is a fail-fast config error). If `ANTHROPIC_API_KEY` (or any always-deny var) is present in the operator's environment at launch, the supervisor FAILS FAST before creating the screen, with: `ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session must bill against the Claude Code subscription, not the API. Unset it and retry.`
-2. **Subscription-auth verification (FR-20).** Before launch the supervisor confirms `~/.claude/.credentials.json` (path overridable via `DEVBENCH_CLAUDE_CREDENTIALS_FILE`, `docs/llm-authentication.md:45`) exists, parses to a `claudeAiOauth.accessToken`, and the token's `scopes` include `user:inference`. If not, fail fast: `ERROR: Claude Code subscription auth not found. Run 'claude' and complete the browser login, then retry.` (DISCOVERY ITEM DI-2: confirm the live token has not expired; the supervisor checks the embedded expiry if present and warns -- the CLI itself refreshes while the session is live per `docs/llm-authentication.md:102`.)
-3. **Status surfacing (FR-9).** `status` and `info` print `billing-channel: subscription` (and the credential-file path + scope) so the operator can audit at a glance.
+1. **Environment minimization (FR-21), mode-resolved.** The supervisor constructs the `screen` session environment from a copy of the operator's environment with the mode-resolved deny set applied:
+   - **BASE (both modes):** the direct-Anthropic-API routing vars `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`.
+   - **`subscription` ADDITIONALLY:** the Bedrock/Vertex routing vars `DEVBENCH_USE_BEDROCK`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `AWS_BEARER_TOKEN_BEDROCK` (so inference cannot route off-subscription).
+   - **`bedrock`:** strips only the BASE set, then EXPORTS the claude-CLI Bedrock route (`CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION` from the operator env, `ANTHROPIC_MODEL` = the resolved Bedrock model id), failing fast if no region is present.
+
+   **The AWS workload creds (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`) and region (`AWS_REGION` / `AWS_DEFAULT_REGION`) are in NEITHER mode's deny set and ALWAYS pass through** -- AWS creds do not route Claude billing, and the orchestrator runs live AWS terratests that need them. The deny-list is extensible (`supervise.env.deny_vars`, Section 5.2) but the routing-var set (the union across modes) is NON-REMOVABLE: a config attempting to whitelist a routing var by negation is a fail-fast config error. If a denied routing var is present in the operator's environment at launch, the supervisor FAILS FAST before creating the screen, e.g.: `ERROR: ANTHROPIC_API_KEY is set; an interactive supervised session in subscription mode must bill via the Claude Code subscription, not the direct API. Unset it and retry.`
+2. **Mode-aware auth verification (FR-20).** In `subscription` mode the supervisor confirms `~/.claude/.credentials.json` (path overridable via `DEVBENCH_CLAUDE_CREDENTIALS_FILE`, `docs/llm-authentication.md:45`) exists, parses to a `claudeAiOauth.accessToken`, and the token's `scopes` include `user:inference`; if not, fail fast: `ERROR: Claude Code subscription auth not found. Run 'claude' and complete the browser login, then retry.` (DISCOVERY ITEM DI-2: confirm the live token has not expired; the supervisor checks the embedded expiry if present and warns -- the CLI itself refreshes while the session is live per `docs/llm-authentication.md:102`.) In `bedrock` mode the supervisor does NOT require subscription auth; instead it fails fast if the AWS Bedrock prerequisites are absent (no AWS credential among `AWS_ACCESS_KEY_ID`/`AWS_PROFILE`/`AWS_BEARER_TOKEN_BEDROCK`, or no `AWS_REGION`/`AWS_DEFAULT_REGION`). Both modes assert non-root.
+3. **Status surfacing (FR-9).** `status` and `info` print `billing-channel: <subscription|bedrock>` (mirroring the active `billing_mode`) so the operator can audit at a glance.
 
 ### 3.6.2 `--dangerously-skip-permissions` safety
 
@@ -379,11 +401,11 @@ The supervisor is one module `src/devbench/supervise.py` (plus `cli.py` verb wir
 - **`SupervisorStateMachine`** -- the pure state machine (Section 4.8); no I/O.
 - **`PtyDriver`** -- thin `pexpect.spawn` wrapper: launch, `expect(pattern_set, timeout)`, `sendline`, capture `before`/`after`, write PTY stream to `pty.log`.
 - **`LogTailDetector`** -- tails `<workspace>/logs/orchestrator.log` (or per-session log) for the marker strings in Section 1.6 (hybrid detection).
-- **`QuotaWaiter`** -- a THIN ADAPTER (NOT a reimplementation) over the shared quota primitives: it delegates the wait to `quota.wait_for_reset`, classification to `quota.detect_quota_error`, the cap to `cli._resolve_max_quota_resumes`, and the checkpoint to `quota.QuotaCheckpoint`; the only new logic is interactive-prompt detection + the in-session-wait-vs-poll-restart branch (Section 4.9, FR-15).
-- **`EnvSanitizer`** -- builds the minimized environment (Section 3.6.1).
+- **`QuotaWaiter`** -- a THIN ADAPTER (NOT a reimplementation) over the shared quota primitives: it delegates the wait to `quota.wait_for_reset`, classification to `quota.detect_quota_error`, the cap to `cli._resolve_max_quota_resumes`, and the checkpoint to `quota.QuotaCheckpoint`; the only new logic is interactive-prompt detection + the in-session-wait-vs-poll-restart branch (Section 4.9, FR-15). In `bedrock` mode the 5-hour wait is DISABLED (it faults fast with `quota-wait-disabled-bedrock`).
+- **`EnvSanitizer`** -- builds the minimized, MODE-RESOLVED environment (Section 3.6.1): strips the mode's routing deny set, keeps the AWS workload creds, and in `bedrock` mode exports the claude-CLI Bedrock route.
 - **`CommandInjector`** -- formats and sends slash commands from the injectable-command registry (Section 5.3).
 - **`SuperviseRegistry`** -- per-session state files (Section 5.5), mirroring `SessionRegistry`.
-- **`AuthVerifier`** -- subscription-auth + API-key-guard preflight.
+- **`AuthVerifier`** -- mode-aware preflight: `subscription` requires subscription auth + no routing var; `bedrock` requires the AWS Bedrock prerequisites; both refuse root (Section 3.6.1).
 
 `FR-1: The CLI shall register a new verb group "supervise" with sub-verbs start, stop, restart, status, info, attach.` It is added to `_COMMANDS` (`cli.py:12660`) as `"supervise": (cmd_supervise, 0, "Supervise an interactive claude orchestrator under screen")` and to `_VARIADIC_COMMANDS` (`cli.py:12996`). `cmd_supervise(*argv)` dispatches on `argv[0]` (the sub-verb), returning exit 2 for an unknown sub-verb with a usage message listing the six sub-verbs. All existing launch paths are untouched (Section 0.1).
 
@@ -391,15 +413,16 @@ The supervisor is one module `src/devbench/supervise.py` (plus `cli.py` verb wir
 
 ### 4.1 `supervise start` (FR-3 .. FR-8)
 
-**Syntax:** `devbench supervise start [--name N] [--include "<tokens>"] [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E]`
+**Syntax:** `devbench supervise start [--name N] [--include "<tokens>"] [--exclude "<tokens>"] [--allow-overlap] [--model M] [--effort E] [--billing-mode {subscription,bedrock}]`
 
 **Semantics (step by step):**
 
 1. **Preflight (fail-fast, no side effects):**
    - `FR-23`: probe `shutil.which("screen")`; if absent, exit `2` with: `ERROR: 'screen' is not installed. Install it (devcontainer: 'apt-get install -y screen'; macOS: 'brew install screen') and retry.` Record the resolved `screen` path + `screen --version` for the registry.
-   - `FR-20`: `AuthVerifier` confirms subscription auth (Section 3.6.1 item 2); else exit `2`.
-   - `FR-21`: `AuthVerifier` confirms no always-deny API-key env var is present (Section 3.6.1 item 1); else exit `2`.
-   - Section 3.6.2: assert non-root; else exit `2`.
+   - `FR-9`/`billing_mode`: resolve `billing_mode` (`--billing-mode` flag > `DEVBENCH_SUPERVISE_BILLING_MODE` env > `supervise.billing_mode` config > default `subscription`); an unrecognized value exits `2` (fail-fast). The resolved mode drives the deny set, the auth preflight, and the quota wait below.
+   - `FR-20`: `AuthVerifier` runs the MODE-AWARE auth preflight (Section 3.6.1 item 2): `subscription` requires subscription auth; `bedrock` requires the AWS Bedrock prerequisites (an AWS credential + region) instead; else exit `2`.
+   - `FR-21`: `AuthVerifier` confirms no routing var from the MODE-RESOLVED deny set is present (Section 3.6.1 item 1); the AWS workload creds are never flagged (they pass through in both modes); else exit `2`.
+   - Section 3.6.2: assert non-root (both modes); else exit `2`.
    - `FR-19`: resolve the model (D-3 order: `--model` > `supervise.model` > `orchestrate.model` > fail-fast) and effort (`--effort` > `supervise.effort` > `xhigh`); a model that fails `validate_agent_model_value` (e.g. `haiku`) exits `2`.
    - `FR-25`: resolve `claude` on `PATH` (`shutil.which("claude")`); record path + `claude --version`. If absent, exit `2`.
 2. **Scope + multi-session arbitration (FR-18):** under `flock_backlog(WORKSPACE_ROOT)` (`session.py:372`), load the `SuperviseRegistry` + `SessionRegistry`, expand the scope via `ScopeFilter.parse` (`scope.py:328`), and run `detect_scope_overlap` (`session.py:437`) against active sessions. On overlap without `--allow-overlap`, exit `2` with the overlapping ids. On a name already running, exit `2` (`ERROR: supervise session 'N' already running (pid P); use 'supervise restart' or a different --name`).
@@ -413,7 +436,7 @@ The supervisor is one module `src/devbench/supervise.py` (plus `cli.py` verb wir
    with the minimized environment (`EnvSanitizer`) plus these scope-conveyance vars EXPLICITLY EXPORTED into the screen session so the in-session `devbench` subprocesses the orchestrate skill runs resolve the correct backlog, config, and scope deterministically:
    - `DEVBENCH_WORKSPACE_ROOT=<workspace>` -- conveys (a) WHICH backlog/workspace and (b) WHERE the config lives: `config.py:200-211` derives `WORKSPACE_ROOT` from this var and `resolve_config_path` derives the backlog config `<DEVBENCH_WORKSPACE_ROOT>/backlog/config/devbench.yaml` from it (`config.py:8-11`). It is a required import-time var (`config.py:202`); without it the in-session `devbench` calls `sys.exit(2)`.
    - `DEVBENCH_SESSION_NAME=<name>` -- routes the per-session scope.json/drain plumbing: `resolve_scope_file_path` (`scope.py:58-79`) and `resolve_drain_signal_path` (`drain.py:123-144`) key off it (ADR-23), so `devbench next` and the orchestrate skill read `<workspace>/.devbench/sessions/<name>/scope.json` (the file step 4a wrote).
-   - `DEVBENCH_CLAUDE_MODEL=<resolved-import-model>` -- the import-time required model var (`config.py:345-348`) the in-session `devbench` subprocesses need to import `config.py` at all. This is the SDK-caller/import model, NOT the interactive billing model; the interactive `claude` model is conveyed solely via the `--model <m>` launch flag (D-3). It is NOT an API-key var and is NOT on the env deny-list (Section 3.6.1), so exporting it does not route inference to API billing -- only `ANTHROPIC_*`/`AWS_*`/`DEVBENCH_USE_BEDROCK` do, and those remain stripped (Section 0.2, FR-21).
+   - `DEVBENCH_CLAUDE_MODEL=<resolved-import-model>` -- the import-time required model var (`config.py:345-348`) the in-session `devbench` subprocesses need to import `config.py` at all. This is the SDK-caller/import model, NOT the interactive billing model; the interactive `claude` model is conveyed solely via the `--model <m>` launch flag (D-3). It is NOT a routing var and is NOT on the env deny-list (Section 3.6.1), so exporting it does not route inference off the selected channel -- only the `ANTHROPIC_*` API vars and (in `subscription` mode) the Bedrock/Vertex routing vars do, and those remain stripped (Section 0.2, FR-21). In `bedrock` mode the supervisor ALSO exports the claude-CLI Bedrock route (`CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`, `ANTHROPIC_MODEL`), and the AWS workload creds pass through in both modes.
    No `-p`/`--print`. (DISCOVERY ITEM DI-1: confirm `--effort xhigh` is accepted alongside `--dangerously-skip-permissions` on the installed CLI version; if the flag is rejected, fall back to injecting `/effort xhigh` post-ready -- the config has both a flag form and a slash form, Section 5.3.)
 6. **Wait for ready (FR-7):** `PtyDriver.expect(supervise.detection_patterns.ready_prompt, timeout=supervise.timeouts.ready_prompt_seconds)`. On timeout, classify FAULT, tear down the screen, write `state=errored exit-reason=ready-prompt-timeout`, exit non-zero. The hybrid detector ALSO accepts readiness if the orchestrate log shows the first orchestrate tool call.
 7. **Inject orchestrate (FR-8):** `CommandInjector.send("orchestrate")` -> `sendline("/devbench-orchestrate:orchestrate")`. The session already KNOWS its scope deterministically before this line runs: (a)(b) the exported env (`DEVBENCH_WORKSPACE_ROOT`, `DEVBENCH_SESSION_NAME`, `DEVBENCH_CLAUDE_MODEL`) from step 5, and (c) the per-session scope.json from step 4a. The orchestrate skill consumes scope WITHOUT a slash argument: SKILL.md step 1c reads `.devbench/scope.json` (session-routed via `DEVBENCH_SESSION_NAME`) before claiming, and `devbench next` already respects it, returning `NO_ACTIONABLE_IN_SCOPE` when nothing matches (`cli.py:1240-1276`). The kickoff line therefore conveys/confirms scope by being injected in an environment where scope is already authoritative; it does NOT depend on a `--scope-from` argument the skill may not parse. (See DI-3, now a concrete verification step, and D-5.)
@@ -446,7 +469,7 @@ Performs `stop --name N` (graceful) capturing the claude session id, then `start
 
 **Syntax:** `devbench supervise status [--name N]`
 
-Reads the `SuperviseRegistry` state file (Section 5.5). With `--name`, prints one session; without, prints all supervise sessions. Fields: `name`, `state` (one of `starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress` (current claimed WU id, read from the backlog claim audit), `last-activity` (UTC), `screen` name, `claude-session` id, `billing-channel` (`subscription`), `exit-reason` (when stopped/errored), and, when `state=quota-waiting`, `expected-resume` (from the parsed `reset_at` / `quota_pause.json`) and `resumes-used=<n>/<cap>`. Session-aware, mirroring `cmd_sessions` (`cli.py:10405-10464`). Exit `0`; unknown `--name` -> exit `2`.
+Reads the `SuperviseRegistry` state file (Section 5.5). With `--name`, prints one session; without, prints all supervise sessions. Fields: `name`, `state` (one of `starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress` (current claimed WU id, read from the backlog claim audit), `last-activity` (UTC), `screen` name, `claude-session` id, `billing-channel` (`subscription` or `bedrock`, mirroring the active `billing_mode`), `exit-reason` (when stopped/errored), and, when `state=quota-waiting`, `expected-resume` (from the parsed `reset_at` / `quota_pause.json`) and `resumes-used=<n>/<cap>` (subscription mode only -- `bedrock` mode never enters `quota-waiting`). Session-aware, mirroring `cmd_sessions` (`cli.py:10405-10464`). Exit `0`; unknown `--name` -> exit `2`.
 
 `FR-10: status shall surface a distinct "quota-waiting" state with the expected resume time when known.`
 
@@ -527,6 +550,8 @@ Note `quota-waiting` is a non-terminal holding state and never maps to a non-zer
 
 ### 4.9 Quota / 5-hour-window wait-and-resume (FR-14, FR-15, FR-16)
 
+**Billing-mode scope:** this section applies to `subscription` mode only. The 5-hour subscription windows are a SUBSCRIPTION construct; **`bedrock` mode has no 5-hour windows, so the QuotaWaiter 5-hour wait is DISABLED.** In `bedrock` mode a subscription usage-limit prompt is anomalous: the `QuotaWaiter` faults fast with `exit-reason=quota-wait-disabled-bedrock` (it does NOT persist a subscription checkpoint or wait an imaginary window). Bedrock API throttling is handled by the SHARED `quota.py` path already used by the SDK orchestrator subprocess (the `_BEDROCK_THROTTLE_CODES` handling), NOT by the supervisor's subscription quota machinery; the subscription-only quota markers and the `LogTailDetector` window-reset logic do not fire in `bedrock` mode. The rest of this section describes the `subscription`-mode behavior.
+
 This path REUSES as much of devbench's existing quota wait-and-resume logic as possible -- it is DRY and COMPOSABLE, not a reimplementation. The interactive supervisor MUST call the SAME `quota_handling` config and the SAME wait-and-resume / `quota.wait_for_reset` / `max_quota_resumes` primitives the SDK path uses. NEW quota code in the supervisor is a THIN INTERACTIVE-PATH ADAPTER over these shared primitives; the only genuinely-new logic is (i) detecting the interactive usage-limit PROMPT in the PTY and (ii) choosing in-session wait (4.9a) vs poll-restart (4.9b), then DELEGATING the wait duration/cap to the existing logic.
 
 **Reused verbatim (no copy):**
@@ -586,6 +611,7 @@ Added to `RuntimeConfig` (`config_loader.py:1577`, new field near line 1634 + co
 supervise:
   model: null                       # default model; null -> falls back to orchestrate.model -> fail-fast (D-3)
   effort: xhigh                      # low|medium|high|xhigh|max (xhigh default; max is session-only)
+  billing_mode: subscription         # subscription (default; 5-hour windows, quota wait engaged) | bedrock (AWS Bedrock, no windows, quota wait disabled). Precedence: --billing-mode flag > DEVBENCH_SUPERVISE_BILLING_MODE env > this > default
   screen_name_prefix: devbench-supervise-
   timeouts:
     ready_prompt_seconds: 120        # wait for the first interactive ready prompt
@@ -616,7 +642,7 @@ supervise:
     markers_fault: ["[ORCHESTRATOR_STOP_REASON]", "[ORCHESTRATOR_FATAL_ERROR]", "[HARNESS_INTEGRITY]"]
     markers_restart: ["[ORCHESTRATOR_AUTO_RESTART]"]
   env:
-    deny_vars: ["AWS_PROFILE", "AWS_SESSION_TOKEN"]    # ADDITIONAL deny vars; the always-deny set is non-removable
+    deny_vars: []                     # ADDITIONAL deny vars layered on the mode-resolved routing deny set (non-removable). AWS workload creds are NOT denied (they pass through in both modes)
   logging:
     pty_log_relpath: pty.log         # under the session state dir
     redact_patterns: ["sk-ant-[A-Za-z0-9_-]+", "AKIA[0-9A-Z]{16}", "(?i)aws_secret[^\\s]*", "Bearer\\s+[A-Za-z0-9._-]+"]
@@ -630,7 +656,7 @@ supervise:
 
 ### 5.2 Schema additions (config-schema.json)
 
-Because the root object has `"additionalProperties": false` (`config-schema.json:9`), a `supervise` key MUST be added to the root `properties` (which open at `config-schema.json:10`) or any config containing `supervise:` is REJECTED at `jsonschema.validate(raw, _SCHEMA)` (`config_loader.py:1906-1910`). The new block is `"supervise": { "type": "object", "additionalProperties": false, "properties": { ... } }` mirroring the field set in 5.1, with enums for `effort` (`low|medium|high|xhigh|max`) and `restart.resume_mode` (`continue|resume`), integer bounds on every timeout (>= 1), and `model` as a string-or-null. The always-deny env set is enforced in `_parse_supervise_config` (a Python-level check, not schema), failing fast if `env.deny_vars` attempts to whitelist an always-deny var by negation.
+Because the root object has `"additionalProperties": false` (`config-schema.json:9`), a `supervise` key MUST be added to the root `properties` (which open at `config-schema.json:10`) or any config containing `supervise:` is REJECTED at `jsonschema.validate(raw, _SCHEMA)` (`config_loader.py:1906-1910`). The new block is `"supervise": { "type": "object", "additionalProperties": false, "properties": { ... } }` mirroring the field set in 5.1, with enums for `effort` (`low|medium|high|xhigh|max`), `billing_mode` (`subscription|bedrock`, default `subscription`), and `restart.resume_mode` (`continue|resume`), integer bounds on every timeout (>= 1), and `model` as a string-or-null. The non-removable routing-var deny set (the union across modes) is enforced in `_parse_supervise_config` (a Python-level check, not schema), failing fast if `env.deny_vars` attempts to whitelist a routing var by negation; the AWS workload creds are NOT in that set.
 
 ### 5.3 The injectable-command registry (FR-28, extensibility)
 
@@ -638,9 +664,11 @@ Because the root object has `"additionalProperties": false` (`config-schema.json
 
 `FR-28: New injectable operator commands shall be addable via the supervise.injectable_commands config map without modifying supervisor code.`
 
-### 5.4 Model + effort resolution
+### 5.4 Model + effort + billing-mode resolution
 
 `FR-19: supervise.model resolves --model > supervise.model > orchestrate.model, fail-fast if all unset; effort resolves --effort > supervise.effort > "xhigh".` Validation reuses `validate_agent_model_value` (`config_loader.py:1455`); `haiku` is rejected. `DEVBENCH_CLAUDE_MODEL` is explicitly NOT consulted (Section 0.2/1.2).
+
+`billing_mode` resolves `--billing-mode` flag > `DEVBENCH_SUPERVISE_BILLING_MODE` env > `supervise.billing_mode` config > default `subscription` (the `_resolve_supervise_billing_mode` helper mirrors the project's other `_resolve_*` precedence helpers). The resolved value MUST be one of `{subscription, bedrock}`; an invalid value at any tier fails fast (no silent fallback). The config loader (`_parse_supervise_config`) validates `supervise.billing_mode` at load with the same enum, and the schema enforces it as an enum too.
 
 ### 5.5 The supervise registry / per-session state files
 
@@ -768,12 +796,12 @@ The `__run` supervisor handles `SIGTERM` by entering `draining` (graceful) and `
 
 | Doc | Change |
 |---|---|
-| `docs/supervise.md` | NEW. Full operator guide: the six verbs, the billing rationale (subscription vs API), preflight requirements (screen, subscription login, no API key), quota-wait behavior, multi-session, safe-attach, troubleshooting (CLI version-fragility). |
-| `docs/cli-reference.md` (1504 lines) | ADD the six `supervise` verbs with syntax, flags, exit codes (Section 14 snapshots). |
-| `docs/architecture.md` (693 lines) | ADD the interactive-screen launch path alongside the SDK path; document the billing rationale (subscription windows vs API) and the screen+pexpect+log-tail robustness model. |
-| `docs/execution-modes.md` (248 lines) | ADD "Supervised interactive (subscription-billed)" as a third execution mode beside SDK non-interactive and `make start-interactive` foreground. |
-| `docs/devbench-yaml-reference.md` (454 lines) | DOCUMENT the `supervise:` block (all fields, defaults, env overrides) and note `quota_handling` reuse. |
-| `docs/llm-authentication.md` (229 lines) | ADD a cross-reference: the supervise path is the subscription-billed channel; restate the no-API-key requirement. |
+| `docs/supervise.md` | NEW. Full operator guide: the six verbs, the two billing modes (`--billing-mode` subscription/bedrock + AWS-passthrough rationale), preflight requirements (screen, mode-aware auth, no routing var), quota-wait behavior (subscription-only), multi-session, safe-attach, troubleshooting (CLI version-fragility). |
+| `docs/cli-reference.md` (1504 lines) | ADD the six `supervise` verbs with syntax, flags (incl. `--billing-mode`), exit codes (Section 14 snapshots). |
+| `docs/architecture.md` (693 lines) | ADD the interactive-screen launch path alongside the SDK path; document the two billing modes + AWS passthrough (env-sanitizer/auth/quota sections) and the screen+pexpect+log-tail robustness model. |
+| `docs/execution-modes.md` (248 lines) | ADD "Supervised interactive (billing-mode)" as a third execution mode beside SDK non-interactive and `make start-interactive` foreground. |
+| `docs/devbench-yaml-reference.md` (454 lines) | DOCUMENT the `supervise:` block (all fields incl. `billing_mode`, defaults, env overrides) and note `quota_handling` reuse. |
+| `docs/llm-authentication.md` (229 lines) | ADD a cross-reference: the supervise path's two billing modes; restate the no-routing-var requirement (subscription) and the AWS-passthrough guarantee (both modes). |
 | `docs/adr/31-interactive-screen-supervisor.md` | NEW ADR. Records WHY interactive-CLI-subscription-billing over SDK/API, WHY not `-p`/`--print`, and the screen+pexpect version-fragility tradeoffs + the hybrid log-tail mitigation. |
 
 `FR-31: The feature is "done" only when docs/supervise.md, ADR-31, and the four edited docs ship in the same change as the code.`
@@ -832,9 +860,9 @@ Executable ACs (each maps to one `VERIFY AC-N | type=command` directive; `make t
 - [ ] AC-1: The state machine transitions `starting -> running` on `ready + orchestrate-injected` and `running -> quota-waiting` on `quota-detected` (Section 4.8). verify: `uv run pytest tests/test_supervise_state_machine.py -k transitions` (expect-exit 0).
 - [ ] AC-2: A faulted outcome (crash, circuit-breaker, non-clean stop-reason, prompt-timeout, harness-block) yields a non-zero classified exit; clean completion (`ALL_DONE` / operator-gated `NO_ACTIONABLE`) yields exit 0; quota exhaustion yields NO exit (`quota-waiting`) (Section 4.6, FR-13). verify: `uv run pytest tests/test_supervise_exit_taxonomy.py` (expect-exit 0).
 - [ ] AC-3: The default `detection_patterns.quota_limit` regex matches every string in `quota._QUOTA_MARKERS` and `reset_at` parses `"resets 8:00am (UTC)"` to a UTC datetime (Section 4.9, FR-14). verify: `uv run pytest tests/test_supervise_detection.py -k quota` (expect-exit 0).
-- [ ] AC-4: `EnvSanitizer` strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`, `DEVBENCH_USE_BEDROCK`, and the AWS routing vars from the session env; a config that tries to whitelist an always-deny var fails fast (Section 3.6.1, FR-21). verify: `uv run pytest tests/test_supervise_env_guard.py` (expect-exit 0).
-- [ ] AC-5: `supervise start` fails fast with exit 2 and the documented message when `ANTHROPIC_API_KEY` is present in the environment (Section 7.1, FR-21). verify: `uv run pytest tests/test_supervise_preflight.py -k api_key` (expect-exit 0).
-- [ ] AC-6: `supervise start` fails fast with exit 2 when subscription auth (a `claudeAiOauth.accessToken` with `user:inference` scope) is absent (Section 3.6.1, FR-20). verify: `uv run pytest tests/test_supervise_preflight.py -k auth` (expect-exit 0).
+- [ ] AC-4: `EnvSanitizer` strips the MODE-RESOLVED routing deny set -- both modes strip the direct-Anthropic-API vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_URL`, `ANTHROPIC_BASE_URL`); `subscription` mode also strips the Bedrock/Vertex routing vars (`DEVBENCH_USE_BEDROCK`, `CLAUDE_CODE_USE_BEDROCK`, etc.); `bedrock` mode EXPORTS the Bedrock route. The AWS workload creds pass through in BOTH modes; a config that tries to whitelist a routing var fails fast (Section 3.6.1, FR-21). verify: `uv run pytest tests/test_supervise_env_guard.py` (expect-exit 0).
+- [ ] AC-5: In `subscription` mode, `supervise start` fails fast with exit 2 and the documented message when a routing var (`ANTHROPIC_API_KEY`) is present in the environment; AWS creds present do NOT trigger this (Section 7.1, FR-21). verify: `uv run pytest tests/test_supervise_preflight.py -k api_key` (expect-exit 0).
+- [ ] AC-6: In `subscription` mode, `supervise start` fails fast with exit 2 when subscription auth (a `claudeAiOauth.accessToken` with `user:inference` scope) is absent; in `bedrock` mode it fails fast instead when the AWS Bedrock prerequisites (credential + region) are absent (Section 3.6.1, FR-20). verify: `uv run pytest tests/test_supervise_preflight.py -k auth` (expect-exit 0).
 - [ ] AC-7: `supervise start` fails fast with exit 2 and the install message when `screen` is not on PATH (Section 7.1, FR-23). verify: `uv run pytest tests/test_supervise_preflight.py -k screen_missing` (expect-exit 0).
 - [ ] AC-8: Model resolution honors `--model > supervise.model > orchestrate.model` and fails fast when all are unset; `haiku` is rejected (Section 5.4, FR-19). verify: `uv run pytest tests/test_supervise_model_resolution.py` (expect-exit 0).
 - [ ] AC-9: The quota wait-and-resume bounds: resumes are capped at the resolved cap and a cap-exceeded transition yields `faulted exit-reason=quota-resume-cap-exhausted` (Section 4.9, FR-15). verify: `uv run pytest tests/test_supervise_quota.py -k "resume and cap"` (expect-exit 0).
@@ -859,7 +887,7 @@ Executable ACs (each maps to one `VERIFY AC-N | type=command` directive; `make t
 Deferred ACs (cannot run in CI -- require a real subscription login, live `claude`, real `screen`, or a real quota event; each maps to a `VERIFY AC-N | type=deferred` directive):
 
 - [ ] AC-23: DEFERRED (live) -- INTEGRATION cold start with REAL `claude` + REAL `screen` against the dummy backlog: `supervise start` -> `/orchestrate` -> the 1-2 trivial units complete -> `ALL_DONE` -> exit 0. verify: deferred (requires subscription login + live claude + screen).
-- [ ] AC-24: DEFERRED (live) -- SUBSCRIPTION-BILLING assertion: with REAL `claude`, the live session has NO `ANTHROPIC_API_KEY` in its environment (asserted by reading `/proc/<claude-pid>/environ`) and the session is subscription-authed (`status` shows `billing-channel: subscription`). verify: deferred (requires live session inspection).
+- [ ] AC-24: DEFERRED (live) -- SUBSCRIPTION-BILLING assertion (subscription mode): with REAL `claude` launched under `--billing-mode subscription`, the live session has NO routing var (`ANTHROPIC_API_KEY`, etc.) in its environment (asserted by reading `/proc/<claude-pid>/environ`) yet DOES carry the passed-through AWS workload creds, and the session is subscription-authed (`status` shows `billing-channel: subscription`). verify: deferred (requires live session inspection).
 - [ ] AC-25: DEFERRED (live) -- INTEGRATION induced-fault auto-restart with REAL claude (kill the child mid-run) -> bounded auto-restart -> resume via `--continue`. verify: deferred (requires live claude).
 - [ ] AC-26: DEFERRED (live) -- INTEGRATION multi-session parallel with REAL claude: two names, disjoint scope, no collision, both complete. verify: deferred (requires two concurrent live sessions).
 - [ ] AC-27: DEFERRED (live) -- INTEGRATION attach-and-observe with REAL claude + screen does not disrupt the run (the run completes while an operator watches). verify: deferred (requires live session + human observation).
@@ -1028,7 +1056,7 @@ Exit 0; 2 if no such session.
 - FR-6: create the detached `screen` and run the supervisor inside it.
 - FR-7: wait for the ready prompt before injecting orchestrate (hybrid PTY+log).
 - FR-8: inject `/devbench-orchestrate:orchestrate` and convey scope deterministically (first-class): export `DEVBENCH_WORKSPACE_ROOT`/`DEVBENCH_SESSION_NAME`/`DEVBENCH_CLAUDE_MODEL` and write the session-routed `scope.json` (reusing `ScopeFilter.to_file`) BEFORE launch, so the session resolves the correct backlog, config, and scope (explicit range or whole-backlog default).
-- FR-9: `status` surfaces per-session state incl. `billing-channel: subscription`.
+- FR-9: `status` surfaces per-session state incl. `billing-channel` (`subscription` | `bedrock`, mirroring the resolved `billing_mode`).
 - FR-10: `status` surfaces a distinct `quota-waiting` state with expected resume.
 - FR-11: `info` lists all supervise screens + attach command.
 - FR-12: bounded auto-restart on the exit-42-equivalent via `--continue`/`--resume`; explicit `restart`.
@@ -1038,9 +1066,9 @@ Exit 0; 2 if no such session.
 - FR-16: persist/surface expected-resume across restarts via `quota_pause.json`.
 - FR-17: `SuperviseRegistry` per-session state under `.devbench/supervise/<name>/`.
 - FR-18: multi-session arbitration via `flock_backlog` + `detect_scope_overlap`.
-- FR-19: model/effort resolution + `supervise:` config parse + schema validation.
-- FR-20: verify subscription auth at launch (fail-fast if absent).
-- FR-21: strip + guard API-key env vars (fail-fast if present).
+- FR-19: model/effort/billing_mode resolution + `supervise:` config parse + schema validation (`billing_mode` enum `subscription|bedrock`, default `subscription`; precedence flag > env > config > default; invalid value fails fast).
+- FR-20: mode-aware auth preflight (fail-fast if absent): `subscription` requires subscription auth; `bedrock` requires the AWS Bedrock prerequisites (credential + region) instead.
+- FR-21: strip + guard the MODE-RESOLVED routing-var deny set (fail-fast if a denied routing var is present); AWS workload creds are in NEITHER mode's deny set and always pass through; `bedrock` mode exports the claude-CLI Bedrock route.
 - FR-22: add `pexpect` to `pyproject.toml` dependencies.
 - FR-23: fail-fast with install message when `screen` absent.
 - FR-24: redact secrets from `pty.log`; mode 0600.

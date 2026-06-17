@@ -366,6 +366,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "Aggregate safety valve for block-and-continue. A single non-converging claim is BLOCKED (within_claim_convergence_check) and the orchestrate session CONTINUES to its next in-queue unit -- one bad module no longer abandons the rest of a session's scope. This caps how many DISTINCT units may each trip the convergence bound in ONE session before the session halts for operator attention with [ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K). Default 3. Override via DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS."
+        },
+        "claim_teardown_cleanup_hook": {
+          "type": "string",
+          "description": "Optional sanctioned cleanup command run AFTER the executor's positively-attributed subprocess group is torn down on a [CLAIM_NOT_CONVERGING] block. On block, devbench SIGTERMs the single process group attributed to THIS claim's executor (e.g. a long live 'terraform apply' / 'go test' tree) so it is not orphaned to init and left leaking billable resources; if this hook is set it then runs the command (e.g. a run-id-scoped terratest sweep) to reclaim any resource a torn-down apply left half-created. Empty / unset = no hook (the default): nothing runs unless the project opts in. Override via DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK."
         }
       }
     },

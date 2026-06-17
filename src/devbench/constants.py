@@ -785,6 +785,23 @@ DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK: bool = True
 # recurring failure so an operator/loop can act deterministically.
 CLAIM_NOT_CONVERGING_MARKER: str = "[CLAIM_NOT_CONVERGING]"
 
+# Audit-log marker emitted when the executor's positively-attributed subprocess
+# group is torn down on a CLAIM_NOT_CONVERGING block (Item B of tracked issue
+# 015: a long external subprocess -- e.g. a live ``terraform apply`` / ``go
+# test`` -- the executor spawned would otherwise be orphaned to init and keep
+# running, leaking billable resources). Records the pgid so the single,
+# attributed teardown is auditable.
+CLAIM_TEARDOWN_MARKER: str = "[CLAIM_EXECUTOR_TEARDOWN]"
+
+# Default sanctioned cleanup hook command run AFTER the executor group is torn
+# down on a CLAIM_NOT_CONVERGING block. Empty string = no hook (the default):
+# the project opts in via env ``DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK``
+# or YAML ``orchestrate.claim_teardown_cleanup_hook`` (e.g. a run-id-scoped
+# terratest sweep that reclaims any resource a torn-down ``terraform apply``
+# left half-created). Never run when unset (CLAUDE.md: no hard-coded values, no
+# implicit behaviour).
+DEFAULT_CLAIM_TEARDOWN_CLEANUP_HOOK: str = ""
+
 # Aggregate safety valve for block-and-continue (TDI: claim-not-converging must
 # not halt the whole session).
 #

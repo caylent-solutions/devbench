@@ -691,6 +691,14 @@ class OrchestrateConfig:
     operator attention (``[ORCHESTRATOR_STOP_REASON] reason=too many
     non-converging claims (K)``). ``None`` falls through to the constants.py
     default (3) resolved by ``config.py`` (env > YAML > default).
+
+    ``claim_teardown_cleanup_hook`` is an optional sanctioned cleanup command
+    run AFTER the executor's positively-attributed subprocess group is torn
+    down on a ``[CLAIM_NOT_CONVERGING]`` block (e.g. a run-id-scoped terratest
+    sweep that reclaims any resource a torn-down ``terraform apply`` left
+    half-created). ``None`` / empty = no hook (the default): nothing runs unless
+    the project opts in. Resolved env > YAML > constants.py default by
+    ``config.py``.
     """
 
     max_cascade_depth: int | None = None
@@ -701,6 +709,7 @@ class OrchestrateConfig:
     max_claim_wall_clock_seconds: float | None = None
     max_no_claim_activity_seconds: float | None = None
     max_non_converging_claims: int | None = None
+    claim_teardown_cleanup_hook: str | None = None
 
 
 def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bool) -> OrchestrateConfig:
@@ -769,6 +778,11 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
             f"Config file '{path}': orchestrate.max_non_converging_claims must be >= 1; "
             f"got {max_non_converging_claims!r}."
         )
+    claim_teardown_cleanup_hook = (
+        str(orchestrate_raw["claim_teardown_cleanup_hook"])
+        if "claim_teardown_cleanup_hook" in orchestrate_raw
+        else None
+    )
     return OrchestrateConfig(
         max_cascade_depth=max_cascade_depth,
         model=model,
@@ -778,6 +792,7 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
         max_claim_wall_clock_seconds=max_claim_wall_clock_seconds,
         max_no_claim_activity_seconds=max_no_claim_activity_seconds,
         max_non_converging_claims=max_non_converging_claims,
+        claim_teardown_cleanup_hook=claim_teardown_cleanup_hook,
     )
 
 

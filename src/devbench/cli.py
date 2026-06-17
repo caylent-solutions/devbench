@@ -182,10 +182,12 @@ from devbench.constants import (
     BLOCKED_TARGET_REPO_UNRESOLVED_MARKER,
     CLAIM_BLOCKED_PRECLAIM,
     CLAIM_NOT_CONVERGING_MARKER,
+    CLAIM_TEARDOWN_MARKER,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_CLAIM_TEARDOWN_CLEANUP_HOOK,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
     DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS,
@@ -312,7 +314,7 @@ from devbench.supervise import (
     write_stop_request,
 )
 from devbench.utils.io import atomic_write_text
-from devbench.utils.process import run_command
+from devbench.utils.process import run_command, run_command_in_process_group
 
 __all__ = ["_format_duration"]
 
@@ -4736,8 +4738,20 @@ def _run_verification_item(
         def _emit_heartbeat(*, elapsed: int) -> None:
             logger.info(_format_long_op_heartbeat(verb="verify-ac", unit=task_id, elapsed_seconds=elapsed))
 
+        # Launch the live command in its OWN process group and register that
+        # pgid for the active session, so a [CLAIM_NOT_CONVERGING] block can tear
+        # down exactly this command's subtree (e.g. a live ``terraform apply`` /
+        # ``go test``) instead of orphaning it to init (Item B, tracked issue
+        # 015). The registration is cleared the instant the command terminates.
         rc, stdout, stderr = run_with_long_op_heartbeat(
-            run=lambda: run_command(["bash", "-c", command], cwd=repo_path, timeout=timeout, env=gate_env),
+            run=lambda: run_command_in_process_group(
+                ["bash", "-c", command],
+                cwd=repo_path,
+                timeout=timeout,
+                env=gate_env,
+                on_pgid=_register_executor_pgid,
+                on_complete=_clear_executor_pgid,
+            ),
             heartbeat_interval_seconds=heartbeat_interval,
             emit_heartbeat=_emit_heartbeat,
         )
@@ -8510,6 +8524,24 @@ def _resolve_max_non_converging_claims() -> int:
     return DEFAULT_MAX_NON_CONVERGING_CLAIMS
 
 
+def _resolve_claim_teardown_cleanup_hook() -> str | None:
+    """Return the sanctioned cleanup command run after executor-group teardown.
+
+    Resolves ``DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK`` (env), then
+    YAML ``orchestrate.claim_teardown_cleanup_hook``, then
+    :data:`~devbench.constants.DEFAULT_CLAIM_TEARDOWN_CLEANUP_HOOK`. An empty /
+    whitespace-only value means "no hook" and yields ``None`` so no command ever
+    runs unless the project explicitly opts in (CLAUDE.md: no implicit
+    behaviour, no hard-coded values).
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK", "").strip()
+    if not raw:
+        yaml_value = RUNTIME_CONFIG.orchestrate.claim_teardown_cleanup_hook
+        candidate = yaml_value if yaml_value is not None else DEFAULT_CLAIM_TEARDOWN_CLEANUP_HOOK
+        raw = candidate.strip()
+    return raw or None
+
+
 def _resolve_max_quota_resumes() -> int:
     """Return the effective in-process quota-resume cap (env > default).
 
@@ -9477,7 +9509,12 @@ def cmd_start(*argv: str) -> int:
                 logger.warning("%s%s", _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX, recurring)
                 return True
             unit_id = _convergence_tracker.current_unit_id
-            _block_non_converging_claim(unit_id, recurring)
+            # Positively-attributed teardown: the in-session live-command runner
+            # records the pgid of the external command it launched into this
+            # session's executor.pgid file; read it (None when no live command is
+            # registered) and hand it to the block so the executor's subtree is
+            # reaped rather than orphaned to init (Item B, tracked issue 015).
+            _block_non_converging_claim(unit_id, recurring, executor_pgid=_read_attributed_executor_pgid())
             _non_converging_unit_ids.add(unit_id)
             # Clear the just-blocked claim so its lingering identical-failure
             # messages cannot re-trip the bound for the SAME unit before the skill
@@ -12249,7 +12286,160 @@ def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
     _flag_orphaned_staged_wip(wu, f"interrupted on stop session={session_name}")
 
 
-def _block_non_converging_claim(unit_id: str, recurring_failure: str) -> None:
+def _executor_pgid_file(session_name: str | None) -> Path:
+    """Return the session-scoped path that records the live executor pgid.
+
+    Cross-process attribution channel: the in-session live-command runner (a
+    separate ``devbench verify-ac`` CLI subprocess) writes the process-group id
+    of the external command it launched here; the orchestrator daemon reads it
+    at block time to tear down EXACTLY that group. Keyed by the active session
+    so two sessions on one workspace never read each other's pgid.
+    """
+    name = session_name or os.environ.get("DEVBENCH_SESSION_NAME", "").strip() or "default"
+    return WORKSPACE_ROOT / SESSION_SESSIONS_BASE_DIR / name / "executor.pgid"
+
+
+def _register_executor_pgid(pgid: int, *, session_name: str | None = None) -> None:
+    """Record *pgid* as the live executor process group for the active session.
+
+    Called by the in-session long-op runner right after it launches the live
+    command in its own group. Best-effort: a write failure is logged, never
+    fatal (the command still runs; only the block-time teardown loses its
+    handle).
+    """
+    path = _executor_pgid_file(session_name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, f"{pgid}\n")
+    except OSError as exc:
+        logger.warning("%s could not register executor pgid=%d: %s", CLAIM_TEARDOWN_MARKER, pgid, exc)
+
+
+def _clear_executor_pgid(*, session_name: str | None = None) -> None:
+    """Remove the recorded executor pgid once the live command has terminated.
+
+    A no-longer-live group must never be torn down for a later, unrelated claim,
+    so the file is cleared as soon as the command returns. Best-effort.
+    """
+    path = _executor_pgid_file(session_name)
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def _read_attributed_executor_pgid(*, session_name: str | None = None) -> int | None:
+    """Return the recorded live executor pgid for the active session, or None.
+
+    Read by the orchestrator at ``[CLAIM_NOT_CONVERGING]`` block time. ``None``
+    when no live command is registered (no subprocess to tear down) or the file
+    is missing / unreadable / malformed (fail-safe: a teardown is skipped rather
+    than risking a wrong pgid).
+    """
+    path = _executor_pgid_file(session_name)
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        pgid = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s executor pgid file %s holds non-integer %r; skipping teardown", CLAIM_TEARDOWN_MARKER, path, raw
+        )
+        return None
+    return pgid if pgid > 1 else None
+
+
+def _terminate_process_group(pgid: int) -> bool:
+    """Send ``SIGTERM`` to EXACTLY the one process group *pgid*; never broadly.
+
+    Positively-attributed, single-group teardown (Item B of tracked issue 015):
+    a long external subprocess the executor spawned (e.g. a live ``terraform
+    apply`` / ``go test`` tree) must be reaped on a ``[CLAIM_NOT_CONVERGING]``
+    block so it is not orphaned to init and left applying billable resources
+    outside devbench's lifecycle. Signals ONLY *pgid* via :func:`os.killpg` --
+    NOT a process-name scan, NOT a parent-tree walk, NOT a machine-wide kill --
+    so it can never reach an unrelated session's work.
+
+    Refuses, returning ``False`` without signalling:
+
+    - ``pgid <= 1`` -- pgid 0 means "the caller's own group" and 1 is init; a
+      broad-kill guard so a mis-attributed / unset pgid can never fan out.
+    - the orchestrator's OWN process group (``os.getpgrp()``) -- the daemon must
+      never tear itself (or sibling in-flight work sharing its group) down.
+
+    A group that already exited (``ProcessLookupError``) is a no-op success.
+
+    Args:
+        pgid: The process-group id positively attributed to THIS claim's
+            executor (the leader pid of a subprocess launched with
+            ``start_new_session=True`` / ``setsid``).
+
+    Returns:
+        ``True`` when ``SIGTERM`` was delivered to *pgid*; ``False`` when the
+        group was refused by the attribution guards above.
+    """
+    if pgid <= 1:
+        logger.warning(
+            "%s refused to signal reserved process group pgid=%d (broad-kill guard)", CLAIM_TEARDOWN_MARKER, pgid
+        )
+        return False
+    if pgid == os.getpgrp():
+        logger.warning("%s refused to signal the orchestrator's OWN process group pgid=%d", CLAIM_TEARDOWN_MARKER, pgid)
+        return False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        # The group already exited between attribution and teardown -- nothing
+        # to reap. A no-op success, not a fault (CLAUDE.md no-silent-failure:
+        # logged, not swallowed silently).
+        logger.info(
+            "%s executor process group pgid=%d already exited; nothing to tear down", CLAIM_TEARDOWN_MARKER, pgid
+        )
+        return True
+    except (OSError, PermissionError) as exc:
+        logger.warning("%s failed to signal executor process group pgid=%d: %s", CLAIM_TEARDOWN_MARKER, pgid, exc)
+        return False
+    logger.info("%s sent SIGTERM to attributed executor process group pgid=%d", CLAIM_TEARDOWN_MARKER, pgid)
+    return True
+
+
+def _run_claim_teardown_cleanup_hook(command: str) -> None:
+    """Run the sanctioned post-teardown cleanup *command* (best-effort).
+
+    Invoked AFTER the executor group is torn down on a block, only when a hook
+    is configured (e.g. a run-id-scoped terratest sweep that reclaims any
+    resource a torn-down ``terraform apply`` left half-created). A non-zero exit
+    or a launch failure is logged (CLAUDE.md no-silent-failure) but does not
+    propagate so the orchestrate loop can still exit cleanly.
+    """
+    rc, _stdout, stderr = run_command(["bash", "-c", command])
+    if rc != 0:
+        logger.warning("%s sanctioned cleanup hook exited %d: %s", CLAIM_TEARDOWN_MARKER, rc, stderr.strip())
+        return
+    logger.info("%s sanctioned cleanup hook completed (rc=0)", CLAIM_TEARDOWN_MARKER)
+
+
+def _teardown_non_converging_executor(unit_id: str, executor_pgid: int | None) -> None:
+    """Tear down the attributed executor group, then run the cleanup hook.
+
+    Separated from the status-block so the resource reclaim runs even if the
+    backlog write raised: an orphaned billable ``terraform apply`` is the worse
+    harm. No-op when no pgid was attributed (a non-subprocess claim).
+    """
+    if executor_pgid is None:
+        return
+    torn_down = _terminate_process_group(executor_pgid)
+    if not torn_down:
+        return
+    logger.info(
+        "%s task=%s executor_pgid=%d torn down on non-converging block", CLAIM_TEARDOWN_MARKER, unit_id, executor_pgid
+    )
+    hook = _resolve_claim_teardown_cleanup_hook()
+    if hook:
+        _run_claim_teardown_cleanup_hook(hook)
+
+
+def _block_non_converging_claim(unit_id: str, recurring_failure: str, *, executor_pgid: int | None = None) -> None:
     """Force-block *unit_id* with a ``[CLAIM_NOT_CONVERGING]`` audit comment.
 
     Called from ``_run`` when the within-claim convergence bound trips: the
@@ -12258,6 +12448,16 @@ def _block_non_converging_claim(unit_id: str, recurring_failure: str) -> None:
     normal operator / stop-window path -- the correct outcome for a failure
     that cannot be resolved in scope. Best-effort: a read/parse failure is
     logged and swallowed so the loop can still exit cleanly.
+
+    When *executor_pgid* is provided it is the process group positively
+    attributed to THIS claim's executor (a subprocess launched with
+    ``start_new_session=True``). After the unit is blocked, that single group is
+    torn down via :func:`_terminate_process_group` (SIGTERM to exactly that
+    pgid, never a broad kill) and the configured sanctioned cleanup hook (if
+    any) is run -- so a long external subprocess the executor spawned (e.g. a
+    live ``terraform apply`` / ``go test``) is reaped instead of orphaned to
+    init and left leaking billable resources (Item B of tracked issue 015). The
+    teardown runs regardless of whether the backlog write succeeded.
     """
     try:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
@@ -12283,6 +12483,11 @@ def _block_non_converging_claim(unit_id: str, recurring_failure: str) -> None:
         logger.info("%s task=%s recurring_failure=%r", CLAIM_NOT_CONVERGING_MARKER, unit_id, recurring_failure)
     except (OSError, ValueError) as exc:
         logger.warning("%s failed to block unit %s: %s", CLAIM_NOT_CONVERGING_MARKER, unit_id, exc)
+    finally:
+        # Reap the executor's spawned subprocess group even if the block raised:
+        # an orphaned billable apply is the worse harm. Single, positively
+        # attributed group only.
+        _teardown_non_converging_executor(unit_id, executor_pgid)
 
 
 def _send_sigterm_to_session(session_name: str) -> tuple[int, str, str]:

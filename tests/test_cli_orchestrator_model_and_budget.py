@@ -304,7 +304,9 @@ class TestWithinClaimConvergenceIntegration:
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
 
         blocked: list[tuple[str, str]] = []
-        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append((uid, recurring)))
+        monkeypatch.setattr(
+            cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append((uid, recurring))
+        )
 
         # Turn 1 claims; subsequent turns re-run the SAME verify-ac (the failure).
         turns = [
@@ -327,7 +329,9 @@ class TestWithinClaimConvergenceIntegration:
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "2")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "false")
         blocked: list[tuple[str, str]] = []
-        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append((uid, recurring)))
+        monkeypatch.setattr(
+            cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append((uid, recurring))
+        )
         turns = [
             [_claim_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
             [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
@@ -348,7 +352,7 @@ class TestWithinClaimConvergenceIntegration:
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "3")
 
         blocked: list[str] = []
-        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append(uid))
+        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append(uid))
 
         claims_seen: list[str] = []
         real_claimed_unit_id = cli._claimed_unit_id
@@ -394,7 +398,7 @@ class TestWithinClaimConvergenceIntegration:
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "2")
 
         blocked: list[str] = []
-        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append(uid))
+        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append(uid))
 
         # Unit 1 trips (2 identical failures), unit 2 trips (2 identical failures)
         # -> the 2nd distinct non-converging unit trips the aggregate valve. The
@@ -426,7 +430,7 @@ class TestWithinClaimConvergenceIntegration:
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "3")
 
         blocked: list[str] = []
-        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring: blocked.append(uid))
+        monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append(uid))
 
         turns = [[_FakeResultMsg(result="NO_ACTIONABLE -- 5/5 done, 0 blocked")]]
         fake_sdk = _make_scripted_fake_sdk(turns)

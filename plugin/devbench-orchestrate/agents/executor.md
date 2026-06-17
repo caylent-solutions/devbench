@@ -384,6 +384,14 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
   must never be held hostage to another unit's tests, and a whole-suite failure caused by
   out-of-scope code does not mean YOUR unit failed. The full-suite / global-coverage gate
   belongs to an epic-capstone unit or CI, not to a leaf unit's claim.
+- **Isolate the coverage data file on every `--cov` run.** When your within-claim test
+  invocation measures coverage (`pytest --cov=...`), run it with a UNIQUE `COVERAGE_FILE`,
+  e.g. `COVERAGE_FILE="$(mktemp -u)" uv run pytest --cov=<module> --cov-fail-under=100 ...`.
+  The shared checkout has ONE default `.coverage` SQLite db; repeated or overlapping coverage
+  runs in the same claim contend on its lock and can deadlock, surfacing as a false
+  `CLAIM_NOT_CONVERGING`. A unique `COVERAGE_FILE` per run removes the contention. (`verify-ac`
+  applies the same isolation to the coverage commands it runs, so do not rely on the default
+  `.coverage` from inside a claim.)
 - Document all verification steps in the log comment below.
 - **AC evidence (ADR-27): if the work unit declares a `## Verification` section, you MUST run
   `uv run devbench verify-ac $ARGUMENTS` after staging your changes and before logging completion.**

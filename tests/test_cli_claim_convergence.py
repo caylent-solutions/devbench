@@ -395,6 +395,123 @@ class TestClaimConvergenceTrackerNoClaimActivityBackstop:
         assert DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS >= 300
 
 
+class TestNoClaimBackstopSuppressedByInProgressUnit:
+    """Tracked-issue 003: the no-claim backstop is the 'active but ZERO claims
+    in-progress' wedge only -- it must NOT fire while a unit is genuinely
+    IN_PROGRESS and the executor is emitting SDK messages.
+
+    The tracker's own ``current_unit_id`` can diverge from the authoritative
+    backlog (e.g. it was cleared after a force-block, or the ``devbench claim``
+    message was never observed) while a unit is in fact IN_PROGRESS in the
+    backlog and its executor is emitting messages on a legitimately-long single
+    claim (a live ``terragrunt apply``). The backstop is gated on the injected
+    authoritative ``in_progress_count`` so a long-but-progressing claim is never
+    misread as a stall; the WITHIN-claim wall-clock backstop already governs a
+    genuinely-hung single claim.
+    """
+
+    def test_in_progress_claim_with_activity_does_not_trip_past_window(self) -> None:
+        # (a) Even though the tracker noted no claim (current_unit_id is None),
+        # the backlog reports an IN_PROGRESS unit and the executor keeps emitting
+        # messages WELL past the no-claim window -> the backstop must NOT fire.
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=4,
+            max_claim_wall_clock_seconds=0,
+            max_no_claim_activity_seconds=300.0,
+        )
+        results = [
+            tracker.observe(_bash("Read agent-transcript"), now=float(t), in_progress_count=1)
+            for t in (0.0, 299.0, 300.0, 600.0, 100_000.0)
+        ]
+        assert all(r is None for r in results), (
+            "a unit IS in-progress (executor active) -- the no-claim wedge backstop "
+            "must be suppressed; the within-claim wall-clock backstop governs a hang"
+        )
+
+    def test_zero_in_progress_still_trips_the_wedge(self) -> None:
+        # (b) With NO in-progress claim and activity past the window, the wedge
+        # STILL fires -- the backstop's actual purpose is preserved.
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=4,
+            max_claim_wall_clock_seconds=0,
+            max_no_claim_activity_seconds=300.0,
+        )
+        assert tracker.observe(_bash("Read"), now=0.0, in_progress_count=0) is None
+        assert tracker.observe(_bash("Read"), now=299.0, in_progress_count=0) is None
+        tripped = tracker.observe(_bash("Read"), now=300.0, in_progress_count=0)
+        assert tripped is not None, "the orphaned/wedge case (0 in-progress) must still trip"
+        assert "no claim" in tripped.lower()
+
+    def test_executor_activity_resets_the_timer(self) -> None:
+        # (c) Executor activity while a unit is in-progress resets the no-claim
+        # timer: a burst of in-progress activity (in_progress_count>=1) must clear
+        # the wedge timer so that even after the unit completes (count back to 0)
+        # the window is measured from the NEXT no-claim message, not retroactively.
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=4,
+            max_claim_wall_clock_seconds=0,
+            max_no_claim_activity_seconds=300.0,
+        )
+        # Wedge timer starts at t=0 (no in-progress unit yet).
+        assert tracker.observe(_bash("Read"), now=0.0, in_progress_count=0) is None
+        # A unit goes in-progress and the executor is active -> resets the timer.
+        assert tracker.observe(_bash("work"), now=200.0, in_progress_count=1) is None
+        # The unit is still active far past the original window -> no trip.
+        assert tracker.observe(_bash("work"), now=10_000.0, in_progress_count=1) is None
+        # Now the unit completes (count back to 0); the window is measured fresh
+        # from the next no-claim message, NOT from t=0.
+        assert tracker.observe(_bash("Read"), now=10_001.0, in_progress_count=0) is None
+        assert tracker.observe(_bash("Read"), now=10_300.0, in_progress_count=0) is None
+        assert tracker.observe(_bash("Read"), now=10_301.0, in_progress_count=0) is not None
+
+
+class TestCountInProgressUnits:
+    """Tracked-issue 003: the authoritative IN_PROGRESS count gating the backstop."""
+
+    def _unit(self, unit_id: str, status: Any) -> Any:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitType
+
+        return WorkUnit(
+            id=unit_id,
+            title=f"u {unit_id}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/example",
+            dependencies=[],
+        )
+
+    def test_counts_only_in_progress_units(self, monkeypatch: Any) -> None:
+        from unittest.mock import MagicMock
+
+        from devbench import cli
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [
+            self._unit("E1-F1-S1-T1", WorkUnitStatus.IN_PROGRESS),
+            self._unit("E1-F1-S1-T2", WorkUnitStatus.IN_PROGRESS),
+            self._unit("E1-F1-S1-T3", WorkUnitStatus.IN_QUEUE),
+            self._unit("E1-F1-S1-T4", WorkUnitStatus.IN_REVIEW),
+            self._unit("E1-F1-S1-T5", WorkUnitStatus.DONE),
+        ]
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        monkeypatch.setattr(cli, "BacklogParser", MagicMock(return_value=parser))
+        assert cli._count_in_progress_units() == 2
+
+    def test_parse_failure_yields_zero(self, monkeypatch: Any) -> None:
+        from unittest.mock import MagicMock
+
+        from devbench import cli
+
+        parser = MagicMock()
+        parser.parse_index.side_effect = ValueError("malformed backlog index")
+        monkeypatch.setattr(cli, "BacklogParser", MagicMock(return_value=parser))
+        # A transient parse failure must NOT crash the orchestrate loop; it falls
+        # through to the wedge behaviour (0 in-progress).
+        assert cli._count_in_progress_units() == 0
+
+
 class TestResolveMaxNoClaimActivitySeconds:
     def test_default_when_unset(self, monkeypatch: Any) -> None:
         from devbench import cli

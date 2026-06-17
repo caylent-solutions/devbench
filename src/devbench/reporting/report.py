@@ -2948,18 +2948,60 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
     return rendered
 
 
-def _no_actionable_line(parser: BacklogParser, units: list[WorkUnit]) -> str | None:
-    """Return the no-actionable line when nothing is actionable and not all done.
+#: How many in-flight unit ids to name inline before eliding the rest, so the
+#: headline stays a single readable line when many units are active.
+_MAX_NAMED_INFLIGHT_IDS: int = 5
 
-    Returns the verbatim ``'No actionable units. <N> blocked.'`` string when
-    the backlog has no actionable candidates and is not fully done; returns
-    ``None`` otherwise.  Extracted from :func:`generate_report` so the branch
-    count of that function stays within the linter threshold.
+
+def _name_inflight_ids(units: list[WorkUnit], status: WorkUnitStatus) -> str:
+    """Return a ``" (id1, id2, ...)"`` suffix naming up to N units of *status*.
+
+    Names the unit ids (as ``_print_active_units`` does for ``cmd_status``) so
+    the operator sees exactly what is in flight, eliding the tail with ``...``
+    past :data:`_MAX_NAMED_INFLIGHT_IDS`. Returns the empty string when no unit
+    has *status* (the count is then rendered without a parenthetical).
+    """
+    ids = [u.id for u in units if u.status is status]
+    if not ids:
+        return ""
+    shown = ids[:_MAX_NAMED_INFLIGHT_IDS]
+    suffix = ", ..." if len(ids) > _MAX_NAMED_INFLIGHT_IDS else ""
+    return f" ({', '.join(shown)}{suffix})"
+
+
+def _no_actionable_line(parser: BacklogParser, units: list[WorkUnit]) -> str | None:
+    """Return the no-actionable / no-claimable line, or ``None`` when not applicable.
+
+    Returns ``None`` when there ARE actionable candidates or the backlog is
+    fully done. Otherwise distinguishes two cases (tracked-issue 005):
+
+    - **Busy: work in flight.** When a unit is ``IN_REVIEW`` (the in-progress ->
+      done middle state, reconciled by the orchestrate loop) or ``IN_PROGRESS``
+      but none is currently CLAIMABLE, returns
+      ``'No claimable units; <R> in-review (...), <P> in-progress (...), <N>
+      blocked.'`` -- naming the in-flight unit ids -- so the operator does not
+      misread an actively-reconciling loop as idle. ``IN_REVIEW`` remains
+      NON-claimable (claim semantics unchanged); this enriches reporting only.
+    - **Genuinely idle.** When there is truly zero in-flight work, returns the
+      verbatim ``'No actionable units. <N> blocked.'`` form (matching
+      ``cmd_status``), so the unchanged idle headline is preserved.
+
+    Extracted from :func:`generate_report` so its branch count stays within the
+    linter threshold.
     """
     actionable, all_done_flag, blocked_count = check_actionability(parser, units)
-    if not actionable and not all_done_flag:
-        return f"\nNo actionable units. {blocked_count} blocked."
-    return None
+    if actionable or all_done_flag:
+        return None
+    in_review = [u for u in units if u.status is WorkUnitStatus.IN_REVIEW]
+    in_progress = [u for u in units if u.status is WorkUnitStatus.IN_PROGRESS]
+    if in_review or in_progress:
+        return (
+            f"\nNo claimable units; "
+            f"{len(in_review)} in-review{_name_inflight_ids(units, WorkUnitStatus.IN_REVIEW)}, "
+            f"{len(in_progress)} in-progress{_name_inflight_ids(units, WorkUnitStatus.IN_PROGRESS)}, "
+            f"{blocked_count} blocked."
+        )
+    return f"\nNo actionable units. {blocked_count} blocked."
 
 
 def generate_report(

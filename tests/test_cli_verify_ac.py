@@ -476,3 +476,132 @@ class TestRedExitHelpers:
             verification.EvidenceRecord(ac_ids=["AC-1"], vtype="apply", command="z", exit_code=0, tool="terraform"),
         ]
         assert cli._tool_captured_red_exit(records) is None
+
+
+class TestCommandUsesCoverage:
+    """Tracked-issue 001: classify whether a verify-ac command runs coverage.py.
+
+    A command that runs ``pytest --cov`` / ``coverage run`` / ``coverage`` writes
+    the coverage SQLite db to the shared default ``.coverage`` file in the
+    checkout; repeated/overlapping runs deadlock on its lock and surface as a
+    false ``CLAIM_NOT_CONVERGING``. Only coverage commands need an isolated
+    ``COVERAGE_FILE``; a non-coverage command must be left untouched so a command
+    that legitimately READS an existing ``.coverage`` is not surprised.
+    """
+
+    def test_pytest_cov_flag_is_coverage(self) -> None:
+        assert cli._command_uses_coverage("uv run pytest --cov=devbench --cov-fail-under=100 tests/") is True
+
+    def test_coverage_run_is_coverage(self) -> None:
+        assert cli._command_uses_coverage("coverage run -m pytest && coverage report") is True
+
+    def test_bare_coverage_subcommand_is_coverage(self) -> None:
+        assert cli._command_uses_coverage("coverage combine") is True
+
+    def test_plain_pytest_is_not_coverage(self) -> None:
+        assert cli._command_uses_coverage("uv run pytest tests/unit/test_foo.py") is False
+
+    def test_non_test_command_is_not_coverage(self) -> None:
+        assert cli._command_uses_coverage("terragrunt apply -auto-approve") is False
+
+    def test_discover_substring_is_not_coverage(self) -> None:
+        # A word merely CONTAINING 'cov' (e.g. 'discover', 'recover') must not
+        # be misclassified as a coverage run.
+        assert cli._command_uses_coverage("python -m unittest discover && recover_state.sh") is False
+
+
+class TestUniqueCoverageFilePath:
+    """Tracked-issue 001: a per-invocation unique, non-default COVERAGE_FILE path."""
+
+    def test_path_is_not_the_default(self) -> None:
+        assert Path(cli._unique_coverage_file_path()).name != ".coverage"
+
+    def test_repeated_calls_return_distinct_paths(self) -> None:
+        paths = {cli._unique_coverage_file_path() for _ in range(5)}
+        assert len(paths) == 5, "each invocation must isolate onto its own coverage data file"
+
+    def test_path_is_absolute(self) -> None:
+        # A relative path would still land in the checkout cwd and contend; the
+        # isolated file must be an absolute temp path outside the checkout.
+        assert Path(cli._unique_coverage_file_path()).is_absolute()
+
+
+class TestCleanupCoverageDataFiles:
+    """Tracked-issue 001: the per-invocation coverage data file (and any
+    coverage-parallel siblings) is torn down after the run, best-effort.
+    """
+
+    def test_removes_primary_and_parallel_siblings(self, tmp_path: Path) -> None:
+        primary = tmp_path / "devbench-coverage-x.dat"
+        sib1 = tmp_path / "devbench-coverage-x.dat.host.123"
+        sib2 = tmp_path / "devbench-coverage-x.dat.host.456"
+        for f in (primary, sib1, sib2):
+            f.write_text("data", encoding="utf-8")
+        cli._cleanup_coverage_data_files(str(primary))
+        assert not primary.exists()
+        assert not sib1.exists()
+        assert not sib2.exists()
+
+    def test_missing_primary_is_safe(self, tmp_path: Path) -> None:
+        # coverage.py may not have produced a db (e.g. the command failed before
+        # writing one); removing a non-existent file must not raise.
+        cli._cleanup_coverage_data_files(str(tmp_path / "never-created.dat"))
+
+
+class TestVerifyAcCoverageIsolation:
+    """Tracked-issue 001: verify-ac runs a coverage command with an isolated
+    COVERAGE_FILE so repeated/overlapping coverage runs never contend on the
+    shared default ``.coverage`` SQLite db -- and leaves a non-coverage command
+    untouched.
+    """
+
+    def test_cov_command_runs_with_unique_coverage_file_env(self, tmp_path: Path, repo_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        # The command echoes COVERAGE_FILE; the artifact captures it. The literal
+        # ``--cov`` marks it a coverage command (no real pytest run needed).
+        _write_unit(
+            workspace,
+            '- VERIFY AC-1 | type=command | cmd=`echo "SEEN_COVFILE=[$COVERAGE_FILE]"; true --cov` | expect-exit=0',
+        )
+        rc = _run(workspace, repo_path)
+        assert rc == 0
+        text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(encoding="utf-8")
+        # A COVERAGE_FILE was injected, and it is NOT the shared default.
+        assert "SEEN_COVFILE=[" in text
+        marker = "SEEN_COVFILE=["
+        injected = text[text.index(marker) + len(marker) :].split("]", 1)[0]
+        assert injected, "a coverage command must run with COVERAGE_FILE set"
+        assert Path(injected).name != ".coverage"
+        assert Path(injected).is_absolute()
+
+    def test_non_cov_command_does_not_get_coverage_file(self, tmp_path: Path, repo_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        _write_unit(
+            workspace,
+            "- VERIFY AC-1 | type=command | cmd=`echo SEEN_COVFILE=[$COVERAGE_FILE]` | expect-exit=0",
+        )
+        rc = _run(workspace, repo_path)
+        assert rc == 0
+        text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(encoding="utf-8")
+        # No COVERAGE_FILE injected for a non-coverage command (the placeholder
+        # stays empty -- the env var is unset).
+        assert "SEEN_COVFILE=[]" in text
+
+    def test_two_cov_runs_get_distinct_coverage_files(self, tmp_path: Path, repo_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        _write_unit(
+            workspace,
+            '- VERIFY AC-1 | type=command | cmd=`echo "SEEN_COVFILE=[$COVERAGE_FILE]"; true --cov` | expect-exit=0',
+        )
+
+        def _injected_path(attempt: int) -> str:
+            text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", attempt) / "AC-1.log").read_text(
+                encoding="utf-8"
+            )
+            marker = "SEEN_COVFILE=["
+            return text[text.index(marker) + len(marker) :].split("]", 1)[0]
+
+        assert _run(workspace, repo_path) == 0
+        assert _run(workspace, repo_path) == 0
+        first, second = _injected_path(1), _injected_path(2)
+        assert first and second and first != second, "each coverage run must isolate onto its own data file"

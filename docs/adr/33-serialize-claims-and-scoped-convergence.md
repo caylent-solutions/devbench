@@ -1,7 +1,7 @@
 # ADR-33: serialize claims (shared-checkout safety) + scoped within-claim convergence
 
 **Status:** Accepted
-**Date:** 2026-06-17
+**Date:** 2026-06-17 (extended 2026-06-17 for tracked-issues 001/003/005)
 
 ---
 
@@ -112,6 +112,71 @@ full-suite / global-coverage gate belongs to an epic-capstone unit or CI.
 - **Backlog-agnostic.** No tools-telemetry / app-specific coupling; the cap and
   the checkout-root classification derive from generic config + `REPO_LOCAL_PATHS`.
 
+## Extension (2026-06-17): tracked-issues 001, 003, 005
+
+Operating the live daemon surfaced three further defects in the same
+stall-detection / convergence / reporting surface this ADR governs. They are
+recorded here rather than in a new ADR because they tune the SAME mechanisms.
+
+**Tracked-issue 003 -- the no-claim backstop killed a long in-progress claim.**
+The inter-claim no-claim-activity backstop (`max_no_claim_activity_seconds`,
+default 600s) measured time since the last claim PROGRESSED to a terminal state
+and gated only on the tracker's OWN `current_unit_id`. That id can diverge from
+the authoritative backlog: it is cleared after a force-block
+(`clear_current_claim`), or a `devbench claim` message was never observed by the
+tracker, while a unit is in fact `IN_PROGRESS` and its executor is emitting SDK
+messages on a legitimately-long single claim (a live `terragrunt apply` was
+stall-exited at ~600s past the last completion).
+
+Decision: `ClaimConvergenceTracker.observe` now takes an injected, AUTHORITATIVE
+`in_progress_count` (default `0`, so existing callers/tests still exercise the
+wedge). The orchestrate loop computes it via the pure helper
+`_count_in_progress_units()` (parsing the same backlog index `status` / `next`
+read) and passes it ONLY when the tracker has no current claim -- the sole case
+the no-claim backstop inspects -- so the cost is paid only at a potential-fire
+moment. When `in_progress_count > 0` the backstop is SUPPRESSED and its timer
+reset: an in-progress unit is genuine progress, and the WITHIN-claim 6h
+wall-clock backstop already governs a hung single claim. The wedge the backstop
+exists for -- ZERO in-progress but messages still flowing -- still fires. The
+600s default is therefore now safe for long claims; the
+`DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS=3600` operator workaround is
+no longer required.
+
+**Tracked-issue 001 -- shared `.coverage` contention.** coverage.py writes to
+the default `.coverage` SQLite db in the checkout. Within one claim the harness
+runs `pytest --cov` many times (within-claim TDD attempts + the verify-ac
+done-gate); two overlapping runs, or a prior killed/timed-out run that left a
+process holding the SQLite lock, block on the lock and hang -- captured as a
+repeated `pytest::<checkout>` failure that trips `CLAIM_NOT_CONVERGING` even
+though a single clean run reaches 100% deterministically. The serialize cap
+(this ADR) removed the concurrent-executor trigger but not the orphaned-lock /
+within-claim-overlap edge.
+
+Decision: `verify-ac` isolates the coverage data file per invocation. The pure
+helper `_command_uses_coverage(command)` detects a `--cov` flag or the
+`coverage` runner word (never a mere substring like `discover`/`recover`);
+`_unique_coverage_file_path()` returns a fresh, absolute, non-default path via an
+atomic `mkstemp`; `_run_verification_item` sets `COVERAGE_FILE` to it for a
+coverage command only, and `_cleanup_coverage_data_files` tears down the file and
+any coverage-parallel siblings in a `finally`. A non-coverage command is left
+untouched (a command that legitimately READS an existing `.coverage` is not
+surprised). The executor agent prompt mirrors the rule for the within-claim loop
+(`COVERAGE_FILE="$(mktemp -u)"`).
+
+**Tracked-issue 005 -- the report hid in-flight units as idle.** When the only
+non-terminal work was `IN_REVIEW` (the in-progress -> done middle state the
+orchestrate loop reconciles) and/or `IN_PROGRESS`, the streaming report headline
+printed the bare `No actionable units. <N> blocked.`, misreading an
+actively-reconciling loop as idle.
+
+Decision: `_no_actionable_line` now renders
+`No claimable units; <R> in-review (<ids>), <P> in-progress (<ids>), <N> blocked.`
+-- naming the in-flight unit ids, as `cmd_status`'s `_print_active_units` does --
+whenever an `IN_REVIEW`/`IN_PROGRESS` unit exists, and preserves the verbatim
+`No actionable units. <N> blocked.` form only when there is truly zero in-flight
+work. This is REPORTING ONLY: `IN_REVIEW` stays out of `actionable_statuses`
+(non-claimable) and claim semantics are unchanged.
+
 ## Alternatives considered and rejected
 
 **Give each claim its own git worktree instead of serializing.** A larger
@@ -141,10 +206,18 @@ count. Only the WHOLE-SUITE shape is exempt.
   backstop; `_is_whole_suite_target` + `_looks_like_test_file` helpers;
   `ClaimConvergenceTracker(repo_roots=...)` + `_is_whole_suite_signature` wiring;
   `REPO_LOCAL_PATHS`-sourced `repo_roots` at the production instantiation.
+  Extension (tracked-issues 001/003): `ClaimConvergenceTracker.observe(...,
+  in_progress_count=...)` no-claim-backstop gate + `_count_in_progress_units`
+  authoritative count wired into `_check_convergence`; `_command_uses_coverage`,
+  `_unique_coverage_file_path`, `_cleanup_coverage_data_files`, and the
+  `COVERAGE_FILE` isolation in `_run_verification_item`.
+- `src/devbench/reporting/report.py` -- extension (tracked-issue 005):
+  `_no_actionable_line` busy-vs-idle headline + `_name_inflight_ids` helper.
 
 ### Plugin prompts
 - `plugin/devbench-orchestrate/agents/executor.md` -- within-claim test loop must
-  run only the unit's own scoped tests / `verify-ac`, never the full repo suite.
+  run only the unit's own scoped tests / `verify-ac`, never the full repo suite;
+  and must isolate `COVERAGE_FILE` on every `--cov` run (tracked-issue 001).
 
 ### Tests
 - `tests/test_cli_next.py::TestCmdNextSerializeInProgressCap` /
@@ -152,14 +225,22 @@ count. Only the WHOLE-SUITE shape is exempt.
 - `tests/test_cli_claim.py::TestCmdClaimSerializeBackstop`.
 - `tests/test_config_loader_presync.py::TestMaxParallelInProgressConfig`.
 - `tests/test_cli_claim_convergence.py::TestIsWholeSuiteTarget` /
-  `::TestWholeSuiteFailureDoesNotConverge`.
+  `::TestWholeSuiteFailureDoesNotConverge` /
+  `::TestNoClaimBackstopSuppressedByInProgressUnit` (tracked-issue 003).
+- `tests/test_cli_verify_ac.py::TestCommandUsesCoverage` /
+  `::TestUniqueCoverageFilePath` / `::TestVerifyAcCoverageIsolation`
+  (tracked-issue 001).
+- `tests/test_plugin/test_agent_structure.py::TestExecutorValidationGateEscalation::test_executor_instructs_isolated_coverage_file_for_cov_runs`.
+- `tests/test_reporting/test_report_actionable.py::TestNoActionableLineSurfacesInFlightWork`
+  (tracked-issue 005).
 
 ### Docs
 - `docs/adr/33-serialize-claims-and-scoped-convergence.md` (this file).
 - `docs/cli-reference.md` -- exit code 47, `next` serialize filter, `claim`
-  serialize backstop.
+  serialize backstop; verify-ac coverage-file isolation (tracked-issue 001).
 - `docs/devbench-yaml-reference.md` -- serialize-claims section, scoped
-  convergence note, sample-config key.
-- `CHANGELOG.md` -- both fixes.
+  convergence note, sample-config key; no-claim backstop is in-progress-aware
+  (tracked-issue 003).
+- `CHANGELOG.md` -- all fixes.
 - `examples/backlogs/brownfield/multi-repo_single-pr_no-merge/before/backlog/config/devbench.yaml`
   -- `max_parallel_in_progress` with a comment.

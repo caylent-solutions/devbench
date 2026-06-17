@@ -570,6 +570,20 @@ class TestExecutorValidationGateEscalation:
             "suppresses task-factory."
         )
 
+    def test_executor_instructs_isolated_coverage_file_for_cov_runs(self) -> None:
+        """Tracked-issue 001: the within-claim loop must run any ``--cov`` test
+        invocation with an isolated ``COVERAGE_FILE`` so repeated/overlapping
+        coverage runs in the shared checkout never contend on the default
+        ``.coverage`` SQLite db (a false CLAIM_NOT_CONVERGING). Mirrors the
+        verify-ac anti-contention rule.
+        """
+        content = self._EXECUTOR_PATH.read_text()
+        assert "COVERAGE_FILE" in content and "--cov" in content, (
+            "executor.md must instruct the within-claim loop to run a `--cov` test "
+            'invocation with an isolated COVERAGE_FILE (e.g. `COVERAGE_FILE="$(mktemp -u)"`) '
+            "so repeated coverage runs in the shared checkout never deadlock on `.coverage`."
+        )
+
 
 @pytest.mark.unit
 class TestSkillValidationGateEscalationBranch:

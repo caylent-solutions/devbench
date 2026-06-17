@@ -68,6 +68,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Coroutine, Iterable
@@ -4834,6 +4835,67 @@ def run_with_long_op_heartbeat(
         thread.join()
 
 
+#: A coverage.py invocation: a ``pytest --cov`` flag (``--cov``, ``--cov=...``,
+#: ``--cov-report``, ``--cov-fail-under``) OR the ``coverage`` runner as a WORD
+#: (``coverage run`` / ``coverage report`` / ``coverage combine`` -- never a
+#: mere substring like ``discover`` / ``recover``). Such a command writes the
+#: coverage SQLite db to the shared default ``.coverage`` file in the checkout;
+#: repeated/overlapping runs in one checkout deadlock on its lock (tracked-issue
+#: 001), so verify-ac isolates each onto a unique ``COVERAGE_FILE``.
+_COVERAGE_COMMAND_RE: re.Pattern[str] = re.compile(r"--cov\b|\bcoverage\b")
+
+
+def _command_uses_coverage(command: str) -> bool:
+    """Return ``True`` when *command* runs coverage.py (tracked-issue 001).
+
+    Matches a ``--cov`` pytest flag or the ``coverage`` runner as a standalone
+    word; a word merely CONTAINING ``cov`` (``discover``, ``recover``) does NOT
+    match. Pure + deterministic, so it is trivially unit-tested.
+    """
+    return _COVERAGE_COMMAND_RE.search(command) is not None
+
+
+def _unique_coverage_file_path() -> str:
+    """Return a fresh, absolute, non-default coverage data-file path.
+
+    Tracked-issue 001: each harness-invoked coverage run must write to its OWN
+    ``COVERAGE_FILE`` so repeated/overlapping ``pytest --cov`` runs in one
+    checkout never contend on the shared default ``.coverage`` SQLite db (whose
+    lock can deadlock a run and surface as a false ``CLAIM_NOT_CONVERGING``).
+
+    Uses :func:`tempfile.mkstemp` to obtain a GUARANTEED-unique path (atomic
+    create) outside the checkout, then removes the empty placeholder so
+    coverage.py creates the db itself; repeated calls therefore return distinct
+    paths. The caller is responsible for cleaning the data file (and any
+    coverage-parallel siblings) up after the run.
+    """
+    fd, path = tempfile.mkstemp(prefix="devbench-coverage-", suffix=".dat")
+    os.close(fd)
+    Path(path).unlink()
+    return path
+
+
+def _cleanup_coverage_data_files(coverage_file: str) -> None:
+    """Remove *coverage_file* and any coverage-parallel siblings it spawned.
+
+    Tracked-issue 001: coverage.py writes the primary db to ``COVERAGE_FILE``
+    and, under parallel mode, sibling files named ``<COVERAGE_FILE>.<suffix>``.
+    Remove all of them so the per-invocation temp path leaves nothing behind.
+    Best-effort: a missing file is not an error (the run may not have produced
+    one), but a real removal failure is surfaced via the logger rather than
+    silently swallowed.
+    """
+    base = Path(coverage_file)
+    candidates = [base, *base.parent.glob(base.name + ".*")]
+    for candidate in candidates:
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("could not remove isolated coverage data file %s: %s", candidate, exc)
+
+
 def _run_verification_item(
     item: "verification.VerificationItem",
     repo_path: Path,
@@ -4896,6 +4958,17 @@ def _run_verification_item(
         gate_env = verification.deterministic_gate_env(
             dict(os.environ), seed=VERIFY_AC_PYTEST_SEED, pin_randomly=pin_randomly
         )
+        # Tracked-issue 001: a coverage.py command writes to the shared default
+        # ``.coverage`` SQLite db in the checkout; repeated/overlapping verify-ac
+        # coverage runs contend on its lock and deadlock (a false
+        # CLAIM_NOT_CONVERGING). Isolate THIS run onto a unique COVERAGE_FILE so
+        # it can never contend, and clean it up after. A NON-coverage command is
+        # left untouched -- a command that legitimately READS an existing
+        # ``.coverage`` must not be surprised by an injected override.
+        isolated_coverage_file: str | None = None
+        if _command_uses_coverage(command):
+            isolated_coverage_file = _unique_coverage_file_path()
+            gate_env["COVERAGE_FILE"] = isolated_coverage_file
         # The command can be a 30-60 min terraform apply / go test that produces
         # NO orchestrator-log output while it blocks. Wrap it in the long-op
         # heartbeat (design point 4): a benign [LONG_OP_HEARTBEAT] line is written
@@ -4912,18 +4985,25 @@ def _run_verification_item(
         # down exactly this command's subtree (e.g. a live ``terraform apply`` /
         # ``go test``) instead of orphaning it to init (Item B, tracked issue
         # 015). The registration is cleared the instant the command terminates.
-        rc, stdout, stderr = run_with_long_op_heartbeat(
-            run=lambda: run_command_in_process_group(
-                ["bash", "-c", command],
-                cwd=repo_path,
-                timeout=timeout,
-                env=gate_env,
-                on_pgid=_register_executor_pgid,
-                on_complete=_clear_executor_pgid,
-            ),
-            heartbeat_interval_seconds=heartbeat_interval,
-            emit_heartbeat=_emit_heartbeat,
-        )
+        try:
+            rc, stdout, stderr = run_with_long_op_heartbeat(
+                run=lambda: run_command_in_process_group(
+                    ["bash", "-c", command],
+                    cwd=repo_path,
+                    timeout=timeout,
+                    env=gate_env,
+                    on_pgid=_register_executor_pgid,
+                    on_complete=_clear_executor_pgid,
+                ),
+                heartbeat_interval_seconds=heartbeat_interval,
+                emit_heartbeat=_emit_heartbeat,
+            )
+        finally:
+            # Tracked-issue 001: always tear down the per-invocation isolated
+            # coverage data file (and any parallel siblings) so the temp path
+            # never accumulates -- even if the run raised.
+            if isolated_coverage_file is not None:
+                _cleanup_coverage_data_files(isolated_coverage_file)
     finished_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
 
     combined = "\n".join(part for part in (stdout, stderr) if part.strip())
@@ -8085,29 +8165,31 @@ class ClaimConvergenceTracker:
         # messages without claiming, the backstop below catches that wedge.
         self._no_claim_active_since = None
 
-    def observe(self, message: object, *, now: float) -> str | None:
+    def observe(self, message: object, *, now: float, in_progress_count: int = 0) -> str | None:
         """Fold *message* into the bound; return the recurring failure when tripped.
 
         Returns the recurring failure signature (or a wall-clock / inter-claim
         diagnostic) when the bound trips, else ``None``. Safe to call before any
         claim has been noted.
+
+        Args:
+            message: The SDK message double / real message to fold in.
+            now: Injected monotonic clock value (no hard-coded clock).
+            in_progress_count: The AUTHORITATIVE count of work units currently
+                ``IN_PROGRESS`` in the backlog, injected by the production wiring
+                (tracked-issue 003). It gates the inter-claim no-claim backstop:
+                the backstop's ONLY purpose is the "orchestrator active but ZERO
+                claims in-progress" wedge (an orphaned executor still emitting
+                messages, or a loop stuck without claiming the next unit). When a
+                unit IS in-progress (>= 1) the executor is doing genuine work on a
+                legitimately-long single claim (e.g. a live ``terragrunt apply``);
+                the WITHIN-claim wall-clock backstop already governs a hung single
+                claim, so the no-claim backstop is SUPPRESSED and its timer reset.
+                Defaults to ``0`` so a caller that cannot supply the count still
+                exercises the wedge exactly as before.
         """
         if self.current_unit_id is None or self._claim_started_at is None:
-            # No active claim. Bound the inter-claim "active but not claiming"
-            # window: a legitimate long op always runs INSIDE a claim, so a
-            # no-claim stall can only be an orphaned/churning loop (e.g. an
-            # executor still emitting messages after its unit was force-blocked,
-            # or a loop stuck without claiming the next unit).
-            if self._max_no_claim_activity > 0:
-                if self._no_claim_active_since is None:
-                    self._no_claim_active_since = now
-                elif (now - self._no_claim_active_since) >= self._max_no_claim_activity:
-                    elapsed = int(now - self._no_claim_active_since)
-                    return (
-                        f"no claim progressed for {elapsed}s while the orchestrator stayed "
-                        "active (possible stall: messages flowing but no work claimed)"
-                    )
-            return None
+            return self._no_claim_verdict(now=now, in_progress_count=in_progress_count)
 
         # An active claim is forward progress for the inter-claim backstop.
         self._no_claim_active_since = None
@@ -8166,6 +8248,41 @@ class ClaimConvergenceTracker:
 
         return self._wall_clock_verdict(now)
 
+    def _no_claim_verdict(self, *, now: float, in_progress_count: int) -> str | None:
+        """Return the inter-claim no-claim-activity diagnostic, or ``None``.
+
+        Reached only when NO claim is tracked. Bounds the "active but not
+        claiming" window -- BUT only when there is genuinely NO unit in-progress
+        (tracked-issue 003). The tracker's own ``current_unit_id`` can diverge
+        from the authoritative backlog (it is cleared after a force-block, or a
+        ``devbench claim`` message was never observed) while a unit is in fact
+        ``IN_PROGRESS`` and its executor is emitting SDK messages on a long
+        single claim. Treat an authoritative in-progress unit as forward
+        progress: suppress the no-claim backstop and reset its timer (the
+        WITHIN-claim wall-clock backstop already bounds a genuinely-hung single
+        claim). The wedge -- 0 in-progress but messages still flowing -- still
+        fires.
+
+        Extracted from :meth:`observe` so that method stays within the branch
+        threshold (SRP: this owns the no-claim window, ``observe`` owns the
+        within-claim signature bound).
+        """
+        if in_progress_count > 0:
+            self._no_claim_active_since = None
+            return None
+        if self._max_no_claim_activity <= 0:
+            return None
+        if self._no_claim_active_since is None:
+            self._no_claim_active_since = now
+            return None
+        if (now - self._no_claim_active_since) >= self._max_no_claim_activity:
+            elapsed = int(now - self._no_claim_active_since)
+            return (
+                f"no claim progressed for {elapsed}s while the orchestrator stayed "
+                "active (possible stall: messages flowing but no work claimed)"
+            )
+        return None
+
     def _is_whole_suite_signature(self, signature: str) -> bool:
         """Return ``True`` when *signature* is a whole-suite / out-of-scope test run.
 
@@ -8188,6 +8305,28 @@ class ClaimConvergenceTracker:
         if self._max_wall_clock > 0 and (now - self._claim_started_at) >= self._max_wall_clock:
             return f"wall-clock backstop exceeded for {self.current_unit_id}"
         return None
+
+
+def _count_in_progress_units() -> int:
+    """Return the count of work units currently ``IN_PROGRESS`` in the backlog.
+
+    The AUTHORITATIVE in-progress signal used to gate the inter-claim no-claim
+    backstop (tracked-issue 003): a legitimately-long single claim (e.g. a live
+    ``terragrunt apply``) keeps a unit ``IN_PROGRESS`` while its executor emits
+    SDK messages, and that must NOT be misread as the "active but ZERO claims
+    in-progress" wedge the backstop exists to catch.
+
+    Reads the SAME backlog index the ``status`` / ``next`` paths read. A backlog
+    that cannot be parsed (none present yet, a transient write) yields ``0``
+    rather than raising -- a transient parse failure must not crash the
+    orchestrate loop, and ``0`` simply falls through to the existing wedge
+    behaviour (the within-claim bounds still govern any real claim).
+    """
+    try:
+        units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
+    except (OSError, ValueError):
+        return 0
+    return sum(1 for unit in units if unit.status is WorkUnitStatus.IN_PROGRESS)
 
 
 #: Sub-agent (Task tool) activity message class names. Their presence means the
@@ -10073,7 +10212,14 @@ def cmd_start(*argv: str) -> int:
             claimed = _claimed_unit_id(msg)
             if claimed is not None:
                 _convergence_tracker.note_claim(claimed, now=now)
-            recurring = _convergence_tracker.observe(msg, now=now)
+            # Tracked-issue 003: gate the inter-claim no-claim backstop on the
+            # AUTHORITATIVE backlog in-progress count, not just the tracker's
+            # own (divergeable) ``current_unit_id``. When the tracker has a
+            # current claim the count is irrelevant (the within-claim bounds
+            # govern), so only read the backlog -- a cheap parse -- when there
+            # is no tracked claim, the sole case the no-claim backstop inspects.
+            in_progress_count = _count_in_progress_units() if _convergence_tracker.current_unit_id is None else 0
+            recurring = _convergence_tracker.observe(msg, now=now, in_progress_count=in_progress_count)
             if recurring is None:
                 return False
             if _convergence_tracker.current_unit_id is None:

@@ -19267,8 +19267,121 @@ class TestParseStopArgv:
         assert "session" in msg.lower()
 
 
+class TestCmdStopDaemonControlGate:
+    """cmd_stop refuses without the orchestrator role from a non-interactive context (TDI-004).
+
+    Defense-in-depth atop guard-bash.sh: an executor sub-agent (a non-interactive
+    Claude Agent SDK subprocess that does NOT carry DEVBENCH_AGENT_ROLE=orchestrator)
+    must not be able to SIGTERM its own orchestrator via ``devbench stop``. The
+    gate ALLOWS the call only when the orchestrator role is set OR the call is
+    interactive (an operator at a TTY).
+    """
+
+    @pytest.mark.unit
+    def test_refuses_without_role_when_non_interactive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No orchestrator role + non-interactive stdin (the executor case) -> rc=3, no SIGTERM."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "kanon"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        monkeypatch.delenv("DEVBENCH_AGENT_ROLE", raising=False)
+
+        sent: list[tuple[int, int]] = []
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.sys.stdin.isatty", return_value=False),
+            patch("devbench.cli.os.kill", side_effect=lambda pid, sig: sent.append((pid, sig))),
+        ):
+            rc = cli.cmd_stop("--session", "kanon")
+
+        assert rc == 3, f"executor-context stop must fail-fast with rc=3; got rc={rc}"
+        assert sent == [], "no SIGTERM may be sent when the daemon-control gate refuses"
+        err = capsys.readouterr().err
+        assert "orchestrator" in err.lower(), f"refusal must name the orchestrator role; got: {err!r}"
+
+    @pytest.mark.unit
+    def test_allows_with_orchestrator_role(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DEVBENCH_AGENT_ROLE=orchestrator authorises the stop even when non-interactive."""
+        import signal
+
+        state_dir = tmp_path / ".devbench" / "sessions" / "kanon"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        monkeypatch.setenv("DEVBENCH_AGENT_ROLE", "orchestrator")
+
+        sent: list[tuple[int, int]] = []
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.sys.stdin.isatty", return_value=False),
+            patch("devbench.cli.os.kill", side_effect=lambda pid, sig: sent.append((pid, sig))),
+        ):
+            rc = cli.cmd_stop("--session", "kanon")
+
+        assert rc == 0, f"orchestrator-role stop must proceed; got rc={rc}"
+        assert (12345, signal.SIGTERM) in sent, "SIGTERM must be delivered when the orchestrator role is set"
+
+    @pytest.mark.unit
+    def test_allows_interactive_operator_without_role(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An interactive operator (stdin is a TTY) may stop without any role env set."""
+        import signal
+
+        state_dir = tmp_path / ".devbench" / "sessions" / "kanon"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        monkeypatch.delenv("DEVBENCH_AGENT_ROLE", raising=False)
+
+        sent: list[tuple[int, int]] = []
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.sys.stdin.isatty", return_value=True),
+            patch("devbench.cli.os.kill", side_effect=lambda pid, sig: sent.append((pid, sig))),
+        ):
+            rc = cli.cmd_stop("--session", "kanon")
+
+        assert rc == 0, f"interactive operator stop must proceed; got rc={rc}"
+        assert (12345, signal.SIGTERM) in sent, "SIGTERM must be delivered for an interactive operator"
+
+    @pytest.mark.unit
+    def test_refuses_with_executor_role(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An explicit DEVBENCH_AGENT_ROLE=executor is refused even at a TTY (belt-and-braces)."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "kanon"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        monkeypatch.setenv("DEVBENCH_AGENT_ROLE", "executor")
+
+        sent: list[tuple[int, int]] = []
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.sys.stdin.isatty", return_value=True),
+            patch("devbench.cli.os.kill", side_effect=lambda pid, sig: sent.append((pid, sig))),
+        ):
+            rc = cli.cmd_stop("--session", "kanon")
+
+        assert rc == 3, f"explicit executor role must fail-fast with rc=3; got rc={rc}"
+        assert sent == [], "no SIGTERM may be sent when the caller declares the executor role"
+        err = capsys.readouterr().err
+        assert "orchestrator" in err.lower()
+
+
 class TestCmdStopErrors:
     """cmd_stop returns non-zero with actionable messages on error paths."""
+
+    @pytest.fixture(autouse=True)
+    def _authorize_daemon_control(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Authorise the daemon-control caller-role gate (TDI-004).
+
+        These tests exercise cmd_stop's argument-parse and SIGTERM-delivery
+        behaviour, i.e. the legitimate orchestrator-lifecycle path. The gate's
+        refusal behaviour is covered separately by TestCmdStopDaemonControlGate.
+        """
+        monkeypatch.setenv("DEVBENCH_AGENT_ROLE", "orchestrator")
 
     @pytest.mark.unit
     def test_missing_session_flag_returns_rc2(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -19322,6 +19435,11 @@ class TestCmdStopErrors:
 
 class TestCmdStopSendsSigterm:
     """cmd_stop reads pid file and sends SIGTERM to the target process."""
+
+    @pytest.fixture(autouse=True)
+    def _authorize_daemon_control(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Authorise the daemon-control caller-role gate (TDI-004) for the SIGTERM-delivery path."""
+        monkeypatch.setenv("DEVBENCH_AGENT_ROLE", "orchestrator")
 
     @pytest.mark.unit
     def test_sends_sigterm_to_pid_in_file(self, tmp_path: Path) -> None:
@@ -19414,6 +19532,11 @@ class TestCmdStopSendsSigterm:
 
 class TestCmdStopIntegration:
     """Integration tests for cmd_stop against real fixture workspaces."""
+
+    @pytest.fixture(autouse=True)
+    def _authorize_daemon_control(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Authorise the daemon-control caller-role gate (TDI-004) for the integration path."""
+        monkeypatch.setenv("DEVBENCH_AGENT_ROLE", "orchestrator")
 
     @pytest.mark.unit
     def test_stop_integration_sends_sigterm_to_real_process(

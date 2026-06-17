@@ -254,8 +254,12 @@ class TestCmdRemoveDepContainerEdge:
         with p1, p2, p3:
             rc = cli.cmd_remove_dep("E0-F1-S1-T1", "E0-F1-S1")
 
+        # Assert against the id-format gate's actual rejection message
+        # (``... does not match <shape> format``) rather than the bare word
+        # "format", which false-matches unrelated stderr (e.g. a logging
+        # record routed to stderr by a handler another test installed).
         err = capsys.readouterr().err
-        assert "format" not in err
+        assert "does not match" not in err
         assert rc == 0
 
     @pytest.mark.parametrize(

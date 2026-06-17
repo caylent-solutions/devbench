@@ -1074,3 +1074,156 @@ class TestTimeoutMarkersAndResultShapes:
         tracker.observe(_pytest_run("tests/unit/x.py"), now=10.0)
         result = tracker.observe(_timeout_result(), now=150.0)
         assert result is not None and "wall-clock" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Scoped convergence (root cause of tracked-issue 004)
+#
+# The executor sometimes runs the FULL repo test suite within a claim. A
+# whole-suite failure can be caused by an OUT-OF-SCOPE / other-unit defect even
+# when this unit's OWN scoped verify-ac is green -- so a whole-suite test-runner
+# failure must NOT count toward the within-claim non-converging bound. The
+# AUTHORITATIVE per-unit gate (devbench verify-ac) ALWAYS counts; a SCOPED test
+# failure (a specific test file or node id) still counts.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = "/workspaces/telemetry/target/devbench"
+
+
+def _abs_pytest(target: str) -> _Msg:
+    """A pytest run against an absolute target path."""
+    return _bash(f"uv run pytest {target}")
+
+
+class TestIsWholeSuiteTarget:
+    """Truth table for the pure ``_is_whole_suite_target`` classifier."""
+
+    def _fn(self) -> Any:
+        from devbench.cli import _is_whole_suite_target
+
+        return _is_whole_suite_target
+
+    def test_verify_ac_is_never_whole_suite(self) -> None:
+        # The authoritative per-unit gate always counts, regardless of target.
+        f = self._fn()
+        assert f("devbench verify-ac", "E1-F1-S1-T1", (_REPO_ROOT,)) is False
+        assert f("devbench verify-ac", "", (_REPO_ROOT,)) is False
+
+    def test_empty_target_is_whole_suite(self) -> None:
+        # A bare `pytest` with no target token is a whole-suite run.
+        f = self._fn()
+        assert f("pytest", "", (_REPO_ROOT,)) is True
+        assert f("make test", "", (_REPO_ROOT,)) is True
+
+    def test_bare_directory_is_whole_suite(self) -> None:
+        f = self._fn()
+        assert f("pytest", "tests", (_REPO_ROOT,)) is True
+        assert f("pytest", "tests/unit", (_REPO_ROOT,)) is True
+        assert f("pytest", "tests/", (_REPO_ROOT,)) is True
+
+    def test_repo_root_abs_path_is_whole_suite(self) -> None:
+        f = self._fn()
+        # The checkout root itself, and a subdirectory of it, are whole-suite.
+        assert f("pytest", _REPO_ROOT, (_REPO_ROOT,)) is True
+        assert f("pytest", f"{_REPO_ROOT}/tests", (_REPO_ROOT,)) is True
+        assert f("pytest", f"{_REPO_ROOT}/tests/unit", (_REPO_ROOT,)) is True
+
+    def test_specific_test_file_is_scoped(self) -> None:
+        f = self._fn()
+        assert f("pytest", "tests/unit/test_foo.py", (_REPO_ROOT,)) is False
+        assert f("pytest", "tests/unit/test_foo.py::test_x", (_REPO_ROOT,)) is False
+        assert f("pytest", f"{_REPO_ROOT}/tests/unit/test_foo.py", (_REPO_ROOT,)) is False
+
+    def test_parameterised_module_value_is_scoped(self) -> None:
+        # A KEY=value target (a specific module) names a specific thing -> scoped.
+        # The signature marker for `make tf-test MODULE_PATH=...` is `tf-test`
+        # (the matched _CLAIM_FAILURE_COMMAND_MARKERS entry), and tf-test/terratest
+        # always parameterise a specific module, never a whole suite.
+        f = self._fn()
+        assert f("tf-test", "providers/aws/alb-listener", (_REPO_ROOT,)) is False
+        assert f("terratest", "providers/aws/vpc", (_REPO_ROOT,)) is False
+
+
+class TestWholeSuiteFailureDoesNotConverge:
+    def test_repeated_whole_suite_abs_path_does_not_trip(self) -> None:
+        # AC-(a): repeated pytest against the checkout-root abs path must NOT trip.
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=3,
+            max_claim_wall_clock_seconds=0,
+            repo_roots=(_REPO_ROOT,),
+        )
+        tracker.note_claim("E10-F3-S4-T1", now=0.0)
+        trips = [tracker.observe(_abs_pytest(_REPO_ROOT), now=float(i)) for i in range(8)]
+        assert all(t is None for t in trips), "a whole-suite run against the checkout root must never trip the bound"
+
+    def test_repeated_bare_dir_does_not_trip(self) -> None:
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=3,
+            max_claim_wall_clock_seconds=0,
+            repo_roots=(_REPO_ROOT,),
+        )
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        trips = [tracker.observe(_pytest_run("tests/unit"), now=float(i)) for i in range(8)]
+        assert all(t is None for t in trips), "a bare-directory whole-suite run must never trip the bound"
+
+    def test_repeated_bare_pytest_empty_target_does_not_trip(self) -> None:
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=3,
+            max_claim_wall_clock_seconds=0,
+            repo_roots=(_REPO_ROOT,),
+        )
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        # Bare `pytest` with no target argument -> empty target token -> whole-suite.
+        trips = [tracker.observe(_bash("uv run pytest"), now=float(i)) for i in range(8)]
+        assert all(t is None for t in trips), "a bare pytest (empty target) must never trip the bound"
+
+    def test_repeated_verify_ac_still_trips(self) -> None:
+        # AC-(b): the authoritative per-unit gate still converges.
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=3,
+            max_claim_wall_clock_seconds=0,
+            repo_roots=(_REPO_ROOT,),
+        )
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        result = None
+        for i in range(3):
+            result = tracker.observe(_verify_fail("E1-F1-S1-T1"), now=float(i))
+        assert result is not None, "a repeated verify-ac failure (authoritative gate) must still trip"
+        assert "verify-ac" in result and "E1-F1-S1-T1" in result
+
+    def test_repeated_scoped_test_file_still_trips(self) -> None:
+        # AC-(c): a scoped test naming a specific file still converges.
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=3,
+            max_claim_wall_clock_seconds=0,
+            repo_roots=(_REPO_ROOT,),
+        )
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        result = None
+        for i in range(3):
+            result = tracker.observe(_pytest_run("tests/unit/test_foo.py::test_x"), now=float(i))
+        assert result is not None, "a repeated scoped test-file failure must still trip the bound"
+        assert "pytest" in result and "test_foo.py" in result
+
+    def test_whole_suite_skip_logs_a_note(self, caplog: Any) -> None:
+        import logging
+
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=3,
+            max_claim_wall_clock_seconds=0,
+            repo_roots=(_REPO_ROOT,),
+        )
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            tracker.observe(_pytest_run("tests/unit"), now=0.0)
+        assert any("whole-suite" in rec.getMessage().lower() for rec in caplog.records), (
+            "a one-line audit note must explain why a whole-suite failure was not counted"
+        )
+
+    def test_no_repo_roots_still_classifies_bare_dir_and_empty(self) -> None:
+        # Defensive: with no configured repo roots, the empty/bare-dir rules still
+        # apply (only the abs-path-prefix rule needs roots).
+        tracker = ClaimConvergenceTracker(max_within_claim_attempts=3, max_claim_wall_clock_seconds=0)
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        trips = [tracker.observe(_pytest_run("tests/unit"), now=float(i)) for i in range(8)]
+        assert all(t is None for t in trips)

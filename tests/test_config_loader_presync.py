@@ -148,3 +148,47 @@ class TestParsePresyncCommandDirect:
     def test_malformed_command_raises(self, bad_value: object) -> None:
         with pytest.raises(ValueError, match="presync_command must be a non-empty list"):
             _parse_presync_command(self._PATH, {"presync_command": bad_value})
+
+
+# ---------------------------------------------------------------------------
+# Serialize claims: orchestrate.max_parallel_in_progress
+# (root cause of tracked-issue 002: shared-checkout cross-contamination)
+# ---------------------------------------------------------------------------
+
+
+class TestMaxParallelInProgressConfig:
+    """OrchestrateConfig + parser handling of orchestrate.max_parallel_in_progress."""
+
+    _PATH = Path("/tmp/x/devbench.yaml")
+
+    def test_dataclass_default_is_none(self) -> None:
+        """Absent -> None so the resolver falls through to the constants default."""
+        assert OrchestrateConfig().max_parallel_in_progress is None
+
+    def test_absent_key_stays_none(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "devbench.yaml"
+        _write_minimal_config(cfg_file)
+        cfg = load_runtime_config(cfg_file, {})
+        assert cfg.orchestrate.max_parallel_in_progress is None
+
+    def test_value_loaded_from_yaml(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "devbench.yaml"
+        _write_minimal_config(cfg_file, "orchestrate:\n  max_parallel_in_progress: 2\n")
+        cfg = load_runtime_config(cfg_file, {})
+        assert cfg.orchestrate.max_parallel_in_progress == 2
+
+    def test_parses_value_at_parser(self) -> None:
+        cfg = _parse_orchestrate_config(self._PATH, {"max_parallel_in_progress": 3}, use_bedrock=False)
+        assert cfg.max_parallel_in_progress == 3
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -5])
+    def test_less_than_one_raises_at_parser(self, bad_value: int) -> None:
+        with pytest.raises(ValueError, match="max_parallel_in_progress must be >= 1"):
+            _parse_orchestrate_config(self._PATH, {"max_parallel_in_progress": bad_value}, use_bedrock=False)
+
+    @pytest.mark.parametrize("bad_value", [0, -1])
+    def test_less_than_one_raises_via_loader(self, tmp_path: Path, bad_value: int) -> None:
+        cfg_file = tmp_path / "devbench.yaml"
+        _write_minimal_config(cfg_file, f"orchestrate:\n  max_parallel_in_progress: {bad_value}\n")
+        with pytest.raises(ValueError, match="max_parallel_in_progress"):
+            load_runtime_config(cfg_file, {})

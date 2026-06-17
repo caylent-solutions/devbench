@@ -34,6 +34,7 @@ The following non-zero codes are reserved for specific orchestrator states and M
 | 43 | `ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE` | `start` | Continuation budget exhausted: the in-session resume loop issued `DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS` consecutive non-terminal continuations without progress. Logged as `[ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED]`. Distinct from rc=42 so the wrapping loop never misclassifies fail-fast as auto-restart. |
 | 44 | `CLAIM_BLOCKED_PRECLAIM` | `claim` | Target repo unresolvable: the repo declared in the work-unit file is unknown. Work unit is set to `blocked` with a `[BLOCKED_TARGET_REPO_UNRESOLVED]` marker. |
 | 45 | `GET_DIFF_NO_ATTRIBUTABLE` | `get-diff` | No task-attributed commit found in defer-PR mode: staged and unstaged changes are both empty and no commit matches the work-unit ID. |
+| 47 | `CLAIM_DEFERRED_SERIALIZED` | `claim` | Claim DEFERRED: the concurrently-in-progress cap (`orchestrate.max_parallel_in_progress`, default 1) is already saturated by other in-progress units. NOT a unit failure -- nothing is written and the unit stays `in-queue`; retry after the in-progress unit completes. Distinct from 44 so the wrapping loop never mistakes a transient, self-clearing deferral for a structural block. |
 | 127 | `SUBPROCESS_ERROR_EXIT_CODE` | various | Subprocess command not found or timed out (Unix convention). |
 
 ## Contents
@@ -113,6 +114,8 @@ uv run devbench next [--include "<tokens>"] [--exclude "<tokens>"]
 ```
 
 Print the next actionable work unit as JSON. Returns `ALL_DONE` when every unit is done and `NO_ACTIONABLE` when something is blocked or in-progress but nothing is ready to start. Used by the orchestrate SKILL to drive the main loop.
+
+**Serialize-claims filter:** because every claim shares ONE target-repo checkout, `next` never offers a NEW in-queue unit while the concurrently-in-progress cap (`orchestrate.max_parallel_in_progress`, env `DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS`, default **1**) is already saturated. At the cap, in-queue candidates are dropped (only resumable in-progress candidates remain). When that leaves nothing actionable but a unit is in-progress, `next` prints `NO_ACTIONABLE` with a distinct `IN_PROGRESS_AT_CAPACITY: ... naming the busy unit id(s)` reason line so the loop can tell "serialized, retry later" from "genuinely stalled". See [`orchestrate:` reference](devbench-yaml-reference.md#orchestrate----orchestrator-runtime-tuning).
 
 **Scope filter flags:** `--include` and `--exclude` accept the same printer-pages-style tokens as `status` and `start`. One-off flags override any active `scope.json`; when neither flag is supplied, the active `scope.json` (if present) is consulted automatically. When a scope is active, only work units within the scope's `expanded_ids` set are eligible candidates. See [Scope selectors](#scope-selectors-printer-pages-syntax) for the token syntax.
 
@@ -397,6 +400,8 @@ uv run devbench claim <id>
 ```
 
 Set the work unit's status to `in-progress`. Fails if the unit is already in a terminal state. Invoked by the orchestrate SKILL at the start of each loop iteration.
+
+**Serialize-claims backstop:** claiming a NEW unit (one not already `in-progress`) is DEFERRED with exit `CLAIM_DEFERRED_SERIALIZED` (47) when the number of OTHER in-progress units is already at the cap (`orchestrate.max_parallel_in_progress`, default **1**). This is the hard backstop that pairs with the `next` filter above: it is NOT a unit failure -- nothing is written, the unit stays `in-queue`, and the message says to retry after the in-progress unit completes. Re-claiming a unit that is ALREADY `in-progress` is idempotent and always succeeds (it owns the shared checkout already).
 
 ### `set-status`
 

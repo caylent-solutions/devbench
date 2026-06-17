@@ -266,6 +266,7 @@ hook_tail:
 orchestrate:
   max_cascade_depth: 2                 # recovery-of-recovery cascade depth cap
   model: claude-opus-4-8               # REQUIRED to launch the orchestrator; see below
+  max_parallel_in_progress: 1          # serialize claims (one in-progress unit at a time); see below
   within_claim_convergence_check: true # block a claim that repeats the SAME failure
   max_within_claim_attempts: 4         # identical-failure recurrences before a block
   max_claim_wall_clock_seconds: 21600  # 6h backstop; 0 disables
@@ -281,9 +282,26 @@ orchestrate:
 
 Interactive vs non-interactive: this key governs ONLY the SDK-launched orchestrator. When an operator runs the `/devbench-orchestrate:orchestrate` slash command inside their own interactive Claude Code session, the skill runs on the **host session's selected model** -- devbench cannot and does not override the host session. (The work agents -- executor / judges / etc. -- get their model from each agent's plugin `.md` frontmatter, overridable via the `agents:` block.)
 
+### Serialize claims (`max_parallel_in_progress`)
+
+Every claim operates on ONE shared target-repo checkout. With two units `in-progress` at once, the second unit's uncommitted (staged + working-tree) files leak into the first unit's `get-diff` / staged-index reads -- a review judge then sees files the unit never touched, and a completed unit can even be RE-OPENED by the cross-claim contamination (tracked-issue 002).
+
+| Key | Env override | Default | Meaning |
+|---|---|---|---|
+| `max_parallel_in_progress` | `DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS` | `1` | Cap on units `in-progress` at the same time (>= 1). Default `1` serializes claims. |
+
+The default of `1` SERIALIZES claims, enforced at two layers:
+
+- **`devbench next`** never offers a NEW in-queue unit while the cap is saturated -- it drops in-queue candidates and, when nothing actionable remains but a unit is in-progress, prints `NO_ACTIONABLE` with a distinct `IN_PROGRESS_AT_CAPACITY:` reason naming the busy unit id(s), so the loop can tell "serialized, retry later" from "genuinely stalled".
+- **`devbench claim`** is the hard backstop: claiming a NEW unit while the cap is saturated DEFERS with exit `CLAIM_DEFERRED_SERIALIZED` (47) and writes nothing (the unit stays `in-queue`; the message says to retry after the in-progress unit completes). Re-claiming an ALREADY in-progress unit is idempotent.
+
+Raise above `1` only when each in-progress unit has its OWN isolated checkout (e.g. a worktree-per-claim setup), where cross-contamination cannot occur.
+
 ### Within-claim convergence bound + block-and-continue
 
 A single in-progress claim that repeats the SAME unresolvable AC-verify / TDD-RED / live-test signature -- while staying "busy" so the inactivity budget keeps resetting -- is force-**BLOCKED** with a `[CLAIM_NOT_CONVERGING]` audit comment rather than churning for hours. The bound keys on the REPEATED IDENTICAL signature (never raw duration), so a genuinely-progressing long live run (a different signal each round) is never killed.
+
+**Scoped convergence (whole-suite failures do not count).** The within-claim bound counts the AUTHORITATIVE per-unit gate (`devbench verify-ac`) and SCOPED test failures (a specific test file or node id, e.g. `pytest tests/unit/test_foo.py`). It deliberately does NOT count a WHOLE-SUITE / out-of-scope test-runner failure -- a bare `pytest` with no target, a bare directory (`tests` / `tests/unit`), or a path equal to / under a target-repo checkout root -- because such a failure can be caused by ANOTHER unit's defect even when this unit's own scoped `verify-ac` is green (tracked-issue 004). A leaf unit must never be held hostage to another unit's tests; the full-suite / global-coverage gate belongs to an epic-capstone unit or CI. A skipped whole-suite failure emits a one-line audit note explaining why it was not counted.
 
 | Key | Env override | Default | Meaning |
 |---|---|---|---|

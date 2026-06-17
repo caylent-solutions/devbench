@@ -293,6 +293,152 @@ class TestCmdClaimMarkerIdempotency:
         assert rc == 44
 
 
+class TestCmdClaimSerializeBackstop:
+    """Hard backstop: refuse to claim a NEW unit while the in-progress cap is saturated.
+
+    Root cause of tracked-issue 002: parallel claims share ONE target checkout. ``cmd_claim``
+    refuses (deferral, NOT a unit failure) when the target unit is not already IN_PROGRESS and
+    the number of OTHER IN_PROGRESS units is at or above ``max_parallel_in_progress`` (default 1).
+    Re-claiming an already-in-progress unit stays idempotent (rc 0).
+    """
+
+    def _unit(self, unit_id: str, status: WorkUnitStatus, repo: str = "caylent-solutions/git-repo") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Test",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    def test_second_unit_deferred_when_one_in_progress(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Claiming a 2nd different unit while one is IN_PROGRESS returns CLAIM_DEFERRED_SERIALIZED."""
+        from devbench.constants import CLAIM_DEFERRED_SERIALIZED
+
+        target, wu_file = _make_unit(backlog_dir, unit_id="E0-F1-S1-T2", repo="caylent-solutions/git-repo")
+        busy = self._unit("E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS)
+        backlog_index = _make_backlog_index(backlog_dir.parent, target.id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [busy, target]
+        entered: list[bool] = []
+        flock_factory = _make_noop_flock(entered=entered)
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.flock_backlog", flock_factory),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            rc = cli.cmd_claim(target.id)
+
+        assert rc == CLAIM_DEFERRED_SERIALIZED
+        # Deferral writes NO status: no force_status, no flock entered, file unchanged on disk.
+        mock_mgr.force_status.assert_not_called()
+        assert not entered, "deferral must not acquire the lock"
+        content = wu_file.read_text(encoding="utf-8")
+        assert "## Status: in-queue" in content, "the deferred unit's status must be unchanged"
+        assert "[BLOCKED" not in content, "deferral must NOT mark the unit blocked"
+        err = capsys.readouterr().err
+        assert "E0-F1-S1-T1" in err, "the error must name the in-progress unit"
+        assert "retry" in err.lower(), "the message must say to retry after the in-progress unit completes"
+
+    def test_reclaim_same_in_progress_unit_succeeds(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Re-claiming the SAME already-IN_PROGRESS unit is idempotent (rc 0), even at the cap."""
+        target, wu_file = _make_unit(
+            backlog_dir, unit_id="E0-F1-S1-T1", status="in-progress", repo="caylent-solutions/git-repo"
+        )
+        target.status = WorkUnitStatus.IN_PROGRESS
+        backlog_index = _make_backlog_index(backlog_dir.parent, target.id, status="in-progress")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [target]
+        mock_mgr = MagicMock()
+        entered: list[bool] = []
+        flock_factory = _make_noop_flock(entered=entered)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.flock_backlog", flock_factory),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            rc = cli.cmd_claim(target.id)
+
+        assert rc == 0, "re-claiming an already in-progress unit must remain idempotent"
+        assert entered, "the idempotent re-claim still proceeds through the lock"
+
+    def test_first_claim_proceeds_when_no_other_in_progress(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """With zero OTHER in-progress units the claim proceeds normally (rc 0)."""
+        target, wu_file = _make_unit(backlog_dir, unit_id="E0-F1-S1-T2", repo="caylent-solutions/git-repo")
+        backlog_index = _make_backlog_index(backlog_dir.parent, target.id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [target]
+        mock_mgr = MagicMock()
+        entered: list[bool] = []
+        flock_factory = _make_noop_flock(entered=entered)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.flock_backlog", flock_factory),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            rc = cli.cmd_claim(target.id)
+
+        assert rc == 0
+        assert entered, "a first claim with no other in-progress unit proceeds through the lock"
+
+    def test_cap_two_allows_second_claim(
+        self,
+        backlog_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Env cap=2: a second claim while one unit is in-progress proceeds (rc 0)."""
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS", "2")
+        target, wu_file = _make_unit(backlog_dir, unit_id="E0-F1-S1-T2", repo="caylent-solutions/git-repo")
+        busy = self._unit("E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS)
+        backlog_index = _make_backlog_index(backlog_dir.parent, target.id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [busy, target]
+        mock_mgr = MagicMock()
+        entered: list[bool] = []
+        flock_factory = _make_noop_flock(entered=entered)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.flock_backlog", flock_factory),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            rc = cli.cmd_claim(target.id)
+
+        assert rc == 0, "with cap=2 and only one in-progress unit, a second claim proceeds"
+        assert entered
+
+
 class TestCmdClaimMarkerWriteEdgeCases:
     """Edge-case coverage for _claim_write_unresolved_repo_marker."""
 

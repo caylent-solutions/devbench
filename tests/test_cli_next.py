@@ -261,3 +261,190 @@ class TestCmdNextNoActionableDiagnostic:
         assert expected_class in lines[1], (
             f"Expected {expected_class!r} in reason line for dep status {status}, got: {lines[1]!r}"
         )
+
+
+class TestCmdNextSerializeInProgressCap:
+    """Serialize claims: never offer a NEW in-queue unit while the in-progress cap is saturated.
+
+    Root cause of tracked-issue 002: parallel claims share ONE target checkout, so a
+    concurrent unit's uncommitted files leak into another unit's get-diff/staged-index.
+    ``cmd_next`` enforces a configurable cap on concurrently-in-progress units (default 1)
+    by dropping IN_QUEUE candidates whenever the count of IN_PROGRESS units is at or above
+    the cap.
+    """
+
+    @pytest.mark.unit
+    def test_in_progress_at_cap_drops_in_queue_candidate(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Cap=1: with one IN_PROGRESS + one actionable IN_QUEUE, the IN_QUEUE unit is NOT offered."""
+        in_progress = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_PROGRESS)
+        in_queue = _task("E1-F1-S1-T2", status=WorkUnitStatus.IN_QUEUE)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_progress, in_queue]
+        # get_parallel_candidates returns IN_PROGRESS before IN_QUEUE (resume-first order).
+        mock_parser.get_parallel_candidates.return_value = [in_progress, in_queue]
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The IN_PROGRESS unit may be offered (resume), but the IN_QUEUE unit must NOT be.
+        assert "E1-F1-S1-T2" not in out, "a NEW in-queue unit must not be offered while the cap is saturated"
+        assert "E1-F1-S1-T1" in out, "the in-progress unit should still be resumable"
+
+    @pytest.mark.unit
+    def test_in_progress_at_cap_with_no_in_progress_candidate_prints_serialized_reason(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Cap=1: an IN_PROGRESS unit not itself actionable + an IN_QUEUE unit -> serialized reason line.
+
+        When filtering drops the only candidate (the in-queue one) but an in-progress unit
+        exists, a distinct, clearly-labeled serialized reason names the in-progress id so the
+        operator/loop can tell "serialized, busy" from "genuinely stalled".
+        """
+        # The in-progress unit is NOT in get_parallel_candidates (e.g. its deps regressed),
+        # so the only actionable candidate is the in-queue one -- which the cap drops.
+        in_progress = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_PROGRESS)
+        in_queue = _task("E1-F1-S1-T2", status=WorkUnitStatus.IN_QUEUE)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_progress, in_queue]
+        mock_parser.get_parallel_candidates.return_value = [in_queue]
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "IN_PROGRESS_AT_CAPACITY" in out, "a distinct serialized reason must be printed"
+        assert "E1-F1-S1-T1" in out, "the serialized reason must name the in-progress unit id"
+        assert "—" not in out, "em-dash U+2014 must not appear in the output"
+
+    @pytest.mark.unit
+    def test_cap_two_allows_one_more_in_queue(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Cap=2 (env override): with one IN_PROGRESS, an IN_QUEUE candidate is NOT filtered out.
+
+        Only one candidate (the in-queue unit) is actionable here, so it is the one
+        ``cmd_next`` emits -- demonstrating the cap-2 filter did not drop it (under
+        the default cap-1 it would be dropped; see the next test).
+        """
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS", "2")
+        in_progress = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_PROGRESS)
+        in_queue = _task("E1-F1-S1-T2", status=WorkUnitStatus.IN_QUEUE)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_progress, in_queue]
+        mock_parser.get_parallel_candidates.return_value = [in_queue]
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # 1 in-progress < cap of 2, so the in-queue candidate survives the filter and is offered.
+        assert "E1-F1-S1-T2" in out, "with cap=2 and only 1 in-progress, the in-queue unit may be offered"
+
+    @pytest.mark.unit
+    def test_cap_one_drops_in_queue_when_in_progress_not_actionable(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Cap=1 (default): an IN_QUEUE candidate IS dropped while a unit is in-progress.
+
+        Mirror image of the cap-2 test above: the SAME single in-queue candidate is
+        filtered out under the default cap, proving the cap is what gates it.
+        """
+        in_progress = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_PROGRESS)
+        in_queue = _task("E1-F1-S1-T2", status=WorkUnitStatus.IN_QUEUE)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_progress, in_queue]
+        mock_parser.get_parallel_candidates.return_value = [in_queue]
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E1-F1-S1-T2" not in out, "under cap=1 the in-queue candidate must be dropped"
+        assert "IN_PROGRESS_AT_CAPACITY" in out
+
+    @pytest.mark.unit
+    def test_no_in_progress_offers_in_queue_normally(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Cap=1, zero IN_PROGRESS: the IN_QUEUE candidate is offered (regression guard)."""
+        in_queue = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_QUEUE)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_queue]
+        mock_parser.get_parallel_candidates.return_value = [in_queue]
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E1-F1-S1-T1" in out
+        assert "IN_PROGRESS_AT_CAPACITY" not in out
+
+    @pytest.mark.unit
+    def test_scope_filter_still_yields_scope_sentinel_under_serialize(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The serialize filter must not break the scope-filter NO_ACTIONABLE_IN_SCOPE path."""
+        in_progress = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_PROGRESS)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_progress]
+        # A scope was applied and nothing matched -> the scope path returns [].
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_next("--include", "E9")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "NO_ACTIONABLE_IN_SCOPE" in out
+
+
+class TestResolveMaxParallelInProgress:
+    """``_resolve_max_parallel_in_progress`` env > YAML > default precedence."""
+
+    @pytest.mark.unit
+    def test_default_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.constants import DEFAULT_MAX_PARALLEL_IN_PROGRESS
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS", raising=False)
+        mock_orchestrate = MagicMock()
+        mock_orchestrate.max_parallel_in_progress = None
+        with patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.orchestrate = mock_orchestrate
+            assert cli._resolve_max_parallel_in_progress() == DEFAULT_MAX_PARALLEL_IN_PROGRESS
+
+    @pytest.mark.unit
+    def test_yaml_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS", raising=False)
+        mock_orchestrate = MagicMock()
+        mock_orchestrate.max_parallel_in_progress = 3
+        with patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.orchestrate = mock_orchestrate
+            assert cli._resolve_max_parallel_in_progress() == 3
+
+    @pytest.mark.unit
+    def test_env_overrides_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS", "5")
+        mock_orchestrate = MagicMock()
+        mock_orchestrate.max_parallel_in_progress = 3
+        with patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.orchestrate = mock_orchestrate
+            assert cli._resolve_max_parallel_in_progress() == 5
+
+    @pytest.mark.unit
+    def test_default_constant_is_one(self) -> None:
+        """DEFAULT_MAX_PARALLEL_IN_PROGRESS serializes claims (value 1)."""
+        from devbench.constants import DEFAULT_MAX_PARALLEL_IN_PROGRESS
+
+        assert DEFAULT_MAX_PARALLEL_IN_PROGRESS == 1

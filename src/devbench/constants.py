@@ -679,6 +679,16 @@ assert CLAIM_BLOCKED_PRECLAIM == 44, "CLAIM_BLOCKED_PRECLAIM must equal 44 (spec
 # failure (rc 1). Value 45 is distinct from all other devbench exit codes.
 GET_DIFF_NO_ATTRIBUTABLE: int = 45
 
+# Exit code emitted by ``cmd_claim`` when a claim is DEFERRED because the
+# concurrently-in-progress cap (``orchestrate.max_parallel_in_progress``,
+# default 1) is already saturated by OTHER in-progress units. This is NOT a
+# unit failure: nothing is written, the unit stays ``in-queue``, and the caller
+# must RETRY the claim after the in-progress unit completes. Distinct from
+# CLAIM_BLOCKED_PRECLAIM (44) so the wrapping loop never mistakes a transient,
+# self-clearing deferral for a structural block. Value 47 is unused by every
+# other devbench exit code (42/43/44/45/46/127).
+CLAIM_DEFERRED_SERIALIZED: int = 47
+
 # Audit-log template written to ``logs/orchestrator.log`` when
 # ``cmd_start`` triggers an auto-restart. The token + task-id list let
 # operators grep history for restart frequency without parsing
@@ -756,6 +766,25 @@ FATAL_SDK_ERROR_CODES: frozenset[str] = frozenset(
         "not_found_error",
     }
 )
+
+# Maximum number of work units that may be IN-PROGRESS at the same time.
+#
+# Root cause of tracked-issue 002: every claim operates on ONE shared target
+# repo checkout. When two units are in-progress concurrently, the second unit's
+# uncommitted (staged + working-tree) files leak into the first unit's
+# ``get-diff`` / staged-index reads -- a review judge then sees files the unit
+# never touched, and a completed unit can even be RE-OPENED by the cross-claim
+# contamination. The default of 1 SERIALIZES claims: a new unit is never offered
+# (``devbench next``) and never claimed (``devbench claim``) while another unit
+# is already in-progress, so each claim owns the shared checkout exclusively for
+# its lifetime. Raise above 1 only when each in-progress unit has its OWN
+# isolated checkout (e.g. a worktree-per-claim setup), where cross-contamination
+# cannot occur.
+#
+# Override via env ``DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS`` (int >= 1)
+# or YAML ``orchestrate.max_parallel_in_progress``. Unset-safe: the constant is
+# the default when neither is set.
+DEFAULT_MAX_PARALLEL_IN_PROGRESS: int = 1
 
 # Within-claim convergence bound (repeated-identical-failure churn prevention).
 #

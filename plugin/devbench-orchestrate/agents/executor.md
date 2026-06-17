@@ -376,7 +376,14 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
 ## VERIFICATION REQUIREMENTS
 - After writing a file, read it back to confirm contents match intent.
 - After running a command, check exit codes and output.
-- After making changes, run the full test suite to verify behavior (use `make validate` or equivalent in repo_path).
+- **Scope your within-claim test loop to THIS unit only.** During the RED/GREEN/REFACTOR
+  loop, run ONLY the test files this unit's Changes Manifest covers (pass the specific test
+  file paths or node ids, e.g. `pytest tests/unit/test_foo.py`), or run `uv run devbench
+  verify-ac $ARGUMENTS`. NEVER run the full repo suite (`pytest` with no target, a bare
+  `tests/` / `tests/unit` directory, or `make test`) as your iteration gate: a leaf unit
+  must never be held hostage to another unit's tests, and a whole-suite failure caused by
+  out-of-scope code does not mean YOUR unit failed. The full-suite / global-coverage gate
+  belongs to an epic-capstone unit or CI, not to a leaf unit's claim.
 - Document all verification steps in the log comment below.
 - **AC evidence (ADR-27): if the work unit declares a `## Verification` section, you MUST run
   `uv run devbench verify-ac $ARGUMENTS` after staging your changes and before logging completion.**

@@ -343,6 +343,11 @@
           ],
           "description": "Startup integrity check `devbench start` runs against the devbench checkout: it detects uncommitted edits under the devbench package source (src/devbench/**) -- the signature of a prior orchestrate self-edit or unreviewed manual change -- before any run begins. 'off' skips it; 'warn' (the default) emits a loud warning and continues; 'fail' refuses to start. Pairs with the guard-harness-write.sh PreToolUse hook that hard-denies the session from editing the harness in the first place."
         },
+        "max_parallel_in_progress": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Cap on work units IN-PROGRESS at the same time. Default 1 SERIALIZES claims: every claim shares ONE target-repo checkout, so two concurrent in-progress units would leak each other's uncommitted (staged + working-tree) files into get-diff / the staged index -- a review judge then sees files the unit never touched and a completed unit can even be re-opened (tracked-issue 002). With cap 1, `devbench next` never offers a NEW in-queue unit while another unit is in-progress (it prints IN_PROGRESS_AT_CAPACITY naming the busy unit) and `devbench claim` of a different unit DEFERS with exit 47 (CLAIM_DEFERRED_SERIALIZED) without writing any status. Raise above 1 only when each in-progress unit has its OWN isolated checkout. Override via DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS."
+        },
         "within_claim_convergence_check": {
           "type": "boolean",
           "description": "Whether the within-claim repeated-failure bound is active (default true). A single in-progress claim that repeats the SAME unresolvable AC-verify / TDD-RED / live-test signature max_within_claim_attempts times -- while staying busy so the inactivity budget keeps resetting -- is BLOCKED with a [CLAIM_NOT_CONVERGING] audit comment instead of churning for hours. Keyed on the REPEATED IDENTICAL signature (not raw duration), so a genuinely-progressing long live run is never killed. Set false to disable."

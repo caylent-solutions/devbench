@@ -205,6 +205,15 @@ orchestrate:
   # cascades typically indicate a real spec defect that should surface.
   max_cascade_depth: 2                  # (built-in default)
 
+  # Cap on units IN-PROGRESS at the same time. Default 1 SERIALIZES claims:
+  # every claim shares ONE target-repo checkout, so two concurrent in-progress
+  # units would leak each other's uncommitted files into get-diff / the staged
+  # index. With 1, `devbench next` never offers a new in-queue unit while one is
+  # in-progress (it prints IN_PROGRESS_AT_CAPACITY) and `devbench claim` of a
+  # different unit defers with exit 47. Raise above 1 only with per-claim
+  # isolated checkouts. Override: DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS.
+  max_parallel_in_progress: 1           # (built-in default)
+
 # ---------------------------------------------------------------------------
 # Report / cost estimation
 # ---------------------------------------------------------------------------

@@ -684,6 +684,13 @@ class OrchestrateConfig:
     REPEATED IDENTICAL signature, never raw duration, so a genuinely-progressing
     long live run is not killed.
 
+    ``max_parallel_in_progress`` caps how many work units may be IN-PROGRESS at
+    once. Default 1 SERIALIZES claims: because every claim shares ONE target-repo
+    checkout, two concurrent in-progress units would leak each other's
+    uncommitted files into ``get-diff`` / the staged index (tracked-issue 002).
+    A value < 1 is rejected. ``None`` falls through to the constants.py default
+    (1) resolved by ``config.py`` (env > YAML > default).
+
     ``max_non_converging_claims`` is the aggregate safety valve for
     block-and-continue: a single non-converging claim is BLOCKED and the session
     CONTINUES to its next in-queue unit, but once this many DISTINCT units have
@@ -717,6 +724,7 @@ class OrchestrateConfig:
     max_cascade_depth: int | None = None
     model: str | None = None
     harness_integrity_check: str = _ORCHESTRATE_DEFAULT_HARNESS_INTEGRITY_CHECK
+    max_parallel_in_progress: int | None = None
     within_claim_convergence_check: bool | None = None
     max_within_claim_attempts: int | None = None
     max_claim_wall_clock_seconds: float | None = None
@@ -752,6 +760,15 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
         raise ValueError(
             f"Config file '{path}': orchestrate.harness_integrity_check {harness_integrity_check!r} "
             f"is not one of [{valid}]."
+        )
+    max_parallel_in_progress = (
+        int(orchestrate_raw["max_parallel_in_progress"]) if "max_parallel_in_progress" in orchestrate_raw else None
+    )
+    if max_parallel_in_progress is not None and max_parallel_in_progress < 1:
+        raise ValueError(
+            f"Config file '{path}': orchestrate.max_parallel_in_progress must be >= 1 "
+            f"(1 serializes claims to prevent shared-checkout cross-contamination); "
+            f"got {max_parallel_in_progress!r}."
         )
     within_claim_convergence_check = (
         bool(orchestrate_raw["within_claim_convergence_check"])
@@ -814,6 +831,7 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
         max_cascade_depth=max_cascade_depth,
         model=model,
         harness_integrity_check=harness_integrity_check,
+        max_parallel_in_progress=max_parallel_in_progress,
         within_claim_convergence_check=within_claim_convergence_check,
         max_within_claim_attempts=max_within_claim_attempts,
         max_claim_wall_clock_seconds=max_claim_wall_clock_seconds,

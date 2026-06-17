@@ -181,6 +181,7 @@ from devbench.constants import (
     BACKLOG_STATUS_RE,
     BLOCKED_TARGET_REPO_UNRESOLVED_MARKER,
     CLAIM_BLOCKED_PRECLAIM,
+    CLAIM_DEFERRED_SERIALIZED,
     CLAIM_NOT_CONVERGING_MARKER,
     CLAIM_TEARDOWN_MARKER,
     COMMENT_AGENT_TEMPLATE,
@@ -193,6 +194,7 @@ from devbench.constants import (
     DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS,
     DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS,
     DEFAULT_MAX_NON_CONVERGING_CLAIMS,
+    DEFAULT_MAX_PARALLEL_IN_PROGRESS,
     DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
@@ -1334,9 +1336,37 @@ def cmd_next(*argv: str) -> int:
 
     candidates = backlog_parser.get_parallel_candidates(units, scope=scope_filter)
 
+    # Serialize claims (tracked-issue 002): every claim shares ONE target-repo
+    # checkout, so a NEW in-queue unit must not be offered while the
+    # concurrently-in-progress cap is already saturated -- otherwise two
+    # in-progress units leak each other's uncommitted files into get-diff. Count
+    # the units currently IN-PROGRESS; if that meets the cap, drop IN_QUEUE
+    # candidates so only resumable IN_PROGRESS candidates remain.
+    in_progress_ids = [u.id for u in units if u.status is WorkUnitStatus.IN_PROGRESS]
+    serialize_cap = _resolve_max_parallel_in_progress()
+    dropped_by_serialize = False
+    if len(in_progress_ids) >= serialize_cap:
+        kept = [c for c in candidates if c.status is WorkUnitStatus.IN_PROGRESS]
+        # The serialized reason is reported ONLY when the cap actually suppressed
+        # an otherwise-actionable in-queue candidate -- so a genuine dependency
+        # stall (candidates already empty before filtering) still reports its real
+        # cause rather than being masked as "serialized, busy".
+        dropped_by_serialize = len(kept) < len(candidates)
+        candidates = kept
+
     if not candidates:
         if scope_filter is not None:
             print("NO_ACTIONABLE_IN_SCOPE")
+        elif dropped_by_serialize:
+            # Distinct from a genuine stall: the loop is serialized and busy, not
+            # wedged. Name the in-progress unit(s) so the operator/loop can tell
+            # "serialized, retry later" from "nothing actionable left".
+            print("NO_ACTIONABLE")
+            ids_str = ", ".join(in_progress_ids)
+            print(
+                f"  reason: IN_PROGRESS_AT_CAPACITY: {len(in_progress_ids)} in-progress at cap "
+                f"{serialize_cap}; a new unit is deferred until one completes: {ids_str}"
+            )
         elif backlog_parser.all_done(units):
             print("ALL_DONE")
         else:
@@ -1394,33 +1424,18 @@ def cmd_claim(unit_id: str) -> int:
     if wu_file is None:
         print(f"ERROR: work unit file not found for '{unit_id}'", file=sys.stderr)
         return 1
-    # Use a fresh import path so the unit-test layer's
-    # `patch("devbench.cli.BacklogManager", ...)` does not stub out the
-    # placeholder-detection classmethod via attribute lookup on the mock.
-    from devbench.backlog.manager import BacklogManager as _BacklogManager
-
-    placeholder = _BacklogManager._first_placeholder_manifest_cell(wu_file.read_text(encoding="utf-8"))
-    if placeholder:
-        print(
-            f"ERROR: cannot claim {unit_id!r}: Changes Manifest still has placeholder row "
-            f"{placeholder!r}. Replace with real file entries before claim.",
-            file=sys.stderr,
-        )
+    placeholder_error = _claim_placeholder_error(wu_file, unit_id)
+    if placeholder_error is not None:
+        print(placeholder_error, file=sys.stderr)
         return 1
 
-    # Pre-claim target-repo guard (issue #241). Resolve the repo before
-    # acquiring any lock. On failure: write the idempotent marker, set
-    # blocked, and return CLAIM_BLOCKED_PRECLAIM (44) without a lock.
-    try:
-        resolve_repo(unit.repo)
-    except ValueError:
-        _claim_write_unresolved_repo_marker(wu_file, unit_id, unit.repo)
-        print(
-            f"ERROR: cannot claim {unit_id!r}: target repo {unit.repo!r} is not in the allowed "
-            f"repos list. {BLOCKED_TARGET_REPO_UNRESOLVED_MARKER} {unit.repo}",
-            file=sys.stderr,
-        )
-        return CLAIM_BLOCKED_PRECLAIM
+    # Pre-claim target-repo guard (issue #241) -> CLAIM_BLOCKED_PRECLAIM (44), and
+    # serialize-claims backstop (tracked-issue 002) -> CLAIM_DEFERRED_SERIALIZED
+    # (47). Both are folded into one pre-lock check that returns the exit code to
+    # surface (or None to proceed), keeping cmd_claim within the PLR0911 budget.
+    preclaim_rc = _claim_preflight_guard(unit, wu_file, unit_id, units)
+    if preclaim_rc is not None:
+        return preclaim_rc
 
     session_name: str | None = os.environ.get("DEVBENCH_SESSION_NAME", "").strip() or None
     error_message = _claim_under_lock(wu_file, unit_id, session_name)
@@ -1487,6 +1502,91 @@ def _claim_write_unresolved_repo_marker(wu_file: Path, unit_id: str, repo: str) 
     # ``_set_status`` rewrites it to the same value (idempotent on the WU file)
     # while correctly updating the index row.
     BacklogManager().force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_BLOCKED)
+
+
+def _claim_placeholder_error(wu_file: Path, unit_id: str) -> str | None:
+    """Return an error message when the unit's Changes Manifest still has a placeholder.
+
+    Issue #117: refuses to claim a work unit whose Changes Manifest still contains
+    a ``TBD`` placeholder row. Returns the human-readable error message, or ``None``
+    when the manifest is clean. Extracted so ``cmd_claim`` stays within the PLR0911
+    return-statement budget.
+    """
+    # Use a fresh import path so the unit-test layer's
+    # `patch("devbench.cli.BacklogManager", ...)` does not stub out the
+    # placeholder-detection classmethod via attribute lookup on the mock.
+    from devbench.backlog.manager import BacklogManager as _BacklogManager
+
+    placeholder = _BacklogManager._first_placeholder_manifest_cell(wu_file.read_text(encoding="utf-8"))
+    if not placeholder:
+        return None
+    return (
+        f"ERROR: cannot claim {unit_id!r}: Changes Manifest still has placeholder row "
+        f"{placeholder!r}. Replace with real file entries before claim."
+    )
+
+
+def _claim_serialize_deferral(unit: WorkUnit, units: list[WorkUnit]) -> str | None:
+    """Return a deferral message when claiming *unit* would breach the serialize cap.
+
+    Serialize-claims hard backstop (tracked-issue 002). Every claim shares ONE
+    target-repo checkout, so a SECOND unit must not go in-progress while the cap
+    (``orchestrate.max_parallel_in_progress``, default 1) is saturated by OTHER
+    in-progress units -- otherwise the two units leak each other's uncommitted
+    files into ``get-diff`` / the staged index. Re-claiming a unit that is ALREADY
+    in-progress is idempotent and always permitted (it owns the checkout already),
+    so this returns ``None`` for it.
+
+    Returns a human-readable DEFERRAL message (a deferral, NOT a unit failure) when
+    the cap is breached, else ``None`` to proceed with the claim.
+    """
+    if unit.status is WorkUnitStatus.IN_PROGRESS:
+        return None
+    other_in_progress = [u.id for u in units if u.id != unit.id and u.status is WorkUnitStatus.IN_PROGRESS]
+    serialize_cap = _resolve_max_parallel_in_progress()
+    if len(other_in_progress) < serialize_cap:
+        return None
+    busy = ", ".join(other_in_progress)
+    return (
+        f"DEFERRED: cannot claim {unit.id!r}: {len(other_in_progress)} unit(s) already in-progress "
+        f"at the serialized cap of {serialize_cap} ({busy}). This is NOT a failure -- the unit stays "
+        f"in-queue; retry after the in-progress unit completes."
+    )
+
+
+def _claim_preflight_guard(unit: WorkUnit, wu_file: Path, unit_id: str, units: list[WorkUnit]) -> int | None:
+    """Run the lock-free pre-claim guards; return an exit code to surface, or ``None`` to proceed.
+
+    Two guards, evaluated before any lock is acquired:
+
+    1. **Target-repo guard (issue #241).** When ``unit.repo`` cannot be resolved
+       by :func:`resolve_repo`, write the idempotent
+       ``[BLOCKED_TARGET_REPO_UNRESOLVED]`` marker, set the unit ``blocked``, and
+       return :data:`CLAIM_BLOCKED_PRECLAIM` (44).
+    2. **Serialize-claims backstop (tracked-issue 002).** When claiming this NEW
+       unit would breach ``orchestrate.max_parallel_in_progress`` (the shared
+       target-repo checkout would then carry two units' WIP), print the deferral
+       message and return :data:`CLAIM_DEFERRED_SERIALIZED` (47) -- a deferral,
+       not a unit failure (nothing is written; the unit stays ``in-queue``).
+
+    Extracted from ``cmd_claim`` so it stays within the PLR0911 return budget.
+    """
+    try:
+        resolve_repo(unit.repo)
+    except ValueError:
+        _claim_write_unresolved_repo_marker(wu_file, unit_id, unit.repo)
+        print(
+            f"ERROR: cannot claim {unit_id!r}: target repo {unit.repo!r} is not in the allowed "
+            f"repos list. {BLOCKED_TARGET_REPO_UNRESOLVED_MARKER} {unit.repo}",
+            file=sys.stderr,
+        )
+        return CLAIM_BLOCKED_PRECLAIM
+
+    deferral = _claim_serialize_deferral(unit, units)
+    if deferral is not None:
+        print(deferral, file=sys.stderr)
+        return CLAIM_DEFERRED_SERIALIZED
+    return None
 
 
 def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:
@@ -7745,6 +7845,96 @@ def _extract_failure_signature(message: object) -> str | None:
     return None
 
 
+#: The AUTHORITATIVE per-unit acceptance gate. A repeated ``devbench verify-ac``
+#: failure ALWAYS counts toward the within-claim convergence bound, regardless of
+#: its target token: it is scoped to the unit by construction, so it can never be
+#: a "whole repo suite" run.
+_VERIFY_AC_MARKER: str = "devbench verify-ac"
+
+#: Test-runner markers whose target is a TEST PATH (a file, node id, directory,
+#: or the whole checkout). Only these can express a "whole repo suite" target,
+#: so only these are subject to the whole-suite exemption. Markers that
+#: parameterise by a ``KEY=value`` module (``tf-test`` / ``terratest``) always
+#: name a SPECIFIC module -- never a whole suite -- so they are excluded here and
+#: always counted toward the bound.
+_PATH_SCOPED_TEST_MARKERS: frozenset[str] = frozenset({"pytest", "make test", "go test"})
+
+
+def _is_whole_suite_target(marker: str, target_token: str, repo_roots: tuple[str, ...]) -> bool:
+    """Return ``True`` when a failure is a WHOLE-SUITE / out-of-scope test-runner run.
+
+    Root cause of tracked-issue 004: the executor sometimes runs the FULL repo
+    test suite within a claim. A whole-suite failure can be caused by an
+    OUT-OF-SCOPE / other-unit defect even when this unit's OWN scoped
+    ``verify-ac`` is green, so it must NOT accrue toward the within-claim
+    non-converging bound (a leaf unit must never be held hostage to another
+    unit's tests).
+
+    Pure + deterministic (no I/O), so it is trivially unit-tested.
+
+    Classification:
+
+    - The authoritative per-unit gate (:data:`_VERIFY_AC_MARKER`) is NEVER
+      whole-suite -- it always counts.
+    - A raw test-runner failure (``pytest`` / ``make test`` / ``go test`` /
+      ``tf-test`` / ``terratest``) is whole-suite when its *target token* is:
+        * empty (a bare runner invocation with no target), OR
+        * a bare directory (no file component -- e.g. ``tests`` / ``tests/unit``),
+          OR
+        * an absolute path equal to, or a descendant of, a configured target-repo
+          checkout root (the whole checkout, not a specific file).
+    - A target naming a SPECIFIC test file (``...test_foo.py`` /
+      ``file.py::node``) or a parameterised ``KEY=value`` module value is SCOPED,
+      so it still counts.
+
+    Args:
+        marker: The matched command marker (the part before ``::`` in a
+            signature, e.g. ``pytest`` or ``devbench verify-ac``).
+        target_token: The target identifier (the part after ``::``).
+        repo_roots: Resolved target-repo checkout root paths to compare absolute
+            targets against. May be empty (only the empty/bare-dir rules then
+            apply).
+    """
+    if marker == _VERIFY_AC_MARKER:
+        return False
+    if marker not in _PATH_SCOPED_TEST_MARKERS:
+        # A ``KEY=value``-parameterised runner (``tf-test`` / ``terratest``)
+        # always names a SPECIFIC module, never a whole suite -- always counts.
+        return False
+    token = target_token.strip()
+    if not token:
+        # A bare runner invocation with no target -> the whole suite.
+        return True
+    if token.startswith("/"):
+        # An absolute path: whole-suite when it IS a checkout root or a
+        # descendant of one (the whole checkout, not one file inside it).
+        normalized = token.rstrip("/")
+        for root in repo_roots:
+            root_norm = root.rstrip("/")
+            if normalized == root_norm or normalized.startswith(root_norm + "/"):
+                # A specific file UNDER the root is still scoped.
+                return not _looks_like_test_file(token)
+        # An absolute path outside every configured checkout root: treat a bare
+        # directory as whole-suite, a specific file as scoped.
+        return not _looks_like_test_file(token)
+    # A relative target: a specific test file / node id is scoped; a bare
+    # directory (no file component) is a whole-suite run.
+    return not _looks_like_test_file(token)
+
+
+def _looks_like_test_file(token: str) -> bool:
+    """Return ``True`` when *token* names a SPECIFIC test file or node id.
+
+    A specific target carries a file component -- a ``.py`` file (optionally with
+    a ``::node`` id) or a ``::``-qualified node selector. A bare directory token
+    (``tests`` / ``tests/unit`` / an absolute dir) has no file component and is
+    therefore a whole-suite target, not a scoped one.
+    """
+    head = token.split("::", 1)[0]
+    last = head.rstrip("/").rsplit("/", 1)[-1]
+    return "." in last and not head.endswith("/")
+
+
 def _resolve_timeout_result_markers() -> tuple[str, ...]:
     """Return the kill-by-timeout result markers (env > constants default).
 
@@ -7836,9 +8026,17 @@ class ClaimConvergenceTracker:
         max_within_claim_attempts: int,
         max_claim_wall_clock_seconds: float,
         max_no_claim_activity_seconds: float = 0.0,
+        repo_roots: tuple[str, ...] = (),
     ) -> None:
         self._max_attempts = max_within_claim_attempts
         self._max_wall_clock = max_claim_wall_clock_seconds
+        # Resolved target-repo checkout roots (tracked-issue 004). Used to
+        # classify a raw test-runner failure whose target is a checkout root /
+        # bare directory as a WHOLE-SUITE run that must NOT accrue toward the
+        # within-claim non-converging bound (a leaf unit must never be held
+        # hostage to another unit's tests). The authoritative per-unit
+        # ``verify-ac`` gate is unaffected and always counts.
+        self._repo_roots = repo_roots
         # Inter-claim activity backstop: max seconds the orchestrator may stay
         # active while NO unit is claimed. <= 0 disables it. Default 0.0 keeps
         # the bound off unless the caller (production wiring) supplies a value.
@@ -7933,6 +8131,23 @@ class ClaimConvergenceTracker:
             return self._wall_clock_verdict(now)
 
         signature = _extract_failure_signature(message)
+        if signature is not None and self._is_whole_suite_signature(signature):
+            # Tracked-issue 004: a WHOLE-SUITE / out-of-scope test-runner failure
+            # (the executor ran the full repo suite, or a bare checkout-root
+            # directory) can be tripped by ANOTHER unit's defect even when this
+            # unit's own scoped verify-ac is green. It must NOT accrue toward the
+            # within-claim bound -- the authoritative per-unit verify-ac gate
+            # still does. Skip the increment and clear any pending marker so a
+            # following result cannot roll back an unrelated increment.
+            logger.info(
+                "convergence: not counting whole-suite/out-of-scope failure %r toward the "
+                "within-claim bound for %s (scoped verify-ac is the per-unit gate)",
+                signature,
+                self.current_unit_id,
+            )
+            self._pending_signature = None
+            return self._wall_clock_verdict(now)
+
         if signature is not None:
             # A NEW test/verify re-run: its result (success / real failure /
             # timeout) arrives in a LATER message. Remember it as pending so a
@@ -7950,6 +8165,17 @@ class ClaimConvergenceTracker:
             self._pending_signature = None
 
         return self._wall_clock_verdict(now)
+
+    def _is_whole_suite_signature(self, signature: str) -> bool:
+        """Return ``True`` when *signature* is a whole-suite / out-of-scope test run.
+
+        Splits the ``marker::target`` signature (the shape produced by
+        :func:`_extract_failure_signature`) and delegates to the pure
+        :func:`_is_whole_suite_target` classifier against the tracker's
+        configured ``repo_roots`` (tracked-issue 004).
+        """
+        marker, _, target = signature.partition("::")
+        return _is_whole_suite_target(marker, target, self._repo_roots)
 
     def _wall_clock_verdict(self, now: float) -> str | None:
         """Return the wall-clock backstop diagnostic when exceeded, else ``None``.
@@ -8665,6 +8891,26 @@ def _resolve_max_within_claim_attempts() -> int:
     if yaml_value is not None:
         return yaml_value
     return DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS
+
+
+def _resolve_max_parallel_in_progress() -> int:
+    """Return the concurrently-in-progress cap (env > YAML > default).
+
+    Caps how many work units may be IN-PROGRESS at once. Default 1 SERIALIZES
+    claims because every claim shares ONE target-repo checkout: two concurrent
+    in-progress units would leak each other's uncommitted files into get-diff /
+    the staged index (tracked-issue 002). Reads
+    ``DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS`` (int), then YAML
+    ``orchestrate.max_parallel_in_progress``, falling through to
+    :data:`~devbench.constants.DEFAULT_MAX_PARALLEL_IN_PROGRESS`.
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_MAX_PARALLEL_IN_PROGRESS", "").strip()
+    if raw:
+        return int(raw)
+    yaml_value = RUNTIME_CONFIG.orchestrate.max_parallel_in_progress
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_MAX_PARALLEL_IN_PROGRESS
 
 
 def _resolve_max_claim_wall_clock_seconds() -> float:
@@ -9797,6 +10043,10 @@ def cmd_start(*argv: str) -> int:
             max_within_claim_attempts=_resolve_max_within_claim_attempts(),
             max_claim_wall_clock_seconds=_resolve_max_claim_wall_clock_seconds(),
             max_no_claim_activity_seconds=_resolve_max_no_claim_activity_seconds(),
+            # Tracked-issue 004: the configured target-repo checkout roots, so a
+            # whole-suite test-runner failure against a checkout root / bare dir
+            # is not counted toward the within-claim bound.
+            repo_roots=tuple(str(p) for p in REPO_LOCAL_PATHS.values()),
         )
 
         def _check_convergence(msg: object) -> bool:

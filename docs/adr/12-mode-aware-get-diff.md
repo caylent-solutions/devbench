@@ -52,6 +52,8 @@ All five review judge prompts additionally carry a defensive "Scope contract" li
 - **Regression surface shrinks.** Three plugin-structure regression pins (`TestReviewJudgesUseGetDiffForScope`) now fail any PR that drops the "use get-diff for scope" contract or reintroduces the `git diff origin/main` anti-pattern in a judge prompt.
 - **No new configuration to maintain.** The fix reuses `devbench.config.DEFER_PR`, already populated by `config_loader` from `git_ops.defer_pr`. Operators do not learn a new flag.
 
+> **Related (concurrent-claim variant).** This ADR fixes scope misreads caused by *branch accumulation* in `defer_pr` mode. A second source of the same "files staged outside the manifest" misread -- two work units `in-progress` on the SAME shared checkout leaking each other's uncommitted files into `get-diff` -- is addressed by serializing claims in [ADR-33](33-serialize-claims-and-scoped-convergence.md) (`orchestrate.max_parallel_in_progress`, default 1).
+
 ## Alternatives considered and rejected
 
 **Rewrite every judge prompt to compute its own staged-diff via raw git.** Rejected: duplicates git logic across five agents, each of which would re-learn the staged/unstaged/post-commit discriminator separately. Brittle to model drift and to future changes in the git-ops flow.

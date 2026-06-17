@@ -38,6 +38,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from devbench.config import (
+    REPORT_STREAM_MAX_POLL_INTERVAL,
+    REPORT_STREAM_RENDER_BUDGET_SECONDS,
+    REPORT_STREAM_TAIL_BYTES,
+)
+
 # Polling cadence between cache-stat checks (seconds). 100 ms gives
 # human-perceptible immediate updates without burning CPU on workspace
 # stat churn. Issue #163 explicitly bounds this at ~100 ms; do not
@@ -46,6 +52,69 @@ _POLL_INTERVAL_SECONDS: float = 0.1
 
 # Number of warm-tick durations the running-average tracks.
 _WARM_HISTORY_SIZE: int = 8
+
+
+class StreamRenderBudgetExceededError(RuntimeError):
+    """A single streaming render exceeded its configured time budget.
+
+    TDI-005: the always-on ``devbench report`` streaming loop re-renders
+    on every source-file advance. Under an actively-writing orchestrator
+    the source key changes on nearly every tick, so a render whose cost
+    has grown past a sane ceiling would otherwise be re-run indefinitely,
+    pinning a CPU core (observed: 5.5h R+ at multi-GB RSS). Per CLAUDE.md
+    fail-fast, the loop raises this -- which propagates to a non-zero
+    exit -- instead of spinning. The message names the budget so the
+    operator can raise ``DEVBENCH_REPORT_STREAM_RENDER_BUDGET_SECONDS``
+    or investigate the slow render.
+    """
+
+
+def _backoff_interval(*, render_duration: float, base_interval: float, max_interval: float) -> float:
+    """Compute the next poll interval given the last render's duration.
+
+    Adaptive backoff (TDI-005): when a render is cheap relative to the
+    base cadence the loop polls at ``base_interval``; when a render is
+    expensive the next interval grows to at least the render's own
+    duration so the loop cannot re-render back-to-back and pin a core on
+    a fast-growing log. The result is always clamped to
+    ``[base_interval, max_interval]`` so a single pathological render can
+    never push the cadence unboundedly and an idle/fast workspace keeps
+    the responsive base cadence.
+
+    All three bounds are caller-supplied (env/config-driven at the call
+    site); this helper hard-codes no threshold.
+    """
+    candidate = max(base_interval, render_duration)
+    return min(candidate, max_interval)
+
+
+def _read_log_tail(path: Path, offset: int, *, max_bytes: int) -> tuple[str, int]:
+    """Read at most ``max_bytes`` of ``path`` starting at byte ``offset``.
+
+    Incremental, bounded read (TDI-005 requirement ii). Each call seeks
+    to ``offset`` and returns only the bytes appended since -- never
+    re-reading the whole (growing) file -- and never pulls more than
+    ``max_bytes`` into memory in one call. The returned new offset is
+    ``offset + len(bytes read)`` so the next tick resumes exactly where
+    this one stopped (no gap, no overlap).
+
+    Rotation/truncation safety: if the file is now shorter than
+    ``offset`` (log rotated or truncated), the read restarts from 0 so
+    the loop re-syncs instead of seeking past EOF and silently reading
+    nothing.
+
+    Returns ``("", offset)`` for a missing file so the streaming loop
+    treats an absent log the same as an unchanged log.
+    """
+    try:
+        size = path.stat().st_size
+    except (FileNotFoundError, OSError):
+        return ("", offset)
+    start = offset if offset <= size else 0
+    with path.open("rb") as handle:
+        handle.seek(start)
+        raw = handle.read(max_bytes)
+    return (raw.decode("utf-8", errors="replace"), start + len(raw))
 
 
 @dataclass
@@ -179,6 +248,8 @@ def stream_report(
     hook_log_path: Path | None = None,
     transcript_dir: Path | None = None,
     poll_interval: float = _POLL_INTERVAL_SECONDS,
+    render_budget_seconds: float | None = None,
+    max_poll_interval: float | None = None,
 ) -> int:
     """Run the always-on streaming report loop.
 
@@ -188,6 +259,25 @@ def stream_report(
     ``render_fn`` only when something changes, captures the duration,
     appends the latency footer, and writes the result atomically.
 
+    Resource bounds (TDI-005). Two caller-tunable safety bounds prevent
+    the loop from pinning a CPU core / growing RSS under an actively-
+    writing orchestrator (where the source key changes on nearly every
+    tick, so ``render_fn`` would otherwise run at the fixed base
+    cadence):
+
+    - ``render_budget_seconds``: if a single render exceeds this budget
+      the loop raises :class:`StreamRenderBudgetExceededError` (fail-fast,
+      non-zero exit) instead of re-running an ever-growing render
+      forever. ``None`` resolves to
+      :data:`devbench.config.REPORT_STREAM_RENDER_BUDGET_SECONDS`
+      (env > default).
+    - ``max_poll_interval``: the adaptive-backoff ceiling. After each
+      render the next poll interval grows (via :func:`_backoff_interval`)
+      to at least the last render's duration, clamped to this max, so a
+      slow-but-under-budget render cannot pin a core at the base cadence.
+      ``None`` resolves to
+      :data:`devbench.config.REPORT_STREAM_MAX_POLL_INTERVAL`.
+
     Exits cleanly (return code 0) on:
     - ``KeyboardInterrupt`` (Ctrl+C from the operator).
     - Any keypress on stdin (Ctrl+D / Enter / etc.).
@@ -195,35 +285,73 @@ def stream_report(
     Per CLAUDE.md fail-fast: any other exception propagates -- the
     loop does NOT silently swallow render failures.
     """
+    # Resolve bounds at call time so env/config overrides are honoured
+    # without freezing the values into the function default at import.
+    budget = REPORT_STREAM_RENDER_BUDGET_SECONDS if render_budget_seconds is None else render_budget_seconds
+    max_interval = REPORT_STREAM_MAX_POLL_INTERVAL if max_poll_interval is None else max_poll_interval
+
     tracker = _LatencyTracker()
-    paths: list[Path] = [log_path]
+    # Secondary sources (hook log + transcripts) keep cheap stat-based
+    # change detection. The orchestrator log -- the largest, fastest-
+    # growing source -- is tracked by an incremental bounded tail read
+    # below so a tick never pulls the whole growing file into memory.
+    secondary_paths: list[Path] = []
     if hook_log_path is not None:
-        paths.append(hook_log_path)
+        secondary_paths.append(hook_log_path)
     if transcript_dir is not None:
         # Stat the transcript directory itself; mtime advances when
         # any contained file changes, which is exactly the signal
         # the renderer cares about without having to enumerate
         # children every tick.
-        paths.append(transcript_dir)
+        secondary_paths.append(transcript_dir)
 
-    last_key: tuple[tuple[float, int], ...] | None = None
+    last_key: tuple[int, tuple[tuple[float, int], ...]] | None = None
+    # Byte offset into the orchestrator log. Advanced by bounded tail
+    # reads (TDI-005 requirement ii): each tick reads only the bytes
+    # appended since this offset, capped at REPORT_STREAM_TAIL_BYTES,
+    # so RSS stays bounded even under a large append burst.
+    log_offset = 0
+    # Next poll interval; starts at the base cadence and is recomputed by
+    # adaptive backoff after every render so a slow render lengthens the
+    # following sleep.
+    next_interval = poll_interval
     try:
         while True:
-            current_key = _stat_sources(paths)
+            # Incremental, bounded read of the orchestrator log: the new
+            # offset is the change signal for the log, and the read never
+            # re-scans bytes before ``log_offset`` nor exceeds the tail cap.
+            _, log_offset = _read_log_tail(log_path, log_offset, max_bytes=REPORT_STREAM_TAIL_BYTES)
+            current_key = (log_offset, _stat_sources(secondary_paths))
             if current_key != last_key:
                 # Capture the new frame BEFORE clearing the screen
                 # (no-blank-screen contract).
                 start = time.perf_counter()
                 output = render_fn(log_path=log_path)
                 duration = time.perf_counter() - start
+                # Fail-fast budget: a render that has grown past the
+                # ceiling is the CPU-spin / RSS-growth symptom TDI-005
+                # describes. Stop rather than re-render it forever.
+                if duration > budget:
+                    raise StreamRenderBudgetExceededError(
+                        f"streaming render took {duration:.1f}s, exceeding the "
+                        f"{budget:.1f}s budget; raise "
+                        f"DEVBENCH_REPORT_STREAM_RENDER_BUDGET_SECONDS or investigate the slow render"
+                    )
                 tracker.record(duration, cold=last_key is None)
                 # Clear + write in ONE buffered call.
                 frame = output + "\n" + tracker.footer() + "\n"
                 _clear_and_write(frame)
                 last_key = current_key
+                # Back off the next poll so a fast-growing log can't pin a
+                # core at the fixed base cadence.
+                next_interval = _backoff_interval(
+                    render_duration=duration,
+                    base_interval=poll_interval,
+                    max_interval=max_interval,
+                )
             if _stdin_keypress_pending():
                 break
-            time.sleep(poll_interval)
+            time.sleep(next_interval)
     except KeyboardInterrupt:
         # Newline so the next shell prompt doesn't land on the
         # latency-footer line.

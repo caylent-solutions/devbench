@@ -70,6 +70,9 @@ from devbench.constants import (
     DEFAULT_PR_REVIEW_RESOLUTION_ENABLED,
     DEFAULT_PR_REVIEW_SETTLE_SECONDS,
     DEFAULT_RECENT_PACE_TASKS,
+    DEFAULT_REPORT_STREAM_MAX_POLL_INTERVAL,
+    DEFAULT_REPORT_STREAM_RENDER_BUDGET_SECONDS,
+    DEFAULT_REPORT_STREAM_TAIL_BYTES,
     DEFAULT_SECURITY_FETCH_TIMEOUT,
     DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD,
     DEFAULT_SKILLS_USE_WORKFLOW,
@@ -469,6 +472,25 @@ RECENT_PACE_TASKS: int = _resolve_int(
     "DEVBENCH_REPORT_RECENT_PACE_TASKS",
     RUNTIME_CONFIG.report.recent_pace_tasks,
     DEFAULT_RECENT_PACE_TASKS,
+)
+# Streaming-report loop bounds (TDI-005). The always-on `devbench report`
+# streaming loop must not spin a CPU core or grow RSS unbounded under an
+# actively-writing orchestrator. env > default (no YAML field; these are
+# operator-tunable safety bounds, not part of the report cost model).
+REPORT_STREAM_RENDER_BUDGET_SECONDS: float = _resolve_float(
+    "DEVBENCH_REPORT_STREAM_RENDER_BUDGET_SECONDS",
+    None,
+    DEFAULT_REPORT_STREAM_RENDER_BUDGET_SECONDS,
+)
+REPORT_STREAM_MAX_POLL_INTERVAL: float = _resolve_float(
+    "DEVBENCH_REPORT_STREAM_MAX_POLL_INTERVAL",
+    None,
+    DEFAULT_REPORT_STREAM_MAX_POLL_INTERVAL,
+)
+REPORT_STREAM_TAIL_BYTES: int = _resolve_int(
+    "DEVBENCH_REPORT_STREAM_TAIL_BYTES",
+    None,
+    DEFAULT_REPORT_STREAM_TAIL_BYTES,
 )
 # Hook-tail column caps (issue #134). Resolution precedence: env > YAML >
 # constant. EVENT_WIDTH stays a hook_tail.py-local constant; the four below

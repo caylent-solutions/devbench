@@ -17,8 +17,11 @@ from unittest.mock import patch
 import pytest
 
 from devbench.reporting.streaming import (
+    StreamRenderBudgetExceededError,
+    _backoff_interval,
     _clear_and_write,
     _LatencyTracker,
+    _read_log_tail,
     _stat_one,
     _stat_sources,
     _stdin_keypress_pending,
@@ -382,3 +385,201 @@ class TestStreamReport:
         ):
             rc = stream_report(log_file, fake_render)
         assert rc == 0
+
+
+class TestBackoffInterval:
+    """The adaptive-backoff helper grows the poll interval when consecutive
+    renders are slow, so a fast-growing log cannot pin a core at the fixed
+    base cadence. All bounds are caller-supplied (no hard-coded literals)."""
+
+    def test_fast_render_keeps_base_interval(self) -> None:
+        # A render well under the base interval keeps the cadence at base.
+        interval = _backoff_interval(
+            render_duration=0.001,
+            base_interval=0.1,
+            max_interval=2.0,
+        )
+        assert interval == pytest.approx(0.1)
+
+    def test_slow_render_backs_off_proportionally(self) -> None:
+        # A render that took longer than the base interval pushes the next
+        # poll interval out (at least as long as the render itself) so the
+        # loop does not immediately re-render and pin a CPU core.
+        interval = _backoff_interval(
+            render_duration=0.5,
+            base_interval=0.1,
+            max_interval=2.0,
+        )
+        assert interval >= 0.5
+
+    def test_backoff_is_capped_at_max_interval(self) -> None:
+        # Even a pathologically slow render cannot push the cadence past the
+        # configured ceiling.
+        interval = _backoff_interval(
+            render_duration=120.0,
+            base_interval=0.1,
+            max_interval=2.0,
+        )
+        assert interval == pytest.approx(2.0)
+
+
+class TestRenderBudgetFailFast:
+    """Issue TDI-005: a single render exceeding the configured budget must
+    fail fast (raise / non-zero exit) rather than let the loop spin forever
+    re-rendering an ever-growing log."""
+
+    def test_render_exceeding_budget_raises(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "log"
+        log_file.write_text("a")
+
+        # perf_counter is read twice per render (start, end). Return a delta
+        # larger than the budget so the first render is judged over-budget.
+        perf_values = iter([0.0, 5.0, 100.0, 200.0])
+
+        def fake_perf() -> float:
+            return next(perf_values)
+
+        def slow_render(*, log_path: Path) -> str:
+            return "frame"
+
+        with (
+            patch("devbench.reporting.streaming.time.perf_counter", side_effect=fake_perf),
+            patch.object(sys, "stdout", io.StringIO()),
+            pytest.raises(StreamRenderBudgetExceededError),
+        ):
+            stream_report(log_file, slow_render, render_budget_seconds=1.0)
+
+    def test_render_within_budget_does_not_raise(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "log"
+        log_file.write_text("a")
+
+        perf_values = iter([0.0, 0.01, 0.02, 0.03])
+
+        def fake_perf() -> float:
+            return next(perf_values)
+
+        def fast_render(*, log_path: Path) -> str:
+            return "frame"
+
+        def fake_sleep(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.reporting.streaming.time.perf_counter", side_effect=fake_perf),
+            patch("devbench.reporting.streaming.time.sleep", side_effect=fake_sleep),
+            patch.object(sys, "stdout", io.StringIO()),
+        ):
+            rc = stream_report(log_file, fast_render, render_budget_seconds=1.0)
+        assert rc == 0
+
+    def test_loop_backs_off_when_render_is_slow(self, tmp_path: Path) -> None:
+        """When a render is slow (but under the fail-fast budget), the next
+        poll interval must back off above the base cadence so a fast-growing
+        log cannot pin a CPU core at the fixed base interval."""
+        log_file = tmp_path / "log"
+        log_file.write_text("a")
+
+        # start=0.0, end=0.5 -> a 0.5s render (slow relative to 0.1 base,
+        # but under the 5s budget).
+        perf_values = iter([0.0, 0.5, 1.0, 1.5])
+
+        def fake_perf() -> float:
+            return next(perf_values)
+
+        def slow_render(*, log_path: Path) -> str:
+            return "frame"
+
+        observed_sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            observed_sleeps.append(seconds)
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.reporting.streaming.time.perf_counter", side_effect=fake_perf),
+            patch("devbench.reporting.streaming.time.sleep", side_effect=fake_sleep),
+            patch.object(sys, "stdout", io.StringIO()),
+        ):
+            stream_report(
+                log_file,
+                slow_render,
+                poll_interval=0.1,
+                render_budget_seconds=5.0,
+                max_poll_interval=2.0,
+            )
+
+        assert observed_sleeps, "loop must have slept at least once"
+        # The slow render must have pushed the next sleep above the base
+        # cadence (backoff), proving the loop does not spin at the fixed
+        # 0.1s interval when renders are expensive.
+        assert observed_sleeps[0] > 0.1
+
+
+class TestIncrementalLogTail:
+    """Issue TDI-005 requirement (ii): the streaming layer's log read is
+    incremental -- each tick reads only the bytes appended since the prior
+    offset, never re-reading the entire (growing) file."""
+
+    def test_tail_reads_from_offset_only(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "log"
+        log_file.write_text("AAAA")  # 4 bytes
+        # First read from offset 0 returns all 4 bytes and advances offset.
+        text, offset = _read_log_tail(log_file, 0, max_bytes=1_000_000)
+        assert text == "AAAA"
+        assert offset == 4
+
+        # Append more data; a tail read from the prior offset must return
+        # ONLY the appended bytes, not the whole file.
+        with log_file.open("a") as f:
+            f.write("BBB")
+        text2, offset2 = _read_log_tail(log_file, offset, max_bytes=1_000_000)
+        assert text2 == "BBB"
+        assert offset2 == 7
+
+    def test_tail_does_not_reread_whole_file_each_tick(self, tmp_path: Path) -> None:
+        """Across many appends, the cumulative bytes read by repeated tail
+        reads equals the file's final size -- proving each tick reads only
+        its delta, not the whole growing file (which would be O(n^2))."""
+        log_file = tmp_path / "log"
+        log_file.write_bytes(b"")
+
+        total_appended = 0
+        total_read = 0
+        offset = 0
+        chunk = "X" * 100
+        for _ in range(50):
+            with log_file.open("a") as f:
+                f.write(chunk)
+            total_appended += len(chunk)
+            text, offset = _read_log_tail(log_file, offset, max_bytes=1_000_000)
+            total_read += len(text)
+
+        # If the loop re-read the whole file each tick, total_read would be
+        # ~ O(n^2) (sum 100, 200, ... ) = 127500. Incremental reads make it
+        # exactly the number of bytes appended.
+        assert total_read == total_appended
+
+    def test_tail_caps_bytes_read(self, tmp_path: Path) -> None:
+        """A single tail read never pulls more than ``max_bytes`` into
+        memory even when far more has been appended -- bounding RSS."""
+        log_file = tmp_path / "log"
+        log_file.write_bytes(b"Z" * 10_000)
+        text, offset = _read_log_tail(log_file, 0, max_bytes=1_000)
+        assert len(text) == 1_000
+        # Offset advances by exactly the capped read so the next tick
+        # continues from where this one stopped (no data skipped, no
+        # re-read).
+        assert offset == 1_000
+
+    def test_tail_handles_truncation_or_rotation(self, tmp_path: Path) -> None:
+        """If the file shrinks below the saved offset (rotation/truncation),
+        the tail read restarts from 0 rather than seeking past EOF."""
+        log_file = tmp_path / "log"
+        log_file.write_text("AAAAAAAA")  # 8 bytes
+        _, offset = _read_log_tail(log_file, 0, max_bytes=1_000_000)
+        assert offset == 8
+        # Rotation: file replaced with a shorter one.
+        log_file.write_text("BB")  # 2 bytes, < saved offset
+        text, new_offset = _read_log_tail(log_file, offset, max_bytes=1_000_000)
+        assert text == "BB"
+        assert new_offset == 2

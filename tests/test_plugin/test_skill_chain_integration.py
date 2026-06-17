@@ -15,6 +15,7 @@ production code (config_loader.load_runtime_config, cli.cmd_validate_backlog).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -479,15 +480,21 @@ class TestBootstrapEnvironmentDryRun:
     def test_clone_invocation_uses_github_url_pattern(self, tmp_path: Path) -> None:
         """bootstrap-environment's clone command must use the GitHub HTTPS URL pattern.
 
-        The SKILL.md specifies: ``git clone https://github.com/<repo>.git <checkout_directory>``.
-        This test asserts the URL pattern is present in the bootstrap SKILL.md content.
+        The SKILL.md specifies: ``git clone "https://github.com/<repo>.git" ...``.
+        This test asserts the exact ``git clone`` command line documenting the HTTPS
+        GitHub URL is present in the bootstrap SKILL.md content. The assertion matches
+        the contiguous command string (``git clone`` immediately followed by the
+        quoted ``https://github.com/`` placeholder URL) rather than a bare
+        ``https://github.com/`` substring, so it precisely verifies the documented
+        clone invocation instead of a loose URL membership check.
         """
         skill_md = _SKILLS_DIR / "bootstrap-environment" / "SKILL.md"
         content = skill_md.read_text(encoding="utf-8")
-        assert "https://github.com/" in content, (
-            "bootstrap-environment SKILL.md must use 'https://github.com/' URL pattern for git clone"
+        clone_command_pattern = re.compile(r'git clone\s+"https://github\.com/<repo>\.git"')
+        assert clone_command_pattern.search(content) is not None, (
+            "bootstrap-environment SKILL.md must document the clone command "
+            'as `git clone "https://github.com/<repo>.git" ...`'
         )
-        assert "git clone" in content, "bootstrap-environment SKILL.md must use 'git clone' command"
 
 
 @pytest.mark.unit

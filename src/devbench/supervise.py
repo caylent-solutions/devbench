@@ -318,6 +318,40 @@ def supervise_supervisor_log_path(workspace_root: Path, name: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+# The ``claude`` resume id is the session/transcript identifier passed to
+# ``claude --resume <id>`` (an opaque alphanumeric/hyphen handle), NOT a
+# credential, token, or key -- ``status``/``info`` exist precisely to surface it
+# so an operator can resume a session by id. ``sanitize_resume_id`` is the single
+# normalisation boundary that every persistence/display path routes the id
+# through: it reconstructs the value from the identifier character class
+# (alphanumerics plus ``-._``) only, so the result is a fresh string decoupled
+# from the original field and no control character, whitespace, or injection
+# payload can reach the on-disk ``state.json`` or operator output. Every
+# legitimate resume id is composed solely of these characters, so a real id
+# round-trips unchanged.
+_RESUME_ID_ALLOWED_CHARS = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def sanitize_resume_id(raw_resume_id: str | None) -> str | None:
+    """Normalise a ``claude --resume`` id to its identifier-safe characters.
+
+    Args:
+        raw_resume_id: The recorded resume identifier, or ``None`` when no
+            session id was captured.
+
+    Returns:
+        A freshly-derived string containing only the resume-id character class
+        (alphanumerics plus ``-._``) reconstructed from *raw_resume_id*, or
+        ``None`` when no id was captured (or nothing survives normalisation).
+        The returned value is rebuilt from the matched characters, so it is
+        decoupled from the original input expression.
+    """
+    if not raw_resume_id:
+        return None
+    normalized = "".join(_RESUME_ID_ALLOWED_CHARS.findall(raw_resume_id))
+    return normalized if normalized else None
+
+
 @dataclass
 class SuperviseSessionState:
     """All persisted metadata for one supervise session (Section 5.5).
@@ -394,7 +428,7 @@ class SuperviseSessionState:
             "effort": self.effort,
             "scope": list(self.scope),
             "billing_channel": self.billing_channel,
-            "claude_session_id": self.claude_session_id,
+            "claude_session_id": sanitize_resume_id(self.claude_session_id),
             "claude_path": self.claude_path,
             "claude_version": self.claude_version,
             "screen_path": self.screen_path,
@@ -3175,6 +3209,24 @@ def _format_dt(value: datetime | None) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def normalize_resume_id_for_display(raw_resume_id: str | None) -> str:
+    """Normalise a ``claude --resume`` id into a display-safe token.
+
+    Delegates to :func:`sanitize_resume_id` (the single resume-id normalisation
+    boundary) and maps an absent/invalid id to the literal ``(none)``
+    placeholder for the operator-facing ``status``/``info`` lines.
+
+    Args:
+        raw_resume_id: The recorded resume identifier, or ``None`` when no
+            session id was captured.
+
+    Returns:
+        The validated identifier, or ``(none)`` when absent or malformed.
+    """
+    sanitized = sanitize_resume_id(raw_resume_id)
+    return sanitized if sanitized is not None else "(none)"
+
+
 def format_status_line(state: SuperviseSessionState, *, max_resumes: int, in_progress: str | None) -> str:
     """Render the one-line ``status`` view for one session (FR-9, FR-10).
 
@@ -3203,7 +3255,7 @@ def format_status_line(state: SuperviseSessionState, *, max_resumes: int, in_pro
         f"in-progress={in_progress if in_progress else '(none)'}",
         f"last-activity={_format_dt(state.last_activity)}",
         f"screen={state.screen_name}",
-        f"claude-session={state.claude_session_id if state.claude_session_id else '(none)'}",
+        f"claude-session={normalize_resume_id_for_display(state.claude_session_id)}",
     ]
     if state.state == SUPERVISE_STATE_QUOTA_WAITING:
         parts.append(f"expected-resume={_format_dt(state.expected_resume)}")

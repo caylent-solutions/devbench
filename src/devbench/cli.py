@@ -304,6 +304,7 @@ from devbench.supervise import (
     follow_pty_log,
     format_status_line,
     new_session_state,
+    normalize_resume_id_for_display,
     parse_screen_ls,
     read_stop_request,
     reconcile_info_rows,
@@ -312,6 +313,7 @@ from devbench.supervise import (
     resolve_supervise_model,
     run_supervise_event_loop,
     run_supervised_kickoff,
+    sanitize_resume_id,
     screen_session_name,
     supervise_pty_log_path,
     write_session_scope,
@@ -10721,7 +10723,7 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
         return 1
     print(
         f"[supervise] state={outcome.state} pid={outcome.pid} screen={outcome.screen_name} "
-        f"claude-session={outcome.claude_session_id}",
+        f"claude-session={normalize_resume_id_for_display(outcome.claude_session_id)}",
     )
     return 0
 
@@ -11213,7 +11215,8 @@ def _cmd_supervise_info(_parsed: _SuperviseArgs) -> int:
     print("-" * len(header))
     for row in rows:
         pid_str = str(row.pid) if row.pid is not None else "-"
-        claude_session = row.claude_session if row.claude_session else "-"
+        sanitized_session = sanitize_resume_id(row.claude_session)
+        claude_session = sanitized_session if sanitized_session is not None else "-"
         print(
             f"{row.screen:<32} {row.name:<16} {row.state:<14} {pid_str:>8}  "
             f"{claude_session:<18} {row.billing:<13} {row.attach}"

@@ -366,6 +366,24 @@
           "type": "integer",
           "minimum": 1,
           "description": "Aggregate safety valve for block-and-continue. A single non-converging claim is BLOCKED (within_claim_convergence_check) and the orchestrate session CONTINUES to its next in-queue unit -- one bad module no longer abandons the rest of a session's scope. This caps how many DISTINCT units may each trip the convergence bound in ONE session before the session halts for operator attention with [ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K). Default 3. Override via DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS."
+        },
+        "presync_environment": {
+          "type": "boolean",
+          "description": "TDI #016: when true (default) `devbench start` runs presync_command once in each configured repo checkout BEFORE the orchestrate loop claims any work, so no claim pays the cold uv dependency-sync cost inside a timed test attempt (which would otherwise be recorded as a failure and trip the within-claim convergence bound). Override via DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT."
+        },
+        "presync_command": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "TDI #016: provisioning command argv run once per configured repo at start to warm its dependency environment. Default [\"uv\", \"sync\"] (idempotent and fast on a warm env). Override via DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND (whitespace-tokenised)."
+        },
+        "presync_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TDI #016: seconds the presync command may run per repo before it is treated as a provisioning failure. Default 900 (a cold sync can take minutes). Override via DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS."
         }
       }
     },

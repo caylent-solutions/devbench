@@ -103,30 +103,50 @@ class TestHarnessIntegrityCheck:
 
 @pytest.mark.unit
 class TestOrchestratorStartupGates:
-    """``_check_orchestrator_startup_gates`` chains the hook check then the integrity check."""
+    """``_check_orchestrator_startup_gates`` chains the hook check, the integrity check, then pre-sync."""
 
     def test_hook_check_failure_short_circuits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from pathlib import Path as _Path
 
         monkeypatch.setattr(cli, "_check_guard_hooks_registered", lambda _p: 7)
-        # Integrity must NOT run when the hook check already failed.
+        # Integrity + pre-sync must NOT run when the hook check already failed.
         monkeypatch.setattr(
             cli,
             "_check_harness_integrity",
             lambda _m: (_ for _ in ()).throw(AssertionError("integrity must not run")),
         )
+        monkeypatch.setattr(
+            cli,
+            "_run_presync_if_enabled",
+            lambda: (_ for _ in ()).throw(AssertionError("pre-sync must not run")),
+        )
         assert cli._check_orchestrator_startup_gates(_Path("/tmp/plugin")) == 7
 
-    def test_integrity_failure_returned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_integrity_failure_short_circuits_presync(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from pathlib import Path as _Path
 
         monkeypatch.setattr(cli, "_check_guard_hooks_registered", lambda _p: None)
         monkeypatch.setattr(cli, "_check_harness_integrity", lambda _m: 9)
+        # Pre-sync must NOT run when the integrity gate already failed.
+        monkeypatch.setattr(
+            cli,
+            "_run_presync_if_enabled",
+            lambda: (_ for _ in ()).throw(AssertionError("pre-sync must not run")),
+        )
         assert cli._check_orchestrator_startup_gates(_Path("/tmp/plugin")) == 9
 
-    def test_both_pass_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_presync_failure_returned(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from pathlib import Path as _Path
 
         monkeypatch.setattr(cli, "_check_guard_hooks_registered", lambda _p: None)
         monkeypatch.setattr(cli, "_check_harness_integrity", lambda _m: None)
+        monkeypatch.setattr(cli, "_run_presync_if_enabled", lambda: 1)
+        assert cli._check_orchestrator_startup_gates(_Path("/tmp/plugin")) == 1
+
+    def test_all_pass_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pathlib import Path as _Path
+
+        monkeypatch.setattr(cli, "_check_guard_hooks_registered", lambda _p: None)
+        monkeypatch.setattr(cli, "_check_harness_integrity", lambda _m: None)
+        monkeypatch.setattr(cli, "_run_presync_if_enabled", lambda: None)
         assert cli._check_orchestrator_startup_gates(_Path("/tmp/plugin")) is None

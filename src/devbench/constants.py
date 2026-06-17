@@ -785,6 +785,29 @@ DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK: bool = True
 # recurring failure so an operator/loop can act deterministically.
 CLAIM_NOT_CONVERGING_MARKER: str = "[CLAIM_NOT_CONVERGING]"
 
+# TDI #016: a run KILLED by its per-attempt timeout is a NON-deterministic
+# provisioning/infra failure (e.g. a cold ``uv`` env syncing dependencies from
+# ``uv.lock`` on the first invocation), NOT the "same deterministic test
+# failure". It carries timeout text + an error flag and no captured
+# assertion/collection output. The within-claim convergence tracker must NOT
+# count a timed-out run toward CLAIM_NOT_CONVERGING the way a real failure does.
+#
+# These case-insensitive substrings identify a kill-by-timeout in a Bash tool
+# result's text. They cover both the Claude Code Bash tool form
+# (``Command timed out after Ns``) and the shared ``run_command`` helper form
+# (``<cmd>: timed out after Ns``). Each entry is matched as a substring so the
+# detector is robust to surrounding text.
+#
+# Override the comma-separated set via env
+# ``DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS``; unset-safe (this tuple is the
+# default). Kept config-driven (CLAUDE.md: no hard-coded literals baked into
+# behaviour) so a target stack whose runner phrases timeouts differently can
+# extend the set without a code change.
+TIMEOUT_RESULT_MARKERS: tuple[str, ...] = (
+    "timed out after",
+    "command timed out",
+)
+
 # Aggregate safety valve for block-and-continue (TDI: claim-not-converging must
 # not halt the whole session).
 #
@@ -802,6 +825,38 @@ CLAIM_NOT_CONVERGING_MARKER: str = "[CLAIM_NOT_CONVERGING]"
 # in a sweep, but a session that cannot converge three distinct units is treated
 # as systemically broken.
 DEFAULT_MAX_NON_CONVERGING_CLAIMS: int = 3
+
+# TDI #016: pre-sync (warm-up) of each configured target repo environment at
+# orchestrator start.
+#
+# A COLD ``uv`` environment makes the FIRST ``uv run pytest ...`` in a checkout
+# spend minutes syncing dependencies from ``uv.lock``. When that sync exceeds the
+# per-attempt test timeout the attempt is recorded as a test failure and trips
+# the within-claim convergence tracker, falsely blocking a structurally-correct
+# unit. The cleanest agnostic fix is to PROVISION each configured repo's
+# environment ONCE -- before the orchestrate loop claims any work -- so no claim
+# ever pays the cold-sync cost inside a timed attempt.
+#
+# Whether ``devbench start`` pre-syncs each configured repo before the
+# orchestrate loop. Default True (on). Override via env
+# ``DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT`` or YAML
+# ``orchestrate.presync_environment``.
+DEFAULT_PRESYNC_ENVIRONMENT: bool = True
+
+# The provisioning command run once in each configured repo's checkout at start.
+# ``uv sync`` is idempotent and fast on a warm env (a no-op), so running it
+# unconditionally is safe and keeps the warm-up backlog-agnostic. Override the
+# whitespace-tokenised command via env
+# ``DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND`` or YAML ``orchestrate.presync_command``
+# (a list) so a target stack that provisions differently (e.g. ``make deps``)
+# can substitute its own command.
+DEFAULT_PRESYNC_COMMAND: tuple[str, ...] = ("uv", "sync")
+
+# Seconds the pre-sync command may run per repo before it is treated as a
+# provisioning failure. A cold dependency sync can take minutes, so the budget is
+# generous (15 minutes). Override via env
+# ``DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS`` (int).
+DEFAULT_PRESYNC_TIMEOUT_SECONDS: int = 900
 
 # TDI: in-process quota-resume cap.
 #

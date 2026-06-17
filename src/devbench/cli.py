@@ -195,6 +195,9 @@ from devbench.constants import (
     DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS,
     DEFAULT_PLUGIN_SUBPATH,
+    DEFAULT_PRESYNC_COMMAND,
+    DEFAULT_PRESYNC_ENVIRONMENT,
+    DEFAULT_PRESYNC_TIMEOUT_SECONDS,
     DEFAULT_WITHIN_CLAIM_CONVERGENCE_CHECK,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
@@ -243,6 +246,7 @@ from devbench.constants import (
     SUPERVISE_STATE_STOPPED,
     SUPERVISE_SUBVERBS,
     SUPERVISE_VALID_BILLING_MODES,
+    TIMEOUT_RESULT_MARKERS,
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
@@ -7270,11 +7274,19 @@ def _check_orchestrator_startup_gates(plugin_path: Path) -> int | None:
        package source -- the signature of a prior orchestrate self-edit. Pairs
        with the ``guard-harness-write.sh`` hook that hard-denies the session
        from editing the harness in the first place.
+    3. Target-env pre-sync (TDI #016, ``orchestrate.presync_environment``,
+       default on): warm each configured repo's dependency environment ONCE
+       before the orchestrate loop claims any work, so no claim pays the
+       cold-dependency-sync cost inside a timed test attempt (which would
+       otherwise be misread as a test failure and trip the within-claim
+       convergence bound). Fail-fast on a real provisioning failure.
     """
     if (hook_check_rc := _check_guard_hooks_registered(plugin_path)) is not None:
         return hook_check_rc
     if (integrity_rc := _check_harness_integrity(RUNTIME_CONFIG.orchestrate.harness_integrity_check)) is not None:
         return integrity_rc
+    if (presync_rc := _run_presync_if_enabled()) is not None:
+        return presync_rc
     return None
 
 
@@ -7654,6 +7666,72 @@ def _extract_failure_signature(message: object) -> str | None:
     return None
 
 
+def _resolve_timeout_result_markers() -> tuple[str, ...]:
+    """Return the kill-by-timeout result markers (env > constants default).
+
+    TDI #016. Reads the comma-separated env
+    ``DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS`` when set (each token lower-cased
+    + stripped, empty tokens dropped), else falls through to
+    :data:`~devbench.constants.TIMEOUT_RESULT_MARKERS`. Kept config-driven so a
+    target stack whose runner phrases timeouts differently can extend the set
+    without a code change (CLAUDE.md: no hard-coded literals baked into behaviour).
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS", "").strip()
+    if raw:
+        tokens = tuple(tok.strip().lower() for tok in raw.split(",") if tok.strip())
+        if tokens:
+            return tokens
+    return TIMEOUT_RESULT_MARKERS
+
+
+def _tool_result_texts(message: object) -> list[str]:
+    """Return the text content of every ToolResultBlock carried by *message*.
+
+    Duck-typed: a ToolResultBlock is any content block exposing a
+    ``tool_use_id`` attribute (so it is distinguished from a ToolUseBlock, which
+    exposes ``name`` + ``input``). Its ``content`` is either a plain string or a
+    list of ``{"type": "text", "text": ...}`` dicts (the SDK's two shapes); both
+    are flattened to their text. Returns an empty list when *message* carries no
+    tool result.
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, (list, tuple)):
+        return []
+    texts: list[str] = []
+    for block in content:
+        if not hasattr(block, "tool_use_id"):
+            continue
+        block_content = getattr(block, "content", None)
+        if isinstance(block_content, str):
+            texts.append(block_content)
+        elif isinstance(block_content, (list, tuple)):
+            for part in block_content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+    return texts
+
+
+def _is_timeout_result(message: object) -> bool:
+    """Return ``True`` when *message* is a Bash result KILLED by its timeout.
+
+    TDI #016. A timed-out run is a NON-deterministic provisioning/infra failure
+    (e.g. a cold ``uv`` env syncing dependencies on the first invocation), NOT
+    the "same deterministic test failure": it carries timeout text and no
+    captured assertion/collection output. The within-claim convergence tracker
+    uses this to AVOID counting a timed-out run toward CLAIM_NOT_CONVERGING the
+    way a real failure does.
+
+    Matches any of :func:`_resolve_timeout_result_markers` (case-insensitive
+    substring) in any ToolResultBlock text. Duck-typed; never raises.
+    """
+    markers = _resolve_timeout_result_markers()
+    for text in _tool_result_texts(message):
+        lowered = text.lower()
+        if any(marker in lowered for marker in markers):
+            return True
+    return False
+
+
 class ClaimConvergenceTracker:
     """Bound a single in-progress claim that repeats the SAME failure forever.
 
@@ -7692,12 +7770,20 @@ class ClaimConvergenceTracker:
         # When > 0, the timestamp of the first message observed while no unit is
         # claimed; reset to None whenever a claim is active or freshly noted.
         self._no_claim_active_since: float | None = None
+        # TDI #016: the signature of the most-recent run whose count was just
+        # incremented, pending its result. A subsequent timed-out result
+        # (``_is_timeout_result``) rolls that increment back because a timeout is
+        # non-deterministic provisioning latency, not a deterministic failure.
+        # Cleared once any result is observed so a timeout can never roll back an
+        # increment it did not cause.
+        self._pending_signature: str | None = None
 
     def note_claim(self, unit_id: str, *, now: float) -> None:
         """Begin tracking a freshly-claimed unit, resetting all per-claim state."""
         self.current_unit_id = unit_id
         self._claim_started_at = now
         self._signature_counts = {}
+        self._pending_signature = None
         # A fresh claim is forward progress: stop any inter-claim stall timer.
         self._no_claim_active_since = None
 
@@ -7716,6 +7802,7 @@ class ClaimConvergenceTracker:
         self.current_unit_id = None
         self._claim_started_at = None
         self._signature_counts = {}
+        self._pending_signature = None
         # Restart the inter-claim window fresh: the orchestrator should claim
         # the next unit promptly after a block; if it instead keeps emitting
         # messages without claiming, the backstop below catches that wedge.
@@ -7748,13 +7835,51 @@ class ClaimConvergenceTracker:
         # An active claim is forward progress for the inter-claim backstop.
         self._no_claim_active_since = None
 
+        # TDI #016: a Bash result KILLED by its timeout is a non-deterministic
+        # provisioning failure (e.g. a cold ``uv`` env syncing dependencies on
+        # the first invocation), NOT the "same deterministic test failure". Roll
+        # back the increment the just-run command (``_pending_signature``)
+        # contributed so repeated timed-out runs never accrue toward the bound.
+        # A timeout result carries no failure signature of its own, so this is
+        # handled before signature extraction. The pending signature is then
+        # cleared either way so a later result cannot double-roll-back it.
+        if _is_timeout_result(message):
+            if self._pending_signature is not None:
+                rolled_back = self._signature_counts.get(self._pending_signature, 0) - 1
+                if rolled_back > 0:
+                    self._signature_counts[self._pending_signature] = rolled_back
+                else:
+                    self._signature_counts.pop(self._pending_signature, None)
+                self._pending_signature = None
+            return self._wall_clock_verdict(now)
+
         signature = _extract_failure_signature(message)
         if signature is not None:
+            # A NEW test/verify re-run: its result (success / real failure /
+            # timeout) arrives in a LATER message. Remember it as pending so a
+            # following timeout result can roll this increment back (#016).
             count = self._signature_counts.get(signature, 0) + 1
             self._signature_counts[signature] = count
+            self._pending_signature = signature
             if count >= self._max_attempts:
                 return signature
+        else:
+            # A non-run message that is not a timeout result (an edit, a
+            # non-timeout test result, narrative text): the pending run's verdict
+            # is settled, so its increment stands. Drop the pending marker so a
+            # subsequent timeout result cannot roll back an unrelated increment.
+            self._pending_signature = None
 
+        return self._wall_clock_verdict(now)
+
+    def _wall_clock_verdict(self, now: float) -> str | None:
+        """Return the wall-clock backstop diagnostic when exceeded, else ``None``.
+
+        Extracted so every ``observe`` exit path applies the same secondary
+        backstop without duplicating the condition (DRY).
+        """
+        if self._claim_started_at is None:
+            return None
         if self._max_wall_clock > 0 and (now - self._claim_started_at) >= self._max_wall_clock:
             return f"wall-clock backstop exceeded for {self.current_unit_id}"
         return None
@@ -8508,6 +8633,145 @@ def _resolve_max_non_converging_claims() -> int:
     if yaml_value is not None:
         return yaml_value
     return DEFAULT_MAX_NON_CONVERGING_CLAIMS
+
+
+def _resolve_presync_environment() -> bool:
+    """Return whether start-time target-env pre-sync is active (env > YAML > default).
+
+    TDI #016. Reads ``DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT`` (truthy/falsey),
+    then YAML ``orchestrate.presync_environment``, then
+    :data:`~devbench.constants.DEFAULT_PRESYNC_ENVIRONMENT`.
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    yaml_value = RUNTIME_CONFIG.orchestrate.presync_environment
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_PRESYNC_ENVIRONMENT
+
+
+def _resolve_presync_command() -> list[str]:
+    """Return the per-repo provisioning command argv (env > YAML > default).
+
+    TDI #016. The env override ``DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND`` is
+    whitespace-tokenised; YAML ``orchestrate.presync_command`` is already a list;
+    the fallback is :data:`~devbench.constants.DEFAULT_PRESYNC_COMMAND`.
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND", "").strip()
+    if raw:
+        tokens = raw.split()
+        if tokens:
+            return tokens
+    yaml_value = RUNTIME_CONFIG.orchestrate.presync_command
+    if yaml_value:
+        return list(yaml_value)
+    return list(DEFAULT_PRESYNC_COMMAND)
+
+
+def _resolve_presync_timeout_seconds() -> int:
+    """Return the per-repo pre-sync timeout in seconds (env > YAML > default).
+
+    TDI #016. Reads ``DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS`` (int), then
+    YAML ``orchestrate.presync_timeout_seconds``, then
+    :data:`~devbench.constants.DEFAULT_PRESYNC_TIMEOUT_SECONDS`.
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        return int(raw)
+    yaml_value = RUNTIME_CONFIG.orchestrate.presync_timeout_seconds
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_PRESYNC_TIMEOUT_SECONDS
+
+
+class PresyncError(RuntimeError):
+    """Raised when start-time pre-sync of a target repo environment fails (#016).
+
+    Fail-fast: a real provisioning failure (a non-zero ``presync_command`` exit,
+    or a repo with no resolved checkout path) surfaces LOUDLY at orchestrator
+    start rather than silently inside a timed claim attempt where it would be
+    misread as a test failure. The message names the offending repo + the
+    provisioning command's stderr so an operator can act deterministically.
+    """
+
+
+def _presync_target_environments(
+    repos: dict[str, RepoConfig],
+    *,
+    command: list[str],
+    runner: verification.CommandRunner,
+    timeout: int,
+) -> None:
+    """Provision each configured repo's dependency environment ONCE (#016).
+
+    Runs *command* (e.g. ``["uv", "sync"]``) in every configured repo's resolved
+    checkout BEFORE the orchestrate loop claims any work, so no claim pays the
+    cold-dependency-sync cost inside a timed test attempt. ``uv sync`` is
+    idempotent and fast on a warm env, so this is a no-op-fast warm-up when the
+    environment is already synced.
+
+    Args:
+        repos: The configured ``org/repo`` -> :class:`RepoConfig` mapping.
+        command: The provisioning command argv to run in each repo checkout.
+        runner: Injected command runner (``run_command``-shaped) returning
+            ``(returncode, stdout, stderr)``; injectable so the helper is
+            unit-testable without shelling out.
+        timeout: Per-repo timeout in seconds passed to *runner*.
+
+    Raises:
+        PresyncError: When a repo has no resolved checkout path, or the
+            provisioning command exits non-zero for any repo (fail-fast).
+    """
+    for repo_name, repo_cfg in repos.items():
+        checkout = repo_cfg.resolved_checkout_path
+        if checkout is None:
+            raise PresyncError(
+                f"pre-sync: repo {repo_name!r} has no resolved checkout path; cannot provision its "
+                f"environment. Check repos.{repo_name}.checkout_directory in devbench.yaml."
+            )
+        logger.info("[ORCHESTRATOR_PRESYNC] repo=%s command=%r cwd=%s", repo_name, command, checkout)
+        rc, _stdout, stderr = runner(command, cwd=checkout, timeout=timeout)
+        if rc != 0:
+            raise PresyncError(
+                f"pre-sync of {repo_name!r} failed (rc={rc}) running {' '.join(command)} in {checkout}: "
+                f"{stderr.strip() or '<no stderr>'}"
+            )
+
+
+def _run_presync_if_enabled() -> int | None:
+    """Pre-sync every configured target repo at ``cmd_start``, when enabled (#016).
+
+    Resolves the config-driven enablement / command / timeout (env > YAML >
+    default) and provisions each configured repo's environment via
+    :func:`_presync_target_environments`. A no-op (returns ``None``) when the
+    feature is disabled or no repos are configured.
+
+    Returns:
+        ``None`` on success or when disabled (``cmd_start`` proceeds), or rc=1
+        when a provisioning failure (:class:`PresyncError`) is raised -- the
+        caller returns that rc so the run fails fast at start with an actionable
+        message rather than carrying a broken env into the orchestrate loop.
+    """
+    if not _resolve_presync_environment():
+        return None
+    repos = RUNTIME_CONFIG.repos
+    if not repos:
+        return None
+    try:
+        _presync_target_environments(
+            repos,
+            command=_resolve_presync_command(),
+            runner=run_command,
+            timeout=_resolve_presync_timeout_seconds(),
+        )
+    except PresyncError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        logger.error("[ORCHESTRATOR_PRESYNC_FAILED] %s", exc)
+        return 1
+    return None
 
 
 def _resolve_max_quota_resumes() -> int:

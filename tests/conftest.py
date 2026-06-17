@@ -27,6 +27,21 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 _WORKSPACE_ROOT = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
 
 
+@pytest.fixture(autouse=True)
+def _disable_target_presync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable start-time target-env pre-sync for the whole test suite (TDI #016).
+
+    The pre-sync gate (``orchestrate.presync_environment``, default ON) runs the
+    provisioning command (``uv sync``) in every configured repo checkout at
+    ``devbench start``. In tests the configured repos are fixtures with no real
+    checkout / no ``uv`` on PATH, so the real gate would fail every ``cmd_start``
+    drive. Default it OFF here so the orchestrate-loop tests exercise the loop,
+    not the warm-up. The dedicated pre-sync tests override this env explicitly
+    (or drive the helper directly) to assert the on-behaviour.
+    """
+    monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT", "off")
+
+
 @pytest.fixture
 def tmp_work_unit_file(tmp_path: Path) -> Path:
     """Create a temporary .md file with valid work-unit format."""

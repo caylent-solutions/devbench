@@ -691,6 +691,19 @@ class OrchestrateConfig:
     operator attention (``[ORCHESTRATOR_STOP_REASON] reason=too many
     non-converging claims (K)``). ``None`` falls through to the constants.py
     default (3) resolved by ``config.py`` (env > YAML > default).
+
+    ``presync_environment`` / ``presync_command`` / ``presync_timeout_seconds``
+    govern the start-time warm-up of each configured target repo's dependency
+    environment (TDI #016). When ``presync_environment`` is ``True`` (the
+    default) ``devbench start`` runs ``presync_command`` (default ``["uv",
+    "sync"]``) once in every configured repo's checkout BEFORE the orchestrate
+    loop claims any work, so no claim ever pays the cold-dependency-sync cost
+    inside a timed test attempt (which would otherwise be recorded as a test
+    failure and trip the within-claim convergence bound). ``presync_command``
+    is the provisioning argv (a non-empty list of non-empty strings) and
+    ``presync_timeout_seconds`` bounds it per repo. ``None`` for each falls
+    through to the constants.py defaults resolved by ``config.py``
+    (env > YAML > default).
     """
 
     max_cascade_depth: int | None = None
@@ -701,6 +714,9 @@ class OrchestrateConfig:
     max_claim_wall_clock_seconds: float | None = None
     max_no_claim_activity_seconds: float | None = None
     max_non_converging_claims: int | None = None
+    presync_environment: bool | None = None
+    presync_command: list[str] | None = None
+    presync_timeout_seconds: int | None = None
 
 
 def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bool) -> OrchestrateConfig:
@@ -769,6 +785,17 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
             f"Config file '{path}': orchestrate.max_non_converging_claims must be >= 1; "
             f"got {max_non_converging_claims!r}."
         )
+    presync_environment = (
+        bool(orchestrate_raw["presync_environment"]) if "presync_environment" in orchestrate_raw else None
+    )
+    presync_command = _parse_presync_command(path, orchestrate_raw)
+    presync_timeout_seconds = (
+        int(orchestrate_raw["presync_timeout_seconds"]) if "presync_timeout_seconds" in orchestrate_raw else None
+    )
+    if presync_timeout_seconds is not None and presync_timeout_seconds < 1:
+        raise ValueError(
+            f"Config file '{path}': orchestrate.presync_timeout_seconds must be >= 1; got {presync_timeout_seconds!r}."
+        )
     return OrchestrateConfig(
         max_cascade_depth=max_cascade_depth,
         model=model,
@@ -778,7 +805,29 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
         max_claim_wall_clock_seconds=max_claim_wall_clock_seconds,
         max_no_claim_activity_seconds=max_no_claim_activity_seconds,
         max_non_converging_claims=max_non_converging_claims,
+        presync_environment=presync_environment,
+        presync_command=presync_command,
+        presync_timeout_seconds=presync_timeout_seconds,
     )
+
+
+def _parse_presync_command(path: Path, orchestrate_raw: dict) -> list[str] | None:
+    """Parse + validate ``orchestrate.presync_command`` (TDI #016).
+
+    The command must be a non-empty YAML list of non-empty strings (the argv of
+    the per-repo provisioning command, e.g. ``["uv", "sync"]``). Absent -> None,
+    which the resolver falls through to the constants default. Fails fast with an
+    actionable message on a malformed value rather than silently coercing it.
+    """
+    if "presync_command" not in orchestrate_raw:
+        return None
+    raw = orchestrate_raw["presync_command"]
+    if not isinstance(raw, list) or not raw or not all(isinstance(tok, str) and tok.strip() for tok in raw):
+        raise ValueError(
+            f"Config file '{path}': orchestrate.presync_command must be a non-empty list of "
+            f"non-empty strings (the provisioning command argv); got {raw!r}."
+        )
+    return [str(tok) for tok in raw]
 
 
 @dataclass

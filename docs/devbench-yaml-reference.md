@@ -271,6 +271,9 @@ orchestrate:
   max_claim_wall_clock_seconds: 21600  # 6h backstop; 0 disables
   max_no_claim_activity_seconds: 600   # inter-claim stall backstop (10m); 0 disables
   max_non_converging_claims: 3         # aggregate block-and-continue safety valve
+  presync_environment: true            # warm each repo's deps once at start (TDI #016)
+  presync_command: [uv, sync]          # per-repo provisioning command argv
+  presync_timeout_seconds: 900         # per-repo pre-sync timeout (15m)
 ```
 
 **`model`** is the model the top-level orchestrate SDK session runs on when devbench launches it non-interactively (`devbench start` / `--daemon`). devbench passes it into `ClaudeAgentOptions(model=...)`, so the session is **pinned** to this value and can never inherit the interactive Claude Code (`~/.claude/settings.json`) model. It is **required** for `devbench start` and has **no fallback** (not to `DEVBENCH_CLAUDE_MODEL`, not to the CLI settings) -- the orchestrator-launch path fails fast with an actionable error when it is unset. Short name (`opus` | `sonnet`) or a full Anthropic id when `use_bedrock: false`; a Bedrock ARN when `true`. Haiku is rejected (#198).
@@ -294,6 +297,19 @@ A single in-progress claim that repeats the SAME unresolvable AC-verify / TDD-RE
 **Block-and-continue.** A non-converging claim is BLOCKED and the orchestrate session **continues to its next in-queue unit in scope** -- one bad module no longer abandons the rest of a session's scope, and a multi-session sweep no longer loses a whole session to its first defective module. The session keeps accumulating both completions and blocks in one pass and only stops when there is genuinely nothing actionable left (the normal `NO_ACTIONABLE` / `ALL_DONE` termination).
 
 `max_non_converging_claims` is the aggregate safety valve so a systemically-broken run still halts for the operator: the session stops once **K distinct units** have each hit the convergence bound in the same session, emitting `[ORCHESTRATOR_STOP_REASON] reason=too many non-converging claims (K)`. (Resolution order for all four keys is env > YAML > the `constants.py` default.)
+
+**Cold-environment robustness (#016).** Two mechanisms keep a cold target-repo dependency environment from being misread as a non-converging unit:
+
+1. **Start-time pre-sync.** A COLD `uv` environment makes the FIRST `uv run pytest ...` in a checkout spend minutes syncing dependencies from `uv.lock`; if that exceeds the per-attempt test timeout the attempt is recorded as a test failure and can falsely trip the convergence bound. When `presync_environment` is on (the default), `devbench start` runs `presync_command` once in **each configured repo** checkout BEFORE the orchestrate loop claims any work, so no claim ever pays the cold-sync cost inside a timed attempt. `uv sync` is idempotent and fast on a warm env, so the warm-up is a no-op-fast there. A real provisioning failure (non-zero exit) fails the start fast with an actionable message instead of surfacing silently mid-run.
+2. **Timeout exemption in the convergence tracker.** A run KILLED by its per-attempt timeout is a non-deterministic provisioning/infra failure, not the "same deterministic test failure". The tracker recognises a kill-by-timeout result and does NOT count it toward `[CLAIM_NOT_CONVERGING]` the way a real assertion/collection failure is counted, so a transient cold-sync timeout cannot trip the bound on its own. A genuine repeated deterministic failure still trips it normally.
+
+| Key | Env override | Default | Meaning |
+|---|---|---|---|
+| `presync_environment` | `DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT` | `true` | Whether `devbench start` pre-syncs each configured repo before the orchestrate loop. |
+| `presync_command` | `DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND` (whitespace-tokenised) | `[uv, sync]` | Per-repo provisioning command argv run once at start. |
+| `presync_timeout_seconds` | `DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS` | `900` | Per-repo pre-sync timeout in seconds (>= 1). |
+
+The set of kill-by-timeout result markers the tracker matches (case-insensitive substrings) defaults to `timed out after` / `command timed out` and is overridable via the comma-separated `DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS`.
 
 ---
 

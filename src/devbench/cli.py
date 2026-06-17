@@ -14154,16 +14154,38 @@ def cmd_add_dep(*argv: str) -> int:
     return 0
 
 
-def _parse_dep_edge_argv(argv: tuple[str, ...], verb: str) -> tuple[str | None, str, str]:
+# A leaf Task id: every hierarchy segment present.
+_DEP_EDGE_TASK_ID_RE: re.Pattern[str] = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+# A canonical work-unit id of any level: Epic, Feature, Story, or Task. Used as
+# the blocker shape for ``remove-dep`` so an operator can cut a CONTAINER
+# dependency edge (TDI-001). ``add-dep`` keeps the strict Task-only shape so it
+# can never wire a new self-ancestor / container edge in the first place.
+_DEP_EDGE_CANONICAL_ID_RE: re.Pattern[str] = re.compile(r"^E\d+(-F\d+)?(-S\d+)?(-T\d+)?$")
+
+
+def _parse_dep_edge_argv(
+    argv: tuple[str, ...],
+    verb: str,
+    *,
+    allow_container_blocker: bool = False,
+) -> tuple[str | None, str, str]:
     """Parse the shared ``<blocked-id> <blocker-id> [--reason <msg>]`` grammar.
 
     Used by both ``add-dep`` and ``remove-dep`` (their CLI grammar is identical).
     ``verb`` only feeds the error messages so each command names itself.
 
+    The ``blocked`` operand (the depending unit whose ``## Dependencies`` table
+    is edited) must always be a leaf Task. The ``blocker`` operand (the
+    dependency being wired or cut) is a leaf Task by default; when
+    ``allow_container_blocker`` is ``True`` it may instead be any canonical
+    work-unit id (Epic / Feature / Story / Task) so ``remove-dep`` can cut a
+    non-Task dependency edge an author wrote by hand (TDI-001). ``add-dep`` never
+    enables this: wiring a new container edge would re-introduce the
+    self-ancestor self-block the validator now rejects.
+
     Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
     after printing a usage error to stderr so the caller can ``return 1``.
     """
-    task_id_re = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
     positional: list[str] = []
     reason = ""
     i = 0
@@ -14192,10 +14214,15 @@ def _parse_dep_edge_argv(argv: tuple[str, ...], verb: str) -> tuple[str | None, 
         )
         return None, "", ""
     blocked_id, blocker_id = positional
-    for label, tid in (("blocked", blocked_id), ("blocker", blocker_id)):
-        if not task_id_re.match(tid):
+    blocker_re = _DEP_EDGE_CANONICAL_ID_RE if allow_container_blocker else _DEP_EDGE_TASK_ID_RE
+    blocker_shape = "E<N>[-F<N>][-S<N>][-T<N>]" if allow_container_blocker else "E<N>-F<N>-S<N>-T<N>"
+    for label, tid, pattern, shape in (
+        ("blocked", blocked_id, _DEP_EDGE_TASK_ID_RE, "E<N>-F<N>-S<N>-T<N>"),
+        ("blocker", blocker_id, blocker_re, blocker_shape),
+    ):
+        if not pattern.match(tid):
             print(
-                f"ERROR: {verb}: {label} task id '{tid}' does not match E<N>-F<N>-S<N>-T<N> format",
+                f"ERROR: {verb}: {label} task id '{tid}' does not match {shape} format",
                 file=sys.stderr,
             )
             return None, "", ""
@@ -14235,7 +14262,7 @@ def cmd_remove_dep(*argv: str) -> int:
     actually removed on this call; ``removed: false`` means there was no such
     dependency and nothing was written.
     """
-    blocked_task_id, blocker_task_id, reason = _parse_dep_edge_argv(argv, "remove-dep")
+    blocked_task_id, blocker_task_id, reason = _parse_dep_edge_argv(argv, "remove-dep", allow_container_blocker=True)
     if blocked_task_id is None:
         return 1
 

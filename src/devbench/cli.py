@@ -9976,6 +9976,73 @@ def _supervise_wait_for_terminal(
         _gate(timeout_seconds - elapsed)
 
 
+def _supervise_wait_for_running(
+    *,
+    name: str,
+    registry: SuperviseRegistry,
+    launch_began_at: datetime,
+    timeout_seconds: int,
+    _gate: Callable[[float], None] | None = None,
+    _now: Callable[[], float] | None = None,
+) -> "SuperviseSessionState | str | None":
+    """Wait (event-driven, bounded) for the NEW daemon to reach ``running``.
+
+    ``supervise start`` launches the in-screen ``__run`` daemon asynchronously via
+    ``screen -dmS`` and the daemon writes its own registry record only once it
+    comes up. Reading the registry immediately after launch therefore returns the
+    STALE prior record (a ``stopped`` / ``faulted`` leftover from an earlier run),
+    which must NEVER be reported as the launch result (tracked issue:
+    supervise-start-returns-early-prints-stale-record).
+
+    This distinguishes the NEW record from the stale one by ``started_at``: only a
+    record written at or after *launch_began_at* belongs to this launch. It polls
+    until that fresh record reaches:
+
+    - ``running`` -> returns the :class:`SuperviseSessionState` (success), or
+    - ``faulted`` -> returns the fault ``exit_reason`` string (fail-fast), or
+    - the *timeout_seconds* budget elapses with no fresh record reaching either
+      -> returns ``None`` (the caller fails fast with a timeout diagnostic).
+
+    The wait is event-driven (a bounded ``select`` park between reads, the same
+    mechanism as :func:`_supervise_wait_for_terminal`), not a ``time.sleep``
+    busy-loop, and is bounded by a configurable timeout (``ready_prompt_seconds``).
+
+    Args:
+        name: The supervise session name.
+        registry: The :class:`SuperviseRegistry` to poll.
+        launch_began_at: UTC timestamp captured just before the launch; the
+            discriminator between the new record and any stale prior one.
+        timeout_seconds: Readiness budget; on expiry returns ``None``.
+        _gate: Test seam for the per-iteration bounded park.
+        _now: Test seam for the monotonic clock.
+
+    Returns:
+        The running :class:`SuperviseSessionState` on success, the fault reason
+        string on a startup fault, or ``None`` on timeout.
+    """
+    now = _now if _now is not None else time.monotonic
+    if _gate is None:
+        poll_interval = _supervise_runtime_config().timeouts.poll_interval_seconds
+
+        def _gate(_remaining: float) -> None:
+            _block_until_readable(poll_interval_seconds=min(float(poll_interval), max(_remaining, 0.0)))
+
+    start = now()
+    while True:
+        state = registry.read_state(name)
+        # Only a record written at/after the launch belongs to THIS daemon; a
+        # stale prior record (older started_at) is ignored entirely.
+        if state is not None and state.started_at >= launch_began_at:
+            if state.state == SUPERVISE_STATE_RUNNING:
+                return state
+            if state.state == SUPERVISE_STATE_FAULTED:
+                return state.exit_reason or "startup fault"
+        elapsed = now() - start
+        if elapsed >= timeout_seconds:
+            return None
+        _gate(timeout_seconds - elapsed)
+
+
 def _supervise_launch_screen(
     *,
     name: str,
@@ -10184,6 +10251,12 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
     cfg = _supervise_runtime_config()
 
     registry = SuperviseRegistry(WORKSPACE_ROOT)
+    # Capture the launch instant BEFORE the (asynchronous) screen launch so the
+    # readiness wait can tell the NEW daemon's record (started_at >= this) apart
+    # from any stale prior record. The screen daemon writes its own record only
+    # once it comes up, so reading the registry immediately after launch would
+    # otherwise surface a stopped/faulted leftover from an earlier run.
+    launch_began_at = datetime.now(UTC)
     try:
         launch_rc = _supervise_start_under_flock(
             parsed, registry=registry, model=model, billing_mode=billing_mode, screen_path=screen_path, cfg=cfg
@@ -10194,18 +10267,32 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
     if launch_rc != 0:
         return launch_rc
 
-    # Confirm __run reached state=running via the registry (Section 4.1 step 4).
-    state = registry.read_state(parsed.name)
-    if state is None or state.state == SUPERVISE_STATE_FAULTED:
-        reason = state.exit_reason if state is not None else "no registry record"
+    # Wait (event-driven, bounded by the configurable ready-prompt timeout) for
+    # the NEW daemon to reach running (Section 4.1 step 4). Never report the
+    # stale prior record (tracked issue: supervise-start-returns-early).
+    outcome = _supervise_wait_for_running(
+        name=parsed.name,
+        registry=registry,
+        launch_began_at=launch_began_at,
+        timeout_seconds=cfg.timeouts.ready_prompt_seconds,
+    )
+    if outcome is None:
         print(
-            f"ERROR: supervise session {parsed.name!r} failed to reach running ({reason}).",
+            f"ERROR: supervise session {parsed.name!r} did not reach running within "
+            f"{cfg.timeouts.ready_prompt_seconds}s; check 'supervise status --name {parsed.name}' "
+            "and the session pty.log for the startup fault.",
+            file=sys.stderr,
+        )
+        return 1
+    if isinstance(outcome, str):
+        print(
+            f"ERROR: supervise session {parsed.name!r} faulted during startup ({outcome}).",
             file=sys.stderr,
         )
         return 1
     print(
-        f"[supervise] state={state.state} pid={state.pid} screen={state.screen_name} "
-        f"claude-session={state.claude_session_id}",
+        f"[supervise] state={outcome.state} pid={outcome.pid} screen={outcome.screen_name} "
+        f"claude-session={outcome.claude_session_id}",
     )
     return 0
 

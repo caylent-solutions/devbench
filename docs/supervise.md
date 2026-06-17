@@ -149,6 +149,17 @@ transitions the session to `running`. Exits 0 only once the session reaches
 `state=running`; exit 2 on a preflight/argument failure; a non-zero classified
 code on a launch fault.
 
+The screen daemon comes up asynchronously and writes its own registry record only
+once it is up, so `start` does not return until it has confirmed the launch
+outcome: it waits (event-driven, bounded by `supervise.timeouts.ready_prompt_seconds`)
+for a **fresh** record -- one written at or after the launch began -- to reach
+`running`, and prints THAT record (the new pid). A pre-existing `stopped`/`faulted`
+record from an earlier run with the same name is never surfaced as the launch
+result (it has an older `started_at` and is ignored by the wait). If the new daemon
+faults during startup, `start` exits non-zero with the fault reason; if it does not
+reach `running` within the timeout, `start` exits 1 with a diagnostic pointing at
+`supervise status` and the session `pty.log`.
+
 ```bash
 $ uv run devbench supervise start --name nightly
 [supervise] preflight: screen 4.09.01 found

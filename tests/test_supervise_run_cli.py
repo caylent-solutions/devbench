@@ -238,12 +238,24 @@ class TestStartRunningConfirmation:
     def test_no_registry_record_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         creds = self._creds(tmp_path)
         patches = self._common(tmp_path, creds)
-        # The launch is a no-op (no registry record written) -> start reports failure.
+        # The launch is a no-op (no registry record written): the new daemon never
+        # reaches running, so the bounded readiness wait times out and start fails
+        # fast (tracked issue: supervise-start-returns-early-prints-stale-record).
         patches.append(patch("devbench.cli._supervise_launch_screen", MagicMock(return_value=0)))
+        # Drive the monotonic clock so the bounded wait exhausts immediately and
+        # _block_until_readable is a no-op (no real park / sleep in the test).
+        clock = {"t": 0.0}
+
+        def _now() -> float:
+            clock["t"] += 1000.0
+            return clock["t"]
+
+        patches.append(patch("devbench.cli._block_until_readable", lambda **kw: None))
+        patches.append(patch("devbench.cli.time.monotonic", _now))
         with _ctx(patches), patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
             rc = cli.cmd_supervise("start", "--name", "ghost")
         assert rc == 1
-        assert "failed to reach running" in capsys.readouterr().err
+        assert "did not reach running" in capsys.readouterr().err
 
     def test_already_running_returns_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         from devbench.constants import SUPERVISE_STATE_RUNNING

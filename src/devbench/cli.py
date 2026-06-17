@@ -12366,6 +12366,73 @@ def _kill_sigterm(pid: int, session_name: str) -> str:
     return ""
 
 
+#: Exit code for a daemon-control verb refused by the caller-role gate (TDI-004).
+#: Distinct from the argument-parse error (2) and the runtime-delivery error (1)
+#: so callers and tests can tell an authorisation refusal apart from a bad flag.
+DAEMON_CONTROL_REFUSED_RC: int = 3
+
+
+def _is_daemon_control_authorized() -> bool:
+    """Return whether the caller may invoke a devbench daemon-control verb (TDI-004).
+
+    The validated defect: an executor sub-agent (a non-interactive Claude Agent
+    SDK subprocess) ran ``devbench stop --session <name>`` and SIGTERMed its OWN
+    orchestrator, halting the entire run. The executor carries no
+    ``DEVBENCH_AGENT_ROLE=orchestrator`` indicator (the same env mechanism
+    ``guard-work-unit-write.sh`` already keys on) and runs with no controlling
+    TTY.
+
+    Authorisation rule (defense-in-depth behind ``guard-bash.sh``), evaluated
+    in order:
+
+    - ``DEVBENCH_AGENT_ROLE=executor`` -> REFUSED. The caller positively declares
+      itself a work-unit worker; a worker is never authorised, even at a TTY.
+    - ``DEVBENCH_AGENT_ROLE=orchestrator`` -> AUTHORIZED. The orchestrator's own
+      lifecycle management is legitimate.
+    - An interactive caller (``stdin`` is a TTY) -> AUTHORIZED. An operator at a
+      terminal may stop/drain/restart a session directly.
+    - Otherwise (non-interactive AND no orchestrator role -- the executor
+      sub-agent case, which inherits no role indicator) -> REFUSED.
+
+    Returns:
+        ``True`` when the caller is authorised; ``False`` otherwise.
+    """
+    role = os.environ.get("DEVBENCH_AGENT_ROLE", "").strip()
+    if role == "executor":
+        return False
+    if role == "orchestrator":
+        return True
+    try:
+        return bool(sys.stdin.isatty())
+    except (OSError, ValueError):
+        # A closed/detached stdin is the non-interactive (automated) case.
+        return False
+
+
+def _refuse_daemon_control(verb: str) -> int:
+    """Print the TDI-004 refusal diagnostic for *verb* and return the refusal rc.
+
+    Args:
+        verb: The daemon-control verb being refused (e.g. ``"stop"``).
+
+    Returns:
+        :data:`DAEMON_CONTROL_REFUSED_RC` so the caller can ``return`` it directly.
+    """
+    print(
+        (
+            f"ERROR: 'devbench {verb}' is a daemon-control verb and is refused from this context "
+            "(TDI-004). A work-unit worker must never control the orchestrator's lifecycle -- "
+            f"'devbench {verb}' would stop or restart the orchestrator running you, halting ALL "
+            "work, not just your unit. If the repo state is confusing, escalate: log a comment "
+            "and BLOCK your own unit; never stop the daemon. Authorised callers are the "
+            "orchestrator itself (DEVBENCH_AGENT_ROLE=orchestrator) or an interactive operator "
+            "at a terminal."
+        ),
+        file=sys.stderr,
+    )
+    return DAEMON_CONTROL_REFUSED_RC
+
+
 def cmd_stop(*argv: str) -> int:
     """Send SIGTERM to a named session's orchestrator process (spec section 4.4.5, issue #192).
 
@@ -12378,22 +12445,36 @@ def cmd_stop(*argv: str) -> int:
     catches the signal, forces any in-flight work unit to ``blocked`` with a
     ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit comment, then exits rc=0.
 
+    Caller-role gate (TDI-004): ``stop`` is a daemon-control verb. It is refused
+    when invoked by a non-interactive caller that is NOT the orchestrator -- the
+    executor-sub-agent case that was observed SIGTERMing its own orchestrator.
+    Authorised callers are the orchestrator itself
+    (``DEVBENCH_AGENT_ROLE=orchestrator``) or an interactive operator at a TTY.
+    See :func:`_is_daemon_control_authorized`. This is defense-in-depth behind
+    the deterministic ``guard-bash.sh`` daemon-control block.
+
     Exit codes:
 
     - 0 on success (SIGTERM delivered).
     - 1 when the session does not exist, the PID file is absent or malformed, or
       the signal cannot be delivered (ESRCH, EPERM, or other OS error).
     - 2 on invalid arguments (missing or unknown flags).
+    - 3 when the caller-role gate refuses (TDI-004): see
+      :data:`DAEMON_CONTROL_REFUSED_RC`.
 
     Args:
         *argv: CLI flags as individual strings (``--session <name>``).
 
     Returns:
-        0 on success; 1 on runtime error; 2 on argument parse error.
+        0 on success; 1 on runtime error; 2 on argument parse error; 3 when the
+        daemon-control caller-role gate refuses.
 
     Raises:
         Nothing -- all errors are reported to stderr and returned as exit codes.
     """
+    if not _is_daemon_control_authorized():
+        return _refuse_daemon_control("stop")
+
     session_name, error_rc, error_msg = _parse_stop_argv(argv)
     if error_rc != 0:
         print(error_msg, file=sys.stderr)

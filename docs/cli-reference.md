@@ -865,6 +865,8 @@ uv run devbench stop --session <name>
 
 Send SIGTERM to a running session's orchestrator process, forcing it to exit after the in-flight work unit is marked `blocked`. The SIGTERM is delivered via the session's `pid` file located at `<workspace>/.devbench/sessions/<name>/pid`.
 
+`stop` is a **daemon-control verb** and carries a caller-role gate (TDI-004): it is refused (rc=3) for a work-unit worker -- a non-interactive caller that is not the orchestrator. A worker must never stop its own orchestrator (doing so halts ALL work, not just the worker's unit); it escalates a confusing state by BLOCKing its own unit instead. Authorised callers are the orchestrator itself (`DEVBENCH_AGENT_ROLE=orchestrator`) or an interactive operator at a terminal. This complements the deterministic `guard-bash.sh` Bash-level block on all daemon-control verbs.
+
 **What happens when stop runs:**
 
 1. `devbench stop` reads the session's `pid` file.
@@ -885,6 +887,7 @@ Send SIGTERM to a running session's orchestrator process, forcing it to exit aft
 | PID file missing or unreadable. | 1 |
 | Process already exited (stale session). | 1 (with actionable message; run `devbench sessions --cleanup`). |
 | `--session` flag omitted. | 2 (argument-parse error). |
+| Daemon-control caller-role gate refused (worker context: non-interactive and not `DEVBENCH_AGENT_ROLE=orchestrator`). | 3 (TDI-004). |
 
 **Worked example:**
 

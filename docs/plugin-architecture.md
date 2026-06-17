@@ -45,7 +45,10 @@ plugin/devbench-orchestrate/
 │   └── hooks.json               ← hook registrations (PreToolUse, PostToolUse)
 └── scripts/
     ├── hook-logger.sh           ← logs every tool call to the hook log
-    ├── guard-bash.sh            ← blocks dangerous Bash commands
+    ├── guard-bash.sh            ← blocks dangerous Bash commands (rm -rf, force-push, hard-reset, ...)
+    │                              AND devbench daemon-control verbs (stop/start/drain/restart,
+    │                              sessions --cleanup) so a work-unit worker cannot stop its own
+    │                              orchestrator (TDI-004)
     ├── guard-backlog.sh         ← blocks direct Bash writes to backlog/ tracking files
     ├── guard-verdict-format.sh  ← validates log-verdict argument format
     ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the work unit's Changes Manifest
@@ -196,6 +199,8 @@ The Write/Edit matchers run `guard-plugin-write.sh` first -- the "guard the guar
 `guard-harness-write.sh` runs next -- the "guard the HARNESS" hook (ADR-30). The orchestrate session runs devbench from an editable source checkout, so the harness's own Python package is writable from inside the session; an autonomous session once self-patched `src/devbench/cli.py` mid-run, unreviewed and with no audit marker. This hook hard-denies (exit 2, **no role bypass** -- not even `DEVBENCH_AGENT_ROLE=orchestrator`) any Write/Edit whose target resolves under the devbench repo's protected harness surface: the package source tree (`src/devbench/**`), the package test tree (`tests/**`), `pyproject.toml`, the dependency lockfile, and the `Makefile`. The devbench repo root is resolved **generically** -- the script walks up from its own real location (resolving the shadow plugin's symlink back to canonical) to the directory holding both `src/devbench` and `pyproject.toml` -- so a target repo that merely contains a `src/devbench/`-shaped tree is never wrongly blocked. Every denial emits the deterministic `[HARNESS_SELF_EDIT_BLOCKED]` marker plus the sanctioned alternative: **the orchestrate role is forbidden from editing the harness** -- a harness bug must be surfaced by BLOCKing the unit and recording a `tracked-devbench-issues/*.md` for the operator to resolve at a stop-window, never self-patched.
 
 Complementing the runtime hook, `devbench start` runs a startup **harness-integrity check** (`orchestrate.harness_integrity_check`: `off` / `warn` (default) / `fail`). Before any SDK subprocess is spawned it compares the devbench checkout against committed git state and, on uncommitted edits under `src/devbench/**` (the signature of a prior self-edit or unreviewed manual change), emits a loud `[HARNESS_INTEGRITY]` warning (or fails fast under `fail`). This catches drift that pre-dates the run; the hook prevents new drift during it.
+
+The Bash matcher's `guard-bash.sh` also denies (exit 2) **devbench daemon-control verbs** -- `devbench stop` / `start` / `drain` / `restart` and `devbench sessions --cleanup` (matched on a `devbench <verb>` word boundary, so `stop-instance` and the read-only `devbench sessions` are not affected). An executor sub-agent has unrestricted Bash and was once observed running `uv run devbench stop --session <name>`, which SIGTERMs its OWN orchestrator and halts the entire run -- not just the one unit the worker was assigned (TDI-004). A work-unit worker must never control the daemon lifecycle: a confusing repo state is escalated by logging a comment and BLOCKing its own unit, never by stopping the orchestrator. As defense-in-depth behind this deterministic block, `cmd_stop` in `cli.py` also carries a **caller-role gate**: `devbench stop` is refused (rc=3) unless the caller is the orchestrator itself (`DEVBENCH_AGENT_ROLE=orchestrator`) or an interactive operator at a TTY -- the non-interactive, non-orchestrator executor context is refused with an actionable diagnostic.
 
 ### The Stop hook circuit breaker
 

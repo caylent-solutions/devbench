@@ -557,7 +557,7 @@ DevBench registers hooks for Claude Code events via `plugin/devbench-orchestrate
 
 | Hook event | Matcher | Script(s) | Purpose |
 | --- | --- | --- | --- |
-| `PreToolUse` | `Bash` | `hook-logger.sh`, `guard-bash.sh`, `guard-verdict-format.sh`, `guard-comment-format.sh`, `guard-git-stage.sh`, `guard-destructive-git.sh`, `guard-review-supervisor-scope.sh` | Audit log + block destructive bash + validate verdict format + block control-language comments + require git stage before commit + block destructive git + scope the (deprecated) review-supervisor |
+| `PreToolUse` | `Bash` | `hook-logger.sh`, `guard-bash.sh`, `guard-verdict-format.sh`, `guard-comment-format.sh`, `guard-git-stage.sh`, `guard-destructive-git.sh`, `guard-review-supervisor-scope.sh` | Audit log + block destructive bash + block devbench daemon-control verbs (`stop`/`start`/`drain`/`restart`, `sessions --cleanup`) so a worker cannot stop its own orchestrator (TDI-004) + validate verdict format + block control-language comments + require git stage before commit + block destructive git + scope the (deprecated) review-supervisor |
 | `PreToolUse` | `Write` | `guard-plugin-write.sh`, `guard-work-unit-write.sh` | Self-protection (hard-deny Write to plugin scripts/hooks, plugin-shadow, `.claude/settings*.json`, the `$BASH_ENV` target -- no role bypass) + block direct edits to work-unit markdown files (only orchestrate skill should modify them) |
 | `PreToolUse` | `Edit` | `guard-plugin-write.sh`, `guard-work-unit-write.sh` | Same |
 | `PreToolUse` | `.*` | `hook-logger.sh` | Catch-all audit log |
@@ -602,6 +602,8 @@ Protected target categories (a match in any one is an exit-2 block):
 | `$BASH_ENV` env-injection vector | the file named by `$BASH_ENV` (when set), compared as absolute paths -- editing it injects arbitrary code into every non-interactive bash subprocess |
 
 `guard-bash.sh` carries defense-in-depth deny patterns for the same paths so the protection cannot be sidestepped via a Bash mutation (`sed -i`, `tee`, output redirection) instead of a Write/Edit tool call.
+
+`guard-bash.sh` additionally denies (exit 2) **devbench daemon-control verbs** -- `devbench stop` / `start` / `drain` / `restart` and `devbench sessions --cleanup` (matched on a `devbench <verb>` word boundary; `stop-instance` and read-only `devbench sessions` are unaffected). An executor sub-agent with unrestricted Bash was observed running `uv run devbench stop --session <name>`, SIGTERMing its own orchestrator and halting the whole run (TDI-004). A worker must never control the daemon lifecycle; it escalates a confusing state by BLOCKing its own unit, never by stopping the orchestrator. Behind this deterministic block, `cmd_stop` adds a caller-role gate: `devbench stop` is refused (rc=3) unless `DEVBENCH_AGENT_ROLE=orchestrator` is set or the caller is interactive (stdin is a TTY) -- the non-interactive executor context is refused.
 
 ### The Stop hook circuit breaker (the headline reliability feature)
 

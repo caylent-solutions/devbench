@@ -43,6 +43,35 @@ for pattern in "${BLOCKED_PATTERNS[@]}"; do
   fi
 done
 
+# Daemon-control verbs (TDI-004): deterministically DENY any Bash command that
+# invokes a devbench daemon-control verb. An executor sub-agent has unrestricted
+# Bash and was observed running `uv run devbench stop --session <name>`, which
+# SIGTERMs its OWN orchestrator and halts the entire run -- not just the one
+# unit the executor was assigned. A worker must never control the daemon's
+# lifecycle; a confusing repo state is escalated by BLOCKing its own unit, never
+# by stopping the orchestrator.
+#
+# Matched (word-boundary `devbench <verb>`, so `stop-instance` is NOT matched):
+#   devbench stop | start | drain | restart        -> always blocked
+#   devbench sessions --cleanup                     -> blocked (mutating);
+#                                                      `devbench sessions` (list) is allowed
+# This is the first layer of a defense-in-depth fix; cmd_stop in cli.py carries
+# a caller-role gate as the second layer.
+DAEMON_CONTROL_VERB_RE='(^|[^[:alnum:]_-])devbench[[:space:]]+(stop|start|drain|restart)([^[:alnum:]_-]|$)'
+DAEMON_CONTROL_SESSIONS_RE='(^|[^[:alnum:]_-])devbench[[:space:]]+sessions([[:space:]]|$)'
+
+if [[ "$COMMAND" =~ $DAEMON_CONTROL_VERB_RE ]] ||
+  { [[ "$COMMAND" =~ $DAEMON_CONTROL_SESSIONS_RE ]] && [[ "$COMMAND" == *"--cleanup"* ]]; }; then
+  echo "guard-bash: blocked devbench daemon-control command (TDI-004)" >&2
+  echo "Command: ${COMMAND}" >&2
+  echo "Reason: a work-unit worker must never control the orchestrator's lifecycle." >&2
+  echo "  'devbench stop/start/drain/restart' and 'devbench sessions --cleanup' send signals to," >&2
+  echo "  or tear down, the orchestrator that is running you -- stopping ALL work, not just your unit." >&2
+  echo "Fix: if the repo state is confusing, escalate -- log a comment and BLOCK your own unit." >&2
+  echo "  Never stop the daemon. Daemon lifecycle is the operator's job, not a worker's." >&2
+  exit 2
+fi
+
 # Defense-in-depth atop guard-plugin-write.sh: that hook only fires for the
 # Write / Edit tools, so an agent could route around it by mutating a
 # protected file via a Bash command (sed -i, tee, or shell output

@@ -12,6 +12,8 @@ Work unit and repo context:
 
 > **Issue #160 reminder.** Executor-tier writes to `backlog/**/*.md` are BLOCKED by `guard-work-unit-write.sh`. Work-unit files are managed exclusively by the orchestrate skill and the devbench CLI. The orchestrator-tier bypass introduced by ADR-15 (`DEVBENCH_AGENT_ROLE=orchestrator`) does NOT extend to executor agents -- the executor subprocess inherits no role indicator and the hook defaults to BLOCK on missing role.
 
+> **TDI-004 reminder.** You must NEVER control the orchestrator's lifecycle. `devbench stop` / `start` / `drain` / `restart` and `devbench sessions --cleanup` are daemon-control verbs: running any of them stops or restarts the orchestrator that is running you, halting ALL work, not just your unit. `guard-bash.sh` BLOCKs them deterministically and `cmd_stop` refuses them from your context. If you hit a confusing repo state, the only correct response is to ESCALATE -- log a comment and BLOCK your own unit. Never "stop the daemon to investigate."
+
 ---
 
 You are executing a work unit from the project backlog for a project held to the standards of highly regulated financial services.

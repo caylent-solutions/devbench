@@ -2560,6 +2560,7 @@ def run_supervise_event_loop(
     stop_poll: Callable[[], bool] | None = None,
     state_machine: SupervisorStateMachine | None = None,
     on_quota_wait: Callable[[datetime | None, int], None] | None = None,
+    on_activity: Callable[[], None] | None = None,
     progress_poll: Callable[[], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> EventLoopResult:
@@ -2616,6 +2617,15 @@ def run_supervise_event_loop(
             ``supervise status`` from another process surfaces ``quota-waiting``
             with the expected resume time (FR-10, FR-16). ``None`` skips persistence
             (the SDK-style in-process callers do not need mid-wait status).
+        on_activity: Optional callback invoked when the loop observes ONGOING
+            working activity during ``running`` -- a non-terminal PTY read or a
+            non-actionable (advisory) running-phase log-tail hit. Production wires
+            it to refresh the registry ``last_activity`` (throttled) so
+            ``supervise status`` reflects true liveness and a busy session is not
+            mistaken for a hung one (tracked issue:
+            supervise-status-last-activity-stale-during-active-work). ``None``
+            (the default) skips the refresh (SDK-style callers do not surface a
+            registry ``last_activity``).
         progress_poll: A zero-arg predicate returning ``True`` once the
             orchestrator's own log has GROWN since the previous call (production
             passes a closure over the :class:`LogTailDetector`'s byte offset). It is
@@ -2635,6 +2645,9 @@ def run_supervise_event_loop(
     sm = state_machine or _running_state_machine()
     budget = RestartBudget(max_attempts=config.restart.max_attempts)
     idle_timeout = config.timeouts.idle_seconds
+    # Normalise the optional activity callback to a no-op so the call sites need no
+    # ``if`` guard (keeps the loop's branch count down; ruff PLR0912).
+    notify_activity: Callable[[], None] = on_activity if on_activity is not None else (lambda: None)
     # When an operator stop CAN arrive (``stop_poll`` set), each PTY read is bounded
     # by the (shorter) stop-poll cadence so the loop re-checks the stop request
     # during a quiet session instead of blocking up to the full idle window: a
@@ -2693,7 +2706,9 @@ def run_supervise_event_loop(
             log_result = _handle_log_hit(log_hit, sm, restarts_used, resumes_used)
             if log_result is not None:
                 return log_result
-            # A non-actionable (advisory) log hit falls through to the PTY read.
+            # A non-actionable (advisory) log hit falls through to the PTY read. It
+            # is still observed liveness, so refresh last_activity (throttled).
+            notify_activity()
 
         try:
             observation = _observe_pty(driver, read_timeout)
@@ -2725,7 +2740,16 @@ def run_supervise_event_loop(
             last_progress_at = clock()
             continue
         terminal = _handle_pty_observation(
-            observation, driver, sm, quota_waiter, budget, relaunch, restarts_used, resumes_used, on_quota_wait
+            observation,
+            driver,
+            sm,
+            quota_waiter,
+            budget,
+            relaunch,
+            restarts_used,
+            resumes_used,
+            on_quota_wait,
+            notify_activity,
         )
         result, restarts_used, resumes_used = terminal
         if result is not None:
@@ -2851,6 +2875,7 @@ def _handle_pty_observation(
     restarts_used: int,
     resumes_used: int,
     on_quota_wait: Callable[[datetime | None, int], None] | None = None,
+    on_activity: Callable[[], None] | None = None,
 ) -> tuple[EventLoopResult | None, int, int]:
     """Act on a PTY observation; return (result|None, restarts, resumes)."""
     # A quota PTY marker (path 4.9a/4.9b): NEVER a non-zero exit.
@@ -2887,9 +2912,13 @@ def _handle_pty_observation(
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
 
     # No terminal marker and no EOF: ongoing working activity (refresh state) and
-    # keep reading until the child reaches a terminal.
+    # keep reading until the child reaches a terminal. Notify the activity callback
+    # so the registry ``last_activity`` advances (throttled) -- a busy session must
+    # not look stale to ``supervise status``.
     with contextlib.suppress(SuperviseTransitionError):
         sm.on_event("working-activity")
+    if on_activity is not None:
+        on_activity()
     return None, restarts_used, resumes_used
 
 

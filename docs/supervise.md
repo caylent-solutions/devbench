@@ -205,6 +205,13 @@ active billing mode), and (when stopped/errored) `exit-reason`. When
 `state=quota-waiting` it also shows `expected-resume` and `resumes-used=<n>/<cap>`
 (subscription mode only -- bedrock mode never enters `quota-waiting`).
 
+`last-activity` advances while the session is `running` whenever the `__run`
+event loop observes ongoing PTY activity (a non-terminal read) or a running-phase
+log-tail hit -- not only on state transitions. The registry write is throttled to
+the `supervise.timeouts.poll_interval_seconds` cadence to bound write frequency.
+This lets an operator (or an automated babysitter) trust `last-activity` to tell a
+busy session from a hung one without having to stat the session `pty.log`.
+
 ### `supervise info`
 
 ```

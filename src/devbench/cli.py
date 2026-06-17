@@ -10376,6 +10376,39 @@ def _make_supervise_quota_wait_persister(
     return _persist
 
 
+def _make_supervise_activity_persister(
+    *,
+    registry: SuperviseRegistry,
+    state: SuperviseSessionState,
+    min_interval_seconds: int,
+    _now: Callable[[], datetime] | None = None,
+) -> Callable[[], None]:
+    """Return the callback the event loop invokes on observed PTY activity.
+
+    It refreshes ``state.last_activity`` and persists the record so a concurrent
+    ``supervise status`` reflects true liveness -- a session actively producing
+    PTY output is not mistaken for a hung one (tracked issue:
+    supervise-status-last-activity-stale-during-active-work). The registry write
+    is THROTTLED to at most once per *min_interval_seconds* so a chatty session
+    does not hammer the registry on every read chunk; the in-flight loop observes
+    activity far more often than the status surface needs to advance. A
+    *min_interval_seconds* of ``0`` writes on every call (no throttle).
+    """
+    now = _now if _now is not None else (lambda: datetime.now(UTC))
+    last_write: list[datetime | None] = [None]
+
+    def _persist() -> None:
+        current = now()
+        previous = last_write[0]
+        if previous is not None and (current - previous).total_seconds() < min_interval_seconds:
+            return
+        state.last_activity = current
+        registry.write_state(state)
+        last_write[0] = current
+
+    return _persist
+
+
 def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     """Hidden ``supervise __run`` body: the pexpect supervisor inside the screen (D-10).
 
@@ -10488,6 +10521,13 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         state=state,
     )
     on_quota_wait = _make_supervise_quota_wait_persister(registry=registry, state=state)
+    # Refresh last_activity on observed PTY activity (throttled to the registry
+    # poll cadence) so supervise status distinguishes a busy session from a hung
+    # one without an operator having to stat the pty.log (tracked issue:
+    # supervise-status-last-activity-stale-during-active-work).
+    on_activity = _make_supervise_activity_persister(
+        registry=registry, state=state, min_interval_seconds=cfg.timeouts.poll_interval_seconds
+    )
     result: EventLoopResult = run_supervise_event_loop(
         driver=driver,
         config=cfg,
@@ -10496,6 +10536,7 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         relaunch=relaunch,
         stop_poll=lambda: read_stop_request(WORKSPACE_ROOT, parsed.name),
         on_quota_wait=on_quota_wait,
+        on_activity=on_activity,
         # PROGRESS WATCHDOG (design point 2): the same LogTailDetector that scrapes
         # the orchestrator log for terminal markers also reports whether that log
         # GREW (progressed), which is the watchdog's "is real work happening?"

@@ -949,7 +949,7 @@ Graceful `stop` then relaunch preserving context via `--continue` (or `--resume 
 uv run devbench supervise status [--name N]
 ```
 
-With `--name`: one session; without: all supervise sessions. Columns: `name`, `state` (`starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress`, `last-activity`, `screen`, `claude-session`, `billing-channel` (`subscription` or `bedrock`), `exit-reason`; `quota-waiting` also shows `expected-resume` and `resumes-used` (subscription mode only). Exit 0; exit 2 if `--name` unknown.
+With `--name`: one session; without: all supervise sessions. Columns: `name`, `state` (`starting|running|quota-waiting|draining|stopped|errored|restarting`), `in-progress`, `last-activity`, `screen`, `claude-session`, `billing-channel` (`subscription` or `bedrock`), `exit-reason`; `quota-waiting` also shows `expected-resume` and `resumes-used` (subscription mode only). Exit 0; exit 2 if `--name` unknown. `last-activity` advances on observed PTY activity / running-phase log-tail hits during `running` (throttled to `supervise.timeouts.poll_interval_seconds`), not only on state transitions, so a busy session is distinguishable from a hung one without stat-ing the `pty.log`.
 
 ### `supervise info`
 

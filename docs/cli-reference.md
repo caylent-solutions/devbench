@@ -473,10 +473,12 @@ uv run devbench set-status --include "E2" --exclude "E2-F3" in-queue
 ### `mark-done`
 
 ```
-uv run devbench mark-done <id>
+uv run devbench mark-done <id> [--already-satisfied]
 ```
 
 Mark the unit as `done`. Enforces the done-gate: the five always-on core judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) must each have logged `[REVIEW_PASS]` in the most recent round (after any intervening `[REVIEW_REJECTED]`). When an optional specialty judge is enabled and applicable to the unit -- `iac_review` for a unit whose `## Verification` contract has an infrastructure item -- its `[REVIEW_PASS]` is also required. Exits 1 with a clear error naming the missing judge(s) when the gate fails.
+
+`--already-satisfied` is the narrow, audited recovery for a **verification-only** unit whose deliverable already landed in the repo (committed under a non-attributable commit, by a dependency, or by an operator's direct fix). Such a unit produces no staged/unstaged diff, so `get-diff` returns `GET_DIFF_NO_ATTRIBUTABLE` (45) and the review pipeline can never run -- the unit is otherwise stranded even though its acceptance criteria verifiably pass. The flag completes the unit **only** when all three conditions hold: (1) the unit is verification-only (its `## Changes Manifest` exists, has rows, and every row is a sentinel such as `<verification-only>` -- it owns no real file deliverable); (2) it declares a `## Verification` contract; and (3) its latest `verify-ac` evidence ledger shows every executable AC with a tool-captured exit-0 record. The deterministic, non-forgeable `verify-ac` evidence gate stands in for the judge-pass gate (which is unsatisfiable without a diff). On success a `[WU_ALREADY_SATISFIED]` audit comment is written before the status flips. A unit that lists any real file path is refused (exit 1) -- so the flag cannot be used to skip work that authors source.
 
 ### `decline`
 

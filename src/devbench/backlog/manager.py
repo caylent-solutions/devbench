@@ -254,6 +254,98 @@ class BacklogManager:
         title = _extract_wu_title(work_unit_path, unit_id)
         notify_work_unit_done(unit_id, title)
 
+    def mark_done_already_satisfied(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
+        """Complete a verification-only unit whose deliverable is already present.
+
+        This is the sanctioned, audited recovery for a unit that is genuinely
+        complete but stranded: its ``## Changes Manifest`` owns no real-file
+        deliverable, the desired state already landed in the repo (e.g. under a
+        non-attributable batch commit, a dependency, or an operator's direct
+        fix), and therefore ``get-diff`` returns ``GET_DIFF_NO_ATTRIBUTABLE`` and
+        the review pipeline can never run. Such a unit cannot reach ``done`` via
+        :meth:`mark_done` (no diff for the judges) and ``set-status done`` is
+        refused, so without this path it sits on the critical path forever.
+
+        The path is narrow and evidence-gated so it cannot be abused to skip
+        real work. ALL THREE conditions must hold or it fails fast:
+
+        1. **Verification-only Manifest** -- :func:`devbench.tdd_gate.is_verification_only`
+           must be ``True``: the ``## Changes Manifest`` exists, has at least one
+           row, and EVERY row is a sentinel (e.g. ``<verification-only>``). A unit
+           that lists any real file path authors source and MUST go through the
+           standard diff-attributed done-gate.
+        2. **Declared ``## Verification`` contract** -- the unit must declare a
+           verification section. Without it there is no deterministic,
+           tool-captured proof to stand in for the waived judge review.
+        3. **Complete green evidence** -- the latest ``verify-ac`` ledger must show
+           every executable Acceptance Criterion with a tool-captured exit-0
+           record (:meth:`_ac_evidence_complete`). This is the same
+           non-forgeable, real-tool-exit-code gate :meth:`mark_done` enforces.
+
+        The standard judge-pass gate (:meth:`_last_round_all_passed`) is
+        intentionally NOT consulted: the review pipeline is unsatisfiable without
+        a diff, so the deterministic verify-ac evidence gate stands in its place.
+        On success a ``[WU_ALREADY_SATISFIED]`` audit comment is written before
+        the unit advances to Done.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+
+        Raises:
+            RuntimeError: If the unit is not verification-only, declares no
+                ``## Verification`` contract, or its verify-ac evidence is
+                incomplete.
+            FileNotFoundError: If either file does not exist.
+            ValueError: If the status line or unit row is not found.
+        """
+        from devbench import verification
+        from devbench.tdd_gate import is_verification_only
+
+        content = work_unit_path.read_text(encoding="utf-8")
+
+        if not is_verification_only(content):
+            raise RuntimeError(
+                f"Cannot complete {unit_id} as already-satisfied: it is not verification-only "
+                "(its Changes Manifest names a real file deliverable). Units that author source "
+                "must go through 'mark-done' with an attributable diff and judge review."
+            )
+
+        if not verification.has_verification_section(content):
+            raise RuntimeError(
+                f"Cannot complete {unit_id} as already-satisfied: it declares no '## Verification' "
+                "contract, so there is no deterministic tool-captured evidence to gate completion. "
+                "Add a '## Verification' section with executable VERIFY directives."
+            )
+
+        completeness = self._ac_evidence_complete(work_unit_path, backlog_index.parent, unit_id)
+        if not completeness.complete:
+            raise RuntimeError(
+                f"Cannot complete {unit_id} as already-satisfied: Acceptance-Criteria evidence "
+                f"incomplete -- {completeness.message()}. Run 'devbench verify-ac {unit_id}' so every "
+                "executable AC has a tool-captured exit-0 record."
+            )
+
+        executable = verification.executable_items(verification.parse_verification_section(content))
+        executable_acs = sorted({ac for item in executable for ac in item.ac_ids})
+        attempt = verification.latest_attempt_number(backlog_index.parent, unit_id)
+        self._append_agent_comment(
+            work_unit_path,
+            "orchestrator",
+            f"[WU_ALREADY_SATISFIED] {unit_id}: verification-only deliverable already present; "
+            f"completed on tool-captured verify-ac exit-0 evidence (attempt={attempt}, "
+            f"ACs={', '.join(executable_acs)}) in lieu of an attributable diff.",
+        )
+        # _set_status reads the file fresh, so the audit comment appended above
+        # is preserved alongside the status flip.
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
+
+        from devbench.notifications import notify_work_unit_done
+
+        title = _extract_wu_title(work_unit_path, unit_id)
+        notify_work_unit_done(unit_id, title)
+
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Blocked in both files and append a comment.
 

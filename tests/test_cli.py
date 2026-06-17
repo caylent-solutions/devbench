@@ -3687,6 +3687,179 @@ class TestCmdMarkDoneEventComment:
 
 
 @pytest.mark.unit
+class TestCmdMarkDoneAlreadySatisfied:
+    """Tracked issue 014: a verification-only unit whose deliverable already landed.
+
+    Reproduces the stuck state -- get-diff returns GET_DIFF_NO_ATTRIBUTABLE (45)
+    because there is no staged/unstaged diff and no unit-id-prefixed commit -- and
+    proves the sanctioned, evidence-gated ``mark-done --already-satisfied`` path
+    completes the unit while leaving the normal done-gate intact for units that
+    have done no work.
+    """
+
+    _UNIT_ID = "E11-F3-S1-T1"
+    _REPO = "caylent-solutions/devbench"
+    _VERIF_ONLY_MANIFEST = "| File | Change |\n|------|--------|\n| `<verification-only>` | live verify only |\n"
+    _REAL_MANIFEST = "| File | Change |\n|------|--------|\n| `src/devbench/x.py` | new module |\n"
+    _VERIF_BLOCK = "- VERIFY AC-1 | type=command | cmd=`make tf-output` | expect-exit=0"
+
+    def _build(self, tmp_path: Path, *, manifest: str, verification: str) -> tuple[Path, Path, WorkUnit]:
+        unit = WorkUnit(
+            id=self._UNIT_ID,
+            title="Already-landed verification-only unit",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{self._UNIT_ID}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {self._UNIT_ID} | T | Task | in-review | None | {self._REPO} | `backlog/{self._UNIT_ID}.md` |\n",
+            encoding="utf-8",
+        )
+        section = f"## Verification\n\n{verification}\n\n" if verification else ""
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{self._UNIT_ID}.md"
+        # Intentionally NO canonical judge REVIEW_PASS lines: the review pipeline
+        # can never run without a diff, so the standard done-gate is unsatisfiable.
+        wu_file.write_text(
+            f"# {self._UNIT_ID}\n\n## Status: in-review\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-1: output present\n\n"
+            "## Changes Manifest\n\n"
+            f"{manifest}\n"
+            f"{section}"
+            "## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu_file, backlog_index, unit
+
+    def _write_green_evidence(self, tmp_path: Path) -> None:
+        from devbench import verification
+
+        attempt = verification.next_attempt_number(tmp_path, self._UNIT_ID)
+        rec = verification.EvidenceRecord(
+            ac_ids=["AC-1"],
+            vtype="command",
+            command="make tf-output",
+            exit_code=0,
+            tool="terraform",
+        )
+        verification.write_evidence_ledger(tmp_path, self._UNIT_ID, attempt, [rec])
+
+    def test_normal_mark_done_is_stuck_without_diff(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Baseline: without --already-satisfied the unit cannot reach done (no judge passes)."""
+        wu_file, backlog_index, unit = self._build(
+            tmp_path, manifest=self._VERIF_ONLY_MANIFEST, verification=self._VERIF_BLOCK
+        )
+        self._write_green_evidence(tmp_path)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(self._UNIT_ID)
+        assert result == 1
+        assert "## Status: in-review" in wu_file.read_text()
+
+    def test_already_satisfied_completes_verification_only_unit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--already-satisfied completes a verification-only unit with green verify-ac evidence."""
+        wu_file, backlog_index, unit = self._build(
+            tmp_path, manifest=self._VERIF_ONLY_MANIFEST, verification=self._VERIF_BLOCK
+        )
+        self._write_green_evidence(tmp_path)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(self._UNIT_ID, "--already-satisfied")
+        assert result == 0
+        content = wu_file.read_text()
+        assert "## Status: done" in content
+        assert "[WU_ALREADY_SATISFIED]" in content
+
+    def test_already_satisfied_refuses_real_manifest_unit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--already-satisfied refuses a unit that owns a real-file deliverable (cannot skip work)."""
+        wu_file, backlog_index, unit = self._build(
+            tmp_path, manifest=self._REAL_MANIFEST, verification=self._VERIF_BLOCK
+        )
+        self._write_green_evidence(tmp_path)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(self._UNIT_ID, "--already-satisfied")
+        assert result == 1
+        assert "## Status: in-review" in wu_file.read_text()
+        assert "verification-only" in capsys.readouterr().err
+
+    def test_already_satisfied_refuses_without_green_evidence(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--already-satisfied refuses a verification-only unit whose verify-ac evidence is absent."""
+        wu_file, backlog_index, unit = self._build(
+            tmp_path, manifest=self._VERIF_ONLY_MANIFEST, verification=self._VERIF_BLOCK
+        )
+        # No evidence ledger written.
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(self._UNIT_ID, "--already-satisfied")
+        assert result == 1
+        assert "## Status: in-review" in wu_file.read_text()
+
+
+@pytest.mark.unit
+class TestParseMarkDoneArgv:
+    """Unit tests for _parse_mark_done_argv flag/positional parsing (tracked issue 014)."""
+
+    def test_id_only(self) -> None:
+        assert cli._parse_mark_done_argv(("E1-F1-S1-T1",)) == ("E1-F1-S1-T1", False)
+
+    def test_id_then_flag(self) -> None:
+        assert cli._parse_mark_done_argv(("E1-F1-S1-T1", "--already-satisfied")) == ("E1-F1-S1-T1", True)
+
+    def test_flag_then_id(self) -> None:
+        assert cli._parse_mark_done_argv(("--already-satisfied", "E1-F1-S1-T1")) == ("E1-F1-S1-T1", True)
+
+    def test_missing_id_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert cli._parse_mark_done_argv(("--already-satisfied",)) == 1
+        assert "usage" in capsys.readouterr().err
+
+    def test_unknown_flag_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert cli._parse_mark_done_argv(("E1-F1-S1-T1", "--bogus")) == 1
+        assert "unknown flag" in capsys.readouterr().err
+
+    def test_extra_positional_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert cli._parse_mark_done_argv(("E1-F1-S1-T1", "E1-F1-S1-T2")) == 1
+        assert "exactly one" in capsys.readouterr().err
+
+
+@pytest.mark.unit
 class TestResolveUnitFile:
     """AC-8: _resolve_unit_file helper extracted and used by relevant commands."""
 

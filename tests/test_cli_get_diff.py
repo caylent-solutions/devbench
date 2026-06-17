@@ -237,6 +237,44 @@ class TestGetDiffDeferTaskAttributedLookup:
         err = capsys.readouterr().err
         assert "WARNING" in err
 
+    def test_verification_only_already_landed_unit_is_stuck_at_exit_45(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Tracked issue 014 trigger: a verification-only unit whose deliverable already landed.
+
+        The unit produces no staged/unstaged diff and the landing commit is NOT
+        prefixed with the unit id, so defer-mode get-diff returns
+        GET_DIFF_NO_ATTRIBUTABLE (45). This is the state that strands the unit;
+        the sanctioned recovery is ``mark-done --already-satisfied`` (covered in
+        the manager/CLI suites), not a change to get-diff.
+        """
+        from devbench.constants import GET_DIFF_NO_ATTRIBUTABLE
+
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feat/flatten-review-pipeline\n", "")
+            # No staged/unstaged diff, no untracked files, and the grep for an
+            # attributable commit returns nothing (the value landed under a
+            # non-attributable batch commit).
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_get_diff("E4-F1-S1-T1")
+
+        assert result == GET_DIFF_NO_ATTRIBUTABLE
+        assert result == 45
+
     def test_defer_mode_rev_parse_failure_falls_back_to_head(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

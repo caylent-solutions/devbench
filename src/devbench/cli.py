@@ -2036,13 +2036,32 @@ def _clean_target_repo_on_block(unit: WorkUnit) -> int:
     return 0
 
 
-def cmd_mark_done(unit_id: str) -> int:
+def cmd_mark_done(*argv: str) -> int:
     """Mark a work unit as Done, enforcing the done-gate check.
 
-    Calls ``BacklogManager.mark_done()`` which verifies that all required
-    review judges passed in the most recent round before allowing the transition.
-    Raises ``RuntimeError`` if the gate check fails.
+    Usage::
+
+        mark-done <id>                     standard diff-attributed done-gate
+        mark-done <id> --already-satisfied verification-only already-landed path
+
+    The default path calls ``BacklogManager.mark_done()`` which verifies that
+    all required review judges passed in the most recent round AND that the AC
+    evidence ledger is complete before allowing the transition.
+
+    The ``--already-satisfied`` flag routes to
+    ``BacklogManager.mark_done_already_satisfied()`` -- the narrow, audited
+    recovery for a *verification-only* unit whose deliverable already landed (no
+    diff to attribute, so the review pipeline can never run). That path is gated
+    on the unit being verification-only AND its ``verify-ac`` evidence being
+    complete; it cannot be used to skip work on a unit that authors source.
+
+    Returns ``1`` (with a stderr ERROR) on any gate failure or bad invocation.
     """
+    parsed = _parse_mark_done_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, already_satisfied = parsed
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
 
@@ -2061,6 +2080,8 @@ def cmd_mark_done(unit_id: str) -> int:
     # [NEEDS_DEP] before the task can transition to done. Otherwise the
     # done-gate refuses with a clear actionable error and emits a
     # [REJECTION_FEEDBACK_OUTSTANDING] audit so subsequent runs can see why.
+    # This guard applies to both paths: an already-satisfied unit must not
+    # carry unresolved rejection feedback either.
     outstanding = _outstanding_rejection_categories(unit_id, wu_file)
     if outstanding:
         mgr_audit = BacklogManager()
@@ -2080,7 +2101,10 @@ def cmd_mark_done(unit_id: str) -> int:
 
     mgr = BacklogManager()
     try:
-        mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)
+        if already_satisfied:
+            mgr.mark_done_already_satisfied(wu_file, BACKLOG_INDEX, unit_id)
+        else:
+            mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -2090,6 +2114,39 @@ def cmd_mark_done(unit_id: str) -> int:
     logger.info("Marked %s as done", unit_id)
     print(f"Marked {unit_id} as done")
     return 0
+
+
+def _parse_mark_done_argv(argv: "tuple[str, ...]") -> "tuple[str, bool] | int":
+    """Parse ``mark-done`` argv into ``(unit_id, already_satisfied)``.
+
+    Accepts exactly one positional work-unit id and an optional
+    ``--already-satisfied`` flag, in any order. Returns the integer ``1`` (with
+    a stderr ERROR) on a missing id, an unknown flag, or extra positionals --
+    fail-fast, no silent absorption.
+
+    Args:
+        argv: Raw trailing CLI tokens for ``mark-done``.
+
+    Returns:
+        ``(unit_id, already_satisfied)`` on success, or ``1`` on a parse error.
+    """
+    unit_id: str | None = None
+    already_satisfied = False
+    for arg in argv:
+        if arg == "--already-satisfied":
+            already_satisfied = True
+            continue
+        if arg.startswith("--"):
+            print(f"ERROR: mark-done: unknown flag {arg!r}", file=sys.stderr)
+            return 1
+        if unit_id is not None:
+            print(f"ERROR: mark-done accepts exactly one work-unit id; got extra positional {arg!r}", file=sys.stderr)
+            return 1
+        unit_id = arg
+    if unit_id is None:
+        print("ERROR: mark-done usage: mark-done <id> [--already-satisfied]", file=sys.stderr)
+        return 1
+    return unit_id, already_satisfied
 
 
 def cmd_decline(*argv: str) -> int:
@@ -14472,7 +14529,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "--yes skips prompt when matched count > bulk_update_confirm_threshold)"
         ),
     ),
-    "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
+    "mark-done": (
+        cmd_mark_done,
+        1,
+        (
+            "Mark done: mark-done <id> [--already-satisfied]. "
+            "--already-satisfied completes a verification-only unit whose deliverable already "
+            "landed (no attributable diff); gated on verification-only Manifest + complete verify-ac evidence."
+        ),
+    ),
     "decline": (
         cmd_decline,
         2,
@@ -14832,6 +14897,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "review-token",
         "validate-backlog",
         "log-rejection-feedback",
+        # Tracked issue 014: mark-done owns its --already-satisfied flag parsing.
+        "mark-done",
         # Issue #162 Phase 6: pre-render the report into a snapshot file.
         "write-snapshot",
         # Issue #162 Phase 2: rebuild per-task window-stats aggregates from the log.

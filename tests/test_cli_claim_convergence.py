@@ -212,6 +212,90 @@ class TestClaimConvergenceTrackerWallClock:
         assert result is None
 
 
+class TestClaimConvergenceTrackerNoClaimActivityBackstop:
+    """Inter-claim backstop for the 'active but no unit claimed' wedge.
+
+    The orchestrator can keep emitting SDK messages (so the per-message
+    inactivity timeout never fires) while NO unit is claimed -- e.g. an
+    executor still churning AFTER its unit was force-blocked, or a loop stuck
+    processing a huge command output without claiming the next unit. The
+    streaming report shows 0 in-progress while hook-logs keep flowing. The
+    per-claim bounds do not cover this because there is no current claim.
+
+    SAFETY: a legitimate long op (a live terraform apply / terratest) always
+    runs INSIDE a claim, where the per-signature + wall-clock bounds apply.
+    Bounding the NO-CLAIM window therefore cannot false-positive a real long
+    op; it only catches an orphaned/churning loop that claims no work.
+    """
+
+    def test_no_claim_activity_trips_after_window(self) -> None:
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=4,
+            max_claim_wall_clock_seconds=0,
+            max_no_claim_activity_seconds=300.0,
+        )
+        # No claim ever noted; messages keep arriving (orphaned activity).
+        assert tracker.observe(_bash("Read agent-transcript"), now=0.0) is None, (
+            "the window only starts on the first no-claim message"
+        )
+        assert tracker.observe(_bash("Read agent-transcript"), now=299.0) is None, (
+            "must not trip before the window elapses"
+        )
+        tripped = tracker.observe(_bash("Read agent-transcript"), now=300.0)
+        assert tripped is not None, "must trip once active-but-no-claim exceeds the window"
+        assert "no claim" in tripped.lower()
+
+    def test_no_claim_backstop_disabled_when_zero(self) -> None:
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=4,
+            max_claim_wall_clock_seconds=0,
+            max_no_claim_activity_seconds=0,
+        )
+        results = [tracker.observe(_bash("x"), now=float(i) * 1000) for i in range(5)]
+        assert all(r is None for r in results)
+
+    def test_claim_resets_no_claim_window_and_restarts_after_block(self) -> None:
+        tracker = ClaimConvergenceTracker(
+            max_within_claim_attempts=4,
+            max_claim_wall_clock_seconds=0,
+            max_no_claim_activity_seconds=300.0,
+        )
+        tracker.observe(_bash("Read"), now=0.0)  # no-claim window starts at t=0
+        tracker.note_claim("E1-F1-S1-T1", now=100.0)  # progress: a unit is claimed
+        # While a unit is claimed the no-claim backstop must NEVER fire, even
+        # long after the original no-claim window would have elapsed.
+        assert tracker.observe(_bash("work"), now=10_000.0) is None
+        # After a force-block clears the claim, the window RESTARTS fresh (it
+        # does not retroactively count time spent while claimed).
+        tracker.clear_current_claim()
+        assert tracker.observe(_bash("Read"), now=10_001.0) is None
+        assert tracker.observe(_bash("Read"), now=10_300.0) is None
+        assert tracker.observe(_bash("Read"), now=10_301.0) is not None
+
+    def test_default_no_claim_backstop_is_set_and_generous(self) -> None:
+        from devbench.constants import DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS
+
+        # Generous enough that a normal claim->work->claim cadence never trips,
+        # but bounded (not disabled) so a true wedge is caught.
+        assert DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS > 0
+        assert DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS >= 300
+
+
+class TestResolveMaxNoClaimActivitySeconds:
+    def test_default_when_unset(self, monkeypatch: Any) -> None:
+        from devbench import cli
+        from devbench.constants import DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS", raising=False)
+        assert cli._resolve_max_no_claim_activity_seconds() == DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS
+
+    def test_env_override(self, monkeypatch: Any) -> None:
+        from devbench import cli
+
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS", "123.5")
+        assert cli._resolve_max_no_claim_activity_seconds() == 123.5
+
+
 # ---------------------------------------------------------------------------
 # CLI plumbing: claim-id extraction, exit classification, force-block
 # ---------------------------------------------------------------------------

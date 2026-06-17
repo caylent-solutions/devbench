@@ -269,6 +269,7 @@ orchestrate:
   within_claim_convergence_check: true # block a claim that repeats the SAME failure
   max_within_claim_attempts: 4         # identical-failure recurrences before a block
   max_claim_wall_clock_seconds: 21600  # 6h backstop; 0 disables
+  max_no_claim_activity_seconds: 600   # inter-claim stall backstop (10m); 0 disables
   max_non_converging_claims: 3         # aggregate block-and-continue safety valve
 ```
 
@@ -285,7 +286,10 @@ A single in-progress claim that repeats the SAME unresolvable AC-verify / TDD-RE
 | `within_claim_convergence_check` | `DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK` | `true` | Master toggle for the bound. |
 | `max_within_claim_attempts` | `DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS` | `4` | How many times the SAME failing signature may recur within one claim before it is blocked (>= 1). |
 | `max_claim_wall_clock_seconds` | `DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS` | `21600` | Secondary wall-clock backstop in seconds (>= 0; `0` disables it, the signature bound still applies). |
+| `max_no_claim_activity_seconds` | `DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS` | `600` | Inter-claim activity backstop in seconds (>= 0; `0` disables). See below. |
 | `max_non_converging_claims` | `DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS` | `3` | Aggregate block-and-continue safety valve K (>= 1). See below. |
+
+**Inter-claim activity backstop (`max_no_claim_activity_seconds`).** The per-claim bounds above only cover time spent *while a unit is claimed*. They do not catch the orchestrator staying ACTIVE -- SDK messages still arriving, so the per-message inactivity timeout never fires -- while **no unit is claimed**: e.g. an executor still churning AFTER its unit was force-blocked, or a loop stuck processing a huge command output without claiming the next unit (the "0 in-progress in the report but hook-logs still flowing" wedge). This backstop ends the session cleanly when no claim has progressed for this many seconds, so the daemon stops (and the operator/supervisor restarts it on the remaining backlog) instead of hanging. It is SAFE from false-positives because a legitimate long op always runs *inside* a claim (covered by the signature + wall-clock bounds); the no-claim window can only catch an orphaned/churning loop that claims no work.
 
 **Block-and-continue.** A non-converging claim is BLOCKED and the orchestrate session **continues to its next in-queue unit in scope** -- one bad module no longer abandons the rest of a session's scope, and a multi-session sweep no longer loses a whole session to its first defective module. The session keeps accumulating both completions and blocks in one pass and only stops when there is genuinely nothing actionable left (the normal `NO_ACTIONABLE` / `ALL_DONE` termination).
 

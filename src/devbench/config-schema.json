@@ -357,6 +357,11 @@
           "minimum": 0,
           "description": "Secondary wall-clock backstop for a single claim, in seconds, for the within_claim_convergence_check bound. Set well above the observed-legit maximum (e.g. a 3.5h live firehose apply) so it only fires on an implausibly long stuck claim with no repeated-identical signature. Default 21600 (6h). 0 disables the backstop (the repeated-signature bound still applies). Override via DEVBENCH_ORCHESTRATOR_MAX_CLAIM_WALL_CLOCK_SECONDS."
         },
+        "max_no_claim_activity_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Inter-claim activity backstop, in seconds. Bounds how long the orchestrator may stay ACTIVE (SDK messages still arriving, so the per-message inactivity timeout never fires) while NO unit is claimed -- e.g. an executor still churning AFTER its unit was force-blocked, or a loop stuck processing a huge command output without claiming the next unit (the '0 in-progress but hook-logs flowing' wedge). SAFE because a legitimate long op always runs INSIDE a claim (covered by the per-signature + wall-clock bounds), so bounding the no-claim window cannot false-positive a real long op. Default 600 (10m). 0 disables the inter-claim backstop. Override via DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS."
+        },
         "max_non_converging_claims": {
           "type": "integer",
           "minimum": 1,

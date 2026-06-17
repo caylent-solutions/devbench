@@ -763,6 +763,18 @@ DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS: int = 4
 # disables the wall-clock backstop (the repeated-signature bound still applies).
 DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS: float = 21600.0
 
+# Inter-claim activity backstop, in seconds. Bounds the time the orchestrator
+# may stay ACTIVE (SDK messages still arriving, so the per-message inactivity
+# timeout never fires) while NO unit is claimed -- e.g. an executor still
+# churning AFTER its unit was force-blocked, or a loop stuck processing a huge
+# command output without claiming the next unit (the "0 in-progress but
+# hook-logs flowing" wedge). It is SAFE because a legitimate long op always runs
+# INSIDE a claim (covered by the per-signature + wall-clock bounds), so bounding
+# the no-claim window cannot false-positive a real long op. Default 10 minutes
+# (600s). Override via ``DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS``
+# (float). A value <= 0 disables the inter-claim backstop.
+DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS: float = 600.0
+
 # Whether the within-claim convergence bound is active. Default True (on), per
 # the operator decision that a busy-but-not-converging unit must BLOCK rather
 # than churn. Override via env ``DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK``.

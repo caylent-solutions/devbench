@@ -189,6 +189,7 @@ from devbench.constants import (
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
     DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS,
+    DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS,
     DEFAULT_MAX_NON_CONVERGING_CLAIMS,
     DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_MAX_WITHIN_CLAIM_ATTEMPTS,
@@ -7672,18 +7673,33 @@ class ClaimConvergenceTracker:
     so the tracker is fully deterministic under test.
     """
 
-    def __init__(self, *, max_within_claim_attempts: int, max_claim_wall_clock_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        max_within_claim_attempts: int,
+        max_claim_wall_clock_seconds: float,
+        max_no_claim_activity_seconds: float = 0.0,
+    ) -> None:
         self._max_attempts = max_within_claim_attempts
         self._max_wall_clock = max_claim_wall_clock_seconds
+        # Inter-claim activity backstop: max seconds the orchestrator may stay
+        # active while NO unit is claimed. <= 0 disables it. Default 0.0 keeps
+        # the bound off unless the caller (production wiring) supplies a value.
+        self._max_no_claim_activity = max_no_claim_activity_seconds
         self.current_unit_id: str | None = None
         self._claim_started_at: float | None = None
         self._signature_counts: dict[str, int] = {}
+        # When > 0, the timestamp of the first message observed while no unit is
+        # claimed; reset to None whenever a claim is active or freshly noted.
+        self._no_claim_active_since: float | None = None
 
     def note_claim(self, unit_id: str, *, now: float) -> None:
         """Begin tracking a freshly-claimed unit, resetting all per-claim state."""
         self.current_unit_id = unit_id
         self._claim_started_at = now
         self._signature_counts = {}
+        # A fresh claim is forward progress: stop any inter-claim stall timer.
+        self._no_claim_active_since = None
 
     def clear_current_claim(self) -> None:
         """Stop tracking the current claim after it has been force-blocked.
@@ -7700,16 +7716,37 @@ class ClaimConvergenceTracker:
         self.current_unit_id = None
         self._claim_started_at = None
         self._signature_counts = {}
+        # Restart the inter-claim window fresh: the orchestrator should claim
+        # the next unit promptly after a block; if it instead keeps emitting
+        # messages without claiming, the backstop below catches that wedge.
+        self._no_claim_active_since = None
 
     def observe(self, message: object, *, now: float) -> str | None:
         """Fold *message* into the bound; return the recurring failure when tripped.
 
-        Returns the recurring failure signature (or a wall-clock diagnostic)
-        when the bound trips for the current claim, else ``None``. Safe to call
-        before any claim has been noted (returns ``None``).
+        Returns the recurring failure signature (or a wall-clock / inter-claim
+        diagnostic) when the bound trips, else ``None``. Safe to call before any
+        claim has been noted.
         """
         if self.current_unit_id is None or self._claim_started_at is None:
+            # No active claim. Bound the inter-claim "active but not claiming"
+            # window: a legitimate long op always runs INSIDE a claim, so a
+            # no-claim stall can only be an orphaned/churning loop (e.g. an
+            # executor still emitting messages after its unit was force-blocked,
+            # or a loop stuck without claiming the next unit).
+            if self._max_no_claim_activity > 0:
+                if self._no_claim_active_since is None:
+                    self._no_claim_active_since = now
+                elif (now - self._no_claim_active_since) >= self._max_no_claim_activity:
+                    elapsed = int(now - self._no_claim_active_since)
+                    return (
+                        f"no claim progressed for {elapsed}s while the orchestrator stayed "
+                        "active (possible stall: messages flowing but no work claimed)"
+                    )
             return None
+
+        # An active claim is forward progress for the inter-claim backstop.
+        self._no_claim_active_since = None
 
         signature = _extract_failure_signature(message)
         if signature is not None:
@@ -8435,6 +8472,22 @@ def _resolve_max_claim_wall_clock_seconds() -> float:
     if yaml_value is not None:
         return yaml_value
     return DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS
+
+
+def _resolve_max_no_claim_activity_seconds() -> float:
+    """Return the inter-claim activity backstop in seconds (env > YAML > default).
+
+    Bounds how long the orchestrator may stay active while NO unit is claimed
+    before the loop treats it as a stall (the orphaned-executor / "0 in-progress
+    but hook-logs flowing" wedge). A value <= 0 disables the backstop.
+    """
+    raw = os.environ.get("DEVBENCH_ORCHESTRATOR_MAX_NO_CLAIM_ACTIVITY_SECONDS", "").strip()
+    if raw:
+        return float(raw)
+    yaml_value = RUNTIME_CONFIG.orchestrate.max_no_claim_activity_seconds
+    if yaml_value is not None:
+        return yaml_value
+    return DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS
 
 
 def _resolve_max_non_converging_claims() -> int:
@@ -9382,6 +9435,7 @@ def cmd_start(*argv: str) -> int:
         _convergence_tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=_resolve_max_within_claim_attempts(),
             max_claim_wall_clock_seconds=_resolve_max_claim_wall_clock_seconds(),
+            max_no_claim_activity_seconds=_resolve_max_no_claim_activity_seconds(),
         )
 
         def _check_convergence(msg: object) -> bool:
@@ -9409,8 +9463,19 @@ def cmd_start(*argv: str) -> int:
             if claimed is not None:
                 _convergence_tracker.note_claim(claimed, now=now)
             recurring = _convergence_tracker.observe(msg, now=now)
-            if recurring is None or _convergence_tracker.current_unit_id is None:
+            if recurring is None:
                 return False
+            if _convergence_tracker.current_unit_id is None:
+                # Inter-claim stall: the orchestrator is active (messages still
+                # arriving, so the per-message inactivity timeout never fires)
+                # but has claimed no unit for too long -- e.g. an executor still
+                # churning AFTER its unit was force-blocked, or a loop stuck
+                # without claiming the next unit (the "0 in-progress but
+                # hook-logs flowing" wedge). End the session cleanly so the
+                # daemon stops instead of hanging (and ignoring SIGTERM); the
+                # operator/supervisor restarts it on the remaining backlog.
+                logger.warning("%s%s", _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX, recurring)
+                return True
             unit_id = _convergence_tracker.current_unit_id
             _block_non_converging_claim(unit_id, recurring)
             _non_converging_unit_ids.add(unit_id)

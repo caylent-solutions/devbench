@@ -699,6 +699,7 @@ class OrchestrateConfig:
     within_claim_convergence_check: bool | None = None
     max_within_claim_attempts: int | None = None
     max_claim_wall_clock_seconds: float | None = None
+    max_no_claim_activity_seconds: float | None = None
     max_non_converging_claims: int | None = None
 
 
@@ -750,6 +751,16 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
             f"Config file '{path}': orchestrate.max_claim_wall_clock_seconds must be >= 0 "
             f"(0 disables the backstop); got {max_claim_wall_clock_seconds!r}."
         )
+    max_no_claim_activity_seconds = (
+        float(orchestrate_raw["max_no_claim_activity_seconds"])
+        if "max_no_claim_activity_seconds" in orchestrate_raw
+        else None
+    )
+    if max_no_claim_activity_seconds is not None and max_no_claim_activity_seconds < 0:
+        raise ValueError(
+            f"Config file '{path}': orchestrate.max_no_claim_activity_seconds must be >= 0 "
+            f"(0 disables the inter-claim backstop); got {max_no_claim_activity_seconds!r}."
+        )
     max_non_converging_claims = (
         int(orchestrate_raw["max_non_converging_claims"]) if "max_non_converging_claims" in orchestrate_raw else None
     )
@@ -765,6 +776,7 @@ def _parse_orchestrate_config(path: Path, orchestrate_raw: dict, use_bedrock: bo
         within_claim_convergence_check=within_claim_convergence_check,
         max_within_claim_attempts=max_within_claim_attempts,
         max_claim_wall_clock_seconds=max_claim_wall_clock_seconds,
+        max_no_claim_activity_seconds=max_no_claim_activity_seconds,
         max_non_converging_claims=max_non_converging_claims,
     )
 

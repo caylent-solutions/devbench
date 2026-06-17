@@ -564,6 +564,28 @@ DEFAULT_RECENT_PACE_TASKS: int = 10
 # editable from one place.
 SIDE_BY_SIDE_GAP_CHARS: int = 4
 
+# Streaming-report loop bounds (TDI-005). The always-on `devbench report`
+# streaming loop re-renders on every source-file advance. Under an actively-
+# writing orchestrator the source key changes on nearly every tick, so without
+# bounds the loop re-runs the full report ~10x/sec, pinning a CPU core and
+# growing RSS. These defaults bound that:
+#
+# - render-budget: if a single render exceeds this many seconds the loop fails
+#   fast (non-zero) instead of spinning forever on an ever-growing log. A normal
+#   render is ~2s; this ceiling is generous headroom for a large live workspace
+#   while still catching a pathological spin. Override via
+#   `DEVBENCH_REPORT_STREAM_RENDER_BUDGET_SECONDS`.
+# - max-poll-interval: the adaptive-backoff ceiling. When consecutive renders are
+#   slow the next poll interval grows up to this bound so a fast-growing log
+#   cannot pin a core at the base cadence. Override via
+#   `DEVBENCH_REPORT_STREAM_MAX_POLL_INTERVAL`.
+# - tail-window: maximum bytes a single incremental tail read pulls into memory
+#   per tick, bounding per-tick RSS even when the orchestrator appends a large
+#   burst between ticks. Override via `DEVBENCH_REPORT_STREAM_TAIL_BYTES`.
+DEFAULT_REPORT_STREAM_RENDER_BUDGET_SECONDS: float = 30.0
+DEFAULT_REPORT_STREAM_MAX_POLL_INTERVAL: float = 5.0
+DEFAULT_REPORT_STREAM_TAIL_BYTES: int = 1_048_576
+
 # Timeout defaults (seconds)
 DEFAULT_GH_API_TIMEOUT: int = 30
 # Generic per-AC verification-command budget. A backlog whose ACs run live

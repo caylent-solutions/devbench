@@ -128,6 +128,15 @@ class _ToolUseBlock:
 
 
 @dataclass
+class _ToolResultBlock:
+    """Duck-typed double for the SDK's ToolResultBlock (the result of a Bash run)."""
+
+    content: str | list[dict[str, Any]] | None = None
+    is_error: bool | None = None
+    tool_use_id: str = "toolu_x"
+
+
+@dataclass
 class _Msg:
     content: list[Any]
 
@@ -144,6 +153,18 @@ def _verify_fail(unit_id: str) -> _Msg:
     # A repeated verify-ac re-run is the canonical "re-checking the same AC"
     # signal the orchestrator observes for a non-converging unit.
     return _bash(f"uv run devbench verify-ac {unit_id}")
+
+
+def _pytest_run(target: str) -> _Msg:
+    # A repeated pytest re-run against the SAME target file is the signal that
+    # surfaced TDI #016 (a cold ``uv`` env makes the first run time out).
+    return _bash(f"uv run pytest {target}")
+
+
+def _timeout_result(text: str = "Command timed out after 120s") -> _Msg:
+    # The Bash tool surfaces a kill-by-timeout as a ToolResultBlock carrying an
+    # error flag and timeout text -- NOT a captured assertion/collection failure.
+    return _Msg(content=[_ToolResultBlock(content=text, is_error=True)])
 
 
 # ---------------------------------------------------------------------------
@@ -927,3 +948,129 @@ class TestResolveClaimTeardownCleanupHook:
         monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK", raising=False)
         monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "claim_teardown_cleanup_hook", "yaml-sweep")
         assert cli._resolve_claim_teardown_cleanup_hook() == "yaml-sweep"
+
+
+# ---------------------------------------------------------------------------
+# TDI #016: a TIMED-OUT run (cold ``uv`` sync) must NOT accrue toward the bound
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutResultDetection:
+    """``_is_timeout_result`` recognises a kill-by-timeout Bash result.
+
+    A timed-out run is a non-deterministic provisioning failure (e.g. a cold
+    ``uv`` env syncing dependencies on the first invocation), NOT the "same
+    deterministic test failure". It carries timeout text + an error flag and no
+    captured assertion/collection output.
+    """
+
+    def test_timeout_text_with_error_flag_is_timeout(self) -> None:
+        from devbench.cli import _is_timeout_result
+
+        assert _is_timeout_result(_timeout_result("Command timed out after 120s")) is True
+
+    def test_run_command_style_timeout_text_is_timeout(self) -> None:
+        # The shared ``run_command`` helper renders ``<cmd>: timed out after Ns``.
+        from devbench.cli import _is_timeout_result
+
+        assert _is_timeout_result(_timeout_result("uv run pytest tests/unit/x.py: timed out after 3600s")) is True
+
+    def test_real_assertion_failure_is_not_timeout(self) -> None:
+        from devbench.cli import _is_timeout_result
+
+        msg = _Msg(content=[_ToolResultBlock(content="E   assert 1 == 2\n1 failed in 0.12s", is_error=True)])
+        assert _is_timeout_result(msg) is False
+
+    def test_non_result_message_is_not_timeout(self) -> None:
+        from devbench.cli import _is_timeout_result
+
+        assert _is_timeout_result(_pytest_run("tests/unit/x.py")) is False
+        assert _is_timeout_result(object()) is False
+
+
+class TestTimeoutDoesNotAccrueConvergence:
+    def test_timed_out_pytest_runs_do_not_trip_bound(self) -> None:
+        # The exact #016 shape: the SAME pytest command is re-run, and EVERY run
+        # is killed by the per-attempt timeout (cold ``uv`` sync). A timeout is
+        # non-deterministic provisioning latency, not a deterministic failure, so
+        # repeated timed-out runs must NOT trip CLAIM_NOT_CONVERGING.
+        tracker = ClaimConvergenceTracker(max_within_claim_attempts=4, max_claim_wall_clock_seconds=0)
+        tracker.note_claim("E10-F3-S4-T1", now=0.0)
+        trips: list[str] = []
+        for i in range(8):
+            # The command is observed (assistant tool-use), then its result is a
+            # timeout (ToolResultBlock) -- the run was killed, not a real failure.
+            # The convergence bound must not trip on EITHER message.
+            run = tracker.observe(_pytest_run("tests/unit/test_live_verify.py"), now=float(2 * i))
+            res = tracker.observe(_timeout_result(), now=float(2 * i + 1))
+            trips += [r for r in (run, res) if r is not None]
+        assert trips == [], f"repeated TIMED-OUT runs must not trip the convergence bound (#016); got {trips}"
+
+    def test_deterministic_failure_still_trips_after_timeouts(self) -> None:
+        # Once the env is warm and the SAME command produces a REAL deterministic
+        # failure (no timeout result), the bound must still trip normally -- the
+        # timeout exemption must not defeat genuine non-convergence detection.
+        tracker = ClaimConvergenceTracker(max_within_claim_attempts=3, max_claim_wall_clock_seconds=0)
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        # Two cold timed-out runs first: these must not count.
+        for i in range(2):
+            tracker.observe(_pytest_run("tests/unit/x.py"), now=float(i))
+            tracker.observe(_timeout_result(), now=float(i) + 0.5)
+        # Now three genuine deterministic failures (no timeout result follows).
+        result = None
+        for i in range(3):
+            result = tracker.observe(_pytest_run("tests/unit/x.py"), now=10.0 + i)
+        assert result is not None, "a genuine repeated deterministic failure must still trip the bound"
+        assert "pytest" in result and "tests/unit/x.py" in result
+
+    def test_timeout_result_only_exempts_the_preceding_run(self) -> None:
+        # A timeout result rolls back ONLY the signature of the run it terminated;
+        # it does not erase counts accrued by genuine prior deterministic failures
+        # of the SAME signature.
+        tracker = ClaimConvergenceTracker(max_within_claim_attempts=2, max_claim_wall_clock_seconds=0)
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        # One genuine deterministic failure (counts: 1).
+        assert tracker.observe(_pytest_run("tests/unit/x.py"), now=0.0) is None
+        # One timed-out run (the increment it caused is rolled back: counts back to 1).
+        tracker.observe(_pytest_run("tests/unit/x.py"), now=1.0)
+        assert tracker.observe(_timeout_result(), now=1.5) is None
+        # A second genuine deterministic failure brings counts to 2 -> trips.
+        result = tracker.observe(_pytest_run("tests/unit/x.py"), now=2.0)
+        assert result is not None, "two genuine deterministic failures (1 timeout in between) must trip"
+
+
+class TestTimeoutMarkersAndResultShapes:
+    def test_env_override_extends_timeout_markers(self, monkeypatch: Any) -> None:
+        from devbench.cli import _is_timeout_result, _resolve_timeout_result_markers
+
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS", "deadline exceeded, killed by watchdog")
+        assert _resolve_timeout_result_markers() == ("deadline exceeded", "killed by watchdog")
+        # A result phrased with the custom marker is now recognised as a timeout;
+        # the built-in defaults no longer apply once overridden.
+        assert _is_timeout_result(_Msg(content=[_ToolResultBlock(content="job hit DEADLINE EXCEEDED")])) is True
+        assert _is_timeout_result(_timeout_result("Command timed out after 5s")) is False
+
+    def test_blank_env_falls_back_to_defaults(self, monkeypatch: Any) -> None:
+        from devbench.cli import _resolve_timeout_result_markers
+        from devbench.constants import TIMEOUT_RESULT_MARKERS
+
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS", "   ")
+        assert _resolve_timeout_result_markers() == TIMEOUT_RESULT_MARKERS
+
+    def test_list_of_dicts_result_content_is_read(self) -> None:
+        # The SDK's other ToolResultBlock shape: content is a list of
+        # {"type": "text", "text": ...} parts rather than a bare string.
+        from devbench.cli import _is_timeout_result
+
+        msg = _Msg(content=[_ToolResultBlock(content=[{"type": "text", "text": "Command timed out after 60s"}])])
+        assert _is_timeout_result(msg) is True
+
+    def test_timed_out_run_still_hits_wall_clock_backstop(self) -> None:
+        # The wall-clock backstop must still fire on a timed-out result message
+        # (the timeout exemption rolls back the signature but does not bypass the
+        # secondary backstop for an implausibly long stuck claim).
+        tracker = ClaimConvergenceTracker(max_within_claim_attempts=999, max_claim_wall_clock_seconds=100.0)
+        tracker.note_claim("E1-F1-S1-T1", now=0.0)
+        tracker.observe(_pytest_run("tests/unit/x.py"), now=10.0)
+        result = tracker.observe(_timeout_result(), now=150.0)
+        assert result is not None and "wall-clock" in result.lower()

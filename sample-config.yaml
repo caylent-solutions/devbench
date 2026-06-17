@@ -387,6 +387,26 @@ orchestrate:
   # Default 3 (must be >= 1). Override via
   # DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS.
   max_non_converging_claims: 3
+  # Target-environment pre-sync (TDI #016). A COLD `uv` environment makes the
+  # FIRST `uv run pytest ...` in a checkout spend minutes syncing dependencies
+  # from uv.lock; if that exceeds the per-attempt test timeout the attempt is
+  # recorded as a test failure and can falsely trip the convergence bound above.
+  # When on (the default), `devbench start` runs presync_command once in EACH
+  # configured repo checkout BEFORE the orchestrate loop claims any work, so no
+  # claim pays the cold-sync cost inside a timed attempt. Fail-fast on a real
+  # provisioning failure. Override via DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT.
+  presync_environment: true
+  # The provisioning command argv run once per configured repo at start. The
+  # default `uv sync` is idempotent and fast on a warm env (a no-op). Substitute
+  # your stack's command (e.g. [make, deps]) here, or via
+  # DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND (whitespace-tokenised).
+  presync_command:
+    - uv
+    - sync
+  # Seconds the pre-sync command may run per repo before it is treated as a
+  # provisioning failure. Default 900 (a cold sync can take minutes). Override
+  # via DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS.
+  presync_timeout_seconds: 900
 
 # ---------------------------------------------------------------------------
 # Report / cost estimation

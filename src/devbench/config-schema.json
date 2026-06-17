@@ -370,6 +370,24 @@
         "claim_teardown_cleanup_hook": {
           "type": "string",
           "description": "Optional sanctioned cleanup command run AFTER the executor's positively-attributed subprocess group is torn down on a [CLAIM_NOT_CONVERGING] block. On block, devbench SIGTERMs the single process group attributed to THIS claim's executor (e.g. a long live 'terraform apply' / 'go test' tree) so it is not orphaned to init and left leaking billable resources; if this hook is set it then runs the command (e.g. a run-id-scoped terratest sweep) to reclaim any resource a torn-down apply left half-created. Empty / unset = no hook (the default): nothing runs unless the project opts in. Override via DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK."
+        },
+        "presync_environment": {
+          "type": "boolean",
+          "description": "TDI #016: when true (default) `devbench start` runs presync_command once in each configured repo checkout BEFORE the orchestrate loop claims any work, so no claim pays the cold uv dependency-sync cost inside a timed test attempt (which would otherwise be recorded as a failure and trip the within-claim convergence bound). Override via DEVBENCH_ORCHESTRATOR_PRESYNC_ENVIRONMENT."
+        },
+        "presync_command": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "description": "TDI #016: provisioning command argv run once per configured repo at start to warm its dependency environment. Default [\"uv\", \"sync\"] (idempotent and fast on a warm env). Override via DEVBENCH_ORCHESTRATOR_PRESYNC_COMMAND (whitespace-tokenised)."
+        },
+        "presync_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TDI #016: seconds the presync command may run per repo before it is treated as a provisioning failure. Default 900 (a cold sync can take minutes). Override via DEVBENCH_ORCHESTRATOR_PRESYNC_TIMEOUT_SECONDS."
         }
       }
     },

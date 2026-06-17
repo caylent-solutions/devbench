@@ -13054,9 +13054,7 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     # Capture the original ids in declaration order so a collision re-home
     # (suggested_id reassigned by materialise_proposal) is observable here.
     original_ids = [task.suggested_id for task in proposal.proposed_tasks]
-    pre_states = {
-        tid: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, tid) for tid in original_ids
-    }
+    pre_states = {tid: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, tid) for tid in original_ids}
 
     try:
         drafts = materialise_proposal(
@@ -13585,6 +13583,11 @@ def cmd_escalate_proposal(source_task_id: str) -> int:
         return 1
 
     out_of_scope = [f.strip() for f in attributed_files if f.strip() and f.strip() not in set(manifest_files)]
+    # The PARENT's own failing executable gate directive, carried onto each fix
+    # unit so its done-gate re-runs the parent gate -- a fix that merely relocates
+    # the failure cannot reach done (tracked issue:
+    # fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
+    parent_verify_directive = _parent_failing_verify_directive(wu_file)
     mgr = BacklogManager()
 
     if not out_of_scope:
@@ -13603,6 +13606,7 @@ def cmd_escalate_proposal(source_task_id: str) -> int:
             attributed_files=attributed_files,
             manifest_files=manifest_files,
             out_of_scope=out_of_scope,
+            parent_verify_directive=parent_verify_directive,
         )
     except _ProposalInputError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -13663,18 +13667,47 @@ def _resolve_escalation_context(source_task_id: str) -> tuple[Path, WorkUnit, li
     return wu_file, unit, manifest_files
 
 
+def _parent_failing_verify_directive(wu_file: Path) -> str | None:
+    """Return the PARENT unit's failing executable ``VERIFY`` directive line, or ``None``.
+
+    Reads the blocked unit's ``## Verification`` section and returns the directive
+    line of the gate the cross-unit failure came from -- preferring an infra/live
+    directive (terraform/terragrunt/deploy/apply, the class that surfaces
+    cross-unit defects) and otherwise the first executable directive. This exact
+    line is carried onto each fix unit so its done-gate re-runs the PARENT's gate
+    command, so a fix that merely relocates the failure cannot reach ``done``
+    (tracked issue: fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
+    Returns ``None`` when the parent declares no executable directive (the fix unit
+    then keeps its narrow-only verification -- there is no parent gate to re-run).
+    """
+    try:
+        content = wu_file.read_text(encoding="utf-8")
+        items = verification.parse_verification_section(content)
+    except (OSError, ValueError):
+        return None
+    executable = [item for item in items if item.is_executable() and (item.command or "").strip()]
+    if not executable:
+        return None
+    infra = [item for item in executable if item.is_infra()]
+    chosen = infra[0] if infra else executable[0]
+    return chosen.raw or None
+
+
 def _write_escalation_proposal(
     *,
     source_task_id: str,
     attributed_files: list[str],
     manifest_files: list[str],
     out_of_scope: list[str],
+    parent_verify_directive: str | None = None,
 ) -> tuple[Path, list[str]]:
     """Allocate ids, build + write the escalation proposal; return ``(path, fix_ids)``.
 
     Raises ``_ProposalInputError`` on any build / write failure (caught once by
     ``cmd_escalate_proposal``). ``out_of_scope`` is non-empty (the caller has
-    already short-circuited the no-out-of-scope case).
+    already short-circuited the no-out-of-scope case). *parent_verify_directive*
+    is the parent's failing executable gate, carried onto the fix units so their
+    done-gate re-runs the parent gate.
     """
     story_id = "-".join(source_task_id.split("-")[:3])
     try:
@@ -13689,6 +13722,7 @@ def _write_escalation_proposal(
                 f"{source_task_id} live acceptance check failed due to defect(s) in file(s) "
                 f"outside its Changes Manifest: {', '.join(out_of_scope)}"
             ),
+            parent_verify_directive=parent_verify_directive,
         )
     except (ProposalError, ValueError) as exc:
         raise _ProposalInputError(f"cannot build escalation proposal: {exc}") from exc

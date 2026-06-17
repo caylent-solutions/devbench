@@ -885,6 +885,15 @@ class ProposedTask:
     linked_scenarios: list[str]
     suggested_acs: list[str]
     suggested_approach: str
+    #: The PARENT (blocked) unit's failing executable ``VERIFY`` directive, carried
+    #: verbatim so the materialised fix unit's ``## Verification`` re-runs the
+    #: parent's exact gate command -- not only the fix's own narrow diagnostic.
+    #: ``verify-ac`` then executes the parent gate, so a fix that merely RELOCATES
+    #: the failure (trades one error class for another) cannot reach ``done``
+    #: (tracked issue: fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
+    #: ``None`` (the default) preserves the legacy narrow-only behaviour for
+    #: proposals that do not carry a parent gate.
+    parent_verify_directive: str | None = None
 
 
 @dataclass(frozen=True)
@@ -964,6 +973,11 @@ class Proposal:
                     linked_scenarios=[str(x) for x in entry["linked_scenarios"]],
                     suggested_acs=[str(x) for x in entry["suggested_acs"]],
                     suggested_approach=str(entry["suggested_approach"]),
+                    parent_verify_directive=(
+                        str(entry["parent_verify_directive"])
+                        if entry.get("parent_verify_directive") is not None
+                        else None
+                    ),
                 )
             )
 
@@ -1351,6 +1365,7 @@ def build_escalation_proposal(
     suggested_ids: list[str],
     generated_at: str,
     rejection_reason: str,
+    parent_verify_directive: str | None = None,
 ) -> Proposal | None:
     """Decompose a cross-unit-defect block into a fix :class:`Proposal`, or ``None``.
 
@@ -1411,6 +1426,7 @@ def build_escalation_proposal(
             suggested_id=suggested_ids[idx],
             offending_file=offending_file,
             source_task_id=source_task_id,
+            parent_verify_directive=parent_verify_directive,
         )
         for idx, offending_file in enumerate(out_of_scope)
     ]
@@ -1423,13 +1439,22 @@ def build_escalation_proposal(
     )
 
 
-def _build_escalation_fix_task(*, suggested_id: str, offending_file: str, source_task_id: str) -> ProposedTask:
+def _build_escalation_fix_task(
+    *, suggested_id: str, offending_file: str, source_task_id: str, parent_verify_directive: str | None = None
+) -> ProposedTask:
     """Build one fix :class:`ProposedTask` owning *offending_file*.
 
     The corrective AC names the file to repair AND a re-run of the blocked
     unit's failing live AC (referencing ``source_task_id``) so the cascade
     re-validates the original failure once the fix lands. The approach narrative
     is the deterministic four-section structure ``materialise_proposal`` requires.
+
+    When *parent_verify_directive* is supplied (the parent's failing executable
+    ``VERIFY`` line), it is carried onto the task so the materialised fix unit's
+    ``## Verification`` re-runs the PARENT's exact gate command. ``verify-ac`` then
+    executes the parent gate as part of the fix unit's done-gate, so a fix that
+    merely relocates the failure cannot reach ``done`` (tracked issue:
+    fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
     """
     corrective_acs = [
         f"AC-FIX-1 the defect in `{offending_file}` is corrected so it no longer causes "
@@ -1454,6 +1479,7 @@ def _build_escalation_fix_task(*, suggested_id: str, offending_file: str, source
         linked_scenarios=[],
         suggested_acs=corrective_acs,
         suggested_approach=approach,
+        parent_verify_directive=parent_verify_directive,
     )
 
 
@@ -1623,7 +1649,9 @@ def _derive_command_for_ac(files_to_own: list[str]) -> str | None:
     return "uv run pytest " + " ".join(test_files)
 
 
-def _draft_verification_block(suggested_acs: list[str], files_to_own: list[str]) -> str:
+def _draft_verification_block(
+    suggested_acs: list[str], files_to_own: list[str], *, parent_verify_directive: str | None = None
+) -> str:
     """Render a non-stub ``## Verification`` body for a proposal draft (TDI-008).
 
     One directive per AC that carries an ``AC-N`` id:
@@ -1637,6 +1665,14 @@ def _draft_verification_block(suggested_acs: list[str], files_to_own: list[str])
       directive a reviewer assesses; it is never run by ``verify-ac`` and is thus
       always satisfiable.
 
+    When *parent_verify_directive* is supplied (the PARENT unit's failing
+    executable ``VERIFY`` line), the directive for the fix unit's parent-re-run AC
+    (``AC-FIX-2``) is REPLACED by the parent's directive re-labelled to that AC id,
+    so ``verify-ac`` re-runs the parent's exact gate command rather than a narrow
+    derived pytest. A fix that merely relocates the parent failure then cannot pass
+    its own done-gate (tracked issue:
+    fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
+
     The factory NEVER emits a ``<fill-in ...>`` placeholder ``cmd``: such a
     directive cannot pass ``verify-ac`` (the shell cannot execute ``<...>``),
     which would stall the recovery proposal it was generated to unblock.
@@ -1644,6 +1680,10 @@ def _draft_verification_block(suggested_acs: list[str], files_to_own: list[str])
     carries an id.
     """
     from devbench.verification import text_has_execution_verb
+
+    # When a parent gate is supplied, find the fix AC whose text asserts the parent
+    # re-run so its directive runs the PARENT command (not the narrow pytest).
+    parent_gate_ac = _parent_rerun_ac_id(suggested_acs) if parent_verify_directive else None
 
     derived_command = _derive_command_for_ac(files_to_own)
     directives: list[str] = []
@@ -1656,13 +1696,58 @@ def _draft_verification_block(suggested_acs: list[str], files_to_own: list[str])
         if ac_id in seen:
             continue
         seen.append(ac_id)
-        if text_has_execution_verb(line) and derived_command is not None:
+        if parent_verify_directive is not None and ac_id == parent_gate_ac:
+            # Re-run the PARENT's exact failing gate command for this AC.
+            directives.append(_relabel_verify_directive(parent_verify_directive, ac_id))
+        elif text_has_execution_verb(line) and derived_command is not None:
             directives.append(f"- VERIFY {ac_id} | type=command | cmd=`{derived_command}` | expect-exit=0")
         else:
             directives.append(f"- VERIFY {ac_id} | type=judge")
     if not directives:
         directives.append(f"- VERIFY {_first_ac_id(suggested_acs)} | type=judge")
     return "\n".join(directives)
+
+
+def _parent_rerun_ac_id(suggested_acs: list[str]) -> str | None:
+    """Return the fix AC id whose text asserts re-running the parent's failing gate.
+
+    The escalation fix task seeds an ``AC-FIX-2`` whose text says "re-running the
+    blocked unit ... failing live acceptance check passes". Match it by content
+    (the verb 're-run'), not a hard-coded id, so a hand-authored proposal that
+    phrases the parent re-run on a different AC id still wires its directive to the
+    parent gate. Returns ``None`` when no AC asserts a parent re-run.
+    """
+    for line in suggested_acs:
+        match = _DRAFT_AC_ID_RE.search(line)
+        if match is None:
+            continue
+        lowered = line.lower()
+        if "re-run" in lowered or "re-running" in lowered or "rerun" in lowered:
+            return match.group(0)
+    return None
+
+
+def _relabel_verify_directive(directive: str, ac_id: str) -> str:
+    """Return *directive* with its AC id replaced by *ac_id* (the fix unit's AC).
+
+    The parent's directive references the parent's AC id (e.g. ``AC-2``); the fix
+    unit's ``## Verification`` must reference the fix unit's own AC (``AC-FIX-2``)
+    so the directive validates against the fix unit's Acceptance Criteria. Only the
+    leading ``AC-N`` token (before the first ``|``) is rewritten; the rest of the
+    directive -- ``type``, ``cmd``, ``expect-exit`` -- is preserved verbatim so the
+    PARENT's exact gate command is re-run.
+    """
+    body = directive.strip()
+    # Strip any leading list-bullet and the ``VERIFY`` keyword in either form
+    # (``- VERIFY ...`` from a markdown line, or ``VERIFY ...`` from a parsed
+    # VerificationItem.raw) so the rebuilt directive carries exactly one ``VERIFY``.
+    if body.startswith("- "):
+        body = body[2:].lstrip()
+    if body.startswith("VERIFY"):
+        body = body[len("VERIFY") :].lstrip()
+    leading, sep, rest = body.partition("|")
+    leading = _DRAFT_AC_ID_RE.sub(ac_id, leading, count=1)
+    return f"- VERIFY {leading.strip()} {sep}{rest}".rstrip() if sep else f"- VERIFY {leading.strip()}"
 
 
 def generate_draft_md(
@@ -1699,7 +1784,11 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=_draft_manifest_block(proposed.files_to_own),
-        verification=_draft_verification_block(proposed.suggested_acs, proposed.files_to_own),
+        verification=_draft_verification_block(
+            proposed.suggested_acs,
+            proposed.files_to_own,
+            parent_verify_directive=proposed.parent_verify_directive,
+        ),
     )
 
 

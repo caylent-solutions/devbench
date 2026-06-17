@@ -1503,11 +1503,12 @@ uv run devbench remove-dep <blocked-task-id> <blocker-task-id> [--reason "<audit
 
 Exact inverse of [`add-dep`](#add-dep). Removes the `## Dependencies`-table row for `<blocker-task-id>` from `<blocked-task-id>`'s work-unit file (collapsing the table to the canonical `| none | | |` row when it empties) AND strips the open `[BLOCKED_PENDING_PROPOSAL] <blocker-task-id>` marker so the ADR-07 cascade, the `add-dep` reverse-cycle guard, and every other marker reader stop treating the edge as live. A `[DEP_REMOVED]` audit comment recording the cut + operator reason is appended to the blocked task's append-only Comments history.
 
-Use this to undo a dependency wired by `add-dep` (or by `promote-proposal`) when the edge is no longer correct -- for example, after re-scoping the work so the blocked task no longer needs to wait on the blocker.
+Use this to undo a dependency wired by `add-dep` (or by `promote-proposal`) when the edge is no longer correct -- for example, after re-scoping the work so the blocked task no longer needs to wait on the blocker. It is also the sanctioned way to cut a hand-authored **container** dependency edge: when a Task wrongly lists one of its own ancestor containers (parent Story / Feature / Epic) as a dependency, `validate-backlog` rejects it (TDI-001) and `remove-dep <task-id> <ancestor-id>` removes the offending row.
 
 Fail-fast:
 
-- Both IDs must match the `E<N>-F<N>-S<N>-T<N>` task-ID format.
+- `<blocked-task-id>` must match the leaf-Task ID format `E<N>-F<N>-S<N>-T<N>` (the blocked unit is always the Task whose `## Dependencies` table is edited).
+- `<blocker-task-id>` must match the canonical work-unit ID format `E<N>[-F<N>][-S<N>][-T<N>]` -- a leaf Task **or** a container (Epic / Feature / Story), so a non-Task dependency edge can be cut. (`add-dep` keeps the strict leaf-Task blocker shape; it never wires a new container edge.)
 - `<blocked-task-id>` must exist in the backlog index.
 - `<blocker-task-id>` must exist in the backlog index.
 - `<blocked-task-id>` and `<blocker-task-id>` cannot be the same.

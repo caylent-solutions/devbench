@@ -435,8 +435,14 @@ class BacklogParser:
           is ``done`` or ``declined``.
         - **Epic / Feature / Story dep** (no ``T`` segment): satisfied when
           EVERY descendant task whose ID starts with ``<dep_id>-`` is in a
-          terminal state. An epic/feature/story with no task descendants is
-          vacuously satisfied -- there is nothing to wait on.
+          terminal state, EXCLUDING the depending ``unit`` itself and its own
+          subtree. An epic/feature/story with no (other) task descendants is
+          vacuously satisfied -- there is nothing to wait on. The self-exclusion
+          handles a Task that lists one of its OWN ancestor containers (TDI-001):
+          a unit cannot depend on itself, so for a 1-task story the dep is
+          vacuously satisfied, and for a multi-task story it correctly collapses
+          to "wait for my siblings" rather than the unsatisfiable self-block of
+          requiring the depending Task to already be terminal before it may start.
         - **Unknown dep ID** (not in ``units_by_id``): treated as satisfied
           so the orchestrator does not deadlock on a typo'd ID;
           ``validate-backlog`` reports unknown deps as integrity errors so
@@ -460,11 +466,20 @@ class BacklogParser:
             # Non-task dep: every descendant TASK must be terminal. Walk
             # the units list rather than recursing through the hierarchy
             # -- IDs are flat-prefixed so a starts-with comparison covers
-            # every descendant level (Feature -> Story -> Task).
+            # every descendant level (Feature -> Story -> Task). Exclude the
+            # depending unit and its own subtree (TDI-001): a unit cannot depend
+            # on itself, so a Task that lists one of its own ancestor containers
+            # must not wait on itself (which would deadlock as NO_ACTIONABLE
+            # with no cycle reported).
+            self_subtree_prefix = unit.id + "-"
             descendants = [
                 u
                 for u in units_by_id.values()
-                if u.id != dep_id and u.id.startswith(dep_id + "-") and u.unit_type is WorkUnitType.TASK
+                if u.id != dep_id
+                and u.id.startswith(dep_id + "-")
+                and u.unit_type is WorkUnitType.TASK
+                and u.id != unit.id
+                and not u.id.startswith(self_subtree_prefix)
             ]
             for descendant in descendants:
                 if descendant.status not in cls._DEP_TERMINAL_STATUSES:

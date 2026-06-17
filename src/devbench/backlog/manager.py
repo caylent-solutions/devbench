@@ -473,6 +473,7 @@ class BacklogManager:
         self._check_required_sections(rows, workspace_root, errors)
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
+        self._check_no_self_ancestor_dep(rows, workspace_root, errors)
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_committable_manifest_sentinel(rows, workspace_root, errors, warnings, strict=strict)
@@ -541,6 +542,12 @@ class BacklogManager:
             must be one of the recognised values (``test-only``, ``coverage-only``).
             Unknown values are rejected with an error that names the task ID and the
             bad value (``_check_task_type_header``).
+        28. No self-ancestor dependency (TDI-001): a Task must not list one of its
+            own ancestor containers (parent Story / Feature / Epic) in its
+            ``## Dependencies`` table. Such an edge is not a graph cycle (so check
+            21 / ``_check_dep_cycles`` never flags it) yet is always either a no-op
+            or an unsatisfiable self-block that silently drives the daemon to
+            ``NO_ACTIONABLE`` (``_check_no_self_ancestor_dep``).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -3173,6 +3180,51 @@ class BacklogManager:
                         f"{row_id}: dependency ID {dep_id!r} does not match the "
                         f"canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]. "
                         f"Fix the row in '## Dependencies' or remove it."
+                    )
+
+    def _check_no_self_ancestor_dep(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """TDI-001: reject a Task that depends on one of its own ancestor containers.
+
+        A Task ``E<e>-F<f>-S<s>-T<t>`` whose ``## Dependencies`` table lists one
+        of its own ancestors -- the parent Story ``E<e>-F<f>-S<s>``, Feature
+        ``E<e>-F<f>``, or Epic ``E<e>`` -- is always either a no-op (a 1-Task
+        story: the only descendant Task is the depending Task itself) or a
+        self-block (a multi-Task story collapses to "wait for my siblings", but
+        the literal "every descendant Task must be terminal" reading required the
+        Task to be terminal before it could start). Neither is a meaningful
+        authored dependency.
+
+        ``_check_dep_cycles`` does NOT catch this: a self-ancestor edge points
+        from a Task to its own container, which is not a cycle in the dependency
+        graph, so the backlog passes every authoring gate yet the daemon goes
+        straight to ``NO_ACTIONABLE`` (indistinguishable from "all done"). This
+        gate rejects the edge at ``validate-backlog`` time so it cannot reach a
+        launch-ready backlog. The detection is purely structural: ``dep_id`` is a
+        self-ancestor of ``row_id`` when ``row_id`` starts with ``dep_id + "-"``.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            for dep_id in self._iter_dep_ids(content):
+                if row_id.startswith(dep_id + "-"):
+                    errors.append(
+                        f"{row_id}: dependency {dep_id!r} is one of this Task's own ancestor "
+                        f"containers. A Task cannot depend on its own Epic/Feature/Story -- the "
+                        f"edge is either a no-op (1-task story) or an unsatisfiable self-block. "
+                        f"Remove the row from '## Dependencies' (use `devbench remove-dep "
+                        f"{row_id} {dep_id}`) or replace it with a real sibling/cross-task "
+                        f"dependency."
                     )
 
     def _check_branch_uniqueness(

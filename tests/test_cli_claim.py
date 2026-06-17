@@ -4,11 +4,19 @@ Verifies that cmd_claim resolves the target repo before acquiring the lock,
 writes the [BLOCKED_TARGET_REPO_UNRESOLVED] marker idempotently, sets the
 unit to blocked, and returns exit code 44 (CLAIM_BLOCKED_PRECLAIM) with no
 lock acquired.
+
+Also covers the on-claim foreign-WIP eviction (TDI-006): a unit claimed into a
+checkout that still carries orphaned staged / working-tree WIP from a prior
+interrupted unit must start from a clean tree, with the orphaned (non-manifest)
+WIP evicted from BOTH the index and the working tree -- while the claimed
+unit's own legitimate manifest work is never clobbered.
 """
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -362,3 +370,380 @@ class TestCmdClaimResolvableRepoProceeds:
         assert rc == 0
         assert entered, "flock_backlog must be entered for a resolvable repo"
         mock_mgr.force_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TDI-006: on-claim foreign-WIP eviction
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> str:
+    """Run a git command in *repo* and return stripped stdout (fail-fast)."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _init_checkout(repo: Path) -> None:
+    """Initialise a git checkout with one committed baseline file."""
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "baseline")
+
+
+def _staged_paths(repo: Path) -> set[str]:
+    """Return the set of paths currently staged (index differs from HEAD)."""
+    out = _git(repo, "diff", "--cached", "--name-only")
+    return {line for line in out.splitlines() if line}
+
+
+def _porcelain(repo: Path) -> str:
+    """Return ``git status --porcelain`` output for *repo*."""
+    return _git(repo, "status", "--porcelain")
+
+
+class TestCmdClaimEvictsForeignWip:
+    """TDI-006: on claim the checkout is cleaned of foreign orphaned WIP."""
+
+    def _claim_into_checkout(
+        self,
+        backlog_dir: Path,
+        checkout: Path,
+        *,
+        manifest_path: str = "src/x.py",
+    ) -> int:
+        """Run cmd_claim for a unit whose manifest lists *manifest_path*.
+
+        Wires the unit's resolvable repo to *checkout* via REPO_LOCAL_PATHS so
+        the on-claim cleanup operates on the real git checkout.
+        """
+        unit, _wu_file = _make_unit(backlog_dir, repo="caylent-solutions/git-repo")
+        # Rewrite the manifest row so the unit's own legitimate path is known.
+        _wu_file.write_text(
+            f"# {unit.id}: Test\n\n## Status: in-queue\n\n## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            f"| {manifest_path} | modify |\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        backlog_index = _make_backlog_index(backlog_dir.parent, unit.id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_mgr = MagicMock()
+        canonical = "caylent-solutions/git-repo"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+            patch("devbench.cli.resolve_repo", return_value=canonical),
+            patch.dict("devbench.cli.REPO_LOCAL_PATHS", {canonical: checkout}, clear=False),
+        ):
+            return cli.cmd_claim(unit.id)
+
+    def test_orphaned_staged_wip_is_evicted_from_index(
+        self,
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Foreign staged WIP in the checkout is unstaged AND removed from the tree on claim."""
+        checkout = tmp_path / "checkout"
+        _init_checkout(checkout)
+        # Orphaned WIP from a prior interrupted unit: a foreign file, staged.
+        foreign = checkout / "src" / "lockfile.py"
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_text("orphaned = True\n", encoding="utf-8")
+        _git(checkout, "add", "src/lockfile.py")
+        assert "src/lockfile.py" in _staged_paths(checkout), "precondition: foreign WIP staged"
+
+        rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
+
+        assert rc == 0
+        # The foreign path must no longer be staged...
+        assert "src/lockfile.py" not in _staged_paths(checkout)
+        # ...and must no longer pollute the working tree (evicted, not merely unstaged).
+        assert not foreign.exists(), "foreign WIP must be removed from the working tree"
+        # The index must be clean (no staged changes at all).
+        assert _staged_paths(checkout) == set()
+
+    def test_orphaned_wip_is_recoverable_via_stash(
+        self,
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Evicted foreign WIP is parked (stashed), not destroyed -- it is recoverable."""
+        checkout = tmp_path / "checkout"
+        _init_checkout(checkout)
+        foreign = checkout / "src" / "lockfile.py"
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_text("orphaned = True\n", encoding="utf-8")
+        _git(checkout, "add", "src/lockfile.py")
+
+        rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
+
+        assert rc == 0
+        # A stash entry must exist holding the evicted WIP (recoverable backup).
+        stash_list = _git(checkout, "stash", "list")
+        assert stash_list, "evicted foreign WIP must be parked in a stash for recovery"
+
+    def test_claimed_units_own_manifest_work_is_preserved(
+        self,
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The claimed unit's own in-progress manifest work survives the cleanup."""
+        checkout = tmp_path / "checkout"
+        _init_checkout(checkout)
+        # The claimed unit's OWN legitimate in-progress work (resumed unit).
+        own = checkout / "src" / "x.py"
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text("legit = 1\n", encoding="utf-8")
+        _git(checkout, "add", "src/x.py")
+        # A foreign orphan from a prior interrupted unit, also staged.
+        foreign = checkout / "src" / "lockfile.py"
+        foreign.write_text("orphaned = True\n", encoding="utf-8")
+        _git(checkout, "add", "src/lockfile.py")
+
+        rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="src/x.py")
+
+        assert rc == 0
+        # Foreign orphan evicted...
+        assert not foreign.exists()
+        assert "src/lockfile.py" not in _staged_paths(checkout)
+        # ...but the unit's own manifest file is untouched in the working tree.
+        assert own.exists(), "the claimed unit's own manifest work must NOT be clobbered"
+        assert own.read_text(encoding="utf-8") == "legit = 1\n"
+
+    def test_clean_checkout_claim_is_a_noop(
+        self,
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Claiming into an already-clean checkout leaves the tree untouched (no stash)."""
+        checkout = tmp_path / "checkout"
+        _init_checkout(checkout)
+        assert _porcelain(checkout) == "", "precondition: clean checkout"
+
+        rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
+
+        assert rc == 0
+        assert _porcelain(checkout) == "", "a clean claim must not dirty the tree"
+        assert _git(checkout, "stash", "list") == "", "a clean claim must create no stash"
+
+    def test_non_git_checkout_is_a_noop(
+        self,
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Claiming when the configured checkout is not a git repo is a safe no-op."""
+        checkout = tmp_path / "not-a-git-repo"
+        checkout.mkdir()
+        (checkout / "file.txt").write_text("plain\n", encoding="utf-8")
+
+        rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
+
+        assert rc == 0
+        # The directory and its contents are left intact (no crash, no eviction).
+        assert (checkout / "file.txt").exists()
+
+
+class TestDirtyPaths:
+    """Unit coverage for the _dirty_paths git-status parser."""
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path) -> None:
+        """A path that is not a directory yields None (nothing to clean)."""
+        assert cli._dirty_paths(tmp_path / "does-not-exist") is None
+
+    def test_non_git_directory_returns_none(self, tmp_path: Path) -> None:
+        """An existing directory that is not a git checkout yields None."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "a.txt").write_text("x\n", encoding="utf-8")
+        assert cli._dirty_paths(plain) is None
+
+    def test_lists_staged_untracked_and_modified(self, tmp_path: Path) -> None:
+        """Staged, untracked, and working-tree-modified paths are all reported."""
+        repo = tmp_path / "repo"
+        _init_checkout(repo)
+        # Modify the committed baseline (working-tree change).
+        (repo / "README.md").write_text("changed\n", encoding="utf-8")
+        # A new staged file.
+        (repo / "staged.py").write_text("s = 1\n", encoding="utf-8")
+        _git(repo, "add", "staged.py")
+        # An untracked file.
+        (repo / "untracked.txt").write_text("u\n", encoding="utf-8")
+
+        result = cli._dirty_paths(repo)
+
+        assert result is not None
+        assert set(result) == {"README.md", "staged.py", "untracked.txt"}
+
+    def test_rename_record_reports_only_destination(self, tmp_path: Path) -> None:
+        """A staged rename reports the destination path, not the original, exactly once."""
+        repo = tmp_path / "repo"
+        _init_checkout(repo)
+        (repo / "old_name.py").write_text("body\n", encoding="utf-8")
+        _git(repo, "add", "old_name.py")
+        _git(repo, "commit", "-q", "-m", "add old_name")
+        # Rename via git so status reports an "R" record (two NUL fields).
+        _git(repo, "mv", "old_name.py", "new_name.py")
+
+        result = cli._dirty_paths(repo)
+
+        assert result is not None
+        assert "new_name.py" in result
+        assert "old_name.py" not in result
+        # The destination must appear exactly once (the original field is consumed).
+        assert result.count("new_name.py") == 1
+
+
+class TestOwnManifestPaths:
+    """Unit coverage for _own_manifest_paths fallbacks."""
+
+    def test_returns_empty_when_wu_file_unresolvable(self) -> None:
+        """A unit whose work-unit file cannot be resolved yields an empty set."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T9",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T9.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        with patch("devbench.cli._resolve_unit_file", return_value=None):
+            assert cli._own_manifest_paths(unit) == set()
+
+    def test_returns_empty_when_manifest_unparsable(self, backlog_dir: Path) -> None:
+        """A work-unit file with no Changes Manifest section yields an empty set.
+
+        parse_manifest raises ManifestParseError (a ValueError) when the
+        ``## Changes Manifest`` section is absent; the helper swallows it.
+        """
+        unit, wu_file = _make_unit(backlog_dir, repo="caylent-solutions/git-repo")
+        # Remove the Changes Manifest section so parse_manifest raises.
+        wu_file.write_text(
+            f"# {unit.id}: Test\n\n## Status: in-queue\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        with patch("devbench.cli._resolve_unit_file", return_value=wu_file):
+            assert cli._own_manifest_paths(unit) == set()
+
+    def test_returns_committable_manifest_paths(self, backlog_dir: Path) -> None:
+        """A valid manifest yields its real (non-sentinel) file paths."""
+        unit, wu_file = _make_unit(backlog_dir, repo="caylent-solutions/git-repo")
+        with patch("devbench.cli._resolve_unit_file", return_value=wu_file):
+            assert cli._own_manifest_paths(unit) == {"src/x.py"}
+
+
+class TestResolveClaimCheckout:
+    """Unit coverage for _resolve_claim_checkout guards."""
+
+    def _unit(self, *, repo: str) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T8",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T8.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    def test_empty_repo_returns_none(self) -> None:
+        """A unit with no repo cannot be cleaned (None)."""
+        assert cli._resolve_claim_checkout(self._unit(repo="")) is None
+
+    def test_unresolvable_repo_returns_none(self) -> None:
+        """A unit whose repo cannot be resolved yields None (no cleanup)."""
+        with patch("devbench.cli.resolve_repo", side_effect=ValueError("nope")):
+            assert cli._resolve_claim_checkout(self._unit(repo="x/y")) is None
+
+    def test_no_configured_checkout_returns_none(self) -> None:
+        """A resolvable repo with no configured local checkout yields None."""
+        with (
+            patch("devbench.cli.resolve_repo", return_value="x/y"),
+            patch.dict("devbench.cli.REPO_LOCAL_PATHS", {}, clear=True),
+        ):
+            assert cli._resolve_claim_checkout(self._unit(repo="x/y")) is None
+
+    def test_missing_checkout_dir_returns_none(self, tmp_path: Path) -> None:
+        """A configured checkout path that does not exist yields None."""
+        missing = tmp_path / "missing"
+        with (
+            patch("devbench.cli.resolve_repo", return_value="x/y"),
+            patch.dict("devbench.cli.REPO_LOCAL_PATHS", {"x/y": missing}, clear=True),
+        ):
+            assert cli._resolve_claim_checkout(self._unit(repo="x/y")) is None
+
+
+class TestCleanForeignWipBranches:
+    """Unit coverage for _clean_foreign_wip_on_claim edge branches."""
+
+    def _unit(self, *, repo: str = "caylent-solutions/git-repo") -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T7",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T7.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    def test_unresolvable_checkout_is_noop(self) -> None:
+        """No checkout resolved -> no eviction (False)."""
+        with patch("devbench.cli._resolve_claim_checkout", return_value=None):
+            assert cli._clean_foreign_wip_on_claim(self._unit()) is False
+
+    def test_only_own_manifest_dirty_is_noop(self, tmp_path: Path) -> None:
+        """When the only dirty paths belong to the claimed unit, nothing is evicted."""
+        repo = tmp_path / "repo"
+        _init_checkout(repo)
+        own = repo / "src" / "x.py"
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text("legit = 1\n", encoding="utf-8")
+        _git(repo, "add", "src/x.py")
+
+        with (
+            patch("devbench.cli._resolve_claim_checkout", return_value=repo),
+            patch("devbench.cli._own_manifest_paths", return_value={"src/x.py"}),
+        ):
+            assert cli._clean_foreign_wip_on_claim(self._unit()) is False
+
+        # The unit's own staged work is untouched and no stash was created.
+        assert "src/x.py" in _staged_paths(repo)
+        assert _git(repo, "stash", "list") == ""
+
+    def test_stash_push_failure_returns_false(self, tmp_path: Path) -> None:
+        """A failing git stash push is reported (False) and never raises."""
+        repo = tmp_path / "repo"
+        _init_checkout(repo)
+        foreign = repo / "foreign.py"
+        foreign.write_text("orphan = 1\n", encoding="utf-8")
+        _git(repo, "add", "foreign.py")
+
+        failing = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+        real_run = subprocess.run
+
+        def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if len(cmd) >= 4 and cmd[3] == "stash":
+                return failing
+            return real_run(cmd, **kwargs)
+
+        with (
+            patch("devbench.cli._resolve_claim_checkout", return_value=repo),
+            patch("devbench.cli._own_manifest_paths", return_value=set()),
+            patch("devbench.cli.subprocess.run", side_effect=_fake_run),
+        ):
+            assert cli._clean_foreign_wip_on_claim(self._unit()) is False

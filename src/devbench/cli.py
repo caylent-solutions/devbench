@@ -1420,6 +1420,12 @@ def cmd_claim(unit_id: str) -> int:
         print(error_message, file=sys.stderr)
         return 1
 
+    # TDI-006: before the executor starts, evict any foreign (non-manifest)
+    # orphaned WIP left in the target checkout by a prior interrupted unit so
+    # every executor begins from a known-clean tree. The claimed unit's own
+    # manifest work is preserved; evicted WIP is parked in a recoverable stash.
+    _clean_foreign_wip_on_claim(unit)
+
     logger.info("Claimed %s (set to in-progress)", unit_id)
     print(f"Claimed {unit_id}")
     return 0
@@ -12120,6 +12126,147 @@ def _unstage_interrupted_wip(repo_path: Path, *, unit_id: str, reason: str) -> b
         repo_path,
         unit_id,
         reason,
+    )
+    return True
+
+
+def _dirty_paths(repo_path: Path) -> list[str] | None:
+    """Return every path with index/working-tree/untracked changes in *repo_path*.
+
+    Uses ``git status --porcelain -z`` so paths with spaces or special
+    characters are unambiguous. Returns the repo-relative paths (renames are
+    expanded to the destination path). Returns ``None`` when *repo_path* is not
+    a git checkout or the status probe fails -- the caller treats that as
+    "nothing to clean" (best-effort, never raises into the claim path).
+    """
+    if not repo_path.is_dir():
+        return None
+    probe = subprocess.run(
+        ["git", "-C", str(repo_path), "status", "--porcelain", "-z"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return None
+    paths: list[str] = []
+    # NUL-delimited records: each is "XY <path>"; a rename ("R") record is
+    # followed by a second NUL-delimited field holding the ORIGINAL path,
+    # which must be consumed but is not a dirty destination path itself.
+    fields = [field for field in probe.stdout.split("\0") if field]
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        status_code = record[:2]
+        path = record[3:]
+        if path:
+            paths.append(path)
+        if status_code and status_code[0] in ("R", "C"):
+            # Consume the trailing original-path field for rename/copy records.
+            index += 1
+        index += 1
+    return paths
+
+
+def _own_manifest_paths(unit: WorkUnit) -> set[str]:
+    """Return the claimed unit's own legitimate manifest file paths.
+
+    These are the real (non-sentinel) ``Changes Manifest`` paths the executor
+    for *unit* is permitted to touch. The on-claim cleanup must NOT evict these
+    -- a resumed in-progress unit's own WIP is legitimate. Returns an empty set
+    when the work-unit file or its manifest cannot be read (best-effort).
+    """
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        return set()
+    from devbench.backlog.manifest import parse_manifest
+
+    try:
+        manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return set(_committable_manifest_paths(manifest_rows))
+
+
+def _resolve_claim_checkout(unit: WorkUnit) -> Path | None:
+    """Resolve *unit*'s target checkout for on-claim cleanup, or ``None``.
+
+    Returns the existing git-checkout directory configured for the unit's repo,
+    or ``None`` when the unit has no repo, the repo is unresolvable, no local
+    checkout is configured, or the configured path is not a directory. Keeps
+    :func:`_clean_foreign_wip_on_claim` within the PLR0911 return budget.
+    """
+    if not unit.repo:
+        return None
+    try:
+        canonical_repo = resolve_repo(unit.repo)
+    except ValueError:
+        return None
+    configured = REPO_LOCAL_PATHS.get(canonical_repo)
+    if configured is None:
+        return None
+    repo_path = Path(configured)
+    if not repo_path.is_dir():
+        return None
+    return repo_path
+
+
+def _clean_foreign_wip_on_claim(unit: WorkUnit) -> bool:
+    """Evict foreign (non-manifest) orphaned WIP from the unit's checkout on claim.
+
+    When a prior unit is interrupted (crash, quota exit, SIGTERM) mid-execution
+    its staged / working-tree edits can remain in the shared single-branch
+    checkout. In single-branch mode ``ensure_branch`` is a no-op (no stash), so
+    that orphaned WIP would otherwise reach the NEXT unit's executor, which then
+    either bundles foreign files into its commit (manifest-scope violation) or
+    takes investigative/destructive action (tracked issue TDI-006).
+
+    On claim this parks every dirty path that does NOT belong to *unit*'s own
+    Changes Manifest into a single ``git stash push -u`` entry -- removing the
+    foreign WIP from BOTH the index and the working tree while keeping it
+    recoverable (the owning unit redoes the work when next claimed, the stash is
+    a backup). The claimed unit's own manifest paths are explicitly preserved so
+    a resumed in-progress unit's legitimate WIP is never clobbered.
+
+    Best-effort: a no-op (returns ``False``) when the repo is unresolvable, has
+    no configured checkout, is not a git repo, or carries no foreign WIP. Never
+    raises into the claim path. Returns ``True`` when foreign WIP was evicted.
+    """
+    repo_path = _resolve_claim_checkout(unit)
+    if repo_path is None:
+        return False
+
+    dirty = _dirty_paths(repo_path)
+    if not dirty:
+        return False
+    own = _own_manifest_paths(unit)
+    foreign = [path for path in dirty if path not in own]
+    if not foreign:
+        # The only dirty paths belong to the claimed unit itself -- leave them.
+        return False
+
+    stash_message = f"devbench: orphaned WIP evicted on claim of {unit.id}"
+    stash_result = subprocess.run(
+        ["git", "-C", str(repo_path), "stash", "push", "-u", "-m", stash_message, "--", *foreign],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if stash_result.returncode != 0:
+        logger.warning(
+            "_clean_foreign_wip_on_claim: git stash push failed for '%s' (unit %s); foreign WIP NOT evicted: %s",
+            repo_path,
+            unit.id,
+            stash_result.stderr.strip(),
+        )
+        return False
+    logger.info(
+        "_clean_foreign_wip_on_claim: evicted %d foreign WIP path(s) %s from '%s' on claim of %s "
+        "(parked in a recoverable stash); the claimed unit's own manifest work is preserved.",
+        len(foreign),
+        sorted(foreign),
+        repo_path,
+        unit.id,
     )
     return True
 

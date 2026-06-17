@@ -17,13 +17,106 @@ tests never spawn a session.
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from devbench.cli import (
     ClaimConvergenceTracker,
     _extract_failure_signature,
 )
+
+# Minimal backlog index + work-unit pair reused by the teardown tests so the
+# real ``_block_non_converging_claim`` resolves an on-disk unit (DRY with
+# ``TestBlockNonConvergingClaim``).
+_BLOCK_INDEX = """\
+# Backlog
+
+## Status Summary
+
+| Epic | Title | Done | In Progress | In Queue | Blocked |
+|------|-------|------|-------------|----------|---------|
+| EX | Example Epic | 0 | 1 | 0 | 0 |
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| EX-F1-S1-T1 | Sample | Task | in-progress | None | caylent-solutions/example | `backlog/EX-F1-S1-T1.md` |
+"""
+
+_BLOCK_WU = """\
+# EX-F1-S1-T1: Sample
+
+## Status: in-progress
+
+## Description
+
+x
+
+## Dependencies
+
+| ID | Title | Status |
+|----|-------|--------|
+| none | | |
+
+## Acceptance Criteria
+
+- [ ] AC-1 something
+
+## Changes Manifest
+
+| File | Change |
+|------|--------|
+| `src/x.py` | modify |
+
+## Definition of Done
+
+- [ ] done
+"""
+
+
+def _write_block_backlog(tmp_path: Path, monkeypatch: Any) -> None:
+    """Write the minimal index + unit and point the cli module at it."""
+    from devbench import cli
+
+    (tmp_path / "BACKLOG.md").write_text(_BLOCK_INDEX, encoding="utf-8")
+    backlog = tmp_path / "backlog"
+    backlog.mkdir()
+    (backlog / "EX-F1-S1-T1.md").write_text(_BLOCK_WU, encoding="utf-8")
+    monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog)
+    monkeypatch.setattr(cli, "BACKLOG_INDEX", tmp_path / "BACKLOG.md")
+
+
+def _spawn_sleeper_group() -> tuple[subprocess.Popen[bytes], int]:
+    """Spawn a long-lived sleeper as a session leader; return (proc, pgid).
+
+    ``start_new_session=True`` puts the child in its OWN process group whose
+    pgid equals the child pid -- the positively-attributed group a real
+    executor's ``make``/``go test``/``terraform`` tree would form when launched
+    the same way.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        start_new_session=True,
+    )
+    return proc, os.getpgid(proc.pid)
+
+
+def _wait_until_dead(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> bool:
+    """Poll until *proc* terminates (readiness detection, not a fixed sleep)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.02)
+    return proc.poll() is not None
+
 
 # --- Synthetic SDK message doubles (duck-typed like the real SDK messages) ---
 
@@ -519,3 +612,318 @@ class TestResolveMaxNonConvergingClaims:
         monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", raising=False)
         monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "max_non_converging_claims", 9)
         assert cli._resolve_max_non_converging_claims() == 9
+
+
+class TestTerminateProcessGroup:
+    """The attributed single-pgid teardown primitive (Item B).
+
+    Tears down EXACTLY one positively-attributed process group via
+    ``os.killpg(pgid, SIGTERM)`` -- never a broad / machine-wide kill, and
+    never the orchestrator's own group, so it can never reach an unrelated
+    session.
+    """
+
+    def test_signals_only_the_attributed_group(self) -> None:
+        from devbench import cli
+
+        target_proc, target_pgid = _spawn_sleeper_group()
+        bystander_proc, _ = _spawn_sleeper_group()
+        try:
+            signalled = cli._terminate_process_group(target_pgid)
+            assert signalled is True
+            # The attributed group dies; the unrelated group keeps running.
+            assert _wait_until_dead(target_proc), "attributed executor group was not torn down"
+            assert bystander_proc.poll() is None, "an UNRELATED process group was killed"
+        finally:
+            for proc in (target_proc, bystander_proc):
+                if proc.poll() is None:
+                    with contextlib_suppress():
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=5)
+
+    def test_refuses_init_and_kernel_groups(self) -> None:
+        from devbench import cli
+
+        # pgid 0 (caller's group) and 1 (init) are NEVER signalled -- a broad
+        # kill guard. Returns False without raising.
+        assert cli._terminate_process_group(0) is False
+        assert cli._terminate_process_group(1) is False
+
+    def test_refuses_own_process_group(self) -> None:
+        from devbench import cli
+
+        # The orchestrator must never tear down its OWN process group (that
+        # would kill the daemon / unrelated in-flight work).
+        own_pgid = os.getpgrp()
+        assert cli._terminate_process_group(own_pgid) is False
+
+    def test_missing_group_is_safe(self) -> None:
+        from devbench import cli
+
+        # A group that already exited (ProcessLookupError) is a no-op success
+        # for teardown, not a fault.
+        proc, pgid = _spawn_sleeper_group()
+        os.killpg(pgid, signal.SIGKILL)
+        proc.wait(timeout=5)
+        # Signalling the now-dead group must not raise.
+        cli._terminate_process_group(pgid)
+
+    def test_oserror_on_signal_returns_false(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        # killpg raising OSError (e.g. EPERM) is reported as a failed teardown
+        # (False), never swallowed silently.
+        def _boom(_pgid: int, _sig: int) -> None:
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(cli.os, "killpg", _boom)
+        assert cli._terminate_process_group(424242) is False
+
+
+class TestRunClaimTeardownCleanupHook:
+    """The sanctioned post-teardown cleanup hook runner (best-effort)."""
+
+    def test_success_path(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "run_command", lambda _cmd: (0, "ok", ""))
+        # Must not raise on rc=0.
+        cli._run_claim_teardown_cleanup_hook("sweep")
+
+    def test_nonzero_exit_is_logged_not_raised(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "run_command", lambda _cmd: (2, "", "sweep failed"))
+        # A non-zero exit is logged, not propagated (the loop must still exit).
+        cli._run_claim_teardown_cleanup_hook("sweep")
+
+
+class TestTeardownNonConvergingExecutor:
+    """The orchestration of teardown -> conditional cleanup hook."""
+
+    def test_noop_when_no_pgid(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        called: list[int] = []
+        monkeypatch.setattr(cli, "_terminate_process_group", called.append)
+        cli._teardown_non_converging_executor("EX-F1-S1-T1", None)
+        assert called == []
+
+    def test_skips_cleanup_when_teardown_refused(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        # When the group is refused (e.g. it was the orchestrator's own pgid),
+        # the cleanup hook is NOT run.
+        monkeypatch.setattr(cli, "_terminate_process_group", lambda _pgid: False)
+        hook_calls: list[str] = []
+        monkeypatch.setattr(cli, "_resolve_claim_teardown_cleanup_hook", lambda: "sweep")
+        monkeypatch.setattr(cli, "_run_claim_teardown_cleanup_hook", hook_calls.append)
+        cli._teardown_non_converging_executor("EX-F1-S1-T1", 4242)
+        assert hook_calls == []
+
+
+class TestRegisterExecutorPgidErrorPath:
+    """_register_executor_pgid tolerates a write failure (best-effort)."""
+
+    def test_write_failure_is_logged_not_raised(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+
+        def _boom(_path: object, _text: str) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cli, "atomic_write_text", _boom)
+        # Must not raise -- the command still runs; only the teardown handle is lost.
+        cli._register_executor_pgid(4242, session_name="alpha")
+
+
+class TestBlockNonConvergingClaimTeardown:
+    """``_block_non_converging_claim`` tears down the attributed executor group.
+
+    On blocking a non-converging claim the executor's spawned subprocess group
+    (a live ``terraform apply`` / ``go test`` tree) must be torn down so it is
+    not orphaned to init and left leaking billable resources (Item B).
+    """
+
+    def test_block_tears_down_attributed_executor_group(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+        from devbench.constants import CLAIM_NOT_CONVERGING_MARKER
+
+        _write_block_backlog(tmp_path, monkeypatch)
+        executor_proc, executor_pgid = _spawn_sleeper_group()
+        bystander_proc, _ = _spawn_sleeper_group()
+        try:
+            cli._block_non_converging_claim(
+                "EX-F1-S1-T1",
+                "make tf-test::EX-F1-S1-T1",
+                executor_pgid=executor_pgid,
+            )
+            # The unit is blocked AND the attributed group is torn down.
+            updated = (tmp_path / "backlog" / "EX-F1-S1-T1.md").read_text(encoding="utf-8")
+            assert "## Status: blocked" in updated
+            assert CLAIM_NOT_CONVERGING_MARKER in updated
+            assert _wait_until_dead(executor_proc), "executor subprocess group was orphaned, not torn down"
+            assert bystander_proc.poll() is None, "an UNRELATED process group was killed"
+        finally:
+            for proc in (executor_proc, bystander_proc):
+                if proc.poll() is None:
+                    with contextlib_suppress():
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=5)
+
+    def test_block_without_pgid_does_not_signal(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        _write_block_backlog(tmp_path, monkeypatch)
+        captured: list[int] = []
+
+        def _record(pgid: int) -> bool:
+            captured.append(pgid)
+            return True
+
+        monkeypatch.setattr(cli, "_terminate_process_group", _record)
+        # No attributed executor pgid -> no teardown attempted (the prior
+        # behaviour is preserved for non-subprocess claims).
+        cli._block_non_converging_claim("EX-F1-S1-T1", "verify-ac::EX-F1-S1-T1")
+        assert captured == []
+        updated = (tmp_path / "backlog" / "EX-F1-S1-T1.md").read_text(encoding="utf-8")
+        assert "## Status: blocked" in updated
+
+    def test_block_runs_sanctioned_cleanup_hook_when_configured(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        _write_block_backlog(tmp_path, monkeypatch)
+        executor_proc, executor_pgid = _spawn_sleeper_group()
+        sentinel = tmp_path / "cleanup-ran.txt"
+        # A sanctioned, run-id-scoped cleanup hook (e.g. the terratest sweep):
+        # config-driven, only invoked when configured.
+        monkeypatch.setattr(cli, "_resolve_claim_teardown_cleanup_hook", lambda: f"touch {sentinel}")
+        try:
+            cli._block_non_converging_claim(
+                "EX-F1-S1-T1",
+                "make tf-test::EX-F1-S1-T1",
+                executor_pgid=executor_pgid,
+            )
+            assert sentinel.exists(), "configured sanctioned cleanup hook was not triggered on block"
+        finally:
+            if executor_proc.poll() is None:
+                with contextlib_suppress():
+                    os.killpg(os.getpgid(executor_proc.pid), signal.SIGKILL)
+                executor_proc.wait(timeout=5)
+
+    def test_block_skips_cleanup_hook_when_unconfigured(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        _write_block_backlog(tmp_path, monkeypatch)
+        executor_proc, executor_pgid = _spawn_sleeper_group()
+        ran: list[str] = []
+        monkeypatch.setattr(cli, "_resolve_claim_teardown_cleanup_hook", lambda: None)
+        monkeypatch.setattr(cli, "_run_claim_teardown_cleanup_hook", ran.append)
+        try:
+            cli._block_non_converging_claim(
+                "EX-F1-S1-T1",
+                "make tf-test::EX-F1-S1-T1",
+                executor_pgid=executor_pgid,
+            )
+            assert ran == [], "cleanup hook was run despite no hook being configured"
+        finally:
+            if executor_proc.poll() is None:
+                with contextlib_suppress():
+                    os.killpg(os.getpgid(executor_proc.pid), signal.SIGKILL)
+                executor_proc.wait(timeout=5)
+
+
+def contextlib_suppress() -> Any:
+    """Local alias kept tiny so the teardown finally-blocks stay readable."""
+    import contextlib
+
+    return contextlib.suppress(ProcessLookupError, OSError)
+
+
+class TestExecutorPgidRegistry:
+    """The session-scoped executor-pgid attribution channel.
+
+    The in-session live-command runner records the pgid of the external command
+    it launched; the orchestrator reads it at block time. Keyed by session so two
+    sessions on one workspace never cross-attribute.
+    """
+
+    def test_register_then_read_round_trips(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        cli._register_executor_pgid(4242, session_name="alpha")
+        assert cli._read_attributed_executor_pgid(session_name="alpha") == 4242
+
+    def test_read_is_none_when_unregistered(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        assert cli._read_attributed_executor_pgid(session_name="alpha") is None
+
+    def test_clear_removes_the_registration(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        cli._register_executor_pgid(99, session_name="alpha")
+        cli._clear_executor_pgid(session_name="alpha")
+        assert cli._read_attributed_executor_pgid(session_name="alpha") is None
+
+    def test_sessions_are_isolated(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        cli._register_executor_pgid(11, session_name="alpha")
+        cli._register_executor_pgid(22, session_name="beta")
+        # Each session reads ONLY its own pgid -- never the other's.
+        assert cli._read_attributed_executor_pgid(session_name="alpha") == 11
+        assert cli._read_attributed_executor_pgid(session_name="beta") == 22
+
+    def test_read_rejects_reserved_pgid(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        cli._register_executor_pgid(1, session_name="alpha")  # init -- never attributable
+        assert cli._read_attributed_executor_pgid(session_name="alpha") is None
+
+    def test_read_is_none_on_malformed_file(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        path = cli._executor_pgid_file("alpha")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not-a-pid\n", encoding="utf-8")
+        assert cli._read_attributed_executor_pgid(session_name="alpha") is None
+
+
+class TestResolveClaimTeardownCleanupHook:
+    """The sanctioned post-teardown cleanup hook (env > YAML > constant)."""
+
+    def test_none_when_unset(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK", raising=False)
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "claim_teardown_cleanup_hook", None)
+        assert cli._resolve_claim_teardown_cleanup_hook() is None
+
+    def test_empty_string_means_no_hook(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK", raising=False)
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "claim_teardown_cleanup_hook", "   ")
+        assert cli._resolve_claim_teardown_cleanup_hook() is None
+
+    def test_env_overrides_yaml(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "claim_teardown_cleanup_hook", "yaml-sweep")
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK", "env-sweep")
+        assert cli._resolve_claim_teardown_cleanup_hook() == "env-sweep"
+
+    def test_yaml_used_when_env_unset(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from devbench import cli
+
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_CLAIM_TEARDOWN_CLEANUP_HOOK", raising=False)
+        monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "claim_teardown_cleanup_hook", "yaml-sweep")
+        assert cli._resolve_claim_teardown_cleanup_hook() == "yaml-sweep"

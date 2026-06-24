@@ -204,14 +204,10 @@ file ships at `/path/to/kanon-deps-work/devbench-commands.txt` in any live run.
 - [`how-it-was-made.md`](how-it-was-made.md) -- comprehensive step-by-step
   journey from spec lock to validated backlog (every iteration, every
   validator finding, every fix).
-- [`operator-interventions.md`](operator-interventions.md) -- running log of
-  every operator decision made WHILE DevBench was processing this backlog
-  (recovery actions, scope authorisations, devbench bugs filed). Updated
-  as the run progresses.
-- [`../../../README.md`](../../../README.md) (devbench README) -- the
+- [`../../../../README.md`](../../../../README.md) (devbench README) -- the
   canonical project README; links back to this example under "Real-world
   backlog examples".
-- [`../../../docs/backlog-contract.md`](../../../docs/backlog-contract.md) --
+- [`../../../../docs/backlog-contract.md`](../../../../docs/backlog-contract.md) --
   the 20 rules every work unit must satisfy; this example passes them all.
-- [`../../../docs/creating-specs-and-backlogs.md`](../../../docs/creating-specs-and-backlogs.md) --
+- [`../../../../docs/creating-specs-and-backlogs.md`](../../../../docs/creating-specs-and-backlogs.md) --
   the authoring guide this example follows.

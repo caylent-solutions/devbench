@@ -402,9 +402,8 @@ match to their own setup and copy it as a starting point.
 > claude plugin install devbench-orchestrate@devbench --scope project
 > ```
 >
-> Migrating from a v0.3.0 user-scope install? See
-> [`docs/migration-0.4.0.md`](docs/migration-0.4.0.md). **For non-interactive
-> runs the plugin is never needed** -- the Agent SDK loads it ad-hoc from
+> **For non-interactive runs the plugin is never needed** -- the Agent SDK
+> loads it ad-hoc from
 > the checkout via `DEFAULT_PLUGIN_SUBPATH`. Skip the plugin install entirely
 > unless you have a specific reason to run interactive.
 >
@@ -420,9 +419,7 @@ match to their own setup and copy it as a starting point.
 >
 > Both tools point at the same workspace. See
 > [`docs/zero-to-ready.md`](docs/zero-to-ready.md) Step 10 for the full
-> two-track operator workflow, and
-> [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
-> for a worked example.
+> two-track operator workflow.
 
 ```bash
 make start-interactive

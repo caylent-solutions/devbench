@@ -139,7 +139,6 @@ since the last release. PR #119 carries every change.
     `configure-devbench`, `bootstrap-environment`. No hooks; safe to
     enable in any authoring workspace.
 
-  See `docs/migration-0.4.0.md` for the operator migration walkthrough.
   Note: prior CHANGELOG entries that reference `plugin/devbench/`
   paths describe the pre-split layout and are not rewritten.
 

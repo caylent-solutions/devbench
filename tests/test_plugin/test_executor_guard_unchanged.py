@@ -2,8 +2,7 @@
 
 Pins the EXACT ordered list of guard scripts that fire on each PreToolUse
 matcher in the orchestrate plugin's ``hooks/hooks.json``.  Captured from
-the pre-split baseline (``docs/plugin-split-0.4.0-baseline.md``) and
-asserted verbatim here.
+the pre-split baseline and asserted verbatim here.
 
 If a future refactor drops, silently adds, or re-orders any guard, this
 test fails before the orchestrator behaviour can be silently weakened.

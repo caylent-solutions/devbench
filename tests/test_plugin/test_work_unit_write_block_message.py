@@ -6,10 +6,9 @@ integration tests across the project match on substrings of this format,
 so any drift would silently break downstream matching.
 
 This test invokes the script with a fixture stdin payload and asserts
-the exact stderr captured from the pre-split baseline
-(``docs/plugin-split-0.4.0-baseline.md``).  The shell guard ships in
-``plugin/devbench-orchestrate/scripts/`` post-split (issue #224); the
-script body itself is byte-for-byte identical to the pre-split version.
+the exact stderr captured from the pre-split baseline.  The shell guard
+ships in ``plugin/devbench-orchestrate/scripts/`` post-split (issue #224);
+the script body itself is byte-for-byte identical to the pre-split version.
 """
 
 from __future__ import annotations

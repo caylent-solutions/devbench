@@ -63,12 +63,12 @@ In either case, edit `bob-smith/terragrunt.hcl` -- set `owner_email`, `linux_use
    ```bash
    # Run only if no existing state bucket: see infra/terraform/modules/state-bucket
    ```
-4. Apply the singleton VPC (one-time per account; skip if `network/` already applied):
+1. Apply the singleton VPC (one-time per account; skip if `network/` already applied):
    ```bash
    cd <devbench-checkout>
    make ec2-network-apply
    ```
-5. Upload your GitHub PAT and SSH private key into AWS Secrets Manager (one-time, rotatable later):
+2. Upload your GitHub PAT and SSH private key into AWS Secrets Manager (one-time, rotatable later):
    ```bash
    export GH_TOKEN=ghp_...                               # or `source shell.env`
    export DEVBENCH_GITHUB_SSH_KEY=$HOME/.ssh/id_ed25519  # private key matching your registered GitHub key
@@ -77,21 +77,21 @@ In either case, edit `bob-smith/terragrunt.hcl` -- set `owner_email`, `linux_use
    Two secrets are created (or updated) under `devbench-remote/<your-email>/`:
    `github-token` and `github-ssh-key`. The EC2's IAM role grants
    `secretsmanager:GetSecretValue` on those two ARNs only.
-6. Provision your instance (all variables from the env block above must be exported in your shell):
+3. Provision your instance (all variables from the env block above must be exported in your shell):
    ```bash
    export DEVBENCH_SSH_KEY=$HOME/.ssh/<your-aws-keypair-private-key>
    aws sso login --profile "$AWS_PROFILE"
    make ec2-init
    make ec2-apply
    ```
-7. Wait ~1 min for cloud-init to mark the box ready, then push the playbook + run it:
+4. Wait ~1 min for cloud-init to mark the box ready, then push the playbook + run it:
    ```bash
    make ec2-bootstrap
    ```
    This scp's the ansible roles over an SSH-over-SSM tunnel and runs them locally
    on the box. The `git-auth` role fetches your token + SSH key from Secrets Manager
    using the instance IAM role (no operator credentials transit).
-8. SSH in:
+5. SSH in:
    ```bash
    make ec2-ssh
    ```

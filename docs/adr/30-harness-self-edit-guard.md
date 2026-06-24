@@ -75,7 +75,7 @@ harness logic itself, and nothing noticed pre-existing drift before a run began.
 ## Consequences
 
 - A future harness bug encountered mid-run is **surfaced to the operator** (block
-  + tracked issue) rather than self-patched, restoring review and accountability
+  - tracked issue) rather than self-patched, restoring review and accountability
   and avoiding running-process-vs-file split-brain.
 - The runtime hook prevents new drift during a run; the startup check catches
   drift that pre-dates it. The two compose: `warn` is the default so existing

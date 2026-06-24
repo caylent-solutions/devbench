@@ -35,12 +35,14 @@ tables (e.g., the `Draft` column in `BACKLOG.md` status tables). When referring
 to the status in prose, use `draft` or `` `draft` ``.
 
 Correct:
+
 ```
 The work unit has `draft` status.
 Promote it from draft to in-queue with: devbench promote E1-F1-S1-T1
 ```
 
 Incorrect:
+
 ```
 The work unit has Draft status.   # Title-case outside a table heading
 ```

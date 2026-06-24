@@ -228,8 +228,8 @@ the same workspace that the orchestrator is processing.
 
 ## References
 
-- `src/devbench/plugin_shadow.py` -- materialiser implementation.
-- `src/devbench/config_loader.py` -- `AgentModelsConfig` dataclass and parser.
-- `src/devbench/config.py` -- `DEVBENCH_AGENT_MODEL_* (non-judge agents) / JUDGE_AGENT_MODEL_* (judge agents)` env var merge.
-- `src/devbench/cli.py` -- `cmd_start` pre-flight and `cmd_prepare_plugin_shadow`.
-- `tests/test_plugin_shadow.py` -- 100% line + branch coverage gate.
+* `src/devbench/plugin_shadow.py` -- materialiser implementation.
+* `src/devbench/config_loader.py` -- `AgentModelsConfig` dataclass and parser.
+* `src/devbench/config.py` -- `DEVBENCH_AGENT_MODEL_* (non-judge agents) / JUDGE_AGENT_MODEL_* (judge agents)` env var merge.
+* `src/devbench/cli.py` -- `cmd_start` pre-flight and `cmd_prepare_plugin_shadow`.
+* `tests/test_plugin_shadow.py` -- 100% line + branch coverage gate.

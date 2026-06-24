@@ -88,6 +88,7 @@ PY
 ```
 
 The expected structure is:
+
 ```json
 {
   "claudeAiOauth": {

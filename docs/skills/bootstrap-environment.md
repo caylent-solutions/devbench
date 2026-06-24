@@ -69,14 +69,15 @@ run devbench:bootstrap-environment
      second failure, escalates and asks whether to skip this repo.
 
    - **Step 2d -- Per-repo status report**:
+  
      ```
      [REPO_DONE] org/repo
-       clone:         OK / SKIPPED (already present)
+  clone:         OK / SKIPPED (already present)
        asdf tools:    OK / SKIPPED (no .tool-versions) / ESCALATED
        make validate: PASS / ESCALATED
      ```
 
-3. **Final summary table** -- printed after all repos are processed:
+1. **Final summary table** -- printed after all repos are processed:
 
    ```
    Bootstrap-environment complete.

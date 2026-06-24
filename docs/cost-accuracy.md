@@ -28,12 +28,14 @@ CostBreakdown (renderer-facing)
 ## Where to look
 
 - **Raw model ids in the cache** -- query the SQLite directly:
+
   ```bash
   sqlite3 .devbench/report-cache/events.sqlite \
     "SELECT model, COUNT(*) FROM hook_entries GROUP BY model;"
   sqlite3 .devbench/report-cache/events.sqlite \
     "SELECT model, COUNT(*) FROM transcript_entries GROUP BY model;"
   ```
+
   Any NULL row aggregates under the sentinel key `"<unknown>"` and is
   priced against `report.default_model`.
 - **Per-model rates** -- inspect `backlog/config/devbench.yaml` under

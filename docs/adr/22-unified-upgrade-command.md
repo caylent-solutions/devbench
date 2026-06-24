@@ -98,7 +98,7 @@ on a workspace whose `BACKLOG.md` is mid-edit.
 ## Future cleanup
 
 After devbench's first major release ships, the entire upgrade tool
-+ upgrade-guide doc + readme cross-link become legacy infrastructure
+- upgrade-guide doc + readme cross-link become legacy infrastructure
 (new operators post-1.0 will have no legacy state to migrate). A
 post-release tracking issue captures the removal task:
 

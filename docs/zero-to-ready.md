@@ -135,16 +135,20 @@ profile (`~/.claude/`).
 
 **Without make:**
 
-    claude plugin marketplace add $DEVBENCH_DIR/plugin --scope user
-    claude plugin install devbench --scope user
+```
+claude plugin marketplace add $DEVBENCH_DIR/plugin --scope user
+claude plugin install devbench --scope user
+```
 
 **Verify the plugin is installed:** expected output of `claude plugin list`: a line
 containing `devbench` in the installed list.
 
 **To uninstall later** (e.g., to unblock backlog edits in other Claude sessions):
 
-    claude plugin uninstall devbench --scope user
-    claude plugin marketplace remove devbench --scope user
+```
+claude plugin uninstall devbench --scope user
+claude plugin marketplace remove devbench --scope user
+```
 
 ---
 
@@ -897,7 +901,7 @@ this two-track workflow is described in
 
 Interactive mode opens a Claude Code session with the devbench plugin loaded so you can
 watch tool calls inside Claude Code's UI. **It offers almost nothing over non-interactive
-+ `devbench hook-tail` + `devbench report`** -- both modes give live tool-call visibility.
+- `devbench hook-tail` + `devbench report`** -- both modes give live tool-call visibility.
 The only unique capability of interactive mode is the ability to type natural-language
 instructions to the orchestrate skill mid-run, and that is exactly what we recommend
 AGAINST (mid-claim interjection disturbs the executor's reasoning; corrections belong in
@@ -999,11 +1003,15 @@ RuntimeError: DEVBENCH_WORKSPACE_ROOT environment variable is not set. Set it to
 
 Export the variable before running any devbench command:
 
-    export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
+```
+export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
+```
 
 Or prefix it inline:
 
-    DEVBENCH_WORKSPACE_ROOT=~/my-workspace uv run --project $DEVBENCH_DIR devbench validate-backlog
+```
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace uv run --project $DEVBENCH_DIR devbench validate-backlog
+```
 
 ### `DevBench config file not found`
 
@@ -1014,7 +1022,9 @@ FileNotFoundError: DevBench config file not found at '<DEVBENCH_WORKSPACE_ROOT>/
 The config file was not created (Step 7) or `DEVBENCH_WORKSPACE_ROOT` is pointing at the
 wrong directory. Verify:
 
-    ls $DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml
+```
+ls $DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml
+```
 
 ### `Manifest path begins with checkout_directory prefix`
 
@@ -1038,8 +1048,10 @@ workspace root. Remove the `my-target-repo/` prefix from the offending row:
 If `claude plugin list` does not show `devbench`, try running the install commands
 manually from the devbench clone root:
 
-    claude plugin marketplace add $DEVBENCH_DIR/plugin --scope user
-    claude plugin install devbench --scope user
+```
+claude plugin marketplace add $DEVBENCH_DIR/plugin --scope user
+claude plugin install devbench --scope user
+```
 
 If the `plugin/` directory is missing, verify you cloned the full devbench repo (not a
 shallow clone with `--depth 1`) and that the clone is at a commit that includes the plugin

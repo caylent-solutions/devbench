@@ -25,7 +25,6 @@ Two public classifier functions are available:
   `generate_report` to produce the composite line and by the assistant plugin for
   the same purpose.
 
-
 ## Eight Classes -- Summary Table
 
 | State | Priority | Cause | Resolution hint | Operator action |
@@ -38,7 +37,6 @@ Two public classifier functions are available:
 | `AWAITING_AMENDMENT_RECOVERY` | 5 | No marker or pending dep, but a recovery signal is on disk (pending proposal JSON, rejected-amendment archive, or a recent `[BLOCKED]` audit comment from a recovery agent). | Wait; the orchestrator's next sweep will run blocker-resolver / task-factory. | None -- check back if the state persists beyond two sweep cycles. |
 | `INTERRUPTED_ON_STOP` | 6 | The only blocking signal is a `[FORCED_BLOCKED_ON_STOP]` audit written by the SIGTERM shutdown safeguard; no structural co-blocker exists. The work was merely interrupted on stop. | Wait; the next reconcile sweep auto-requeues it (`[REQUEUED_AFTER_STOP]`), or run `devbench reconcile-cascade`. | None -- automation handles it. |
 | `OPERATOR_ACTION_REQUIRED` | 7 | None of the above match: no marker, no pending dep, no recovery signal, no forced-stop marker. Includes manual gates (`DO NOT CLAIM`), unknown marker targets, and cascade-stuck states. | Inspect the work-unit's Comments section for the most recent `[BLOCKED]` audit row. | **Required** -- operator must investigate and unblock. |
-
 
 ## Per-Class Reference
 
@@ -128,7 +126,6 @@ E3-F2-S1-T2  RUNTIME_DEGRADATION + structural blocker (AWAITING_DEPENDENCY):
 # The structural dep must then be resolved separately.
 ```
 
-
 ### HELD
 
 **Cause.**
@@ -177,7 +174,6 @@ claim until the audit log export schema is approved.
 
 $ devbench set-status E2-F3-S1-T4 in-queue
 ```
-
 
 ### BLOCKED_ON_HELD
 
@@ -230,7 +226,6 @@ $ devbench set-status E2-F3-S1-T2 in-queue
 # Once E2-F3-S1-T2 reaches done/declined, T5 is unblocked automatically.
 ```
 
-
 ### AUTO_CLEARING_VIA_PROPOSAL
 
 **Cause.**
@@ -280,7 +275,6 @@ E3-F1-S1-T3  AUTO_CLEARING_VIA_PROPOSAL  markers -> [E3-F1-S1-T1 (in-progress)]
 # in-queue automatically (ADR-07 cascade).
 ```
 
-
 ### AWAITING_DEPENDENCY
 
 **Cause.**
@@ -326,7 +320,6 @@ $ devbench show E3-F1-S2-T2
 
 # Once E3-F1-S1-T1 reaches done, E3-F1-S2-T2 transitions to in-queue.
 ```
-
 
 ### AWAITING_AMENDMENT_RECOVERY
 
@@ -390,7 +383,6 @@ E2-F1-S1-T7  AWAITING_AMENDMENT_RECOVERY  [recovery: pending proposal at .devben
 # the orchestrator will promote them. T7 will be unblocked once all
 # proposed tasks complete.
 ```
-
 
 ### OPERATOR_ACTION_REQUIRED
 
@@ -469,7 +461,6 @@ for legal sign-off on data-export spec. See Jira INFRA-4421.
 $ devbench set-status E1-F2-S3-T9 in-queue
 ```
 
-
 ## `[CLAIM_NOT_CONVERGING]` -- non-converging claim (block-and-continue)
 
 **What it is.**
@@ -520,7 +511,6 @@ devbench set-status <task-id> in-queue
 # Or decline a unit that can never converge in this backlog:
 devbench decline <task-id> --reason "<rationale>"
 ```
-
 
 ## Recovery-Signal Heuristic Contract
 
@@ -588,7 +578,6 @@ rather than the task silently lingering in an assumed-recovery state.
 The window can be overridden per-call via the `recovery_window_seconds` keyword
 argument to `classify_blocked_task` (`proposal.py` line 274).
 
-
 ## Troubleshooting -- Misclassification Scenarios
 
 The following scenarios were root-caused and fixed in the E2-F1 story. They are
@@ -609,6 +598,7 @@ file exists, the classifier returns `AWAITING_AMENDMENT_RECOVERY` immediately
 without reading the work-unit file.
 
 **Verification.** If this regression occurs, check:
+
 ```bash
 ls .devbench/proposals/<task-id>.json
 # File should exist. If it does and the task shows OPERATOR_ACTION_REQUIRED,
@@ -633,6 +623,7 @@ classifier reaches the marker path (priority 2-3) before Signal 3 is evaluated,
 so the state transitions correctly to `AUTO_CLEARING_VIA_PROPOSAL`.
 
 **Verification.** If this regression occurs, check:
+
 ```bash
 grep "BLOCKED_PENDING_PROPOSAL" backlog/<path-to-task>.md
 # Marker should be present if task-factory has already run.
@@ -654,6 +645,7 @@ fired if all targets are terminal -- seeing `OPERATOR_ACTION_REQUIRED` in that
 case correctly alerts the operator that the cascade is stuck.
 
 **Verification.**
+
 ```bash
 devbench show <marker-target-id>
 # If status shows done/declined and the blocked task is BLOCKED_ON_HELD,
@@ -675,12 +667,12 @@ now checks `if agent not in _RECOVERY_AGENT_TAGS: return False` before evaluatin
 the body regex. Executor and review-judge `[BLOCKED]` comments are excluded.
 
 **Verification.**
+
 ```bash
 devbench show <task-id>
 # Inspect Comments. If the most recent [BLOCKED] row has agent/executor
 # or a review-judge tag, it must NOT produce AWAITING_AMENDMENT_RECOVERY.
 ```
-
 
 ## Classifier API
 
@@ -748,7 +740,6 @@ no degradation signal were present.
 classification logic via the private helper `_classify_structural_bucket`
 (`proposal.py`). Changes to the structural bucket logic only need to be applied
 once.
-
 
 ## Cross-References
 

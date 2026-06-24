@@ -311,21 +311,25 @@ The most important tests are lifecycle journeys -- they chain multiple operation
 ### Examples by project type
 
 **Application development:**
+
 ```
 bootstrap -> configure -> build -> test -> deploy -> verify -> teardown
 ```
 
 **Infrastructure migration (e.g., VMware to EC2):**
+
 ```
 discover inventory -> plan migration -> create target infra -> migrate workload -> validate connectivity -> cutover DNS -> verify application -> decommission source
 ```
 
 **Cloud operations:**
+
 ```
 provision resources -> configure security groups -> deploy application -> health check -> scale up -> scale down -> terminate
 ```
 
 **Package manager (like kanon):**
+
 ```
 bootstrap -> install -> verify packages -> validate manifests -> clean -> verify clean
 install with marketplace -> verify plugins registered -> clean -> verify plugins removed

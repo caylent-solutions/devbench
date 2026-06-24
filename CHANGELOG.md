@@ -778,7 +778,7 @@ since the last release. PR #119 carries every change.
   `E\d+(-F\d+)?(-S\d+)?(-T\d+)?` and forbids directory-slug forms
   (`E16-test-cleanup`); Step 6 Status Summary count semantics now
   match what the validator's `_compute_epic_counts` does (Features
-  + Stories + Tasks under the Epic; the Epic file itself is NOT
+  - Stories + Tasks under the Epic; the Epic file itself is NOT
   counted). The new `normalize_dep_ids` post-processor pass
   rewrites slug-form dep IDs to canonical form when found.
 
@@ -1046,7 +1046,7 @@ since the last release. PR #119 carries every change.
   values raise `ValueError` with an actionable error message listing
   the accepted choices.
 - **HOLD lifecycle status** (E222, issue #104). New `WorkUnitStatus.HOLD`
-  + `devbench hold <id>` / `devbench unhold <id>` CLI for tasks
+  - `devbench hold <id>` / `devbench unhold <id>` CLI for tasks
   deliberately deferred without breaking dep-chain math.
 - **`RepoConfig.resolved_checkout_path`** (E213, issue #105) and
   `validated_repo` enrichment so consumers stop re-resolving paths
@@ -1168,7 +1168,7 @@ since the last release. PR #119 carries every change.
   `devbench log-rejection-feedback <judge> <id> --json '<payload>'`
   CLI primitive validates the payload against
   `src/devbench/backlog/review-feedback-schema.json` (schema_version 1)
-  + the per-judge controlled vocabulary in
+  - the per-judge controlled vocabulary in
   `src/devbench/backlog/review_feedback_vocabulary.py`, and persists
   to `.devbench/review-failures/<task-id>-<judge>-<n>.json`. The
   manifest-amender path migrates to the same shared directory; the
@@ -1656,8 +1656,8 @@ since the last release. PR #119 carries every change.
   raise `RuntimeError` if a future enum addition is not wired in --
   per CLAUDE.md no-fallback-logic. The blocked-task display gains a
   dedicated "Blocked tasks (runtime-degradation)" panel with the
-  resolution hint `"SDK lost Agent-tool access mid-session; `make
-  start` auto-restarts to recover."`. `_BacklogTotals` exposes a new
+  resolution hint `"SDK lost Agent-tool access mid-session;`make
+  start`auto-restarts to recover."`. `_BacklogTotals` exposes a new
   `tasks_blocked_runtime_degradation` field. Pinned by
   `tests/test_reporting/test_report.py::TestBacklogTotalsSixBlockedFields::test_unhandled_blocked_state_raises_in_counter_path`
   plus extended canonical-order panel test.
@@ -2058,7 +2058,7 @@ since the last release. PR #119 carries every change.
   `EVENT_WIDTH` stays a `hook_tail.py`-local constant -- the arrow
   column is intrinsic to the format. New regression tests
   `tests/unit/test_hook_tail.py::TestHookTailColumnConfig`
-  + `tests/test_config_loader.py::TestHookTailConfig` cover global-
+  - `tests/test_config_loader.py::TestHookTailConfig` cover global-
   only / full-override / partial-override / schema rejection of
   non-positive caps and unknown keys.
 - **Turn-end resilience: two-layer liveness model** (issue #262). The
@@ -2092,7 +2092,7 @@ since the last release. PR #119 carries every change.
   with cache + base-rate multipliers (apply after cache scaling,
   before discount) per AC-FUNC-003. New regression tests
   `tests/test_reporting/test_report.py::TestAccurateCost::test_data_residency_multiplier_applies_to_us_only_subset`
-  + the fast-mode + composition + default-no-boost siblings cover
+  - the fast-mode + composition + default-no-boost siblings cover
   all four AC scenarios.
 
 ### Renamed / Removed

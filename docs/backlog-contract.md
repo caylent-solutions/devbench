@@ -350,11 +350,13 @@ alternatives:
 Glob rejection emits an error like:
 
 ```
+
 EX-F1-S1-T1: Manifest entry 'src/**/*.py' contains a glob pattern.
 Manifest paths must be concrete; for execution-determined file lists,
 use a sentinel value (e.g.,
 `<source-drift-fix-targets-determined-at-execution>`) and amend the
 Manifest at runtime via `manifest_amendment`.
+
 ```
 
 #### Status Summary count semantics (issue #221 B6 clarification)
@@ -591,7 +593,7 @@ When an Acceptance Criterion (or a `type=command` path operand) asserts that a c
 
 1. it **exists** in the target-repo checkout, or
 2. it is **created by a task** -- it appears as an `add` row in some backlog task's `## Changes Manifest`, or
-3. it is an explicit **external carve-out** (a pinned third-party / out-of-repo source; declare it inline with a trailing ` (ref)` or external wording).
+3. it is an explicit **external carve-out** (a pinned third-party / out-of-repo source; declare it inline with a trailing `(ref)` or external wording).
 
 A required path that satisfies none of these is unsatisfiable: the unit cannot reach `done` and the executor can only escalate. `validate-backlog` flags such a path (WARNING by default, ERROR under `--strict`) naming the AC, the path, and the three resolutions. The check runs only when the target-repo checkout is present, so absence is asserted with certainty.
 
@@ -712,12 +714,12 @@ re-derived at runtime.
 
 **Content quality (task files only -- IDs containing `-T{n}`):**
 
-6. `## Description` section exists and is non-empty
-7. `## Acceptance Criteria` section exists with at least one `AC-` prefixed item
-8. `## Changes Manifest` section exists with at least one entry
-9. `## Definition of Done` section exists
-10. No em-dash character (U+2014) anywhere in the work unit file
-11. No Changes Manifest path begins with a `<checkout_directory>/` prefix (see below)
+1. `## Description` section exists and is non-empty
+2. `## Acceptance Criteria` section exists with at least one `AC-` prefixed item
+3. `## Changes Manifest` section exists with at least one entry
+4. `## Definition of Done` section exists
+5. No em-dash character (U+2014) anywhere in the work unit file
+6. No Changes Manifest path begins with a `<checkout_directory>/` prefix (see below)
 
 Non-task files (Epics, Features, Stories) are exempt from content quality checks.
 
@@ -730,13 +732,17 @@ entries against `git diff --name-only` output, which is always repo-relative; a
 `checkout_directory` prefix on a manifest path produces a guaranteed miss at commit
 time, blocking the commit after the executor has done the work. Example: for a repo
 with `checkout_directory: example-repo`, the manifest row must read
+
 ```
 | `README.md` | update |
 ```
+
 not
+
 ```
 | `example-repo/README.md` | update |
 ```
+
 `validate-backlog` surfaces this at authoring / startup time so it never reaches git-ops.
 
 **Issue #159 -- proposal-write enforcement.** Rule 11 has historically been enforced at the validator (this section) and at the `guard-work-unit-write.sh` PreToolUse hook. The third tier -- `cmd_write_proposal` -- now strips matching `<checkout_directory>/` prefixes from every `proposed_tasks[*].files_to_own` entry before persisting the JSON. The strip runs after the issue #146 backlog-repo filter so target-repo classification still fires on the prefixed form. Paths that match multiple configured `checkout_directories` are rejected with a structured error rather than silently picking one interpretation. blocker-resolver and any other agent that calls `devbench write-proposal` no longer needs to hand-strip prefixes; the strip is the safety net that makes rule 11 enforcement cover all three write tiers.

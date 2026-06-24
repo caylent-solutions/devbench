@@ -45,6 +45,7 @@ dev = [
     "ruff>=0.15.0",
     "bandit>=1.8.0",
     "mypy>=1.15.0",
+    "pymarkdownlnt>=0.9.0",
     "types-pyyaml>=6.0.12.20250915",
     "types-jsonschema>=4.23.0.20241208",
     # devbench-supervise-screen-orchestrator (FR-22): mypy stubs for the new

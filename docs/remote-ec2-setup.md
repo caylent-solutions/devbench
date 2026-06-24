@@ -138,11 +138,13 @@ The orchestrator's log file is resolved by precedence: `DEVBENCH_LOG_FILE` env v
 Three panes (tmux is the usual harness):
 
 1. **Orchestrator pane** -- the interactive Claude session.
+
    ```bash
    PATH=... DEVBENCH_CLAUDE_MODEL=claude-opus-4-8 DEVBENCH_WORKSPACE_ROOT=$DEVBENCH_WORKSPACE_ROOT \
      DEVBENCH_ORCHESTRATOR_SESSION_ID=$DEVBENCH_ORCHESTRATOR_SESSION_ID \
      claude --plugin-dir /path/to/devbench/plugin/devbench --dangerously-skip-permissions
    ```
+
    Inside Claude, run `/devbench:orchestrate` (or the equivalent skill).
 2. **Live report pane** -- `uv run --project /path/to/devbench devbench report --watch 120`.
 3. **Hook-tail pane** -- `uv run --project /path/to/devbench devbench hook-tail --orchestrator-only`. The `--orchestrator-only` flag (E230) filters to events stamped with `DEVBENCH_ORCHESTRATOR_SESSION_ID` so side-pane Claude sessions in the same workspace do not pollute the audit stream.

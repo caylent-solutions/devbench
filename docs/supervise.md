@@ -337,7 +337,7 @@ Observation is a hard read-only requirement, not a preference:
   window on the target `screen` build (DI-4).
 
 The `pty.log` is created mode `0600` and is run through a configurable redaction
-pass (`sk-ant-*`, `AKIA*`, `aws_secret`, `Bearer ` tokens by default) before any
+pass (`sk-ant-*`, `AKIA*`, `aws_secret`, `Bearer` tokens by default) before any
 chunk is written, so a secret the model happened to print is not persisted.
 
 ## Auto-restart and exit taxonomy

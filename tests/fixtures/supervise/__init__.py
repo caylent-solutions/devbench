@@ -75,10 +75,6 @@ class FakePexpectChild:
         self.terminated = False
         self.terminate_force: bool | None = None
 
-    # ------------------------------------------------------------------
-    # pexpect.spawn API surface the supervisor uses
-    # ------------------------------------------------------------------
-
     def expect(self, patterns: list[str], timeout: int | None = None) -> int:
         """Return the index of the first *patterns* entry the next step matches.
 
@@ -110,8 +106,6 @@ class FakePexpectChild:
                 self.after = step.emit
                 self._cursor += 1
                 return index
-        # The step exists but matched none of the requested patterns: from the
-        # caller's perspective this expect found nothing -> a timeout.
         raise pexpect.TIMEOUT("FakePexpectChild: scripted step matched no requested pattern")
 
     def sendline(self, payload: str = "") -> int:
@@ -140,10 +134,6 @@ class FakePexpectChild:
         """Return whether the scripted child is still alive."""
         return self._alive
 
-    # ------------------------------------------------------------------
-    # internals
-    # ------------------------------------------------------------------
-
     def _next_available_step(self) -> _ScriptStep | None:
         """Return the next step whose ``on_send`` gate (if any) has been met.
 
@@ -157,8 +147,6 @@ class FakePexpectChild:
             if step.on_send is not None:
                 matches = sum(1 for s in self.sent if re.search(step.on_send, s))
                 if matches < step.on_send_count:
-                    # The gate is unmet: this expect cannot consume the gated step
-                    # yet, so it sees nothing -> the caller will time out.
                     return None
             return step
         return None

@@ -47,8 +47,6 @@ import sys
 import time
 from pathlib import Path
 
-#: Default exit code per named script (the single-script ``STUB_CLAUDE_EXIT_CODE``
-#: env var overrides it; a sequence entry uses the default for its script).
 _SCRIPT_DEFAULT_EXIT_CODE = {
     "clean": 0,
     "no_actionable": 0,
@@ -163,16 +161,12 @@ def main() -> int:
         _emit(f"[stub-claude] received: {line}")
         stripped = line.strip()
         if script == "idle":
-            # Stay alive until the drain command arrives (the operator stop path).
             if kickoff_seen and stripped == drain_command:
                 return exit_code
             if stripped == kickoff:
                 kickoff_seen = True
             continue
         if script == "spin":
-            # The root-cause hang: spin the working prompt forever after kickoff.
-            # The progress watchdog must terminate this child (the parent kills it),
-            # so this loop is exited only by SIGTERM from the supervisor.
             if stripped == kickoff:
                 spin_interval = float(os.environ.get("STUB_CLAUDE_SPIN_INTERVAL_SECONDS", "0.2"))
                 while True:
@@ -183,9 +177,6 @@ def main() -> int:
             _emit(_terminal_output(script))
             return exit_code
 
-    # stdin closed before the kickoff/drain arrived: exit cleanly so the supervisor
-    # observes an EOF rather than hanging (the supervisor's timeout still bounds
-    # this path).
     return exit_code
 
 

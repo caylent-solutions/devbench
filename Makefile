@@ -3,9 +3,8 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-# Python comment linter scope (first-party source; fixtures are sample data).
+# Python comment linter scope: all first-party Python, fixtures included.
 COMMENT_LINT_PATHS := src tests tools infra/scripts
-COMMENT_LINT_EXCLUDE := --exclude 'tests/fixtures/**'
 # Markdown linter: human-authored docs only. Claude plugin/marketplace,
 # fixture, and example-backlog markdown are excluded so the linter can never
 # rewrite or break frontmatter-driven plugin files.
@@ -75,11 +74,11 @@ lint-no-duplicates:
 
 ## lint-comments: Fail if disallowed (explanatory) Python comments exist
 lint-comments:
-	uv run python tools/comment_lint.py --check $(COMMENT_LINT_PATHS) $(COMMENT_LINT_EXCLUDE)
+	uv run python tools/comment_lint.py --check $(COMMENT_LINT_PATHS)
 
 ## fix-comments: Remove disallowed Python comments in place (maintenance only)
 fix-comments:
-	uv run python tools/comment_lint.py --fix $(COMMENT_LINT_PATHS) $(COMMENT_LINT_EXCLUDE)
+	uv run python tools/comment_lint.py --fix $(COMMENT_LINT_PATHS)
 
 ## lint-markdown: Run the Markdown linter (pymarkdown) over human-authored docs
 lint-markdown:

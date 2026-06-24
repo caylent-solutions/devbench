@@ -78,7 +78,6 @@ class TestExtractIntentPhrase:
             ("Add .coverage to .gitignore", "gitignore-add"),
             ("Register smoke marker in pyproject", "register-marker"),
             ("Fix pyproject.toml placeholder", "fix-placeholder"),
-            # Generic fallbacks when no pattern matches.
             ("", "generic"),
             ("Implement the feature", "generic"),
             ("Some random approach text", "generic"),
@@ -96,5 +95,4 @@ class TestExtractIntentPhrase:
         """End-to-end: same approach text -> same intent -> same signature."""
         sig1 = _compute_fix_signature("org/repo", ["a.py"], _extract_intent_phrase("Remove the X row"))
         sig2 = _compute_fix_signature("org/repo", ["a.py"], _extract_intent_phrase("REMOVE THE Y row"))
-        # Both extract to "remove-row" so signatures match.
         assert sig1 == sig2

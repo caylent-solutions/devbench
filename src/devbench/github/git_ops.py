@@ -29,15 +29,8 @@ from devbench.config_loader import get_configured_default_branch
 from devbench.constants import RAW_RESPONSE_PREVIEW_CHARS
 from devbench.utils.process import run_command
 
-# ---------------------------------------------------------------------------
-# CIResult: structured return type for wait_for_checks_and_classify
-# ---------------------------------------------------------------------------
-
-#: Regex that matches the task-ID tag embedded in per-task commit messages,
-#: e.g. ``[E3-F2-S1-T5]``.  Groups: (task_id,).
 _TASK_MARKER_RE = re.compile(r"\[E\d+-F\d+-S\d+-T\d+\]")
 
-#: CI check states that indicate a failing run.
 _FAILING_CHECK_STATES: frozenset[str] = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"})
 
 
@@ -70,7 +63,7 @@ def _extract_distinct_task_ids(log_text: str) -> list[str]:
     seen: set[str] = set()
     distinct: list[str] = []
     for m in raw_matches:
-        task_id = m[1:-1]  # strip leading '[' and trailing ']'
+        task_id = m[1:-1]
         if task_id not in seen:
             seen.add(task_id)
             distinct.append(task_id)
@@ -110,27 +103,18 @@ class CIResult:
             ...
     """
 
-    #: The :class:`_FailedKnownTask` carrier class.  Use
-    #: ``isinstance(result, CIResult.FAILED_KNOWN_TASK)`` to test membership
-    #: and ``result.task_id`` to retrieve the attributed ID.
     FAILED_KNOWN_TASK: type[_FailedKnownTask] = _FailedKnownTask
 
-    #: Singleton sentinel: all CI checks passed (or the repo has no CI).
     GREEN: "CIResult"
-    #: Singleton sentinel: checks failed but attribution is ambiguous.
     FAILED_UNKNOWN: "CIResult"
-    #: Singleton sentinel: ``gh pr checks --watch`` exceeded the timeout.
     TIMEOUT: "CIResult"
 
 
-# Sentinel instances assigned after class definition so that the forward
-# reference ``"CIResult"`` in the ClassVar annotations resolves.
 CIResult.GREEN = CIResult()
 CIResult.FAILED_UNKNOWN = CIResult()
 CIResult.TIMEOUT = CIResult()
 
 
-# Public type alias used in method signatures.
 CIResultType = CIResult | _FailedKnownTask
 
 
@@ -190,10 +174,6 @@ class ReviewResolution:
     elapsed_seconds: float = 0.0
 
 
-# Allowlist pattern for git branch names: starts with alphanumeric, allows
-# alphanumerics, dots, hyphens, underscores, and single forward slashes.
-# Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
-# git ref naming rules (git-check-ref-format).
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
 
@@ -418,10 +398,6 @@ class GitOpsService:
                 "(no consecutive special characters)."
             )
 
-        # Refuse to commit if HEAD has drifted off the expected branch (e.g.
-        # leftover detached-HEAD state from a previous task). Prevents the
-        # orphan-branch class of bug where a commit lands on backlog/<id>
-        # instead of the configured single_branch.
         self.assert_on_branch(repo_path, branch)
         self._stage_changes(repo_path, manifest_paths)
 
@@ -494,8 +470,6 @@ class GitOpsService:
                 "(no consecutive special characters)."
             )
 
-        # Same orphan-branch protection as commit_and_push -- refuse to
-        # commit when HEAD has drifted off the expected branch.
         self.assert_on_branch(repo_path, branch)
         self._stage_changes(repo_path, manifest_paths)
 
@@ -690,10 +664,6 @@ class GitOpsService:
 
         effective_timeout = timeout if timeout is not None else GITHUB_CHECK_TIMEOUT_SECONDS
 
-        # Total attempts = retries + 1 (the first call is attempt 0; on
-        # "no checks reported" the loop sleeps and retries up to
-        # CHECK_REGISTRATION_RETRIES additional times). On exhaustion the
-        # post-loop block emits the canonical refuse-to-merge error.
         workflow_files: list[Path] = []
         for attempt in range(CHECK_REGISTRATION_RETRIES + 1):
             rc, stdout, stderr = self._gh(
@@ -722,8 +692,6 @@ class GitOpsService:
                 )
                 return True
             if attempt == CHECK_REGISTRATION_RETRIES:
-                # Final attempt: skip the sleep; fall through to the
-                # retry-exhausted block below.
                 break
             self.logger.info(
                 "PR #%d on %s: workflow files exist (%d) but `gh pr checks` "
@@ -785,13 +753,10 @@ class GitOpsService:
             timeout: Maximum seconds to wait per ``gh pr checks`` call.
                 Defaults to the configured value.
         """
-        # Parse owner/repo and PR number from the URL.
-        # Expected shape: https://github.com/<owner>/<repo>/pull/<number>
         parts = pr_url.rstrip("/").split("/")
         pr_number = int(parts[-1])
         repo = f"{parts[-4]}/{parts[-3]}"
 
-        # Phase 1: wait for checks.
         try:
             checks_passed = self.wait_for_checks(repo, pr_number, timeout, repo_path=repo_path)
         except subprocess.TimeoutExpired:
@@ -804,7 +769,6 @@ class GitOpsService:
         if checks_passed:
             return CIResult.GREEN
 
-        # Phase 2: attribute the failure.
         return self._classify_ci_failure(repo, pr_number, repo_path)
 
     def _classify_ci_failure(
@@ -923,8 +887,6 @@ class GitOpsService:
                 continue
             if check.get("state") in _FAILING_CHECK_STATES:
                 link = check.get("link") or ""
-                # ``link`` shape: https://github.com/<org>/<repo>/actions/runs/<id>/job/<job-id>
-                # Extract the run ID -- the segment after ``runs/``.
                 match = re.search(r"/actions/runs/(\d+)", str(link))
                 if match:
                     return match.group(1)
@@ -957,7 +919,6 @@ class GitOpsService:
             return ""
         if max_bytes <= 0 or len(stdout) <= max_bytes:
             return stdout
-        # Tail-bias trim: keep the last ``max_bytes`` of the log.
         return stdout[-max_bytes:]
 
     def poll_pr_review_resolution(
@@ -1200,10 +1161,8 @@ class GitOpsService:
         parent_path = WORKSPACE_ROOT
         submodule_name = repo_path.name
 
-        # Pull latest default branch into the submodule so parent sees the merged commit
         self.checkout_default_branch(repo, repo_path)
 
-        # Stage the submodule reference update in the parent
         self._git(["add", submodule_name], parent_path)
         self._git(["commit", "-m", message], parent_path)
         self.logger.info(
@@ -1211,10 +1170,6 @@ class GitOpsService:
             submodule_name,
             parent_path,
         )
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _get_default_branch(self, repo_path: Path, repo: str = "") -> str:
         """Return the default branch name for the repo (e.g. ``main``, ``main3``).

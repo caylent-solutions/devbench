@@ -95,7 +95,7 @@ class TestNoVerificationSectionBackCompat:
 
     def test_mark_done_allowed_without_verification_section(self, tmp_path: Path) -> None:
         idx = _make_index(tmp_path)
-        wu = _make_unit(tmp_path, "")  # no verification block
+        wu = _make_unit(tmp_path, "")
         mgr = BacklogManager()
         with patch("devbench.config.RUNTIME_CONFIG", _runtime_config()):
             mgr.mark_done(wu, idx, _UNIT_ID)
@@ -113,7 +113,6 @@ class TestEvidenceGateBlocks:
         with patch("devbench.config.RUNTIME_CONFIG", _runtime_config()):
             with pytest.raises(RuntimeError, match="evidence incomplete"):
                 mgr.mark_done(wu, idx, _UNIT_ID)
-        # Status NOT advanced to done.
         assert "## Status: in-review" in wu.read_text()
         assert not _is_done(idx)
 
@@ -145,8 +144,8 @@ class TestEvidenceGateAllows:
         """A failing attempt 1 followed by a passing attempt 2 is allowed."""
         idx = _make_index(tmp_path)
         wu = _make_unit(tmp_path, "- VERIFY AC-1 | type=apply | cmd=`make tf-apply` | expect-exit=0")
-        _write_evidence(tmp_path, exit_code=1)  # attempt 1 fails
-        _write_evidence(tmp_path, exit_code=0)  # attempt 2 passes -> latest
+        _write_evidence(tmp_path, exit_code=1)
+        _write_evidence(tmp_path, exit_code=0)
         assert verification.latest_attempt_number(tmp_path, _UNIT_ID) == 2
         mgr = BacklogManager()
         with patch("devbench.config.RUNTIME_CONFIG", _runtime_config()):

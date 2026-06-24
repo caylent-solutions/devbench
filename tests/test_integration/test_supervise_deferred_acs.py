@@ -27,8 +27,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SPEC = REPO_ROOT / "spec" / "devbench-supervise-screen-orchestrator" / "devbench-supervise-screen-orchestrator.md"
 
-#: The deferred-AC set (Section 10.1). Each requires a live subscription, a live
-#: ``claude``, a real ``screen``, or a real quota event, so none runs in CI.
 DEFERRED_ACS: tuple[str, ...] = ("AC-23", "AC-24", "AC-25", "AC-26", "AC-27", "AC-28", "AC-29", "AC-34")
 
 
@@ -52,7 +50,6 @@ class TestDeferredAcsArePinned:
 
     @pytest.mark.parametrize("ac", DEFERRED_ACS)
     def test_ac_states_a_live_only_reason(self, ac: str) -> None:
-        # Each deferred AC must state WHY it cannot run in CI (a live dependency).
         text = _spec_text()
         line = _ac_line(text, ac)
         assert line is not None
@@ -67,9 +64,6 @@ class TestExecutableAcsCoverNonLiveSurface:
     """The in-CI integration harness covers the non-live surface (DoD<->AC)."""
 
     def test_dummy_backlog_integration_module_exists(self) -> None:
-        # AC-23/AC-24's non-live portions are exercised by the dummy-backlog
-        # integration module; its presence is the in-CI complement to the
-        # deferred live cold-start + billing ACs.
         module = REPO_ROOT / "tests" / "test_integration" / "test_supervise_dummy_backlog_integration.py"
         assert module.is_file(), (
             "the dummy-backlog integration harness must exist so the deferred live "

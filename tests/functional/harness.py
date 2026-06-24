@@ -37,7 +37,6 @@ from devbench.config_loader import (
     SuperviseTimeoutsConfig,
 )
 
-#: Absolute path to the executable stub-claude CLI fixture (Section 10.0).
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "supervise"
 STUB_CLAUDE_PATH: Path = (_FIXTURES_DIR / "stub-claude.py").resolve()
 

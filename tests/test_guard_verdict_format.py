@@ -41,15 +41,11 @@ NON_CANONICAL_JUDGES = [
 ]
 
 REVIEWER_AGENT_TYPES = [
-    # ADR-28: the four review_team reviewers are dispatched directly by the
-    # orchestrate skill and present their subdir-namespaced agent_type, so each
-    # is allowlisted in its REGISTERED `review_team:`-infixed form.
     "devbench-orchestrate:review_team:code-reviewer",
     "devbench-orchestrate:review_team:test-reviewer",
     "devbench-orchestrate:review_team:doc-reviewer",
     "devbench-orchestrate:review_team:changes-manifest",
     "devbench-orchestrate:security-reviewer",
-    # Deprecated, but still in the allowlist for back-compat.
     "devbench-orchestrate:review-supervisor",
 ]
 
@@ -63,8 +59,6 @@ NON_REVIEWER_AGENT_TYPES = [
 ]
 
 SAMPLE_UNIT_ID = "E8-F3-S1-T1"
-# ADR-29 + Fix B: a valid token is scoped to the unit under review
-# (prefix "<unit-id>-") and is written to the round-token FILE.
 ROUND_TOKEN = f"{SAMPLE_UNIT_ID}-r1-abc123"
 
 
@@ -127,9 +121,6 @@ def _run_hook(
         check=False,
         env=env,
     )
-
-
-# --------------------------------------------------------------------------- AC-H3-1
 
 
 @pytest.mark.unit
@@ -197,9 +188,6 @@ class TestH3DefaultDenyNonReviewerAgents:
         )
 
 
-# --------------------------------------------------------------------------- AC-H3-2
-
-
 @pytest.mark.unit
 class TestH3RoundTokenRequired:
     """AC-H3-2: canonical verdicts require the round-token FILE even for reviewer agents."""
@@ -209,7 +197,6 @@ class TestH3RoundTokenRequired:
     def test_reviewer_without_token_file_blocked(self, judge: str, agent_type: str, tmp_path: Path) -> None:
         """Reviewer agent type with no round-token FILE must be blocked for canonical verdicts."""
         cmd = f"uv run devbench log-verdict {judge} {SAMPLE_UNIT_ID} pass"
-        # round_token=None -> the file is never created (absent token file).
         result = _run_hook(cmd, tmp_path, agent_type=agent_type, round_token=None)
         assert result.returncode == 2, (
             f"agent_type='{agent_type}' judge='{judge}' WITHOUT token file should be blocked (exit 2)"
@@ -241,7 +228,6 @@ class TestH3RoundTokenRequired:
             "tool_input": {"command": cmd},
             "agent_type": agent_type,
         }
-        # Build env WITHOUT DEVBENCH_WORKSPACE_ROOT (so the guard cannot resolve the file).
         env = _clean_env()
         result = subprocess.run(
             ["bash", str(HOOK_PATH)],
@@ -282,9 +268,6 @@ class TestH3RoundTokenRequired:
         )
 
 
-# --------------------------------------------------------------------------- Fix B: round token unit-scoped
-
-
 @pytest.mark.unit
 class TestH3RoundTokenUnitScoped:
     """Fix B: the round token must be scoped to the unit being reviewed.
@@ -300,7 +283,7 @@ class TestH3RoundTokenUnitScoped:
     def test_token_scoped_to_other_unit_blocked(self, judge: str, agent_type: str, tmp_path: Path) -> None:
         """A token file prefixed for a different unit is rejected even for a reviewer agent."""
         cmd = f"uv run devbench log-verdict {judge} {SAMPLE_UNIT_ID} pass"
-        stale = "E1-F1-S1-T9-r1-stale"  # scoped to a DIFFERENT unit than SAMPLE_UNIT_ID
+        stale = "E1-F1-S1-T9-r1-stale"
         result = _run_hook(cmd, tmp_path, agent_type=agent_type, round_token=stale)
         assert result.returncode == 2, (
             f"agent_type='{agent_type}' judge='{judge}' with a foreign-unit token should be blocked"
@@ -320,9 +303,6 @@ class TestH3RoundTokenUnitScoped:
             f"agent_type='{agent_type}' judge='{judge}' with a correctly-scoped token should be allowed"
             f" but got exit {result.returncode}; stderr: {result.stderr}"
         )
-
-
-# --------------------------------------------------------------------------- Regression: existing rules still hold
 
 
 @pytest.mark.unit
@@ -368,9 +348,6 @@ class TestH3ExistingBehaviorPreserved:
         assert "review-supervisor" in result.stderr or "security-reviewer" in result.stderr, (
             f"stderr must name allowed agent types, got: {result.stderr!r}"
         )
-
-
-# --------------------------------------------------------------------------- Workstream D: iac_review optional judge
 
 
 IAC_REVIEWER_AGENT_TYPE = "devbench-orchestrate:iac-deploy-reviewer"

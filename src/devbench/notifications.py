@@ -53,12 +53,6 @@ from typing import Any
 
 from devbench.utils.io import atomic_write_text
 
-# ---------------------------------------------------------------------------
-# Event-kind tokens.  Every public ``notify_*`` function dispatches under
-# one of these strings; the corresponding ``NotificationsEventsConfig`` field
-# uses the same name for grep-ability.
-# ---------------------------------------------------------------------------
-
 EVENT_WORK_UNIT_DONE = "work_unit_done"
 EVENT_WORK_UNIT_BLOCKED_OPERATOR = "work_unit_blocked_operator"
 EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION = "work_unit_blocked_runtime_degradation"
@@ -67,27 +61,15 @@ EVENT_WORK_UNIT_BLOCKED_ON_HELD = "work_unit_blocked_on_held"
 EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING = "work_unit_blocked_auto_clearing"
 EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY = "work_unit_blocked_awaiting_dependency"
 EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY = "work_unit_blocked_amendment_recovery"
-# Operator-block Slack-gap spec G4 / AC-4: the ``INTERRUPTED_ON_STOP`` block
-# bucket (unit force-blocked by the SIGTERM safeguard, auto-requeued on the next
-# sweep) gets its own event so it is mapped rather than unmapped-and-silent.
-# Default toggle OFF -- the interruption is transient, so operators opt in.
 EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP = "work_unit_blocked_interrupted_on_stop"
 EVENT_WORK_UNIT_MATERIALISED = "work_unit_materialised"
 EVENT_WORK_UNIT_PROMOTED = "work_unit_promoted"
 EVENT_PR_OPENED = "pr_opened"
 EVENT_PR_MERGED = "pr_merged"
 EVENT_CI_FAILURE = "ci_failure"
-# Issue #219 / #220: ``ci_pass`` fires on CIResult.GREEN inside the
-# finalize path so operators running ``auto_merge: false`` know the
-# batch PR is ready for manual merge.  Sibling event to ``ci_failure``.
 EVENT_CI_PASS = "ci_pass"
 EVENT_ORCHESTRATOR_STOP = "orchestrator_stop"
 EVENT_ORCHESTRATOR_AUTO_RESTART = "orchestrator_auto_restart"
-# Quota wait-and-resume lifecycle (operator request).  ``quota_waiting`` fires
-# the moment the orchestrator hits a quota and begins waiting; ``quota_resumed``
-# fires when the quota recovers and the run resumes.  Both default OFF (opt-in),
-# mirroring every other event toggle.  Fired from ``_handle_quota_pause`` in
-# ``devbench.cli`` -- see Feature 1 of the quota-notifications change.
 EVENT_QUOTA_WAITING = "quota_waiting"
 EVENT_QUOTA_RESUMED = "quota_resumed"
 
@@ -114,23 +96,8 @@ ALL_EVENTS: tuple[str, ...] = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Notification-payload constants
-# ---------------------------------------------------------------------------
-
-# Slack's broadcast mention that notifies every online member of the channel
-# the webhook posts to.  Operators routing to a one-person private DM channel
-# get a personal push; operators routing to a shared team channel notify the
-# whole online team.  Single payload works for both.
 SLACK_HERE_MENTION: str = "<!here>"
 
-
-# ---------------------------------------------------------------------------
-# Orchestrator stop-class tokens (E14-F2-S1-T1, issue #271)
-# ---------------------------------------------------------------------------
-# Single-sourced enumeration of the orchestrator stop classes.  These tokens
-# are the keys for the configurable mention-level mapping; the dispatch path
-# and config resolution both import from here so no literal is duplicated.
 
 STOP_CLASS_PREMATURE_TURN_END: str = "premature-turn-end"
 STOP_CLASS_COMPLETION: str = "completion"
@@ -148,24 +115,12 @@ ALL_STOP_CLASSES: tuple[str, ...] = (
     STOP_CLASS_QUOTA_EXHAUSTED,
 )
 
-# ---------------------------------------------------------------------------
-# Mention-level tokens (E14-F2-S1-T1)
-# ---------------------------------------------------------------------------
-# Allowed values for the per-stop-class mention level.
-# ``here`` -- emit ``<!here>`` so Slack pushes a notification to every online
-#     channel member (the existing behaviour for all stops).
-# ``none`` -- omit the broadcast mention; the message still lands in the
-#     channel but no push notification fires.
 
 MENTION_LEVEL_HERE: str = "here"
 MENTION_LEVEL_NONE: str = "none"
 
 ALL_MENTION_LEVELS: tuple[str, ...] = (MENTION_LEVEL_HERE, MENTION_LEVEL_NONE)
 
-# Default noise-reducing mapping.  Attention-worthy stops (premature exit,
-# operator interrupt, crash, quota) get ``<!here>``; genuine completion and
-# clean drain get no broadcast mention.  Declared once here so config.py and
-# the dispatch path share the same default without copying literals.
 DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP: dict[str, str] = {
     STOP_CLASS_PREMATURE_TURN_END: MENTION_LEVEL_HERE,
     STOP_CLASS_COMPLETION: MENTION_LEVEL_NONE,
@@ -229,7 +184,6 @@ def classify_stop_class(reason: str) -> str:
         return STOP_CLASS_OPERATOR_INTERRUPT
     if reason.startswith("quota"):
         return STOP_CLASS_QUOTA_EXHAUSTED
-    # crash:, continuation budget exhausted, and any unrecognised reason
     return STOP_CLASS_CRASH
 
 
@@ -253,30 +207,8 @@ def resolve_mention_text(mention_level: str) -> str:
     raise ValueError(f"unknown mention level {mention_level!r}; allowed mention levels: {sorted(ALL_MENTION_LEVELS)}")
 
 
-# ---------------------------------------------------------------------------
-# Classification-transition cache (#207)
-# ---------------------------------------------------------------------------
-#
-# The base ``notify_work_unit_blocked_operator`` fires once at ``mark_blocked``
-# time and only when classification == OPERATOR_ACTION_REQUIRED at that exact
-# moment.  When a blocked task's classification later transitions into
-# OPERATOR_ACTION_REQUIRED (because a dep landed but the task never
-# auto-unblocked, or a ``[BLOCKED]`` audit went stale), no ping fires --
-# operators silently miss notifications they explicitly enabled.
-#
-# ``notify_blocked_operator_transition`` closes that gap with a per-workspace
-# JSON cache of each task's last-observed classification.  Callers from write
-# sites (``mark_blocked``, ``cmd_sync_blocked``, ``cmd_reconcile_cascade``)
-# route through this helper; read-only sites (the status / report renderers)
-# do not, so classification on every render does not produce duplicate pings.
-
 NOTIFICATION_STATE_FILENAME: str = "notification-state.json"
 
-# ``BlockedTaskState`` enum member name -> Slack event toggle.  Each
-# blocked classification gets its own per-event toggle so operators can
-# opt in by bucket (issue #209).  Re-using the enum's ``.name`` string
-# (e.g. ``"AWAITING_DEPENDENCY"``) keeps the mapping single-source-of-truth
-# with the classifier in ``backlog/proposal.py``.
 _EVENT_BY_CLASSIFICATION: dict[str, str] = {
     "RUNTIME_DEGRADATION": EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION,
     "HELD": EVENT_WORK_UNIT_BLOCKED_HELD,
@@ -285,22 +217,9 @@ _EVENT_BY_CLASSIFICATION: dict[str, str] = {
     "AWAITING_DEPENDENCY": EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY,
     "AWAITING_AMENDMENT_RECOVERY": EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY,
     "OPERATOR_ACTION_REQUIRED": EVENT_WORK_UNIT_BLOCKED_OPERATOR,
-    # G4 / AC-4: map the transient SIGTERM-interrupt bucket so it is no longer
-    # unmapped-and-silent.  The event's toggle defaults OFF (opt-in).
     "INTERRUPTED_ON_STOP": EVENT_WORK_UNIT_BLOCKED_INTERRUPTED_ON_STOP,
 }
 
-# ``BlockedTaskState`` member names that DELIBERATELY do not page, with a
-# reviewed rationale (operator-block Slack-gap spec, Inv-2 / AC-4).  The
-# coverage test (``tests/test_notification_coverage.py``) asserts this set and
-# ``_EVENT_BY_CLASSIFICATION`` partition ``BlockedTaskState`` exactly, so a new
-# bucket added without a deliberate decision fails the test instead of silently
-# never paging.
-#
-# Empty today: every bucket -- including ``INTERRUPTED_ON_STOP`` -- maps to an
-# event in ``_EVENT_BY_CLASSIFICATION``.  ``INTERRUPTED_ON_STOP`` maps to a
-# default-OFF event (``work_unit_blocked_interrupted_on_stop``) so the transient
-# auto-requeued interruption is opt-in rather than unmapped-and-silent.
 _DELIBERATELY_SILENT_CLASSIFICATIONS: frozenset[str] = frozenset()
 
 
@@ -327,11 +246,6 @@ def _resolve_backlog_label() -> str:
     return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# URL masking for log lines (sensitive data)
-# ---------------------------------------------------------------------------
-
-
 def _mask_url(url: str) -> str:
     """Return the trailing 8 characters of *url* with a leading ``...``.
 
@@ -345,11 +259,6 @@ def _mask_url(url: str) -> str:
     if len(url) <= 8:
         return "***"
     return f"...{url[-8:]}"
-
-
-# ---------------------------------------------------------------------------
-# Config lookup (lazy, never raises)
-# ---------------------------------------------------------------------------
 
 
 def _load_notifications_config() -> Any:
@@ -381,11 +290,6 @@ def is_event_enabled(event_kind: str) -> bool:
     if cfg is None or not cfg.enabled:
         return False
     return bool(getattr(cfg.events, event_kind, False))
-
-
-# ---------------------------------------------------------------------------
-# Payload builders
-# ---------------------------------------------------------------------------
 
 
 def _build_slack_payload(
@@ -446,15 +350,8 @@ def _build_slack_payload(
     return {"text": text_line, "blocks": blocks}
 
 
-# ---------------------------------------------------------------------------
-# Webhook transport (stdlib http.client, best-effort)
-# ---------------------------------------------------------------------------
-
-# Default timeout for best-effort webhook POST calls.
 _WEBHOOK_DEFAULT_TIMEOUT_SECONDS: float = 10.0
 
-# Allowed URL schemes for webhook POSTs.  Only http and https are permitted;
-# file: and other custom schemes are disallowed (security: untrusted output sinks).
 _WEBHOOK_ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
 
@@ -497,7 +394,6 @@ def post_webhook(
         msg = f"timeout_seconds must be positive, got {timeout_seconds!r}"
         raise ValueError(msg)
 
-    # Validate scheme before any network I/O: reject file: and custom handlers.
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in _WEBHOOK_ALLOWED_SCHEMES:
         msg = f"url scheme {parsed.scheme!r} is not allowed; use one of {sorted(_WEBHOOK_ALLOWED_SCHEMES)}"
@@ -512,11 +408,6 @@ def post_webhook(
     try:
         _http_post(parsed, body, headers, timeout_seconds)
     except Exception as exc:
-        # Webhook URLs are credentials (CLAUDE.md "Sensitive Data
-        # Handling").  Mask all but the last 8 chars in the log so an
-        # operator can correlate the failure with the URL they
-        # configured without leaking the secret to a shared stdout
-        # capture.
         masked = "..." + url[-8:] if len(url) > 8 else "***"
         print(
             f"[WARN] webhook POST to {masked!r} failed: {exc!r}",
@@ -572,11 +463,6 @@ def _http_post(
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Dispatch core (best-effort)
-# ---------------------------------------------------------------------------
-
-
 def _dispatch(
     event_kind: str,
     slack_summary: str,
@@ -626,11 +512,6 @@ def _dispatch(
             f"[WARN] notifications: dispatch failed for {event_kind!r}: {exc!r}",
             file=sys.stderr,
         )
-
-
-# ---------------------------------------------------------------------------
-# Per-event dispatchers
-# ---------------------------------------------------------------------------
 
 
 def notify_work_unit_done(unit_id: str, title: str) -> None:
@@ -730,11 +611,6 @@ def notify_work_unit_blocked_interrupted_on_stop(unit_id: str, title: str, reaso
     )
 
 
-# Map ``BlockedTaskState`` enum-member name -> per-class notify_* function NAME.
-# Stored as a string and resolved through ``globals()`` at call time so test
-# ``patch("devbench.notifications.notify_*")`` patches the same module
-# attribute the dispatcher actually invokes; a direct function-object map
-# would capture the pre-patch object and bypass the mock.
 _NOTIFY_FN_NAME_BY_CLASSIFICATION: dict[str, str] = {
     "RUNTIME_DEGRADATION": "notify_work_unit_blocked_runtime_degradation",
     "HELD": "notify_work_unit_blocked_held",
@@ -763,8 +639,6 @@ def _load_notification_state(state_path: Path) -> dict[str, str]:
         return {}
     if not isinstance(payload, dict):
         return {}
-    # Coerce to str/str: defensively reject non-string keys / values rather
-    # than carrying mismatched shapes forward.
     return {str(k): str(v) for k, v in payload.items() if isinstance(k, str)}
 
 
@@ -844,8 +718,6 @@ def notify_blocked_classification_transition(
         )
 
     if transitioned and is_event_enabled(event_kind):
-        # Resolve via globals so test-time patches of ``notify_work_unit_blocked_*``
-        # in this module are honoured (see _NOTIFY_FN_NAME_BY_CLASSIFICATION).
         notify_fn = globals()[_NOTIFY_FN_NAME_BY_CLASSIFICATION[classification]]
         notify_fn(unit_id, title, reason)
 
@@ -1166,11 +1038,6 @@ def notify_quota_resumed(waited_seconds: int) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Self-test driver (used by ``devbench notify-test``)
-# ---------------------------------------------------------------------------
-
-
 def send_test_notification(event_kind: str) -> None:
     """Fire one sample notification for *event_kind*.
 
@@ -1192,10 +1059,6 @@ def send_test_notification(event_kind: str) -> None:
         )
         return
 
-    # Temporarily force the toggle on for the named event so the
-    # dispatcher fires regardless of yaml state.  We do this by
-    # wrapping the dispatch call in an attribute-patch on the cached
-    # events object; restored in the finally block.
     original = getattr(cfg.events, event_kind)
     try:
         setattr(cfg.events, event_kind, True)
@@ -1218,16 +1081,10 @@ _BLOCKED_CLASS_SAMPLE_DISPATCH = {
 
 def _fire_sample(event_kind: str) -> None:
     """Dispatch a canned payload for *event_kind* with placeholder data."""
-    # All seven blocked-class events share the (unit_id, title, reason)
-    # signature; dispatch via a dict to keep branch count manageable.
     blocked_fn = _BLOCKED_CLASS_SAMPLE_DISPATCH.get(event_kind)
     if blocked_fn is not None:
         blocked_fn("E0-F1-S1-T1", "Sample test task", "manual notify-test invocation")
         return
-    # Issue #219: pr_opened / pr_merged / ci_pass all share the
-    # (unit_id, repo, pr_url) signature, so dispatch them via a dict
-    # alongside the blocked-class dispatch to keep ``_fire_sample``
-    # under ruff PLR0912's 12-branch cap as new events are added.
     pr_url = "https://github.com/acme/widget/pull/1"
     pr_3arg_dispatch: dict[str, Callable[[str, str, str], None]] = {
         EVENT_PR_OPENED: notify_pr_opened,
@@ -1255,7 +1112,4 @@ def _fire_sample(event_kind: str) -> None:
     elif event_kind == EVENT_QUOTA_RESUMED:
         notify_quota_resumed(1234)
     else:
-        # ALL_EVENTS guard above keeps us off this branch in practice;
-        # the explicit raise is defensive only for future-event additions
-        # so a missing elif branch is loud instead of silent.
         raise ValueError(f"_fire_sample missing branch for event {event_kind!r}")

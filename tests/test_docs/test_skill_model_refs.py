@@ -15,9 +15,6 @@ import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 
-# ---------------------------------------------------------------------------
-# File paths under test
-# ---------------------------------------------------------------------------
 
 CONFIGURE_DEVBENCH_SKILL = (
     REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / "configure-devbench" / "SKILL.md"
@@ -35,11 +32,6 @@ SECURITY_REVIEWER_AGENT = REPO_ROOT / "plugin" / "devbench-orchestrate" / "agent
 def _read(path: Path) -> str:
     assert path.is_file(), f"Required skill/agent file does not exist: {path}"
     return path.read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# AC-E9-2a: model examples must use claude-opus-4-8 (not claude-opus-4-7)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -91,11 +83,6 @@ class TestModelExamplesAreOpus48:
         assert "claude-opus-4-7" not in text, "security-reviewer.md must not reference claude-opus-4-7 (issue #254)."
 
 
-# ---------------------------------------------------------------------------
-# AC-E9-2: per-file required new-capability text
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestConfigureDevbenchCapabilities:
     """Required new-capability text in configure-devbench SKILL.md."""
@@ -117,18 +104,14 @@ class TestConfigureDevbenchCapabilities:
     def test_task_factory_default_true_documented(self) -> None:
         """Issue #259: task_factory section must document enabled with default: true."""
         text = _read(CONFIGURE_DEVBENCH_SKILL)
-        # The task_factory step heading must exist
         assert "task_factory section" in text or "task_factory" in text, (
             "configure-devbench SKILL.md must contain a task_factory section (issue #259)."
         )
-        # Find the dedicated task_factory STEP (not agents references) and check for default: true
-        # Look for the step heading then search within that section
         step_marker = "## Step 8 -- task_factory section"
         assert step_marker in text, (
             "configure-devbench SKILL.md must have a '## Step 8 -- task_factory section' heading (issue #259)."
         )
         step_start = text.find(step_marker)
-        # Section ends at the next '## Step' or '---' boundary
         next_section = text.find("\n## ", step_start + len(step_marker))
         step_text = text[step_start:next_section] if next_section != -1 else text[step_start:]
         assert "default: true" in step_text or "[default: true]" in step_text or "default true" in step_text.lower(), (
@@ -139,7 +122,6 @@ class TestConfigureDevbenchCapabilities:
     def test_emit_all_sections_documented(self) -> None:
         """Issue #260: Step 20 must state that ALL sections are emitted in the final YAML."""
         text = _read(CONFIGURE_DEVBENCH_SKILL)
-        # The file should document emitting all sections
         assert (
             "emit" in text.lower()
             or "all sections" in text.lower()
@@ -297,26 +279,16 @@ class TestSecurityReviewerCapabilities:
         )
 
 
-# ---------------------------------------------------------------------------
-# AC-E9-2: stale-reference grep over plugin*/**/*.md
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestStaleReferenceGrep:
     """AC-E9-2: the stale-reference grep must return zero non-historical hits."""
 
     _STALE_PATTERN = re.compile(r"claude-opus-4-7|opt-in", re.IGNORECASE)
 
-    # Phrases that are intentional historical or feature-description references
-    # and are NOT stale. Strings that contain one of these substrings are allowed
-    # to appear even if they match the broad pattern.
     _HISTORICAL_MARKERS = (
-        # The PR-review-resolution feature is described as opt-in via config
         "pr_review_resolution",
         "DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED",
         "issue #116",
-        # Historical: any sentence explicitly saying "4.7 is the previous model"
         "previous model",
         "4.7 row",
         "Claude Opus 4.7",
@@ -358,11 +330,6 @@ class TestStaleReferenceGrep:
             "Stale 'opt-in' references found in plugin*/**/*.md "
             "(non-historical; use descriptive wording instead):\n" + "\n".join(hits)
         )
-
-
-# ---------------------------------------------------------------------------
-# No em-dash in any enumerated skill/agent file
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

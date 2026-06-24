@@ -38,12 +38,10 @@ def _extract_relative_file_links(text: str) -> list[str]:
     file_links: list[str] = []
     for raw in raw_links:
         stripped = raw.strip()
-        # Skip bare anchors, absolute URLs, and mail links.
         if stripped.startswith("#"):
             continue
         if stripped.startswith(("http://", "https://", "mailto:")):
             continue
-        # Strip trailing fragment anchor (e.g. ``foo.md#section``).
         path_part = stripped.split("#")[0]
         if path_part:
             file_links.append(path_part)

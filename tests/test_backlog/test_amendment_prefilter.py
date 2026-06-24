@@ -19,10 +19,6 @@ from devbench.backlog.amendment import (
 )
 from devbench.config_loader import AmendmentConfig
 
-# ---------------------------------------------------------------------------
-# Fixture content
-# ---------------------------------------------------------------------------
-
 WORK_UNIT_TEMPLATE = """\
 # {task_id}: Sample Task
 
@@ -106,25 +102,15 @@ def _make_request(**overrides: Any) -> AmendmentRequest:
     return AmendmentRequest.from_dict(_sample_payload(**overrides))
 
 
-# ---------------------------------------------------------------------------
-# check_enabled
-# ---------------------------------------------------------------------------
-
-
 class TestCheckEnabled:
     def test_enabled_passes(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config(enabled=True))
-        pf.check_enabled()  # no raise
+        pf.check_enabled()
 
     def test_disabled_rejects(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config(enabled=False))
         with pytest.raises(AmendmentError, match="disabled for this backlog"):
             pf.check_enabled()
-
-
-# ---------------------------------------------------------------------------
-# check_reason_allowed
-# ---------------------------------------------------------------------------
 
 
 class TestCheckReasonAllowed:
@@ -137,11 +123,6 @@ class TestCheckReasonAllowed:
         req = _make_request(reason="some_other_reason")
         with pytest.raises(AmendmentError, match="not in allowed reasons"):
             pf.check_reason_allowed(req)
-
-
-# ---------------------------------------------------------------------------
-# check_rate_limit
-# ---------------------------------------------------------------------------
 
 
 class TestCheckRateLimit:
@@ -160,11 +141,6 @@ class TestCheckRateLimit:
             pf.check_rate_limit(3)
 
 
-# ---------------------------------------------------------------------------
-# check_task_exists_and_in_progress
-# ---------------------------------------------------------------------------
-
-
 class TestCheckTaskExistsAndInProgress:
     def test_in_progress_passes(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
@@ -178,7 +154,6 @@ class TestCheckTaskExistsAndInProgress:
             pf.check_task_exists_and_in_progress(req)
 
     def test_non_in_progress_rejects(self, tmp_path: Path) -> None:
-        # Rebuild the backlog with a non-in-progress status.
         index = tmp_path / "BACKLOG.md"
         index.write_text(BACKLOG_INDEX_TEMPLATE.format(status="in-queue"))
         backlog_dir = tmp_path / "backlog"
@@ -195,11 +170,6 @@ class TestCheckTaskExistsAndInProgress:
         pf = PreFilter(tmp_path / "nonexistent-BACKLOG.md", _default_config())
         with pytest.raises(AmendmentError, match="Cannot read backlog index"):
             pf.check_task_exists_and_in_progress(_make_request())
-
-
-# ---------------------------------------------------------------------------
-# check_linked_acs_exist
-# ---------------------------------------------------------------------------
 
 
 class TestCheckLinkedAcsExist:
@@ -220,33 +190,25 @@ class TestCheckLinkedAcsExist:
             pf.check_linked_acs_exist(_make_request(linked_acs=["AC-DOES-NOT-EXIST"]), unit)
 
 
-# ---------------------------------------------------------------------------
-# check_files_not_already_in_manifest
-# ---------------------------------------------------------------------------
-
-
 class TestCheckFilesNotAlreadyInManifest:
     def test_new_file_passes(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
         unit = pf.check_task_exists_and_in_progress(_make_request())
-        pf.check_files_not_already_in_manifest(_make_request(), unit)  # src/example/parser.py not in manifest
+        pf.check_files_not_already_in_manifest(_make_request(), unit)
 
     def test_duplicate_file_rejects(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
         unit = pf.check_task_exists_and_in_progress(_make_request())
-        # The template's manifest already lists tests/test_example.py
         req = _make_request(files_to_add=[{"path": "tests/test_example.py", "change": "dup"}])
         with pytest.raises(AmendmentError, match="already declared in Changes Manifest"):
             pf.check_files_not_already_in_manifest(req, unit)
 
     def test_malformed_manifest_raises_amendment_error(self, tmp_path: Path) -> None:
-        # Build a work unit whose Changes Manifest is malformed
         index = tmp_path / "BACKLOG.md"
         index.write_text(BACKLOG_INDEX_TEMPLATE.format(status="in-progress"))
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
         content = WORK_UNIT_TEMPLATE.format(task_id="EX-F1-S1-T1", status="in-progress")
-        # Inject a three-column row into the manifest
         content = content.replace(
             "| `tests/test_example.py` | add new tests |",
             "| `tests/test_example.py` | add | bad |",
@@ -256,11 +218,6 @@ class TestCheckFilesNotAlreadyInManifest:
         unit = pf.check_task_exists_and_in_progress(_make_request())
         with pytest.raises(AmendmentError, match="Cannot read current Changes Manifest"):
             pf.check_files_not_already_in_manifest(_make_request(), unit)
-
-
-# ---------------------------------------------------------------------------
-# check_files_in_staged_diff
-# ---------------------------------------------------------------------------
 
 
 class TestCheckFilesInStagedDiff:
@@ -274,11 +231,6 @@ class TestCheckFilesInStagedDiff:
             pf.check_files_in_staged_diff(_make_request(), frozenset({"other/file.py"}))
 
 
-# ---------------------------------------------------------------------------
-# run_all integration
-# ---------------------------------------------------------------------------
-
-
 class TestRunAll:
     def test_all_pass_end_to_end(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
@@ -289,21 +241,13 @@ class TestRunAll:
         )
 
     def test_short_circuits_on_first_failure(self, tmp_backlog: Path) -> None:
-        # Config says enabled=False; the very first check (enabled) must fail
-        # without needing any of the later context.
         pf = PreFilter(tmp_backlog, _default_config(enabled=False))
         with pytest.raises(AmendmentError, match="disabled"):
             pf.run_all(_make_request())
 
     def test_run_all_skips_staged_check_when_none(self, tmp_backlog: Path) -> None:
-        # Passing staged_files=None means the check is skipped; everything else passes.
         pf = PreFilter(tmp_backlog, _default_config())
         pf.run_all(_make_request(), staged_files=None, prior_applied_count=0)
-
-
-# ---------------------------------------------------------------------------
-# _extract_ac_id helper
-# ---------------------------------------------------------------------------
 
 
 class TestExtractAcId:

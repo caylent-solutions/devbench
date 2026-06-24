@@ -31,11 +31,6 @@ from devbench.backlog.amendment import (
 )
 from devbench.config_loader import AmendmentConfig
 
-# ---------------------------------------------------------------------------
-# Shared fixtures
-# ---------------------------------------------------------------------------
-
-
 BACKLOG_INDEX_TEMPLATE = """\
 # Backlog
 
@@ -125,11 +120,6 @@ def _default_config(**overrides: Any) -> AmendmentConfig:
     return AmendmentConfig(**defaults)
 
 
-# ---------------------------------------------------------------------------
-# operator_mode field
-# ---------------------------------------------------------------------------
-
-
 class TestOperatorModeField:
     """operator_mode defaults to False; truthy JSON bool sets it True."""
 
@@ -152,11 +142,6 @@ class TestOperatorModeField:
     def test_integer_rejects(self) -> None:
         with pytest.raises(ValueError, match="operator_mode must be a bool"):
             AmendmentRequest.from_dict(_base_payload(operator_mode=1))
-
-
-# ---------------------------------------------------------------------------
-# files_to_remove field
-# ---------------------------------------------------------------------------
 
 
 class TestFilesToRemoveField:
@@ -183,11 +168,6 @@ class TestFilesToRemoveField:
             AmendmentRequest.from_dict(_base_payload(files_to_remove=[""]))
 
 
-# ---------------------------------------------------------------------------
-# target_repository field
-# ---------------------------------------------------------------------------
-
-
 class TestTargetRepositoryField:
     """target_repository: str, default ""."""
 
@@ -206,11 +186,6 @@ class TestTargetRepositoryField:
     def test_list_rejects(self) -> None:
         with pytest.raises(ValueError, match="target_repository must be a string"):
             AmendmentRequest.from_dict(_base_payload(target_repository=["org/repo"]))
-
-
-# ---------------------------------------------------------------------------
-# description_patch field
-# ---------------------------------------------------------------------------
 
 
 class TestDescriptionPatchField:
@@ -233,11 +208,6 @@ class TestDescriptionPatchField:
             AmendmentRequest.from_dict(_base_payload(description_patch=["line"]))
 
 
-# ---------------------------------------------------------------------------
-# approach_patch field
-# ---------------------------------------------------------------------------
-
-
 class TestApproachPatchField:
     """approach_patch: str, default ""."""
 
@@ -252,11 +222,6 @@ class TestApproachPatchField:
     def test_non_string_rejects(self) -> None:
         with pytest.raises(ValueError, match="approach_patch must be a string"):
             AmendmentRequest.from_dict(_base_payload(approach_patch=99))
-
-
-# ---------------------------------------------------------------------------
-# title_patch field
-# ---------------------------------------------------------------------------
 
 
 class TestTitlePatchField:
@@ -279,11 +244,6 @@ class TestTitlePatchField:
             AmendmentRequest.from_dict(_base_payload(title_patch=["Title"]))
 
 
-# ---------------------------------------------------------------------------
-# dod_patch field
-# ---------------------------------------------------------------------------
-
-
 class TestDodPatchField:
     """dod_patch: str, default ""."""
 
@@ -298,11 +258,6 @@ class TestDodPatchField:
     def test_non_string_rejects(self) -> None:
         with pytest.raises(ValueError, match="dod_patch must be a string"):
             AmendmentRequest.from_dict(_base_payload(dod_patch={"key": "val"}))
-
-
-# ---------------------------------------------------------------------------
-# section_patches field
-# ---------------------------------------------------------------------------
 
 
 class TestSectionPatchesField:
@@ -328,11 +283,6 @@ class TestSectionPatchesField:
     def test_non_string_value_rejects(self) -> None:
         with pytest.raises(ValueError, match="section_patches values must be strings"):
             AmendmentRequest.from_dict(_base_payload(section_patches={"## Sec": 42}))
-
-
-# ---------------------------------------------------------------------------
-# to_dict round-trip
-# ---------------------------------------------------------------------------
 
 
 class TestRoundTrip:
@@ -374,11 +324,6 @@ class TestRoundTrip:
         assert rebuilt.section_patches == {}
 
 
-# ---------------------------------------------------------------------------
-# PreFilter.run_all skips in-progress gate in operator mode
-# ---------------------------------------------------------------------------
-
-
 class TestPreFilterOperatorMode:
     """run_all with operator_mode=True skips check_task_exists_and_in_progress."""
 
@@ -407,7 +352,6 @@ class TestPreFilterOperatorMode:
         )
         pf = PreFilter(tmp_backlog, _default_config())
         req = AmendmentRequest.from_dict(_base_payload(operator_mode=True, linked_acs=[]))
-        # Should NOT raise (in-progress gate is skipped)
         pf.run_all(req, operator_mode=True)
 
     def test_operator_mode_still_enforces_check_enabled(self, tmp_backlog: Path) -> None:
@@ -416,11 +360,6 @@ class TestPreFilterOperatorMode:
         req = AmendmentRequest.from_dict(_base_payload(operator_mode=True))
         with pytest.raises(AmendmentError, match="disabled for this backlog"):
             pf.run_all(req, operator_mode=True)
-
-
-# ---------------------------------------------------------------------------
-# apply_operator_amendment error paths
-# ---------------------------------------------------------------------------
 
 
 class TestApplyOperatorAmendmentErrorPaths:
@@ -434,7 +373,6 @@ class TestApplyOperatorAmendmentErrorPaths:
         index.write_text(BACKLOG_INDEX_TEMPLATE.format(status="blocked"))
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
-        # WU file without a ## Changes Manifest section triggers ManifestParseError
         wu_content = """\
 # EX-F1-S1-T1: Sample Task
 
@@ -480,7 +418,6 @@ No manifest section here.
             )
         )
 
-        # Patch ManifestRow to raise ValueError when constructed from a valid entry
         def _raise_value_error(file: str, change: str) -> ManifestRow:
             raise ValueError("ManifestRow mock error")
 
@@ -489,14 +426,6 @@ No manifest section here.
                 apply_operator_amendment(index, "EX-F1-S1-T1", req)
 
 
-# ---------------------------------------------------------------------------
-# apply_operator_amendment files_to_remove (AC-1)
-# ---------------------------------------------------------------------------
-
-
-# A work unit whose Changes Manifest carries two rows; removing the stale row
-# leaves a valid non-empty manifest (mirrors the E9-F7-S1-T1 incident where a
-# DONE sibling renamed terragrunt.hcl -> root.hcl).
 TWO_ROW_WORK_UNIT_TEMPLATE = """\
 # {task_id}: Sample Task
 
@@ -567,7 +496,6 @@ class TestApplyOperatorAmendmentFilesToRemove:
         wu_file = tmp_backlog_two_rows.parent / "backlog" / "EX-F1-S1-T1.md"
         updated = wu_file.read_text(encoding="utf-8")
         rows = parse_manifest(updated)
-        # Exactly the named row is gone; the sibling row remains.
         assert [r.file for r in rows] == ["terragrunt/root.hcl"]
 
     def test_writes_row_removed_audit_comment(self, tmp_backlog_two_rows: Path) -> None:
@@ -589,7 +517,6 @@ class TestApplyOperatorAmendmentFilesToRemove:
         wu_file = tmp_backlog_two_rows.parent / "backlog" / "EX-F1-S1-T1.md"
         updated = wu_file.read_text(encoding="utf-8")
         assert MANIFEST_ROW_REMOVED_ACTION in updated
-        # The audit comment names the removed row so the trail is actionable.
         assert "terragrunt/terragrunt.hcl" in updated
 
     def test_add_and_remove_in_one_request(self, tmp_backlog_two_rows: Path) -> None:
@@ -632,13 +559,11 @@ class TestApplyOperatorAmendmentFilesToRemove:
             apply_operator_amendment(tmp_backlog_two_rows, "EX-F1-S1-T1", req)
         assert "terragrunt/does-not-exist.hcl" in str(exc.value)
 
-        # Fail-fast before any write: file is byte-for-byte unchanged.
         assert wu_file.read_text(encoding="utf-8") == before
 
     def test_post_check_rollback_on_integrity_violation(self, tmp_backlog_two_rows: Path) -> None:
         from devbench.backlog.amendment import apply_operator_amendment
 
-        # Damage BACKLOG.md so validate-backlog fails after the removal write.
         index = tmp_backlog_two_rows
         damaged = index.read_text().replace(
             "| EX-F1-S1-T1 | Sample Task | Task | in-progress | None |",
@@ -660,5 +585,4 @@ class TestApplyOperatorAmendmentFilesToRemove:
         with pytest.raises(AmendmentError, match="Layer-3 post-check failed"):
             apply_operator_amendment(index, "EX-F1-S1-T1", req)
 
-        # Rollback: work-unit file restored to pre-amendment content.
         assert wu_file.read_text(encoding="utf-8") == before

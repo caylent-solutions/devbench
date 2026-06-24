@@ -24,10 +24,6 @@ from devbench.config_loader import (
     NotificationsSlackConfig,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _make_config(
     *,
@@ -45,11 +41,6 @@ def _make_config(
     )
 
 
-# ---------------------------------------------------------------------------
-# _mask_url
-# ---------------------------------------------------------------------------
-
-
 class TestMaskUrl:
     def test_returns_triple_star_for_empty(self) -> None:
         assert notifications._mask_url("") == "***"
@@ -59,11 +50,6 @@ class TestMaskUrl:
 
     def test_returns_last_8_chars_prefixed_with_ellipsis(self) -> None:
         assert notifications._mask_url("https://hooks.slack.com/services/AAA/BBB/SECRET01") == "...SECRET01"
-
-
-# ---------------------------------------------------------------------------
-# is_event_enabled
-# ---------------------------------------------------------------------------
 
 
 class TestIsEventEnabled:
@@ -90,11 +76,6 @@ class TestIsEventEnabled:
         cfg = _make_config(enabled=True)
         with patch.object(notifications, "_load_notifications_config", return_value=cfg):
             assert notifications.is_event_enabled("not_an_event") is False
-
-
-# ---------------------------------------------------------------------------
-# _build_slack_payload
-# ---------------------------------------------------------------------------
 
 
 class TestSlackPayload:
@@ -131,7 +112,6 @@ class TestSlackPayload:
         payload = notifications._build_slack_payload(summary="x", fields=[], context=None)
         block_types = [b["type"] for b in payload["blocks"]]
         assert block_types == ["section", "section"]
-        # Backlog is the sole field when callers supply none.
         fields_block = payload["blocks"][1]
         assert len(fields_block["fields"]) == 1
         assert "*Backlog*" in fields_block["fields"][0]["text"]
@@ -147,11 +127,6 @@ class TestSlackPayload:
         fields_block = payload["blocks"][1]
         assert "*Backlog*" in fields_block["fields"][0]["text"]
         assert "*Task*" in fields_block["fields"][1]["text"]
-
-
-# ---------------------------------------------------------------------------
-# Per-event dispatchers — gating + payload shape
-# ---------------------------------------------------------------------------
 
 
 class TestNotifyWorkUnitDone:
@@ -207,11 +182,9 @@ class TestNotifyWorkUnitDone:
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
             patch("devbench.notifications.post_webhook", side_effect=boom),
         ):
-            # Must not raise.
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
         err = capsys.readouterr().err
         assert "[WARN]" in err
-        # URL must be masked in the error log.
         assert "https://hooks.slack.com/services/T/B/X" not in err
 
 
@@ -393,7 +366,6 @@ class TestPerEventPayloads:
             event_name="orchestrator_stop",
         )
         assert "Orchestrator stopped" in payload["text"]
-        # In-flight WU appears in a structured field.
         field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
         assert "E0-F1-S1-T1" in field_blob
 
@@ -404,7 +376,6 @@ class TestPerEventPayloads:
             None,
             event_name="orchestrator_stop",
         )
-        # In-flight field absent (only the Reason field present).
         for block in payload["blocks"]:
             for f in block.get("fields", []):
                 assert "In-flight" not in f.get("text", "")
@@ -452,11 +423,6 @@ class TestPerEventPayloads:
         assert "+15 more" in field_blob
 
 
-# ---------------------------------------------------------------------------
-# Quota notification events (quota_waiting / quota_resumed)
-# ---------------------------------------------------------------------------
-
-
 class TestQuotaNotificationEvents:
     """The two quota lifecycle events follow the shared notify_* contract:
     they are in ALL_EVENTS, have per-event toggles, gate on the toggle +
@@ -466,7 +432,6 @@ class TestQuotaNotificationEvents:
     def test_events_registered_in_all_events(self) -> None:
         assert notifications.EVENT_QUOTA_WAITING in notifications.ALL_EVENTS
         assert notifications.EVENT_QUOTA_RESUMED in notifications.ALL_EVENTS
-        # Constant strings match their config-toggle field names.
         assert notifications.EVENT_QUOTA_WAITING == "quota_waiting"
         assert notifications.EVENT_QUOTA_RESUMED == "quota_resumed"
 
@@ -539,7 +504,6 @@ class TestQuotaNotificationEvents:
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
             patch("devbench.notifications.post_webhook", side_effect=boom),
         ):
-            # Must not raise -- best-effort.
             notifications.notify_quota_waiting("anthropic-api", "unknown")
         assert "[WARN]" in capsys.readouterr().err
 
@@ -555,11 +519,6 @@ class TestQuotaNotificationEvents:
         ):
             notifications.notify_quota_resumed(7)
         assert "[WARN]" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# send_test_notification (CLI self-test driver)
-# ---------------------------------------------------------------------------
 
 
 class TestSendTestNotification:
@@ -581,8 +540,6 @@ class TestSendTestNotification:
             patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.send_test_notification("work_unit_done")
-        # Despite work_unit_done=False in the config, send_test_notification
-        # temporarily flips it on so the operator can verify regardless.
         posted.assert_called_once()
 
     def test_restores_toggle_after_dispatch(self) -> None:
@@ -603,11 +560,6 @@ class TestSendTestNotification:
         ):
             notifications.send_test_notification(event)
         posted.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Config-loader integration (parser + validation)
-# ---------------------------------------------------------------------------
 
 
 class TestNotificationsConfigParser:
@@ -658,12 +610,11 @@ class TestNotificationsConfigParser:
         assert n.slack.webhook_url == "https://hooks.slack.com/services/T/B/X"
         assert n.timeout_seconds == 15.0
         assert n.events.work_unit_done is True
-        assert n.events.work_unit_blocked_operator is False  # default
+        assert n.events.work_unit_blocked_operator is False
 
     def test_per_class_blocked_event_toggles_default_false_and_parse(self) -> None:
         """The 6 new per-class blocked-event toggles (#209) default to false and
         accept independent boolean settings from yaml."""
-        # Defaults when absent.
         rt_default = self._load(
             """\
             repos:
@@ -680,7 +631,6 @@ class TestNotificationsConfigParser:
         assert rt_default.notifications.events.work_unit_blocked_awaiting_dependency is False
         assert rt_default.notifications.events.work_unit_blocked_amendment_recovery is False
 
-        # Explicit yaml values flip each independently.
         rt = self._load(
             """\
             repos:
@@ -709,7 +659,6 @@ class TestNotificationsConfigParser:
         to False and accepts a boolean override from yaml.  Defaulting
         false on upgrade keeps existing workspaces silent until they opt
         in."""
-        # Default false when absent from yaml.
         rt_default = self._load(
             """\
             repos:
@@ -721,7 +670,6 @@ class TestNotificationsConfigParser:
         )
         assert rt_default.notifications.events.ci_pass is False
 
-        # Explicit override flips it.
         rt = self._load(
             """\
             repos:
@@ -738,7 +686,6 @@ class TestNotificationsConfigParser:
     def test_quota_event_toggles_default_false_and_parse(self) -> None:
         """The two quota lifecycle event toggles default to False and accept
         independent boolean overrides from yaml."""
-        # Default false when absent.
         rt_default = self._load(
             """\
             repos:
@@ -751,7 +698,6 @@ class TestNotificationsConfigParser:
         assert rt_default.notifications.events.quota_waiting is False
         assert rt_default.notifications.events.quota_resumed is False
 
-        # Explicit yaml values flip each independently.
         rt = self._load(
             """\
             repos:
@@ -780,14 +726,6 @@ class TestNotificationsConfigParser:
                     webhook_url: "http://hooks.slack.com/services/T/B/X"
                 """
             )
-
-
-# ---------------------------------------------------------------------------
-# post_webhook -- best-effort HTTP POST helper (webhook transport).
-#
-# Relocated webhook-transport tests: post_webhook / _http_post now live in
-# devbench.notifications. The webhook transport lives here, so its tests do too.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -935,15 +873,6 @@ class TestPostWebhook:
             post_webhook(url, payload, timeout_seconds=timeout_seconds)
 
 
-# ---------------------------------------------------------------------------
-# Issue #203: _http_post internals -- direct coverage of the network-level
-# helper that post_webhook delegates to. Existing TestPostWebhook stubs
-# _http_post itself; this class drives _http_post directly with patched
-# http.client connection classes so the HTTPS/HTTP branches, path/query
-# construction, and finally-block close are all exercised.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestHttpPostInternals:
     """Issue #203: cover the network-level POST helper without real I/O.
@@ -1038,11 +967,6 @@ class TestHttpPostInternals:
             )
 
         conn.close.assert_called_once_with()
-
-
-# ---------------------------------------------------------------------------
-# E14-F2-S1-T1: Stop-class to mention-level mapping
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1229,7 +1153,6 @@ class TestOrchestratorStopMentionDispatch:
         from devbench.notifications import _resolve_stop_mention
 
         with patch.dict("sys.modules", {"devbench.config": None}):
-            # STOP_CLASS_CRASH -> MENTION_LEVEL_HERE by default map -> "<!here>"
             text = _resolve_stop_mention(notifications.STOP_CLASS_CRASH)
         assert text == "<!here>"
 
@@ -1241,11 +1164,8 @@ class TestOrchestratorStopMentionDispatch:
         from devbench.notifications import _resolve_stop_mention
 
         fake_config = types.ModuleType("devbench.config")
-        # fake_config has no ORCHESTRATOR_STOP_MENTION_MAP attribute;
-        # 'from devbench.config import ORCHESTRATOR_STOP_MENTION_MAP' raises ImportError
         with patch.dict("sys.modules", {"devbench.config": fake_config}):
             text = _resolve_stop_mention(notifications.STOP_CLASS_DRAIN)
-        # STOP_CLASS_DRAIN -> MENTION_LEVEL_NONE -> ""
         assert text == ""
 
 

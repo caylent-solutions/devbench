@@ -154,12 +154,9 @@ class TestSkillMdScopeEquivalenceNote:
         text = _read_skill()
         step_1c_section = _extract_section(text, "1c.")
         if not step_1c_section:
-            # Try finding it inline
             idx = text.find("1c.")
             if idx != -1:
                 step_1c_section = text[idx : idx + 800]
-        # The SKILL.md step 1c already mentions scope.json -- check it also
-        # mentions the equivalence to cmd_scope set or both pathways.
         has_pathway_note = (
             "scope set" in step_1c_section
             or "cmd_scope" in step_1c_section

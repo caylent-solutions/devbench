@@ -51,17 +51,13 @@ class TestPerUnitGateScopedToOwnTests:
     """AC-FINAL-005/006/007 gate the unit's OWN tests, not the full suite."""
 
     def test_ac_final_005_scoped_to_own_tests(self, canonical_text: str) -> None:
-        # The 005 row must no longer claim the WHOLE unit suite is the per-unit gate.
         assert "AC-FINAL-005" in canonical_text
-        # The per-unit gate runs the unit's own test files (the Manifest test paths).
         assert "own test" in canonical_text.lower(), (
             "AC-FINAL-005 must be documented as scoped to the unit's OWN test files "
             "(the test paths in the unit's Changes Manifest), not the full tests/unit suite."
         )
 
     def test_full_suite_phrase_attributed_to_capstone_not_per_unit(self, canonical_text: str) -> None:
-        # A "full unit suite green" check must be associated with the capstone gate ID,
-        # not presented as the per-unit AC-FINAL-005 gate.
         assert "AC-FINAL-016" in canonical_text, (
             "A capstone AC-FINAL-016 must own the FULL-suite green check so it is not a per-unit block."
         )
@@ -85,14 +81,12 @@ class TestCapstoneGateDocumented:
 
     def test_rationale_one_unit_not_hostage(self, canonical_text: str) -> None:
         lowered = canonical_text.lower()
-        # The rationale: a unit is never blocked by another unit's tests.
         assert ("order-dependent" in lowered) or ("flaky" in lowered), (
             "The doc must explain the flaky / order-dependent rationale for splitting the "
             "per-unit gate from the full-suite capstone gate."
         )
 
     def test_capstone_ids_not_per_unit_applicability(self, canonical_text: str) -> None:
-        # The capstone IDs must be declared as capstone-only, not 'All tiers' leaf gates.
         assert "Epic capstone" in canonical_text or "epic-capstone" in canonical_text.lower(), (
             "AC-FINAL-016/017 must declare epic-capstone applicability so leaf Tasks do not "
             "inherit the full-suite block."
@@ -109,7 +103,6 @@ class TestExistingIdsNotRepurposed:
             assert ident in canonical_text, f"{ident} must still be defined (IDs must not be renumbered)."
 
     def test_capstone_ids_are_new_numbers(self, canonical_text: str) -> None:
-        # New checks get NEW IDs (016+), per the lifecycle rule.
         assert "AC-FINAL-016" in canonical_text
         assert "AC-FINAL-017" in canonical_text
 

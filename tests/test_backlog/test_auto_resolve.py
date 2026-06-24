@@ -321,7 +321,6 @@ class TestAutoResolveBudgetEnforcement:
         cfg = AutoResolveConfig(enabled=True, max_attempts=2)
         payload = "advise-only payload"
 
-        # First two calls should succeed and log [AUTO_RESOLVED]
         for _ in range(2):
             result = apply_auto_resolve(
                 task_id="BUDGET-T1",
@@ -348,7 +347,6 @@ class TestAutoResolveBudgetEnforcement:
         cfg = AutoResolveConfig(enabled=True, max_attempts=2)
         payload = "advise-only payload"
 
-        # Exhaust the budget
         for _ in range(2):
             apply_auto_resolve(
                 task_id="BUDGET-T2",
@@ -357,9 +355,8 @@ class TestAutoResolveBudgetEnforcement:
                 advise_only_payload=payload,
                 config=cfg,
             )
-        capsys.readouterr()  # Discard prior output
+        capsys.readouterr()
 
-        # Next call must escalate
         result = apply_auto_resolve(
             task_id="BUDGET-T2",
             signature="exhaust-sig",
@@ -379,7 +376,6 @@ class TestAutoResolveBudgetEnforcement:
         cfg = AutoResolveConfig(enabled=True, max_attempts=1)
         payload = "payload"
 
-        # Exhaust the budget (1 attempt)
         apply_auto_resolve(
             task_id="AUDIT-TASK-99",
             signature="audit-sig",
@@ -389,7 +385,6 @@ class TestAutoResolveBudgetEnforcement:
         )
         capsys.readouterr()
 
-        # Trigger escalation
         apply_auto_resolve(
             task_id="AUDIT-TASK-99",
             signature="audit-sig",
@@ -453,7 +448,6 @@ class TestAutoResolveBudgetEnforcement:
         )
         captured = capsys.readouterr()
         combined = captured.out + captured.err
-        # Attempt count should appear in the escalation log
         assert "1" in combined
 
     def test_budget_is_per_task_signature_pair(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -467,7 +461,6 @@ class TestAutoResolveBudgetEnforcement:
         cfg = AutoResolveConfig(enabled=True, max_attempts=1)
         payload = "payload"
 
-        # Exhaust budget for pair A
         apply_auto_resolve(
             task_id="PAIR-T1",
             signature="sig-A",
@@ -477,7 +470,6 @@ class TestAutoResolveBudgetEnforcement:
         )
         capsys.readouterr()
 
-        # Pair B should still have its full budget
         apply_auto_resolve(
             task_id="PAIR-T1",
             signature="sig-B",
@@ -487,7 +479,6 @@ class TestAutoResolveBudgetEnforcement:
         )
         captured = capsys.readouterr()
         combined = captured.out + captured.err
-        # sig-B's first call must NOT trigger escalation
         assert AUTO_RESOLVE_ESCALATED_STRING not in combined
 
     def test_escalated_call_returns_advise_only_not_error(self) -> None:
@@ -547,9 +538,7 @@ class TestAutoResolveCompositeBlockDetection:
         assert result == payload
         captured = capsys.readouterr()
         combined = captured.out + captured.err
-        # Must NOT log [AUTO_RESOLVED] -- it was routed to advise
         assert AUTO_RESOLVE_AUDIT_STRING not in combined
-        # Must NOT log escalation -- budget was not consumed
         assert AUTO_RESOLVE_ESCALATED_STRING not in combined
 
     def test_composite_block_does_not_consume_budget(self) -> None:
@@ -560,7 +549,6 @@ class TestAutoResolveCompositeBlockDetection:
         cfg = AutoResolveConfig(enabled=True, max_attempts=1)
         payload = "payload"
 
-        # One composite-blocked call -- must not consume budget
         apply_auto_resolve(
             task_id="COMP-BUDGET-T1",
             signature="comp-budget-sig",
@@ -684,7 +672,6 @@ class TestAutoResolveCatalogConsult:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Pre-seed the catalog so the signature is already learned
             record_outcome(
                 root,
                 classification="RUNTIME_DEGRADATION",
@@ -717,7 +704,6 @@ class TestAutoResolveCatalogConsult:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Pre-seed the catalog so the signature is already learned (max_attempts=1)
             record_outcome(
                 root,
                 classification="RUNTIME_DEGRADATION",
@@ -726,7 +712,6 @@ class TestAutoResolveCatalogConsult:
                 outcome="applied",
             )
             cfg = AutoResolveConfig(enabled=True, max_attempts=1)
-            # Exhaust the budget (1 learned apply)
             apply_auto_resolve(
                 task_id="CAT-ESC",
                 signature="esc-sig",
@@ -736,7 +721,6 @@ class TestAutoResolveCatalogConsult:
                 catalog_path=root,
                 classification="RUNTIME_DEGRADATION",
             )
-            # Trigger escalation on budget exhaustion
             apply_auto_resolve(
                 task_id="CAT-ESC",
                 signature="esc-sig",
@@ -748,7 +732,6 @@ class TestAutoResolveCatalogConsult:
             )
             result = lookup_entry(root, "RUNTIME_DEGRADATION", "esc-sig")
             assert result is not None
-            # success_count is 2: the pre-seeded apply + the budget-exhausting apply
             assert result.success_count == 2
             assert result.failure_count == 0
 
@@ -785,7 +768,6 @@ class TestAutoResolveCatalogConsult:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Pre-seed the catalog so the signature is already learned
             record_outcome(
                 root,
                 classification="AWAITING_DEPENDENCY",
@@ -794,7 +776,6 @@ class TestAutoResolveCatalogConsult:
                 outcome="applied",
             )
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            # Apply 3 times on top of the seed
             for _ in range(3):
                 apply_auto_resolve(
                     task_id="RECUR-T1",
@@ -807,7 +788,7 @@ class TestAutoResolveCatalogConsult:
                 )
             result = lookup_entry(root, "AWAITING_DEPENDENCY", "recur-sig")
             assert result is not None
-            assert result.success_count == 4  # 1 seed + 3 auto-applied
+            assert result.success_count == 4
 
     def test_catalog_consult_logs_recurring_true_on_second_apply(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Engine logs recurring=True when the signature was seen before (learned)."""
@@ -819,7 +800,6 @@ class TestAutoResolveCatalogConsult:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Pre-seed so signature is already learned
             record_outcome(
                 root,
                 classification="RUNTIME_DEGRADATION",
@@ -829,7 +809,6 @@ class TestAutoResolveCatalogConsult:
             )
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
 
-            # This call should auto-apply (recurring=True) since it is already in catalog
             apply_auto_resolve(
                 task_id="RECUR-LOG-T1",
                 signature="recur-log-sig",
@@ -848,7 +827,6 @@ class TestAutoResolveCatalogConsult:
         from devbench.backlog.auto_resolve import AutoResolveConfig, apply_auto_resolve
 
         cfg = AutoResolveConfig(enabled=True, max_attempts=3)
-        # Must not raise when no catalog_path is given (backward compat)
         result = apply_auto_resolve(
             task_id="NO-CAT",
             signature="no-cat-sig",
@@ -984,7 +962,6 @@ class TestAutoResolveCatalogConsult:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Pre-populate the catalog to simulate a learned signature
             record_outcome(
                 root,
                 classification="RUNTIME_DEGRADATION",
@@ -1061,7 +1038,6 @@ class TestAutoResolveCatalogConsult:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            # First call -- records novel entry and returns advise-only.
             result_first = apply_auto_resolve(
                 task_id="NOVEL-SECOND",
                 signature="novel-second-call-sig",
@@ -1075,8 +1051,6 @@ class TestAutoResolveCatalogConsult:
             captured = capsys.readouterr()
             assert AUTO_RESOLVE_AUDIT_STRING not in (captured.out + captured.err)
 
-            # Second call -- novel entry exists in catalog but success_count == 0.
-            # Must still return advise-only, never auto-apply.
             result_second = apply_auto_resolve(
                 task_id="NOVEL-SECOND",
                 signature="novel-second-call-sig",
@@ -1112,7 +1086,6 @@ class TestAutoResolveDestructiveNeverAutoInvariant:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Manually inject a "learned" entry for the destructive verb into the catalog
             record_outcome(
                 root,
                 classification="RUNTIME_DEGRADATION",
@@ -1121,7 +1094,6 @@ class TestAutoResolveDestructiveNeverAutoInvariant:
                 outcome="applied",
             )
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            # Even with a learned catalog entry, a destructive verb must raise
             with pytest.raises(ValueError, match=destructive_verb):
                 apply_auto_resolve(
                     task_id="DESTR-LEARNED",
@@ -1144,7 +1116,6 @@ class TestAutoResolveDestructiveNeverAutoInvariant:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
             cfg = AutoResolveConfig(enabled=True, max_attempts=5)
-            # The catalog is empty -- yet a destructive verb still raises
             with pytest.raises(ValueError, match=destructive_verb):
                 apply_auto_resolve(
                     task_id="DESTR-GUARD",

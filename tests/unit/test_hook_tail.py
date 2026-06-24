@@ -37,10 +37,6 @@ from devbench.hook_tail import (
     timezone_display,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures / helpers
-# ---------------------------------------------------------------------------
-
 
 def _entry(**overrides) -> dict:
     """Build a well-formed hook-logs.jsonl record with overridable fields."""
@@ -57,17 +53,12 @@ def _entry(**overrides) -> dict:
     return base
 
 
-# ---------------------------------------------------------------------------
-# resolve_timezone
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestResolveTimezone:
     def test_none_returns_os_local_tzinfo(self) -> None:
         tz = resolve_timezone(None)
         assert tz is not None
-        assert tz.utcoffset(None) is not None or True  # tzinfo may need a dt; just assert not-None
+        assert tz.utcoffset(None) is not None or True
 
     def test_empty_string_returns_os_local_tzinfo(self) -> None:
         tz = resolve_timezone("")
@@ -92,11 +83,6 @@ class TestResolveTimezone:
         assert "Not/AZone" in str(excinfo.value)
 
 
-# ---------------------------------------------------------------------------
-# timezone_display
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestTimezoneDisplay:
     def test_utc_reports_utc_iana_and_abbreviation(self) -> None:
@@ -107,13 +93,7 @@ class TestTimezoneDisplay:
     def test_america_new_york_reports_zone_key_and_current_abbreviation(self) -> None:
         iana, abbrev = timezone_display(ZoneInfo("America/New_York"))
         assert iana == "America/New_York"
-        # EDT in April 2026, EST in January -- allow either since tests run year-round.
         assert abbrev in {"EDT", "EST"}
-
-
-# ---------------------------------------------------------------------------
-# format_entry -- event labels (parametrized over the full map)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -122,8 +102,6 @@ class TestFormatEntryEventLabels:
     def test_known_event_renders_canonical_label(self, event: str, expected: str) -> None:
         entry = _entry(event=event)
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        # After HH:MM:SS is a space then the padded event (EVENT_WIDTH chars).
-        # Slice past the timestamp and its trailing space.
         slot = line[len("HH:MM:SS") + 1 : len("HH:MM:SS") + 1 + EVENT_WIDTH]
         assert slot == expected
 
@@ -138,13 +116,7 @@ class TestFormatEntryEventLabels:
         entry.pop("event")
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
         slot = line[9 : 9 + EVENT_WIDTH]
-        # Single "?" character padded to EVENT_WIDTH.
         assert slot == "? "
-
-
-# ---------------------------------------------------------------------------
-# format_entry -- field fallback, sentinels, widths
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -171,10 +143,8 @@ class TestFormatEntryFallbacks:
 
     def test_description_empty_when_tool_input_none(self) -> None:
         entry = _entry(input={"tool_input": None})
-        # Must still render a row (no crash) and not contain any "null"/"None" junk
-        # after the tool column.
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        assert line  # non-empty
+        assert line
         assert "None" not in line
 
     def test_description_truncated_at_limit(self) -> None:
@@ -216,40 +186,30 @@ class TestFormatEntryFallbacks:
     def test_agent_padded_to_width_and_prefix_stripped(self) -> None:
         entry = _entry(input={"agent_type": "devbench:executor", "tool_name": "Bash", "tool_input": {}})
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        # After timestamp + event + padding, agent is padded to AGENT_WIDTH.
-        # We don't slice by offset (padding shifts with sentinels); just
-        # assert the prefix-stripped form is present.
         assert "executor" in line
         assert "devbench:executor" not in line
 
     def test_missing_agent_uses_default(self) -> None:
         entry = _entry(input={"tool_name": "Bash", "tool_input": {}})
-        # no agent_type
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
         assert "orch" in line
 
     def test_missing_tool_renders_sentinel(self) -> None:
         entry = _entry(input={"agent_type": "executor", "tool_input": {}})
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        # Single "?" in the tool column.
         assert "?" in line
 
     def test_missing_input_block_renders_sentinel_row(self) -> None:
         entry = _entry()
         entry.pop("input")
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        assert line  # non-empty; no crash
+        assert line
         assert "orch" in line
 
     def test_non_dict_entry_renders_fallback_sentinel(self) -> None:
         line = format_entry("not a dict", ZoneInfo("UTC"), color=False)  # type: ignore[arg-type]
         assert "--:--:--" in line
         assert "not a dict" in line
-
-
-# ---------------------------------------------------------------------------
-# format_entry -- timestamps + timezones
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -259,7 +219,6 @@ class TestFormatEntryTimestamps:
         assert line.startswith("12:34:56")
 
     def test_utc_timestamp_rendered_in_eastern_applies_offset(self) -> None:
-        # 2026-04-19 is in EDT (UTC-4).
         line = format_entry(
             _entry(timestamp="2026-04-19T12:34:56Z"),
             ZoneInfo("America/New_York"),
@@ -286,11 +245,6 @@ class TestFormatEntryTimestamps:
         assert line.startswith("12:34:56")
 
 
-# ---------------------------------------------------------------------------
-# format_entry -- color
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestFormatEntryColor:
     def test_color_false_produces_no_ansi_escapes(self) -> None:
@@ -301,11 +255,6 @@ class TestFormatEntryColor:
         line = format_entry(_entry(), ZoneInfo("UTC"), color=True)
         assert "\033[" in line
         assert "\033[0m" in line
-
-
-# ---------------------------------------------------------------------------
-# render_header
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -327,11 +276,6 @@ class TestRenderHeader:
     def test_header_color_true_has_escapes(self) -> None:
         header = render_header(Path("/x"), ZoneInfo("UTC"), color=True)
         assert "\033[" in header
-
-
-# ---------------------------------------------------------------------------
-# should_use_color
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -379,11 +323,6 @@ class TestShouldUseColor:
                 raise ValueError("closed")
 
         assert should_use_color(BrokenTTY()) is False  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# follow -- no-follow mode (snapshot)
-# ---------------------------------------------------------------------------
 
 
 def _write_jsonl(path: Path, entries: list[dict]) -> None:
@@ -434,7 +373,7 @@ class TestFollowNoFollow:
             buf,
         )
         assert rc == 0
-        assert buf.getvalue() == ""  # seek-to-EOF skips existing history
+        assert buf.getvalue() == ""
 
     def test_bad_json_line_produces_sentinel_row_and_continues(self, tmp_path: Path) -> None:
         log = tmp_path / "hook.jsonl"
@@ -476,11 +415,6 @@ class TestFollowNoFollow:
         assert rc == 1
 
 
-# ---------------------------------------------------------------------------
-# follow -- live tail (thread-driven)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestFollowLiveTail:
     def test_tail_follow_reads_lines_as_they_appear(self, tmp_path: Path) -> None:
@@ -504,14 +438,12 @@ class TestFollowLiveTail:
         thread = threading.Thread(target=follow, args=(log, options, buf), daemon=True)
         thread.start()
 
-        # Give the follower a moment to open and seek-to-EOF.
         time.sleep(0.05)
 
         with log.open("a", encoding="utf-8") as f:
             f.write(json.dumps(_entry(timestamp="2026-04-19T01:00:00Z")) + "\n")
             f.flush()
 
-        # Wait up to 2s for the line to appear (bounded so CI can't hang).
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if "01:00:00" in buf.getvalue():
@@ -519,7 +451,6 @@ class TestFollowLiveTail:
             time.sleep(0.02)
 
         assert "01:00:00" in buf.getvalue()
-        # Thread is daemon=True so it dies with the test process; no join needed.
 
     def test_tail_follow_reopens_on_inode_rotation(self, tmp_path: Path) -> None:
         """Write entries, replace the file (different inode), write more.
@@ -534,7 +465,7 @@ class TestFollowLiveTail:
         options = FollowOptions(
             tz=ZoneInfo("UTC"),
             no_follow=False,
-            from_start=True,  # start-from-zero so the first write is included
+            from_start=True,
             color=False,
             poll_seconds=0.01,
         )
@@ -548,9 +479,7 @@ class TestFollowLiveTail:
             time.sleep(0.02)
         assert "02:00:00" in buf.getvalue()
 
-        # Rotate: replace the file with a new inode.
         log.unlink()
-        # Small gap so the follower observes file-absence, then reopens.
         time.sleep(0.05)
         _write_jsonl(log, [_entry(timestamp="2026-04-19T03:00:00Z")])
 
@@ -588,17 +517,12 @@ class TestFollowLiveTail:
         assert "04:00:00" in buf.getvalue()
 
 
-# ---------------------------------------------------------------------------
-# Coverage-completeness edge cases
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestEdgeCases:
     def test_non_string_timestamp_does_not_crash(self) -> None:
         entry = _entry(timestamp=12345)  # type: ignore[arg-type]
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        assert line  # must render something
+        assert line
 
     def test_tool_response_with_non_string_stdout(self) -> None:
         entry = _entry(
@@ -610,7 +534,7 @@ class TestEdgeCases:
             }
         )
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        assert "|" not in line  # no preview when stdout is not a string
+        assert "|" not in line
 
     def test_description_non_dict_tool_input_rendered(self) -> None:
         entry = _entry(input={"tool_input": "just a string"})
@@ -618,16 +542,12 @@ class TestEdgeCases:
         assert "just a string" in line
 
     def test_non_dict_input_block_still_renders(self) -> None:
-        # Tests the branch where entry.get("input") is not a dict.
         entry = {"timestamp": "2026-04-19T00:00:00Z", "event": "PreToolUse", "input": "wat"}
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
         assert line.startswith("00:00:00")
 
     def test_follow_options_frozen(self) -> None:
         opts = FollowOptions(tz=ZoneInfo("UTC"))
-        # Frozen dataclass assignment raises FrozenInstanceError; catch the
-        # specific exception so the test would fail loudly if the class
-        # were silently un-frozen by a refactor.
         from dataclasses import FrozenInstanceError
 
         with pytest.raises(FrozenInstanceError):
@@ -650,20 +570,13 @@ class TestEdgeCases:
             }
         )
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        # The first occurrence of the description "x" should be at or after
-        # the minimum column position determined by the declared widths.
-        # HH:MM:SS(8) + " " + event(2) + " " + agent(12) + " " + tool(8) + " " = 32
         min_desc_pos = 8 + 1 + EVENT_WIDTH + 1 + AGENT_WIDTH + 1 + TOOL_WIDTH + 1
-        # The agent and tool may be truncated but still padded to width;
-        # the description appears after both.
         assert line.rfind(" x") >= min_desc_pos - 1
 
     def test_non_dict_input_tool_name_falls_back(self) -> None:
         entry = {"timestamp": "2026-04-19T00:00:00Z", "event": "PreToolUse", "input": {}}
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
-        # Default agent "orch" + sentinel tool "?" should render.
         assert "orch" in line
-        # isolate the tool column by looking after the agent slot.
         assert "?" in line
 
     def test_keyboard_interrupt_in_follow_loop_returns_zero(
@@ -699,7 +612,7 @@ class TestOrchestratorSessionFilter:
             '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
         )
         out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id="session-abc")
-        assert out  # non-empty -> emitted
+        assert out
 
     def test_mismatched_session_is_suppressed(self) -> None:
         from devbench.hook_tail import _format_line
@@ -713,9 +626,6 @@ class TestOrchestratorSessionFilter:
         assert out == ""
 
     def test_legacy_log_lacking_session_field_passes_through(self) -> None:
-        # Pre-Phase-11 entries have no orchestrator_session field; the
-        # filter must not silently drop them so historical events stay
-        # visible after the migration.
         from devbench.hook_tail import _format_line
 
         raw = (
@@ -723,7 +633,7 @@ class TestOrchestratorSessionFilter:
             '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
         )
         out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id="session-abc")
-        assert out  # non-empty -> emitted
+        assert out
 
     def test_no_filter_when_id_is_none(self) -> None:
         from devbench.hook_tail import _format_line
@@ -734,7 +644,7 @@ class TestOrchestratorSessionFilter:
             '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
         )
         out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id=None)
-        assert out  # non-empty -> emitted (no filter)
+        assert out
 
 
 class TestDescriptionNormalisation:
@@ -786,9 +696,6 @@ class TestDescriptionNormalisation:
         single line in practice but the collapse is defence-in-depth."""
         from devbench.hook_tail import _description
 
-        # The dumps call uses sort_keys=True so this string has no
-        # embedded newlines, but exercise the collapse path explicitly
-        # with a payload that IS multi-line via a string field.
         result = _description({"unknown_key": "line1\nline2"})
         assert "\n" not in result
 
@@ -814,8 +721,6 @@ class TestDescriptionNormalisation:
 
         big = ("a" * 60) + "\n" + ("b" * 80)
         result = _description({"description": big})
-        # Post-collapse: 60 a's + 1 space + 80 b's = 141 chars (no truncation
-        # at this layer; truncation happens in format_entry).
         assert "\n" not in result
         assert len(result) == 141
 

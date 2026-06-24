@@ -93,7 +93,6 @@ class TestRealExitCodeCapture:
 
     def test_failing_command_records_real_nonzero_exit_and_fails(self, tmp_path: Path, repo_path: Path) -> None:
         workspace = tmp_path / "ws"
-        # The command genuinely exits 7 -- the runner must capture 7, not 0.
         _write_unit(workspace, "- VERIFY AC-1 | type=command | cmd=`exit 7` | expect-exit=0")
         rc = _run(workspace, repo_path)
         assert rc == 1
@@ -159,7 +158,6 @@ class TestLedgerAndArtifacts:
         lines of an over-budget log survive (the old slice kept only the tail).
         """
         workspace = tmp_path / "ws"
-        # Emit far more than the cap; the artifact keeps a head + tail window.
         _write_unit(
             workspace,
             "- VERIFY AC-1 | type=command | cmd=`for i in $(seq 1 5000); do echo LINE$i; done` | expect-exit=0",
@@ -169,10 +167,7 @@ class TestLedgerAndArtifacts:
         assert rc == 0
         artifact = verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log"
         text = artifact.read_text(encoding="utf-8")
-        # Bounded near the cap (head + tail windows plus one elision marker).
         assert len(text) <= 256 + len("[... 999999 bytes elided ...]\n")
-        # The LAST line survives (tail window) and the FIRST now survives too
-        # (head window) -- the middle is elided.
         assert "LINE5000" in text
         assert "LINE1\n" in text
         assert "bytes elided" in text
@@ -192,7 +187,6 @@ class TestSkippedItems:
         rc = _run(workspace, repo_path)
         assert rc == 0
         records = verification.read_latest_evidence_ledger(workspace, "E1-F1-S1-T1")
-        # Only the executable command produced a record.
         assert [r.ac_ids for r in records] == [["AC-3"]]
 
 
@@ -203,7 +197,6 @@ class TestExecutableWithoutCommand:
         from devbench.constants import SUBPROCESS_ERROR_EXIT_CODE
 
         workspace = tmp_path / "ws"
-        # type=apply with no cmd= -- parses, but cannot prove anything.
         _write_unit(workspace, "- VERIFY AC-1 | type=apply | expect-exit=0")
         rc = _run(workspace, repo_path)
         assert rc == 1
@@ -244,7 +237,6 @@ class TestAttemptAdvances:
         assert _run(workspace, repo_path) == 0
         assert _run(workspace, repo_path) == 0
         assert verification.latest_attempt_number(workspace, "E1-F1-S1-T1") == 2
-        # Both attempt directories exist; the gate loads attempt 2 via the pointer.
         assert verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1).is_dir()
         assert verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 2).is_dir()
 
@@ -258,7 +250,6 @@ class TestUnitNotFoundAndRepoResolution:
         assert "not found" in capsys.readouterr().err
 
     def test_missing_work_unit_file(self, tmp_path: Path, repo_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        # Index returns the unit, but no .md file exists on disk.
         workspace = tmp_path / "ws"
         (workspace / "backlog").mkdir(parents=True)
         rc = _run(workspace, repo_path)
@@ -296,7 +287,6 @@ class TestTddGateFromVerifyAc:
             ["git", "config", "user.name", "T"],
         ):
             subprocess.run(args, cwd=repo, check=True, capture_output=True)
-        # Initial commit so ``git diff HEAD`` has a base to diff against.
         (repo / "README.md").write_text("# repo\n")
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, capture_output=True)
@@ -343,7 +333,6 @@ class TestTddGateFromVerifyAc:
 
         workspace = tmp_path / "ws"
         repo = self._git_repo(tmp_path)
-        # Stage a production-file change so check 2 (empty diff) passes.
         (repo / "src_prod.py").write_text("x = 1\n")
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
         self._write_unit_with_red(
@@ -372,7 +361,6 @@ class TestDeterministicGateSeed:
         self, tmp_path: Path, repo_path: Path
     ) -> None:
         workspace = tmp_path / "ws"
-        # The command echoes the two pinned env vars; the artifact captures them.
         _write_unit(
             workspace,
             "- VERIFY AC-1 | type=command | "
@@ -406,7 +394,6 @@ class TestDeterministicGateSeed:
         assert rc == 0
         text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(encoding="utf-8")
         assert "SEEN_HASHSEED=5" in text
-        # No --randomly-seed injected (a repo without the plugin would error on it).
         assert "--randomly-seed" not in text
 
     def test_seed_is_deterministic_across_two_runs(self, tmp_path: Path, repo_path: Path) -> None:
@@ -433,7 +420,6 @@ class TestDeterministicGateSeed:
     def test_inherits_parent_env_alongside_pinned_seed(self, tmp_path: Path, repo_path: Path) -> None:
         """The overlay does not wipe the inherited environment: PATH still resolves tools."""
         workspace = tmp_path / "ws"
-        # ``env`` is resolved via PATH; if PATH were dropped the command would 127.
         _write_unit(workspace, "- VERIFY AC-1 | type=command | cmd=`env >/dev/null && echo OK` | expect-exit=0")
         with (
             patch("devbench.config.VERIFY_AC_PYTEST_SEED", 5),
@@ -455,7 +441,6 @@ class TestRedExitHelpers:
             "- [RED] tests/b.py -- Command: pytest. Exit: 0. Failures: 2 failed\n"
         )
         spliced = cli._splice_red_exit_code(content, 5)
-        # Only the LAST RED entry's exit token is rewritten.
         assert "Exit: 5. Failures: 2 failed" in spliced
         assert "Exit: 0. Failures: 1 failed" in spliced
 
@@ -505,8 +490,6 @@ class TestCommandUsesCoverage:
         assert cli._command_uses_coverage("terragrunt apply -auto-approve") is False
 
     def test_discover_substring_is_not_coverage(self) -> None:
-        # A word merely CONTAINING 'cov' (e.g. 'discover', 'recover') must not
-        # be misclassified as a coverage run.
         assert cli._command_uses_coverage("python -m unittest discover && recover_state.sh") is False
 
 
@@ -521,8 +504,6 @@ class TestUniqueCoverageFilePath:
         assert len(paths) == 5, "each invocation must isolate onto its own coverage data file"
 
     def test_path_is_absolute(self) -> None:
-        # A relative path would still land in the checkout cwd and contend; the
-        # isolated file must be an absolute temp path outside the checkout.
         assert Path(cli._unique_coverage_file_path()).is_absolute()
 
 
@@ -543,8 +524,6 @@ class TestCleanupCoverageDataFiles:
         assert not sib2.exists()
 
     def test_missing_primary_is_safe(self, tmp_path: Path) -> None:
-        # coverage.py may not have produced a db (e.g. the command failed before
-        # writing one); removing a non-existent file must not raise.
         cli._cleanup_coverage_data_files(str(tmp_path / "never-created.dat"))
 
 
@@ -557,8 +536,6 @@ class TestVerifyAcCoverageIsolation:
 
     def test_cov_command_runs_with_unique_coverage_file_env(self, tmp_path: Path, repo_path: Path) -> None:
         workspace = tmp_path / "ws"
-        # The command echoes COVERAGE_FILE; the artifact captures it. The literal
-        # ``--cov`` marks it a coverage command (no real pytest run needed).
         _write_unit(
             workspace,
             '- VERIFY AC-1 | type=command | cmd=`echo "SEEN_COVFILE=[$COVERAGE_FILE]"; true --cov` | expect-exit=0',
@@ -566,7 +543,6 @@ class TestVerifyAcCoverageIsolation:
         rc = _run(workspace, repo_path)
         assert rc == 0
         text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(encoding="utf-8")
-        # A COVERAGE_FILE was injected, and it is NOT the shared default.
         assert "SEEN_COVFILE=[" in text
         marker = "SEEN_COVFILE=["
         injected = text[text.index(marker) + len(marker) :].split("]", 1)[0]
@@ -583,8 +559,6 @@ class TestVerifyAcCoverageIsolation:
         rc = _run(workspace, repo_path)
         assert rc == 0
         text = (verification.evidence_attempt_dir(workspace, "E1-F1-S1-T1", 1) / "AC-1.log").read_text(encoding="utf-8")
-        # No COVERAGE_FILE injected for a non-coverage command (the placeholder
-        # stays empty -- the env var is unset).
         assert "SEEN_COVFILE=[]" in text
 
     def test_two_cov_runs_get_distinct_coverage_files(self, tmp_path: Path, repo_path: Path) -> None:

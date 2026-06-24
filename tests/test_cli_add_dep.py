@@ -9,10 +9,6 @@ import pytest
 
 from devbench import cli
 
-# ---------------------------------------------------------------------------
-# Shared workspace helpers (mirrors test_proposal_add_dep.py conventions)
-# ---------------------------------------------------------------------------
-
 _BACKLOG_HEADER = (
     "# Backlog\n\n"
     "## Status Summary\n\n"
@@ -77,11 +73,6 @@ def _build_two_task_workspace(tmp_path: Path, t1_status: str = "blocked", t2_sta
     return tmp_path
 
 
-# ---------------------------------------------------------------------------
-# CLI surface: cycle-guard output and return code
-# ---------------------------------------------------------------------------
-
-
 class TestCmdAddDepCycleGuard:
     """cmd_add_dep must surface the cycle error with rc 1 and a clear message."""
 
@@ -94,11 +85,9 @@ class TestCmdAddDepCycleGuard:
             patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
             patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
         ):
-            # Wire T1 -> T2.
             rc_first = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
             assert rc_first == 0
 
-            # Reverse edge T2 -> T1 must fail.
             rc = cli.cmd_add_dep("E0-F1-S1-T2", "E0-F1-S1-T1")
 
         assert rc == 1
@@ -121,7 +110,6 @@ class TestCmdAddDepCycleGuard:
     def test_cycle_via_marker_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-253-2: when the reverse edge exists as a marker, rc is 1."""
         workspace = _build_two_task_workspace(tmp_path)
-        # Inject marker-only reverse edge on T1's file (T1 depends on T2 via marker).
         t1_path = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         t1_path.write_text(
             t1_path.read_text(encoding="utf-8") + "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n",

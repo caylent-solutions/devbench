@@ -101,8 +101,6 @@ class TestOrchestrateSkillStep7SecurityPass:
             "SKILL.md step 7 must route a security PASS forward to step 7b (the optional "
             "iac_review dispatch), which in turn proceeds to step 8 (git-ops)."
         )
-        # The conditional iac step 7b must itself proceed to git-ops (step 8),
-        # so the security-PASS -> ... -> git-ops forward path is unbroken.
         assert "proceed to step 8" in content, (
             "SKILL.md step 7b must proceed to step 8 (git-ops) so the security-PASS forward path is unbroken."
         )
@@ -181,7 +179,6 @@ class TestOrchestrateSkillStep1cScopeFilter:
         content = SKILL_PATH.read_text()
         validate_pos = content.find("uv run devbench validate-backlog")
         scope_pos = content.find("scope.json")
-        # Step 2 starts with "2." -- find the first occurrence of step 2's next invocation
         step2_marker = "2. `uv run devbench next`"
         next_pos = content.find(step2_marker)
         assert validate_pos >= 0, "SKILL.md must reference uv run devbench validate-backlog"
@@ -239,16 +236,10 @@ class TestOrchestrateSkillDrainCheck:
         content = SKILL_PATH.read_text()
         drain_pos = content.find("drain --status")
         assert drain_pos >= 0, "SKILL.md must reference drain --status"
-        # The drain check section must mention exiting cleanly
         drain_section = content[drain_pos : drain_pos + 500]
         assert "exit" in drain_section.lower(), (
             "SKILL.md drain check step must instruct the orchestrator to exit cleanly when a drain is pending"
         )
-
-
-# ---------------------------------------------------------------------------
-# create-spec/SKILL.md tests  (AC-191-2, AC-191-3)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -276,7 +267,6 @@ class TestCreateSpecSkillFrontmatter:
         """AC-191-2: Frontmatter must be delimited by YAML front-matter markers."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
         assert content.startswith("---"), "create-spec/SKILL.md must start with YAML frontmatter delimiter '---'"
-        # Second --- must close the frontmatter block
         assert content.count("---") >= 2, (
             "create-spec/SKILL.md must have at least two '---' markers (open + close frontmatter)"
         )
@@ -523,7 +513,6 @@ class TestCreateSpecSkillOperatorFinalReview:
     def test_skill_re_enters_iterate_loop_on_operator_feedback(self) -> None:
         """Step 5 must re-enter the iterate loop when the operator provides feedback."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        # The skill should mention re-entering the loop or revising on feedback
         assert any(phrase in content.lower() for phrase in ("re-enter", "re-run", "revise", "iterate", "feedback")), (
             "create-spec/SKILL.md step 5 must re-enter the iterate loop on operator feedback"
         )
@@ -582,11 +571,6 @@ class TestCreateSpecSkillQualityReference:
             "(after the spec is written, not during authoring) so the audit log records "
             "provenance at completion time"
         )
-
-
-# ---------------------------------------------------------------------------
-# spec-to-backlog/SKILL.md tests  (AC-191-4, AC-191-7)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -754,7 +738,6 @@ class TestSpecToBacklogSkillDecompositionHierarchy:
     def test_skill_four_level_hierarchy_expressed(self) -> None:
         """Hierarchy chain Epic -> Feature -> Story -> Task must be explicitly stated."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        # The spec mandates 4-level hierarchy -- verify all 4 are present together
         assert "Epic" in content and "Feature" in content and "Story" in content and "Task" in content, (
             "spec-to-backlog/SKILL.md must express the full 4-level hierarchy "
             "(Epic -> Feature -> Story -> Task) with no skipped levels"
@@ -768,8 +751,6 @@ class TestSpecToBacklogSkillKanonCanonicalSections:
     def test_skill_mentions_8_canonical_sections(self) -> None:
         """Skill must specify that each task file includes the 8 canonical work-unit sections."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        # Spec section 4.6.0 names 8 canonical sections (previously said "22 sections" but
-        # the per-task rubric enumerates 8 top-level ## headings)
         required_sections = [
             "Status",
             "Description",
@@ -1054,7 +1035,6 @@ class TestSpecToBacklogSkillForbiddenPatterns:
     def test_skill_prohibits_placeholder_deps(self) -> None:
         """Skill must prohibit placeholder text in Depends On This table."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        # Spec says: no "filled in by validate-backlog" placeholders
         assert any(
             kw in content.lower() for kw in ("placeholder", "real wu id", "real ids", "no placeholder", "filled in at")
         ), (
@@ -1122,7 +1102,6 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
     def test_rubric_requires_no_skipped_hierarchy_levels(self) -> None:
         """Rubric: hierarchy must be exactly Epic -> Feature -> Story -> Task with no skipped levels."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        # Verify all four levels appear together in a rubric-like context
         assert all(level in content for level in ["Epic", "Feature", "Story", "Task"]), (
             "spec-to-backlog/SKILL.md rubric must require Epic->Feature->Story->Task with no skipped levels"
         )
@@ -1135,10 +1114,6 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
             "(validated by validate-backlog)"
         )
 
-
-# ---------------------------------------------------------------------------
-# bootstrap-environment/SKILL.md tests  (AC-191-5)
-# ---------------------------------------------------------------------------
 
 BOOTSTRAP_ENV_SKILL_PATH = (
     Path(__file__).parent.parent.parent
@@ -1313,10 +1288,6 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
             "bootstrap-environment/SKILL.md must pause on failure with a diagnostic and suggested fix for the operator"
         )
 
-
-# ---------------------------------------------------------------------------
-# configure-devbench/SKILL.md tests  (AC-191-6)
-# ---------------------------------------------------------------------------
 
 CONFIGURE_DEVBENCH_SKILL_PATH = (
     Path(__file__).parent.parent.parent

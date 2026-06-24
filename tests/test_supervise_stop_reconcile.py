@@ -58,7 +58,6 @@ class TestStopStaleScreenReconcile:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         reg = _seed_running(tmp_path, "nightly")
-        # The screen is NOT present -> reconcile, no drain signal written.
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli._supervise_live_screen_names", return_value=set()),
@@ -69,7 +68,6 @@ class TestStopStaleScreenReconcile:
         assert after is not None
         assert after.state == "stopped"
         assert after.exit_reason == "stale-screen-reconciled"
-        # No graceful drain control-file when the screen is already gone.
         assert not supervise_stop_request_path(tmp_path, "nightly").exists()
         assert "reconciled" in capsys.readouterr().out
 
@@ -81,16 +79,12 @@ class TestStopGracefulDrain:
     def test_graceful_writes_signals_and_waits_for_run_to_stop(self, tmp_path: Path) -> None:
         reg = _seed_running(tmp_path, "nightly")
 
-        # The injected wait stands in for the in-screen __run supervisor: on the
-        # FIRST registry poll it transitions the session to ``stopped`` (as __run
-        # would after draining the in-flight WU), so the operator stop observes a
-        # terminal and returns 0 WITHOUT stamping the registry itself.
         def _fake_wait(*, name, registry, timeout_seconds):
             st = registry.read_state(name)
             st.state = SUPERVISE_STATE_STOPPED
             st.exit_reason = "graceful-stop"
             registry.write_state(st)
-            return True  # __run reached a terminal within the budget
+            return True
 
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
@@ -103,14 +97,11 @@ class TestStopGracefulDrain:
         assert after is not None
         assert after.state == "stopped"
         assert after.exit_reason == "graceful-stop"
-        # The drain + stop.request control files were written for __run to read.
         stop_req = supervise_stop_request_path(tmp_path, "nightly")
         assert stop_req.exists()
         assert read_stop_request(tmp_path, "nightly") is True
 
     def test_graceful_accepts_completed_clean_terminal(self, tmp_path: Path) -> None:
-        # If the in-flight WU finishing drove __run to ``completed-clean`` instead
-        # of ``stopped``, the operator stop still succeeds (the session IS down).
         reg = _seed_running(tmp_path, "nightly")
 
         def _fake_wait(*, name, registry, timeout_seconds):
@@ -132,9 +123,6 @@ class TestStopGracefulDrain:
         assert after.state == "completed-clean"
 
     def test_graceful_does_not_stamp_stopped_before_run_acts(self, tmp_path: Path) -> None:
-        # CRITICAL regression: the operator stop must NOT immediately mark the
-        # registry stopped. It writes the signals and DELEGATES the terminal to
-        # __run. We capture the registry state at the moment the wait is entered.
         _seed_running(tmp_path, "nightly")
         observed: dict[str, str] = {}
 
@@ -152,8 +140,6 @@ class TestStopGracefulDrain:
             patch("devbench.cli._supervise_wait_for_terminal", _fake_wait),
         ):
             cli.cmd_supervise("stop", "--name", "nightly")
-        # The session was still ``running`` when the wait began: the operator stop
-        # signalled __run and waited; it did not stamp the terminal itself.
         assert observed["state_when_wait_entered"] == "running"
 
 
@@ -165,7 +151,6 @@ class TestStopGracefulTimeoutEscalatesToHard:
         reg = _seed_running(tmp_path, "nightly")
         quits: list[str] = []
 
-        # __run never reaches a terminal within the budget -> escalate to hard.
         def _fake_wait(*, name, registry, timeout_seconds):
             return False
 
@@ -184,7 +169,6 @@ class TestStopGracefulTimeoutEscalatesToHard:
         after = reg.read_state("nightly")
         assert after is not None
         assert after.state == "stopped"
-        # An escalated stop is recorded as a hard stop (the screen was force-quit).
         assert after.exit_reason == "hard-stop"
         assert quits == ["devbench-supervise-nightly"]
 
@@ -212,18 +196,14 @@ class TestStopHardTerminates:
         assert after is not None
         assert after.state == "stopped"
         assert after.exit_reason == "hard-stop"
-        # --hard tore the screen down via screen -X quit.
         assert quits == ["devbench-supervise-n"]
-        # --hard never writes the graceful stop.request control file.
         assert not supervise_stop_request_path(tmp_path, "n").exists()
 
     def test_hard_on_stale_screen_still_marks_stopped(self, tmp_path: Path) -> None:
-        # --hard on a session whose screen is already gone must not crash on the
-        # quit (the screen is absent); it still records the stop.
         reg = _seed_running(tmp_path, "n")
 
         def _fake_quit(*, screen_name, screen_path):
-            return None  # quitting an absent screen is a no-op for the caller
+            return None
 
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
@@ -239,10 +219,6 @@ class TestStopHardTerminates:
         assert after.exit_reason == "hard-stop"
 
     def test_hard_records_stop_even_when_screen_not_installed(self, tmp_path: Path) -> None:
-        # If `screen` is not on PATH, --hard cannot quit a screen, but the registry
-        # transition to stopped is the authoritative operator outcome (it does not
-        # block on the quit). _supervise_live_screen_names is patched so the early
-        # list-check does not fail fast before reaching the hard body.
         reg = _seed_running(tmp_path, "n")
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),

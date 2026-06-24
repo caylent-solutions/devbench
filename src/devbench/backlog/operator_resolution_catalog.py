@@ -49,23 +49,14 @@ __all__ = [
     "save_catalog",
 ]
 
-# Schema version sentinel.  Bump when the on-disk format changes in a
-# backward-incompatible way; the loader will treat any version != this as empty.
 CATALOG_SCHEMA_VERSION: int = 1
 
-# Valid outcome literals accepted by record_outcome().
-# "novel" records an unrecognized signature for operator review; it does not
-# increment success or failure counts.  The engine routes novel signatures to
-# advise-only and never auto-applies them until the operator confirms the
-# pattern (spec Section 4 E11-F2-S2 AC-1).
 OutcomeLiteral = Literal["applied", "escalated", "failed", "novel"]
 
 _VALID_OUTCOMES: frozenset[str] = frozenset({"applied", "escalated", "failed", "novel"})
 
-# Filename of the catalog inside the .devbench state directory.
 _CATALOG_FILENAME: str = "operator-resolution-catalog.json"
 
-# Intermediate temp-file suffix used for atomic writes.
 _TMP_SUFFIX: str = ".tmp"
 
 
@@ -339,7 +330,6 @@ def record_outcome(
         success_count += 1
     elif outcome == "failed":
         failure_count += 1
-    # "escalated" and "novel" leave both counts unchanged
 
     entries[key] = CatalogRecord(
         classification=classification,

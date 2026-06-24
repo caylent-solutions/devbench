@@ -15,9 +15,6 @@ from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
 pytestmark = pytest.mark.unit
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 _BLOCKED_MARKER = "[BLOCKED_TARGET_REPO_UNRESOLVED]"
 
@@ -65,11 +62,6 @@ def _wu_without_marker(unit_id: str) -> str:
         "## Comments\n\n"
         "[2026-06-07 00:00 UTC] [backlog_manager] [BLOCKED] manual gate\n"
     )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 class TestClassifyBlockedTaskTargetRepoMarker:
@@ -143,8 +135,6 @@ class TestClassifyBlockedTaskTargetRepoMarker:
             task_id=unit_id,
         )
 
-        # Without marker, no deps, no recovery: still OPERATOR_ACTION_REQUIRED
-        # (catch-all bucket) but NOT because of the marker path.
         assert result == BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
     @pytest.mark.parametrize(
@@ -189,7 +179,6 @@ class TestHasUnresolvedRepoMarkerEdgeCases:
         from devbench.backlog.proposal import _has_unresolved_repo_marker
 
         non_existent = tmp_path / "does_not_exist.md"
-        # The file does not exist; read_text raises FileNotFoundError (subclass of OSError).
         result = _has_unresolved_repo_marker(non_existent)
 
         assert result is False

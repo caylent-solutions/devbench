@@ -35,8 +35,6 @@ class TestLatencyTracker:
     def test_cold_captured_once(self) -> None:
         t = _LatencyTracker()
         t.record(0.5, cold=True)
-        # Subsequent cold calls must NOT overwrite (cold is the
-        # historical anchor).
         t.record(0.7, cold=True)
         assert t.cold == pytest.approx(0.5)
 
@@ -44,9 +42,7 @@ class TestLatencyTracker:
         t = _LatencyTracker()
         for i in range(20):
             t.record(0.01 * (i + 1), cold=False)
-        # Only the last 8 values are kept.
         assert len(t.warm_history) == 8
-        # The oldest 12 were evicted; the kept window is values 13..20.
         assert t.warm_history == [pytest.approx(0.01 * v) for v in range(13, 21)]
 
     def test_warm_avg_is_mean_of_history(self) -> None:
@@ -76,7 +72,6 @@ class TestLatencyTracker:
         t.record(2.5, cold=True)
         t.record(0.05, cold=False)
         s = t.footer()
-        # Cold: one decimal. Warm + last: two decimals.
         assert "cold 2.5s" in s
         assert "warm 0.05s" in s
         assert "last refresh 0.05s" in s
@@ -129,16 +124,11 @@ class TestClearAndWriteSingleBuffer:
         with patch.object(sys, "stdout", _FakeStdout()):
             _clear_and_write("FRAME-CONTENT")
 
-        # Exactly one write call, exactly one flush.
         assert len(captured_writes) == 1, f"expected 1 write, got {captured_writes}"
         assert len(captured_flushes) == 1
-        # The clear escape comes BEFORE the content with no intervening
-        # flush; both bytes hit the buffer in a single call.
         full = captured_writes[0]
         assert full.startswith("\033c"), "clear sequence must be at the start"
         assert "FRAME-CONTENT" in full
-        # The content must appear IMMEDIATELY after the clear sequence
-        # (no other bytes between them).
         clear_end = len("\033c")
         assert full[clear_end : clear_end + len("FRAME-CONTENT")] == "FRAME-CONTENT"
 
@@ -147,7 +137,7 @@ class TestClearAndWriteSingleBuffer:
         flush between writing the clear sequence and writing the content.
         We assert this by ensuring there is exactly ONE flush total and
         it follows the single write."""
-        events: list[tuple[str, str]] = []  # (kind, payload)
+        events: list[tuple[str, str]] = []
 
         class _FakeStdout:
             def write(self, s: str) -> int:
@@ -166,7 +156,6 @@ class TestClearAndWriteSingleBuffer:
 
 class TestStdinKeypressPending:
     def test_returns_false_for_non_tty_stdin(self) -> None:
-        # io.StringIO is not a TTY.
         with patch.object(sys, "stdin", io.StringIO("data")):
             assert _stdin_keypress_pending() is False
 
@@ -255,8 +244,6 @@ class TestStreamReport:
             sleep_count += 1
             if sleep_count >= 3:
                 raise KeyboardInterrupt
-            # On second tick, mutate the log file so the next stat
-            # comparison detects a change and triggers a render.
             if sleep_count == 1:
                 log_file.write_text("ab")
 
@@ -267,9 +254,6 @@ class TestStreamReport:
             rc = stream_report(log_file, fake_render)
 
         assert rc == 0
-        # Initial render plus one re-render after the file mutation
-        # = 2 renders. The third tick would have triggered another
-        # render but the KeyboardInterrupt fires first.
         assert render_calls == 2
 
     def test_keyboard_interrupt_exits_cleanly(self, tmp_path: Path) -> None:
@@ -317,13 +301,8 @@ class TestStreamReport:
         ):
             stream_report(log_file, fake_render)
 
-        # The captured frames carry the latency footer. Both a cold
-        # (first-render) and a warm (post-mutation) tick should be
-        # represented; check the second frame shows non-dash warm.
         out = capture.getvalue()
-        # Two frames means two clear sequences.
         assert out.count("\033c") == 2
-        # Final footer should show populated cold + warm + last.
         assert "[refresh] cold" in out
         assert "warm" in out
         assert "last refresh" in out
@@ -350,7 +329,6 @@ class TestStreamReport:
             sleep_count += 1
             if sleep_count >= 2:
                 raise KeyboardInterrupt
-            # Touch the hook log so the next tick's key differs.
             hook_log.write_text("hh")
 
         with (
@@ -364,7 +342,6 @@ class TestStreamReport:
                 transcript_dir=transcripts,
             )
         assert rc == 0
-        # Two renders: initial frame + one re-render after hook_log mutation.
         assert cap.getvalue().count("\033c") == 2
 
     def test_keypress_breaks_loop_and_returns_zero(self, tmp_path: Path) -> None:
@@ -393,7 +370,6 @@ class TestBackoffInterval:
     base cadence. All bounds are caller-supplied (no hard-coded literals)."""
 
     def test_fast_render_keeps_base_interval(self) -> None:
-        # A render well under the base interval keeps the cadence at base.
         interval = _backoff_interval(
             render_duration=0.001,
             base_interval=0.1,
@@ -402,9 +378,6 @@ class TestBackoffInterval:
         assert interval == pytest.approx(0.1)
 
     def test_slow_render_backs_off_proportionally(self) -> None:
-        # A render that took longer than the base interval pushes the next
-        # poll interval out (at least as long as the render itself) so the
-        # loop does not immediately re-render and pin a CPU core.
         interval = _backoff_interval(
             render_duration=0.5,
             base_interval=0.1,
@@ -413,8 +386,6 @@ class TestBackoffInterval:
         assert interval >= 0.5
 
     def test_backoff_is_capped_at_max_interval(self) -> None:
-        # Even a pathologically slow render cannot push the cadence past the
-        # configured ceiling.
         interval = _backoff_interval(
             render_duration=120.0,
             base_interval=0.1,
@@ -432,8 +403,6 @@ class TestRenderBudgetFailFast:
         log_file = tmp_path / "log"
         log_file.write_text("a")
 
-        # perf_counter is read twice per render (start, end). Return a delta
-        # larger than the budget so the first render is judged over-budget.
         perf_values = iter([0.0, 5.0, 100.0, 200.0])
 
         def fake_perf() -> float:
@@ -479,8 +448,6 @@ class TestRenderBudgetFailFast:
         log_file = tmp_path / "log"
         log_file.write_text("a")
 
-        # start=0.0, end=0.5 -> a 0.5s render (slow relative to 0.1 base,
-        # but under the 5s budget).
         perf_values = iter([0.0, 0.5, 1.0, 1.5])
 
         def fake_perf() -> float:
@@ -509,9 +476,6 @@ class TestRenderBudgetFailFast:
             )
 
         assert observed_sleeps, "loop must have slept at least once"
-        # The slow render must have pushed the next sleep above the base
-        # cadence (backoff), proving the loop does not spin at the fixed
-        # 0.1s interval when renders are expensive.
         assert observed_sleeps[0] > 0.1
 
 
@@ -522,14 +486,11 @@ class TestIncrementalLogTail:
 
     def test_tail_reads_from_offset_only(self, tmp_path: Path) -> None:
         log_file = tmp_path / "log"
-        log_file.write_text("AAAA")  # 4 bytes
-        # First read from offset 0 returns all 4 bytes and advances offset.
+        log_file.write_text("AAAA")
         text, offset = _read_log_tail(log_file, 0, max_bytes=1_000_000)
         assert text == "AAAA"
         assert offset == 4
 
-        # Append more data; a tail read from the prior offset must return
-        # ONLY the appended bytes, not the whole file.
         with log_file.open("a") as f:
             f.write("BBB")
         text2, offset2 = _read_log_tail(log_file, offset, max_bytes=1_000_000)
@@ -554,9 +515,6 @@ class TestIncrementalLogTail:
             text, offset = _read_log_tail(log_file, offset, max_bytes=1_000_000)
             total_read += len(text)
 
-        # If the loop re-read the whole file each tick, total_read would be
-        # ~ O(n^2) (sum 100, 200, ... ) = 127500. Incremental reads make it
-        # exactly the number of bytes appended.
         assert total_read == total_appended
 
     def test_tail_caps_bytes_read(self, tmp_path: Path) -> None:
@@ -566,20 +524,16 @@ class TestIncrementalLogTail:
         log_file.write_bytes(b"Z" * 10_000)
         text, offset = _read_log_tail(log_file, 0, max_bytes=1_000)
         assert len(text) == 1_000
-        # Offset advances by exactly the capped read so the next tick
-        # continues from where this one stopped (no data skipped, no
-        # re-read).
         assert offset == 1_000
 
     def test_tail_handles_truncation_or_rotation(self, tmp_path: Path) -> None:
         """If the file shrinks below the saved offset (rotation/truncation),
         the tail read restarts from 0 rather than seeking past EOF."""
         log_file = tmp_path / "log"
-        log_file.write_text("AAAAAAAA")  # 8 bytes
+        log_file.write_text("AAAAAAAA")
         _, offset = _read_log_tail(log_file, 0, max_bytes=1_000_000)
         assert offset == 8
-        # Rotation: file replaced with a shorter one.
-        log_file.write_text("BB")  # 2 bytes, < saved offset
+        log_file.write_text("BB")
         text, new_offset = _read_log_tail(log_file, offset, max_bytes=1_000_000)
         assert text == "BB"
         assert new_offset == 2

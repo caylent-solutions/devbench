@@ -48,16 +48,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# The canonical body. Operators who want to customise per-workspace
-# override this by placing a ``code-standards-canonical.md`` file at
-# their workspace root. The body uses the same three placeholder tokens
-# documented at module-level (``<WORKSPACE_CLAUDE_MD>``,
-# ``<TASK_SPECIFIC_ERROR_PATHS>``, ``<REPO_CARVE_OUTS>``).
-#
-# The body is authored to align with the engineering standards at
-# ``/workspaces/rpm-migration/CLAUDE.md`` (the operator's source-of-truth
-# for kanon-deps-work). Other workspaces can replace this body wholesale
-# by shipping their own ``code-standards-canonical.md`` override.
 _CANONICAL_CODE_STANDARDS = (
     "### Code Standards\n"
     "\n"

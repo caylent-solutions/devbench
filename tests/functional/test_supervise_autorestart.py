@@ -40,18 +40,16 @@ class TestStubAutoRestart:
         assert rc == 0
         state = SuperviseRegistry(tmp_path).read_state("ar1")
         assert state is not None
-        # The first launch emitted exit-42 (one relaunch), the relaunch completed clean.
         assert state.state == "completed-clean"
         assert state.restart_count == 1
         assert state.exit_reason == "all-done"
 
     def test_repeated_exit_42_exhausts_bound(self, tmp_path: Path) -> None:
-        # A stub that ALWAYS exits 42 must hit the configured cap and fault (not loop).
         timeouts = SuperviseTimeoutsConfig(
             ready_prompt_seconds=15, idle_seconds=15, command_ack_seconds=2, poll_interval_seconds=1
         )
         config = SuperviseConfig(timeouts=timeouts, restart=SuperviseRestartConfig(max_attempts=2))
-        stub_env = {"STUB_CLAUDE_SCRIPT": "restart"}  # every launch exits 42
+        stub_env = {"STUB_CLAUDE_SCRIPT": "restart"}
         with supervised_stub(workspace_root=tmp_path, config=config, stub_env=stub_env):
             rc = cli.cmd_supervise("__run", "--name", "ar2", "--model", "claude-opus-4-8")
 
@@ -76,14 +74,11 @@ class TestStubProgressStallAutoRestart:
 
     @staticmethod
     def _watchdog_config(*, max_attempts: int) -> SuperviseConfig:
-        # idle_seconds is far larger than progress_stall_seconds so a stall trip can
-        # ONLY have come from the progress watchdog, never the PTY-silence timer.
         base = functional_supervise_config(idle_seconds=120, poll_interval_seconds=1)
         timeouts = replace(base.timeouts, progress_stall_seconds=2, long_op_heartbeat_seconds=1)
         return replace(base, timeouts=timeouts, restart=SuperviseRestartConfig(max_attempts=max_attempts))
 
     def test_spin_hang_is_caught_by_watchdog_then_recovers(self, tmp_path: Path) -> None:
-        # spin forever on launch 1 (watchdog trips -> restart), clean on the relaunch.
         config = self._watchdog_config(max_attempts=3)
         state_file = tmp_path / "stub-seq.state"
         stub_env = stub_sequence_env(sequence="spin,clean", state_file=state_file)
@@ -93,15 +88,11 @@ class TestStubProgressStallAutoRestart:
         assert rc == 0
         state = SuperviseRegistry(tmp_path).read_state("ps1")
         assert state is not None
-        # The watchdog terminated the hung child and relaunched once; the relaunch
-        # completed clean. The idle timer (120s) never had a chance to fire.
         assert state.state == "completed-clean"
         assert state.restart_count == 1
         assert state.exit_reason == "all-done"
 
     def test_persistent_spin_hang_exhausts_restart_cap(self, tmp_path: Path) -> None:
-        # Every launch spins forever: the watchdog restarts up to the cap then faults
-        # with the progress-stall-specific reason (distinct from the exit-42 cap).
         config = self._watchdog_config(max_attempts=2)
         stub_env = {"STUB_CLAUDE_SCRIPT": "spin", "STUB_CLAUDE_SPIN_INTERVAL_SECONDS": "0.1"}
         with supervised_stub(workspace_root=tmp_path, config=config, stub_env=stub_env):

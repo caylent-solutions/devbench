@@ -78,11 +78,6 @@ def _contract_findings(items: list[str]) -> list[str]:
     return [i for i in items if "Verification Contract" in i or "malformed '## Verification'" in i]
 
 
-# ---------------------------------------------------------------------------
-# Finding 1: executable-AC coverage
-# ---------------------------------------------------------------------------
-
-
 def test_executable_ac_without_verify_warns_then_errors_under_strict(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, "E1-F1-S1-T1")
     _make_task(
@@ -153,11 +148,6 @@ def test_non_executable_ac_without_verify_is_clean(tmp_path: Path, backlog_dir: 
     assert _contract_findings(warnings) == []
 
 
-# ---------------------------------------------------------------------------
-# Finding 2: DoD/AC agreement
-# ---------------------------------------------------------------------------
-
-
 def test_dod_runnable_claim_without_ac_reference_is_flagged(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, "E1-F1-S1-T1")
     _make_task(
@@ -186,11 +176,6 @@ def test_dod_runnable_claim_citing_existing_ac_is_clean(tmp_path: Path, backlog_
     assert _contract_findings(warnings) == []
 
 
-# ---------------------------------------------------------------------------
-# Malformed directive + clean unit
-# ---------------------------------------------------------------------------
-
-
 def test_malformed_verify_directive_is_always_error(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, "E1-F1-S1-T1")
     _make_task(
@@ -200,7 +185,7 @@ def test_malformed_verify_directive_is_always_error(tmp_path: Path, backlog_dir:
         dod_block="- [ ] All ACs checked",
         verification_block="- VERIFY AC-1 | type=bogus",
     )
-    errors, _ = _validate(tmp_path)  # non-strict -- still an error
+    errors, _ = _validate(tmp_path)
     assert any("malformed '## Verification' directive" in e for e in errors)
 
 
@@ -278,15 +263,12 @@ def test_promoted_proposal_draft_with_files_and_executable_ac_validates_clean(
         generated_at="NOW",
         status="in-queue",
     )
-    # AC-1: concrete add rows, no TODO cell.
     assert "| `src/resolver.py` | add |" in draft
     assert "TODO" not in draft
-    # AC-3: executable AC gets a type=command directive; qualitative AC gets type=judge.
     assert "- VERIFY AC-1 | type=command" in draft
     assert "- VERIFY AC-2 | type=judge" in draft
 
     (backlog_dir / "E1-F1-S1-T1.md").write_text(draft, encoding="utf-8")
 
-    # AC-2: promoting (status in-queue) introduces no validate-backlog ERRORs.
     errors, _ = _validate(tmp_path, strict=True)
     assert errors == [], f"unexpected validate errors on promoted draft: {errors}"

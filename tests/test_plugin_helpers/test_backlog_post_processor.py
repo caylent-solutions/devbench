@@ -22,18 +22,12 @@ def _write(path: Path, content: str) -> Path:
     return path
 
 
-# ---------------------------------------------------------------------------
-# _iter_work_unit_files
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestIterWorkUnitFiles:
     """The iterator skips BACKLOG.md and any path under config/."""
 
     def test_yields_only_work_units(self, tmp_path: Path) -> None:
         _write(tmp_path / "BACKLOG.md", "# index\n")
-        # A .md file under config/ -- skipped because 'config' is in path.parts.
         _write(tmp_path / "config" / "notes.md", "# config notes\n")
         _write(tmp_path / "E1" / "E1-F1-S1-T1.md", "# task\n")
         _write(tmp_path / "E1" / "E1.md", "# epic\n")
@@ -43,11 +37,6 @@ class TestIterWorkUnitFiles:
         assert "notes.md" not in names
         assert "E1-F1-S1-T1.md" in names
         assert "E1.md" in names
-
-
-# ---------------------------------------------------------------------------
-# normalize_manifest_column_count -- issue #227
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -117,13 +106,10 @@ class TestNormalizeManifestColumnCount:
         count = bpp.normalize_manifest_column_count(tmp_path)
         assert count == 1
         text = wu.read_text(encoding="utf-8")
-        # Canonical header.
         assert "| File | Change |" in text
         assert "|------|--------|" in text
-        # Row preserves repo + path + action.
         assert "| `caylent/cpk -- .github/workflows/audit.yml` | modify |" in text
         assert "| `caylent/cpk -- docs/contributing.md` | modify |" in text
-        # Original headers gone.
         assert "| Repo | Path | Action |" not in text
 
     def test_3col_file_change_notes_to_canonical(self, tmp_path: Path) -> None:
@@ -132,7 +118,6 @@ class TestNormalizeManifestColumnCount:
         assert count == 1
         text = wu.read_text(encoding="utf-8")
         assert "| File | Change |" in text
-        # Notes appended to Change with ' -- '.
         assert "| `src/foo.py` | add -- new feature |" in text
         assert "| `tests/test_foo.py` | add -- covers AC-1 |" in text
 
@@ -141,7 +126,6 @@ class TestNormalizeManifestColumnCount:
         count = bpp.normalize_manifest_column_count(tmp_path)
         assert count == 1
         text = wu.read_text(encoding="utf-8")
-        # Repo + Path merge, then Action -- Notes in Change.
         assert "| `caylent/cpk -- audit.yml` | modify -- install pkg fix |" in text
 
     def test_canonical_unchanged(self, tmp_path: Path) -> None:
@@ -186,9 +170,7 @@ class TestNormalizeManifestColumnCount:
         out_before = out_of_scope.read_text(encoding="utf-8")
         count = bpp.normalize_manifest_column_count(tmp_path, scope_paths=[tmp_path / "E2"])
         assert count == 1
-        # In-scope file collapsed.
         assert "| File | Change |" in in_scope.read_text(encoding="utf-8")
-        # Out-of-scope file unchanged.
         assert out_of_scope.read_text(encoding="utf-8") == out_before
 
 
@@ -213,11 +195,6 @@ class TestSplitRowCells:
 
     def test_empty_cells_kept(self) -> None:
         assert bpp._split_row_cells("|  |  |") == ["", ""]
-
-
-# ---------------------------------------------------------------------------
-# sanitize_markdown_pipes_in_manifest -- A12
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -298,34 +275,22 @@ class TestEscapeInnerPipes:
         assert bpp._escape_inner_pipes("| a | b |") == "| a | b |"
 
     def test_already_escaped_left_alone(self) -> None:
-        # The row has 3 unescaped pipes; ``\|`` is escaped already.
         assert bpp._escape_inner_pipes(r"| a | b \| c |") == r"| a | b \| c |"
 
     def test_extra_inner_pipe_gets_escaped(self) -> None:
         result = bpp._escape_inner_pipes("| a | b | c |")
-        # First, second, and last pipes are preserved; the third is escaped.
         assert result == r"| a | b \| c |"
 
     def test_mixed_escaped_and_unescaped_inner_pipes(self) -> None:
         """Row with an already-escaped pipe AND extra unescaped pipes:
         the escaped pipe is preserved verbatim and unescaped extras get escaped."""
-        # 5 unescaped pipes (positions 0, 4, 10, 14, 22) + 1 already-escaped pipe.
         row = r"| a | b \| c | d | e |"
-        # Unescaped pipe positions: 0 (lead), 4 (col-sep), 12 (inner), 16 (inner), 21 (trail).
-        # _escape_inner_pipes preserves 0/4/last and escapes the two inner ones; the
-        # pre-existing ``\|`` stays as-is.
         result = bpp._escape_inner_pipes(row)
-        assert r"\| c" in result  # original escape preserved
+        assert r"\| c" in result
         assert result.startswith("| a | b ")
         assert result.endswith(" |")
-        # The two extra inner pipes (at "| d" and "| e") are now escaped.
         assert r"\| d" in result
         assert r"\| e" in result
-
-
-# ---------------------------------------------------------------------------
-# dedupe_manifest_rows -- A13
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -352,7 +317,6 @@ class TestDedupeManifestRows:
         wu = _write(tmp_path / "T.md", self._DUP)
         assert bpp.dedupe_manifest_rows(tmp_path) == 1
         text = wu.read_text(encoding="utf-8")
-        # First occurrence kept; second collapsed.
         assert text.count("`src/foo.py`") == 1
 
     def test_idempotent(self, tmp_path: Path) -> None:
@@ -431,7 +395,6 @@ class TestDedupeBlockRows:
         """
         block = "## Changes Manifest\n| File | Change |\n| File | Change |\n|---|---|\n"
         new, _changed = bpp._dedupe_block_rows(block)
-        # The two pre-separator pipe lines remain.
         assert new.count("| File | Change |\n") == 2
 
     def test_invalid_row_pipe_format_left_alone(self) -> None:
@@ -446,11 +409,6 @@ class TestDedupeBlockRows:
         new, changed = bpp._dedupe_block_rows(block)
         assert changed is False
         assert "malformed row" in new
-
-
-# ---------------------------------------------------------------------------
-# suffix_ref_on_orphan_paths -- A11
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -484,9 +442,7 @@ class TestSuffixRefOnOrphanPaths:
         count = bpp.suffix_ref_on_orphan_paths(tmp_path)
         assert count == 1
         text = wu.read_text(encoding="utf-8")
-        # In-Manifest path stays bare.
         assert "`src/foo.py` exporting" in text
-        # Orphan paths get ``(ref)``.
         assert "`src/legacy.py` (ref)" in text
         assert "`tests/test_foo.py` (ref)" in text
 
@@ -552,13 +508,7 @@ class TestSuffixRefOnOrphanPaths:
         wu = _write(tmp_path / "T.md", self._BASE)
         supplied = {wu: {"src/legacy.py", "tests/test_foo.py", "src/foo.py"}}
         count = bpp.suffix_ref_on_orphan_paths(tmp_path, manifest_paths=supplied)
-        # With the broader supplied set, every token is in-Manifest -- zero changes.
         assert count == 0
-
-
-# ---------------------------------------------------------------------------
-# normalize_dep_ids -- issue #229
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -611,12 +561,9 @@ class TestNormalizeDepIds:
         count = bpp.normalize_dep_ids(tmp_path)
         assert count == 1
         text = wu.read_text(encoding="utf-8")
-        # Slug suffix stripped to canonical prefix.
         assert "| E16 | E16: Test cleanup for `feat/...` (PR #60) | done |" in text
         assert "| E15 | E15: Implementation cleanup | done |" in text
-        # ``### Depends On This`` block also rewritten.
         assert "| E20-F1-S1-T1 | E20-F1-S1-T1: Cross-repo gate | in-queue |" in text
-        # Original slug strings gone.
         assert "E16-test-cleanup" not in text
         assert "E15-impl-cleanup" not in text
         assert "E20-F1-S1-T1-verification" not in text
@@ -671,11 +618,6 @@ class TestNormalizeDepIds:
         assert count == 1
         assert "E16-test-cleanup" not in in_scope.read_text(encoding="utf-8")
         assert out_of_scope.read_text(encoding="utf-8") == out_before
-
-
-# ---------------------------------------------------------------------------
-# suffix_na_on_non_python_tasks -- issue #228
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -766,14 +708,11 @@ class TestSuffixNAOnNonPythonTasks:
         count = bpp.suffix_na_on_non_python_tasks(tmp_path)
         assert count == 1
         text = wu.read_text(encoding="utf-8")
-        # All Python-tooling AC-FINAL rows get the YAML suffix.
         assert "AC-FINAL-002 ruff format --check exits zero. -- N/A for YAML Tasks (no Python source authored)" in text
         assert "AC-FINAL-004 mypy src exits zero. -- N/A for YAML Tasks (no Python source authored)" in text
         assert "AC-FINAL-014 coverage gate is met. -- N/A for YAML Tasks (no Python source authored)" in text
-        # AC-FINAL-001 is NOT in the language-tier set; left alone.
         assert "AC-FINAL-001 every AC-TEST-* test runs and passes." in text
         assert "AC-FINAL-001 every AC-TEST-* test runs and passes. -- N/A" not in text
-        # AC-FUNC-001 is not an AC-FINAL line; left alone.
         assert "AC-FUNC-001 the workflow installs kanon-cli." in text
 
     def test_python_task_untouched(self, tmp_path: Path) -> None:
@@ -810,15 +749,12 @@ class TestSuffixNAOnNonPythonTasks:
 
     def test_skips_epic_feature_story(self, tmp_path: Path) -> None:
         """Only Task work units are processed (Epic / Feature / Story files have no AC-FINAL rows)."""
-        # Epic file ID 'E1' should be skipped even with AC-FINAL lines in body.
         _write(tmp_path / "E1.md", self._YAML_TASK.replace("E1-F1-S1-T1", "E1"))
         count = bpp.suffix_na_on_non_python_tasks(tmp_path)
         assert count == 0
 
     def test_unparseable_manifest_skipped(self, tmp_path: Path) -> None:
         """A task with a malformed Manifest (3-col header) is skipped silently."""
-        # 3-col header would fail parse_manifest; this pass skips so other
-        # passes (normalize_manifest_column_count) can fix the root cause.
         bad = """\
             # E1-F1-S1-T1: bad manifest
 
@@ -861,11 +797,6 @@ class TestSuffixNAOnNonPythonTasks:
         assert count == 1
         assert "-- N/A for YAML" in in_scope.read_text(encoding="utf-8")
         assert out_of_scope.read_text(encoding="utf-8") == out_before
-
-
-# ---------------------------------------------------------------------------
-# regenerate_backlog_index -- issue #225
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -962,10 +893,9 @@ class TestRegenerateBacklogIndex:
         ws = self._write_existing_workspace(tmp_path)
         self._write_new_epic(ws)
         result = bpp.regenerate_backlog_index(ws / "backlog", scope_paths=[ws / "backlog" / "E2-second"])
-        assert result == 0  # workspace_root not supplied; no-op.
+        assert result == 0
 
     def test_missing_backlog_md_is_noop(self, tmp_path: Path) -> None:
-        # No BACKLOG.md exists yet -- the skill's greenfield write handles it.
         _write(tmp_path / "backlog" / "E2-second" / "E2.md", "# E2: Second\n\n## Status: in-queue\n")
         result = bpp.regenerate_backlog_index(
             tmp_path / "backlog",
@@ -986,13 +916,10 @@ class TestRegenerateBacklogIndex:
         )
         assert result == 1
         after = (ws / "BACKLOG.md").read_text(encoding="utf-8")
-        # Every existing row from BEFORE is still in AFTER, byte-for-byte.
         for original_row in before.splitlines():
             if original_row.strip().startswith("| E1"):
                 assert original_row in after, f"row lost: {original_row!r}"
-        # E2 Status Summary row appended (3 children: 1F + 1S + 1T = 3 in-queue).
         assert "| E2 | Second epic |" in after
-        # E2 Full Work Unit Index rows appended.
         assert "| E2 | Second epic | Epic |" in after
         assert "| E2-F1 |" in after
         assert "| E2-F1-S1 |" in after
@@ -1000,7 +927,6 @@ class TestRegenerateBacklogIndex:
 
     def test_collision_raises(self, tmp_path: Path) -> None:
         ws = self._write_existing_workspace(tmp_path)
-        # Author a new E1 epic at a different path -- collision.
         _write(
             ws / "backlog" / "E1-different" / "E1.md",
             "# E1: Collision\n\n## Status: in-queue\n",
@@ -1012,7 +938,6 @@ class TestRegenerateBacklogIndex:
                 scope_paths=[ws / "backlog" / "E1-different"],
                 workspace_root=ws,
             )
-        # File on disk is unchanged after the collision.
         assert (ws / "BACKLOG.md").read_text(encoding="utf-8") == before
 
     def test_idempotent(self, tmp_path: Path) -> None:
@@ -1041,8 +966,6 @@ class TestRegenerateBacklogIndex:
             workspace_root=ws,
         )
         text = (ws / "BACKLOG.md").read_text(encoding="utf-8")
-        # E2 has 1 Feature + 1 Story + 1 Task all in-queue, plus the Epic
-        # itself (in-queue but excluded). So the In Queue column should be 3.
         m = re.search(r"^\| E2 \| Second epic \| (\d+) \| (\d+) \| (\d+) \|", text, re.MULTILINE)
         assert m is not None, f"E2 row not found in:\n{text}"
         done, in_progress, in_queue = m.group(1), m.group(2), m.group(3)
@@ -1059,14 +982,8 @@ class TestRegenerateBacklogIndex:
             scope_paths=[ws / "backlog" / "E1-first"],
             workspace_root=ws,
         )
-        # No new rows to append; existing rows already cover the scope.
         assert result == 0
         assert (ws / "BACKLOG.md").read_text(encoding="utf-8") == before
-
-
-# ---------------------------------------------------------------------------
-# verify_code_standards_canonical -- issue #230
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1077,7 +994,6 @@ class TestVerifyCodeStandardsCanonical:
         from devbench.plugin_helpers.code_standards_template import emit_code_standards_block
 
         block = emit_code_standards_block(tmp_path, task_specific_error_paths=["task-specific error 1"])
-        # Compose a minimal Task work-unit file.
         content = (
             textwrap.dedent("""\
             # E1-F1-S1-T1: Title
@@ -1091,7 +1007,6 @@ class TestVerifyCodeStandardsCanonical:
         return _write(tmp_path / "E1-F1-S1-T1.md", content)
 
     def _make_task_with_drift(self, tmp_path: Path) -> Path:
-        # Same shape as canonical but Critical Rule 1 is paraphrased.
         drifted_block = textwrap.dedent("""\
             ### Code Standards
 
@@ -1126,7 +1041,6 @@ class TestVerifyCodeStandardsCanonical:
         before = wu.read_text(encoding="utf-8")
         count = bpp.verify_code_standards_canonical(tmp_path, workspace_root=tmp_path)
         assert count == 0
-        # File is not mutated.
         assert wu.read_text(encoding="utf-8") == before
 
     def test_drift_detected_but_not_mutated(self, tmp_path: Path) -> None:
@@ -1134,21 +1048,17 @@ class TestVerifyCodeStandardsCanonical:
         before = wu.read_text(encoding="utf-8")
         count = bpp.verify_code_standards_canonical(tmp_path)
         assert count == 1
-        # File is NOT mutated -- check-only pass.
         assert wu.read_text(encoding="utf-8") == before
 
     def test_skips_non_task_files(self, tmp_path: Path) -> None:
         """Epic / Feature / Story files are skipped (they may not carry the block)."""
-        # Author the drift content but use an Epic-shaped filename.
         self._make_task_with_drift(tmp_path)
-        # Rename to Epic shape.
         (tmp_path / "E1-F1-S1-T1.md").rename(tmp_path / "E1.md")
         count = bpp.verify_code_standards_canonical(tmp_path)
         assert count == 0
 
     def test_terminal_status_skipped_by_default(self, tmp_path: Path) -> None:
         wu = self._make_task_with_drift(tmp_path)
-        # Mark the file done.
         content = wu.read_text(encoding="utf-8").replace("## Status: in-queue", "## Status: done")
         wu.write_text(content, encoding="utf-8")
         count = bpp.verify_code_standards_canonical(tmp_path)
@@ -1167,7 +1077,6 @@ class TestVerifyCodeStandardsCanonical:
         assert count == 0
 
     def test_scope_paths_honoured(self, tmp_path: Path) -> None:
-        # Out-of-scope task is drifted but scope only includes E2.
         out_scope_dir = tmp_path / "E1"
         out_scope_dir.mkdir()
         drifted_block = "### Code Standards\n\nbad\n\n#### Error Handling Contract\n\n(none)\n"
@@ -1182,13 +1091,7 @@ class TestVerifyCodeStandardsCanonical:
             "# T\n\n## Status: in-queue\n\n" + drifted_block,
         )
         count = bpp.verify_code_standards_canonical(tmp_path, scope_paths=[in_scope_dir])
-        # Only the in-scope drift is counted.
         assert count == 1
-
-
-# ---------------------------------------------------------------------------
-# run_all
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1207,11 +1110,6 @@ class TestRunAll:
             "regenerate_backlog_index": 0,
             "verify_code_standards_canonical": 0,
         }
-
-
-# ---------------------------------------------------------------------------
-# Scope-awareness + terminal-status guard -- issue #226
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1263,13 +1161,10 @@ class TestScopeAwareness:
 
         result = bpp.run_all(tmp_path, scope_paths=[tmp_path / "E2"])
 
-        # E1 (out of scope) is bit-identical.
         assert old.read_text(encoding="utf-8") == old_before
-        # E2 (in scope) had its orphan path suffixed.
         new_after = new.read_text(encoding="utf-8")
         assert new_after != new_before
         assert "`src/orphan.py` (ref)" in new_after
-        # Only E2 was modified.
         assert result["suffix_ref_on_orphan_paths"] == 1
 
     def test_run_all_skips_terminal_status_by_default(self, tmp_path: Path) -> None:
@@ -1279,7 +1174,6 @@ class TestScopeAwareness:
 
         result = bpp.run_all(tmp_path)
 
-        # Done task is not mutated even though it has an orphan path.
         assert done.read_text(encoding="utf-8") == before
         assert result["suffix_ref_on_orphan_paths"] == 0
 
@@ -1334,8 +1228,6 @@ class TestScopeAwareness:
         """Overlapping ``scope_paths`` do not double-process the same file."""
         _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._NEW_WITH_ORPHAN)
 
-        # The parent directory and the explicit E2 directory both contain
-        # the same file; the walk yields it once.
         result = bpp.run_all(tmp_path, scope_paths=[tmp_path, tmp_path / "E2"])
 
         assert result["suffix_ref_on_orphan_paths"] == 1
@@ -1409,11 +1301,6 @@ class TestIsTerminalStatus:
 
     def test_status_value_is_case_insensitive(self) -> None:
         assert bpp._is_terminal_status("## Status: DONE\n") is True
-
-
-# ---------------------------------------------------------------------------
-# Helper functions: _split_manifest_section / _extract_manifest_paths
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

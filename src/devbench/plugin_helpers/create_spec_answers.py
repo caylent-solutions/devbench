@@ -34,9 +34,6 @@ __all__ = [
     "validate_answers",
 ]
 
-# ---------------------------------------------------------------------------
-# Public constants
-# ---------------------------------------------------------------------------
 
 REQUIRED_BLOCKS: list[str] = ["A", "B", "C", "D", "E", "F", "G"]
 """Ordered list of block keys that MUST be present in the answers file."""
@@ -44,11 +41,6 @@ REQUIRED_BLOCKS: list[str] = ["A", "B", "C", "D", "E", "F", "G"]
 BLOCKED_MESSAGE_TEMPLATE: str = "[BLOCKED] create-spec headless: missing answer for Block {block}"
 """Verbatim message template emitted (and raised) when a required block is
 absent. Format with ``block=<letter>`` to produce the exact spec string."""
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
 
 
 class MalformedAnswersError(ValueError):
@@ -61,11 +53,6 @@ class MissingBlockError(ValueError):
     ``str(exc)`` returns the verbatim ``[BLOCKED]`` message required by
     spec AC-256-1 so callers can emit it directly to stderr.
     """
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def load_answers_file(path: Path) -> dict[str, Any]:

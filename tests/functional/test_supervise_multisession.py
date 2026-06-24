@@ -61,8 +61,6 @@ class TestStubMultiSession:
         def _capture_print(*args: object, **_kwargs: object) -> None:
             captured["out"] = captured.get("out", "") + " ".join(str(a) for a in args) + "\n"
 
-        # One shared harness covers BOTH concurrent __run threads (mock.patch is not
-        # thread-safe -- a single outer context avoids per-thread patch races).
         with supervised_stub(workspace_root=tmp_path, config=config, stub_env={"STUB_CLAUDE_SCRIPT": "idle"}):
             threads = [threading.Thread(target=_run_session, args=(name, rc_out), name=f"run-{name}") for name in names]
             for thread in threads:
@@ -78,7 +76,6 @@ class TestStubMultiSession:
                 ):
                     info_rc = cli.cmd_supervise("info")
             finally:
-                # Drain both sessions so neither thread lingers.
                 for name in names:
                     write_stop_request(tmp_path, name)
                 for thread in threads:
@@ -87,10 +84,8 @@ class TestStubMultiSession:
         assert info_rc == 0
         assert all(rc_out.get(name) == 0 for name in names)
         out = captured["out"]
-        # Both screens are listed with their distinct names + the exact attach command.
         for name in names:
             assert screen_session_name(name, prefix=config.screen_name_prefix) in out
             assert f"supervise attach --name {name}" in out
-        # The two sessions are distinct registry entries (multi-session listing, FR-17).
         registry_names = {s.name for s in SuperviseRegistry(tmp_path).load()}
         assert registry_names == set(names)

@@ -32,10 +32,6 @@ from pathlib import Path
 EM_DASH = "\u2014"
 MANIFEST_HEADER = "Changes Manifest"
 
-# Bounded timeout (seconds) for the read-only ``git diff --cached --name-only``
-# call used by ``assert_staged_matches_manifest``. Kept generous so a slow
-# checkout still completes; far below the global command timeout so a hung
-# git process surfaces fast.
 _GIT_DIFF_TIMEOUT: int = 30
 
 _SECTION_RE = re.compile(
@@ -228,11 +224,6 @@ def remove_rows(content: str, paths_to_remove: list[str]) -> str:
     return content[: match.start()] + replacement + content[match.end() :]
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
 def _parse_body(body: str) -> list[ManifestRow]:
     """Parse the body of the Changes Manifest section into typed rows.
 
@@ -253,7 +244,6 @@ def _parse_body(body: str) -> list[ManifestRow]:
         if len(cells) != 2:
             raise ManifestParseError(f"Manifest row must have exactly 2 columns, got {len(cells)}: {line!r}")
         raw_file = cells[0]
-        # Handle repo-prefixed manifest format: `<repo>` -- `<path>`
         if "` -- `" in raw_file:
             file_cell = raw_file.split("` -- `", 1)[1].strip("`").strip()
         else:
@@ -266,10 +256,6 @@ def _parse_body(body: str) -> list[ManifestRow]:
     return rows
 
 
-# Sentinel byte that cannot occur naturally in Markdown source. Used by
-# ``_split_cells_honouring_escapes`` to temporarily replace markdown-escaped
-# pipes (``\\|``) so the line can be split on unescaped pipes via
-# ``str.split`` without a regex-based tokenizer.
 _ESC_PIPE_SENTINEL = "\x00ESC_PIPE\x00"
 
 

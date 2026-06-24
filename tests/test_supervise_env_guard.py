@@ -62,8 +62,6 @@ class TestEnvSanitizerSubscriptionDenies:
         assert "ANTHROPIC_API_KEY" not in result
 
     def test_bedrock_routing_vars_stripped_in_subscription(self) -> None:
-        # The claude-CLI Bedrock/Vertex routing vars are denied in subscription
-        # mode so they cannot route inference off-subscription.
         sanitizer = EnvSanitizer(extra_deny_vars=(), billing_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
         result = sanitizer.build(
             source_env={
@@ -123,7 +121,6 @@ class TestEnvSanitizerBedrockMode:
             session_name="n",
             import_model="us.anthropic.claude-opus-4-1-v1",
         )
-        # CLAUDE_CODE_USE_BEDROCK is EXPORTED so the CLI routes inference to Bedrock.
         assert result[SUPERVISE_BEDROCK_USE_FLAG_VAR] == "1"
 
     def test_bedrock_mode_exports_region_and_model(self) -> None:
@@ -134,8 +131,6 @@ class TestEnvSanitizerBedrockMode:
             session_name="n",
             import_model="us.anthropic.claude-opus-4-1-v1",
         )
-        # The CLI reads ANTHROPIC_MODEL for the Bedrock model id; the region is the
-        # operator's AWS_REGION (which already passed through).
         assert result[SUPERVISE_BEDROCK_MODEL_VAR] == "us.anthropic.claude-opus-4-1-v1"
         assert result[SUPERVISE_BEDROCK_REGION_VAR] == "eu-west-1"
 
@@ -175,8 +170,6 @@ class TestEnvSanitizerCliHangGuards:
         [SUPERVISE_BILLING_MODE_SUBSCRIPTION, SUPERVISE_BILLING_MODE_BEDROCK],
     )
     def test_cli_hang_guards_always_set(self, billing_mode: str) -> None:
-        # Bedrock mode needs a region to export; subscription does not. Provide one
-        # unconditionally so the single parametrized case covers both modes.
         sanitizer = EnvSanitizer(extra_deny_vars=(), billing_mode=billing_mode)
         result = sanitizer.build(
             source_env={"PATH": "/usr/bin", "AWS_REGION": "us-east-1"},
@@ -188,7 +181,6 @@ class TestEnvSanitizerCliHangGuards:
         assert result["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
     def test_cli_hang_guards_set_even_when_absent_from_source(self) -> None:
-        # The operator env does NOT carry them; the sanitizer must inject them.
         sanitizer = EnvSanitizer(extra_deny_vars=(), billing_mode=SUPERVISE_BILLING_MODE_SUBSCRIPTION)
         result = sanitizer.build(
             source_env={"PATH": "/usr/bin"},
@@ -200,8 +192,6 @@ class TestEnvSanitizerCliHangGuards:
         assert result["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
     def test_cli_hang_guards_not_in_any_deny_set(self) -> None:
-        # They must survive the deny comprehension in both modes (they are not
-        # billing-routing vars, so they are never denied).
         for mode in (SUPERVISE_BILLING_MODE_SUBSCRIPTION, SUPERVISE_BILLING_MODE_BEDROCK):
             deny = resolve_supervise_deny_vars(mode)
             assert "DISABLE_AUTOUPDATER" not in deny
@@ -275,9 +265,6 @@ class TestEnvSanitizerFailFast:
             )
 
     def test_bedrock_mode_requires_region_for_export(self) -> None:
-        # Bedrock mode must export AWS_REGION to the CLI; if neither AWS_REGION nor
-        # AWS_DEFAULT_REGION is present in the source env there is no region to
-        # route Bedrock to -- fail fast rather than launch a session that cannot bill.
         with pytest.raises(ValueError, match="region"):
             EnvSanitizer(extra_deny_vars=(), billing_mode=SUPERVISE_BILLING_MODE_BEDROCK).build(
                 source_env={"PATH": "/usr/bin"},

@@ -28,10 +28,6 @@ from devbench.config_loader import (
 )
 from devbench.constants import STATUS_DRAFT, STATUS_IN_QUEUE
 
-# ---------------------------------------------------------------------------
-# resolve_config_path -- AC-2
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestResolveConfigPath:
@@ -82,11 +78,6 @@ class TestResolveConfigPath:
         assert result == workspace / DEFAULT_CONFIG_SUBPATH, (
             f"Expected default path {workspace / DEFAULT_CONFIG_SUBPATH}, got {result}"
         )
-
-
-# ---------------------------------------------------------------------------
-# load_runtime_config -- AC-3, AC-4, AC-5
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -224,11 +215,6 @@ class TestLoadRuntimeConfig:
             load_runtime_config(cfg, {})
 
 
-# ---------------------------------------------------------------------------
-# get_configured_default_branch -- AC-6 (pure function)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestGetConfiguredDefaultBranch:
     """AC-6: YAML default_branch returned when configured; None when absent."""
@@ -290,11 +276,6 @@ class TestGetEffectiveMergeStrategy:
         assert get_effective_merge_strategy("org/repo", config) is None
 
 
-# ---------------------------------------------------------------------------
-# RuntimeConfig / RepoConfig dataclasses
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestDataclasses:
     """Structural tests for RuntimeConfig and RepoConfig."""
@@ -313,11 +294,6 @@ class TestDataclasses:
         """RepoConfig() has checkout_directory=None by default."""
         rc = RepoConfig()
         assert rc.checkout_directory is None, f"Expected checkout_directory=None, got {rc.checkout_directory!r}"
-
-
-# ---------------------------------------------------------------------------
-# checkout_directory parsing -- AC-1, AC-3, AC-4
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -385,11 +361,6 @@ class TestCheckoutDirectory:
             load_runtime_config(cfg, {})
 
 
-# ---------------------------------------------------------------------------
-# get_repo_local_path -- AC-2, AC-5
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestGetRepoLocalPath:
     """AC-2 and AC-5: get_repo_local_path returns checkout_directory or falls back to short name."""
@@ -433,11 +404,6 @@ class TestGetRepoLocalPath:
         config = RuntimeConfig(repos={"org/my-repo": RepoConfig(checkout_directory=None)})
         result = get_repo_local_path("org/my-repo", config, tmp_path)
         assert result == tmp_path / "my-repo", f"Expected {tmp_path / 'my-repo'}, got {result}"
-
-
-# ---------------------------------------------------------------------------
-# JSON Schema validation -- AC-1, AC-2, AC-3, AC-4, AC-5, AC-6
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -577,11 +543,6 @@ class TestJsonSchemaValidation:
             load_runtime_config(cfg, {})
 
 
-# ---------------------------------------------------------------------------
-# TimeoutConfig / LimitConfig dataclasses -- AC-9
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestTimeoutConfigDefaults:
     """AC-9: TimeoutConfig fields default to None when not specified in YAML."""
@@ -693,11 +654,6 @@ class TestLimitConfigDefaults:
         assert lc.llm_file_preview_chars is None, (
             f"Expected llm_file_preview_chars=None, got {lc.llm_file_preview_chars!r}"
         )
-
-
-# ---------------------------------------------------------------------------
-# RuntimeConfig population from YAML -- AC-9
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -852,11 +808,6 @@ class TestRuntimeConfigPopulation:
         )
 
 
-# ---------------------------------------------------------------------------
-# AC-10: config_loader.py does not read env vars
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestConfigLoaderNoEnvVars:
     """AC-10: config_loader module does not read any environment variables."""
@@ -894,12 +845,6 @@ class TestConfigLoaderNoEnvVars:
                 env_read_calls.append("os.getenv")
 
         assert env_read_calls == [], f"config_loader.py must not read env vars -- found: {env_read_calls}"
-
-
-# ---------------------------------------------------------------------------
-# AC-7: checkout_directory path safety enforced post-schema
-# AC-8: allowed_orgs vs repos cross-validation enforced post-schema
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -991,11 +936,6 @@ class TestPostSchemaValidation:
         )
         result = load_runtime_config(cfg, {})
         assert "any-org/repo" in result.repos, f"Expected 'any-org/repo' in repos, got {set(result.repos)}"
-
-
-# ---------------------------------------------------------------------------
-# GitOpsConfig -- T3 AC-3, AC-4, AC-5, AC-6
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1159,14 +1099,9 @@ class TestGitOpsConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.report.models == {}
-        # default_model falls back to the package constant when YAML
-        # leaves it unset.
         from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES
 
         assert result.report.default_model == DEFAULT_FALLBACK_MODEL_RATES
-        # Cache multipliers default to None in the parsed YAML layer;
-        # config.py applies the constant defaults via _resolve_float
-        # (env > YAML > const).
         assert result.report.cache_read_multiplier is None
         assert result.report.cache_write_5min_multiplier is None
         assert result.report.cache_write_1hr_multiplier is None
@@ -1855,7 +1790,6 @@ class TestRepoConfigRuntimeFields:
         )
         rt = load_runtime_config(cfg, {})
         assert rt.repos["org/repo"].resolved_checkout_path is None
-        # validated_repo remains populated even without workspace_root.
         assert rt.repos["org/repo"].validated_repo == "org/repo"
 
     def test_get_repo_local_path_uses_resolved_checkout_path_when_set(self, tmp_path: Path) -> None:
@@ -1873,7 +1807,6 @@ class TestRepoConfigRuntimeFields:
         )
         rt = load_runtime_config(cfg, {"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "explicit-dir"
-        # workspace_root argument is ignored because resolved_checkout_path is set.
         result = get_repo_local_path("org/repo", rt, Path("/different/ws"))
         assert result == tmp_path / "explicit-dir"
 
@@ -2001,13 +1934,6 @@ class TestVNextCanonicalConfig:
             load_runtime_config(cfg, {})
 
     def test_local_only_incompatible_with_pause_before_merge(self, tmp_path: Path) -> None:
-        # pause_before_merge: true is itself mutually exclusive with defer_pr: true,
-        # so the only way to combine local_only + pause_before_merge is without defer_pr
-        # -- which trips the local_only-requires-defer_pr check first. The schema
-        # validator reaches the pause_before_merge incompatibility branch only when
-        # defer_pr is also present, which the existing pause-vs-defer rule already
-        # rejects. We assert the intent: local_only + pause_before_merge can never
-        # coexist successfully, regardless of which validator fires first.
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -2190,7 +2116,6 @@ class TestSampleConfigCompleteness:
         """
         sample_path = Path(__file__).parent.parent / "sample-config.yaml"
         rt = load_runtime_config(sample_path, {})
-        # Sanity: the v-next defaults that operators rely on are present.
         assert rt.git_ops.inline_orphan_cleanup is True
         assert rt.git_ops.ci_failure_retry is True
         assert rt.git_ops.pause_before_merge is False
@@ -2212,7 +2137,6 @@ class TestSampleConfigCompleteness:
             schema = _json.load(fh)
         sample_path = Path(__file__).parent.parent / "sample-config.yaml"
         sample_text = sample_path.read_text(encoding="utf-8")
-        # Strip comment markers so commented-out fields still count as documented.
         decommented = _re.sub(r"^\s*#\s?", "", sample_text, flags=_re.MULTILINE)
         missing = [
             field_name
@@ -2639,11 +2563,6 @@ class TestHookTailConfig:
         assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)
 
 
-# ---------------------------------------------------------------------------
-# auto_finalize + auto_merge toggle tests (AC-FUNC-001..004)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestAutoFinalizeAutoMergeConfig:
     """Schema and loader tests for git_ops.auto_finalize and git_ops.auto_merge toggles."""
@@ -2653,7 +2572,6 @@ class TestAutoFinalizeAutoMergeConfig:
         path.write_text(textwrap.dedent(content), encoding="utf-8")
         return path
 
-    # AC-FUNC-001: both fields default to False when absent
     def test_auto_finalize_defaults_to_false(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",
@@ -2714,7 +2632,6 @@ class TestAutoFinalizeAutoMergeConfig:
         assert rt.git_ops.auto_finalize is True
         assert rt.git_ops.defer_pr is True
 
-    # AC-FUNC-002: auto_finalize: true without defer_pr: true must be rejected
     def test_auto_finalize_without_defer_pr_raises(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",
@@ -2729,7 +2646,6 @@ class TestAutoFinalizeAutoMergeConfig:
         with pytest.raises(ValueError, match=r"auto_finalize: true requires .*defer_pr: true"):
             load_runtime_config(cfg, {})
 
-    # AC-FUNC-003: auto_merge: true without auto_finalize: true must be rejected
     def test_auto_merge_without_auto_finalize_raises(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",
@@ -2746,7 +2662,6 @@ class TestAutoFinalizeAutoMergeConfig:
         with pytest.raises(ValueError, match=r"auto_merge: true requires .*auto_finalize: true"):
             load_runtime_config(cfg, {})
 
-    # AC-FUNC-004: auto_merge: true + local_only: true must be rejected
     def test_auto_merge_with_local_only_raises(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",
@@ -2762,18 +2677,8 @@ class TestAutoFinalizeAutoMergeConfig:
               auto_merge: true
             """,
         )
-        # The config loader rejects any combination of auto_finalize/auto_merge
-        # with local_only=true because local-only repos have no remote. The
-        # auto_finalize + local_only check fires first (before auto_merge +
-        # local_only), so we match on "local_only: true" which appears in both
-        # error messages.
         with pytest.raises(ValueError, match=r"local_only: true"):
             load_runtime_config(cfg, {})
-
-
-# ---------------------------------------------------------------------------
-# BacklogConfig -- AC-189-8, AC-189-9
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -2952,8 +2857,6 @@ class TestBacklogConfig:
             match=r"must be one of.*draft.*in-queue|must be one of.*in-queue.*draft",
         ):
             _parse_backlog_config(fake_path, {"default_status_for_new_work_units": "proposed"})
-
-    # -- AC-194-4 / AC-194-7: bulk_update_confirm_threshold and bulk_update_audit_path fields --
 
     def test_backlog_config_default_bulk_update_confirm_threshold(self) -> None:
         """
@@ -3277,15 +3180,10 @@ class TestAgentModelsConfig:
             validate_agent_model_value("env DEVBENCH_AGENT_MODEL_X", "executor", "garbage", False)
         with pytest.raises(ValueError, match="not a valid Bedrock"):
             validate_agent_model_value("env DEVBENCH_AGENT_MODEL_X", "executor", "opus", True)
-        # Happy paths return None.
         validate_agent_model_value("yaml", "executor", "opus", False)
         validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)
         validate_agent_model_value("yaml", "executor", "us.anthropic.claude-opus-4-7-v1", True)
 
-
-# ---------------------------------------------------------------------------
-# Haiku rejection -- AC-198-2, AC-198-3
-# ---------------------------------------------------------------------------
 
 _ALL_TOP_LEVEL_AGENT_FIELDS = (
     "executor",
@@ -3304,7 +3202,6 @@ _ALL_REVIEW_TEAM_FIELDS = (
     "changes_manifest",
 )
 
-# All haiku input shapes that must be rejected (use_bedrock=False paths)
 _HAIKU_ANTHROPIC_INPUTS = (
     "haiku",
     "claude-haiku-4-5-20251001",
@@ -3312,7 +3209,6 @@ _HAIKU_ANTHROPIC_INPUTS = (
     "HAIKU",
 )
 
-# Haiku Bedrock ARN shape rejected when use_bedrock=True
 _HAIKU_BEDROCK_INPUTS = ("us.anthropic.claude-haiku-4-5-v1",)
 
 
@@ -3462,16 +3358,10 @@ class TestHaikuRejectionValidatorHelper:
         """Non-haiku short names (opus, sonnet) must still pass validation."""
         from devbench.config_loader import validate_agent_model_value
 
-        # These must NOT raise.
         validate_agent_model_value("yaml", "executor", "opus", False)
         validate_agent_model_value("yaml", "executor", "sonnet", False)
         validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)
         validate_agent_model_value("yaml", "executor", "claude-sonnet-4-6", False)
-
-
-# ---------------------------------------------------------------------------
-# Opus 4.8 acceptance -- AC-254-1 (issue #254d)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -3488,14 +3378,12 @@ class TestOpus48Acceptance:
         """claude-opus-4-8 (Anthropic API form) passes when use_bedrock=False."""
         from devbench.config_loader import validate_agent_model_value
 
-        # Must not raise.
         validate_agent_model_value("yaml", "executor", "claude-opus-4-8", False)
 
     def test_bedrock_id_accepted(self) -> None:
         """us.anthropic.claude-opus-4-8-v1 (Bedrock form) passes when use_bedrock=True."""
         from devbench.config_loader import validate_agent_model_value
 
-        # Must not raise.
         validate_agent_model_value("yaml", "executor", "us.anthropic.claude-opus-4-8-v1", True)
 
     def test_bad_id_rejected_with_verbatim_message(self) -> None:
@@ -3516,13 +3404,7 @@ class TestOpus48Acceptance:
         """Both 4.8 id forms pass validate_agent_model_value without raising."""
         from devbench.config_loader import validate_agent_model_value
 
-        # Must not raise for either form.
         validate_agent_model_value("yaml", "executor", model_id, use_bedrock)
-
-
-# ---------------------------------------------------------------------------
-# SkillsConfig -- issue #221 E1-E10 (application-agnostic SKILL.md + config)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -3751,11 +3633,6 @@ class TestAutoResolveConfigDataclass:
         rt = load_runtime_config(cfg_path, {})
         assert rt.auto_resolve.enabled is False
         assert rt.auto_resolve.max_attempts == DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS
-
-
-# ---------------------------------------------------------------------------
-# SkillsConfig -- workflow fields (E12-F1-S1-T1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

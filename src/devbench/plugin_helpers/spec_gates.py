@@ -45,9 +45,6 @@ __all__ = [
     "run_gates",
 ]
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 _EM_DASH = "\u2014"
 """The em-dash character banned from all spec files (use -- instead)."""
@@ -55,15 +52,7 @@ _EM_DASH = "\u2014"
 _FENCE_MARKER = "```"
 """Triple-backtick that opens or closes a fenced code block in Markdown."""
 
-# Pattern that matches ``key: value`` pairs where the key is a lower-case
-# identifier (word characters and hyphens) and the value is the remainder
-# of the line after optional whitespace. Both sides are trimmed.
 _VERSION_KEY_RE = re.compile(r"^\s*([\w][\w_-]*)\s*:\s*(.+?)\s*$", re.MULTILINE)
-
-
-# ---------------------------------------------------------------------------
-# Public enums and dataclasses
-# ---------------------------------------------------------------------------
 
 
 class BlockerKind(StrEnum):
@@ -102,11 +91,6 @@ class Blocker:
     detail: str
 
 
-# ---------------------------------------------------------------------------
-# Gate: balanced fenced and mermaid blocks
-# ---------------------------------------------------------------------------
-
-
 def check_balanced_blocks(file_path: str, content: str) -> list[Blocker]:
     """Check that every triple-backtick block in *content* is closed.
 
@@ -139,11 +123,6 @@ def check_balanced_blocks(file_path: str, content: str) -> list[Blocker]:
     return []
 
 
-# ---------------------------------------------------------------------------
-# Gate: banned glyphs (em-dash)
-# ---------------------------------------------------------------------------
-
-
 def check_no_banned_glyphs(file_path: str, content: str) -> list[Blocker]:
     """Check that *content* contains no banned glyph characters.
 
@@ -173,11 +152,6 @@ def check_no_banned_glyphs(file_path: str, content: str) -> list[Blocker]:
     return blockers
 
 
-# ---------------------------------------------------------------------------
-# Gate: cross-file version/identifier consistency
-# ---------------------------------------------------------------------------
-
-
 def check_version_consistency(files: dict[str, str]) -> list[Blocker]:
     """Check that version/identifier keys have consistent values across files.
 
@@ -194,7 +168,6 @@ def check_version_consistency(files: dict[str, str]) -> list[Blocker]:
         one per key that has conflicting values across the file set.
         Returns an empty list when all keys are consistent.
     """
-    # Collect all (value, file_path) tuples per key.
     key_occurrences: dict[str, list[tuple[str, str]]] = {}
     for file_path, content in files.items():
         for match in _VERSION_KEY_RE.finditer(content):
@@ -221,11 +194,6 @@ def check_version_consistency(files: dict[str, str]) -> list[Blocker]:
     return blockers
 
 
-# ---------------------------------------------------------------------------
-# Gate: acyclic declared dependency graph
-# ---------------------------------------------------------------------------
-
-
 def check_acyclic_deps(dep_graph: dict[str, list[str]]) -> list[Blocker]:
     """Check that the declared dependency graph contains no cycles.
 
@@ -247,8 +215,6 @@ def check_acyclic_deps(dep_graph: dict[str, list[str]]) -> list[Blocker]:
     if not dep_graph:
         return []
 
-    # DFS color tracking: 0 = white (unvisited), 1 = gray (on the
-    # recursion stack), 2 = black (fully processed).
     color: dict[str, int] = dict.fromkeys(dep_graph, 0)
     stack: list[str] = []
     reported: set[tuple[str, ...]] = set()
@@ -259,10 +225,8 @@ def check_acyclic_deps(dep_graph: dict[str, list[str]]) -> list[Blocker]:
         stack.append(node)
         for dep in dep_graph.get(node, []):
             if dep not in color:
-                # Edge to a node not in the graph; skip (not our gate).
                 continue
             if color[dep] == 1:
-                # Back-edge -- cycle detected. Normalise and deduplicate.
                 cycle_start = stack.index(dep)
                 cycle = tuple(stack[cycle_start:])
                 rotation = cycle.index(min(cycle))
@@ -292,11 +256,6 @@ def check_acyclic_deps(dep_graph: dict[str, list[str]]) -> list[Blocker]:
             _visit(node)
 
     return blockers
-
-
-# ---------------------------------------------------------------------------
-# Aggregator: run all gates over a file set
-# ---------------------------------------------------------------------------
 
 
 def run_gates(

@@ -22,10 +22,6 @@ from devbench.plugin_helpers.name_coverage import (
     verify_gap,
 )
 
-# ---------------------------------------------------------------------------
-# Sample fixtures
-# ---------------------------------------------------------------------------
-
 _SPEC_WITH_ELEMENTS = """\
 # My Project Spec
 
@@ -83,10 +79,6 @@ _MANIFEST_EMPTY = """\
 |------|--------|
 """
 
-# ---------------------------------------------------------------------------
-# ELEMENT_CATEGORIES -- the six named categories must be present
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestElementCategories:
@@ -107,11 +99,6 @@ class TestElementCategories:
 
         for cat, pattern in ELEMENT_CATEGORIES.items():
             assert isinstance(pattern, re.Pattern), f"Category '{cat}' must map to a compiled re.Pattern"
-
-
-# ---------------------------------------------------------------------------
-# enumerate_spec_elements -- extracts named items across all categories
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -174,12 +161,10 @@ class TestEnumerateSpecElements:
 
         import devbench.plugin_helpers.name_coverage as nc
 
-        # A pattern with one optional group that matches but captures nothing.
         original = dict(nc.ELEMENT_CATEGORIES)
         nc.ELEMENT_CATEGORIES.clear()
         nc.ELEMENT_CATEGORIES["module"] = re.compile(r"TRIGGER(?:( ))?NONE")
         try:
-            # "TRIGGERNONE" matches but the optional group is None.
             elements = enumerate_spec_elements("TRIGGERNONE")
             assert elements == []
         finally:
@@ -194,7 +179,6 @@ class TestEnumerateSpecElements:
 
         original = dict(nc.ELEMENT_CATEGORIES)
         nc.ELEMENT_CATEGORIES.clear()
-        # Pattern that captures one or more spaces.
         nc.ELEMENT_CATEGORIES["module"] = re.compile(r"TRIGGER( +)EMPTY")
         try:
             elements = enumerate_spec_elements("TRIGGER   EMPTY")
@@ -202,11 +186,6 @@ class TestEnumerateSpecElements:
         finally:
             nc.ELEMENT_CATEGORIES.clear()
             nc.ELEMENT_CATEGORIES.update(original)
-
-
-# ---------------------------------------------------------------------------
-# run_name_coverage_pre_pass -- core function: spec elements vs manifests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -303,11 +282,6 @@ class TestRunNameCoveragePrePass:
             )
 
 
-# ---------------------------------------------------------------------------
-# CoverageResult -- data class shape
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCoverageResult:
     """CoverageResult carries element, covering_task_id, and is_covered."""
@@ -327,11 +301,6 @@ class TestCoverageResult:
         result = CoverageResult(element=elem, covering_task_id=None, is_covered=False)
         assert not result.is_covered
         assert result.covering_task_id is None
-
-
-# ---------------------------------------------------------------------------
-# GapReport -- structured gap shape
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -378,11 +347,6 @@ class TestGapReport:
         assert report.severity == severity
 
 
-# ---------------------------------------------------------------------------
-# verify_gap -- per-gap independent verification
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestVerifyGap:
     """verify_gap confirms or rejects a gap to eliminate false positives."""
@@ -421,8 +385,6 @@ class TestVerifyGap:
             fix="NEW TASK",
         )
         is_genuine = verify_gap(gap=gap, element=elem, manifest_dir=manifest_dir)
-        # The gap was declared uncovered, but TokenService IS in the manifest.
-        # Independent verification must reject this as a false positive.
         assert is_genuine is False
 
     def test_raises_when_manifest_dir_does_not_exist(self, tmp_path: Path) -> None:

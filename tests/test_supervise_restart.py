@@ -69,12 +69,10 @@ class TestBuildResumeArgv:
             restart_config=SuperviseRestartConfig(resume_mode="continue"),
             claude_session_id="abc-123",
         )
-        # continue mode ignores the captured id and uses --continue.
         assert "--continue" in argv
         assert "--resume" not in argv
 
     def test_resume_mode_without_id_falls_back_to_continue(self) -> None:
-        # resume_mode=resume but no captured id: --continue is the only safe relaunch.
         argv = build_resume_argv(
             claude_path="/usr/bin/claude",
             model="claude-opus-4-8",
@@ -85,11 +83,6 @@ class TestBuildResumeArgv:
         )
         assert "--continue" in argv
         assert "--resume" not in argv
-
-
-# ---------------------------------------------------------------------------
-# supervise restart CLI body (Section 4.3)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -136,7 +129,6 @@ class TestSuperviseRestartCli:
         ):
             rc = cli.cmd_supervise("restart", "--name", "nightly")
         assert rc == 0
-        # restart performs a graceful stop first, then a start.
         assert stop_mock.called
         assert start_mock.called
 
@@ -170,9 +162,6 @@ class TestSuperviseRestartCli:
         st.state = SUPERVISE_STATE_RUNNING
         reg.write_state(st)
 
-        # The screen is live, so the graceful drain path runs: stop signals __run
-        # and WAITS for it to reach a terminal. The injected wait stands in for the
-        # in-screen __run supervisor draining + recording the stop (Section 4.2).
         def _fake_wait(*, name, registry, timeout_seconds):
             inner = registry.read_state(name)
             inner.state = SUPERVISE_STATE_STOPPED
@@ -191,7 +180,6 @@ class TestSuperviseRestartCli:
         assert after is not None
         assert after.state == "stopped"
         assert after.exit_reason == "graceful-stop"
-        # The stop.request control file the __run loop polls was written.
         assert supervise_stop_request_path(tmp_path, "nightly").exists()
 
     def test_stop_hard_skips_drain(self, tmp_path) -> None:
@@ -226,7 +214,6 @@ class TestSuperviseRestartCli:
         assert after is not None
         assert after.state == "stopped"
         assert after.exit_reason == "hard-stop"
-        # --hard tears the screen down (and never writes the graceful stop.request).
         assert quit_mock.called
         assert not supervise_stop_request_path(tmp_path, "n").exists()
 
@@ -256,6 +243,5 @@ class TestSuperviseRestartCli:
             patch("devbench.cli._cmd_supervise_start", MagicMock(return_value=0)) as start_mock,
         ):
             rc = cli.cmd_supervise("restart", "--name", "nightly")
-        # A failed stop short-circuits: start must NOT run.
         assert rc == 2
         assert not start_mock.called

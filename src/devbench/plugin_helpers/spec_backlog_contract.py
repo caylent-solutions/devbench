@@ -28,18 +28,8 @@ from __future__ import annotations
 
 import re
 
-# ---------------------------------------------------------------------------
-# Public constant -- the stable machine-locatable AC-N marker
-# ---------------------------------------------------------------------------
-
-#: Stable delimiter that create-spec writes immediately before the AC-N block.
-#: spec-to-backlog uses this constant (not a positional heading number) to
-#: locate the section, making the contract independent of section numbering.
 AC_MARKER: str = "<!-- AC-SECTION-START -->"
 
-# ---------------------------------------------------------------------------
-# Custom exception
-# ---------------------------------------------------------------------------
 
 _REPO_PATTERN: re.Pattern[str] = re.compile(r"^\s*-\s+\*\*Repo:\*\*", re.MULTILINE)
 _BRANCH_PATTERN: re.Pattern[str] = re.compile(r"^\s*-\s+\*\*Branch:\*\*", re.MULTILINE)
@@ -60,11 +50,6 @@ class ReadinessError(ValueError):
     """
 
 
-# ---------------------------------------------------------------------------
-# extract_fr_list
-# ---------------------------------------------------------------------------
-
-
 def extract_fr_list(spec_text: str) -> list[str]:
     """Return every line in *spec_text* that contains a ``FR-N`` identifier.
 
@@ -79,11 +64,6 @@ def extract_fr_list(spec_text: str) -> list[str]:
         order.  Duplicate lines are preserved if they appear multiple times.
     """
     return [m.group(0).strip() for m in _FR_PATTERN.finditer(spec_text)]
-
-
-# ---------------------------------------------------------------------------
-# extract_ac_section
-# ---------------------------------------------------------------------------
 
 
 def extract_ac_section(spec_text: str) -> str:
@@ -112,11 +92,9 @@ def extract_ac_section(spec_text: str) -> str:
     """
     marker_pos = spec_text.find(AC_MARKER)
     if marker_pos != -1:
-        # Start extraction after the marker line itself.
         after_marker = spec_text[marker_pos + len(AC_MARKER) :]
         return _extract_until_next_section(after_marker)
 
-    # Legacy fallback: find "## Section 6"
     section_6_match = _SECTION_6_PATTERN.search(spec_text)
     if section_6_match:
         after_heading = spec_text[section_6_match.start() :]
@@ -138,7 +116,6 @@ def _extract_until_next_section(text: str) -> str:
     """
     lines = text.splitlines(keepends=True)
     collected: list[str] = []
-    # Skip the very first line if it IS a section heading (the anchor itself).
     start = 0
     if lines and _NEXT_SECTION_PATTERN.match(lines[0]):
         start = 1
@@ -148,11 +125,6 @@ def _extract_until_next_section(text: str) -> str:
             break
         collected.append(line)
     return "".join(collected)
-
-
-# ---------------------------------------------------------------------------
-# check_backlog_readiness
-# ---------------------------------------------------------------------------
 
 
 def check_backlog_readiness(spec_text: str, *, is_multi_unit: bool) -> None:
@@ -182,7 +154,6 @@ def check_backlog_readiness(spec_text: str, *, is_multi_unit: bool) -> None:
         ReadinessError: When any required element is absent.  The message
             always names the missing element.
     """
-    # 1 -- FR list
     frs = extract_fr_list(spec_text)
     if not frs:
         raise ReadinessError(
@@ -191,10 +162,8 @@ def check_backlog_readiness(spec_text: str, *, is_multi_unit: bool) -> None:
             "AC section and re-run the readiness check."
         )
 
-    # 2 -- AC-N section (raises ReadinessError itself if absent)
     extract_ac_section(spec_text)
 
-    # 3 -- Repo + branch
     if not _REPO_PATTERN.search(spec_text) or not _BRANCH_PATTERN.search(spec_text):
         raise ReadinessError(
             "ERROR: spec is missing the Target Repository block "
@@ -203,7 +172,6 @@ def check_backlog_readiness(spec_text: str, *, is_multi_unit: bool) -> None:
             "and '- **Branch:** ...' lines and re-run the readiness check."
         )
 
-    # 4 -- Unit inventory (multi-unit only)
     if is_multi_unit and not _INVENTORY_PATTERN.search(spec_text):
         raise ReadinessError(
             "ERROR: multi-unit spec is missing the Unit Inventory section.\n"

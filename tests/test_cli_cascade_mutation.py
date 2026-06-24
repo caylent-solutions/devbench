@@ -23,10 +23,6 @@ import pytest
 
 from devbench import cli
 
-# ---------------------------------------------------------------------------
-# Fixture helpers
-# ---------------------------------------------------------------------------
-
 
 def _build_backlog(
     tmp_path: Path,
@@ -70,11 +66,6 @@ def _patch_backlog(
     )
 
 
-# ---------------------------------------------------------------------------
-# AC-245a-1: depth-desc traversal order
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeDepthDescOrder:
     """cascade_status_mutation traverses depth-desc (T before S before F before E)."""
@@ -115,8 +106,6 @@ class TestCascadeDepthDescOrder:
             rc = cli.cmd_hold("E3", "--cascade", "--reason", "epic paused")
 
         assert rc == 0
-        # Tasks come before story, story before feature, feature before epic
-        # The exact order within the same depth is not prescribed, but the depth must descend.
         assert len(mutated_order) == 5
         task_positions = [mutated_order.index(u) for u in ["E3-F1-S1-T1", "E3-F1-S1-T2"]]
         story_position = mutated_order.index("E3-F1-S1")
@@ -125,11 +114,6 @@ class TestCascadeDepthDescOrder:
         assert max(task_positions) < story_position
         assert story_position < feature_position
         assert feature_position < epic_position
-
-
-# ---------------------------------------------------------------------------
-# AC-245-1: hold cascade -- audit markers and SKIP lines
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -159,11 +143,9 @@ class TestCascadeHold:
         assert rc == 0
         out = capsys.readouterr().out
 
-        # T2 is done -- should be skipped
         assert "SKIP E3-F1-S1-T2:" in out
         assert "not eligible for hold" in out
 
-        # All others should be mutated
         for unit_id in ["E3", "E3-F1", "E3-F1-S1", "E3-F1-S1-T1"]:
             wu_file = tmp_path / "backlog" / f"{unit_id}.md"
             content = wu_file.read_text()
@@ -239,11 +221,6 @@ class TestCascadeHold:
         assert "E99" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# unhold cascade
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeUnhold:
     """unhold --cascade only returns held descendants to in-queue."""
@@ -271,11 +248,9 @@ class TestCascadeUnhold:
         assert rc == 0
         out = capsys.readouterr().out
 
-        # T2 is in-queue, T3 is done -- both should be skipped
         assert "SKIP E3-F1-S1-T2:" in out
         assert "SKIP E3-F1-S1-T3:" in out
 
-        # E3, E3-F1, T1 were held and should be unheld
         for unit_id in ["E3", "E3-F1", "E3-F1-S1-T1"]:
             wu_file = tmp_path / "backlog" / f"{unit_id}.md"
             content = wu_file.read_text()
@@ -318,11 +293,6 @@ class TestCascadeUnhold:
         assert "E99" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# decline cascade
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeDecline:
     """decline --cascade declines eligible descendants."""
@@ -350,12 +320,10 @@ class TestCascadeDecline:
         assert rc == 0
         out = capsys.readouterr().out
 
-        # T2 done, T3 already declined -- both skipped
         assert "SKIP E3-F1-S1-T2:" in out
         assert "not eligible for decline" in out
         assert "SKIP E3-F1-S1-T3:" in out
 
-        # E3, E3-F1, T1 should be declined
         for unit_id in ["E3", "E3-F1", "E3-F1-S1-T1"]:
             wu_file = tmp_path / "backlog" / f"{unit_id}.md"
             content = wu_file.read_text()
@@ -387,11 +355,6 @@ class TestCascadeDecline:
         assert "E99" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# set-status cascade
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeSetStatus:
     """set-status <id> <status> --cascade sets all non-terminal descendants."""
@@ -418,11 +381,9 @@ class TestCascadeSetStatus:
         assert rc == 0
         out = capsys.readouterr().out
 
-        # T2 is done -- skipped
         assert "SKIP E3-F1-S1-T2:" in out
         assert "not eligible for set-status:blocked" in out
 
-        # Others should be blocked
         for unit_id in ["E3", "E3-F1", "E3-F1-S1-T1"]:
             wu_file = tmp_path / "backlog" / f"{unit_id}.md"
             content = wu_file.read_text()
@@ -477,11 +438,6 @@ class TestCascadeSetStatus:
             content = wu_file.read_text()
             assert "[SET-STATUS:blocked]" in content
             assert "[CASCADE_FROM E3]" in content
-
-
-# ---------------------------------------------------------------------------
-# Parametrized: SKIP line shape is verbatim per spec
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -549,11 +505,6 @@ class TestSkipLineShape:
         assert "SKIP E3-F1-S1-T1: done not eligible for set-status:in-queue" in out
 
 
-# ---------------------------------------------------------------------------
-# Parametrized: hold/decline cascade require --reason
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeReasonEnforcement:
     """hold and decline cascade require --reason; unhold and set-status do not."""
@@ -576,11 +527,6 @@ class TestCascadeReasonEnforcement:
         assert rc == 1
         err = capsys.readouterr().err
         assert "reason" in err.lower()
-
-
-# ---------------------------------------------------------------------------
-# _parse_id_and_reason_cascade argument parser coverage
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -629,8 +575,6 @@ class TestParseIdAndReasonCascade:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """Second positional arg after task_id is ignored; task_id is first positional."""
-        # task_id captures first non-flag arg; subsequent positional args are silently ignored.
-        # This tests the branch where task_id is already set (line 2778->2780).
         index = _build_backlog(
             tmp_path,
             rows=[("E3-F1-S1-T1", "Task", "in-queue")],
@@ -638,7 +582,6 @@ class TestParseIdAndReasonCascade:
         p1, p2, p3 = _patch_backlog(tmp_path, index)
         with p1, p2, p3:
             rc = cli.cmd_hold("E3-F1-S1-T1", "extra-ignored", "--reason", "test")
-        # Task E3-F1-S1-T1 is found and held; rc should be 0.
         assert rc == 0
 
     def test_empty_string_arg_skipped_in_parser(
@@ -646,16 +589,9 @@ class TestParseIdAndReasonCascade:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """Empty-string arguments are skipped silently by the parser."""
-        # Pass an empty string as an arg -- the parser skips it and then
-        # returns rc=1 because task_id is missing.
         rc = cli.cmd_hold("", "--reason", "r")
         assert rc == 1
         assert "requires" in capsys.readouterr().err.lower()
-
-
-# ---------------------------------------------------------------------------
-# cascade_status_mutation error path: wu_file not resolvable
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -731,7 +667,6 @@ class TestCascadeMutationFileError:
                 ("E3-F1-S1-T1", "Task", "in-queue"),
             ],
         )
-        # Patch _resolve_unit_file to return None for T1 so the error path fires.
         original_resolve = cli._resolve_unit_file
 
         def patched_resolve(unit: Any) -> Any:

@@ -19,9 +19,6 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent.parent
 HOOKS_JSON = REPO_ROOT / "plugin" / "devbench-orchestrate" / "hooks" / "hooks.json"
 
-# Exact ordered list of guard scripts that must fire on each matcher.
-# Captured pre-split from plugin/devbench/hooks/hooks.json and pinned
-# here as the orchestrate-plugin contract (issue #224 amendment 2).
 EXPECTED_PRE_TOOL_USE: dict[str, list[str]] = {
     "Bash": [
         "hook-logger.sh",
@@ -32,16 +29,6 @@ EXPECTED_PRE_TOOL_USE: dict[str, list[str]] = {
         "guard-destructive-git.sh",
         "guard-review-supervisor-scope.sh",
     ],
-    # "Guard the guards": guard-plugin-write.sh runs BEFORE guard-work-unit-write.sh
-    # on Write/Edit. It hard-denies (exit 2, no role bypass) Write/Edit to the
-    # plugin's own scripts/hooks, the workspace shadow plugin, .claude/settings*
-    # files, and the $BASH_ENV target -- closing the self-modification gap that
-    # let an orchestrator session edit guard-verdict-format.sh.
-    # "Guard the HARNESS": guard-harness-write.sh runs next; it hard-denies
-    # (exit 2, no role bypass) Write/Edit to the devbench package source
-    # (src/devbench/**), its test tree (tests/**), pyproject.toml, the
-    # lockfile, and the Makefile -- closing the gap that let an orchestrate
-    # session self-patch src/devbench/cli.py mid-run.
     "Write": ["guard-plugin-write.sh", "guard-harness-write.sh", "guard-work-unit-write.sh"],
     "Edit": ["guard-plugin-write.sh", "guard-harness-write.sh", "guard-work-unit-write.sh"],
     ".*": ["hook-logger.sh"],

@@ -18,10 +18,6 @@ from devbench.plugin_helpers.workflow_runtime import (
     should_fan_out,
 )
 
-# ---------------------------------------------------------------------------
-# FanOutMode -- enum values
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestFanOutMode:
@@ -32,11 +28,6 @@ class TestFanOutMode:
 
     def test_fallback_mode_value(self) -> None:
         assert FanOutMode.FALLBACK == "fallback"
-
-
-# ---------------------------------------------------------------------------
-# chunk_tasks -- AC-3: chunk size never exceeds configured value
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -87,11 +78,6 @@ class TestChunkTasks:
             assert len(chunk) <= chunk_size, f"chunk {chunk!r} exceeds size {chunk_size}"
 
 
-# ---------------------------------------------------------------------------
-# should_fan_out -- threshold predicate
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestShouldFanOut:
     """should_fan_out returns True when task_count strictly exceeds threshold."""
@@ -108,11 +94,6 @@ class TestShouldFanOut:
     )
     def test_threshold_boundary(self, task_count: int, threshold: int, expected: bool) -> None:
         assert should_fan_out(task_count, threshold) is expected
-
-
-# ---------------------------------------------------------------------------
-# decide_fan_out -- AC-1, AC-2: main decision function
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -150,9 +131,7 @@ class TestDecideFanOut:
             fan_out_threshold=10,
         )
         assert decision.mode is FanOutMode.WORKFLOW
-        # chunk_count = ceil(12 / 4) = 3
         assert len(decision.chunks) == 3
-        # All chunks together cover all 12 indices
         all_items = [item for chunk in decision.chunks for item in chunk]
         assert sorted(all_items) == list(range(12))
 
@@ -198,11 +177,6 @@ class TestDecideFanOut:
             fan_out_threshold=10,
         )
         assert decision.mode is FanOutMode.FALLBACK
-
-
-# ---------------------------------------------------------------------------
-# FanOutDecision -- dataclass contract
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

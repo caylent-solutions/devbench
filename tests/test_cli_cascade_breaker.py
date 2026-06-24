@@ -22,10 +22,6 @@ import pytest
 from devbench import cli
 from devbench.config_loader import BacklogConfig
 
-# ---------------------------------------------------------------------------
-# Fixture helpers
-# ---------------------------------------------------------------------------
-
 
 def _build_backlog(
     tmp_path: Path,
@@ -72,11 +68,6 @@ def _compute_signature(marker_ids: list[str], unsatisfied_dep_ids: list[str]) ->
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
-# ---------------------------------------------------------------------------
-# AC-248b-1: Signature formula
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeSignature:
     """AC-248b-1: The signature is sha256(sorted_markers + '#' + sorted_deps)[:12]."""
@@ -105,11 +96,6 @@ class TestCascadeSignature:
         assert sig_a != sig_b
 
 
-# ---------------------------------------------------------------------------
-# AC-248-2: Circuit breaker behaviour
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCascadeCircuitBreaker:
     """AC-248-2: Past the cap, breaker fires; counter resets on signature change."""
@@ -120,8 +106,6 @@ class TestCascadeCircuitBreaker:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """While count <= cap, the task flips to in-queue as usual."""
-        # T2 blocked with open dep on T1 (not done yet) -- stale cycle scenario
-        # but we'll have it succeed here (dep is done) so it flips normally.
         index = _build_backlog(
             tmp_path,
             rows=[
@@ -157,7 +141,6 @@ class TestCascadeCircuitBreaker:
     ) -> None:
         """When count > cap the breaker writes the verbatim marker + [BLOCKED] and
         adds the task to the escalated array; rc stays 0."""
-        # T1 is in-progress (dep not done) so T2 will never flip -- stale cycle.
         index = _build_backlog(
             tmp_path,
             rows=[
@@ -173,10 +156,8 @@ class TestCascadeCircuitBreaker:
             ],
         )
         backlog_cfg = _make_backlog_config(max_cycles=2)
-        # Pre-seed counter file so the task has already been seen twice (at cap).
         cycles_dir = tmp_path / ".devbench" / "cascade-cycles"
         cycles_dir.mkdir(parents=True)
-        # Compute the signature for T2: no markers, dep T1 unsatisfied.
         sig = _compute_signature([], ["E0-F1-S1-T1"])
         counter_file = cycles_dir / "E0-F1-S1-T2.json"
         counter_file.write_text(
@@ -273,7 +254,6 @@ class TestCascadeCircuitBreaker:
             patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
         ):
             mock_cfg.backlog = backlog_cfg
-            # Run twice.
             capsys.readouterr()
             rc1 = cli.cmd_reconcile_cascade()
             capsys.readouterr()
@@ -291,7 +271,6 @@ class TestCascadeCircuitBreaker:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """When the signature changes (genuine progress), the counter resets to 1."""
-        # Start with T2 blocked on T1 -- dep was "T1", now it's absent.
         index = _build_backlog(
             tmp_path,
             rows=[
@@ -307,10 +286,9 @@ class TestCascadeCircuitBreaker:
             ],
         )
         backlog_cfg = _make_backlog_config(max_cycles=5)
-        # Pre-seed with an OLD signature (different from current state).
         cycles_dir = tmp_path / ".devbench" / "cascade-cycles"
         cycles_dir.mkdir(parents=True)
-        old_sig = "aabbccddeeff"  # 12 chars but not the real signature
+        old_sig = "aabbccddeeff"
         counter_file = cycles_dir / "E0-F1-S1-T2.json"
         counter_file.write_text(
             json.dumps({"signature": old_sig, "count": 4}),
@@ -326,7 +304,6 @@ class TestCascadeCircuitBreaker:
             capsys.readouterr()
             cli.cmd_reconcile_cascade()
         data = json.loads(counter_file.read_text(encoding="utf-8"))
-        # Counter must have reset to 1 because signature changed.
         assert data["count"] == 1
         new_sig = _compute_signature([], ["E0-F1-S1-T1"])
         assert data["signature"] == new_sig
@@ -422,10 +399,8 @@ class TestCascadeCircuitBreaker:
             ],
         )
         backlog_cfg = _make_backlog_config(max_cycles=2)
-        # Seed counter with the signature that includes the open marker.
         cycles_dir = tmp_path / ".devbench" / "cascade-cycles"
         cycles_dir.mkdir(parents=True)
-        # T2 has marker E0-F1-S1-T9 (unresolved -- open) and no dep.
         sig = _compute_signature(["E0-F1-S1-T9"], [])
         counter_file = cycles_dir / "E0-F1-S1-T2.json"
         counter_file.write_text(

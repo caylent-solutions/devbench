@@ -51,7 +51,6 @@ class TestMaterialiseProposalCollision:
     def test_collision_allocates_free_id_and_materialises(self, tmp_path: Path) -> None:
         """The proposed fix unit is created under a free id, not silently skipped."""
         workspace = _build_workspace(tmp_path)
-        # T2 is occupied by an unrelated, already-done unit -- a genuine collision.
         unrelated = _seed_unrelated_unit(workspace, "E0-F1-S1-T2", status="done")
         original_unrelated_body = unrelated.read_text(encoding="utf-8")
 
@@ -64,13 +63,10 @@ class TestMaterialiseProposalCollision:
             repo="caylent-solutions/example",
         )
 
-        # The fix unit MUST be materialised (the bug was that it was dropped).
         assert len(drafts) == 1, "the proposed fix unit must be materialised, not silently skipped"
         created = drafts[0]
-        # It must NOT have overwritten the pre-existing unrelated unit.
         assert created.name != "E0-F1-S1-T2.md", "the colliding unrelated unit must not be overwritten"
         assert unrelated.read_text(encoding="utf-8") == original_unrelated_body
-        # The allocated id is free (next T after the highest existing).
         assert created.name == "E0-F1-S1-T3.md"
 
     def test_collision_repoints_proposal_suggested_id(self, tmp_path: Path) -> None:

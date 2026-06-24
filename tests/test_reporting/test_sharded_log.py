@@ -67,10 +67,9 @@ class TestMigrateFlatToSharded:
         result = migrate_flat_to_sharded(tmp_path, log)
 
         assert result["lines_processed"] == 4
-        assert result["shards_written"] == 2  # T1 in April, T2 in May
-        assert result["meta_shards_written"] == 1  # the Sweep line in May
+        assert result["shards_written"] == 2
+        assert result["meta_shards_written"] == 1
 
-        # Verify shards by reading them back.
         april_t1 = tmp_path / LOGS_DIR_NAME / "2026-04" / "E0-F1-S1-T1.jsonl"
         may_t2 = tmp_path / LOGS_DIR_NAME / "2026-05" / "E0-F1-S1-T2.jsonl"
         may_meta = tmp_path / LOGS_DIR_NAME / "2026-05" / META_SHARD_NAME
@@ -90,7 +89,6 @@ class TestMigrateFlatToSharded:
 
         migrate_flat_to_sharded(tmp_path, log)
 
-        # Source removed; archive present.
         assert not log.exists()
         legacy = tmp_path / LEGACY_DIR_NAME / LEGACY_LOG_NAME
         assert legacy.is_file()
@@ -149,13 +147,8 @@ class TestMigrateFlatToSharded:
 
         migrate_flat_to_sharded(tmp_path, log)
 
-        # Trailing untimestamped line attaches to the previous bucket
-        # because the iterator first appends it as untimestamped, then
-        # gets routed when no further bucket exists.
         shard = tmp_path / LOGS_DIR_NAME / "2026-05" / "E0-F1-S1-T1.jsonl"
         meta = tmp_path / LOGS_DIR_NAME / "2026-05" / META_SHARD_NAME
-        # The tail must show up SOMEWHERE in the sharded tree (both
-        # placements are acceptable for a fail-safe migration).
         all_content = ""
         if shard.exists():
             all_content += shard.read_text()
@@ -197,7 +190,6 @@ class TestMigrateFlatToSharded:
 
         assert result["lines_processed"] == 0
         assert result["shards_written"] == 0
-        # Source still archived (not silently lost).
         legacy = tmp_path / LEGACY_DIR_NAME / LEGACY_LOG_NAME
         assert legacy.is_file()
         assert "no timestamp here" in legacy.read_text()
@@ -206,19 +198,16 @@ class TestMigrateFlatToSharded:
         """Re-running the migration appends new lines into existing
         shards. Operators can periodically re-run to absorb new
         accumulation into the sharded tree."""
-        # First migration.
         log = tmp_path / LOGS_DIR_NAME / "orchestrator.log"
         log.parent.mkdir(parents=True)
         log.write_text("2026-05-01T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
         migrate_flat_to_sharded(tmp_path, log)
 
-        # New flat log accumulates.
         log.write_text("2026-05-15T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'blocked' in both files\n")
         migrate_flat_to_sharded(tmp_path, log)
 
         shard = tmp_path / LOGS_DIR_NAME / "2026-05" / "E0-F1-S1-T1.jsonl"
         content = shard.read_text()
-        # Both transitions present.
         assert "done" in content
         assert "blocked" in content
 
@@ -238,7 +227,6 @@ class TestIterShardPaths:
         migrate_flat_to_sharded(tmp_path, log)
 
         paths = list(iter_shard_paths(tmp_path))
-        # Months sort lexically; April -> May -> June.
         months = [p.parent.name for p in paths]
         assert months == sorted(months)
 
@@ -258,6 +246,5 @@ class TestReadShards:
 
         lines = list(read_shards(tmp_path))
         assert len(lines) == 2
-        # April's shard comes before May's.
         assert "2026-04" in lines[0]
         assert "2026-05" in lines[1]

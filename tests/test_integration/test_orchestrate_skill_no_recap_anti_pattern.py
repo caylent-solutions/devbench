@@ -63,18 +63,13 @@ class TestOrchestrateSkillNoRecapAntiPattern:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # Forbidden pattern explicitly named.
             "recap-prose pattern",
             "FORBIDDEN",
-            # The two valid turn-ends.
             "Every turn MUST end with EITHER (a) a tool call",
             "uv run devbench next",
-            # Explanation of why the bug fires.
             "Claude Code interprets a turn-end-without-tool-call",
             "Stop hook's block decision arrives after the turn has already wound down",
-            # Self-correcting heuristic.
             "delete the recap, and emit the actual tool call instead",
-            # Cross-link to this regression test.
             "test_orchestrate_skill_no_recap_anti_pattern.py",
         ],
     )

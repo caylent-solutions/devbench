@@ -35,10 +35,6 @@ import pytest
 
 from devbench.quota import QuotaExhaustedError, SubscriptionRateLimitError
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _make_quota_exc(reset_at: datetime | None = None) -> SubscriptionRateLimitError:
     """Build a subscription rate-limit error for the quota sentinel."""
@@ -55,11 +51,6 @@ def _quota_detected() -> Any:
 def _capture_info_logs(log_messages: list[str]) -> Any:
     """Return a side_effect that records formatted logger.info messages."""
     return lambda msg, *a, **kw: log_messages.append(msg % a if a else msg)
-
-
-# ---------------------------------------------------------------------------
-# _resolve_max_quota_resumes
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -103,11 +94,6 @@ class TestResolveMaxQuotaResumes:
         assert DEFAULT_MAX_QUOTA_RESUMES >= 100
 
 
-# ---------------------------------------------------------------------------
-# _should_resume_after_quota_recovery
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestShouldResumeAfterQuotaRecovery:
     """Resume decision: True under the cap (with audit), False at the cap (with audit)."""
@@ -129,11 +115,6 @@ class TestShouldResumeAfterQuotaRecovery:
             mock_logger.info.side_effect = _capture_info_logs(logs)
             assert _should_resume_after_quota_recovery(resumes_used=3, max_resumes=3) is False
         assert any("ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED" in m and "max=3" in m for m in logs)
-
-
-# ---------------------------------------------------------------------------
-# _drive_orchestrate_with_quota_resume loop semantics
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -172,7 +153,6 @@ class TestDriveOrchestrateWithQuotaResume:
                     raise _QuotaDetected(_make_quota_exc())
                 if behavior == "drain":
                     raise _DrainRequested("drain-now")
-                # "clean": the session finished normally (implicit return None).
 
             return _coro()
 
@@ -196,7 +176,6 @@ class TestDriveOrchestrateWithQuotaResume:
             return_value="quota-wait-recovered",
         ):
             result = self._drive(run)
-        # Fell through to normal classification after the clean second run.
         assert result.terminal_rc is None
         assert calls["count"] == 2
 
@@ -214,7 +193,6 @@ class TestDriveOrchestrateWithQuotaResume:
     def test_resume_cap_terminates_with_exhausted_audit(self) -> None:
         """AC-2: the resume loop is capped; exceeding it terminates with rc=0, the
         quota-resume-cap-exhausted stop reason, and the exhausted audit line."""
-        # Always recovers -> would loop forever without the cap.
         run, calls = self._make_run(["quota"])
         logs: list[str] = []
         with (
@@ -226,7 +204,6 @@ class TestDriveOrchestrateWithQuotaResume:
             result = self._drive(run)
         assert result.terminal_rc == 0
         assert result.stop_reason == "quota-resume-cap-exhausted"
-        # 2 resumes performed (3 _run invocations) then the cap stops it.
         assert calls["count"] == 3
         assert any("ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED" in m and "max=2" in m for m in logs)
 
@@ -278,11 +255,6 @@ class TestDriveOrchestrateWithQuotaResume:
         ):
             with pytest.raises(QuotaExhaustedError):
                 self._drive(run)
-
-
-# ---------------------------------------------------------------------------
-# End-to-end cmd_start in-process resume (daemon-agnostic)
-# ---------------------------------------------------------------------------
 
 
 def _make_resuming_sdk(session_outcomes: list[str]) -> tuple[types.ModuleType, dict[str, int]]:
@@ -344,7 +316,6 @@ class TestCmdStartInProcessResumeEndToEnd:
             patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.detect_quota_error", side_effect=fake_detect),
-            # Recover instantly (no real wait); covers the wait->resume path.
             patch("devbench.cli._handle_quota_pause", new_callable=AsyncMock, return_value=True),
             patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
         ):

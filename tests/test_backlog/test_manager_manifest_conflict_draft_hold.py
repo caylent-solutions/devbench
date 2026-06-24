@@ -16,10 +16,6 @@ import pytest
 
 from devbench.backlog.manager import BacklogManager
 
-# ---------------------------------------------------------------------------
-# Harness (mirrors _ValidateRuleHarness in test_manager.py)
-# ---------------------------------------------------------------------------
-
 INDEX_HEADER: str = (
     "# Backlog\n\n"
     "## Status Summary\n\n"
@@ -68,11 +64,6 @@ def _make_task(
     return wu
 
 
-# ---------------------------------------------------------------------------
-# Draft-only conflict: warning vs strict-error
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 @pytest.mark.parametrize("task_status", ["draft", "hold"])
 def test_two_draft_or_hold_no_dep_emits_warning(
@@ -91,10 +82,8 @@ def test_two_draft_or_hold_no_dep_emits_warning(
     )
     mgr = BacklogManager()
     errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path)
-    # No errors in default (non-strict) mode
     conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
     assert len(conflict_errors) == 0, f"Unexpected error in default mode: {conflict_errors}"
-    # A warning should be present
     conflict_warnings = [w for w in warnings if "draft/hold conflict" in w and "shared.yaml" in w]
     assert len(conflict_warnings) == 1
     assert "E1-F1-S1-T1" in conflict_warnings[0]
@@ -119,19 +108,12 @@ def test_two_draft_or_hold_no_dep_strict_emits_error(
     )
     mgr = BacklogManager()
     errors, warnings = mgr.validate_with_warnings(tmp_path / "BACKLOG.md", tmp_path, strict=True)
-    # Under strict mode the draft/hold conflict escalates to ERROR
     conflict_errors = [e for e in errors if "draft/hold conflict" in e and "shared.yaml" in e]
     assert len(conflict_errors) == 1
     assert "E1-F1-S1-T1" in conflict_errors[0]
     assert "E1-F1-S1-T2" in conflict_errors[0]
-    # No warning because it was promoted to error
     conflict_warnings = [w for w in warnings if "draft/hold conflict" in w and "shared.yaml" in w]
     assert len(conflict_warnings) == 0
-
-
-# ---------------------------------------------------------------------------
-# In-flight conflict: error path unchanged
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -157,11 +139,6 @@ def test_inflight_conflict_always_error_strict_false(
     assert "E2-F1-S1-T1" in conflict_errors[0]
     assert "E2-F1-S1-T2" in conflict_errors[0]
     assert "docs/backlog-contract.md" in conflict_errors[0]
-
-
-# ---------------------------------------------------------------------------
-# Serial dep present: no finding for draft/hold
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -226,11 +203,6 @@ def test_draft_or_hold_with_serial_dep_strict_no_finding(
     assert len(conflict_warnings) == 0, f"Unexpected warning under strict: {conflict_warnings}"
 
 
-# ---------------------------------------------------------------------------
-# Out-of-scope statuses: never flagged
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 @pytest.mark.parametrize("task_status", ["done", "declined", "in-progress"])
 def test_out_of_scope_statuses_never_flagged(
@@ -255,11 +227,6 @@ def test_out_of_scope_statuses_never_flagged(
     assert len(conflict_warnings) == 0, f"Unexpected warning for {task_status}: {conflict_warnings}"
 
 
-# ---------------------------------------------------------------------------
-# (repo, path) scoping preserved: different repos with same path -> no finding
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_draft_tasks_different_repos_same_path_no_finding(tmp_path: Path, backlog_dir: Path) -> None:
     """Two draft tasks in different repos with same path are not in conflict."""
@@ -278,12 +245,6 @@ def test_draft_tasks_different_repos_same_path_no_finding(tmp_path: Path, backlo
     assert len(conflict_warnings) == 0
 
 
-# ---------------------------------------------------------------------------
-# Verb-aware chain ordering: an ``add``er must precede a ``modify``/``delete``r
-# regardless of lexicographic id order (adds-before-modifies).
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 @pytest.mark.parametrize("edit_verb", ["modify", "delete", "update", "remove"])
 def test_adder_recommended_before_modifier(
@@ -299,9 +260,7 @@ def test_adder_recommended_before_modifier(
     instead recommend the modifier depend on the adder: ``add-dep T1 T2``.
     """
     repo = "ex/foo"
-    # T1 is lexicographically FIRST but only modifies/deletes the file.
     _make_task(backlog_dir, "E6-F1-S1-T1", repo, f"| `shared.yaml` | {edit_verb} |\n", status="in-queue")
-    # T2 is lexicographically LAST but is the one that creates the file.
     _make_task(backlog_dir, "E6-F1-S1-T2", repo, "| `shared.yaml` | add |\n", status="in-queue")
     _make_index(
         tmp_path,
@@ -313,13 +272,10 @@ def test_adder_recommended_before_modifier(
     conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
     assert len(conflict_errors) == 1, f"Expected exactly one conflict error; got: {errors}"
     message = conflict_errors[0]
-    # The recommendation must order the modifier as the dependent of the adder.
     assert "uv run devbench add-dep E6-F1-S1-T1 E6-F1-S1-T2" in message, (
         f"Expected modifier-depends-on-adder recommendation; got:\n{message}"
     )
-    # The wrong (lexicographic) direction must NOT be recommended.
     assert "uv run devbench add-dep E6-F1-S1-T2 E6-F1-S1-T1" not in message
-    # Claim list stays lexicographically ordered regardless of chain order.
     assert "claimed by E6-F1-S1-T1, E6-F1-S1-T2" in message
 
 
@@ -347,7 +303,6 @@ def test_all_modify_falls_back_to_lexicographic(
     conflict_errors = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
     assert len(conflict_errors) == 1, f"Expected exactly one conflict error; got: {errors}"
     message = conflict_errors[0]
-    # Lexicographic fallback: later id depends on earlier id.
     assert "uv run devbench add-dep E7-F1-S1-T2 E7-F1-S1-T1" in message, (
         f"Expected lexicographic fallback recommendation; got:\n{message}"
     )
@@ -382,16 +337,6 @@ def test_two_adders_falls_back_to_lexicographic(
     )
 
 
-# ---------------------------------------------------------------------------
-# G3 (authoring-skills-deterministic-strict-gate AC-4): the verb-aware
-# adds-before-modifies ordering must also hold on the all-draft output under
-# ``--strict`` -- the exact path ``spec-to-backlog`` relies on. The existing
-# verb-aware tests above use ``in-queue`` (the always-error
-# ``_check_manifest_conflicts`` path); these mirror them on the draft/hold
-# strict path (``_check_manifest_conflicts_draft_hold``).
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 @pytest.mark.parametrize("edit_verb", ["modify", "delete", "update", "remove"])
 def test_draft_strict_adder_recommended_before_modifier(
@@ -407,9 +352,7 @@ def test_draft_strict_adder_recommended_before_modifier(
     and the validator's in-queue verb-aware test on the draft/hold strict path.
     """
     repo = "ex/foo"
-    # T1 sorts FIRST but only modifies/deletes the file.
     _make_task(backlog_dir, "E9-F1-S1-T1", repo, f"| `shared.yaml` | {edit_verb} |\n", status="draft")
-    # T2 sorts LAST but is the one that creates the file.
     _make_task(backlog_dir, "E9-F1-S1-T2", repo, "| `shared.yaml` | add |\n", status="draft")
     _make_index(
         tmp_path,
@@ -421,13 +364,10 @@ def test_draft_strict_adder_recommended_before_modifier(
     conflict_errors = [e for e in errors if "draft/hold conflict" in e and "shared.yaml" in e]
     assert len(conflict_errors) == 1, f"Expected exactly one strict draft/hold conflict; got: {errors}"
     message = conflict_errors[0]
-    # The modifier must be wired as the dependent of the adder (adds-before-modifies).
     assert "uv run devbench add-dep E9-F1-S1-T1 E9-F1-S1-T2" in message, (
         f"Expected modifier-depends-on-adder recommendation on the strict draft path; got:\n{message}"
     )
-    # The wrong (lexicographic) direction must NOT be recommended.
     assert "uv run devbench add-dep E9-F1-S1-T2 E9-F1-S1-T1" not in message
-    # Under --strict the finding is an ERROR, not a warning.
     conflict_warnings = [w for w in warnings if "draft/hold conflict" in w and "shared.yaml" in w]
     assert len(conflict_warnings) == 0
 

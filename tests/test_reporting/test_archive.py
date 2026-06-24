@@ -47,7 +47,6 @@ class TestArchiveSession:
         out = archive_session(tmp_path, "session-abc", log)
         assert out == archive_path(tmp_path, "session-abc")
         assert out.is_file()
-        # Parquet files start with the magic bytes "PAR1".
         assert out.read_bytes()[:4] == b"PAR1"
 
     def test_round_trip_preserves_raw_lines(self, tmp_path: Path) -> None:
@@ -86,8 +85,6 @@ class TestArchiveDependencyMissingError:
     structured error pointing at the install command."""
 
     def test_archive_session_raises_when_pyarrow_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Simulate pyarrow not installed by removing it from sys.modules
-        # and blocking re-import.
         log = tmp_path / "log"
         log.write_text('{"event": "x"}\n')
 
@@ -95,7 +92,6 @@ class TestArchiveDependencyMissingError:
             if module_name.startswith("pyarrow"):
                 monkeypatch.delitem(sys.modules, module_name)
 
-        # Inject a meta-path finder that refuses pyarrow imports.
         class _BlockPyarrow:
             def find_spec(self, name: str, path: object | None = None, target: object | None = None) -> object:
                 if name.startswith("pyarrow"):
@@ -111,8 +107,6 @@ class TestArchiveDependencyMissingError:
     def test_read_archived_session_raises_when_pyarrow_missing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Set up: archive a session FIRST while pyarrow is available, then
-        # simulate it being missing for the read.
         log = tmp_path / "log"
         log.write_text('{"event": "x"}\n')
         out = archive_session(tmp_path, "s1", log)

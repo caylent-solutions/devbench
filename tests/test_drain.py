@@ -41,16 +41,7 @@ from devbench.drain import (
     resolve_drain_signal_path,
 )
 
-# ---------------------------------------------------------------------------
-# Module-level sentinel datetime for reuse across tests
-# ---------------------------------------------------------------------------
-
 _NOW = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
-
-
-# ---------------------------------------------------------------------------
-# DRAIN_SIGNAL_NAME constant
-# ---------------------------------------------------------------------------
 
 
 class TestDrainSignalNameConstant:
@@ -63,11 +54,6 @@ class TestDrainSignalNameConstant:
     @pytest.mark.unit
     def test_type_is_str(self) -> None:
         assert isinstance(DRAIN_SIGNAL_NAME, str)
-
-
-# ---------------------------------------------------------------------------
-# DrainState dataclass
-# ---------------------------------------------------------------------------
 
 
 class TestDrainStateConstruction:
@@ -121,11 +107,6 @@ class TestDrainStateConstruction:
         assert "(none)" in text
 
 
-# ---------------------------------------------------------------------------
-# DrainState.to_dict
-# ---------------------------------------------------------------------------
-
-
 class TestDrainStateToDict:
     """to_dict serializes all fields to a JSON-serializable dict."""
 
@@ -138,7 +119,6 @@ class TestDrainStateToDict:
     def test_requested_at_is_iso_string(self) -> None:
         d = DrainState(requested_at=_NOW, requested_by="alice").to_dict()
         assert isinstance(d["requested_at"], str)
-        # Must be parseable back to the same datetime
         parsed = datetime.fromisoformat(d["requested_at"])
         assert parsed == _NOW
 
@@ -156,11 +136,6 @@ class TestDrainStateToDict:
     def test_reason_empty_string_when_default(self) -> None:
         d = DrainState(requested_at=_NOW, requested_by="x").to_dict()
         assert d["reason"] == ""
-
-
-# ---------------------------------------------------------------------------
-# DrainState.from_dict
-# ---------------------------------------------------------------------------
 
 
 class TestDrainStateFromDict:
@@ -202,7 +177,6 @@ class TestDrainStateFromDict:
 
     @pytest.mark.unit
     def test_non_utc_datetime_normalised(self) -> None:
-        # +05:30 is IST; should normalise to UTC
         d = self._make_dict(requested_at="2026-01-15T17:30:00+05:30")
         state = DrainState.from_dict(d)
         assert state.requested_at == datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
@@ -230,11 +204,6 @@ class TestDrainStateFromDict:
         d = self._make_dict(requested_at="not-a-datetime")
         with pytest.raises(ValueError, match="not a valid ISO 8601"):
             DrainState.from_dict(d)
-
-
-# ---------------------------------------------------------------------------
-# request_drain
-# ---------------------------------------------------------------------------
 
 
 class TestRequestDrain:
@@ -326,7 +295,6 @@ class TestRequestDrain:
     @pytest.mark.unit
     def test_exception_during_write_cleans_up_tmp_and_reraises(self, tmp_path: Path) -> None:
         """When the atomic write fails, the tmp file is removed and the exception re-raised."""
-        # Pre-create the parent dir so mkdir doesn't fail
         (tmp_path / ".devbench").mkdir(parents=True, exist_ok=True)
 
         original_write = Path.write_text
@@ -336,7 +304,6 @@ class TestRequestDrain:
         def failing_write(self: Path, *args: Any, **kwargs: Any) -> int:
             nonlocal call_count
             call_count += 1
-            # Only fail the first write_text call (the tmp file write)
             if self.suffix == ".tmp":
                 raise OSError("simulated disk full")
             return original_write(self, *args, **kwargs)
@@ -345,7 +312,6 @@ class TestRequestDrain:
             with pytest.raises(OSError, match="simulated disk full"):
                 request_drain(tmp_path, reason="doomed")
 
-        # The tmp file must not exist after the failed write
         tmp_file = tmp_path / ".devbench" / "drain.tmp"
         assert not tmp_file.exists()
 
@@ -374,11 +340,6 @@ class TestRequestDrain:
                     request_drain(tmp_path, reason="doomed2")
 
 
-# ---------------------------------------------------------------------------
-# cancel_drain
-# ---------------------------------------------------------------------------
-
-
 class TestCancelDrain:
     """cancel_drain deletes the signal file when present, returns False when absent."""
 
@@ -405,11 +366,6 @@ class TestCancelDrain:
         cancel_drain(tmp_path)
         result = cancel_drain(tmp_path)
         assert result is False
-
-
-# ---------------------------------------------------------------------------
-# read_drain_state
-# ---------------------------------------------------------------------------
 
 
 class TestReadDrainState:
@@ -485,11 +441,6 @@ class TestReadDrainState:
             read_drain_state(tmp_path)
 
 
-# ---------------------------------------------------------------------------
-# consume_drain
-# ---------------------------------------------------------------------------
-
-
 class TestConsumeDrain:
     """consume_drain atomically reads and removes the drain signal."""
 
@@ -550,9 +501,7 @@ class TestConsumeDrain:
 
         def racing_unlink(self: Path, missing_ok: bool = False) -> None:
             if self == signal:
-                # Simulate another process deleting the file first
                 original_unlink(self, missing_ok=True)
-                # Now raise FileNotFoundError as if the file was already gone
                 raise FileNotFoundError(f"[Errno 2] No such file or directory: '{self}'")
             return original_unlink(self, missing_ok=missing_ok)
 
@@ -578,11 +527,6 @@ class TestConsumeDrain:
         with patch.object(Path, "unlink", permission_denied_unlink):
             with pytest.raises(PermissionError):
                 consume_drain(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# resolve_drain_signal_path -- per-session path routing (spec 4.4.4, AC-192-7)
-# ---------------------------------------------------------------------------
 
 
 class TestResolveDrainSignalPath:
@@ -653,11 +597,6 @@ class TestResolveDrainSignalPath:
         with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "sess"}, clear=False):
             result = resolve_drain_signal_path(tmp_path)
         assert result.name == "drain.signal"
-
-
-# ---------------------------------------------------------------------------
-# Per-session path routing integration -- public helpers use session path
-# ---------------------------------------------------------------------------
 
 
 class TestPerSessionDrainHelpers:
@@ -735,9 +674,7 @@ class TestPerSessionDrainHelpers:
         that signal (previously it did not, causing drain.signal to stay on
         disk indefinitely and the next start to auto-drain).
         """
-        # Write a drain signal at workspace root (no session env vars)
         request_drain(tmp_path, reason="root-only")
-        # Now read with session env vars -- must find workspace-root signal as fallback
         env = self._session_env(tmp_path, "session-f")
         with patch.dict(os.environ, env, clear=False):
             state = read_drain_state(tmp_path)
@@ -747,9 +684,7 @@ class TestPerSessionDrainHelpers:
     @pytest.mark.unit
     def test_read_drain_state_prefers_session_path_when_both_exist(self, tmp_path: Path) -> None:
         """When both per-session and workspace-root signals exist, session wins (#212)."""
-        # Write workspace-root signal first
         request_drain(tmp_path, reason="root-signal")
-        # Write per-session signal second
         env = self._session_env(tmp_path, "session-pref")
         with patch.dict(os.environ, env, clear=False):
             request_drain(tmp_path, reason="session-signal")
@@ -778,33 +713,27 @@ class TestPerSessionDrainHelpers:
         from a shell do not.  consume_drain must find and remove the
         operator's signal so the drain is acknowledged + cleaned up.
         """
-        # Operator writes signal at workspace root (no session env vars)
         request_drain(tmp_path, reason="root-signal")
         workspace_root_signal = tmp_path / DRAIN_SIGNAL_NAME
         assert workspace_root_signal.exists()
 
-        # Orchestrator consumes with session env active
         env = self._session_env(tmp_path, "session-h")
         with patch.dict(os.environ, env, clear=False):
             state = consume_drain(tmp_path)
 
         assert state is not None
         assert state.reason == "root-signal"
-        # Workspace-root signal must be removed by the consume
         assert not workspace_root_signal.exists()
 
     @pytest.mark.unit
     def test_cancel_drain_clears_both_paths(self, tmp_path: Path) -> None:
         """cancel_drain removes signals from both per-session and workspace-root paths (#212)."""
-        # Write workspace-root signal
         request_drain(tmp_path, reason="root-signal")
-        # Write per-session signal
         env = self._session_env(tmp_path, "session-clear-both")
         with patch.dict(os.environ, env, clear=False):
             request_drain(tmp_path, reason="session-signal")
             result = cancel_drain(tmp_path)
         assert result is True
-        # Both paths must be cleared
         assert not (tmp_path / DRAIN_SIGNAL_NAME).exists()
         session_signal = tmp_path / ".devbench" / "sessions" / "session-clear-both" / "drain.signal"
         assert not session_signal.exists()
@@ -823,16 +752,13 @@ class TestPerSessionDrainHelpers:
         env_s1 = self._session_env(tmp_path, "session-s1")
         env_s2 = self._session_env(tmp_path, "session-s2")
 
-        # Write to session-s1
         with patch.dict(os.environ, env_s1, clear=False):
             request_drain(tmp_path, reason="s1-drain")
 
-        # Session s2 must not see session s1's drain signal
         with patch.dict(os.environ, env_s2, clear=False):
             state_s2 = read_drain_state(tmp_path)
         assert state_s2 is None
 
-        # Session s1 still has its signal
         with patch.dict(os.environ, env_s1, clear=False):
             state_s1 = read_drain_state(tmp_path)
         assert state_s1 is not None
@@ -854,11 +780,6 @@ class TestPerSessionDrainHelpers:
         with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": session_name}, clear=False):
             result = resolve_drain_signal_path(tmp_path)
         assert result == tmp_path / ".devbench" / "sessions" / session_name / "drain.signal"
-
-
-# ---------------------------------------------------------------------------
-# DRY: drain.py imports SESSION_DRAIN_SIGNAL_FILENAME from constants.py
-# ---------------------------------------------------------------------------
 
 
 class TestDrainSessionDrainSignalFilenameConstant:

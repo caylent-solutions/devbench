@@ -23,9 +23,6 @@ from devbench.config_loader import RepoConfig, RuntimeConfig
 
 pytestmark = pytest.mark.unit
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 
 _KNOWN_REPO = "caylent-solutions/devbench"
 _UNKNOWN_REPO = "unknown-org/mystery-repo"
@@ -97,11 +94,6 @@ def _run_validate(tmp_path: Path, rt_cfg: RuntimeConfig) -> list[str]:
     idx = tmp_path / "BACKLOG.md"
     with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
         return BacklogManager().validate(idx, tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# C1 check: target repo resolves
-# ---------------------------------------------------------------------------
 
 
 class TestCheckTargetRepoResolves:
@@ -189,17 +181,10 @@ class TestCheckTargetRepoResolves:
         )
         rt_cfg = _make_runtime_config(_KNOWN_REPO)
         errors = _run_validate(tmp_path, rt_cfg)
-        # C1 fires
         c1_errors = [e for e in errors if "target repo" in e.lower() and "not recognised" in e.lower()]
         assert len(c1_errors) >= 1
-        # Manifest-prefix check (11) does NOT fire -- unknown repo is skipped there
         prefix_errors = [e for e in errors if "checkout_directory prefix" in e]
         assert prefix_errors == []
-
-
-# ---------------------------------------------------------------------------
-# C3: manifest multi-repo prefix resolves
-# ---------------------------------------------------------------------------
 
 
 class TestCheckManifestMultiRepoPrefixes:
@@ -268,17 +253,11 @@ class TestCheckManifestMultiRepoPrefixes:
         assert c3_errors == [], f"Unexpected C3 errors: {c3_errors}"
 
 
-# ---------------------------------------------------------------------------
-# C4: dep id resolves to an existing WU file on disk
-# ---------------------------------------------------------------------------
-
-
 class TestCheckDepFileExists:
     """C4: every dep ID in ## Dependencies must have a real WU file on disk."""
 
     def test_dep_with_no_file_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
         """A dep ID whose WU file does not exist on disk emits a C4 error."""
-        # T1 depends on T2, but T2 has no file on disk (only in index)
         _make_task(
             backlog_dir,
             "E1-F1-S1-T1",
@@ -325,11 +304,6 @@ class TestCheckDepFileExists:
         assert c4_errors == [], f"Unexpected C4 errors: {c4_errors}"
 
 
-# ---------------------------------------------------------------------------
-# C5: self-dep not duplicated (AC-240a-1)
-# ---------------------------------------------------------------------------
-
-
 class TestC5SelfDepNotDuplicated:
     """C5 self-dep is already covered by existing check 4; C1-C4/C6/C7 do not duplicate it."""
 
@@ -347,14 +321,8 @@ class TestC5SelfDepNotDuplicated:
         )
         rt_cfg = _make_runtime_config(_KNOWN_REPO)
         errors = _run_validate(tmp_path, rt_cfg)
-        # C4 must NOT emit a duplicate about E1-F1-S1-T1's own file not existing
         c4_dup_errors = [e for e in errors if "E1-F1-S1-T1" in e and "no work-unit file" in e and "E1-F1-S1-T1" in e]
         assert c4_dup_errors == [], f"C4 duplicated self-dep error: {c4_dup_errors}"
-
-
-# ---------------------------------------------------------------------------
-# C6: WU title matches BACKLOG.md index title
-# ---------------------------------------------------------------------------
 
 
 class TestCheckTitleMatchesIndex:
@@ -362,7 +330,6 @@ class TestCheckTitleMatchesIndex:
 
     def test_title_mismatch_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
         """A title in the WU file different from the index row emits a C6 error."""
-        # WU title: "Real Task Title", index title: "Wrong Index Title"
         _make_task(backlog_dir, "E1-F1-S1-T1", title="Real Task Title")
         _make_index(
             tmp_path,
@@ -416,24 +383,15 @@ class TestCheckTitleMatchesIndex:
         )
 
 
-# ---------------------------------------------------------------------------
-# C7: path canonical shape
-# ---------------------------------------------------------------------------
-
-
 class TestCheckCanonicalPathShape:
     """C7: the file path in the BACKLOG.md index must match the canonical shape for the unit type."""
 
     @pytest.mark.parametrize(
         "unit_id,unit_type,bad_path",
         [
-            # Task ID but path ends with story-shaped filename
             ("E1-F1-S1-T1", "Task", "backlog/E1-F1-S1.md"),
-            # Feature ID but path has task-shaped basename
             ("E1-F1", "Feature", "backlog/E1-F1-S1-T1.md"),
-            # Story ID but wrong basename
             ("E1-F1-S1", "Story", "backlog/E1-F1.md"),
-            # Epic ID but wrong basename
             ("E1", "Epic", "backlog/E1-F1.md"),
         ],
     )
@@ -446,7 +404,6 @@ class TestCheckCanonicalPathShape:
         bad_path: str,
     ) -> None:
         """A file path whose basename does not match the unit ID emits a C7 error."""
-        # Write the WU file AT the bad path location
         bad_wu = tmp_path / bad_path
         bad_wu.parent.mkdir(parents=True, exist_ok=True)
         bad_wu.write_text(
@@ -473,12 +430,10 @@ class TestCheckCanonicalPathShape:
     @pytest.mark.parametrize(
         "unit_id,unit_type,good_path",
         [
-            # Flat paths (used in tests)
             ("E1-F1-S1-T1", "Task", "backlog/E1-F1-S1-T1.md"),
             ("E1-F1-S1", "Story", "backlog/E1-F1-S1.md"),
             ("E1-F1", "Feature", "backlog/E1-F1.md"),
             ("E1", "Epic", "backlog/E1.md"),
-            # Nested paths (used in real backlog)
             (
                 "E1-F1-S1-T1",
                 "Task",
@@ -517,11 +472,6 @@ class TestCheckCanonicalPathShape:
         errors = _run_validate(tmp_path, rt_cfg)
         c7_errors = [e for e in errors if unit_id in e and "canonical" in e.lower()]
         assert c7_errors == [], f"Unexpected C7 errors for {unit_id} at {good_path!r}: {c7_errors}"
-
-
-# ---------------------------------------------------------------------------
-# Clean-backlog zero-false-positives
-# ---------------------------------------------------------------------------
 
 
 class TestCleanBacklogNoFalsePositives:

@@ -128,11 +128,9 @@ _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD: int = 10
 _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
 _BACKLOG_DEFAULT_CASCADE_REQUEUE_MAX_CYCLES: int = 3
 
-# Skills plugin configuration defaults (issue #221 E1-E10).
 _SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
 _SKILLS_DEFAULT_MAX_ITERATIONS: int = 5
 
-# Quota handling defaults (issue #236, Appendix A QW-6, D-Q-1).
 _QUOTA_HANDLING_VALID_ON_EXHAUSTION: frozenset[str] = frozenset({"wait", "fail", "drain"})
 _QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT: frozenset[str] = frozenset({"drain", "fail", "keep_waiting"})
 _QUOTA_HANDLING_VALID_RESUME_STRATEGY: frozenset[str] = frozenset(
@@ -142,35 +140,19 @@ _QUOTA_HANDLING_POLL_INTERVAL_MIN: int = 30
 _QUOTA_HANDLING_POLL_INTERVAL_MAX: int = 3600
 _QUOTA_HANDLING_MAX_WAIT_MIN: int = 1
 
-# Supervise (devbench-supervise-screen-orchestrator). Every timeout and the
-# restart-attempt count must be >= 1 (Section 5.2). Effort + resume-mode enums
-# and the always-deny env set come from constants. A config attempting to
-# whitelist an always-deny env var via negation (``!ANTHROPIC_API_KEY``) is a
-# fail-fast error (Section 3.6.1, FR-21).
 _SUPERVISE_MIN_TIMEOUT_SECONDS: int = 1
 _SUPERVISE_MIN_RESTART_ATTEMPTS: int = 1
 _SUPERVISE_DENY_NEGATION_PREFIX: str = "!"
 
-# Harness self-edit integrity check (trust-gap fix). When ``devbench start``
-# launches the orchestrator it can warn (or fail fast) if there are uncommitted
-# edits under the devbench package source -- catching drift from any prior
-# self-edit or manual change before a run begins. Default "warn".
 _ORCHESTRATE_VALID_HARNESS_INTEGRITY_CHECK: frozenset[str] = frozenset({"off", "warn", "fail"})
 _ORCHESTRATE_DEFAULT_HARNESS_INTEGRITY_CHECK: str = "warn"
 
-# ---------------------------------------------------------------------------
-# Audit-row string constants for auto_finalize / auto_merge skill steps.
-# Pinned here so SKILL.md prose and tests reference the same literals.
-# ---------------------------------------------------------------------------
 AUTO_FINALIZE_SKIPPED_LOCAL_ONLY: str = "[AUTO_FINALIZE_SKIPPED] local_only=true"
 AUTO_MERGE_SKIPPED_NO_CI_WATCHER: str = "[AUTO_MERGE_SKIPPED] no_ci_watcher"
 BATCH_PR_CREATED_AUDIT_PREFIX: str = "[BATCH_PR_CREATED]"
 BATCH_PR_MERGED_AUDIT_PREFIX: str = "[BATCH_PR_MERGED]"
 
 
-# Judge names that may appear in ``max_executor_retries_per_judge``: the
-# always-on core 5 plus the optional specialty judges (which still have a
-# retry budget when enabled).
 _PER_JUDGE_RETRY_ALLOWED: frozenset[str] = ALL_REQUIRED_JUDGE_NAMES | OPTIONAL_JUDGE_NAMES
 
 
@@ -269,10 +251,8 @@ def _load_done_gate(raw_value: object) -> DoneGateConfig:
     return DoneGateConfig(allow_deferred_evidence=allow)
 
 
-# Relative path from WORKSPACE_ROOT to the default config file location.
 DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
 
-# Load the JSON Schema once at module import time.
 _SCHEMA_PATH: Path = Path(__file__).parent / "config-schema.json"
 with _SCHEMA_PATH.open(encoding="utf-8") as _f:
     _SCHEMA: dict = json.load(_f)
@@ -1013,7 +993,7 @@ class SuperviseEnvConfig:
     ``SUPERVISE_ALWAYS_DENY_ENV_VARS``).
     """
 
-    deny_vars: tuple[str, ...] = SUPERVISE_ALWAYS_DENY_ENV_VARS  # overwritten by parser default
+    deny_vars: tuple[str, ...] = SUPERVISE_ALWAYS_DENY_ENV_VARS
 
 
 @dataclass(frozen=True)
@@ -1490,9 +1470,6 @@ def _parse_supervise_config(path: Path, raw: dict) -> SuperviseConfig:
 
     env_raw = raw.get("env") or {}
     deny_vars = tuple(env_raw.get("deny_vars", ()))
-    # FR-21 / Section 3.6.1: the always-deny set is non-removable. A config that
-    # tries to whitelist one (by negation, e.g. "!ANTHROPIC_API_KEY") is a
-    # fail-fast config error.
     for var in deny_vars:
         if var.startswith(_SUPERVISE_DENY_NEGATION_PREFIX):
             target = var[len(_SUPERVISE_DENY_NEGATION_PREFIX) :]
@@ -1649,11 +1626,6 @@ def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
     )
 
 
-# ---------------------------------------------------------------------------
-# Notifications (Slack + generic webhook) -- spec / PR #202
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class NotificationsSlackConfig:
     """Slack endpoint for the notifications dispatcher.
@@ -1694,23 +1666,15 @@ class NotificationsEventsConfig:
     work_unit_blocked_auto_clearing: bool = False
     work_unit_blocked_awaiting_dependency: bool = False
     work_unit_blocked_amendment_recovery: bool = False
-    # Operator-block Slack-gap spec G4 / AC-4: transient SIGTERM-interrupt
-    # bucket (auto-requeued next sweep).  Default OFF -- opt-in only.
     work_unit_blocked_interrupted_on_stop: bool = False
     work_unit_materialised: bool = False
     work_unit_promoted: bool = False
     pr_opened: bool = False
     pr_merged: bool = False
     ci_failure: bool = False
-    # Issue #219: fires on CIResult.GREEN inside the finalize path so
-    # operators running ``git_ops.auto_merge: false`` get an explicit
-    # "PR ready for manual merge" Slack signal.  Default ``False`` --
-    # existing workspaces stay silent on upgrade.
     ci_pass: bool = False
     orchestrator_stop: bool = False
     orchestrator_auto_restart: bool = False
-    # Quota wait-and-resume lifecycle (operator request).  Default OFF (opt-in)
-    # like every other event, so existing workspaces stay silent on upgrade.
     quota_waiting: bool = False
     quota_resumed: bool = False
 
@@ -2190,7 +2154,6 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> tuple[R
     default_branch: str | None = repo_data.get("default_branch")
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
     local_only_raw = repo_data.get("local_only")
-    # None means "not set in YAML"; bool means explicitly set.
     per_repo_local_only: bool | None = bool(local_only_raw) if local_only_raw is not None else None
 
     raw_checkout = repo_data.get("checkout_directory")
@@ -2278,7 +2241,6 @@ def _parse_repos(
                     f"which is not in allowed_orgs: {allowed_orgs}."
                 )
         cfg, per_repo_local_only = _parse_repo_config(path, repo_name, repo_data)
-        # Effective local_only: per-repo when explicitly set, else top-level fallback.
         cfg.local_only = per_repo_local_only if per_repo_local_only is not None else top_level_local_only
         cfg.validated_repo = repo_name
         if workspace_root is not None:
@@ -2388,7 +2350,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config file '{path}' must be a YAML mapping at the top level, got {type(raw).__name__}.")
 
-    # JSON Schema validation -- catches unknown keys, type errors, and enum violations.
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
@@ -2397,7 +2358,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
     workspace_root_raw = _env.get("DEVBENCH_WORKSPACE_ROOT", "")
     workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
-    # Extract git_ops.local_only early so _parse_repos can apply the top-level fallback.
     _git_ops_raw_for_repos = raw.get("git_ops") or {}
     top_level_local_only = bool(_git_ops_raw_for_repos.get("local_only", False))
     repos = _parse_repos(
@@ -2408,7 +2368,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         top_level_local_only=top_level_local_only,
     )
 
-    # Populate TimeoutConfig from YAML timeouts block (absent keys yield None).
     timeouts_raw = raw.get("timeouts") or {}
     timeouts = TimeoutConfig(
         gh_api=timeouts_raw.get("gh_api"),
@@ -2421,7 +2380,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         orchestrator_inactivity_timeout=timeouts_raw.get("orchestrator_inactivity_timeout"),
     )
 
-    # Populate LimitConfig from YAML limits block (absent keys yield None).
     limits_raw = raw.get("limits") or {}
     limits = LimitConfig(
         alert_summary=limits_raw.get("alert_summary"),
@@ -2432,7 +2390,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ci_failure_log_bytes=limits_raw.get("ci_failure_log_bytes"),
     )
 
-    # Populate GitOpsConfig from YAML git_ops block (absent keys yield defaults).
     git_ops_raw = raw.get("git_ops") or {}
     single_branch_raw = git_ops_raw.get("single_branch") or None
     defer_pr = bool(git_ops_raw.get("defer_pr", False))
@@ -2487,8 +2444,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         auto_finalize=auto_finalize,
         auto_merge=auto_merge,
     )
-    # Every local_only repo (effective value) must have an explicit default_branch;
-    # there is no origin/HEAD to fall back to in local-only mode.
     missing_default_branch = [
         repo_name for repo_name, repo_cfg in repos.items() if repo_cfg.local_only and not repo_cfg.default_branch
     ]
@@ -2500,7 +2455,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "back to in local-only mode."
         )
 
-    # Populate DebugConfig from YAML debug block (absent keys yield None).
     debug_raw = raw.get("debug") or {}
     debug = DebugConfig(
         check_registration_retries=debug_raw.get("check_registration_retries"),
@@ -2508,10 +2462,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         blocked_recovery_window_seconds=debug_raw.get("blocked_recovery_window_seconds"),
     )
 
-    # Populate ReportConfig from YAML report block.  Issue #223: per-model
-    # pricing replaces the legacy scalar token_cost_per_million_* +
-    # token_cost_discount fields.  Operators with the old keys get a
-    # fail-fast error pointing at the new ``report.models`` block.
     report_raw = raw.get("report") or {}
     legacy_report_keys = {
         "token_cost_per_million_input",
@@ -2554,7 +2504,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
     )
 
-    # Populate ManifestAmendment config from YAML manifest_amendment block.
     amendment_raw = raw.get("manifest_amendment") or {}
     default_amendment = AmendmentConfig()
     manifest_amendment = AmendmentConfig(
@@ -2581,10 +2530,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate TaskFactory config from YAML task_factory block. Requires
-    # manifest_amendment.enabled when task_factory.enabled is true -- the
-    # loop runs after an amendment reject, so it has nothing to do when the
-    # amendment workflow itself is off.
     task_factory_raw = raw.get("task_factory") or {}
     default_task_factory = TaskFactoryConfig()
     task_factory = TaskFactoryConfig(
@@ -2599,13 +2544,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
         )
 
-    # Populate AgentModelsConfig from YAML agents block (ADR-25). Cross-
-    # validates each non-None value against the top-level use_bedrock flag so
-    # an inconsistent config fails at load time, not at first invocation.
     agent_models = _parse_agent_models_config(path, raw.get("agents"), bool(raw.get("use_bedrock", False)))
 
-    # Populate ValidateConfig from YAML validate block. All toggles default
-    # to False so existing backlogs see no behaviour change.
     validate_raw = raw.get("validate") or {}
     default_validate = ValidateConfig()
     validate_cfg = ValidateConfig(
@@ -2614,7 +2554,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
     stop_hook = StopHookConfig(
         max_blocks=int(
@@ -2628,10 +2567,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate HookTailConfig from YAML hook_tail block (issue #134).
-    # JSONSchema enforces minimum:1 + additionalProperties:false at parse
-    # time; absent fields stay None so config.py applies the env > default
-    # fallback chain.
     hook_tail_raw = raw.get("hook_tail") or {}
     hook_tail = HookTailConfig(
         agent_width=(int(hook_tail_raw["agent_width"]) if "agent_width" in hook_tail_raw else None),
@@ -2642,45 +2577,23 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate OrchestrateConfig from YAML orchestrate block (issue #144).
-    # Schema enforces minimum:1; absent field stays None so config.py
-    # applies the env > default fallback chain.
     orchestrate = _parse_orchestrate_config(path, raw.get("orchestrate") or {}, bool(raw.get("use_bedrock", False)))
 
-    # Populate BacklogConfig from YAML backlog block (issue #189).
-    # Schema enforces enum on default_status_for_new_work_units and
-    # additionalProperties: false. We re-validate at runtime so that
-    # _parse_backlog_config can emit a clear, actionable error message
-    # that names both the invalid value and the allowed values.
     backlog_raw = raw.get("backlog") or {}
     backlog = _parse_backlog_config(path, backlog_raw)
 
-    # Populate SkillsConfig from YAML skills block (issue #221 E1-E10).
-    # JSON Schema validates types + minimums; _parse_skills_config
-    # re-validates at runtime to emit clearer messages naming the field.
     skills_raw = raw.get("skills") or {}
     skills = _parse_skills_config(path, skills_raw)
 
-    # Populate NotificationsConfig from YAML notifications block (PR #202).
-    # JSON Schema validation already enforces shape; _parse_notifications_config
-    # applies value-level checks (URL scheme, Slack user-id pattern).
     notifications_raw = raw.get("notifications") or {}
     notifications = _parse_notifications_config(notifications_raw)
 
-    # Populate QuotaHandlingConfig from YAML quota_handling block (issue #236).
-    # Runtime re-validation catches enum/range violations with clear messages.
     quota_handling_raw = raw.get("quota_handling") or {}
     quota_handling = _parse_quota_handling_config(path, quota_handling_raw)
 
-    # Populate SuperviseConfig from YAML supervise block
-    # (devbench-supervise-screen-orchestrator, Section 5.1). The schema enforces
-    # enums/bounds/unknown-key rejection; the parser re-validates with clear
-    # messages and fail-fast rejects always-deny env whitelist attempts (FR-21).
     supervise_raw = raw.get("supervise") or {}
     supervise = _parse_supervise_config(path, supervise_raw)
 
-    # Populate AutoResolveConfig from YAML auto_resolve block (issue #263, E11-F1-S1).
-    # Schema enforces correct types; absent fields yield the unset-safe defaults.
     auto_resolve_raw = raw.get("auto_resolve") or {}
     default_auto_resolve = AutoResolveConfig()
     auto_resolve = AutoResolveConfig(
@@ -2688,9 +2601,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         max_attempts=int(auto_resolve_raw.get("max_attempts", default_auto_resolve.max_attempts)),
     )
 
-    # Populate the optional-judge enablement map + done-gate settings. Both
-    # are optional with defaults so existing configs validate unchanged: every
-    # optional judge defaults to disabled and deferred evidence blocks done.
     optional_judges = _load_optional_judges(raw.get("optional_judges"))
     done_gate = _load_done_gate(raw.get("done_gate"))
 

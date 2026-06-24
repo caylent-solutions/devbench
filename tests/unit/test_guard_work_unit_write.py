@@ -19,7 +19,6 @@ def _run_hook(
     extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
     env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if extra_env:
         env.update(extra_env)
@@ -52,14 +51,10 @@ def _make_edit_payload(file_path: str) -> dict:
 class TestGuardWorkUnitWriteHook:
     """Tests for guard-work-unit-write.sh PreToolUse hook."""
 
-    # ------------------------------------------------------------------ AC-1
-
     def test_script_exists_and_is_executable(self) -> None:
         """AC-1: The script must exist and be executable."""
         assert SCRIPT_PATH.exists(), f"Script not found at {SCRIPT_PATH}"
         assert os.access(SCRIPT_PATH, os.X_OK), f"Script is not executable: {SCRIPT_PATH}"
-
-    # ------------------------------------------------------------------ AC-2: blocks work unit .md writes
 
     @pytest.mark.parametrize(
         "file_path",
@@ -106,8 +101,6 @@ class TestGuardWorkUnitWriteHook:
         assert any(word in stderr_lower for word in ["backlog", "work unit", "orchestrate", "blocked"]), (
             f"Error message not actionable: {result.stderr}"
         )
-
-    # ------------------------------------------------------------------ AC-3: non-backlog paths are allowed
 
     @pytest.mark.parametrize(
         "file_path",
@@ -209,8 +202,6 @@ class TestGuardWorkUnitWriteContentValidation:
                 "content": content,
             },
         }
-        # This should still exit 2 due to the path-based block (work unit .md),
-        # but the content checks must NOT fire before the path block.
         result = _run_hook(payload)
         assert result.returncode == 2
         assert "rule 10" not in result.stderr
@@ -312,7 +303,6 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
                 "content": content,
             },
         }
-        # Also strip legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE per AC-197-9.
         _stripped = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_AGENT_ROLE"}
         env = {k: v for k, v in os.environ.items() if k not in _stripped}
         result = subprocess.run(

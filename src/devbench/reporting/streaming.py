@@ -44,13 +44,8 @@ from devbench.config import (
     REPORT_STREAM_TAIL_BYTES,
 )
 
-# Polling cadence between cache-stat checks (seconds). 100 ms gives
-# human-perceptible immediate updates without burning CPU on workspace
-# stat churn. Issue #163 explicitly bounds this at ~100 ms; do not
-# tune lower without revisiting the CPU-utilisation budget.
 _POLL_INTERVAL_SECONDS: float = 0.1
 
-# Number of warm-tick durations the running-average tracks.
 _WARM_HISTORY_SIZE: int = 8
 
 
@@ -139,10 +134,6 @@ class _LatencyTracker:
     def record(self, duration: float, *, cold: bool) -> None:
         """Push a new render duration into the tracker."""
         if cold:
-            # Capture cold once. Refusing to overwrite means a long-
-            # running session keeps the original cold value as a
-            # historical anchor; subsequent cache rebuilds don't get
-            # mistaken for cold ticks.
             if self.cold is None:
                 self.cold = duration
         else:
@@ -205,8 +196,6 @@ def _stdin_keypress_pending() -> bool:
     try:
         ready, _, _ = select.select([sys.stdin], [], [], 0)
     except (ValueError, OSError):
-        # Closed stdin or otherwise-broken descriptor -- treat as
-        # "no keypress pending" so the loop sleeps and retries.
         return False
     return bool(ready)
 
@@ -232,10 +221,6 @@ def _clear_and_write(text: str) -> None:
     forking a subprocess between clear and write reintroduces the
     blank-screen race the buffered-write contract is preventing.
     """
-    # VT100 full reset: clears the screen, scrollback (on most modern
-    # terminals), cursor position, attributes. Selected over the
-    # narrower ``\033[2J\033[H`` because it also wipes scrollback so
-    # the operator's history doesn't accumulate stale frames.
     clear_seq = "\033c"
     sys.stdout.write(clear_seq + text)
     sys.stdout.flush()
@@ -285,52 +270,27 @@ def stream_report(
     Per CLAUDE.md fail-fast: any other exception propagates -- the
     loop does NOT silently swallow render failures.
     """
-    # Resolve bounds at call time so env/config overrides are honoured
-    # without freezing the values into the function default at import.
     budget = REPORT_STREAM_RENDER_BUDGET_SECONDS if render_budget_seconds is None else render_budget_seconds
     max_interval = REPORT_STREAM_MAX_POLL_INTERVAL if max_poll_interval is None else max_poll_interval
 
     tracker = _LatencyTracker()
-    # Secondary sources (hook log + transcripts) keep cheap stat-based
-    # change detection. The orchestrator log -- the largest, fastest-
-    # growing source -- is tracked by an incremental bounded tail read
-    # below so a tick never pulls the whole growing file into memory.
     secondary_paths: list[Path] = []
     if hook_log_path is not None:
         secondary_paths.append(hook_log_path)
     if transcript_dir is not None:
-        # Stat the transcript directory itself; mtime advances when
-        # any contained file changes, which is exactly the signal
-        # the renderer cares about without having to enumerate
-        # children every tick.
         secondary_paths.append(transcript_dir)
 
     last_key: tuple[int, tuple[tuple[float, int], ...]] | None = None
-    # Byte offset into the orchestrator log. Advanced by bounded tail
-    # reads (TDI-005 requirement ii): each tick reads only the bytes
-    # appended since this offset, capped at REPORT_STREAM_TAIL_BYTES,
-    # so RSS stays bounded even under a large append burst.
     log_offset = 0
-    # Next poll interval; starts at the base cadence and is recomputed by
-    # adaptive backoff after every render so a slow render lengthens the
-    # following sleep.
     next_interval = poll_interval
     try:
         while True:
-            # Incremental, bounded read of the orchestrator log: the new
-            # offset is the change signal for the log, and the read never
-            # re-scans bytes before ``log_offset`` nor exceeds the tail cap.
             _, log_offset = _read_log_tail(log_path, log_offset, max_bytes=REPORT_STREAM_TAIL_BYTES)
             current_key = (log_offset, _stat_sources(secondary_paths))
             if current_key != last_key:
-                # Capture the new frame BEFORE clearing the screen
-                # (no-blank-screen contract).
                 start = time.perf_counter()
                 output = render_fn(log_path=log_path)
                 duration = time.perf_counter() - start
-                # Fail-fast budget: a render that has grown past the
-                # ceiling is the CPU-spin / RSS-growth symptom TDI-005
-                # describes. Stop rather than re-render it forever.
                 if duration > budget:
                     raise StreamRenderBudgetExceededError(
                         f"streaming render took {duration:.1f}s, exceeding the "
@@ -338,12 +298,9 @@ def stream_report(
                         f"DEVBENCH_REPORT_STREAM_RENDER_BUDGET_SECONDS or investigate the slow render"
                     )
                 tracker.record(duration, cold=last_key is None)
-                # Clear + write in ONE buffered call.
                 frame = output + "\n" + tracker.footer() + "\n"
                 _clear_and_write(frame)
                 last_key = current_key
-                # Back off the next poll so a fast-growing log can't pin a
-                # core at the fixed base cadence.
                 next_interval = _backoff_interval(
                     render_duration=duration,
                     base_interval=poll_interval,
@@ -353,8 +310,6 @@ def stream_report(
                 break
             time.sleep(next_interval)
     except KeyboardInterrupt:
-        # Newline so the next shell prompt doesn't land on the
-        # latency-footer line.
         sys.stdout.write("\n")
         sys.stdout.flush()
         return 0

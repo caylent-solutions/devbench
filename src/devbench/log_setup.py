@@ -77,10 +77,6 @@ def _resolve_log_file() -> Path:
         if workspace:
             return Path(workspace) / configured_path
         return configured_path
-    # Unset default: the shared, workspace-local aggregate log. Per-session
-    # isolation is provided additionally by the session FileHandler below
-    # (attached when DEVBENCH_SESSION_NAME is set); cli._resolve_log_file_path
-    # mirrors this default exactly.
     if workspace:
         return Path(workspace) / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
     return Path(_DEFAULT_LOG_FILE)
@@ -144,36 +140,25 @@ def setup_logging(level: int | None = None) -> Path:
     log_file = _resolve_log_file()
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resolve per-session log path before touching any handlers so a
-    # RuntimeError here aborts the setup cleanly (no partial handler state).
     session_log_file = _resolve_session_log_file()
 
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
 
-    # Clear any existing handlers (prevents duplicates on re-import)
     root_logger.handlers.clear()
 
     formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-    # Stderr handler -- real-time visibility in Claude Code terminal without
-    # polluting stdout for commands that emit data (report, get-diff, status).
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setLevel(level)
     stderr_handler.setFormatter(formatter)
     root_logger.addHandler(stderr_handler)
 
-    # Aggregate file handler -- persistent log for review and backwards
-    # compatibility with single-session deployments.
     file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    # Per-session file handler (spec 4.4.4, AC-192-14) -- attached in addition
-    # to the aggregate handler so both logs receive the same messages. Skipped
-    # in the edge case where an explicit log_file points at the same path as the
-    # session log, to avoid attaching two handlers to one file (duplicate lines).
     if session_log_file is not None and session_log_file != log_file:
         session_log_file.parent.mkdir(parents=True, exist_ok=True)
         session_handler = logging.FileHandler(str(session_log_file), encoding="utf-8")
@@ -182,9 +167,5 @@ def setup_logging(level: int | None = None) -> Path:
         root_logger.addHandler(session_handler)
 
     _state[0] = True
-    # Demoted to DEBUG (issue #132): every devbench CLI invocation used to
-    # emit this banner on stderr, polluting the output of stream-rendering
-    # commands like `hook-tail` and `get-diff`. Operators who want the banner
-    # back can re-enable it via DEVBENCH_LOG_LEVEL=DEBUG.
     logging.getLogger("judges.log_setup").debug("Logging to stderr and %s", log_file)
     return log_file

@@ -19,20 +19,12 @@ import pytest
 from devbench import cli as cli_mod
 from devbench.backlog.work_unit import WorkUnit
 
-# ---------------------------------------------------------------------------
-# _clean_target_repo_on_block — deterministic checkout resolution + fail-fast
-# ---------------------------------------------------------------------------
-
 
 class TestCleanTargetRepoOnBlock:
     """Resolves the checkout deterministically (repo -> REPO_LOCAL_PATHS); fails fast, never silently skips."""
 
     @staticmethod
     def _unit(repo: str = "acme/widget", uid: str = "E1-F1-S1-T1") -> WorkUnit:
-        # ``_clean_target_repo_on_block`` reads only ``.id`` + ``.repo``; a
-        # SimpleNamespace stand-in is sufficient. Cast so the duck-typed double
-        # type-checks against the WorkUnit parameter without a real (heavier)
-        # WorkUnit construction.
         return cast(WorkUnit, SimpleNamespace(id=uid, repo=repo))
 
     def test_happy_path_resets_and_cleans_resolved_checkout(self, tmp_path: Path) -> None:
@@ -45,7 +37,6 @@ class TestCleanTargetRepoOnBlock:
             patch("devbench.cli.subprocess.run", return_value=good) as run,
         ):
             assert cli_mod._clean_target_repo_on_block(self._unit()) == 0
-        # Cleanup ran against the DETERMINISTICALLY-resolved path, with no Local-path prose scrape.
         cmds = [call.args[0] for call in run.call_args_list]
         assert ["git", "-C", str(local), "reset", "--hard", "HEAD"] in cmds
         assert ["git", "-C", str(local), "clean", "-fd"] in cmds
@@ -101,11 +92,6 @@ class TestCleanTargetRepoOnBlock:
             assert cli_mod._clean_target_repo_on_block(self._unit()) == 1
 
 
-# ---------------------------------------------------------------------------
-# _parse_watchdog_args — lines 5312-5348
-# ---------------------------------------------------------------------------
-
-
 class TestParseWatchdogArgs:
     """Every flag-parser branch of the watchdog argument grammar."""
 
@@ -154,11 +140,6 @@ class TestParseWatchdogArgs:
         assert "unknown flag" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# cmd_watchdog — lines 5373-5403
-# ---------------------------------------------------------------------------
-
-
 class TestCmdWatchdog:
     """Both branches of the watchdog command: healthy + stuck."""
 
@@ -170,7 +151,6 @@ class TestCmdWatchdog:
         log = tmp_path / "orch.log"
         log.write_text("nothing in progress", encoding="utf-8")
         flag = tmp_path / "needs-restart.flag"
-        # detect_stuck returns a result with stuck=None for healthy state.
         healthy = SimpleNamespace(stuck=None)
         with patch("devbench.watchdog.detect_stuck", return_value=healthy):
             rc = cli_mod.cmd_watchdog("--idle-minutes", "1", "--log-file", str(log), "--flag-file", str(flag))
@@ -206,11 +186,6 @@ class TestCmdWatchdog:
         assert "E1-F1-S1-T1" in out
 
 
-# ---------------------------------------------------------------------------
-# cmd_clean_orphans + _resolve_orphan_repo_path — lines 4419-4466
-# ---------------------------------------------------------------------------
-
-
 class TestResolveOrphanRepoPath:
     def test_direct_filesystem_path_with_git(self, tmp_path: Path) -> None:
         repo = tmp_path / "myrepo"
@@ -219,7 +194,6 @@ class TestResolveOrphanRepoPath:
         assert cli_mod._resolve_orphan_repo_path(str(repo)) == repo
 
     def test_unknown_returns_none(self, tmp_path: Path) -> None:
-        # Direct path that's not a git repo, and "org/repo" not in REPO_LOCAL_PATHS.
         not_a_repo = tmp_path / "not-a-repo"
         not_a_repo.mkdir()
         assert cli_mod._resolve_orphan_repo_path(str(not_a_repo)) is None
@@ -268,14 +242,8 @@ class TestCmdCleanOrphans:
         assert payload["dry_run"] is True
 
 
-# ---------------------------------------------------------------------------
-# _parse_hook_tail_argv extra branches — lines 5172-5173, 5186-5188, 5197-5199
-# ---------------------------------------------------------------------------
-
-
 class TestParseHookTailArgvExtraBranches:
     def test_empty_string_argument_is_skipped(self) -> None:
-        # Empty argv entries (eg. from shell expansion) skip the loop iteration.
         result = cli_mod._parse_hook_tail_argv(("", "--no-follow"))
         assert not isinstance(result, int)
         assert result.no_follow is True
@@ -294,11 +262,6 @@ class TestParseHookTailArgvExtraBranches:
         rc = cli_mod._parse_hook_tail_argv(("--orchestrator-session",))
         assert rc == 2
         assert "requires a value" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# _validate_rejection_feedback_payload — lines 7555, 7562, 7566, 7569, 7578, 7580
-# ---------------------------------------------------------------------------
 
 
 class TestValidateRejectionFeedbackPayload:
@@ -373,16 +336,8 @@ class TestValidateRejectionFeedbackPayload:
             cli_mod._validate_rejection_feedback_payload("code_review", payload)
 
 
-# ---------------------------------------------------------------------------
-# _parse_log_rejection_feedback_argv — lines 7594-7595, 7598
-# ---------------------------------------------------------------------------
-
-
 class TestParseLogRejectionFeedbackArgv:
     def test_empty_arg_skipped(self) -> None:
-        # Empty string arg should be silently skipped, parser should still
-        # require judge/task/json after.  Test that the missing-values
-        # error still fires (so the empty skip happens).
         with pytest.raises(ValueError, match=r"--json requires a value"):
             cli_mod._parse_log_rejection_feedback_argv(("", "--json"))
 
@@ -399,11 +354,6 @@ class TestParseLogRejectionFeedbackArgv:
         assert raw_json == '{"a": 1}'
 
 
-# ---------------------------------------------------------------------------
-# Scope set/clear/show error paths — lines 6342-6471
-# ---------------------------------------------------------------------------
-
-
 class TestScopeSetErrorBranches:
     def test_session_scope_value_error_returns_one(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         with patch(
@@ -416,7 +366,6 @@ class TestScopeSetErrorBranches:
 
     def test_scope_to_file_oserror_returns_one(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         target = tmp_path / "scope.json"
-        # Ensure backlog parser sees an empty index OK; mock parse_index to no-op.
         with (
             patch("devbench.cli.BacklogParser") as parser_cls,
             patch("devbench.cli._session_scope_file_path", return_value=target),
@@ -430,7 +379,6 @@ class TestScopeSetErrorBranches:
     def test_invalid_scope_token_returns_one(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         with patch("devbench.cli.BacklogParser") as parser_cls:
             parser_cls.return_value.parse_index.return_value = []
-            # "E3-E1" is a reverse-range token that raises InvalidScopeError.
             rc = cli_mod._scope_set("E3-E1", "", tmp_path)
         assert rc == 1
         assert "invalid scope token" in capsys.readouterr().err
@@ -484,7 +432,6 @@ class TestParseScopeSetArgvErrorBranches:
         assert "--include requires a value" in capsys.readouterr().err
 
     def test_include_value_starts_with_dashes_errors(self, capsys: pytest.CaptureFixture) -> None:
-        # When the value begins with ``--`` the parser treats it as a flag.
         include, exclude, rc = cli_mod._parse_scope_set_argv(("--include", "--exclude"))
         assert rc == 1
 
@@ -492,11 +439,6 @@ class TestParseScopeSetArgvErrorBranches:
         include, exclude, rc = cli_mod._parse_scope_set_argv(("not-a-flag",))
         assert rc == 1
         assert "unrecognised argument" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# _detect_test_validates_source — lines 8712-8728
-# ---------------------------------------------------------------------------
 
 
 class TestDetectTestValidatesSource:
@@ -542,10 +484,7 @@ class TestDetectTestValidatesSource:
             )
         )
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            # _TEST_VALIDATES_SOURCE_TITLE_PREFIXES includes "Make test pass" — sanity-check.
             result = cli_mod._detect_test_validates_source("E1-F1-S1-T1")
-            # Either "heuristic" (prefix matched) or "" if prefix not in the tuple;
-            # the goal is to exercise the title-startswith branch.
             assert result in ("heuristic", "")
 
     def test_test_only_files_yields_heuristic(self, tmp_path: Path) -> None:
@@ -570,18 +509,11 @@ class TestDetectTestValidatesSource:
     def test_outer_oserror_returns_empty(self, tmp_path: Path) -> None:
         pdir = tmp_path / ".devbench" / "proposals"
         pdir.mkdir(parents=True)
-        # The outer try wraps proposals_dir.glob() -- making glob raise OSError
-        # hits the catch at line 8727.
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch.object(Path, "glob", side_effect=OSError("denied")),
         ):
             assert cli_mod._detect_test_validates_source("anything") == ""
-
-
-# ---------------------------------------------------------------------------
-# _kill_sigterm — lines 7112-7113
-# ---------------------------------------------------------------------------
 
 
 class TestKillSigterm:
@@ -605,11 +537,6 @@ class TestKillSigterm:
         assert "cannot send SIGTERM" in msg
 
 
-# ---------------------------------------------------------------------------
-# _build_amendment_request_from_stdin — lines 7490-7491
-# ---------------------------------------------------------------------------
-
-
 class TestBuildAmendmentRequestFromStdin:
     def test_stdin_oserror_raises(self) -> None:
         fake_stdin = MagicMock()
@@ -619,14 +546,8 @@ class TestBuildAmendmentRequestFromStdin:
                 cli_mod._build_amendment_request_from_stdin("E1-F1-S1-T1")
 
 
-# ---------------------------------------------------------------------------
-# _latest_log_in_progress_ts + _latest_audit_in_progress_ts — lines 847, 860, 882
-# ---------------------------------------------------------------------------
-
-
 class TestLatestLogInProgressTs:
     def test_returns_none_when_log_file_missing(self, tmp_path: Path) -> None:
-        # log_path=None + _try_resolve_log_file_path returns None → return None.
         with patch("devbench.cli._try_resolve_log_file_path", return_value=None):
             assert cli_mod._latest_log_in_progress_ts("E1-F1-S1-T1", None) is None
 
@@ -637,8 +558,6 @@ class TestLatestLogInProgressTs:
             assert cli_mod._latest_log_in_progress_ts("E1-F1-S1-T1", log) is None
 
     def test_skips_lines_with_bad_timestamp(self, tmp_path: Path) -> None:
-        # Log line matching the prefix but with an unparseable timestamp
-        # (9999-99-99) -- the strptime ValueError is caught and the line skipped.
         log = tmp_path / "log"
         log.write_text(
             "9999-99-99T99:99:99Z [logger] INFO Set E1-F1-S1-T1 to 'in-progress'\n"
@@ -665,20 +584,10 @@ class TestLatestAuditInProgressTs:
             assert cli_mod._latest_audit_in_progress_ts("E1-F1-S1-T1") is None
 
 
-# ---------------------------------------------------------------------------
-# _try_resolve_log_file_path — line 847-848
-# ---------------------------------------------------------------------------
-
-
 class TestTryResolveLogFilePath:
     def test_returns_none_on_systemexit(self) -> None:
         with patch("devbench.cli._resolve_log_file_path", side_effect=SystemExit(1)):
             assert cli_mod._try_resolve_log_file_path() is None
-
-
-# ---------------------------------------------------------------------------
-# _legacy_emit_orphan_cleanup_proposal extra branches — lines 3858-3906
-# ---------------------------------------------------------------------------
 
 
 class TestLegacyEmitOrphanCleanupProposalExtraBranches:
@@ -715,7 +624,6 @@ class TestLegacyEmitOrphanCleanupProposalExtraBranches:
         self._patch_workspace(monkeypatch, tmp_path)
         proposals = tmp_path / ".devbench" / "proposals"
         proposals.mkdir(parents=True)
-        # Materialise the proposal file at the path that ``proposal_path()`` returns.
         (proposals / f"{self._SOURCE_ID}.json").write_text("{}", encoding="utf-8")
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -769,15 +677,10 @@ class TestLegacyEmitOrphanCleanupProposalExtraBranches:
                 unit_id=self._SOURCE_ID,
                 unit=self._make_unit(),
                 repo_path=repo,
-                detected=[".coverage"] * 10,  # >5 to also exercise the "and N more" branch
+                detected=[".coverage"] * 10,
             )
         assert result is True
         assert "cannot allocate cleanup-task ID" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# _session_scope_file_path — line 6309
-# ---------------------------------------------------------------------------
 
 
 class TestSessionScopeFilePath:
@@ -787,21 +690,13 @@ class TestSessionScopeFilePath:
             cli_mod._session_scope_file_path(tmp_path)
 
 
-# ---------------------------------------------------------------------------
-# _build_scope_for_next — lines 986-987, 998-999
-# ---------------------------------------------------------------------------
-
-
 class TestBuildScopeForNext:
     def test_invalid_scope_token_returns_error_message(self, tmp_path: Path) -> None:
-        # "E3-E1" reverse range raises InvalidScopeError.
         scope, err = cli_mod._build_scope_for_next("E3-E1", "", ["E1-F1-S1-T1"])
         assert scope is None
         assert "invalid scope token" in err
 
     def test_corrupt_scope_json_returns_error_message(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # When scope.json banner data parses but ScopeFilter.from_file
-        # then fails with corrupt content, we hit the line-998-999 branch.
         scope_path = tmp_path / ".devbench" / "scope.json"
         scope_path.parent.mkdir(parents=True)
         scope_path.write_text(
@@ -814,14 +709,8 @@ class TestBuildScopeForNext:
         assert "scope.json is corrupt" in err
 
 
-# ---------------------------------------------------------------------------
-# _parse_add_dep_argv extra branches — lines 8844-8845
-# ---------------------------------------------------------------------------
-
-
 class TestParseAddDepArgv:
     def test_empty_arg_skipped(self) -> None:
-        # Empty argv slot is skipped; missing positional → error returned.
         blocked, blocker, reason = cli_mod._parse_add_dep_argv(("", "E1-F1-S1-T1", "E1-F1-S1-T2"))
         assert blocked == "E1-F1-S1-T1"
 
@@ -838,11 +727,6 @@ class TestParseAddDepArgv:
         blocked, blocker, reason = cli_mod._parse_add_dep_argv(("--unknown",))
         assert blocked is None
         assert "unknown flag" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# _parse_reject_proposal_argv — lines 8938-8939, 8953
-# ---------------------------------------------------------------------------
 
 
 class TestParseRejectProposalArgv:
@@ -872,11 +756,6 @@ class TestParseRejectProposalArgv:
             cli_mod._parse_reject_proposal_argv(("E1-F1-S1-T1",))
 
 
-# ---------------------------------------------------------------------------
-# _parse_id_and_reason — lines 2191-2192
-# ---------------------------------------------------------------------------
-
-
 class TestParseIdAndReason:
     def test_empty_string_skipped_and_happy_path(self) -> None:
         result = cli_mod._parse_id_and_reason(("", "E1-F1-S1-T1", "--reason", "why"), command_name="hold")
@@ -893,11 +772,6 @@ class TestParseIdAndReason:
         assert "hold requires" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# cmd_set_status usage error — lines 1245-1250
-# ---------------------------------------------------------------------------
-
-
 class TestCmdSetStatusUsage:
     def test_wrong_number_of_args_errors(self, capsys: pytest.CaptureFixture) -> None:
         rc = cli_mod.cmd_set_status("only-one")
@@ -910,11 +784,6 @@ class TestCmdSetStatusUsage:
         assert "Invalid status" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# _parse_bulk_set_status_args — lines 1339-1343
-# ---------------------------------------------------------------------------
-
-
 class TestParseBulkSetStatusArgs:
     def test_include_missing_value_errors(self, capsys: pytest.CaptureFixture) -> None:
         rc = cli_mod._parse_bulk_set_status_args(["--include"])
@@ -925,12 +794,6 @@ class TestParseBulkSetStatusArgs:
         rc = cli_mod._parse_bulk_set_status_args(["--exclude"])
         assert rc == 1
         assert "requires a value" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# _check_repo_origin / _check_repo_default_branch / _check_repo_open_prs —
-# lines 2600-2671
-# ---------------------------------------------------------------------------
 
 
 class TestCheckRepoOrigin:
@@ -1017,11 +880,6 @@ class TestCheckRepoOpenPrs:
         assert "open PR" in err
 
 
-# ---------------------------------------------------------------------------
-# _run_inline_cleanup_steps — lines 3725-3757 (each git step's error branch)
-# ---------------------------------------------------------------------------
-
-
 class TestRunInlineCleanupSteps:
     @staticmethod
     def _git_side_effects(*raise_at_step: int) -> object:
@@ -1073,7 +931,6 @@ class TestRunInlineCleanupSteps:
             gitignore_path=gitignore,
             removed=[],
         )
-        # Steps: 1=diff (ok), 2=reset (ok), 3=add .gitignore (fail).
         with (
             patch("devbench.github.git_ops.GitOpsService._git", side_effect=self._git_side_effects(3)),
             patch("devbench.git_orphans.cleanup_tracked_orphans", return_value=report),
@@ -1091,7 +948,6 @@ class TestRunInlineCleanupSteps:
             gitignore_path=gitignore,
             removed=["a.tmp"],
         )
-        # Steps: 1=diff, 2=reset, 3=add gitignore (ok), 4=commit (fail).
         with (
             patch("devbench.github.git_ops.GitOpsService._git", side_effect=self._git_side_effects(4)),
             patch("devbench.git_orphans.cleanup_tracked_orphans", return_value=report),
@@ -1110,16 +966,13 @@ class TestRunInlineCleanupSteps:
             removed=[],
         )
 
-        # Force the diff step to return a path that should be re-staged.
         calls = {"n": 0}
 
         def _se(*args: object, **kwargs: object) -> object:
             calls["n"] += 1
             if calls["n"] == 1:
-                # diff step returns one path.
                 return (0, "preserve.py\n", "")
             if calls["n"] == 3:
-                # re-stage step fails.
                 raise RuntimeError("restage broke")
             return (0, "", "")
 
@@ -1129,11 +982,6 @@ class TestRunInlineCleanupSteps:
         ):
             with pytest.raises(cli_mod._InlineCleanupError, match=r"re-stage executor paths"):
                 cli_mod._run_inline_cleanup_steps(repo, ["a.tmp"])
-
-
-# ---------------------------------------------------------------------------
-# _write_escalation_proposal — defensive None-proposal guard
-# ---------------------------------------------------------------------------
 
 
 class TestWriteEscalationProposalNoneGuard:

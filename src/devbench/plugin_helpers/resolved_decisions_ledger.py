@@ -56,19 +56,12 @@ __all__ = [
     "read_ledger",
 ]
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 _LEDGER_HEADING = "# Resolved Decisions"
 """Top-level heading written at the start of every new ledger file."""
 
 _ENTRY_HEADING_RE = re.compile(r"^## D(\d+)\s*$", re.MULTILINE)
 """Matches ``## D<N>`` section headings in the ledger Markdown."""
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -110,11 +103,6 @@ class LedgerEntry:
     raw: str
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
 class DuplicateResolutionError(ValueError):
     """Raised when an already-recorded contradiction is re-submitted.
 
@@ -138,11 +126,6 @@ class DuplicateResolutionError(ValueError):
         )
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
 def _parse_entries(content: str) -> list[LedgerEntry]:
     """Parse ``## D<N>`` sections from *content* and return them sorted by index.
 
@@ -154,7 +137,6 @@ def _parse_entries(content: str) -> list[LedgerEntry]:
         An empty list is returned when no ``## D<N>`` headings are found.
     """
     entries: list[LedgerEntry] = []
-    # Split on the section heading pattern so each chunk starts with "## D<N>".
     parts = re.split(r"(?=^## D\d+\s*$)", content, flags=re.MULTILINE)
     for part in parts:
         match = _ENTRY_HEADING_RE.match(part.splitlines()[0].strip()) if part.strip() else None
@@ -183,11 +165,6 @@ def _format_entry(index: int, decision: DecisionEntry) -> str:
         f"**Resolution:** {decision.resolution}\n\n"
         f"**Rationale:** {decision.rationale}\n"
     )
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def next_index(ledger_path: Path) -> int:
@@ -271,17 +248,14 @@ def append_decision(ledger_path: Path, decision: DecisionEntry) -> LedgerEntry:
             exist (propagated from ``atomic_write_text``).
         OSError: For any other IO error (disk full, permission, etc.).
     """
-    # Read the existing content (may be empty / non-existent).
     existing_content = ""
     if ledger_path.exists():
         existing_content = ledger_path.read_text(encoding="utf-8")
 
-    # Deduplication check: scan existing **Contradiction:** lines.
     contradiction_line_re = re.compile(r"^\*\*Contradiction:\*\*\s*(.+)$", re.MULTILINE)
     for match in contradiction_line_re.finditer(existing_content):
         recorded_text = match.group(1).strip()
         if recorded_text == decision.contradiction.strip():
-            # Find the D<N> index for this entry by scanning backwards.
             pos = match.start()
             prior_text = existing_content[:pos]
             heading_matches = list(_ENTRY_HEADING_RE.finditer(prior_text))
@@ -291,19 +265,15 @@ def append_decision(ledger_path: Path, decision: DecisionEntry) -> LedgerEntry:
                 contradiction=decision.contradiction,
             )
 
-    # Assign the next sequential index.
     index = next_index(ledger_path)
 
-    # Build the new entry Markdown block.
     new_entry_text = _format_entry(index, decision)
 
-    # Compose the full ledger content.
     if existing_content.strip():
         new_content = existing_content.rstrip("\n") + "\n\n" + new_entry_text
     else:
         new_content = _LEDGER_HEADING + "\n\n" + new_entry_text
 
-    # Persist atomically.
     atomic_write_text(ledger_path, new_content)
 
     return LedgerEntry(index=index, raw=new_entry_text.rstrip("\n"))

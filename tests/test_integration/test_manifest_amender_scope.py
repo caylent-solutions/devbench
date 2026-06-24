@@ -65,15 +65,10 @@ class TestManifestAmenderScopeRule:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # 1. The explicit forbidden-reason statement
             "is **never** a SCOPE-failure reason",
-            # 2. Reference to deterministic pre-filter rule 5
             "pre-filter rule 5 has already confirmed every requested file is present in the staged diff",
-            # 3. Reference to Layer-3 post-check
             "Layer-3 post-check after `apply-amendment` will verify AC-FINAL-015",
-            # 4. SCOPE re-statement: minimal + Approach-coherent, not pre-existence
             "evaluates whether each requested *diff* is minimal and Approach-coherent",
-            # 5. Self-correcting heuristic
             "stop and re-evaluate against the Approach + diff text instead",
         ],
     )

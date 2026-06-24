@@ -51,7 +51,7 @@ def find_cycles(graph: Mapping[str, Sequence[str]]) -> list[tuple[str, ...]]:
         stack.append(node)
         for nxt in graph.get(node, ()):
             if nxt not in color:
-                continue  # dependency on a node not in the graph -- not a cycle
+                continue
             if color[nxt] == 1:
                 start = stack.index(nxt)
                 cycle = tuple(stack[start:])

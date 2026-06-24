@@ -26,10 +26,6 @@ from devbench.plugin_helpers.spec_gates import (
     run_gates,
 )
 
-# ---------------------------------------------------------------------------
-# check_balanced_blocks -- balanced fenced and mermaid code blocks
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestCheckBalancedBlocks:
@@ -87,11 +83,6 @@ class TestCheckBalancedBlocks:
         assert result[0].kind == BlockerKind.UNBALANCED_BLOCKS
 
 
-# ---------------------------------------------------------------------------
-# check_no_banned_glyphs -- em-dash U+2014 is banned
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCheckNoBannedGlyphs:
     """Em-dash (U+2014) is banned; double hyphen is acceptable."""
@@ -125,11 +116,6 @@ class TestCheckNoBannedGlyphs:
         content = f"prefix{safe_char}suffix\n"
         result = check_no_banned_glyphs("spec.md", content)
         assert result == []
-
-
-# ---------------------------------------------------------------------------
-# check_version_consistency -- cross-file version/identifier consistency
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -183,11 +169,6 @@ class TestCheckVersionConsistency:
         assert BlockerKind.VERSION_INCONSISTENCY in kinds
 
 
-# ---------------------------------------------------------------------------
-# check_acyclic_deps -- declared dependency graph must be acyclic
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCheckAcyclicDeps:
     """The declared dependency graph must be a DAG (no cycles)."""
@@ -230,7 +211,6 @@ class TestCheckAcyclicDeps:
 
     def test_edge_to_unknown_node_is_skipped(self) -> None:
         """An edge to a node not in the graph is skipped without error."""
-        # "A" depends on "UNKNOWN" which is not a key in the graph.
         result = check_acyclic_deps({"A": ["UNKNOWN"], "B": []})
         assert result == []
 
@@ -265,11 +245,6 @@ class TestCheckAcyclicDeps:
     def test_valid_dags_pass(self, graph: dict[str, list[str]]) -> None:
         result = check_acyclic_deps(graph)
         assert result == []
-
-
-# ---------------------------------------------------------------------------
-# run_gates -- aggregator: collects all blocker findings from all gates
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -324,11 +299,6 @@ class TestRunGates:
         }
         result = run_gates(files=files, dep_graph={})
         assert any("appendix.md" in b.detail for b in result)
-
-
-# ---------------------------------------------------------------------------
-# Blocker dataclass -- structural sanity
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

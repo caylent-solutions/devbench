@@ -25,10 +25,6 @@ from devbench import cli
 from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 from devbench.github.git_ops import CIResult
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 _REPO = "caylent-solutions/devbench"
 _BRANCH = "feature/combined"
 _PR_URL = "https://github.com/caylent-solutions/devbench/pull/77"
@@ -49,7 +45,6 @@ def _build_workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
     backlog_root = workspace / "backlog"
     backlog_root.mkdir()
 
-    # BACKLOG.md index - seven columns required by BACKLOG_INDEX_TABLE_ROW_RE
     backlog_index = workspace / "BACKLOG.md"
     backlog_index.write_text(
         "# Backlog\n\n"
@@ -63,7 +58,6 @@ def _build_workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
         encoding="utf-8",
     )
 
-    # Work-unit files - must include # ID: Title and ## Status: <status>
     for tid in (_KNOWN_TASK_ID, _TASK_ID):
         wu_file = backlog_root / f"{tid}.md"
         wu_file.write_text(
@@ -85,11 +79,6 @@ def _make_mock_ops(ci_result: object) -> MagicMock:
     mock_ops.wait_for_checks_and_classify.return_value = ci_result
     mock_ops.get_latest_failing_run_id.return_value = None
     return mock_ops
-
-
-# ---------------------------------------------------------------------------
-# GREEN path
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
@@ -135,7 +124,6 @@ class TestFinalizeGreen:
         ):
             cli.cmd_git_ops_finalize(_REPO)
 
-        # The most recently sorted in-review task should have [CI_GREEN] audit
         wu_file = backlog_root / f"{_TASK_ID}.md"
         content = wu_file.read_text(encoding="utf-8")
         assert "[CI_GREEN]" in content
@@ -159,11 +147,6 @@ class TestFinalizeGreen:
             cli.cmd_git_ops_finalize(_REPO)
 
         mock_ops.merge_pr.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# FAILED_KNOWN_TASK path
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
@@ -240,11 +223,6 @@ class TestFinalizeFailedKnownTask:
         assert "[CI_FAILED_BATCH_PR]" in content
 
 
-# ---------------------------------------------------------------------------
-# FAILED_UNKNOWN path
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.integration
 class TestFinalizeFailedUnknown:
     """AC-FUNC-004 / AC-CYCLE-001: FAILED_UNKNOWN transitions most-recent in-review/done task."""
@@ -287,17 +265,10 @@ class TestFinalizeFailedUnknown:
         ):
             cli.cmd_git_ops_finalize(_REPO)
 
-        # The last in-review task in iteration order should be blocked
-        # (most recent = last task in the backlog listing)
         wu_file = backlog_root / f"{_TASK_ID}.md"
         content = wu_file.read_text(encoding="utf-8")
         assert "## Status: blocked" in content
         assert "[CI_FAILED_BATCH_PR]" in content
-
-
-# ---------------------------------------------------------------------------
-# TIMEOUT path
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
@@ -342,7 +313,6 @@ class TestFinalizeTimeout:
         ):
             cli.cmd_git_ops_finalize(_REPO)
 
-        # Neither task should be transitioned to blocked
         for tid in (_KNOWN_TASK_ID, _TASK_ID):
             wu_file = backlog_root / f"{tid}.md"
             content = wu_file.read_text(encoding="utf-8")
@@ -372,11 +342,6 @@ class TestFinalizeTimeout:
         assert "[CI_WATCH_TIMEOUT]" in content
 
 
-# ---------------------------------------------------------------------------
-# Cascade-cap interaction
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.integration
 class TestFinalizeCascadeCap:
     """AC-FUNC-006 / AC-CYCLE-001: cascade-cap interaction.
@@ -392,7 +357,6 @@ class TestFinalizeCascadeCap:
         repo_path.mkdir()
         mock_ops = _make_mock_ops(CIResult.FAILED_KNOWN_TASK(_KNOWN_TASK_ID))
 
-        # MAX_CASCADE_DEPTH=1 means depth 0 would already be capped
         with (
             patch("devbench.config.SINGLE_BRANCH", _BRANCH),
             patch("devbench.config.DEFER_PR", True),
@@ -405,7 +369,6 @@ class TestFinalizeCascadeCap:
         ):
             result = cli.cmd_git_ops_finalize(_REPO)
 
-        # Proposal must NOT be written
         proposal_path = workspace / ".devbench" / "proposals" / f"{_KNOWN_TASK_ID}.json"
         assert not proposal_path.exists(), "Proposal should not be written when cascade cap reached"
         assert result == 2
@@ -458,10 +421,6 @@ class TestFinalizeCascadeCap:
         ):
             cli.cmd_git_ops_finalize(_REPO)
 
-        # The cascade-capped task must be classified as OPERATOR_ACTION_REQUIRED:
-        # it is blocked with [CI_FAILED_CASCADE_CAPPED] but has no proposal marker,
-        # no pending dependency, and no recovery signal -- so the classifier falls
-        # through to OPERATOR_ACTION_REQUIRED.
         state = classify_blocked_task(backlog_root, backlog_index, _KNOWN_TASK_ID)
         assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED, (
             f"Expected OPERATOR_ACTION_REQUIRED for cascade-capped task, got {state}"

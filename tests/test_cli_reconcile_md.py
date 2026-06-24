@@ -9,10 +9,6 @@ import pytest
 
 from devbench import cli
 
-# ---------------------------------------------------------------------------
-# Fixture helpers
-# ---------------------------------------------------------------------------
-
 _FULL_INDEX_HEADER = (
     "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
     "|----|-------|------|--------|--------------|------|-----------|\n"
@@ -56,11 +52,6 @@ def _build_backlog_no_index_section(tmp_path: Path) -> Path:
     return path
 
 
-# ---------------------------------------------------------------------------
-# AC-243-1: mutually-exclusive flag error
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestMutuallyExclusiveFlags:
     """--check-only and --force together must error with rc 2."""
@@ -90,11 +81,6 @@ class TestMutuallyExclusiveFlags:
         assert rc == 2
         captured = capsys.readouterr()
         assert "--check-only and --force are mutually exclusive" in captured.err
-
-
-# ---------------------------------------------------------------------------
-# AC-243-1: no-flag mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -129,13 +115,7 @@ class TestNoFlagMode:
         assert rc == 0
         captured = capsys.readouterr()
         assert "drift" in captured.out.lower() or "mismatch" in captured.out.lower()
-        # No write
         assert backlog_md.stat().st_mtime_ns == mtime_before
-
-
-# ---------------------------------------------------------------------------
-# AC-243-1: --check-only mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -163,11 +143,6 @@ class TestCheckOnlyMode:
         ):
             rc = cli.cmd_reconcile_backlog_md("--check-only")
         assert rc == 0
-
-
-# ---------------------------------------------------------------------------
-# AC-243-1: --force mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -216,11 +191,6 @@ class TestForceMode:
         assert "BACKLOG.md" in captured.err
 
 
-# ---------------------------------------------------------------------------
-# AC-243-1: no-flag mode with no Full Work Unit Index section
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestNoFlagModeNoIndexSection:
     """No-flag mode when BACKLOG.md has no '## Full Work Unit Index' section."""
@@ -237,7 +207,6 @@ class TestNoFlagModeNoIndexSection:
         ):
             rc = cli.cmd_reconcile_backlog_md()
         assert rc == 0
-        # File must not be written in no-flag mode.
         assert backlog_md.stat().st_mtime_ns == mtime_before
         captured = capsys.readouterr()
         assert "drift" in captured.out.lower() or "consistent" in captured.out.lower()

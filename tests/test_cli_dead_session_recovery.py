@@ -86,7 +86,6 @@ def _run_cleanup(workspace: Path, backlog_dir: Path) -> int:
         patch("devbench.cli.WORKSPACE_ROOT", workspace),
         patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
         patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
-        # The dead pid must look dead; the live pid is os.getpid().
         patch("devbench.session.os.kill", side_effect=_fake_kill),
     ):
         return cli.cmd_sessions("--cleanup")
@@ -112,9 +111,7 @@ class TestDeadSessionOrphanRecovery:
         assert rc == 0
 
         wu_text = (backlog_dir / "E1-F1-S1-T2.md").read_text(encoding="utf-8")
-        # The orphaned unit must no longer be in-progress.
         assert "## Status: in-queue" in wu_text, "the orphaned in-progress unit must be re-queued"
-        # An explicit recovery audit marker must be written.
         assert "[REQUEUED_AFTER_DEAD_SESSION]" in wu_text
         index_text = (workspace / "BACKLOG.md").read_text(encoding="utf-8")
         assert "| E1-F1-S1-T2 | Orphan candidate | Task | in-queue |" in index_text
@@ -124,7 +121,6 @@ class TestDeadSessionOrphanRecovery:
         workspace = tmp_path
         (workspace / ".devbench").mkdir(parents=True, exist_ok=True)
         backlog_dir = workspace / "backlog"
-        # T2 is in-progress claimed by a LIVE session; T3 by a dead one.
         _write_unit(backlog_dir, "E1-F1-S1-T2", status="in-progress", claimed_by="live")
         _write_unit(backlog_dir, "E1-F1-S1-T3", status="in-progress", claimed_by="dead")
         _write_index(workspace, [("E1-F1-S1-T2", "in-progress"), ("E1-F1-S1-T3", "in-progress")])
@@ -136,10 +132,8 @@ class TestDeadSessionOrphanRecovery:
 
         live_text = (backlog_dir / "E1-F1-S1-T2.md").read_text(encoding="utf-8")
         dead_text = (backlog_dir / "E1-F1-S1-T3.md").read_text(encoding="utf-8")
-        # The live session's unit is untouched.
         assert "## Status: in-progress" in live_text
         assert "[REQUEUED_AFTER_DEAD_SESSION]" not in live_text
-        # The dead session's unit is recovered.
         assert "## Status: in-queue" in dead_text
         assert "[REQUEUED_AFTER_DEAD_SESSION]" in dead_text
 
@@ -192,7 +186,6 @@ class TestDeadSessionRecoveryUnit:
 
         from devbench import cli
 
-        # BACKLOG_ROOT/INDEX point at a non-existent tree -> parse raises -> [].
         with (
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing"),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "missing" / "BACKLOG.md"),

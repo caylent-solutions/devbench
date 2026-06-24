@@ -27,10 +27,6 @@ from devbench.quota import (
     save_checkpoint,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _make_quota_exc(
     reset_at: datetime | None = None,
@@ -49,11 +45,6 @@ def _fake_message_with_quota() -> SimpleNamespace:
         body={},
         message="rate limit hit",
     )
-
-
-# ---------------------------------------------------------------------------
-# cmd_quota_watcher
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -111,11 +102,6 @@ class TestCmdQuotaWatcher:
         assert rc == 1
 
 
-# ---------------------------------------------------------------------------
-# _handle_quota_pause integration
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestHandleQuotaPause:
     """_handle_quota_pause emits [QUOTA_WAITING] + waits + emits [QUOTA_RESUMED]."""
@@ -144,7 +130,6 @@ class TestHandleQuotaPause:
 
         result = asyncio.run(run())
         assert result is True
-        # Check that a QUOTA_WAITING marker was emitted
         waiting_msgs = [m for m in log_messages if "QUOTA_WAITING" in m]
         assert len(waiting_msgs) >= 1, f"Expected [QUOTA_WAITING] in logs. Got: {log_messages}"
 
@@ -214,8 +199,6 @@ class TestHandleQuotaPause:
 
     def test_no_checkpoint_left_when_enabled_false(self, tmp_path: Path) -> None:
         """AC-236-1: enabled:false does not write a checkpoint."""
-        # enabled:false path re-raises the quota exception without writing a checkpoint.
-        # Verify that a fresh workspace has no checkpoint present.
         assert load_checkpoint(tmp_path) is None
 
     def test_fires_quota_waiting_notification_at_wait_start(self, tmp_path: Path) -> None:
@@ -316,7 +299,6 @@ class TestHandleQuotaPause:
                                 session_name="default",
                             )
 
-        # Despite the notify exception, the wait completed and recovery returned True.
         assert asyncio.run(run()) is True
 
     def test_quota_resumed_notification_failure_does_not_break_resume(self, tmp_path: Path) -> None:
@@ -348,11 +330,6 @@ class TestHandleQuotaPause:
         assert asyncio.run(run()) is True
 
 
-# ---------------------------------------------------------------------------
-# enabled:false legacy exit path
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestEnabledFalseLegacyExit:
     """AC-236-1: enabled:false restores legacy non-zero exit, no checkpoint."""
@@ -378,11 +355,6 @@ class TestEnabledFalseLegacyExit:
 
         result = _should_handle_quota(exc, qh_cfg)
         assert result is True
-
-
-# ---------------------------------------------------------------------------
-# on_exhaustion / on_exhaustion_timeout dispatch (Issue #236 follow-up)
-# ---------------------------------------------------------------------------
 
 
 def _quota_detected() -> Any:

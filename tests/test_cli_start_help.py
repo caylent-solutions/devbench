@@ -33,6 +33,5 @@ def test_start_help_is_single_description_string() -> None:
     """AC-249a-1: the start _COMMANDS entry is a single (non-tuple) description string."""
     _, _, desc = cli._COMMANDS["start"]
     assert isinstance(desc, str), f"start description must be a str, got {type(desc).__name__}"
-    # Confirm all five tokens appear in the single string itself (not just at runtime)
     for token in ("--include", "--exclude", "--name", "--allow-overlap", "--daemon"):
         assert token in desc, f"start description string missing token {token!r}; desc={desc!r}"

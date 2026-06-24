@@ -59,15 +59,11 @@ class TestTaskFactorySpecCorrectionScope:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # The contract: markdown-only Manifest for spec-correction tasks.
             "the draft's OWN Changes Manifest contains a single row pointing at",
             "draft MUST NOT list the source files referenced inside that table",
-            # Why: re-introducing the conflict.
             "re-introduces the very Manifest Conflict the recovery task was created to resolve",
-            # Self-correcting heuristic by verb.
             "Self-correcting heuristic",
             "remove the X row",
-            # Cross-link to this regression test.
             "test_task_factory_spec_correction_scope.py",
         ],
     )

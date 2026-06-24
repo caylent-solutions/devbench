@@ -77,11 +77,6 @@ JUDGE_CATEGORIES: Final[dict[str, frozenset[str]]] = {
 }
 
 
-# Severity ordering used by the executor-feedback collector to sort
-# rejection payloads when injecting them into the next executor turn.
-# Higher ordinal = higher priority. Same order as documented in
-# ``plugin/devbench-orchestrate/agents/executor.md`` rejection-feedback resolution
-# protocol.
 JUDGE_SEVERITY_ORDER: Final[dict[str, int]] = {
     "security_review": 60,
     "code_review": 50,

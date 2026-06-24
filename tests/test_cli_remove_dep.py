@@ -10,10 +10,6 @@ import pytest
 
 from devbench import cli
 
-# ---------------------------------------------------------------------------
-# Shared workspace helpers (mirrors test_cli_add_dep.py conventions)
-# ---------------------------------------------------------------------------
-
 _BACKLOG_HEADER = (
     "# Backlog\n\n"
     "## Status Summary\n\n"
@@ -121,11 +117,6 @@ def _patched(workspace: Path):
     )
 
 
-# ---------------------------------------------------------------------------
-# Happy path: removes an existing edge
-# ---------------------------------------------------------------------------
-
-
 class TestCmdRemoveDepHappyPath:
     def test_remove_existing_edge_returns_rc0_and_removed_true(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -136,7 +127,7 @@ class TestCmdRemoveDepHappyPath:
         with p1, p2, p3:
             rc_wire = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
             assert rc_wire == 0
-            capsys.readouterr()  # drain add-dep output
+            capsys.readouterr()
             rc = cli.cmd_remove_dep("E0-F1-S1-T1", "E0-F1-S1-T2", "--reason", "no longer needed")
 
         assert rc == 0
@@ -146,11 +137,6 @@ class TestCmdRemoveDepHappyPath:
         assert payload["blocker"] == "E0-F1-S1-T2"
         assert payload["removed"] is True
         assert payload["reason"] == "no longer needed"
-
-
-# ---------------------------------------------------------------------------
-# Idempotent no-op
-# ---------------------------------------------------------------------------
 
 
 class TestCmdRemoveDepNoOp:
@@ -167,11 +153,6 @@ class TestCmdRemoveDepNoOp:
         out = capsys.readouterr().out
         payload = json.loads(out)
         assert payload["removed"] is False
-
-
-# ---------------------------------------------------------------------------
-# Fail-fast on unknown ids / bad format
-# ---------------------------------------------------------------------------
 
 
 class TestCmdRemoveDepFailFast:
@@ -209,12 +190,6 @@ class TestCmdRemoveDepFailFast:
         assert "em-dash" in err
 
 
-# ---------------------------------------------------------------------------
-# TDI-001: remove-dep must accept a container (Epic/Feature/Story) blocker id so
-# an operator can cut a self-ancestor dependency edge that was authored by hand.
-# ---------------------------------------------------------------------------
-
-
 class TestCmdRemoveDepContainerEdge:
     def test_remove_container_blocker_edge_returns_rc0_and_removed_true(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -233,8 +208,6 @@ class TestCmdRemoveDepContainerEdge:
         assert payload["blocker"] == "E0-F1-S1"
         assert payload["removed"] is True
 
-        # The Dependencies table collapses to the canonical placeholder once the
-        # only (container) row is cut.
         task_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         body = task_file.read_text(encoding="utf-8")
         assert "| E0-F1-S1 | Story" not in body
@@ -254,10 +227,6 @@ class TestCmdRemoveDepContainerEdge:
         with p1, p2, p3:
             rc = cli.cmd_remove_dep("E0-F1-S1-T1", "E0-F1-S1")
 
-        # Assert against the id-format gate's actual rejection message
-        # (``... does not match <shape> format``) rather than the bare word
-        # "format", which false-matches unrelated stderr (e.g. a logging
-        # record routed to stderr by a handler another test installed).
         err = capsys.readouterr().err
         assert "does not match" not in err
         assert rc == 0

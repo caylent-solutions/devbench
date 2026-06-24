@@ -67,9 +67,7 @@ class TestChangesManifestJudgeCommitAttributionContract:
     def test_judge_has_fail_message_for_commit_attribution_violation(self) -> None:
         """The judge must include the required FAIL message template for bundled files."""
         content = CHANGES_MANIFEST_JUDGE.read_text(encoding="utf-8")
-        # The required message must reference both the commit sha and file path.
         assert "Changes Manifest" in content
-        # Check for the amend-scenario explanation.
         assert "amend" in content.lower() or "bundled" in content.lower(), (
             "changes-manifest.md must explain the `git commit --amend` sibling-bundling "
             "scenario so the agent emits a diagnostic message that names the root cause."
@@ -79,8 +77,6 @@ class TestChangesManifestJudgeCommitAttributionContract:
         """The commit-attribution check must be framed as a SECOND assertion on top
         of the existing staged-file check, not a replacement."""
         content = CHANGES_MANIFEST_JUDGE.read_text(encoding="utf-8")
-        # Both the staged-file scope contract (get-diff) and the commit log command
-        # must be present -- the judge performs both checks.
         assert "get-diff" in content, (
             "The staged-file check (devbench get-diff) must still be present -- the "
             "commit-attribution check is additive, not a replacement."
@@ -96,7 +92,6 @@ class TestChangesManifestJudgeCommitAttributionContract:
         and asserts the output would expose the undeclared file, confirming the
         judge's diagnostic prescription is sound.
         """
-        # Build a fake git repo simulating the bundled-commit scenario.
         repo = tmp_path / "repo"
         repo.mkdir()
 
@@ -114,17 +109,14 @@ class TestChangesManifestJudgeCommitAttributionContract:
         git("config", "user.name", "Test")
         git("checkout", "-b", "main")
 
-        # Initial commit on main (the origin/main baseline).
         (repo / "README.md").write_text("# repo\n", encoding="utf-8")
         git("add", "README.md")
         git("commit", "-m", "initial")
 
-        # Create the task branch.
         git("checkout", "-b", "task-branch")
 
-        # The executor committed two files but the manifest declares only one.
         declared_file = "src/feature.py"
-        bundled_file = "src/sibling.py"  # from a sibling task, accidentally bundled
+        bundled_file = "src/sibling.py"
 
         (repo / "src").mkdir()
         (repo / declared_file).write_text("# feature\n", encoding="utf-8")
@@ -132,8 +124,6 @@ class TestChangesManifestJudgeCommitAttributionContract:
         git("add", declared_file, bundled_file)
         git("commit", "-m", "implement feature (accidentally bundled sibling)")
 
-        # The judge's prescribed command: git log --name-only origin/main..HEAD
-        # We simulate origin/main by pointing at main (the initial commit branch).
         result = subprocess.run(
             [
                 "git",
@@ -150,10 +140,8 @@ class TestChangesManifestJudgeCommitAttributionContract:
         )
         committed_files = {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
-        # The manifest only declares the primary file.
         manifest_files = {declared_file}
 
-        # Files in commits but not in manifest -- the judge must FAIL on these.
         undeclared = committed_files - manifest_files
         assert bundled_file in undeclared, (
             f"The git log command prescribed by the judge must surface '{bundled_file}' "
@@ -161,7 +149,6 @@ class TestChangesManifestJudgeCommitAttributionContract:
             f"Committed={committed_files!r}, Manifest={manifest_files!r}, "
             f"Undeclared={undeclared!r}"
         )
-        # Confirm the declared file does NOT appear in undeclared.
         assert declared_file not in undeclared, (
             f"'{declared_file}' is in the manifest and must not appear in undeclared set."
         )

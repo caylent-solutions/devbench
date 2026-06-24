@@ -55,8 +55,6 @@ class TestCommandInjectorSend:
             command_submit_settle_seconds=8,
         )
         injector.send("orchestrate")
-        # New slash contract: type the literal (no newline), then submit a single
-        # Enter -- NOT the old single ``sendline`` of the literal.
         assert driver.child.sent == ["/devbench-orchestrate:orchestrate", "\r"]
 
     def test_send_returns_literal(self) -> None:
@@ -94,8 +92,6 @@ class TestCommandInjectorNonSlash:
     """A NON-slash literal keeps the legacy sendline (no trailing Enter)."""
 
     def test_non_slash_literal_uses_sendline(self) -> None:
-        # No leading ``/`` -> no autocomplete menu, so the literal is sent with the
-        # legacy ``sendline`` (the double records the payload with NO extra ``\r``).
         child = FakePexpectChild([_ScriptStep(emit="esc to interrupt", on_send="continue working")])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         injector = CommandInjector(
@@ -118,7 +114,7 @@ class TestCommandInjectorExtensible:
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         injector = CommandInjector(
             driver=driver,
-            registry={"compact": "/compact"},  # operator-added, no supervisor code touched
+            registry={"compact": "/compact"},
             ack_timeout_seconds=5,
             command_submit_quiet_seconds=1,
             command_submit_settle_seconds=8,

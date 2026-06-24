@@ -126,7 +126,6 @@ class TestFixUnitVerificationRunsParentGate:
             source_task_id=_SOURCE,
             generated_at="2026-06-16T00:00:00Z",
         )
-        # Parses without error (no duplicate VERIFY keyword) and runs the parent command.
         items = verification.parse_verification_section(draft_md)
         commands = [item.command for item in items if item.command]
         assert any(_PARENT_COMMAND in (cmd or "") for cmd in commands)

@@ -56,9 +56,8 @@ class TestCmdStatusUsesSharedActionabilityHelper:
                 else None,
             ),
         ):
-            pass  # verify the import does not cycle
+            pass
 
-        # The real check: cmd_status produces the correct output
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             rc = cli.cmd_status()
 
@@ -104,7 +103,6 @@ class TestCmdStatusUsesSharedActionabilityHelper:
     def test_blocked_count_formatting(self, blocked_count: int, capsys: pytest.CaptureFixture[str]) -> None:
         """The blocked count in the no-actionable line reflects the actual count."""
         blocked_units = [_make_task(f"E0-F1-S1-T{i}", WorkUnitStatus.BLOCKED) for i in range(blocked_count)]
-        # Also add one non-blocked unit so all_done is False but actionable is empty
         unit_in_review = _make_task("E0-F1-S1-T99", WorkUnitStatus.IN_REVIEW)
         units = blocked_units + [unit_in_review]
 
@@ -131,7 +129,6 @@ class TestSharedHelperImportNoCycle:
         import importlib
         import sys
 
-        # Remove from cache to force fresh import
         for mod_name in list(sys.modules.keys()):
             if "actionability" in mod_name:
                 del sys.modules[mod_name]
@@ -144,12 +141,10 @@ class TestSharedHelperImportNoCycle:
         import importlib
         import sys
 
-        # Remove from cache to force fresh import
         for mod_name in list(sys.modules.keys()):
             if "actionability" in mod_name:
                 del sys.modules[mod_name]
 
-        # Track modules loaded during import
         modules_before = set(sys.modules.keys())
         importlib.import_module("devbench.actionability")
         modules_after = set(sys.modules.keys())

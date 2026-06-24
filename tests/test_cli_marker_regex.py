@@ -22,10 +22,6 @@ import pytest
 from devbench import cli
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _build_backlog(
     tmp_path: Path,
@@ -61,11 +57,6 @@ def _build_backlog(
     return index_path
 
 
-# ---------------------------------------------------------------------------
-# AC-253-3: canonical-ID regex does not capture non-canonical tails
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestMarkerRegexNarrow:
     """AC-253-3: ``_BLOCKED_PENDING_PROPOSAL_MARKER_RE`` must NOT capture
@@ -74,12 +65,10 @@ class TestMarkerRegexNarrow:
     @pytest.mark.parametrize(
         "content,expected",
         [
-            # Canonical full ID is captured.
             (
                 "## Comments\n[BLOCKED_PENDING_PROPOSAL] E1-F2-S3-T4\n",
                 ["E1-F2-S3-T4"],
             ),
-            # Partial canonical IDs are also valid.
             (
                 "[BLOCKED_PENDING_PROPOSAL] E1\n",
                 ["E1"],
@@ -92,27 +81,22 @@ class TestMarkerRegexNarrow:
                 "[BLOCKED_PENDING_PROPOSAL] E1-F2-S3\n",
                 ["E1-F2-S3"],
             ),
-            # Non-canonical token: must produce NO match.
             (
                 "[BLOCKED_PENDING_PROPOSAL] Amendment\n",
                 [],
             ),
-            # Non-canonical token: arbitrary word.
             (
                 "[BLOCKED_PENDING_PROPOSAL] SomeWord\n",
                 [],
             ),
-            # Non-canonical token: UUID-like string.
             (
                 "[BLOCKED_PENDING_PROPOSAL] abc-123\n",
                 [],
             ),
-            # Multiple markers: only canonical IDs captured.
             (
                 "[BLOCKED_PENDING_PROPOSAL] E1-F2-S3-T4\n[BLOCKED_PENDING_PROPOSAL] Amendment\n",
                 ["E1-F2-S3-T4"],
             ),
-            # No marker: empty result.
             (
                 "## Comments\nSome other text\n",
                 [],
@@ -123,11 +107,6 @@ class TestMarkerRegexNarrow:
         """The module-level regex must match only canonical ID tails."""
         result = cli._BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
         assert result == expected
-
-
-# ---------------------------------------------------------------------------
-# AC-253-3: no ``unknown marker target`` skip for non-canonical marker tail
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -142,11 +121,6 @@ class TestNonCanonicalMarkerNoSkip:
     ) -> None:
         """A ``[BLOCKED_PENDING_PROPOSAL] Amendment`` line is ignored by the
         narrowed regex, so no skip is emitted for an unknown marker target."""
-        # T1 is done; T2 is blocked but its WU file contains the non-canonical
-        # ``[BLOCKED_PENDING_PROPOSAL] Amendment`` line (emitted by some
-        # automation before the fix).  With the broad ``\\S+`` regex T2 would
-        # have been skipped as ``unknown marker target Amendment``.  With the
-        # narrowed regex the line is ignored and T2 flips normally.
         comments_t2 = "\n## Comments\n[BLOCKED_PENDING_PROPOSAL] Amendment\n"
         index = _build_backlog(
             tmp_path,
@@ -176,11 +150,6 @@ class TestNonCanonicalMarkerNoSkip:
         )
         flipped_ids = {item["unit_id"] for item in envelope.get("flipped", [])}
         assert "E0-F1-S1-T2" in flipped_ids, "T2 must flip to in-queue because its only dep (T1) is done"
-
-
-# ---------------------------------------------------------------------------
-# AC-253c-1: all three consumers inherit the narrowed pattern
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

@@ -81,7 +81,6 @@ class TestGuardHarnessWriteBlocks:
         ],
     )
     def test_protected_path_blocked(self, rel_path: str, label: str, tool_name: str) -> None:
-        # Absolute form (the real on-disk path under the devbench checkout).
         abs_path = str(REPO_ROOT / rel_path)
         result = _run(abs_path, tool_name=tool_name)
         assert result.returncode == 2, (
@@ -113,19 +112,12 @@ class TestGuardHarnessWriteAllows:
     """Non-harness targets are allowed (exit 0) -- the guard is generically scoped (AC-2)."""
 
     def test_target_repo_source_allowed(self) -> None:
-        # A target repo's own src/devbench-named tree is NOT the devbench
-        # checkout the guard lives in, so it must be allowed. The guard scopes
-        # only to ITS OWN resolved repo root, never any path merely containing
-        # the substring 'src/devbench'.
         result = _run("/workspaces/telemetry/tools-telemetry/providers/aws/kms/main.tf")
         assert result.returncode == 0, (
             f"a target-repo source file must be allowed; got rc={result.returncode}, stderr={result.stderr!r}"
         )
 
     def test_unrelated_src_devbench_in_other_repo_allowed(self, tmp_path: Path) -> None:
-        # A file literally at <other-repo>/src/devbench/x.py that is NOT under
-        # the guard's resolved devbench repo root must be ALLOWED -- the guard
-        # anchors on its own repo root, not the bare substring.
         foreign = tmp_path / "some-other-repo" / "src" / "devbench" / "x.py"
         foreign.parent.mkdir(parents=True)
         foreign.write_text("# foreign\n", encoding="utf-8")
@@ -154,8 +146,6 @@ class TestGuardHarnessWriteAllows:
         )
 
     def test_devbench_docs_allowed(self) -> None:
-        # Docs under the devbench repo are not harness LOGIC -- editing them is
-        # part of keeping docs in sync, so they are allowed.
         target = str(REPO_ROOT / "docs" / "plugin-architecture.md")
         result = _run(target)
         assert result.returncode == 0, (

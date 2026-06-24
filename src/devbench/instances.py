@@ -41,8 +41,8 @@ class Instance:
     workspace: str
     workspace_name: str
     session: str
-    mode: str  # "daemon" | "foreground"
-    started_at: str  # ISO-8601 UTC
+    mode: str
+    started_at: str
     model: str
     pid_file: str
 

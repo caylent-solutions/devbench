@@ -42,16 +42,6 @@ _log = logging.getLogger("devbench.reporting.snapshot")
 SNAPSHOT_DIR_NAME = ".devbench"
 SNAPSHOT_FILE_NAME = "report-snapshot.json"
 
-# Bump whenever the on-disk snapshot schema changes in a way that makes
-# previously-written snapshots unreadable. ``read_snapshot`` returns None
-# on a mismatch and the caller rebuilds via the live path.
-#
-# Version 2 (issue #168): freshness key now covers BOTH the live flat
-# log AND the sharded-tree shard mtime aggregate. Workspaces with
-# sharded layouts (post-Phase-3 migration) need the shard-tree mtimes
-# in the key so any shard mutation invalidates the snapshot. Old v1
-# snapshots return None on read and the caller rebuilds via the live
-# path on next iteration.
 _SCHEMA_VERSION = 2
 
 

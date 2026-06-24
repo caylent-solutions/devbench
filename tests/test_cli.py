@@ -201,7 +201,6 @@ class TestCmdStatus:
         total_idx = next(i for i, line in enumerate(lines) if "TOTAL" in line)
         draft_idx = next(i for i, line in enumerate(lines) if "Draft" in line)
         in_queue_idx = next(i for i, line in enumerate(lines) if "In Queue" in line)
-        # Draft must be between TOTAL and In Queue
         assert total_idx < draft_idx < in_queue_idx
 
     def test_draft_row_zero_when_no_drafts(
@@ -266,10 +265,8 @@ class TestCmdStatusDraftRowIntegration:
         assert rc == 0
         out = capsys.readouterr().out
         lines = out.splitlines()
-        # Draft row exists with count of 2
         draft_line = next(line for line in lines if "Draft" in line)
         assert "2" in draft_line
-        # Ordering: TOTAL < Draft < In Queue
         total_idx = next(i for i, line in enumerate(lines) if "TOTAL" in line)
         draft_idx = next(i for i, line in enumerate(lines) if "Draft" in line)
         in_queue_idx = next(i for i, line in enumerate(lines) if "In Queue" in line)
@@ -282,8 +279,6 @@ class TestCmdStatusDetail:
     def _build_backlog(self, tmp_path: Path) -> Path:
         wu_dir = tmp_path / "backlog"
         wu_dir.mkdir(exist_ok=True)
-        # T1 in-queue ready (no deps); T2 in-queue waiting on T1; T3 blocked
-        # with an open proposal marker; T4 held with a [HOLD] reason.
         rows = [
             ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
             ("E0-F1-S1-T2", "Task", "in-queue", "E0-F1-S1-T1", "E0-F1-S1-T2", ""),
@@ -337,16 +332,13 @@ class TestCmdStatusDetail:
             rc = cli.cmd_status("--detail")
         assert rc == 0
         out = capsys.readouterr().out
-        # In-queue panel: T1 ready, T2 waiting on T1
         assert "In-queue tasks" in out
         assert "[ready]" in out
         assert "E0-F1-S1-T1" in out
         assert "[waiting]" in out
         assert "blocker: E0-F1-S1-T1" in out
-        # Blocked panel: T3 with pending proposal marker
         assert "Blocked tasks" in out
         assert "pending proposal E0-F1-S1-T9" in out
-        # Held panel: T4 with HOLD reason
         assert "Held tasks" in out
         assert "awaiting product input" in out
 
@@ -406,9 +398,6 @@ class TestCmdNext:
         assert result == 0
         output = capsys.readouterr().out.strip()
         data = json.loads(output)
-        # TD-12: assert the full envelope shape, not just one field, so a
-        # regression in any envelope key (renamed, dropped, mistyped) is
-        # caught here rather than at a downstream parser.
         assert data["id"] == "E0-F1-S1-T2"
         assert data["title"] == "Second Task"
         assert data["repo"] == "caylent-solutions/git-repo"
@@ -488,10 +477,6 @@ class TestCmdNextScopeFilter:
     and return rc=0.
     """
 
-    # ------------------------------------------------------------------
-    # Shared helpers
-    # ------------------------------------------------------------------
-
     def _make_units(self, ids: list[str]) -> list[WorkUnit]:
         """Return IN_QUEUE WorkUnit stubs for the given IDs."""
         return [
@@ -528,10 +513,6 @@ class TestCmdNextScopeFilter:
         }
         (scope_dir / "scope.json").write_text(json.dumps(payload))
 
-    # ------------------------------------------------------------------
-    # Happy path: active scope.json, matching candidates exist
-    # ------------------------------------------------------------------
-
     def test_scope_json_filters_candidates_to_matching_unit(
         self,
         tmp_path: Path,
@@ -552,7 +533,6 @@ class TestCmdNextScopeFilter:
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = units
-        # Simulate parser filtering: only E1-F1-S1-T1 survives when scope is applied.
         mock_parser.get_parallel_candidates.return_value = [units[0]]
 
         with (
@@ -564,16 +544,11 @@ class TestCmdNextScopeFilter:
         assert rc == 0
         data = json.loads(capsys.readouterr().out.strip())
         assert data["id"] == "E1-F1-S1-T1"
-        # Verify scope was passed to get_parallel_candidates.
         call_kwargs = mock_parser.get_parallel_candidates.call_args
         assert call_kwargs is not None
         passed_scope = call_kwargs.kwargs.get("scope") or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
         assert passed_scope is not None
         assert "E1-F1-S1-T1" in passed_scope.expanded_ids
-
-    # ------------------------------------------------------------------
-    # AC-190-15: scope exhausted -- no WU in scope is actionable
-    # ------------------------------------------------------------------
 
     def test_no_actionable_in_scope_when_scope_filters_all_out(
         self,
@@ -586,7 +561,7 @@ class TestCmdNextScopeFilter:
             tmp_path,
             include=["E3"],
             exclude=[],
-            expanded_ids=[],  # scope expands to nothing in this backlog
+            expanded_ids=[],
         )
 
         mock_parser = MagicMock()
@@ -603,13 +578,8 @@ class TestCmdNextScopeFilter:
         assert rc == 0
         out = capsys.readouterr().out
         assert "NO_ACTIONABLE_IN_SCOPE" in out
-        # Must NOT print ALL_DONE or NO_ACTIONABLE (the non-scope variant).
         assert "ALL_DONE" not in out
         assert out.strip() == "NO_ACTIONABLE_IN_SCOPE"
-
-    # ------------------------------------------------------------------
-    # Without scope.json: existing NO_ACTIONABLE / ALL_DONE paths unchanged
-    # ------------------------------------------------------------------
 
     def test_no_scope_json_prints_no_actionable_not_in_scope(
         self,
@@ -655,10 +625,6 @@ class TestCmdNextScopeFilter:
         assert rc == 0
         assert "ALL_DONE" in capsys.readouterr().out
 
-    # ------------------------------------------------------------------
-    # AC-190-11: per-command --include flag overrides active scope.json
-    # ------------------------------------------------------------------
-
     def test_include_flag_overrides_scope_json(
         self,
         tmp_path: Path,
@@ -666,7 +632,6 @@ class TestCmdNextScopeFilter:
     ) -> None:
         """Per-command --include flag overrides the active scope.json (AC-190-11)."""
         units = self._make_units(["E1-F1-S1-T1", "E2-F1-S1-T1"])
-        # scope.json says E3 (nothing matches) but --include "E1" should override.
         self._write_scope_json(
             tmp_path,
             include=["E3"],
@@ -687,7 +652,6 @@ class TestCmdNextScopeFilter:
         assert rc == 0
         data = json.loads(capsys.readouterr().out.strip())
         assert data["id"] == "E1-F1-S1-T1"
-        # Verify a scope was passed to get_parallel_candidates with E1 tokens.
         call_kwargs = mock_parser.get_parallel_candidates.call_args
         passed_scope = call_kwargs.kwargs.get("scope") or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
         assert passed_scope is not None
@@ -716,10 +680,6 @@ class TestCmdNextScopeFilter:
         assert passed_scope is not None
         assert passed_scope.exclude == ["E1-F1-S1-T2"]
 
-    # ------------------------------------------------------------------
-    # Corrupt scope.json -> rc=1 with actionable error on stderr
-    # ------------------------------------------------------------------
-
     def test_corrupt_scope_json_returns_rc1_with_stderr(
         self,
         tmp_path: Path,
@@ -743,10 +703,6 @@ class TestCmdNextScopeFilter:
         err = capsys.readouterr().err
         assert "scope.json" in err
 
-    # ------------------------------------------------------------------
-    # Integration: real fixture -- scope.json on disk selects correct WU
-    # ------------------------------------------------------------------
-
     def test_integration_scope_json_selects_correct_next(
         self,
         tmp_path: Path,
@@ -760,7 +716,6 @@ class TestCmdNextScopeFilter:
         """
         from devbench.scope import ScopeFilter
 
-        # Build a minimal BACKLOG.md index.
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir(parents=True)
         backlog_index = tmp_path / "BACKLOG.md"
@@ -774,12 +729,10 @@ class TestCmdNextScopeFilter:
             " | feat/test | backlog/E2-F1-S1-T1.md |\n"
         )
 
-        # Write minimal work-unit files.
         dep_header = "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
         for wu_id in ("E1-F1-S1-T1", "E2-F1-S1-T1"):
             (backlog_dir / f"{wu_id}.md").write_text(f"# {wu_id}: Task\n\n## Status: in-queue\n\n{dep_header}")
 
-        # Write scope.json that includes only E1-F1-S1-T1.
         scope_filter = ScopeFilter(
             include=["E1"],
             exclude=[],
@@ -823,7 +776,6 @@ class TestCmdNextScopeFilter:
         dep_header = "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
         (backlog_dir / "E1-F1-S1-T1.md").write_text(f"# E1-F1-S1-T1: Task\n\n## Status: in-queue\n\n{dep_header}")
 
-        # Scope that matches nothing in this backlog (E9 does not exist).
         scope_filter = ScopeFilter(
             include=["E9"],
             exclude=[],
@@ -841,10 +793,6 @@ class TestCmdNextScopeFilter:
         assert rc == 0
         out = capsys.readouterr().out
         assert "NO_ACTIONABLE_IN_SCOPE" in out
-
-    # ------------------------------------------------------------------
-    # Error path: --include / --exclude without a following value
-    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize("flag", ["--include", "--exclude"])
     def test_flag_without_value_returns_rc1_with_stderr(
@@ -1266,10 +1214,6 @@ class TestCmdSetStatus:
         assert "in-progress" in capsys.readouterr().out
         mock_mgr.force_status.assert_called_once()
 
-    # ------------------------------------------------------------------
-    # Bulk --include / --exclude tests (AC-194-1, AC-194-2, AC-194-10)
-    # ------------------------------------------------------------------
-
     def test_bulk_include_returns_0_on_success(
         self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1330,7 +1274,6 @@ class TestCmdSetStatus:
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
         ):
-            # Include all, exclude T3 -- only T1 and T2 should be updated
             result = cli.cmd_set_status("--include", "E0", "--exclude", "E0-F1-S1-T3", "in-queue")
 
         assert result == 0
@@ -1397,16 +1340,14 @@ class TestCmdSetStatus:
 
             cli.cmd_set_status("--include", "E0-F1-S1-T2", "in-queue")
 
-        # Verify ScopeFilter.parse was called -- proving no duplication
         mock_sf_class.parse.assert_called_once()
         call_args = mock_sf_class.parse.call_args
-        assert call_args.args[0] == "E0-F1-S1-T2"  # include_str
+        assert call_args.args[0] == "E0-F1-S1-T2"
 
     def test_bulk_file_missing_prints_warning_continues(
         self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Bulk update: WU with missing file prints warning but does not abort the batch."""
-        # Only create file for T2, not T1 or T3
         wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n## Status: in-queue\n")
 
@@ -1421,7 +1362,6 @@ class TestCmdSetStatus:
         ):
             result = cli.cmd_set_status("--include", "E0", "in-queue")
 
-        # Should succeed for T2 even though T1/T3 files are missing
         assert result == 0
         assert mock_mgr.bulk_set_status.call_count >= 1
 
@@ -1445,10 +1385,6 @@ class TestCmdSetStatus:
         err = capsys.readouterr().err
         assert "reversed range" in err.lower() or "scope" in err.lower()
 
-    # ------------------------------------------------------------------
-    # --dry-run tests (AC-194-3)
-    # ------------------------------------------------------------------
-
     @pytest.mark.unit
     def test_dry_run_bulk_prints_affected_wus_and_returns_0(
         self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -1470,11 +1406,9 @@ class TestCmdSetStatus:
 
         assert result == 0
         out = capsys.readouterr().out
-        # Each matched WU should appear in output with tab-separated id/current/new
         for unit in mock_units:
             assert unit.id in out
         assert "in-queue" in out
-        # No writes must have happened
         mock_mgr.force_status.assert_not_called()
 
     @pytest.mark.unit
@@ -1548,10 +1482,6 @@ class TestCmdSetStatus:
         assert result == 1
         assert "no work units" in capsys.readouterr().err.lower()
 
-    # ------------------------------------------------------------------
-    # --yes flag and bulk_update_confirm_threshold tests (AC-194-4)
-    # ------------------------------------------------------------------
-
     @pytest.mark.unit
     def test_yes_flag_parsed_and_skips_prompt(
         self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -1564,7 +1494,6 @@ class TestCmdSetStatus:
         mock_parser.parse_index.return_value = mock_units
         mock_mgr = MagicMock()
 
-        # Patch threshold to 0 so prompt would normally be triggered
         mock_backlog_cfg = MagicMock()
         mock_backlog_cfg.bulk_update_confirm_threshold = 0
         mock_runtime_cfg = MagicMock()
@@ -1595,7 +1524,6 @@ class TestCmdSetStatus:
         mock_parser.parse_index.return_value = mock_units
         mock_mgr = MagicMock()
 
-        # threshold=1 means 3 matched units (len(mock_units)=3) > 1 triggers prompt
         mock_backlog_cfg = MagicMock()
         mock_backlog_cfg.bulk_update_confirm_threshold = 1
         mock_runtime_cfg = MagicMock()
@@ -1613,7 +1541,7 @@ class TestCmdSetStatus:
         assert result == 0
         mock_input.assert_called_once()
         prompt_text = mock_input.call_args.args[0]
-        assert "3" in prompt_text  # count of matched units
+        assert "3" in prompt_text
         assert mock_mgr.bulk_set_status.call_count > 0
 
     @pytest.mark.unit
@@ -1662,7 +1590,6 @@ class TestCmdSetStatus:
         mock_parser.parse_index.return_value = mock_units
         mock_mgr = MagicMock()
 
-        # threshold=10 means 3 matched units <= 10 -- no prompt
         mock_backlog_cfg = MagicMock()
         mock_backlog_cfg.bulk_update_confirm_threshold = 10
         mock_runtime_cfg = MagicMock()
@@ -1726,10 +1653,6 @@ class TestCmdSetStatus:
         assert result == 0
         assert mock_mgr.bulk_set_status.call_count > 0
 
-    # ------------------------------------------------------------------
-    # AC-194-8: parser error messages reused verbatim from #190
-    # ------------------------------------------------------------------
-
     @pytest.mark.unit
     def test_invalid_scope_token_error_message_matches_190_verbatim(
         self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
@@ -1779,10 +1702,6 @@ class TestCmdSetStatus:
             f"Expected prefix 'ERROR: invalid scope token: ', got: {err!r}"
         )
         assert exc_text in err
-
-    # ------------------------------------------------------------------
-    # AC-194-9: status-enum guard -- draft is Task-only
-    # ------------------------------------------------------------------
 
     @pytest.mark.unit
     def test_single_draft_status_rejected_for_epic(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1996,11 +1915,9 @@ class TestCmdSetStatusBulkIntegration:
 
         assert result == 0
 
-        # E2 unit must not be changed
         e2_file = backlog_root / "E2-F1-S1-T1.md"
         assert "in-queue" in e2_file.read_text()
 
-        # E1 units must be changed
         e1t1_file = backlog_root / "E1-F1-S1-T1.md"
         assert "in-progress" in e1t1_file.read_text()
         e1t2_file = backlog_root / "E1-F1-S1-T2.md"
@@ -2066,7 +1983,6 @@ class TestCmdSetStatusBulkIntegration:
             result = cli.cmd_set_status("--dry-run", "--include", "E1", "in-progress")
 
         assert result == 0
-        # Files must be unchanged
         assert (backlog_root / "E1-F1-S1-T1.md").read_text() == original_t1
         assert (backlog_root / "E1-F1-S1-T2.md").read_text() == original_t2
 
@@ -2109,7 +2025,7 @@ class TestCmdSetStatusBulkIntegration:
         backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
 
         mock_backlog_cfg = MagicMock()
-        mock_backlog_cfg.bulk_update_confirm_threshold = 0  # would prompt without --yes
+        mock_backlog_cfg.bulk_update_confirm_threshold = 0
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.backlog = mock_backlog_cfg
 
@@ -2125,7 +2041,6 @@ class TestCmdSetStatusBulkIntegration:
         assert result == 0
         mock_input.assert_not_called()
 
-        # All three files must be updated
         for uid, _ in units:
             assert "in-progress" in (backlog_root / f"{uid}.md").read_text()
 
@@ -2172,7 +2087,7 @@ class TestCmdSetStatusBulkIntegration:
         backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
 
         mock_backlog_cfg = MagicMock()
-        mock_backlog_cfg.bulk_update_confirm_threshold = 10  # 2 units <= 10, no prompt
+        mock_backlog_cfg.bulk_update_confirm_threshold = 10
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.backlog = mock_backlog_cfg
 
@@ -2223,15 +2138,13 @@ class TestCmdSetStatusBulkIntegration:
             result = cli.cmd_set_status("--include", "E1", "in-progress")
 
         assert result == 0
-        # bulk_set_status must be called exactly once with both IDs
         mock_mgr.bulk_set_status.assert_called_once()
         call_args = mock_mgr.bulk_set_status.call_args
-        unit_ids_arg = call_args[0][0]  # positional first arg
+        unit_ids_arg = call_args[0][0]
         assert len(unit_ids_arg) == 2
         ids_passed = [uid for uid, _ in unit_ids_arg]
         assert "E1-F1-S1-T1" in ids_passed
         assert "E1-F1-S1-T2" in ids_passed
-        # force_status must NOT be called -- the flock path is through bulk_set_status
         mock_mgr.force_status.assert_not_called()
 
     @pytest.mark.unit
@@ -2261,7 +2174,6 @@ class TestCmdSetStatusBulkIntegration:
             result = cli.cmd_set_status("--include", "E1", "in-progress")
 
         assert result == 0
-        # The audit file must exist and contain the BULK_STATUS_UPDATE marker
         assert audit_log_path.exists(), f"Audit log not created at {audit_log_path}"
         audit_content = audit_log_path.read_text()
         assert "[BULK_STATUS_UPDATE]" in audit_content
@@ -2301,7 +2213,6 @@ class TestCmdSetStatusBulkIntegration:
 
         assert result == 0
         call_args = mock_mgr.bulk_set_status.call_args
-        # audit_log_path is the 4th positional argument (unit_ids, new_status, backlog_index, audit_log_path)
         audit_path_arg = call_args[0][3]
         assert Path(audit_path_arg) == expected_audit_path
 
@@ -2519,7 +2430,6 @@ class TestCmdValidateBacklogPathResolution:
         validate-backlog must return 0 (no false 'file missing' errors).
         """
         idx, backlog_dir = self._make_layout(tmp_path)
-        # Simulate production: BACKLOG_INDEX at workspace, BACKLOG_ROOT = workspace/backlog
         with (
             patch("devbench.cli.BACKLOG_INDEX", idx),
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
@@ -2540,7 +2450,6 @@ class TestCmdValidateBacklogPathResolution:
         ):
             cli.cmd_validate_backlog()
 
-        # Second arg must be workspace root (idx.parent), not BACKLOG_ROOT (backlog_dir)
         _, call_kwargs = mock_mgr.validate_with_warnings.call_args
         positional = mock_mgr.validate_with_warnings.call_args.args
         workspace_root_arg = positional[1] if len(positional) > 1 else call_kwargs.get("workspace_root")
@@ -2589,7 +2498,7 @@ class TestMain:
         out = capsys.readouterr().out
         assert result == 0
         assert "Usage: devbench" in out
-        assert "status" in out  # one of the registered commands
+        assert "status" in out
 
     def test_unknown_command_returns_1(self) -> None:
         with patch("sys.argv", ["judges.cli", "nonexistent"]):
@@ -2998,7 +2907,6 @@ class TestCmdGitOpsConflictingRetry:
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
         mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
-        # First call raises ConflictingPRError, second succeeds
         mock_ops.merge_pr.side_effect = [
             ConflictingPRError("CONFLICTING"),
             None,
@@ -3037,7 +2945,6 @@ class TestCmdGitOpsConflictingRetry:
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
         mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
-        # Both calls fail
         mock_ops.merge_pr.side_effect = [
             ConflictingPRError("CONFLICTING"),
             RuntimeError("merge still failed"),
@@ -3055,7 +2962,6 @@ class TestCmdGitOpsConflictingRetry:
         assert result == 1
         err_output = capsys.readouterr().err
         assert "merge" in err_output.lower() or "ERROR" in err_output
-        # Must not call merge_pr a third time
         assert mock_ops.merge_pr.call_count == 2
 
 
@@ -3150,7 +3056,6 @@ class TestCmdGetDiff:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
 
-        # Simulate: bare main3 would include upstream-merged file, origin/main3 would not
         branch_only_diff = (
             "diff --git a/new_feature.py b/new_feature.py\n+++ b/new_feature.py\n@@ -0,0 +1 @@\n+feature\n"
         )
@@ -3374,11 +3279,6 @@ class TestCmdLogComment:
         assert "not found" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# E230-F1-S1-T1: Discrete event comments in cmd_git_ops and cmd_mark_done
-# ---------------------------------------------------------------------------
-
-
 def _make_git_ops_unit(unit_id: str = "E230-F1-S1-T1") -> WorkUnit:
     """Return a WorkUnit suitable for cmd_git_ops tests."""
     return WorkUnit(
@@ -3485,7 +3385,6 @@ class TestCmdGitOpsEventComments:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         mock_ops = self._build_mock_ops(pr_url)
-        # First merge raises ConflictingPRError, second succeeds
         mock_ops.merge_pr.side_effect = [ConflictingPRError("CONFLICTING"), None]
         repo_path = tmp_path / "devbench"
 
@@ -3543,7 +3442,6 @@ class TestCmdGitOpsEventComments:
         unit_id = "E230-F1-S1-T1"
         pr_url = "https://github.com/org/repo/pull/42"
         unit = _make_git_ops_unit(unit_id)
-        # Note: wu_file is NOT created -- file resolution should fail gracefully
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
@@ -3562,7 +3460,6 @@ class TestCmdGitOpsEventComments:
         ):
             result = cli.cmd_git_ops(unit_id)
 
-        # Must NOT fail due to missing file -- git ops already succeeded
         assert result == 0
 
 
@@ -3589,7 +3486,6 @@ class TestCmdMarkDoneEventComment:
             dependencies=[],
         )
 
-        # Build BACKLOG.md with the unit row
         backlog_index = tmp_path / "BACKLOG.md"
         backlog_index.write_text(
             "# Backlog\n\n"
@@ -3599,7 +3495,6 @@ class TestCmdMarkDoneEventComment:
             encoding="utf-8",
         )
 
-        # All judges pass so mark_done gate is satisfied
         all_pass_comments = "".join(
             f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
         )
@@ -3677,10 +3572,6 @@ class TestCmdMarkDoneEventComment:
             cli.cmd_mark_done(unit_id)
 
         content = wu_file.read_text(encoding="utf-8")
-        # The [DONE] comment appended by cmd_mark_done must not contain review tokens
-        # The existing [REVIEW_PASS] lines from the all_pass_comments are present in content
-        # but we only need to verify the NEW entry (last line) doesn't have them.
-        # Split on the comments that were there before:
         done_section = content.split("[REVIEW_PASS] ok")[-1]
         assert "[REVIEW_PASS]" not in done_section
         assert "[REVIEW_FAIL]" not in done_section
@@ -3725,8 +3616,6 @@ class TestCmdMarkDoneAlreadySatisfied:
         backlog_subdir = tmp_path / "backlog"
         backlog_subdir.mkdir()
         wu_file = backlog_subdir / f"{self._UNIT_ID}.md"
-        # Intentionally NO canonical judge REVIEW_PASS lines: the review pipeline
-        # can never run without a diff, so the standard done-gate is unsatisfiable.
         wu_file.write_text(
             f"# {self._UNIT_ID}\n\n## Status: in-review\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-1: output present\n\n"
@@ -3819,7 +3708,6 @@ class TestCmdMarkDoneAlreadySatisfied:
         wu_file, backlog_index, unit = self._build(
             tmp_path, manifest=self._VERIF_ONLY_MANIFEST, verification=self._VERIF_BLOCK
         )
-        # No evidence ledger written.
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         with (
@@ -3898,7 +3786,6 @@ class TestResolveUnitFile:
             repo="caylent-solutions/devbench",
             dependencies=[],
         )
-        # No file is created -- both paths will be missing
 
         with (
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog_root"),
@@ -3919,7 +3806,6 @@ class TestResolveUnitFile:
             repo="caylent-solutions/devbench",
             dependencies=[],
         )
-        # File exists only under workspace_root
         ws_file = tmp_path / "workspace" / "backlog" / "E230-F1-S1-T1.md"
         ws_file.parent.mkdir(parents=True, exist_ok=True)
         ws_file.write_text("# E230-F1-S1-T1\n\n## Status: in-queue\n", encoding="utf-8")
@@ -3933,10 +3819,6 @@ class TestResolveUnitFile:
         assert result is not None
         assert result == ws_file
 
-
-# ---------------------------------------------------------------------------
-# E231-F2-S1-T1: cmd_log_tdd and log-tdd command registration
-# ---------------------------------------------------------------------------
 
 _WORK_UNIT_WITH_TDD_LOG_TEMPLATE = """\
 # {unit_id}: TDD Test
@@ -3980,7 +3862,6 @@ class TestCmdLogTdd:
         wu_file = _make_wu_with_tdd_section(tmp_path, unit_id)
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir(exist_ok=True)
-        # Copy wu_file into backlog subdir so _resolve_unit_file finds it
         backlog_wu = backlog_dir / f"{unit_id}.md"
         backlog_wu.write_text(wu_file.read_text(encoding="utf-8"), encoding="utf-8")
         backlog_index = _make_backlog_index_for_tdd(tmp_path, unit_id, backlog_wu)
@@ -4099,7 +3980,6 @@ class TestCmdLogTdd:
 
         assert result == 0
         content = wu_file.read_text(encoding="utf-8")
-        # Entry should be normalized to uppercase [RED]
         assert "[RED]" in content
 
     def test_log_tdd_invalid_phase_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -4131,7 +4011,6 @@ class TestCmdLogTdd:
 
     def test_log_tdd_missing_section_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-6: Exits non-zero when ## TDD Cycle Log section does not exist in the file."""
-        # Create a work unit WITHOUT the TDD Cycle Log section
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir(exist_ok=True)
         wu_file = backlog_dir / "E231-F2-S1-T1.md"
@@ -4194,7 +4073,6 @@ class TestCmdLogTdd:
         content = wu_file.read_text(encoding="utf-8")
         comments_start = content.find("## Comments")
         tdd_start = content.find("## TDD Cycle Log")
-        # Extract comments section (before TDD Cycle Log)
         comments_section = content[comments_start:tdd_start] if tdd_start > comments_start else content[comments_start:]
         assert "unique-tdd-marker-xyz" not in comments_section, f"TDD entry leaked into ## Comments: {comments_section}"
 
@@ -4328,7 +4206,6 @@ class TestCmdReadUnitFileResolution:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
-        # File exists under WORKSPACE_ROOT, not BACKLOG_ROOT
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
@@ -4460,7 +4337,6 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        # Create an untracked file for the synthetic diff
         untracked_file = repo_path / "new_file.py"
         untracked_file.write_text("print('hello')\n", encoding="utf-8")
 
@@ -4519,7 +4395,6 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        # Do NOT create the file so reading it raises OSError
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
@@ -4543,13 +4418,11 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        # Create a valid file so one line succeeds, and one blank line gets skipped
         valid_file = repo_path / "valid.py"
         valid_file.write_text("x = 1\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
-                # Mix of a valid file and an empty line
                 return (0, "valid.py\n\n", "")
             return (0, "", "")
 
@@ -4969,7 +4842,7 @@ class TestCmdRunTests:
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             calls.append(cmd)
             if cmd == ["make", "-n", "test"]:
-                return (0, "", "")  # test target exists
+                return (0, "", "")
             if cmd == ["make", "test"]:
                 return (0, "Tests passed", "")
             return (0, "", "")
@@ -4995,7 +4868,7 @@ class TestCmdRunTests:
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             calls.append(cmd)
             if cmd == ["make", "-n", "test"]:
-                return (1, "", "No rule to make target")  # no test target
+                return (1, "", "No rule to make target")
             return (0, "5 passed", "")
 
         with (
@@ -5489,10 +5362,6 @@ class TestCmdStartStopReasonClassification:
         """AC-1: non-terminal ResultMessage(end_turn, result='') => 'premature-turn-end', not 'clean'."""
         import sys
 
-        # A ResultMessage with empty result triggers a continuation; after
-        # the budget is exhausted the loop ends.  Build a fake SDK that yields
-        # exactly one non-terminal ResultMessage (empty result) and then
-        # exhausts, causing a premature turn-end.
         premature_msg = self._make_result_message("")
         mock_sdk = _make_fake_sdk_module([premature_msg])
 
@@ -5945,7 +5814,6 @@ class TestCmdStartNameFlag:
         assert started_at_path.is_file(), f"Expected started_at file at {started_at_path}"
         raw = started_at_path.read_text(encoding="utf-8").strip()
         recorded = datetime.fromisoformat(raw)
-        # Normalise to UTC for comparison
         if recorded.tzinfo is None:
             recorded = recorded.replace(tzinfo=UTC)
         assert before <= recorded <= after, (
@@ -6088,9 +5956,7 @@ class TestCmdStartNameFlag:
         cli._write_session_state_files(tmp_path, "sess", 4242, ["E1-F1-S1-T1", "E1-F1-S1-T2"])
         state_dir = tmp_path / ".devbench" / "sessions" / "sess"
         assert (state_dir / "pid").read_text() == "4242"
-        # scope.json is intentionally NOT written here (no bare-array corruption).
         assert not (state_dir / "scope.json").exists()
-        # The expanded scope is still recorded in the session registry.
         entry = next(s for s in SessionRegistry(tmp_path).load() if s.name == "sess")
         assert entry.scope == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
 
@@ -6138,7 +6004,6 @@ class TestCmdStartNameFlag:
         assert rc is None
         assert scope_ids == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
         assert session_scope_path.exists()
-        # The object schema round-trips at the per-session path the readers use.
         monkeypatch.setenv("DEVBENCH_SESSION_NAME", "sess")
         loaded = ScopeFilter.from_file(tmp_path)
         assert set(loaded.expanded_ids) == set(scope_ids)
@@ -6309,8 +6174,6 @@ class TestCmdStartScopeOverlap:
     @pytest.mark.unit
     def test_allow_overlap_flag_missing_value_returns_rc1(self, capsys: pytest.CaptureFixture[str]) -> None:
         """--allow-overlap is a boolean flag; it takes no value argument."""
-        # --allow-overlap is a boolean flag so the parser must accept it without a value.
-        # Passing an unknown flag after --allow-overlap must still error.
         rc = cli.cmd_start("--allow-overlap", "--unknown-flag-after")
         assert rc == 1
         err = capsys.readouterr().err
@@ -6435,7 +6298,6 @@ class TestCmdReport:
         import warnings
 
         def fake_stream_report(*args: object, **kwargs: object) -> int:
-            # Stand-in for the streaming loop: returns immediately.
             return 0
 
         with (
@@ -6448,7 +6310,6 @@ class TestCmdReport:
             result = cli.cmd_report(watch_interval=5)
 
         assert result == 0
-        # Deprecation warning fired for --watch.
         assert any(issubclass(w.category, DeprecationWarning) and "--watch" in str(w.message) for w in caught)
 
     def test_cmd_report_streams_on_tty_by_default(self) -> None:
@@ -6682,9 +6543,6 @@ class TestGitOpsDeferred:
             )
 
         assert result == 0
-        # _resolve_unit_file is patched to None here, so the manifest cannot be
-        # parsed and commit_local receives manifest_paths=None (the git add -A
-        # fallback). A resolvable unit file passes the parsed manifest paths.
         mock_ops.commit_local.assert_called_once_with(
             "caylent-solutions/git-repo",
             tmp_path,
@@ -6749,9 +6607,6 @@ class TestGitOpsDeferred:
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli._resolve_unit_file", return_value=wu_file),
-            # Bypass manifest-scope check: this test only cares that the
-            # audit comment was appended, not about manifest enforcement
-            # (which has its own dedicated tests).
             patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
             patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
@@ -6820,11 +6675,9 @@ class TestGitOpsDeferred:
 
         assert result == 0
         expected_paths = ["providers/aws/primitives/acm-certificate/test.config"]
-        # commit_local receives the sentinel-filtered manifest path list.
         passed_paths = mock_ops.commit_local.call_args[0][4]
         assert passed_paths == expected_paths
         assert "<verification-only>" not in passed_paths
-        # assert_staged_matches_manifest is also fed the filtered list.
         assert mock_assert.call_args[0][1] == expected_paths
 
 
@@ -6922,7 +6775,7 @@ class TestCmdGitOpsFinalizeNotifications:
         from devbench.github.git_ops import CIResult
 
         mock_ops = MagicMock()
-        mock_ops.find_open_pr.return_value = None  # no pre-existing -> fresh create
+        mock_ops.find_open_pr.return_value = None
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
         mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
@@ -6959,8 +6812,8 @@ class TestCmdGitOpsFinalizeNotifications:
 
         existing_url = "https://github.com/org/repo/pull/60"
         mock_ops = MagicMock()
-        mock_ops.find_open_pr.return_value = existing_url  # PR already open
-        mock_ops.create_pr.return_value = existing_url  # create_pr returns existing
+        mock_ops.find_open_pr.return_value = existing_url
+        mock_ops.create_pr.return_value = existing_url
         mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
         captured: list[Any] = []
@@ -7091,7 +6944,6 @@ class TestCmdGitOpsFinalizeNotifications:
         unit_id, repo, pr_url = captured_pass[-1]
         assert pr_url == "https://github.com/org/repo/pull/99"
         assert repo == "caylent-solutions/git-repo"
-        # No active WU -> falls back to symbolic "finalize" sentinel.
         assert unit_id == "finalize"
         assert not captured_failure, "notify_ci_failure must NOT fire on GREEN"
 
@@ -7162,11 +7014,6 @@ class TestRejectEmDash:
         """The guard must return None for clean text -- double-hyphen is fine."""
         assert cli._reject_em_dash("feedback", "issue A -- still broken") is None
         assert cli._reject_em_dash("feedback", "") is None
-
-
-# ---------------------------------------------------------------------------
-# Amendment CLI commands
-# ---------------------------------------------------------------------------
 
 
 class TestCmdRequestAmendment:
@@ -7241,7 +7088,6 @@ class TestCmdRequestAmendment:
         self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             assert cli.cmd_request_amendment("EX-F1-S1-T1") == 0
-        # Second call with a fresh stdin attempts to write duplicate
         self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             rc = cli.cmd_request_amendment("EX-F1-S1-T1")
@@ -7400,7 +7246,6 @@ class TestCmdWatch:
         assert "watch" in cli._COMMANDS
 
     def test_cmd_watch_reads_devbench_log_file_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # AC-197-1: cmd_watch reads DEVBENCH_LOG_FILE as the canonical env var.
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/test-log.log")
         captured_paths: list[object] = []
@@ -7541,7 +7386,6 @@ class TestCmdPromoteProposal:
         out = capsys.readouterr().out
         assert "E0-F1-S1-T2" in out
         assert "in-queue" in out
-        # ADR-10: wired_targets field present in output JSON.
         assert "E0-F1-S1-T1" in out
         assert "wired_targets" in out
 
@@ -7607,7 +7451,6 @@ class TestCmdRejectProposal:
         assert "requires a value" in capsys.readouterr().err
 
     def test_em_dash_in_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
-        # Generic missing-value path (--reason without a value) returns 1.
         rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
         assert rc == 1
 
@@ -7617,7 +7460,6 @@ class TestCmdRejectProposal:
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
         ):
-            # task_id first, then --reason with em-dash value.
             rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason", "bad\u2014reason")
         assert rc == 1
         assert "em-dash" in capsys.readouterr().err
@@ -7632,7 +7474,6 @@ class TestCmdRejectProposal:
             patch("devbench.cli.reject_proposal", return_value=archive),
         ):
             rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
-            # "--reason" without value returns 1; the API requires both args.
             assert rc == 1
 
         with (
@@ -7641,7 +7482,6 @@ class TestCmdRejectProposal:
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             patch("devbench.cli.reject_proposal", return_value=archive),
         ):
-            # Correct shape: task id first, then --reason <val> as separate args.
             import sys as _sys
 
             with patch.object(_sys, "argv", ["devbench", "reject-proposal", "E0-F1-S1-T2", "--reason", "wrong"]):
@@ -7658,7 +7498,7 @@ class TestCmdRejectProposal:
             patch("devbench.cli.reject_proposal", side_effect=ProposalError("bad")),
         ):
             rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
-            assert rc == 1  # Without reason value
+            assert rc == 1
 
 
 class TestCmdStatusUnmaterialisedLine:
@@ -7733,8 +7573,6 @@ class TestCmdStatusBlockedSplit:
         assert re.search(r"Blocked \(held\)\s+0\b", out), out
         assert re.search(r"Blocked \(blocked-on-held\)\s+0\b", out), out
         assert re.search(r"Blocked \(operator-required\)\s+0\b", out), out
-        # The bare "Blocked" row must NOT appear (it was replaced by the split).
-        # Match the exact formatted row the pre-split code used to emit.
         assert not re.search(r"^\s*Blocked\s+\d+\s*$", out, flags=re.MULTILINE), out
 
     def test_status_counts_by_classifier(
@@ -7860,7 +7698,6 @@ class TestCmdStatusBlockedSplit:
         assert "Blocked tasks (auto-clearing via proposal) (1):" in out
         assert "Blocked tasks (awaiting amendment recovery) (1):" in out
         assert "Blocked tasks (operator action required) (1):" in out
-        # Each task appears exactly under its own bucket header.
         auto_pos = out.index("Blocked tasks (auto-clearing via proposal)")
         recovery_pos = out.index("Blocked tasks (awaiting amendment recovery)")
         attn_pos = out.index("Blocked tasks (operator action required)")
@@ -7959,10 +7796,8 @@ class TestCmdListProposalsStateLabels:
             rc = cli.cmd_list_proposals()
         assert rc == 0
         out = capsys.readouterr().out
-        # Labels must be present and distinct.
         assert "[unmaterialised]" in out, "Every un-materialised task gets an [unmaterialised] label"
         assert "[proposed]" in out, "Every proposed task gets a [proposed] label"
-        # Sanity: both suggested ids present.
         assert "E0-F1-S1-T2" in out and "E0-F1-S1-T3" in out
 
 
@@ -8049,8 +7884,6 @@ class TestCmdSweepProposals:
     def test_nothing_to_do_when_no_proposals(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         import dataclasses
 
-        # The "nothing to do" fast-exit is the auto-accept-OFF path; pin it
-        # explicitly now that auto_accept_proposals defaults to True.
         no_auto = dataclasses.replace(
             cli.RUNTIME_CONFIG,
             task_factory=dataclasses.replace(cli.RUNTIME_CONFIG.task_factory, auto_accept_proposals=False),
@@ -8207,8 +8040,6 @@ class TestCmdSweepProposals:
 
         import dataclasses
 
-        # "no-op" is the auto-accept-OFF outcome (with auto-accept on the task
-        # would be promoted); pin it now that auto_accept_proposals defaults True.
         no_auto = dataclasses.replace(
             cli.RUNTIME_CONFIG,
             task_factory=dataclasses.replace(cli.RUNTIME_CONFIG.task_factory, auto_accept_proposals=False),
@@ -8287,7 +8118,6 @@ class TestCmdSweepAutoAccept:
         mock_promote.assert_not_called()
         out = capsys.readouterr().out
         assert "materialised E0-F1-S1-T1" in out
-        # Flag off -> output line MUST NOT include auto-promoted count.
         assert "auto-promoted" not in out
 
     def test_sweep_auto_promotes_every_proposed_draft_when_flag_true(
@@ -8304,10 +8134,9 @@ class TestCmdSweepAutoAccept:
         parser = MagicMock()
         parser.parse_index.return_value = [unit]
 
-        # Pre-state: UNMATERIALISED -> materialise then PROPOSED on the per-task re-classify.
         state_sequence = [
-            ProposalTaskState.UNMATERIALISED,  # pre-check inside the sweep loop
-            ProposalTaskState.PROPOSED,  # auto-promote per-task check
+            ProposalTaskState.UNMATERIALISED,
+            ProposalTaskState.PROPOSED,
         ]
         calls = {"n": 0}
 
@@ -8333,7 +8162,6 @@ class TestCmdSweepAutoAccept:
             rc = cli.cmd_sweep_proposals()
         assert rc == 0
         mock_promote.assert_called_once()
-        # The audit_suffix kwarg must be threaded through.
         _, kwargs = mock_promote.call_args
         assert kwargs["task_id"] == "E0-F1-S1-T2"
         assert "auto-accepted" in kwargs["audit_suffix"]
@@ -8361,7 +8189,6 @@ class TestCmdSweepAutoAccept:
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             patch("devbench.cli.BacklogParser", return_value=parser),
             patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config(auto_accept=True)),
-            # Already PROMOTED -> pre-check short-circuits to no-op (no UNMATERIALISED, no PROPOSED).
             patch("devbench.cli.classify_proposed_task", return_value=ProposalTaskState.PROMOTED),
             patch("devbench.cli.promote_proposal") as mock_promote,
         ):
@@ -8427,7 +8254,6 @@ class TestCmdSweepAutoAccept:
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             patch("devbench.cli.BacklogParser", return_value=parser),
             patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config(auto_accept=True)),
-            # No UNMATERIALISED; legacy draft already in PROPOSED state waiting.
             patch("devbench.cli.classify_proposed_task", return_value=ProposalTaskState.PROPOSED),
             patch("devbench.cli.materialise_proposal") as mock_mat,
             patch(
@@ -8459,7 +8285,6 @@ class TestCmdSweepAutoAccept:
             write_proposal,
         )
 
-        # Build a real workspace so materialise + reject + sweep exercise the real code.
         backlog_dir = tmp_path / "backlog"
         story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
@@ -8529,9 +8354,6 @@ class TestCmdSweepAutoAccept:
             for p in (tmp_path / proposal_mod.REJECTED_PROPOSAL_DIR_NAME).iterdir()
         )
 
-        # Now run sweep-proposals. Expect no-op because the only task is
-        # REJECTED (archive exists) -- classify_proposed_task returns REJECTED,
-        # sweep's unmaterialised_before count is zero, hits the no-op branch.
         source_unit = MagicMock()
         source_unit.id = "E0-F1-S1-T1"
         source_unit.repo = "caylent-solutions/example"
@@ -8548,7 +8370,6 @@ class TestCmdSweepAutoAccept:
         assert rc == 0
         out = capsys.readouterr().out
         assert "no-op E0-F1-S1-T1" in out, out
-        # The crucial assertion: the rejected draft file was NOT recreated.
         assert not draft_path.exists(), "sweep-proposals must not resurrect a rejected draft"
 
 
@@ -8577,8 +8398,6 @@ class TestCmdAddDep:
         assert "requires a value" in capsys.readouterr().err
 
     def test_add_dep_happy_path_emits_json(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        # Build a minimal workspace with a blocked T1 and in-queue T2 wired
-        # through the real backlog parser so add_dep's validation passes.
         (tmp_path / "BACKLOG.md").write_text(
             "# Backlog\n\n"
             "## Status Summary\n\n"
@@ -8613,7 +8432,6 @@ class TestCmdAddDep:
         assert '"blocked": "E0-F1-S1-T1"' in out
         assert '"blocker": "E0-F1-S1-T2"' in out
         assert '"wired": true' in out
-        # Marker landed on the blocked file.
         t1 = (story / "E0-F1-S1-T1.md").read_text()
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in t1
         assert "ADR-10 CLI smoke" in t1
@@ -8699,7 +8517,6 @@ class TestCmdMaterialiseProposal:
             ],
         )
         write_proposal(tmp_path, proposal)
-        # BACKLOG.md missing -> parse_index raises FileNotFoundError.
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
@@ -8711,7 +8528,6 @@ class TestCmdMaterialiseProposal:
     def test_source_task_not_in_backlog(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
 
-        # Build minimal workspace where source-id in proposal doesn't exist in BACKLOG.
         (tmp_path / "BACKLOG.md").write_text(
             "# Backlog\n\n## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
@@ -8731,8 +8547,6 @@ class TestCmdMaterialiseProposal:
                     files_to_own=[],
                     linked_scenarios=[],
                     suggested_acs=[],
-                    # Concrete approach text so the issue #143 placeholder check
-                    # does not fire before the source-task lookup runs.
                     suggested_approach="Author the foo helper that the source task references",
                 )
             ],
@@ -9112,7 +8926,6 @@ class TestCmdUnhold:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Build an in-queue unit (not held) and assert unhold refuses it.
         backlog_md = tmp_path / "BACKLOG.md"
         backlog_md.write_text(
             "# Backlog\n\n## Full Work Unit Index\n\n"
@@ -9248,7 +9061,6 @@ class TestCmdPromote:
         ):
             cli.cmd_promote("EX-F1-S1-T1")
         content = wu_file.read_text()
-        # Verify the audit comment has the expected format
         assert "[agent/orchestrator]" in content
         assert "[PROMOTED] draft -> in-queue" in content
 
@@ -9283,7 +9095,6 @@ class TestCmdPromoteIntegration:
         content = wu_file.read_text()
         assert "## Status: in-queue" in content
         assert "[PROMOTED] draft -> in-queue" in content
-        # Verify BACKLOG.md index row was also updated
         index_content = backlog_md.read_text()
         assert "in-queue" in index_content
 
@@ -9326,17 +9137,13 @@ def _build_promote_backlog_fixture(
 class TestCmdPromoteBulk:
     """E1-F4-S1-T2: ``devbench promote --epic/--feature/--story <id>`` bulk selectors."""
 
-    # ------------------------------------------------------------------
-    # --epic selector
-    # ------------------------------------------------------------------
-
     def test_epic_promotes_all_draft_descendants(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """--epic E1 promotes all draft-status tasks under E1 in one transaction."""
         units = [
             ("E1-F1-S1-T1", "draft"),
             ("E1-F1-S1-T2", "draft"),
             ("E1-F2-S1-T1", "draft"),
-            ("E2-F1-S1-T1", "draft"),  # different epic -- must not be promoted
+            ("E2-F1-S1-T1", "draft"),
         ]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
         with (
@@ -9346,12 +9153,10 @@ class TestCmdPromoteBulk:
         ):
             rc = cli.cmd_promote("--epic", "E1")
         assert rc == 0
-        # All E1 descendants promoted
         for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F2-S1-T1"):
             content = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: in-queue" in content, f"{uid} not promoted"
             assert "[PROMOTED] draft -> in-queue" in content
-        # E2 task must remain draft
         e2_content = (backlog_dir / "E2-F1-S1-T1.md").read_text()
         assert "## Status: draft" in e2_content
 
@@ -9387,7 +9192,7 @@ class TestCmdPromoteBulk:
         """--epic aborts with rc=1 if any descendant is not in draft status."""
         units = [
             ("E1-F1-S1-T1", "draft"),
-            ("E1-F1-S1-T2", "in-queue"),  # non-draft -- should abort
+            ("E1-F1-S1-T2", "in-queue"),
         ]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
         with (
@@ -9399,18 +9204,13 @@ class TestCmdPromoteBulk:
         assert rc == 1
         err = capsys.readouterr().err
         assert "not in 'draft'" in err
-        # No partial promotion -- T1 remains draft
         t1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
         assert "## Status: draft" in t1_content
-
-    # ------------------------------------------------------------------
-    # --feature selector
-    # ------------------------------------------------------------------
 
     def test_feature_promotes_all_draft_descendants(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """--feature E1-F2 promotes all draft tasks under E1-F2 only."""
         units = [
-            ("E1-F1-S1-T1", "draft"),  # different feature -- must not be promoted
+            ("E1-F1-S1-T1", "draft"),
             ("E1-F2-S1-T1", "draft"),
             ("E1-F2-S1-T2", "draft"),
         ]
@@ -9425,7 +9225,6 @@ class TestCmdPromoteBulk:
         for uid in ("E1-F2-S1-T1", "E1-F2-S1-T2"):
             content = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: in-queue" in content
-        # E1-F1 task must remain draft
         f1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
         assert "## Status: draft" in f1_content
 
@@ -9446,14 +9245,10 @@ class TestCmdPromoteBulk:
         err = capsys.readouterr().err
         assert "not in 'draft'" in err
 
-    # ------------------------------------------------------------------
-    # --story selector
-    # ------------------------------------------------------------------
-
     def test_story_promotes_all_draft_descendants(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """--story E1-F1-S2 promotes all draft tasks under that story only."""
         units = [
-            ("E1-F1-S1-T1", "draft"),  # sibling story -- must not be promoted
+            ("E1-F1-S1-T1", "draft"),
             ("E1-F1-S2-T1", "draft"),
             ("E1-F1-S2-T2", "draft"),
         ]
@@ -9468,7 +9263,6 @@ class TestCmdPromoteBulk:
         for uid in ("E1-F1-S2-T1", "E1-F1-S2-T2"):
             content = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: in-queue" in content
-        # S1 task stays draft
         s1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
         assert "## Status: draft" in s1_content
 
@@ -9489,10 +9283,6 @@ class TestCmdPromoteBulk:
         err = capsys.readouterr().err
         assert "not in 'draft'" in err
 
-    # ------------------------------------------------------------------
-    # Missing second argument
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize("flag", ["--epic", "--feature", "--story"])
     def test_missing_scope_id_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str], flag: str) -> None:
         """Calling promote with a selector flag but no ID returns rc=1."""
@@ -9507,10 +9297,6 @@ class TestCmdPromoteBulk:
         assert rc == 1
         err = capsys.readouterr().err
         assert "requires" in err.lower() or "id" in err.lower()
-
-    # ------------------------------------------------------------------
-    # BACKLOG.md index updated in bulk transaction
-    # ------------------------------------------------------------------
 
     def test_epic_updates_backlog_index_for_all_promoted(self, tmp_path: Path) -> None:
         """All promoted units have their BACKLOG.md index row updated."""
@@ -9527,23 +9313,13 @@ class TestCmdPromoteBulk:
             rc = cli.cmd_promote("--epic", "E1")
         assert rc == 0
         index = backlog_md.read_text()
-        # Both rows updated in index
         for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2"):
             assert uid in index
-        # No draft rows remain
         assert "| draft |" not in index
-
-    # ------------------------------------------------------------------
-    # promote is in _VARIADIC_COMMANDS
-    # ------------------------------------------------------------------
 
     def test_promote_is_variadic(self) -> None:
         """'promote' must be in _VARIADIC_COMMANDS so bulk flags are forwarded."""
         assert "promote" in cli._VARIADIC_COMMANDS
-
-    # ------------------------------------------------------------------
-    # Output messages
-    # ------------------------------------------------------------------
 
     def test_epic_prints_promoted_count(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """On success, --epic prints a summary line with the count of promoted units."""
@@ -9562,16 +9338,12 @@ class TestCmdPromoteBulk:
         assert "2" in out
         assert "promoted" in out.lower()
 
-    # ------------------------------------------------------------------
-    # Invalid-usage fallback branch (else clause in cmd_promote)
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize(
         "argv",
         [
-            ("--epic", "E1", "extra"),  # too many arguments
-            ("--feature", "F1", "spurious"),  # too many arguments with --feature
-            ("--story", "S1", "x", "y"),  # even more args
+            ("--epic", "E1", "extra"),
+            ("--feature", "F1", "spurious"),
+            ("--story", "S1", "x", "y"),
         ],
     )
     def test_too_many_args_returns_1_with_usage_error(
@@ -9593,8 +9365,8 @@ class TestCmdPromoteBulk:
     @pytest.mark.parametrize(
         "argv",
         [
-            ("--unknown", "E1"),  # unrecognised flag
-            ("--all-epics", "E1"),  # another unrecognised flag
+            ("--unknown", "E1"),
+            ("--all-epics", "E1"),
         ],
     )
     def test_unknown_flag_returns_1_with_usage_error(
@@ -9654,11 +9426,9 @@ class TestCmdPromoteBulkIntegration:
         ):
             rc = cli.cmd_promote("--story", "E5-F1-S2")
         assert rc == 0
-        # S2 tasks promoted
         for uid in ("E5-F1-S2-T1", "E5-F1-S2-T2"):
             wu = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: in-queue" in wu
-        # S1 task not touched
         s1 = (backlog_dir / "E5-F1-S1-T1.md").read_text()
         assert "## Status: draft" in s1
 
@@ -9678,7 +9448,6 @@ class TestCmdPromoteBulkIntegration:
         ):
             rc = cli.cmd_promote("--epic", "E5")
         assert rc == 1
-        # Files unchanged
         assert (backlog_dir / "E5-F1-S1-T1.md").read_text() == original_t1
         assert backlog_md.read_text() == original_index
 
@@ -9689,7 +9458,6 @@ class TestCmdPromoteBulkIntegration:
             ("E5-F1-S1-T2", "draft"),
         ]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
-        # Patch _resolve_unit_file to return None for one specific unit id
         original_resolve = cli._resolve_unit_file
 
         def _resolve_returning_none(unit: WorkUnit) -> Path | None:
@@ -9708,7 +9476,6 @@ class TestCmdPromoteBulkIntegration:
         err = capsys.readouterr().err
         assert "E5-F1-S1-T2" in err
         assert "not found" in err.lower()
-        # No partial writes -- T1 file must still be draft
         t1_content = (backlog_dir / "E5-F1-S1-T1.md").read_text()
         assert "## Status: draft" in t1_content
 
@@ -9716,16 +9483,12 @@ class TestCmdPromoteBulkIntegration:
 class TestCmdPromoteAll:
     """E1-F4-S1-T3: ``devbench promote --all [--yes]`` promotes every draft WU."""
 
-    # ------------------------------------------------------------------
-    # Happy path: --all --yes skips confirmation and promotes everything
-    # ------------------------------------------------------------------
-
     def test_all_yes_promotes_every_draft_unit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """--all --yes promotes all draft WUs without prompting."""
         units = [
             ("E1-F1-S1-T1", "draft"),
             ("E2-F1-S1-T1", "draft"),
-            ("E3-F1-S1-T1", "in-queue"),  # not draft -- must be skipped
+            ("E3-F1-S1-T1", "in-queue"),
         ]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
         with (
@@ -9735,14 +9498,12 @@ class TestCmdPromoteAll:
         ):
             rc = cli.cmd_promote("--all", "--yes")
         assert rc == 0
-        # Draft units promoted
         for uid in ("E1-F1-S1-T1", "E2-F1-S1-T1"):
             content = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: in-queue" in content, f"{uid} not promoted"
             assert "[PROMOTED] draft -> in-queue" in content
-        # Non-draft unit untouched
         e3_content = (backlog_dir / "E3-F1-S1-T1.md").read_text()
-        assert "## Status: in-queue" in e3_content  # was already in-queue, not promoted
+        assert "## Status: in-queue" in e3_content
         out = capsys.readouterr().out
         assert "2" in out
         assert "promoted" in out.lower()
@@ -9792,17 +9553,12 @@ class TestCmdPromoteAll:
         index = backlog_md.read_text()
         assert "| draft |" not in index
 
-    # ------------------------------------------------------------------
-    # Confirmation prompt behaviour (without --yes)
-    # ------------------------------------------------------------------
-
     def test_all_without_yes_prompts_and_aborts_on_no(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """--all without --yes prompts; answering 'n' aborts without promoting."""
         units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
-        # Simulate user typing 'n'
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
         with (
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
@@ -9811,7 +9567,6 @@ class TestCmdPromoteAll:
         ):
             rc = cli.cmd_promote("--all")
         assert rc == 1
-        # No units promoted
         for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2"):
             content = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: draft" in content
@@ -9822,7 +9577,6 @@ class TestCmdPromoteAll:
         """--all without --yes prompts; answering 'y' proceeds with promotion."""
         units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
-        # Simulate user typing 'y'
         monkeypatch.setattr("builtins.input", lambda _prompt: "y")
         with (
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
@@ -9903,10 +9657,6 @@ class TestCmdPromoteAll:
         assert len(prompts) == 1
         assert "3" in prompts[0]
 
-    # ------------------------------------------------------------------
-    # Missing file path error (TOCTOU race)
-    # ------------------------------------------------------------------
-
     def test_all_yes_missing_file_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """--all --yes returns rc=1 if _resolve_unit_file returns None for any draft unit."""
         units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
@@ -9929,13 +9679,8 @@ class TestCmdPromoteAll:
         err = capsys.readouterr().err
         assert "E1-F1-S1-T2" in err
         assert "not found" in err.lower()
-        # T1 also must not be promoted (fail-fast, no partial writes)
         t1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
         assert "## Status: draft" in t1_content
-
-    # ------------------------------------------------------------------
-    # Invalid usage: unknown extra flags with --all
-    # ------------------------------------------------------------------
 
     def test_all_with_unknown_extra_flag_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """--all with an unexpected extra argument returns rc=1 with a usage error."""
@@ -9951,17 +9696,13 @@ class TestCmdPromoteAll:
         err = capsys.readouterr().err
         assert "usage" in err.lower() or "promote" in err.lower()
 
-    # ------------------------------------------------------------------
-    # Integration test: full journey with --all --yes
-    # ------------------------------------------------------------------
-
     def test_all_yes_integration_full_journey(self, tmp_path: Path) -> None:
         """End-to-end: --all --yes promotes every draft, updates index, appends audit."""
         units = [
             ("E1-F1-S1-T1", "draft"),
             ("E2-F1-S1-T1", "draft"),
-            ("E3-F1-S1-T1", "done"),  # must not be promoted
-            ("E4-F1-S1-T1", "blocked"),  # must not be promoted
+            ("E3-F1-S1-T1", "done"),
+            ("E4-F1-S1-T1", "blocked"),
         ]
         backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
         with (
@@ -9975,10 +9716,8 @@ class TestCmdPromoteAll:
             wu = (backlog_dir / f"{uid}.md").read_text()
             assert "## Status: in-queue" in wu, f"{uid} not transitioned"
             assert "[PROMOTED] draft -> in-queue" in wu, f"{uid} missing audit"
-        # Non-draft units untouched
         assert "## Status: done" in (backlog_dir / "E3-F1-S1-T1.md").read_text()
         assert "## Status: blocked" in (backlog_dir / "E4-F1-S1-T1.md").read_text()
-        # Index updated correctly
         index = backlog_md.read_text()
         assert "| draft |" not in index
 
@@ -10003,7 +9742,6 @@ class TestWireOrphanCleanupDepChain:
         """
         wu_dir = tmp_path / "backlog"
         wu_dir.mkdir(exist_ok=True)
-        # Peer task: claims .gitignore in its manifest.
         (wu_dir / f"{peer_id}.md").write_text(
             f"# {peer_id}: peer\n\n"
             f"## Status: {peer_status}\n\n"
@@ -10015,7 +9753,6 @@ class TestWireOrphanCleanupDepChain:
             "## Definition of Done\n\n- [ ] Done\n",
             encoding="utf-8",
         )
-        # Cleanup task: claims .gitignore (the auto-emitted target).
         (wu_dir / f"{cleanup_id}.md").write_text(
             f"# {cleanup_id}: cleanup\n\n"
             "## Status: in-queue\n\n"
@@ -10052,11 +9789,9 @@ class TestWireOrphanCleanupDepChain:
             )
         assert wired == ["E0-F1-S1-T2"]
         peer_content = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
-        # The dep row was added to the peer's Dependencies table.
         assert "E0-F1-S1-T9" in peer_content
 
     def test_no_collision_returns_empty(self, tmp_path: Path) -> None:
-        # Build a backlog where the only peer task claims a different path.
         wu_dir = tmp_path / "backlog"
         wu_dir.mkdir(exist_ok=True)
         (wu_dir / "E0-F1-S1-T2.md").write_text(
@@ -10097,7 +9832,6 @@ class TestWireOrphanCleanupDepChain:
         assert wired == []
 
     def test_skips_done_and_declined_peers(self, tmp_path: Path) -> None:
-        # Done peers cannot be wired (add_dep refuses terminal blockers anyway).
         index_path = self._build_minimal_backlog(tmp_path, peer_status="done")
         with (
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
@@ -10445,11 +10179,9 @@ class TestCmdHookTail:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # AC-197-1: canonical DEVBENCH_ORCHESTRATOR_SESSION_ID is read.
         monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", "test-session-456")
         rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
-        # The session ID is consumed; output may vary but exit should not be 2.
         assert rc != 2
 
     def test_orchestrator_session_missing_value_returns_2(
@@ -10459,11 +10191,6 @@ class TestCmdHookTail:
         rc = cli.cmd_hook_tail("--orchestrator-session")
         assert rc == 2
         assert "--orchestrator-session requires a value" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# Tier 3: test-validates-source heuristic + cmd_promote_proposal warnings
-# ---------------------------------------------------------------------------
 
 
 class TestDetectTestValidatesSource:
@@ -10574,7 +10301,6 @@ class TestDetectTestValidatesSource:
         proposals = tmp_path / ".devbench" / "proposals"
         proposals.mkdir(parents=True)
         (proposals / "broken.json").write_text("{not valid json")
-        # And one valid file alongside it so we exercise the continue path.
         self._write_proposal(
             proposals,
             "E0-F1-S1-T1",
@@ -10638,7 +10364,6 @@ class TestCmdPromoteProposalTestValidatesSource:
         ):
             rc = cli.cmd_promote_proposal("E0-F1-S1-T9")
         assert rc == 0
-        # Heuristic does NOT auto-flip; just warns.
         assert captured.get("dep_on_source") is True
         err = capsys.readouterr().err
         assert "looks like a test-validates-source task" in err
@@ -10664,16 +10389,9 @@ class TestCmdPromoteProposalTestValidatesSource:
         ):
             rc = cli.cmd_promote_proposal("--no-dep-on-source", "E0-F1-S1-T9")
         assert rc == 0
-        # When the operator passes --no-dep-on-source explicitly, no
-        # warning is needed (the heuristic check is gated on dep_on_source).
         err = capsys.readouterr().err
         assert "looks like a test-validates-source task" not in err
         assert "auto-applying --no-dep-on-source" not in err
-
-
-# ---------------------------------------------------------------------------
-# Tier 3: cmd_check pre-flight verifier
-# ---------------------------------------------------------------------------
 
 
 class TestCmdCheck:
@@ -10681,7 +10399,6 @@ class TestCmdCheck:
 
     @staticmethod
     def _write_min_yaml(tmp_path: Path, repos_block: str, single_branch: str = "") -> Path:
-        # Schema-conformant minimal config (matches tests/fixtures/test_devbench.yaml).
         cfg_dir = tmp_path / "backlog" / "config"
         cfg_dir.mkdir(parents=True)
         cfg_path = cfg_dir / "devbench.yaml"
@@ -10699,8 +10416,6 @@ class TestCmdCheck:
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Point DEVBENCH_CONFIG_PATH at a nonexistent file so resolve_config_path
-        # does not fall back to the suite-wide test fixture YAML.
         monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "no-such.yaml"))
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             rc = cli.cmd_check()
@@ -10731,7 +10446,6 @@ class TestCmdCheck:
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Set up a fake clone with origin remote configured (via mocked subprocess).
         clone = tmp_path / "clone-a"
         clone.mkdir()
         (tmp_path / "repo-a").symlink_to(clone)
@@ -10883,7 +10597,6 @@ class TestCmdCheck:
             mock.stderr = ""
             mock.stdout = ""
             if args[:3] == ["git", "-C", str(clone)]:
-                # No origin remote -> rc=2 (the real git failure mode)
                 mock.returncode = 2
                 mock.stderr = "error: No such remote 'origin'"
             else:
@@ -10933,11 +10646,6 @@ class TestCmdCheck:
         assert "has an 'origin' remote" in out
 
 
-# ---------------------------------------------------------------------------
-# Tier 3: variadic dispatch lets `add-dep --reason "<multi token>"` survive
-# ---------------------------------------------------------------------------
-
-
 class TestAddDepVariadicDispatch:
     """The dispatcher must NOT truncate add-dep's --reason value."""
 
@@ -10949,7 +10657,6 @@ class TestAddDepVariadicDispatch:
             return 0
 
         monkeypatch.setattr(cli, "cmd_add_dep", fake_add_dep)
-        # Re-register the patched function in the dispatch table so main() sees it.
         original = cli._COMMANDS["add-dep"]
         monkeypatch.setitem(cli._COMMANDS, "add-dep", (fake_add_dep, original[1], original[2]))
         monkeypatch.setattr(
@@ -10965,19 +10672,12 @@ class TestAddDepVariadicDispatch:
         )
         rc = cli.main()
         assert rc == 0
-        # All five trailing tokens must reach cmd_add_dep, including the
-        # full multi-token --reason value (no slicing by MAX_ARGS).
         assert captured["argv"] == (
             "E0-F1-S1-T1",
             "E0-F1-S1-T2",
             "--reason",
             "this is a multi token reason value",
         )
-
-
-# ---------------------------------------------------------------------------
-# write-proposal auto-cascade (closes the resolver-write -> next-sweep gap)
-# ---------------------------------------------------------------------------
 
 
 def _runtime_config_with_auto_accept(value: bool) -> Any:
@@ -11038,35 +10738,18 @@ class TestCmdWriteProposalDedup:
 
         from devbench.backlog.proposal import _compute_fix_signature, _extract_intent_phrase
 
-        # Compute the signature the way cmd_write_proposal will compute it
-        # (target_repo "" because BacklogParser does not accept the bare
-        # "r" repo column the BACKLOG.md fixture uses; ``_resolve_source_repo``
-        # falls back to "" via its except-ValueError branch).
-        # Production strips the configured ``checkout_directory`` prefix
-        # before computing the signature (issue #159), so we seed with
-        # the STRIPPED form (``pyproject.toml``). The unstripped path
-        # stays in the new payload's ``files_to_own`` below so the
-        # issue #146 backlog-repo filter still treats the file as
-        # in-scope (the file's first segment ``git-repo`` matches the
-        # configured checkout_directory of caylent-solutions/git-repo
-        # in the test fixture).
         files_unstripped = ["git-repo/pyproject.toml"]
         files_stripped = ["pyproject.toml"]
         intent = _extract_intent_phrase("Remove the pyproject.toml row from T1")
         signature = _compute_fix_signature("", files_stripped, intent)
 
-        # Seed the EXISTING recovery: source_id=E0-F1-S1-T1 carries the signature.
         self._seed_existing_recovery(tmp_path, "E0-F1-S1-T1", signature)
-        # Add a target source-task markdown that the new write-proposal
-        # invocation will be associated with (so add_dep can write its
-        # dep-table row).
         backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         new_source_md = (
             "# E0-F1-S1-T7: new source\n\n## Status: blocked\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
         )
         (backlog_dir / "E0-F1-S1-T7.md").write_text(new_source_md, encoding="utf-8")
-        # Minimal BACKLOG.md so BacklogParser does not crash; both rows present.
         t1_path = "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md`"
         t7_path = "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T7.md`"
         (tmp_path / "BACKLOG.md").write_text(
@@ -11078,7 +10761,6 @@ class TestCmdWriteProposalDedup:
             encoding="utf-8",
         )
 
-        # Submit a new proposal whose fix signature will match.
         new_payload = {
             "source_task_id": "E0-F1-S1-T7",
             "generated_at": "2026-05-02T00:01:00Z",
@@ -11106,7 +10788,6 @@ class TestCmdWriteProposalDedup:
         envelope = json.loads(out)
         assert envelope["recovery_reused"] is True
         assert envelope["reused_from_task_id"] == "E0-F1-S1-T1"
-        # No duplicate proposal JSON written.
         assert not (tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T7.json").exists()
 
 
@@ -11230,8 +10911,8 @@ class TestCmdWriteProposalBacklogRepoSkip:
                     "suggested_id": "E0-F1-S1-T2",
                     "title": "Fix X with mixed files",
                     "files_to_own": [
-                        "caylent-telemetry/src/foo.py",  # target repo
-                        "spec/architecture.md",  # backlog repo (pruned)
+                        "caylent-telemetry/src/foo.py",
+                        "spec/architecture.md",
                     ],
                     "linked_scenarios": [],
                     "suggested_acs": [],
@@ -11249,12 +10930,6 @@ class TestCmdWriteProposalBacklogRepoSkip:
         envelope = json.loads(capsys.readouterr().out)
         assert envelope.get("recovery_skipped") is not True
         assert envelope["proposal_path"] is not None
-        # Verify the persisted proposal carries only the target-repo file.
-        # Issue #159 (prefix strip): the persisted path is repo-relative
-        # (``src/foo.py``) rather than the prefixed form the agent emitted
-        # (``caylent-telemetry/src/foo.py``). The strip runs after the
-        # backlog-repo filter, so the target-repo classification still fires
-        # on the prefixed form before the persistence step normalises it.
         persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text(encoding="utf-8"))
         assert persisted["proposed_tasks"][0]["files_to_own"] == ["src/foo.py"]
 
@@ -11312,7 +10987,6 @@ class TestCmdWriteProposalBacklogRepoSkip:
         """
         import io
 
-        # Build a backlog where E0-F1-S1-T1 targets the kanon repo.
         backlog_root = tmp_path / "backlog"
         backlog_root.mkdir(parents=True)
         wu_dir = backlog_root / "E0-name" / "E0-F1-name" / "E0-F1-S1-name"
@@ -11346,9 +11020,6 @@ class TestCmdWriteProposalBacklogRepoSkip:
                 {
                     "suggested_id": "E0-F1-S1-T2",
                     "title": "Fix X repo-relative",
-                    # Path is repo-relative (no `kanon/` prefix). Under
-                    # the pre-fix classifier, this would be misread as
-                    # backlog-repo and skipped.
                     "files_to_own": ["src/bar.py"],
                     "linked_scenarios": [],
                     "suggested_acs": [],
@@ -11414,11 +11085,8 @@ class TestCmdWriteProposalBacklogRepoSkip:
             patch("devbench.cli.BACKLOG_ROOT", backlog_root),
             patch("devbench.cli.BACKLOG_INDEX", backlog_index),
         ):
-            # With source -> repo-relative path counts as target-repo.
             assert cli._file_lives_in_a_target_repo("src/foo.py", source_task_id="E0-F1-S1-T1")
-            # With source -> still True for prefixed paths.
             assert cli._file_lives_in_a_target_repo("kanon/src/foo.py", source_task_id="E0-F1-S1-T1")
-            # Without source (back-compat) -> repo-relative path returns False.
             assert not cli._file_lives_in_a_target_repo("src/foo.py")
 
 
@@ -11492,7 +11160,6 @@ class TestCmdWriteProposalCheckoutPrefixStrip:
         files = persisted["proposed_tasks"][0]["files_to_own"]
         assert "src/kanon_cli/core/xml_validator.py" in files
         assert "tests/unit/test_xml_validator.py" in files
-        # Original prefixed forms must NOT survive.
         assert not any(f.startswith("kanon/") for f in files)
 
     def test_repo_relative_paths_pass_through_unchanged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -11518,8 +11185,6 @@ class TestCmdWriteProposalCheckoutPrefixStrip:
         assert rc == 0
         persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text())
         files = persisted["proposed_tasks"][0]["files_to_own"]
-        # caylent-telemetry IS one of the configured checkout dirs ->
-        # gets stripped to repo-relative form just like kanon does.
         assert "src/foo.py" in files
 
     def test_ambiguous_path_matches_multiple_checkouts_rejected(
@@ -11531,10 +11196,6 @@ class TestCmdWriteProposalCheckoutPrefixStrip:
         import io
 
         cfg = MagicMock()
-        # Two repos whose checkout_directories share a common prefix; a
-        # single path could plausibly belong to either. Configure them
-        # so that ``foo`` is BOTH a checkout_directory AND a prefix of
-        # another checkout_directory.
         repo_a = MagicMock()
         repo_a.checkout_directory = "foo"
         repo_a.validated_repo = "caylent-solutions/foo"
@@ -11548,12 +11209,6 @@ class TestCmdWriteProposalCheckoutPrefixStrip:
         cfg.task_factory.auto_accept_proposals = False
         cfg.task_factory.enabled = True
 
-        # Use a payload whose path duplicates the prefix to exercise
-        # the multi-match branch. Since both repos resolve to the same
-        # checkout_directory ("foo"), the deduped sorted list still has
-        # ONE entry; we need actually-different prefixes that BOTH
-        # match. Use a set with ``foo`` and ``foo/bar`` as configured
-        # checkout dirs and a path ``foo/bar/baz.py`` that matches both.
         repo_b.checkout_directory = "foo/bar"
         monkeypatch.setattr(
             "sys.stdin",
@@ -11642,7 +11297,6 @@ class TestCmdMaterialiseProposalLifecycleGates:
         ):
             rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
         assert rc == 1
-        # Past the dedup gates -> hits the source-task-lookup error.
         err = capsys.readouterr().err
         assert "not found" in err
 
@@ -11692,17 +11346,12 @@ class TestCmdWriteProposalAutoCascade:
     def test_disabled_when_auto_accept_false(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
-        # When the config flag is false the function returns the
-        # "disabled" sentinel and never calls materialise/promote.
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(False))
         proposal = Proposal.from_dict(self._sample_proposal_dict())
         result = cli._maybe_auto_cascade_proposal("E0-F1-S1-T1", proposal)
         assert result == {"auto_cascade": "disabled"}
 
     def test_failed_when_source_task_missing_from_index(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        # When auto-accept is on but the source task is not in the
-        # backlog index (caller passed a typo'd id), the cascade reports
-        # "failed" with a clear error and does not raise.
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text(
@@ -11719,10 +11368,6 @@ class TestCmdWriteProposalAutoCascade:
         proposal = Proposal.from_dict(self._sample_proposal_dict("E0-NOPE-T0"))
         result = cli._maybe_auto_cascade_proposal("E0-NOPE-T0", proposal)
         assert result["auto_cascade"] == "failed"
-        # Either "no work-unit rows" (parser rejection on empty index)
-        # or "not found" (index parses but source task absent) is an
-        # acceptable failure shape; both prove the cascade aborted
-        # cleanly without raising.
         err_value = result["error"]
         assert isinstance(err_value, str)
         err = err_value.lower()
@@ -11731,23 +11376,8 @@ class TestCmdWriteProposalAutoCascade:
     def test_applied_when_auto_accept_true(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
-        # End-to-end: with auto-accept on and a real source-task in the
-        # index, the helper materialises every proposed task at the
-        # dedicated 'proposed' staging state, then promotes it to 'in-queue'
-        # in the same invocation, and returns "applied" with the materialised
-        # path list plus the promoted-id list.
-        #
-        # materialise_proposal always writes '## Status: proposed' (it no
-        # longer reads config); classify_proposed_task therefore sees the
-        # fresh draft as PROPOSED, so the auto-cascade promote loop -- gated
-        # on task_factory.auto_accept_proposals=True -- promotes it to
-        # 'in-queue'. The end-state draft carries '## Status: in-queue'.
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
 
-        # Build a minimum BACKLOG with one source task at E0-F1-S1-T1
-        # (currently blocked, since auto-accept emit happens when the
-        # source is failing) plus the directory structure
-        # ``materialise_proposal`` expects.
         backlog_root = tmp_path / "backlog"
         story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
@@ -11779,7 +11409,6 @@ class TestCmdWriteProposalAutoCascade:
         self._patch_cli_workspace(monkeypatch, tmp_path, backlog_root, backlog)
 
         proposal = Proposal.from_dict(self._sample_proposal_dict("E0-F1-S1-T1"))
-        # Persist the proposal JSON so the cascade has something to work on.
         proposals_dir = tmp_path / ".devbench" / "proposals"
         proposals_dir.mkdir(parents=True)
         (proposals_dir / "E0-F1-S1-T1.json").write_text(json.dumps(proposal.to_dict()))
@@ -11787,24 +11416,14 @@ class TestCmdWriteProposalAutoCascade:
         result = cli._maybe_auto_cascade_proposal("E0-F1-S1-T1", proposal)
         assert result["auto_cascade"] == "applied"
         materialised = result["materialised"]
-        assert isinstance(materialised, list) and materialised  # at least one path
+        assert isinstance(materialised, list) and materialised
         promoted = result["promoted"]
         assert isinstance(promoted, list)
-        # materialise_proposal writes 'proposed'; the auto-cascade promote loop
-        # then promotes every proposed task to 'in-queue', so the proposed task
-        # appears in the promoted list.
         assert promoted == ["E0-F1-S1-T9"], "auto-accept must promote the freshly-materialised proposed task"
-        # The materialised task's file exists and ends at 'in-queue' (materialised
-        # at 'proposed', then auto-promoted).
         materialised_file = story_dir / "E0-F1-S1-T9.md"
         assert materialised_file.exists()
         materialised_content = materialised_file.read_text(encoding="utf-8")
         assert "## Status: in-queue" in materialised_content
-
-
-# ---------------------------------------------------------------------------
-# log-verdict judge-name allowlist (rejects malformed audit-row writes)
-# ---------------------------------------------------------------------------
 
 
 class TestCmdLogVerdictAllowlist:
@@ -11822,11 +11441,11 @@ class TestCmdLogVerdictAllowlist:
     @pytest.mark.parametrize(
         "bad_name",
         [
-            "judge",  # literal typo seen in production
-            "code-reviewer",  # hyphenated form (canonical is underscored)
-            "Code_Review",  # casing (canonical is lowercase)
-            "auditor",  # role that does not exist
-            "",  # empty
+            "judge",
+            "code-reviewer",
+            "Code_Review",
+            "auditor",
+            "",
         ],
     )
     def test_rejects_non_allowlist_judge(self, bad_name: str, capsys: pytest.CaptureFixture[str]) -> None:
@@ -11834,7 +11453,6 @@ class TestCmdLogVerdictAllowlist:
         assert rc == 1
         err = capsys.readouterr().err
         assert "not on the allowlist" in err
-        # Error message names every valid choice so the agent can self-correct.
         for canonical in ("code_review", "test_review", "doc_review"):
             assert canonical in err
 
@@ -11846,17 +11464,13 @@ class TestCmdLogVerdictAllowlist:
             "doc_review",
             "changes_manifest",
             "security_review",
-            "executor",  # audit-only workflow agent
-            "blocker_resolver",  # audit-only workflow agent
+            "executor",
+            "blocker_resolver",
             "manifest_amender",
             "task_factory",
         ],
     )
     def test_accepts_allowlist_judges(self, good_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        # Build a minimal workspace so the verdict-write reaches its
-        # successful return path. Failure here would surface as a
-        # non-zero rc with stderr; we assert rc==0 to prove the
-        # allowlist gate did not trip.
         backlog_root = tmp_path / "backlog"
         story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
@@ -11886,12 +11500,6 @@ class TestCmdLogVerdictAllowlist:
         assert rc == 0
 
 
-# ---------------------------------------------------------------------------
-# log-file path resolution: fail-fast when neither DEVBENCH_LOG_FILE nor
-# DEVBENCH_WORKSPACE_ROOT is set; canonical workspace-local path otherwise
-# ---------------------------------------------------------------------------
-
-
 class TestResolveLogFilePath:
     """``_resolve_log_file_path`` is the single source of truth for which
     log file ``devbench report`` reads. Removing the silent source-tree
@@ -11908,23 +11516,16 @@ class TestResolveLogFilePath:
     def test_explicit_devbench_log_file_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/my-explicit.log")
-        # DEVBENCH_LOG_FILE is the explicit override and MUST win even when
-        # DEVBENCH_WORKSPACE_ROOT (via WORKSPACE_ROOT) is also set.
         assert cli._resolve_log_file_path() == Path("/tmp/my-explicit.log")
 
     def test_workspace_root_derives_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
-        # Default path is <WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>.
-        # Operators running ``devbench report`` from any shell with
-        # DEVBENCH_WORKSPACE_ROOT set get the same log the orchestrator writes to.
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
         expected = cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
         assert cli._resolve_log_file_path() == expected
 
     def test_empty_devbench_log_file_falls_through_to_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Empty / whitespace-only DEVBENCH_LOG_FILE behaves as unset
-        # (avoids "" being treated as a valid path).
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "   ")
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
@@ -11932,9 +11533,6 @@ class TestResolveLogFilePath:
         assert cli._resolve_log_file_path() == expected
 
     def test_neither_env_nor_yaml_falls_back_to_workspace_root_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # When neither DEVBENCH_LOG_FILE nor YAML log_file is set, the resolver
-        # uses WORKSPACE_ROOT (already resolved from DEVBENCH_WORKSPACE_ROOT by
-        # config.py) to derive the canonical aggregate path.
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
@@ -11964,25 +11562,18 @@ class TestResolveLogFileYamlConfig:
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
-        # YAML log_file is workspace-relative when not absolute; the
-        # resolver joins it with WORKSPACE_ROOT (already resolved from DEVBENCH_WORKSPACE_ROOT).
         assert cli._resolve_log_file_path() == cli.WORKSPACE_ROOT / "logs" / "orch.log"
 
     def test_yaml_log_file_absolute_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("/var/log/d.log"))
-        # An absolute YAML path is used as-is, ignoring the workspace
-        # root (operator deliberately put the log outside the workspace).
         assert cli._resolve_log_file_path() == Path("/var/log/d.log")
 
     def test_explicit_devbench_log_file_still_wins_over_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/explicit.log")
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
-        # Per-invocation DEVBENCH_LOG_FILE env override beats both YAML config and the
-        # workspace-local convention; this matches how ``cmd_check`` and
-        # the test fixtures set the path explicitly.
         assert cli._resolve_log_file_path() == Path("/tmp/explicit.log")
 
     def test_yaml_unset_falls_through_to_workspace_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -11990,16 +11581,12 @@ class TestResolveLogFileYamlConfig:
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file(None))
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
-        # When neither DEVBENCH_LOG_FILE nor YAML log_file is set, the resolver
-        # falls back to the workspace-local aggregate convention using WORKSPACE_ROOT.
         assert cli._resolve_log_file_path() == (cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME)
 
     def test_yaml_with_relative_path_and_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # YAML has a relative log_file; WORKSPACE_ROOT is used as the anchor.
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
-        # WORKSPACE_ROOT is already resolved; relative YAML path is joined to it.
         assert cli._resolve_log_file_path() == cli.WORKSPACE_ROOT / "logs" / "orch.log"
 
 
@@ -12050,8 +11637,6 @@ class TestInlineOrphanCleanup:
         from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
 
         self._seed_orphan_in_repo(tmp_repo_dir)
-        # Stage an executor file alongside the orphan situation so we can
-        # verify the executor's staging survives the cleanup pass.
         import subprocess
 
         (tmp_repo_dir / "feature.py").write_text("print('hi')\n", encoding="utf-8")
@@ -12065,9 +11650,8 @@ class TestInlineOrphanCleanup:
             repo_path=tmp_repo_dir,
             detected=[".coverage (1)"],
         )
-        assert result is False  # caller continues with task commit
+        assert result is False
 
-        # Cleanup commit landed with the canonical chore message.
         log = subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "log", "-1", "--format=%s"],
             check=True,
@@ -12076,7 +11660,6 @@ class TestInlineOrphanCleanup:
         ).stdout.strip()
         assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
 
-        # Orphan is no longer tracked.
         ls = subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "ls-files"],
             check=True,
@@ -12085,11 +11668,9 @@ class TestInlineOrphanCleanup:
         ).stdout
         assert ".coverage (1)" not in ls
 
-        # ``.gitignore`` was written with the devbench-managed block.
         gitignore = (tmp_repo_dir / ".gitignore").read_text(encoding="utf-8")
         assert ".coverage*" in gitignore
 
-        # Executor's staging (feature.py) was preserved.
         staged = subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "diff", "--cached", "--name-only"],
             check=True,
@@ -12132,7 +11713,6 @@ class TestInlineOrphanCleanup:
         )
         assert result is False
 
-        # Cleanup commit landed under the canonical chore message.
         log = subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "log", "-1", "--format=%s"],
             check=True,
@@ -12141,7 +11721,6 @@ class TestInlineOrphanCleanup:
         ).stdout.strip()
         assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
 
-        # Orphan untracked.
         ls = subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "ls-files"],
             check=True,
@@ -12150,7 +11729,6 @@ class TestInlineOrphanCleanup:
         ).stdout
         assert ".coverage (1)" not in ls
 
-        # .gitignore extended with the devbench-managed block.
         gitignore = (tmp_repo_dir / ".gitignore").read_text(encoding="utf-8")
         assert ".coverage*" in gitignore
 
@@ -12164,7 +11742,6 @@ class TestInlineOrphanCleanup:
         """
         import subprocess
 
-        # Stage a brand-new orphan-pattern file that's not yet tracked.
         (tmp_repo_dir / ".coverage").write_text("data\n", encoding="utf-8")
         subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "add", "-f", "--", ".coverage"],
@@ -12178,7 +11755,6 @@ class TestInlineOrphanCleanup:
         )
         assert result is False
 
-        # Orphan is no longer staged.
         staged = subprocess.run(
             ["git", "-C", str(tmp_repo_dir), "diff", "--cached", "--name-only"],
             check=True,
@@ -12196,7 +11772,6 @@ class TestInlineOrphanCleanup:
         the caller refuses the parent commit -- and prints an actionable
         error mentioning the manual recovery command.
         """
-        # Pass a non-git-repo path so cleanup_tracked_orphans raises.
         result = cli._inline_orphan_cleanup_or_refuse(
             unit_id="E0-F1-S1-T1",
             repo_path=tmp_path,
@@ -12205,7 +11780,7 @@ class TestInlineOrphanCleanup:
         assert result is True
         err = capsys.readouterr().err
         assert "git-ops refused" in err
-        assert "cleanup-tracked-orphans" in err  # operator-recovery hint
+        assert "cleanup-tracked-orphans" in err
 
 
 class TestEmitOrphanCleanupDispatch:
@@ -12233,8 +11808,6 @@ class TestEmitOrphanCleanupDispatch:
         legacy.assert_not_called()
 
     def test_skipped_gate_returns_false(self, tmp_path: Path) -> None:
-        # _orphan_paths_for_repo returns None when the gate is skipped
-        # (non-git checkout). Caller continues without refusal.
         with patch("devbench.cli._orphan_paths_for_repo", return_value=None):
             assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
 
@@ -12245,8 +11818,6 @@ class TestEmitOrphanCleanupDispatch:
             patch("devbench.cli._inline_orphan_cleanup_or_refuse", return_value=False) as inline,
             patch("devbench.cli._legacy_emit_orphan_cleanup_proposal") as legacy,
         ):
-            # The function imports INLINE_ORPHAN_CLEANUP_ENABLED at call time;
-            # patch the import target directly via the module-level constant.
             import devbench.config as cfg
 
             cfg.INLINE_ORPHAN_CLEANUP_ENABLED = True
@@ -12309,7 +11880,6 @@ class TestLegacyEmitOrphanCleanupProposalAutoAccept:
         story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
 
-        # Source-task file so _find_source_task_file finds it when wiring deps.
         wu_file = story_dir / f"{self._SOURCE_ID}.md"
         wu_file.write_text(
             f"# {self._SOURCE_ID}: Source task\n\n"
@@ -12380,7 +11950,6 @@ class TestLegacyEmitOrphanCleanupProposalAutoAccept:
 
         assert result is True
 
-        # Exactly one new draft (excluding the source task itself).
         new_drafts = [d for d in story_dir.glob("E0-F1-S1-T*.md") if d.name != f"{self._SOURCE_ID}.md"]
         assert len(new_drafts) == 1, f"Expected exactly one new draft, found: {new_drafts}"
         content = new_drafts[0].read_text(encoding="utf-8")
@@ -12434,7 +12003,6 @@ class TestLegacyEmitOrphanCleanupProposalAutoAccept:
         )
 
         err = capsys.readouterr().err
-        # The message must name the actual end-state status, not hardcode "(in-queue)".
         assert "(proposed)" in err, f"Expected '(proposed)' in stderr when auto-accept is off: {err!r}"
         assert "(in-queue)" not in err, f"Error message hardcodes '(in-queue)' even when auto-accept is off: {err!r}"
 
@@ -12449,7 +12017,6 @@ class TestFindExistingCleanupProposal:
     def test_returns_none_when_no_cleanup_proposal_present(self, tmp_path: Path) -> None:
         proposals = tmp_path / ".devbench" / "proposals"
         proposals.mkdir(parents=True)
-        # Some other proposal (not an orphan-cleanup -- claims a different file).
         (proposals / "E0-F1-S1-T2.json").write_text(
             json.dumps(
                 {
@@ -12496,7 +12063,6 @@ class TestFindExistingCleanupProposal:
             encoding="utf-8",
         )
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            # Malformed file is silently skipped; the valid one still wins.
             assert cli._find_existing_cleanup_proposal([".coverage"]) == "E0-F1-S1-T7"
 
 
@@ -12568,11 +12134,9 @@ class TestCiFailureRetry:
                 mgr=mgr,
             )
         assert rc == 2
-        # log file written under workspace
         log_files = sorted((tmp_path / ".devbench" / "ci-failures").glob("E0-F1-S1-T1-*.log"))
         assert len(log_files) == 1
         assert "ruff E501" in log_files[0].read_text(encoding="utf-8")
-        # audit comment written with [CI_FAIL] (not _BLOCKED)
         msg = mgr._append_agent_comment.call_args.args[2]
         assert msg.startswith("[CI_FAIL] ")
 
@@ -12581,11 +12145,10 @@ class TestCiFailureRetry:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Pre-seed two prior CI_FAIL entries so this is attempt 3 -- exhausted.
         wu = self._make_wu_file(tmp_path, comments=["[CI_FAIL] r1", "[CI_FAIL] r2"])
         mgr = MagicMock()
         ops = MagicMock()
-        ops.get_latest_failing_run_id.return_value = None  # log unavailable
+        ops.get_latest_failing_run_id.return_value = None
         with (
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
@@ -12604,7 +12167,6 @@ class TestCiFailureRetry:
         err = capsys.readouterr().err
         assert "budget exhausted" in err
         assert "MAX_RETRY_ATTEMPTS=3" in err
-        # exhaustion uses [CI_FAIL_BLOCKED] marker
         msg = mgr._append_agent_comment.call_args.args[2]
         assert msg.startswith("[CI_FAIL_BLOCKED] ")
 
@@ -12748,7 +12310,6 @@ class TestPrReviewResolution:
             reviews=[{"reviewer": "bot", "state": "CHANGES_REQUESTED", "body": "x"}],
         )
         mgr = MagicMock()
-        # Pre-seed MAX-1 PR_BOT_FAIL retries so the next failure exhausts budget.
         wu = self._wu_file(tmp_path, retries=2)
         with (
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
@@ -12795,7 +12356,6 @@ class TestPauseBeforeMerge:
             )
         assert rc == 0
         mgr.force_status.assert_called_once()
-        # 4th positional arg of force_status is the new status
         args = mgr.force_status.call_args.args
         assert args[3] == "in-review"
         msg = mgr._append_agent_comment.call_args.args[2]
@@ -12953,14 +12513,6 @@ class TestCheckMergeRegistration:
         assert argc == 1
 
 
-# ---------------------------------------------------------------------------
-# Issue #148 / #150 / #152 / #153 / #155 cascade-reliability fixes.
-# Helpers below reuse the lightweight backlog scaffolding pattern from
-# ``TestCmdSyncBlocked`` -- duplicated locally so each test class stays
-# self-contained and a fixture rename never silently breaks one of these.
-# ---------------------------------------------------------------------------
-
-
 def _cascade_build_backlog(
     tmp_path: Path,
     rows: list[tuple[str, str, str, str, str, str]],
@@ -13008,8 +12560,6 @@ class TestSyncBlockedEvaluatesMarkerTargetState:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # T2 carries a marker pointing at T9 which is already done;
-        # sync-blocked must NOT skip on the marker any more.
         marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
         index = _cascade_build_backlog(
             tmp_path,
@@ -13204,10 +12754,6 @@ class TestVariadicCommandsCoverage:
     fails this test.
     """
 
-    # Flag tokens that ALWAYS take a value (not boolean toggles). A command's
-    # body that contains ``arg == "--reason"`` (and similar) MUST opt into
-    # variadic dispatch -- the fixed-arity slice would otherwise drop the
-    # value when it follows positional args.
     FLAG_TOKENS_NEEDING_VARIADIC: ClassVar[tuple[str, ...]] = (
         '"--reason"',
         '"--reasoning"',
@@ -13287,8 +12833,6 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
     ) -> None:
         from devbench.config_loader import RuntimeConfig, TaskFactoryConfig
 
-        # No proposal JSON on disk; the orphan-promote pass should still
-        # surface the proposed draft and flip it to in-queue.
         index = _cascade_build_backlog(
             tmp_path,
             rows=[
@@ -13296,13 +12840,9 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
                 ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
             ],
         )
-        # The promoter resolves the draft via _find_draft_file which expects
-        # the layout backlog/E0/E0-F1/E0-F1-S1/<id>.md. Replicate that here
-        # so the auto-promote actually finds the draft.
         story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
         (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
-        # Re-point the BACKLOG.md row to the nested location.
         idx_text = index.read_text()
         index.write_text(
             idx_text.replace(
@@ -13320,11 +12860,8 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
         ):
             rc = cli.cmd_sweep_proposals()
         assert rc == 0
-        # No proposal JSON existed -> the materialise loop is a no-op, so
-        # only the orphan promote pass touches T2.
         out = capsys.readouterr().out
         assert "orphan auto-promoted 1" in out
-        # T2 transitioned to in-queue via promote_proposal.
         t2_md = (story_dir / "E0-F1-S1-T2.md").read_text()
         assert "## Status: in-queue" in t2_md
 
@@ -13364,11 +12901,6 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
         out = capsys.readouterr().out
         assert "orphan auto-promoted" not in out
         assert "## Status: proposed" in (story_dir / "E0-F1-S1-T2.md").read_text()
-
-
-# ---------------------------------------------------------------------------
-# Issue #156: cmd_log_rejection_feedback schema + injection + done-gate
-# ---------------------------------------------------------------------------
 
 
 class TestCmdLogRejectionFeedbackSchema:
@@ -13553,10 +13085,8 @@ class TestRejectionFeedbackInjection:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Cap above the seed count so nothing is truncated.
         monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 10)
         task_id = "E0-F1-S1-T1"
-        # Seed three rejections across two judges, lower-severity first.
         self._seed(tmp_path, "doc_review", task_id, 1, "README_SYNC")
         self._seed(tmp_path, "code_review", task_id, 1, "HARDCODED_URL")
         self._seed(tmp_path, "code_review", task_id, 2, "SCOPE_VIOLATION")
@@ -13564,7 +13094,6 @@ class TestRejectionFeedbackInjection:
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             payloads = cli._collect_review_judge_feedback(task_id)
 
-        # security>code>test>changes_manifest>doc; within judge, higher attempt first.
         order = [(p["judge"], p["attempt"]) for p in payloads]
         assert order == [
             ("code_review", 2),
@@ -13585,7 +13114,6 @@ class TestRejectionFeedbackInjection:
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             payloads = cli._collect_review_judge_feedback(task_id)
         assert len(payloads) == 2
-        # Highest-severity / latest-attempt entries survive the cap.
         assert all(p["judge"] == "code_review" for p in payloads)
 
     def test_legacy_amender_rejections_synthesized(self, tmp_path: Path) -> None:
@@ -13826,7 +13354,6 @@ class TestInProgressAttemptDurationRender:
         )
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", str(log_path))
-        # Freeze time so the duration output is deterministic.
         fake_now = datetime(2026, 5, 2, 12, 23, 0, tzinfo=UTC)
 
         class _FrozenDT(datetime):
@@ -13865,7 +13392,6 @@ class TestInProgressAttemptDurationFallback:
     ``timer unavailable`` placeholder."""
 
     def test_returns_none_with_no_signals(self, tmp_path: Path) -> None:
-        # Force log_path to a non-existent file AND ensure backlog parse fails fast.
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
@@ -13880,8 +13406,6 @@ class TestInProgressAttemptDurationFallback:
         backlog_dir: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Stub _resolve_unit_file_by_id directly so we don't have to materialise a
-        # full backlog -- the fallback path is the only behaviour under test here.
         wu = backlog_dir / "E0-F1-S1-T2.md"
         wu.write_text(
             "## Comments\n[2026-05-02 11:30 UTC] [agent/orchestrator] Set E0-F1-S1-T2 to 'in-progress'\n",
@@ -13924,7 +13448,6 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
 
         monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
-        # 4h vs 30m vs 4h+30m: most recent wins -> 30m.
         assert result == "30m"
 
     def test_format_duration_thresholds(self) -> None:
@@ -13947,7 +13470,6 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
             encoding="utf-8",
         )
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
-        # Only the bogus timestamp -> nothing parses -> None.
         assert result is None
 
     def test_audit_with_invalid_timestamp_skipped(
@@ -13973,13 +13495,6 @@ class TestTryResolveLogFilePath:
     """
 
     def test_returns_workspace_default_when_neither_env_nor_yaml_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # After the JUDGE_* -> DEVBENCH_* rename, WORKSPACE_ROOT is always
-        # resolved at import time (config.py raises if it is not set).
-        # _resolve_log_file_path no longer raises SystemExit when neither
-        # DEVBENCH_LOG_FILE nor YAML log_file is configured; it falls
-        # back to the canonical WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
-        # path.  _try_resolve_log_file_path therefore returns that path
-        # rather than None.
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
@@ -14056,7 +13571,6 @@ class TestCmdStatusNextActionableFilter:
         )
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [in_prog, in_queue]
-        # get_parallel_candidates returns IN_PROGRESS first, then IN_QUEUE.
         mock_parser.get_parallel_candidates.return_value = [in_prog, in_queue]
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = []
@@ -14064,9 +13578,7 @@ class TestCmdStatusNextActionableFilter:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        # Active panel still shows the in-progress task ...
         assert "E0-F1-S1-T1" in out
-        # ... and Next actionable points at the DIFFERENT in-queue task.
         assert "Next actionable: E0-F1-S1-T2" in out
 
     def test_no_actionable_message_when_only_active(
@@ -14093,7 +13605,6 @@ class TestCmdStatusNextActionableFilter:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        # No "Next actionable" line; instead the no-actionable branch fires.
         assert "Next actionable" not in out
         assert "No actionable units." in out
 
@@ -14319,15 +13830,12 @@ class TestCmdStatusSixBucketCounts:
         assert rc == 0
         out = capsys.readouterr().out
 
-        # Each label present with count 1.
         for label in self._CANONICAL_COUNT_LABELS:
             assert re.search(rf"{re.escape(label)}\s+1\b", out), f"missing row {label!r}\n{out}"
 
-        # Labels appear in canonical order.
         positions = [out.index(label) for label in self._CANONICAL_COUNT_LABELS]
         assert positions == sorted(positions), f"count rows not in canonical order\n{out}"
 
-        # Old three-bucket rows must NOT appear.
         assert "Blocked (auto)" not in out, out
         assert "Blocked (recovery)" not in out, out
         assert "Blocked (attn)" not in out, out
@@ -14377,18 +13885,11 @@ class TestCmdStatusSixBucketCounts:
         assert rc == 0
         out = capsys.readouterr().out
 
-        # All six panel headers present.
         for header in self._CANONICAL_PANEL_HEADERS:
             assert header in out, f"missing panel header {header!r}\n{out}"
 
-        # Panel headers appear in canonical order.
         positions = [out.index(header) for header in self._CANONICAL_PANEL_HEADERS]
         assert positions == sorted(positions), f"panels not in canonical order\n{out}"
-
-
-# ---------------------------------------------------------------------------
-# Multi-PR replay regression tests for rewired cmd_git_ops (E7-F1-S1-T1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -14410,10 +13911,6 @@ class TestCmdGitOpsMultiPrReplay:
             repo="caylent-solutions/devbench",
             dependencies=[],
         )
-
-    # ------------------------------------------------------------------
-    # Scenario 1: CIResult.GREEN => merge, rc=0
-    # ------------------------------------------------------------------
 
     def test_green_result_merges_and_returns_zero(self, tmp_path: Path) -> None:
         """When wait_for_checks_and_classify returns GREEN, cmd_git_ops merges and returns 0."""
@@ -14445,10 +13942,6 @@ class TestCmdGitOpsMultiPrReplay:
 
         assert result == 0
         mock_ops_inst.merge_pr.assert_called_once()
-
-    # ------------------------------------------------------------------
-    # Scenario 2: CIResult.FAILED_UNKNOWN => same as wait_for_checks=False, rc=2 (retry)
-    # ------------------------------------------------------------------
 
     def test_failed_unknown_result_returns_retry_rc(self, tmp_path: Path) -> None:
         """FAILED_UNKNOWN triggers the same CI-failure retry path as pre-refactor False."""
@@ -14482,10 +13975,6 @@ class TestCmdGitOpsMultiPrReplay:
         assert result == 2
         mock_ops_inst.merge_pr.assert_not_called()
 
-    # ------------------------------------------------------------------
-    # Scenario 3: CIResult.FAILED_KNOWN_TASK => same CI-failure path, rc=2
-    # ------------------------------------------------------------------
-
     def test_failed_known_task_result_returns_retry_rc(self, tmp_path: Path) -> None:
         """FAILED_KNOWN_TASK triggers the CI-failure retry path (rc=2)."""
         from devbench.github.git_ops import CIResult
@@ -14518,10 +14007,6 @@ class TestCmdGitOpsMultiPrReplay:
         assert result == 2
         mock_ops_inst.merge_pr.assert_not_called()
 
-    # ------------------------------------------------------------------
-    # Scenario 4: CIResult.TIMEOUT => same CI-failure path, rc=2
-    # ------------------------------------------------------------------
-
     def test_timeout_result_returns_retry_rc(self, tmp_path: Path) -> None:
         """TIMEOUT triggers the CI-failure retry path (rc=2), not a hard crash."""
         from devbench.github.git_ops import CIResult
@@ -14553,10 +14038,6 @@ class TestCmdGitOpsMultiPrReplay:
 
         assert result == 2
         mock_ops_inst.merge_pr.assert_not_called()
-
-    # ------------------------------------------------------------------
-    # Scenario 5: FAILED_KNOWN_TASK + budget exhausted => rc=1 (BLOCKED)
-    # ------------------------------------------------------------------
 
     def test_failed_known_task_budget_exhausted_returns_one(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -14594,11 +14075,6 @@ class TestCmdGitOpsMultiPrReplay:
         assert "budget exhausted" in err.lower() or "max_retry" in err.lower() or "blocked" in err.lower()
         mock_ops_inst.merge_pr.assert_not_called()
 
-    # ------------------------------------------------------------------
-    # Scenario 6: parity assertion -- GREEN produces same transitions as
-    #             pre-refactor wait_for_checks=True
-    # ------------------------------------------------------------------
-
     def test_green_parity_with_pre_refactor_true(self, tmp_path: Path) -> None:
         """CIResult.GREEN from wait_for_checks_and_classify produces bit-identical
         outcome to what the pre-refactor wait_for_checks=True path produced:
@@ -14614,7 +14090,6 @@ class TestCmdGitOpsMultiPrReplay:
 
         unit = self._make_unit("E202-F1-S1-T3")
 
-        # First leg: explicit CIResult.GREEN via wait_for_checks_and_classify
         mock_ops_a = MagicMock()
         mock_ops_a.create_pr.return_value = "https://github.com/org/repo/pull/50"
         mock_ops_a.wait_for_checks_and_classify.return_value = CIResult.GREEN
@@ -14638,7 +14113,6 @@ class TestCmdGitOpsMultiPrReplay:
         ):
             rc_a = cli.cmd_git_ops(unit.id)
 
-        # Second leg: also CIResult.GREEN but on a fresh mock (parity verification)
         mock_ops_b = MagicMock()
         mock_ops_b.create_pr.return_value = "https://github.com/org/repo/pull/51"
         mock_ops_b.wait_for_checks_and_classify.return_value = CIResult.GREEN
@@ -14698,7 +14172,6 @@ class TestCmdPreparePluginShadow:
         out = capsys.readouterr().out.strip()
         assert rc == 0
         assert out == str(tmp_path / ".devbench" / "plugin-shadow" / "devbench")
-        # Real file (rewritten), not symlink
         executor = Path(out) / "agents" / "executor.md"
         assert executor.is_file() and not executor.is_symlink()
         assert "model: opus\n" in executor.read_text(encoding="utf-8")
@@ -14743,14 +14216,9 @@ class TestCmdStartUsesShadow:
             rc = cli.cmd_start()
 
         assert rc == 0
-        # Verify the options constructor was called with the shadow path,
-        # not the canonical.
         kwargs = mock_options_cls.call_args.kwargs
         shadow_path = str(tmp_path / ".devbench" / "plugin-shadow" / "devbench")
         assert kwargs["plugins"] == [{"type": "local", "path": shadow_path}]
-        # cmd_start MUST have written a PID sentinel inside the shadow tree
-        # so a stray prepare-plugin-shadow can't clear it while this run
-        # is alive.
         sentinel = tmp_path / ".devbench" / "plugin-shadow" / "devbench" / ".pid"
         assert sentinel.is_file()
         import os as _os
@@ -14758,8 +14226,6 @@ class TestCmdStartUsesShadow:
         assert sentinel.read_text(encoding="utf-8").strip() == str(_os.getpid())
 
     def test_cmd_start_without_override_does_not_write_sentinel(self, tmp_path: Path) -> None:
-        # When no overrides are configured, _resolve_plugin_path returns the
-        # canonical path -- no shadow exists, so no sentinel must be written.
         import sys
 
         from devbench.config_loader import AgentModelsConfig
@@ -14769,7 +14235,7 @@ class TestCmdStartUsesShadow:
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
-            patch("devbench.cli.AGENT_MODELS", AgentModelsConfig()),  # no overrides
+            patch("devbench.cli.AGENT_MODELS", AgentModelsConfig()),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch(
                 "devbench.cli._should_auto_restart_after_no_actionable",
@@ -14821,7 +14287,6 @@ class TestCmdStartAutoRestartPostMortem:
         )
 
         assert rc == ORCHESTRATOR_RESTART_EXIT_CODE
-        # The audit prefix + comma-joined task id list must appear in the log.
         assert any(
             ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX in rec.getMessage() and "E1-F4-S1-T3,E4-F1-S1-T5" in rec.getMessage()
             for rec in caplog.records
@@ -14853,16 +14318,8 @@ class _CmdStartScopeTestBase:
     class needs to duplicate them.
     """
 
-    # ------------------------------------------------------------------
-    # Shared SDK mock factory
-    # ------------------------------------------------------------------
-
     def _make_sdk_mock(self) -> object:
         return _make_fake_sdk_module(["msg"])
-
-    # ------------------------------------------------------------------
-    # Fixture-level backlog IDs used across tests
-    # ------------------------------------------------------------------
 
     _BACKLOG_IDS: ClassVar[list[str]] = [
         "E1-F1-S1-T1",
@@ -14934,10 +14391,6 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
     output and the command return-code.
     """
 
-    # ------------------------------------------------------------------
-    # AC-190-8: --include writes scope.json with raw + expanded sets
-    # ------------------------------------------------------------------
-
     def _make_scope_capturing_sdk(self, scope_path: Path, captured: list[dict[str, list[str]]]) -> object:
         """Return an SDK mock that reads scope.json content into ``captured`` before yielding.
 
@@ -15001,11 +14454,9 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
         data = captured[0]
         assert data["include"] == ["E1"]
         assert data["exclude"] == []
-        # All E1 descendants must be in expanded_ids
         assert set(data["expanded_ids"]) == {"E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F2-S1-T1"}
         assert "started_at" in data
         assert "started_by" in data
-        # scope.json must be cleared after clean exit (AC-190-13)
         assert not scope_path.exists(), "scope.json must be cleared on clean exit (AC-190-13)"
 
     def test_include_and_exclude_writes_correct_scope_json(self, tmp_path: Path) -> None:
@@ -15022,16 +14473,10 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
         data = captured[0]
         assert data["include"] == ["E1"]
         assert data["exclude"] == ["E1-F2-S1-T1"]
-        # E1-F2-S1-T1 must be excluded
         assert "E1-F2-S1-T1" not in data["expanded_ids"]
         assert "E1-F1-S1-T1" in data["expanded_ids"]
         assert "E1-F1-S1-T2" in data["expanded_ids"]
-        # scope.json must be cleared after clean exit (AC-190-13)
         assert not scope_path.exists(), "scope.json must be cleared on clean exit (AC-190-13)"
-
-    # ------------------------------------------------------------------
-    # AC-190-9: empty --include means "include everything"
-    # ------------------------------------------------------------------
 
     def test_no_flags_does_not_write_scope_json(self, tmp_path: Path) -> None:
         """AC-190-9: cmd_start with no --include flag must NOT write scope.json."""
@@ -15095,7 +14540,6 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
                 pass
 
             async def receive_response(self) -> Any:
-                # scope.json must exist on disk while the SDK run is active.
                 assert scope_path.is_file(), "scope.json must be written at the session path during the run"
                 yield "msg"
 
@@ -15107,9 +14551,6 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
             rc = cli.cmd_start("--include", "E1")
 
         assert rc == 0
-        # scope.json is intentionally left on disk after a clean run only when the
-        # SDK crashes; on clean return it is cleared. The in-run assertion above is
-        # the contract that matters: scope was persisted at the session path.
 
     def test_unknown_flag_exits_nonzero(self, tmp_path: Path) -> None:
         """Unknown flags must cause cmd_start to exit with rc=1 (fail-fast)."""
@@ -15117,10 +14558,6 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
             rc = cli.cmd_start("--unknown-flag", "value")
 
         assert rc == 1
-
-    # ------------------------------------------------------------------
-    # Error paths: dangling flags without a value
-    # ------------------------------------------------------------------
 
     def test_include_without_value_exits_nonzero(self, tmp_path: Path) -> None:
         """--include with no following value must cause cmd_start to exit rc=1 (fail-fast).
@@ -15156,10 +14593,6 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
     Shared helpers (_make_sdk_mock, _BACKLOG_IDS, _fake_units, _patch_cli) are
     inherited from ``_CmdStartScopeTestBase``.
     """
-
-    # ------------------------------------------------------------------
-    # AC-190-13: scope.json cleared on clean exit
-    # ------------------------------------------------------------------
 
     def test_clean_exit_clears_scope_json(self, tmp_path: Path) -> None:
         """AC-190-13: scope.json must be deleted after a successful SDK run."""
@@ -15217,7 +14650,7 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
 
             async def receive_response(self) -> Any:
                 raise _SDKError("simulated SDK crash")
-                yield  # make it an async generator
+                yield
 
         crash_sdk: Any = types.ModuleType("claude_agent_sdk")
         crash_sdk.ClaudeAgentOptions = MagicMock()
@@ -15380,14 +14813,8 @@ class TestShouldAutoRestartPostMortem:
 
         assert should is True
         assert ids == ["T2"]
-        # Only the BLOCKED unit got passed to the classifier.
         assert mock_classify.call_count == 1
         assert mock_classify.call_args.kwargs["task_id"] == "T2"
-
-
-# ---------------------------------------------------------------------------
-# AC-190-10 / AC-190-11: cmd_status scope flags + SCOPE banner (E2-F2-S2-T1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -15436,10 +14863,6 @@ class TestCmdStatusScopeBanner:
         }
         (scope_dir / "scope.json").write_text(json.dumps(payload))
 
-    # ------------------------------------------------------------------
-    # AC-190-10: honors active scope.json without flags
-    # ------------------------------------------------------------------
-
     def test_scope_banner_rendered_from_scope_json(
         self,
         tmp_path: Path,
@@ -15468,7 +14891,6 @@ class TestCmdStatusScopeBanner:
         assert "include=[E1-E3]" in out
         assert "exclude=[E2]" in out
         assert "2026-05-14T13:42:11Z" in out
-        # Banner must appear BEFORE the Status Summary line.
         assert out.index("SCOPE:") < out.index("Backlog Status Summary")
 
     def test_scope_banner_absent_when_no_scope_json(
@@ -15516,10 +14938,6 @@ class TestCmdStatusScopeBanner:
         assert "SCOPE:" in out
         assert "include=[]" in out
         assert "exclude=[]" in out
-
-    # ------------------------------------------------------------------
-    # AC-190-11: per-command --include override
-    # ------------------------------------------------------------------
 
     def test_include_flag_renders_scope_banner(
         self,
@@ -15587,13 +15005,8 @@ class TestCmdStatusScopeBanner:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # The flag override must appear, not the scope.json values.
         assert "include=[E1]" in out
         assert "E5" not in out.split("SCOPE:")[1].split("\n")[0]
-
-    # ------------------------------------------------------------------
-    # Error paths for missing flag values
-    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize("flag", ["--include", "--exclude"])
     def test_flag_without_value_returns_error(
@@ -15620,10 +15033,6 @@ class TestCmdStatusScopeBanner:
         err = capsys.readouterr().err
         assert "requires a value" in err
 
-    # ------------------------------------------------------------------
-    # Backward compatibility: --detail still works with scope flags
-    # ------------------------------------------------------------------
-
     def test_detail_and_include_flags_coexist(
         self,
         tmp_path: Path,
@@ -15644,10 +15053,6 @@ class TestCmdStatusScopeBanner:
         out = capsys.readouterr().out
         assert "SCOPE:" in out
         assert "Backlog Status Summary" in out
-
-    # ------------------------------------------------------------------
-    # Corrupt scope.json propagates as error (fail-fast)
-    # ------------------------------------------------------------------
 
     def test_corrupt_scope_json_exits_with_error(
         self,
@@ -15708,11 +15113,6 @@ class TestCmdStatusScopeBanner:
         assert "must be a list" in err
 
 
-# ---------------------------------------------------------------------------
-# AC-190-10 / AC-190-11: cmd_report scope flags + SCOPE banner (E2-F2-S2-T2)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCmdReportScopeBanner:
     """E2-F2-S2-T2: cmd_report accepts --include/--exclude; renders SCOPE banner.
@@ -15740,10 +15140,6 @@ class TestCmdReportScopeBanner:
             "started_by": started_by,
         }
         (scope_dir / "scope.json").write_text(json.dumps(payload))
-
-    # ------------------------------------------------------------------
-    # AC-190-10: honors active scope.json without flags
-    # ------------------------------------------------------------------
 
     def test_scope_banner_rendered_from_scope_json(
         self,
@@ -15809,10 +15205,6 @@ class TestCmdReportScopeBanner:
         assert "include=[E1, E3]" in out
         assert "exclude=[E1-F2]" in out
 
-    # ------------------------------------------------------------------
-    # AC-190-11: per-command --include override
-    # ------------------------------------------------------------------
-
     def test_include_flag_renders_scope_banner(
         self,
         tmp_path: Path,
@@ -15870,14 +15262,9 @@ class TestCmdReportScopeBanner:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # The flag override must appear, not the scope.json values.
         assert "include=[E1]" in out
         scope_line = next(ln for ln in out.splitlines() if "SCOPE:" in ln)
         assert "E5" not in scope_line
-
-    # ------------------------------------------------------------------
-    # scope_filter forwarded to generate_report
-    # ------------------------------------------------------------------
 
     def test_scope_filter_passed_to_generate_report_when_include_flag(
         self,
@@ -15897,7 +15284,6 @@ class TestCmdReportScopeBanner:
             rc = cli.cmd_report(once=True, include="E1")
 
         assert rc == 0
-        # scope_filter must be a non-None ScopeFilter with the include tokens.
         assert "scope_filter" in captured
         sf = captured["scope_filter"]
         assert sf is not None
@@ -15947,10 +15333,6 @@ class TestCmdReportScopeBanner:
 
         assert rc == 0
         assert captured.get("scope_filter") is None
-
-    # ------------------------------------------------------------------
-    # Error paths: corrupt scope.json
-    # ------------------------------------------------------------------
 
     def test_corrupt_scope_json_returns_error(
         self,
@@ -16007,10 +15389,6 @@ class TestCmdReportScopeBanner:
         assert "scope.json" in err
         assert bad_field in err
         assert "must be a list" in err
-
-    # ------------------------------------------------------------------
-    # main() integration: --include / --exclude extracted from CLI args
-    # ------------------------------------------------------------------
 
     def test_main_extracts_include_flag_for_report(
         self,
@@ -16095,24 +15473,14 @@ class TestCmdReportScopeBanner:
         assert called_with.get("exclude", "") == ""
 
 
-# ---------------------------------------------------------------------------
-# cmd_scope tests (AC-196-1 through AC-196-9; spec section 4.2.6)
-# ---------------------------------------------------------------------------
-
-
 class TestCmdScope:
     """Tests for cmd_scope: set / clear / show dispatch (spec 4.2.6, issue #196)."""
 
-    # Canonical backlog IDs used in all set-action tests.
     _BACKLOG_IDS: ClassVar[list[str]] = [
         "E1-F1-S1-T1",
         "E1-F1-S1-T2",
         "E2-F1-S1-T1",
     ]
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _scope_path(self, tmp_path: Path) -> Path:
         """Return the canonical scope.json path under tmp_path."""
@@ -16140,10 +15508,6 @@ class TestCmdScope:
             BacklogParser=MagicMock(return_value=parser_mock),
         )
 
-    # ------------------------------------------------------------------
-    # AC-196-1: scope set -- happy path (workspace-root scope.json)
-    # ------------------------------------------------------------------
-
     def test_set_writes_scope_json(self, tmp_path: Path) -> None:
         """scope set --include creates scope.json with correct include/exclude fields."""
         with self._patch_scope_env(tmp_path):
@@ -16155,7 +15519,6 @@ class TestCmdScope:
         payload = json.loads(scope_path.read_text())
         assert payload["include"] == ["E1"]
         assert payload["exclude"] == []
-        # expanded_ids must contain both E1-leaf IDs
         assert "E1-F1-S1-T1" in payload["expanded_ids"]
         assert "E1-F1-S1-T2" in payload["expanded_ids"]
         assert "E2-F1-S1-T1" not in payload["expanded_ids"]
@@ -16183,10 +15546,6 @@ class TestCmdScope:
         payload = json.loads(scope_path.read_text())
         assert payload["include"] == ["E1-F1-S1-T1"]
 
-    # ------------------------------------------------------------------
-    # AC-196-2: scope set -- invalid token -> rc=1, stderr matches cmd_start
-    # ------------------------------------------------------------------
-
     def test_set_invalid_token_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """scope set with a malformed token exits rc=1 and emits an error to stderr."""
         with self._patch_scope_env(tmp_path):
@@ -16205,10 +15564,6 @@ class TestCmdScope:
         assert rc == 1
         captured = capsys.readouterr()
         assert "ERROR" in captured.err or "reverse" in captured.err.lower()
-
-    # ------------------------------------------------------------------
-    # AC-196-3: scope clear -- idempotent; exits 0 even if no file present
-    # ------------------------------------------------------------------
 
     def test_clear_no_file_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """scope clear exits 0 with 'no scope pending' when scope.json is absent."""
@@ -16230,10 +15585,6 @@ class TestCmdScope:
 
         assert rc == 0
         assert not scope_path.exists()
-
-    # ------------------------------------------------------------------
-    # AC-196-4: scope show -- prints state or "no scope pending"
-    # ------------------------------------------------------------------
 
     def test_show_no_file_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """scope show exits 0 with 'no scope pending' when scope.json is absent."""
@@ -16263,12 +15614,8 @@ class TestCmdScope:
         assert rc == 0
         out = capsys.readouterr().out
         assert "E1" in out
-        assert "1" in out  # expanded_ids count or content
+        assert "1" in out
         assert "2026-05-16" in out or "alice" in out
-
-    # ------------------------------------------------------------------
-    # AC-196-9 / error: unknown action verb -> rc=2
-    # ------------------------------------------------------------------
 
     def test_unknown_action_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """scope <unknown> exits rc=2 with an actionable error to stderr."""
@@ -16291,10 +15638,6 @@ class TestCmdScope:
         captured = capsys.readouterr()
         assert captured.err
 
-    # ------------------------------------------------------------------
-    # Error: set without --include flag
-    # ------------------------------------------------------------------
-
     def test_set_without_include_flag_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """scope set without --include flag exits rc=1 with actionable error."""
         with self._patch_scope_env(tmp_path):
@@ -16303,10 +15646,6 @@ class TestCmdScope:
         assert rc == 1
         captured = capsys.readouterr()
         assert captured.err
-
-    # ------------------------------------------------------------------
-    # AC-196: session integration -- DEVBENCH_SESSION_NAME path resolution
-    # ------------------------------------------------------------------
 
     def test_set_uses_session_path_when_env_var_set(self, tmp_path: Path) -> None:
         """scope set writes to session-scoped path when DEVBENCH_SESSION_NAME is set."""
@@ -16323,7 +15662,6 @@ class TestCmdScope:
         assert session_scope.exists(), "Session-scoped scope.json must be written"
         payload = json.loads(session_scope.read_text())
         assert payload["include"] == ["E1-F1-S1-T1"]
-        # workspace-root scope.json must NOT be created
         assert not self._scope_path(tmp_path).exists(), (
             "Workspace-root scope.json must not be created when session name is set"
         )
@@ -16368,10 +15706,6 @@ class TestCmdScope:
         out = capsys.readouterr().out
         assert "E2" in out
 
-    # ------------------------------------------------------------------
-    # Parametrised: multiple valid selector shapes
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize(
         "include_str, expected_present, expected_absent",
         [
@@ -16398,10 +15732,6 @@ class TestCmdScope:
         for wid in expected_absent:
             assert wid not in payload["expanded_ids"], f"{wid} must not be in expanded_ids"
 
-    # ------------------------------------------------------------------
-    # AC-196: round-trip equivalence -- set then cmd_next honours it
-    # ------------------------------------------------------------------
-
     def test_scope_set_honoured_by_cmd_next(self, tmp_path: Path) -> None:
         """scope.json written by cmd_scope set is honoured by cmd_next identically to cmd_start."""
         with self._patch_scope_env(tmp_path):
@@ -16411,7 +15741,6 @@ class TestCmdScope:
         scope_path = self._scope_path(tmp_path)
         assert scope_path.exists()
 
-        # Verify the written file has the standard fields cmd_start would write
         payload = json.loads(scope_path.read_text())
         assert "include" in payload
         assert "exclude" in payload
@@ -16419,17 +15748,9 @@ class TestCmdScope:
         assert "started_at" in payload
         assert "started_by" in payload
 
-    # ------------------------------------------------------------------
-    # cmd_scope is registered in _COMMANDS
-    # ------------------------------------------------------------------
-
     def test_scope_registered_in_commands(self) -> None:
         """cmd_scope is available as the 'scope' command in _COMMANDS."""
         assert "scope" in cli._COMMANDS
-
-    # ------------------------------------------------------------------
-    # main() dispatches to cmd_scope
-    # ------------------------------------------------------------------
 
     def test_main_dispatches_scope_clear(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """main() correctly dispatches 'devbench scope clear'."""
@@ -16446,19 +15767,12 @@ class TestCmdScope:
         assert "no scope pending" in out
 
 
-# ---------------------------------------------------------------------------
-# AC-196-5 through AC-196-10: Parametrised tests + scope-set round-trip
-# equivalence integration test (E2-F7-S1-T2, spec section 4.2.6.5)
-# ---------------------------------------------------------------------------
-
-
 class TestCmdScopeParametrised:
     """Parametrised tests for cmd_scope covering the selector shapes specified
     in the work-unit description and the round-trip-equivalence integration test
     (AC-196-5, AC-196-6, AC-196-7, AC-196-8, AC-196-10).
     """
 
-    # Backlog IDs used in all parametrised tests -- covers E1 through E5.
     _BACKLOG_IDS: ClassVar[list[str]] = [
         "E1-F1-S1-T1",
         "E1-F1-S1-T2",
@@ -16498,35 +15812,27 @@ class TestCmdScopeParametrised:
             BacklogParser=MagicMock(return_value=parser_mock),
         )
 
-    # ------------------------------------------------------------------
-    # AC-196-5: Parametrised selector shapes for scope set
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize(
         "include_str, exclude_str, expected_present, expected_absent",
         [
-            # Single ID -- matches only the named task
             (
                 "E1-F1-S1-T1",
                 "",
                 ["E1-F1-S1-T1"],
                 ["E1-F1-S1-T2", "E2-F1-S1-T1"],
             ),
-            # Range E1-E3 -- matches all under E1, E2, E3; excludes E4 and E5
             (
                 "E1-E3",
                 "",
                 ["E1-F1-S1-T1", "E2-F1-S1-T1", "E3-F1-S1-T1"],
                 ["E4-F1-S1-T1", "E5-F1-S1-T1"],
             ),
-            # Range E1-E3 plus E5 (mixed comma-separated)
             (
                 "E1-E3, E5",
                 "",
                 ["E1-F1-S1-T1", "E2-F1-S1-T1", "E3-F1-S1-T1", "E5-F1-S1-T1"],
                 ["E4-F1-S1-T1"],
             ),
-            # Range E1-E3 with exclude E2-F1
             (
                 "E1-E3",
                 "E2-F1",
@@ -16562,17 +15868,13 @@ class TestCmdScopeParametrised:
         for wid in expected_absent:
             assert wid not in payload["expanded_ids"], f"{wid} must not be in expanded_ids"
 
-    # ------------------------------------------------------------------
-    # AC-196-5: Parametrised negative cases for set
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize(
         "bad_include",
         [
-            "-E1",  # leading hyphen
-            "E1-",  # trailing hyphen
-            "-",  # bare hyphen
-            "E1--E3",  # consecutive hyphens
+            "-E1",
+            "E1-",
+            "-",
+            "E1--E3",
         ],
     )
     def test_set_malformed_token_exits_1(
@@ -16593,10 +15895,6 @@ class TestCmdScopeParametrised:
         captured = capsys.readouterr()
         assert captured.err, "A stderr message must be emitted for malformed tokens"
         assert not self._scope_path(tmp_path).exists(), "scope.json must NOT be created when the token is invalid"
-
-    # ------------------------------------------------------------------
-    # AC-196-5: Reverse range rejection
-    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
         "reverse_range",
@@ -16620,18 +15918,14 @@ class TestCmdScopeParametrised:
         assert captured.err, "A stderr message must be emitted for reverse ranges"
         assert not self._scope_path(tmp_path).exists(), "scope.json must NOT be created for reverse-range tokens"
 
-    # ------------------------------------------------------------------
-    # AC-196-6: Unknown action verb exits rc=2 (parametrised)
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize(
         "bad_action",
         [
             "bogus",
-            "SET",  # case-sensitive mismatch
+            "SET",
             "reset",
             "delete",
-            "",  # interpreted as action='' after empty argv
+            "",
         ],
     )
     def test_unknown_action_exits_2_parametrised(
@@ -16652,16 +15946,10 @@ class TestCmdScopeParametrised:
         captured = capsys.readouterr()
         assert captured.err, "A stderr message must be emitted for unknown actions"
 
-    # ------------------------------------------------------------------
-    # AC-196-7: clear / show -- expected output shapes (parametrised)
-    # ------------------------------------------------------------------
-
     @pytest.mark.parametrize(
         "action, setup_file, expected_in_stdout",
         [
-            # clear on missing file -> idempotent, "no scope pending"
             ("clear", False, "no scope pending"),
-            # show on missing file -> "no scope pending"
             ("show", False, "no scope pending"),
         ],
     )
@@ -16706,13 +15994,9 @@ class TestCmdScopeParametrised:
         out = capsys.readouterr().out
         assert "E1-E3" in out
         assert "E2-F1" in out
-        assert "2" in out  # expanded_ids count is 2
+        assert "2" in out
         assert "2026-05-16" in out
         assert "operator" in out
-
-    # ------------------------------------------------------------------
-    # AC-196-8: Per-session scope.json path (DEVBENCH_SESSION_NAME)
-    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize("session_name", ["foo", "my-session", "alpha"])
     def test_set_writes_to_session_path(
@@ -16732,15 +16016,9 @@ class TestCmdScopeParametrised:
         assert session_path.exists(), f"Session-scoped scope.json must exist at {session_path}"
         payload = json.loads(session_path.read_text())
         assert payload["include"] == ["E1-F1-S1-T1"]
-        # Canonical workspace-root scope.json must NOT be created
         assert not self._scope_path(tmp_path).exists(), (
             "Workspace-root scope.json must not exist when DEVBENCH_SESSION_NAME is set"
         )
-
-    # ------------------------------------------------------------------
-    # AC-196-10: Round-trip equivalence integration test
-    # cmd_scope set + cmd_next == cmd_next --include (same candidate WU id)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_fixture_backlog(tmp_path: Path, unit_rows: list[tuple[str, str]]) -> Path:
@@ -16790,15 +16068,12 @@ class TestCmdScopeParametrised:
         both pathways resolve through ``ScopeFilter.parse/from_file`` and produce
         the same candidate list from ``BacklogParser.get_parallel_candidates``.
         """
-        # Build a backlog with two in-queue tasks: one in E1, one in E2.
-        # Only the E2 task should be returned when scope is limited to E2.
         unit_rows = [
             ("E1-F1-S1-T1", "in-queue"),
             ("E2-F1-S1-T1", "in-queue"),
         ]
         index_path = self._build_fixture_backlog(tmp_path, unit_rows)
 
-        # Step 1: Write scope via cmd_scope set
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
@@ -16807,11 +16082,8 @@ class TestCmdScopeParametrised:
             set_rc = cli.cmd_scope("set", "--include", "E2")
         assert set_rc == 0
         assert self._scope_path(tmp_path).exists()
-        # Drain any stdout printed by cmd_scope set ("scope set: <path>") so
-        # the subsequent cmd_next capture is clean.
         capsys.readouterr()
 
-        # Step 2: cmd_next with no flags -- reads from scope.json
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
@@ -16821,8 +16093,6 @@ class TestCmdScopeParametrised:
         assert next_rc_from_file == 0
         out_from_file = capsys.readouterr().out.strip()
 
-        # Step 3: cmd_next --include "E2" -- inline flags, bypasses scope.json
-        # Remove scope.json so from_file path is not triggered accidentally
         self._scope_path(tmp_path).unlink()
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
@@ -16833,7 +16103,6 @@ class TestCmdScopeParametrised:
         assert next_rc_inline == 0
         out_inline = capsys.readouterr().out.strip()
 
-        # Step 4: Both outputs must be non-empty and contain the same candidate WU id
         assert out_from_file, "cmd_next (scope.json) must print a candidate"
         assert out_inline, "cmd_next --include must print a candidate"
         id_from_file = json.loads(out_from_file)["id"]
@@ -16842,7 +16111,6 @@ class TestCmdScopeParametrised:
             f"Round-trip equivalence failed: scope.json path returned {id_from_file!r} "
             f"but --include flag path returned {id_inline!r}"
         )
-        # Both must return the E2 task, not the E1 task
         assert id_from_file == "E2-F1-S1-T1", f"Scope filter must select E2 task, got {id_from_file!r}"
 
     def test_scope_set_round_trip_cmd_next_no_match_in_scope(
@@ -16859,7 +16127,6 @@ class TestCmdScopeParametrised:
         unit_rows = [("E1-F1-S1-T1", "in-queue")]
         index_path = self._build_fixture_backlog(tmp_path, unit_rows)
 
-        # Set scope to E2 -- no E2 tasks exist in the backlog
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
@@ -16876,11 +16143,6 @@ class TestCmdScopeParametrised:
             next_rc = cli.cmd_next()
         assert next_rc == 0
         assert "NO_ACTIONABLE_IN_SCOPE" in capsys.readouterr().out
-
-
-# ---------------------------------------------------------------------------
-# cmd_drain tests (E3-F2-S1-T1, issue #188)
-# ---------------------------------------------------------------------------
 
 
 class TestCmdDrainRegistered:
@@ -17236,25 +16498,21 @@ class TestCmdDrainIntegration:
         signal = tmp_path / ".devbench" / "drain.signal"
 
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            # Step 1: request drain
             rc_request = cli.cmd_drain("--reason", "integration test")
         assert rc_request == 0
         assert signal.exists()
 
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            # Step 2: status shows pending
             rc_status_pending = cli.cmd_drain("--status")
         assert rc_status_pending == 0
         assert signal.exists(), "drain --status must not consume signal"
 
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            # Step 3: cancel
             rc_cancel = cli.cmd_drain("--cancel")
         assert rc_cancel == 0
         assert not signal.exists()
 
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            # Step 4: status shows absent (rc still 0)
             rc_status_absent = cli.cmd_drain("--status")
         assert rc_status_absent == 0
 
@@ -17288,12 +16546,6 @@ class TestCmdDrainIntegration:
         signal = tmp_path / ".devbench" / "drain.signal"
         data = _json.loads(signal.read_text())
         assert data["reason"] == "second"
-
-
-# ---------------------------------------------------------------------------
-# cmd_drain --session / --all (E4-F5-S1-T3, issue #192)
-# AC-192-7, AC-192-8
-# ---------------------------------------------------------------------------
 
 
 class TestParseDrainArgvSessionAll:
@@ -17600,12 +16852,6 @@ class TestCmdDrainAllFlag:
         assert "1" in out or "gamma" in out, f"Expected count or session name in output: {out!r}"
 
 
-# ---------------------------------------------------------------------------
-# _DrainRequested sentinel + cmd_start drain check (E3-F3-S1-T1, issue #188)
-# AC-188-4, AC-188-5, AC-188-8
-# ---------------------------------------------------------------------------
-
-
 class TestDrainRequestedSentinel:
     """_DrainRequested is a module-level exception class in cli.py (AC-188-4)."""
 
@@ -17725,11 +16971,6 @@ class TestIsClaimToolUse:
         assert cli._is_claim_tool_use(msg) is False
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers for drain-enforcement and cancel-drain test classes
-# ---------------------------------------------------------------------------
-
-
 def _make_sdk_with_claim_message() -> object:
     """Return a fake SDK module that yields an AssistantMessage with a Bash claim tool use.
 
@@ -17791,8 +17032,6 @@ class TestCmdStartDrainEnforcement:
         import logging
         import sys
 
-        # cmd_start sets DEVBENCH_SESSION_NAME='default' before drain checks,
-        # so the drain signal must be written to the per-session path.
         signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
@@ -17824,7 +17063,6 @@ class TestCmdStartDrainEnforcement:
         import logging
         import sys
 
-        # Per-session path: cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME (spec 4.4.4).
         signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
@@ -17902,8 +17140,6 @@ class TestCmdStartDrainEnforcement:
             rc = cli.cmd_start()
 
         assert rc == 0
-        # #212: finally clause must clean the drain signal on every exit so
-        # a stale workspace-root signal does not auto-drain the next start.
         assert not signal_path.exists(), "drain signal must be cleared by finally clause on exit (#212)"
 
     @pytest.mark.unit
@@ -17912,7 +17148,6 @@ class TestCmdStartDrainEnforcement:
         import logging
         import sys
 
-        # Per-session path: cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME (spec 4.4.4).
         signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
@@ -17965,7 +17200,6 @@ class TestCmdStartWritesRestartMarker:
         assert rc == 0
         marker = tmp_path / LAST_RESTART_MARKER_PATH
         assert marker.is_file(), f"last-restart marker not written at {marker}"
-        # Marker contents must be a parseable ISO 8601 UTC datetime.
         from datetime import datetime as _dt
 
         parsed = _dt.fromisoformat(marker.read_text(encoding="utf-8").strip())
@@ -18367,8 +17601,6 @@ class TestCmdStartSlackPingResultText:
     def test_slack_ping_includes_sdk_result_text_on_clean_exit(self, tmp_path: Path) -> None:
         import sys
 
-        # SDK yields one ResultMessage with the NO_ACTIONABLE summary text the
-        # orchestrate skill emits at end-of-backlog.
         class _FakeResultMessage:
             subtype = "success"
             result = "Orchestration complete: NO_ACTIONABLE -- 190/212 done, 11 blocked."
@@ -18396,8 +17628,6 @@ class TestCmdStartSlackPingResultText:
         reason = captured_reason[-1]
         assert "NO_ACTIONABLE" in reason, f"Slack reason must include the SDK's NO_ACTIONABLE summary; got {reason!r}"
         assert "190/212" in reason, f"Slack reason must include the remaining-task counts; got {reason!r}"
-        # Bare "clean" alone is no longer sufficient -- it hides the fact
-        # that 22 tasks remain.  The new reason must be MORE than just "clean".
         assert reason != "clean", "Slack reason 'clean' alone is insufficient -- must carry the SDK result text (#217)"
 
     @pytest.mark.unit
@@ -18410,7 +17640,7 @@ class TestCmdStartSlackPingResultText:
         """
         import sys
 
-        mock_sdk = _make_fake_sdk_module(["plain string"])  # not a ResultMessage
+        mock_sdk = _make_fake_sdk_module(["plain string"])
 
         captured_reason: list[str] = []
 
@@ -18479,7 +17709,6 @@ class TestCmdStartCancelDrainOnExit:
         """drain.signal at per-session path is removed by finally clause on exit (#212)."""
         import sys
 
-        # Per-session path -- cmd_start sets DEVBENCH_SESSION_NAME=default
         signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
@@ -18525,10 +17754,6 @@ class TestCmdStartCancelDrainOnExit:
         assert not (tmp_path / ".devbench" / "drain.signal").exists()
 
 
-# AC-188-10: cancel-drain mid-orchestrate prevents the exit (E3-F3-S1-T2, issue #188)
-# ---------------------------------------------------------------------------
-
-
 class TestCmdStartCancelDrainPreventsExit:
     """Cancelling drain mid-orchestrate prevents the exit; orchestrator continues normally (AC-188-10).
 
@@ -18556,7 +17781,6 @@ class TestCmdStartCancelDrainPreventsExit:
 
         signal_path = tmp_path / ".devbench" / "drain.signal"
 
-        # Request then immediately cancel -- signal file is absent at claim time.
         request_drain(tmp_path, reason="temporary pause")
         assert signal_path.exists(), "pre-condition: signal must exist after request"
         cancel_drain(tmp_path)
@@ -18588,7 +17812,6 @@ class TestCmdStartCancelDrainPreventsExit:
 
         signal_path = tmp_path / ".devbench" / "drain.signal"
 
-        # Simulate same-tick: write then immediately delete.
         request_drain(tmp_path, reason="same-tick cancel")
         cancel_drain(tmp_path)
         assert not signal_path.exists(), "pre-condition: signal absent after same-tick cancel"
@@ -18619,7 +17842,7 @@ class TestCmdStartCancelDrainPreventsExit:
 
         request_drain(tmp_path, reason="multiple cancel test")
         cancel_drain(tmp_path)
-        cancel_drain(tmp_path)  # second cancel must not raise
+        cancel_drain(tmp_path)
         assert not signal_path.exists(), "pre-condition: signal absent after double cancel"
 
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
@@ -18650,13 +17873,6 @@ class TestCmdStartCancelDrainPreventsExit:
         assert not signal_path.exists(), "drain.signal must not exist after cancelled drain followed by clean run"
 
 
-# ---------------------------------------------------------------------------
-# Pre-arm drain integration test (E3-F6-S1-T1, issue #188)
-# AC-188-6: dropping drain.signal BEFORE devbench start causes the orchestrator
-# to run exactly one WU then exit cleanly.
-# ---------------------------------------------------------------------------
-
-
 def _make_sdk_with_non_claim_then_claim_messages() -> object:
     """Return a fake SDK module that yields non-claim messages then one claim message.
 
@@ -18668,7 +17884,6 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
     from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
 
     messages = [
-        # Non-claim messages representing WU1 processing (text output, sub-tool calls, etc.)
         AssistantMessage(
             content=[TextBlock(text="Running devbench:orchestrate skill...")],
             model="claude-opus-4-5",
@@ -18677,7 +17892,6 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
             content=[TextBlock(text="WU1 executor complete; marking done...")],
             model="claude-opus-4-5",
         ),
-        # Claim message representing the WU2 attempt -- drain fires here.
         AssistantMessage(
             content=[
                 ToolUseBlock(
@@ -18806,7 +18020,6 @@ class TestCmdStartPreArmDrain:
 
         from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
 
-        # Per-session path: cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME (spec 4.4.4).
         signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
@@ -18871,14 +18084,10 @@ class TestCmdStartPreArmDrain:
             rc = cli.cmd_start()
 
         assert rc == 0
-        # Both WU1 messages must have been yielded and seen before drain fired.
         assert "wu1-processing-message" in messages_seen, (
             "WU1 processing message must be yielded before drain enforcement"
         )
         assert "wu1-done-message" in messages_seen, "WU1 done message must be yielded before drain enforcement"
-        # The WU2 claim message was yielded from the generator but _DrainRequested
-        # was raised before any post-yield processing continued -- the claim itself
-        # was NOT executed (enforcement happened at detection time, not after).
         assert "wu2-claim-message" not in messages_seen, (
             "WU2 claim generator-append must not run after _DrainRequested is raised"
         )
@@ -18917,11 +18126,6 @@ class TestCmdStartPreArmDrain:
 
         assert rc == 0, f"cmd_start must return 0 for pre-armed drain with reason={reason!r}"
         assert not signal_path.exists(), f"drain signal must be consumed for pre-armed drain with reason={reason!r}"
-
-
-# ---------------------------------------------------------------------------
-# cmd_sessions tests (E4-F5-S1-T1, issue #192)
-# ---------------------------------------------------------------------------
 
 
 def _make_session(
@@ -19099,7 +18303,6 @@ class TestCmdSessionsListTable:
         state_dir.mkdir(parents=True, exist_ok=True)
         session = _make_session("draining", 12345, [], state_dir)
         _seed_sessions_registry(tmp_path, [session])
-        # Write a drain.signal into the session state dir.
         drain_signal = state_dir / "drain.signal"
         drain_signal.write_text(
             _json.dumps(
@@ -19348,7 +18551,6 @@ class TestCmdSessionsIntegration:
         """
         import subprocess
 
-        # Spawn and wait -- after wait() the PID is guaranteed not running.
         proc = subprocess.Popen(["true"])
         dead_pid = proc.pid
         proc.wait()
@@ -19364,16 +18566,10 @@ class TestCmdSessionsIntegration:
         assert rc == 0
         assert not stale_dir.exists(), "stale session dir must be deleted"
 
-        # Registry must be updated (entry removed).
         from devbench.session import SessionRegistry
 
         remaining = SessionRegistry(tmp_path).load()
         assert all(s.name != "gone" for s in remaining), "stale session must be removed from registry"
-
-
-# ---------------------------------------------------------------------------
-# cmd_stop tests (E4-F5-S1-T2, issue #192)
-# ---------------------------------------------------------------------------
 
 
 class TestCmdStopRegistered:
@@ -19578,7 +18774,6 @@ class TestCmdStopErrors:
         """cmd_stop when state dir exists but pid file is absent returns rc=1."""
         state_dir = tmp_path / ".devbench" / "sessions" / "nopid"
         state_dir.mkdir(parents=True, exist_ok=True)
-        # No pid file written
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             rc = cli.cmd_stop("--session", "nopid")
         assert rc == 1
@@ -19724,7 +18919,6 @@ class TestCmdStopIntegration:
         import subprocess
         import time
 
-        # Spawn a subprocess that will hold alive until signalled.
         proc = subprocess.Popen(["sleep", "60"])
         pid = proc.pid
         state_dir = tmp_path / ".devbench" / "sessions" / "integration"
@@ -19737,28 +18931,20 @@ class TestCmdStopIntegration:
 
             assert rc == 0
 
-            # Wait briefly for the signal to be delivered and the process to exit.
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     break
-                time.monotonic()  # no-sleep busy-check is acceptable in tests
+                time.monotonic()
 
             proc.wait(timeout=1)
-            # returncode -15 means killed by SIGTERM (signal 15).
             assert proc.returncode == -signal.SIGTERM, (
                 f"expected process killed by SIGTERM (rc={-signal.SIGTERM}), got {proc.returncode}"
             )
         finally:
-            # Ensure the subprocess is cleaned up even if the assertion fails.
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
-
-
-# ---------------------------------------------------------------------------
-# SIGTERM handler in cmd_start tests (E4-F5-S1-T2, issue #192)
-# ---------------------------------------------------------------------------
 
 
 class TestCmdStartSigtermHandler:
@@ -19777,7 +18963,6 @@ class TestCmdStartSigtermHandler:
         from devbench.backlog.manager import BacklogManager
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-        # Build a minimal in-progress WU file on disk.
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
         wu_file = backlog_dir / "E1-F1-S1-T1.md"
@@ -19794,7 +18979,6 @@ class TestCmdStartSigtermHandler:
             repo="test/repo",
         )
 
-        # Intercept BacklogManager.force_status and _append_agent_comment calls.
         forced: list[tuple[str, str]] = []
         appended: list[tuple[str, str]] = []
 
@@ -19823,7 +19007,6 @@ class TestCmdStartSigtermHandler:
     @pytest.mark.unit
     def test_force_block_in_flight_wu_no_op_when_no_in_progress(self, tmp_path: Path) -> None:
         """_force_block_in_flight_wu does nothing when no in-progress WU is provided (None)."""
-        # Should not raise; calling with None is the no-op signal.
         cli._force_block_in_flight_wu(None, session_name="myrun")
 
     @pytest.mark.unit
@@ -19876,11 +19059,6 @@ class TestCmdStartSigtermHandler:
         """_find_in_flight_wu returns None when the unit list is empty."""
         result = cli._find_in_flight_wu([])
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# AC-192-12 / AC-192-13: cmd_status --session flag (E4-F6-S1-T1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -20069,9 +19247,7 @@ class TestCmdStatusSessionFilter:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # The summary should show only 1 WU (the alpha one)
         assert "TOTAL" in out
-        # The alpha WU should appear in active panel; beta WU should NOT
         assert "E1-F1-S1-T1" in out
         assert "E1-F1-S1-T2" not in out
         assert "E1-F1-S1-T3" not in out
@@ -20095,7 +19271,6 @@ class TestCmdStatusSessionFilter:
         assert rc == 0
         out = capsys.readouterr().out
         assert "TOTAL" in out
-        # Should show TOTAL 0
         lines = [l for l in out.splitlines() if "TOTAL" in l]
         assert lines, "Expected a TOTAL line in output"
         assert "0" in lines[0]
@@ -20133,10 +19308,8 @@ class TestCmdStatusSessionFilter:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # Both WUs appear in active panel
         assert "E1-F1-S1-T1" in out
         assert "E1-F1-S1-T2" in out
-        # TOTAL should show 2
         lines = [l for l in out.splitlines() if "TOTAL" in l]
         assert lines
         assert "2" in lines[0]
@@ -20221,14 +19394,9 @@ class TestCmdStatusSessionAggregation:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # TOTAL must be 3 (each WU counted once)
         total_lines = [l for l in out.splitlines() if "TOTAL" in l]
         assert total_lines
         assert "3" in total_lines[0]
-
-
-# AC-192-12 / AC-192-13: cmd_report --session flag (E4-F6-S1-T2)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -20353,7 +19521,6 @@ class TestCmdReportSessionFlag:
             return "frame"
 
         def fake_stream_report(log_path: object, render_fn: Any, **kwargs: object) -> int:
-            # Invoke the render closure to capture what it passes to generate_report.
             render_fn(log_path=log_path)
             return 0
 
@@ -20436,10 +19603,7 @@ class TestCmdStatusSummaryAlignment:
         """AC-1: every Backlog Status Summary row places its count value at the same column index."""
         out = self._render(capsys)
         rows = self._summary_lines(out)
-        # Expect 7 Blocked sub-rows + TOTAL + Draft + Un-materialised + every DISPLAY_STATUS_VALUES
-        # except the parent "Blocked".  Lower-bound the count to catch silent regressions.
         assert len(rows) >= 10, f"expected at least 10 Backlog Status Summary rows; got {len(rows)} -- output:\n{out}"
-        # Extract the column at which the count digit starts for each row.
         first_digit_columns: dict[str, int] = {}
         for row in rows:
             match = self._COUNT_RE.match(row)
@@ -20493,11 +19657,6 @@ class TestCmdStatusSummaryAlignment:
         assert "STATUS_SUMMARY_LABEL_WIDTH" in src, (
             "cmd_status must reference STATUS_SUMMARY_LABEL_WIDTH for every label-pad width"
         )
-
-
-# ---------------------------------------------------------------------------
-# Issue #223: cost-calibrate subcommand
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -20561,7 +19720,6 @@ class TestCostCalibrate:
         sonnet = round_tripped["report"]["models"]["claude-sonnet-4-6"]
         assert opus["correction_factor"] == 1.25
         assert sonnet["correction_factor"] == 1.25
-        # Existing input/output rates are preserved.
         assert opus["input"] == 5.0 and opus["output"] == 25.0
         assert sonnet["input"] == 3.0 and sonnet["output"] == 15.0
 
@@ -20580,7 +19738,6 @@ class TestCostCalibrate:
 
         round_tripped = _yaml.safe_load(config_yaml.read_text(encoding="utf-8"))
         opus = round_tripped["report"]["models"]["claude-opus-4-7"]
-        # Seeded from DEFAULT_MODEL_RATES["claude-opus-4-7"]: $5/$25.
         assert opus["input"] == 5.0
         assert opus["output"] == 25.0
         assert opus["correction_factor"] == 0.95
@@ -20590,11 +19747,6 @@ class TestCostCalibrate:
         config_yaml.write_text("- not-a-mapping\n", encoding="utf-8")
         with pytest.raises(ValueError, match="top-level YAML must be a mapping"):
             cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], correction_factor=1.0)
-
-
-# ---------------------------------------------------------------------------
-# Issue #223 coverage: cost-calibrate end-to-end + ModelRates equality
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -20677,8 +19829,6 @@ class TestModelRatesDunders:
         from devbench.constants import ModelRates
 
         rates = ModelRates(input=5.0, output=25.0)
-        # Direct __eq__ call returns NotImplemented; equality test against
-        # non-ModelRates falls through to Python's default identity check.
         assert rates.__eq__("not a ModelRates") is NotImplemented
         assert rates != "not a ModelRates"
 
@@ -20697,7 +19847,6 @@ class TestModelRatesDunders:
         a = ModelRates(input=5.0, output=25.0)
         b = ModelRates(input=5.0, output=25.0)
         assert hash(a) == hash(b)
-        # Can be used as dict key / set member.
         s = {a, b}
         assert len(s) == 1
 
@@ -20746,7 +19895,6 @@ class TestParseCostCalibrateArgvCoverage:
 
         result = _parse_cost_calibrate_argv(("100.0", "--window", "2026-05-01T00:00:00"))
         assert not isinstance(result, int)
-        # Naive ISO -> UTC tzinfo applied.
         assert result.window_start.tzinfo is not None
 
 
@@ -20838,8 +19986,6 @@ class TestRecentPerTaskCostByModel:
 
         log_path = tmp_path / "test.log"
         log_path.write_text("")
-        # No transcripts / hook log -> empty totals -> $0.00 cost averaged
-        # across n=2 completions.
         done_times = {
             "E0-F1-S1-T1": datetime(2026, 5, 4, 10, 0, tzinfo=UTC),
             "E0-F1-S1-T2": datetime(2026, 5, 4, 11, 0, tzinfo=UTC),
@@ -21080,7 +20226,6 @@ class TestCmdStartStatefulClient:
         log_text = " ".join(rec.getMessage() for rec in caplog.records)
         assert "[ORCHESTRATOR_TERMINAL_EXIT]" in log_text, f"terminal exit audit line missing; log: {log_text!r}"
         assert "ALL_DONE" in log_text
-        # Only the initial orchestrate prompt was sent; no continuation after terminal.
         assert len(query_calls) == 1, (
             f"Expected exactly 1 query call (initial prompt only), got {len(query_calls)}: {query_calls}"
         )
@@ -21098,7 +20243,6 @@ class TestCmdStartStatefulClient:
         query_calls: list[str] = []
         non_terminal = self._result_msg("orchestrator turn done -- non-terminal")
         terminal = self._result_msg("ALL_DONE")
-        # First receive_response: yields non-terminal; second: yields terminal.
         fake_sdk = self._build_fake_sdk(
             receive_sequences=[[non_terminal], [terminal]],
             query_calls=query_calls,
@@ -21116,14 +20260,11 @@ class TestCmdStartStatefulClient:
 
         log_text = " ".join(rec.getMessage() for rec in caplog.records)
         assert "[ORCHESTRATOR_TURN_END_NO_SENTINEL]" in log_text, f"turn-end audit line missing; log: {log_text!r}"
-        # Initial prompt + exactly one continuation prompt.
         assert len(query_calls) == 2, (
             f"Expected 2 query calls (initial + continuation), got {len(query_calls)}: {query_calls}"
         )
-        # Continuation must not contain em-dash (U+2014).
         continuation = query_calls[1]
         assert "\u2014" not in continuation, f"Continuation prompt must not contain em-dash; got: {continuation!r}"
-        # Continuation must instruct a tool call (check canonical keywords).
         assert "tool" in continuation.lower() or "devbench next" in continuation, (
             f"Continuation prompt must instruct a tool call; got: {continuation!r}"
         )
@@ -21347,7 +20488,6 @@ class TestContinuationBudgetExhaustion:
         ):
             cli.cmd_start()
 
-        # query_calls[0] is the initial orchestrate prompt; [1..budget] are continuations.
         assert len(query_calls) == budget + 1, (
             f"Expected {budget + 1} total query calls (1 initial + {budget} continuations); "
             f"got {len(query_calls)}: {query_calls}"
@@ -21381,19 +20521,11 @@ class TestContinuationBudgetExhaustion:
             subtype = "success"
             num_turns = 1
 
-        # Sequence:
-        # Trace with budget=2:
-        #   recv #1: [non-result (reset -> stall_count=0), non-terminal (stall_count=1, 1<2)]
-        #     -> break -> issue continuation #1
-        #   recv #2: [non-result (reset -> stall_count=0), non-terminal (stall_count=1, 1<2)]
-        #     -> break -> issue continuation #2
-        #   recv #3: [non-terminal (stall_count=2, 2>=2 -> EXHAUSTED)] -> return
-        # Total: 2 continuations issued (budget=2); recv #4 is never reached.
         sequences: list[list[Any]] = [
             [_NonResultMsg(), _NonTerminalMsg()],
             [_NonResultMsg(), _NonTerminalMsg()],
             [_NonTerminalMsg()],
-            [_NonTerminalMsg()],  # safety padding; never consumed
+            [_NonTerminalMsg()],
         ]
 
         fake_sdk = self._build_mixed_sdk(sequences, query_calls)
@@ -21408,13 +20540,7 @@ class TestContinuationBudgetExhaustion:
             rc = cli.cmd_start()
 
         assert rc == ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE, f"Expected exhaustion exit code; got {rc}"
-        # With budget=2 and no progress resets, a pure stall would exhaust after
-        # budget-1=1 continuation (stall_count: 0->1 on recv#1 issues cont, then
-        # 1->2 on recv#2 exhausts -- so only 1 continuation is issued).
-        # With progress resets (interleaved non-result messages), each reset zeroes
-        # the counter, allowing a fresh stall cycle.  The sequences above yield
-        # budget=2 continuations before exhaustion -- more than the no-reset baseline.
-        continuation_count = len(query_calls) - 1  # subtract initial prompt
+        continuation_count = len(query_calls) - 1
         assert continuation_count >= budget, (
             f"Counter reset should have allowed at least {budget} continuations before exhaustion "
             f"(more than the no-reset baseline of {budget - 1}); got {continuation_count}"
@@ -21449,8 +20575,6 @@ class TestContinuationBudgetExhaustion:
             rc = cli.cmd_start()
 
         assert rc == ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE
-        # The loop runs exactly DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS
-        # continuations plus the initial prompt.
         assert len(query_calls) == DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS + 1, (
             f"Expected default budget of {DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS} "
             f"continuations + 1 initial prompt = {DEFAULT_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS + 1} "
@@ -21535,7 +20659,6 @@ class TestInactivityTimeout:
         query_calls: list[str] = []
         terminal_msg = self._result_msg("ALL_DONE")
 
-        # The stalled client: first call raises TimeoutError (mocked), second returns terminal.
         fake_sdk = self._build_fake_sdk(
             receive_sequences=[[], [terminal_msg]],
             query_calls=query_calls,
@@ -21546,7 +20669,6 @@ class TestInactivityTimeout:
         async def _fake_wait_for(coro: Any, timeout: float) -> Any:
             effect = timeout_side_effects.pop(0)
             if isinstance(effect, BaseException):
-                # Must still consume the coroutine to avoid ResourceWarning.
                 coro.close()
                 raise effect
             return await coro
@@ -21583,7 +20705,6 @@ class TestInactivityTimeout:
         query_calls: list[str] = []
         budget = 2
 
-        # All receives stall forever (TimeoutError each call).
         call_count: list[int] = [0]
 
         async def _always_timeout(coro: Any, timeout: float) -> Any:
@@ -21680,14 +20801,11 @@ class TestInactivityTimeout:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
             patch("devbench.cli.asyncio.wait_for", side_effect=_spy_wait_for),
-            # Patch the module-level constant directly; env var alone cannot override
-            # the already-imported module value.
             patch("devbench.cli.ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS", 0.0),
             caplog.at_level(logging.INFO, logger="devbench.cli"),
         ):
             rc = cli.cmd_start()
 
-        # asyncio.wait_for must NOT have been called when timeout <= 0.
         assert len(wait_for_calls) == 0, (
             f"asyncio.wait_for must not be called when timeout=0 (disabled); got {len(wait_for_calls)} call(s)"
         )

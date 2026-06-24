@@ -53,8 +53,6 @@ class TestScreenQuit:
         assert cmd == ["/usr/bin/screen", "-S", "devbench-supervise-n", "-X", "quit"]
 
     def test_quit_absent_screen_is_not_fatal(self) -> None:
-        # screen -X quit on a screen that is already gone exits non-zero ("No
-        # screen session found"); that is a no-op success for teardown, not a fault.
         completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="No screen session found.")
         with patch("devbench.cli.subprocess.run", return_value=completed):
             cli._supervise_screen_quit(screen_name="devbench-supervise-gone", screen_path="/usr/bin/screen")
@@ -64,9 +62,6 @@ class TestScreenQuit:
             cli._supervise_screen_quit(screen_name="devbench-supervise-x", screen_path="/usr/bin/screen")
 
     def test_quit_uses_config_command_invocation_timeout(self) -> None:
-        # FR-19 / Section 7.4: the subprocess.run safety timeout is config-driven,
-        # NOT a hardcoded literal. Drive a distinct, non-default value through the
-        # supervise config and assert it reaches subprocess.run unchanged.
         from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
 
         cfg = SuperviseConfig(timeouts=SuperviseTimeoutsConfig(command_invocation_seconds=77))
@@ -108,9 +103,6 @@ class TestWaitForTerminal:
         reg = self._seed_running(tmp_path, "nightly")
         polls = {"n": 0}
 
-        # The injected readiness gate stands in for the kernel-blocking wait. On
-        # the 2nd poll it flips the registry to stopped (as __run would), so the
-        # waiter observes a terminal. No time.sleep is used.
         def _gate(_timeout: float) -> None:
             polls["n"] += 1
             if polls["n"] == 2:
@@ -125,7 +117,6 @@ class TestWaitForTerminal:
 
     def test_returns_false_on_timeout(self, tmp_path: Path) -> None:
         reg = self._seed_running(tmp_path, "nightly")
-        # The session never leaves running; the monotonic clock crosses the budget.
         clock = _FakeClock([0.0, 0.0, 3.0, 6.0])
 
         def _gate(_timeout: float) -> None:
@@ -141,10 +132,6 @@ class TestWaitForTerminal:
 
         from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
 
-        # Exercise the production default gate (no injected _gate): it must build a
-        # bounded _block_until_readable using the config poll interval. The session
-        # is already terminal so the gate is never actually entered (no real
-        # blocking), but the default-gate construction branch is covered.
         reg = self._seed_running(tmp_path, "done")
         from devbench.constants import SUPERVISE_STATE_STOPPED
 
@@ -162,9 +149,6 @@ class TestWaitForTerminal:
         from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
         from devbench.constants import SUPERVISE_STATE_STOPPED
 
-        # Drive ONE real default-gate invocation: the session flips to terminal
-        # only after the first park, so the constructed gate (which calls
-        # _block_until_readable with the config interval) runs exactly once.
         reg = self._seed_running(tmp_path, "slow")
         seen: dict[str, float] = {}
 
@@ -181,7 +165,6 @@ class TestWaitForTerminal:
         ):
             result = cli._supervise_wait_for_terminal(name="slow", registry=reg, timeout_seconds=600)
         assert result is True
-        # The gate bounded the select on the config poll interval (min vs remaining).
         assert seen["interval"] == 4.0
 
 
@@ -203,8 +186,6 @@ class TestLiveScreenNamesFailFast:
     """A real screen -ls invocation failure fails fast (CLAUDE.md), not silent-empty."""
 
     def test_no_sockets_is_empty_not_error(self) -> None:
-        # screen -ls with no sessions exits 1 with "No Sockets found" -> empty set,
-        # NOT a fault (this is the legitimate "no screens" signal).
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="No Sockets found in /run/screen/S-user.\n", stderr=""
         )
@@ -215,9 +196,6 @@ class TestLiveScreenNamesFailFast:
             assert cli._supervise_live_screen_names() == set()
 
     def test_screen_absent_fails_fast(self) -> None:
-        # screen not installed: a stop/info verb that NEEDS the live screen list to
-        # make a teardown decision must fail fast rather than silently treat every
-        # session as stale.
         with patch("devbench.cli.shutil.which", lambda _n: None):
             with pytest.raises(cli.SuperviseError, match="screen"):
                 cli._supervise_live_screen_names()
@@ -231,7 +209,6 @@ class TestLiveScreenNamesFailFast:
                 cli._supervise_live_screen_names()
 
     def test_uses_config_command_invocation_timeout(self) -> None:
-        # FR-19 / Section 7.4: the screen -ls safety timeout is config-driven.
         from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
 
         cfg = SuperviseConfig(timeouts=SuperviseTimeoutsConfig(command_invocation_seconds=88))

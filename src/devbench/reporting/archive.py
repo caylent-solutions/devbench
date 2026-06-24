@@ -98,9 +98,6 @@ def archive_session(
         for line in fh:
             stripped = line.rstrip("\n")
             raw_lines.append(stripped)
-            # Try to capture the JSON payload alongside the raw line so
-            # downstream readers can skip re-parsing. Lines that aren't
-            # JSON keep an empty payload string; the raw line still rides.
             try:
                 _json.loads(stripped)
                 parsed_payloads.append(stripped)

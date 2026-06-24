@@ -33,57 +33,36 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Element categories -- six spec-defined types and their extraction regexes
-#
-# Each pattern is applied to the full spec text. The first capture group
-# must yield the element name. Patterns are case-sensitive because
-# CamelCase names are distinct from lowercase equivalents.
-#
-# ELEMENT_CATEGORIES is the single authoritative place for these patterns;
-# both enumerate_spec_elements and the five coverage dimensions derive from
-# it so the regex set stays DRY.
-# ---------------------------------------------------------------------------
-
 ELEMENT_CATEGORIES: dict[str, re.Pattern[str]] = {
-    # A work-item is named with a PascalCase identifier followed by the
-    # literal phrase "work-item" (case-insensitive) nearby, or the reverse.
-    # Pattern: backtick-quoted word preceding or following "work-item".
     "work-item": re.compile(
         r"`([A-Za-z][A-Za-z0-9_-]*)` work-item"
         r"|work-item `([A-Za-z][A-Za-z0-9_-]*)`",
         re.IGNORECASE,
     ),
-    # A module is named with PascalCase + the literal "module" adjacent.
     "module": re.compile(
         r"`([A-Za-z][A-Za-z0-9_-]*)` module"
         r"|module `([A-Za-z][A-Za-z0-9_-]*)`"
         r"|the `([A-Za-z][A-Za-z0-9_-]*)` module",
         re.IGNORECASE,
     ),
-    # A unit is named with PascalCase + the literal "unit" adjacent.
     "unit": re.compile(
         r"`([A-Za-z][A-Za-z0-9_-]*)` unit"
         r"|unit `([A-Za-z][A-Za-z0-9_-]*)`"
         r"|the `([A-Za-z][A-Za-z0-9_-]*)` unit",
         re.IGNORECASE,
     ),
-    # A workflow is named with PascalCase + the literal "workflow" adjacent.
     "workflow": re.compile(
         r"`([A-Za-z][A-Za-z0-9_-]*)` workflow"
         r"|workflow `([A-Za-z][A-Za-z0-9_-]*)`"
         r"|the `([A-Za-z][A-Za-z0-9_-]*)` workflow",
         re.IGNORECASE,
     ),
-    # An app is named with a kebab-case or PascalCase identifier adjacent to
-    # the literal "app".
     "app": re.compile(
         r"`([A-Za-z][A-Za-z0-9_-]*)` app"
         r"|app `([A-Za-z][A-Za-z0-9_-]*)`"
         r"|the `([A-Za-z][A-Za-z0-9_-]*)` app",
         re.IGNORECASE,
     ),
-    # A config is named as a filename (with extension) adjacent to "config".
     "config": re.compile(
         r"`([A-Za-z][A-Za-z0-9_.\-]*)` config"
         r"|config `([A-Za-z][A-Za-z0-9_.\-]*)`"
@@ -93,11 +72,6 @@ ELEMENT_CATEGORIES: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
 }
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -159,11 +133,6 @@ class GapReport:
     fix: str
 
 
-# ---------------------------------------------------------------------------
-# enumerate_spec_elements
-# ---------------------------------------------------------------------------
-
-
 def enumerate_spec_elements(spec_text: str) -> list[SpecElement]:
     """Return every named element found in *spec_text* across all categories.
 
@@ -184,7 +153,6 @@ def enumerate_spec_elements(spec_text: str) -> list[SpecElement]:
 
     for category, pattern in ELEMENT_CATEGORIES.items():
         for match in pattern.finditer(spec_text):
-            # The first non-None capture group is the element name.
             name = next((g for g in match.groups() if g is not None), None)
             if name is None:
                 continue
@@ -198,11 +166,6 @@ def enumerate_spec_elements(spec_text: str) -> list[SpecElement]:
             results.append(SpecElement(name=name, category=category))
 
     return results
-
-
-# ---------------------------------------------------------------------------
-# run_name_coverage_pre_pass
-# ---------------------------------------------------------------------------
 
 
 def run_name_coverage_pre_pass(
@@ -243,7 +206,6 @@ def run_name_coverage_pre_pass(
     if not elements:
         return []
 
-    # Load all manifest file contents once to avoid repeated I/O.
     manifest_files: list[tuple[str, str]] = []
     for md_file in sorted(manifest_dir.rglob("*.md")):
         try:
@@ -252,7 +214,6 @@ def run_name_coverage_pre_pass(
             raise OSError(
                 f"ERROR: failed to read manifest file {md_file}: {exc}\nCheck file permissions and encoding."
             ) from exc
-        # Derive task-id from the file stem (basename without extension).
         manifest_files.append((md_file.stem, content))
 
     results: list[CoverageResult] = []
@@ -271,11 +232,6 @@ def run_name_coverage_pre_pass(
         )
 
     return results
-
-
-# ---------------------------------------------------------------------------
-# verify_gap -- per-gap independent verification
-# ---------------------------------------------------------------------------
 
 
 def verify_gap(
@@ -325,8 +281,6 @@ def verify_gap(
                 f"ERROR: failed to read manifest file {md_file}: {exc}\nCheck file permissions and encoding."
             ) from exc
         if element.name in content:
-            # Element is present -- the reported gap is a false positive.
             return False
 
-    # Element not found in any manifest -- gap is genuine.
     return True

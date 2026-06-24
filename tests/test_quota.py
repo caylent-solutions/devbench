@@ -57,10 +57,6 @@ from devbench.quota import (
     wait_for_reset,
 )
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
 _NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
@@ -128,10 +124,6 @@ def _make_result_message_error(result_text: str) -> SimpleNamespace:
     return SimpleNamespace(is_error=True, result=result_text)
 
 
-# Fake anthropic exception hierarchy for recovery_probe classification tests.
-# Mirrors the real inheritance (AuthenticationError/PermissionDeniedError are
-# APIErrors; APIError is an AnthropicError) so recovery_probe's ordered except
-# clauses resolve exactly as they would against the real SDK types.
 class _FakeAnthropicError(Exception):
     """Stand-in for anthropic.AnthropicError (base; non-API config errors)."""
 
@@ -159,11 +151,6 @@ def _patch_fake_anthropic_errors() -> Any:
         AuthenticationError=_FakeAuthError,
         PermissionDeniedError=_FakePermissionError,
     )
-
-
-# ---------------------------------------------------------------------------
-# QuotaExhaustedError base class
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -207,11 +194,6 @@ class TestQuotaExhaustedErrorBase:
     def test_raise_and_catch_as_quota_exhausted(self) -> None:
         with pytest.raises(QuotaExhaustedError):
             raise _make_exc(QuotaExhaustedError)
-
-
-# ---------------------------------------------------------------------------
-# LSP subclass tests: each subtype is a valid QuotaExhaustedError
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -326,11 +308,6 @@ class TestBedrockThrottleError:
         assert err.reset_at == _NOW
 
 
-# ---------------------------------------------------------------------------
-# _has_quota_marker -- verbatim CLI bytes
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestHasQuotaMarker:
     """_has_quota_marker performs substring scan over exact CLI bytes."""
@@ -341,16 +318,14 @@ class TestHasQuotaMarker:
             "You've hit your limit",
             "you've hit your limit",
             "You have hit your limit",
-            # Verbatim line from the CLI (real apostrophe + middle dot separator)
             "You\u2019ve hit your limit \u00b7 resets 4:10pm (UTC)",
-            # Precise "rate limit" phrasing -- exhaustion verb adjacent.
             "rate limit exceeded",
             "rate limit reached",
             "rate limit hit",
             "rate limit exhausted",
             "rate-limit exceeded",
             "rate limits reached",
-            "Rate Limit Exceeded",  # case-insensitive
+            "Rate Limit Exceeded",
             "rate limit resets 4:10pm (UTC)",
         ],
     )
@@ -364,13 +339,10 @@ class TestHasQuotaMarker:
             "you hit your stride",
             "No issues here",
             "",
-            # Bare "rate limit"/"rate limiting" with no adjacent exhaustion verb
-            # must NOT match (the false-positive class this fix removes).
             "rate limit",
             "rate limiting",
             "Implement rate limiting to prevent abuse",
             "rate limit not exceeded",
-            # Verbatim reviewer-agent criteria that previously tripped detection.
             "API endpoints implement rate limiting, CORS policies, and required security headers.",
             "Missing security headers, overly permissive CORS, missing rate limiting.",
         ],
@@ -431,7 +403,6 @@ class TestHasVerbatimQuotaMarker:
     @pytest.mark.parametrize(
         "text",
         [
-            # The regex family is deliberately NOT applied to tool content.
             "rate limit exceeded",
             "rate limit reached",
             "Rate Limit Exceeded",
@@ -446,11 +417,6 @@ class TestHasVerbatimQuotaMarker:
     def test_non_string_returns_false(self) -> None:
         assert _has_verbatim_quota_marker(None) is False  # type: ignore[arg-type]
         assert _has_verbatim_quota_marker(42) is False  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# _parse_reset_at_from_text -- parametrized time parsing
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -474,7 +440,7 @@ class TestParseResetAtFromText:
         with patch("devbench.quota._get_current_utc", return_value=late_clock):
             result = _parse_reset_at_from_text("resets 4:10pm (UTC)")
         assert result is not None
-        assert result.day == 2  # next day
+        assert result.day == 2
         assert result.hour == 16
         assert result.minute == 10
 
@@ -536,7 +502,6 @@ class TestParseResetAtFromText:
     def test_result_is_strictly_in_future(self) -> None:
         """Result is always strictly after the current clock."""
         clock = datetime(2026, 1, 1, 17, 0, 0, tzinfo=UTC)
-        # 4:10pm = 16:10, which is <= 17:00, so should roll to next day
         with patch("devbench.quota._get_current_utc", return_value=clock):
             result = _parse_reset_at_from_text("resets 4:10pm (UTC)")
         assert result is not None
@@ -551,11 +516,6 @@ class TestParseResetAtFromText:
         assert result is not None
         assert result.hour == 16
         assert result.minute == 10
-
-
-# ---------------------------------------------------------------------------
-# detect_quota_error -- ten ordered rules, never raises
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -584,7 +544,6 @@ class TestDetectQuotaErrorNeverRaises:
 class TestDetectQuotaErrorRules:
     """detect_quota_error applies the ten rules in order (AC-234a-1)."""
 
-    # Rule 1: passthrough if already a QuotaExhaustedError
     def test_rule1_passthrough_already_quota_error(self) -> None:
         exc = _make_exc(QuotaExhaustedError)
         assert detect_quota_error(exc) is exc
@@ -593,7 +552,6 @@ class TestDetectQuotaErrorRules:
         exc = _make_exc(SubscriptionRateLimitError)
         assert detect_quota_error(exc) is exc
 
-    # Rule 2: status_code == 429
     def test_rule2_http_429_returns_subscription_rate_limit(self) -> None:
         obj = _make_sdk_exc(status_code=429)
         result = detect_quota_error(obj)
@@ -605,7 +563,6 @@ class TestDetectQuotaErrorRules:
         assert result is not None
         assert result.source == "anthropic-api"
 
-    # Rule 3: 402 + insufficient_quota
     def test_rule3_http_402_insufficient_quota_returns_sdk_credit_error(self) -> None:
         obj = _make_sdk_exc(status_code=402, error_type="insufficient_quota")
         result = detect_quota_error(obj)
@@ -617,7 +574,6 @@ class TestDetectQuotaErrorRules:
         assert result is not None
         assert result.source == "sdk"
 
-    # Rule 4: 402 without insufficient_quota
     def test_rule4_http_402_other_returns_api_billing_error(self) -> None:
         obj = _make_sdk_exc(status_code=402, error_type="payment_required")
         result = detect_quota_error(obj)
@@ -634,7 +590,6 @@ class TestDetectQuotaErrorRules:
         assert result is not None
         assert result.source == "anthropic-api"
 
-    # Rule 5: Bedrock throttle codes
     def test_rule5_bedrock_throttling_exception(self) -> None:
         obj = _make_bedrock_exc("ThrottlingException")
         result = detect_quota_error(obj)
@@ -656,7 +611,6 @@ class TestDetectQuotaErrorRules:
         result = detect_quota_error(obj)
         assert result is None
 
-    # Rule 6: UserMessage with ToolResultBlock containing quota marker
     def test_rule6_user_message_tool_result_block_string(self) -> None:
         obj = _make_user_message_with_quota_marker("You've hit your limit -- some details")
         result = detect_quota_error(obj)
@@ -733,7 +687,6 @@ class TestDetectQuotaErrorRules:
         obj = SimpleNamespace(content=[block])
         assert detect_quota_error(obj) is None
 
-    # Rule 7: AssistantMessage with error='rate_limit'
     def test_rule7_assistant_message_error_rate_limit(self) -> None:
         obj = _make_assistant_message_rate_limit()
         result = detect_quota_error(obj)
@@ -753,7 +706,6 @@ class TestDetectQuotaErrorRules:
         assert result is not None
         assert result.reset_at is not None
 
-    # Rule 8: ResultMessage with is_error=True AND quota marker in .result
     def test_rule8_result_message_is_error_with_quota_marker(self) -> None:
         obj = _make_result_message_error("You've hit your limit")
         result = detect_quota_error(obj)
@@ -780,7 +732,6 @@ class TestDetectQuotaErrorRules:
         obj = _make_result_message_error("error: rate limit exceeded for this operation")
         assert detect_quota_error(obj) is None
 
-    # Rule 9: wrapper BaseException with quota marker in str(obj)
     def test_rule9_base_exception_with_quota_marker(self) -> None:
         obj = Exception("You've hit your limit -- rate limit")
         result = detect_quota_error(obj)
@@ -806,17 +757,11 @@ class TestDetectQuotaErrorRules:
         result = detect_quota_error(obj)
         assert result is None
 
-    # Rule 10: everything else returns None
     def test_rule10_unrecognized_input_returns_none(self) -> None:
         assert detect_quota_error(None) is None
         assert detect_quota_error(42) is None
         assert detect_quota_error("random string") is None
         assert detect_quota_error(SimpleNamespace()) is None
-
-
-# ---------------------------------------------------------------------------
-# AC-234-1: four surfaces -> SubscriptionRateLimitError
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -878,11 +823,6 @@ class TestAC2341FourSurfaces:
         assert result.minute == 10
 
 
-# ---------------------------------------------------------------------------
-# detect_quota_error never raises -- edge cases
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestDetectQuotaErrorEdgeCases:
     """detect_quota_error handles pathological inputs without raising."""
@@ -941,12 +881,10 @@ class TestInternalHelperBranchCoverage:
 
     def test_parse_reset_at_invalid_minute_over_59(self) -> None:
         """Minute > 59 returns None (unreachable via normal regex but defensively checked)."""
-        # The regex \d{2} matches 99, so "resets 4:99pm (UTC)" passes regex then fails validation.
         assert _parse_reset_at_from_text("resets 4:99pm (UTC)") is None
 
     def test_get_error_type_non_dict_body(self) -> None:
         """_apply_rules_1_to_5 with status_code=402 and a non-dict body -> ApiBillingError."""
-        # body is not a dict -- covers _get_error_type's non-dict branch
         obj = _make_sdk_exc(status_code=402)
         obj.body = "not-a-dict"
         result = detect_quota_error(obj)
@@ -969,7 +907,6 @@ class TestInternalHelperBranchCoverage:
     def test_extract_reset_at_from_content_with_text_block(self) -> None:
         """_extract_reset_at_from_content finds reset time in a block.text field."""
         clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        # AssistantMessage with text block containing reset info
         text_block = SimpleNamespace(text="resets 4:10pm (UTC)")
         obj = SimpleNamespace(error="rate_limit", content=[text_block])
         with patch("devbench.quota._get_current_utc", return_value=clock):
@@ -981,21 +918,17 @@ class TestInternalHelperBranchCoverage:
     def test_extract_reset_at_from_content_content_field_branch(self) -> None:
         """_extract_reset_at_from_content checks block.content str field when block.text is None."""
         clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        # Block has no .text but has .content str with reset info
         block = SimpleNamespace(content="resets 4:10pm (UTC)")
         obj = SimpleNamespace(error="rate_limit", content=[block])
         with patch("devbench.quota._get_current_utc", return_value=clock):
             result = detect_quota_error(obj)
         assert result is not None
-        # The rate_limit rule fires; reset_at may or may not be populated depending
-        # on whether the content field text is a parseable string -- it should be.
         assert isinstance(result, SubscriptionRateLimitError)
 
     def test_extract_reset_at_text_not_parseable_falls_through_to_content(self) -> None:
         """When block.text is a str but not parseable, _extract_reset_at_from_content
         falls through to check block.content for a parseable reset time."""
         clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        # block.text is a str but has no reset-at pattern; block.content has the pattern
         block = SimpleNamespace(text="no reset here", content="resets 4:10pm (UTC)")
         obj = SimpleNamespace(error="rate_limit", content=[block])
         with patch("devbench.quota._get_current_utc", return_value=clock):
@@ -1007,11 +940,9 @@ class TestInternalHelperBranchCoverage:
 
     def test_extract_reset_at_content_field_not_parseable_returns_none(self) -> None:
         """When block.content is a str but not parseable, returns None for that block."""
-        # Block with text that doesn't parse, content that doesn't parse either
         block = SimpleNamespace(text="no reset", content="also no reset")
         obj = SimpleNamespace(error="rate_limit", content=[block])
         result = detect_quota_error(obj)
-        # rate_limit fires but reset_at is None since neither field has reset info
         assert result is not None
         assert isinstance(result, SubscriptionRateLimitError)
         assert result.reset_at is None
@@ -1023,8 +954,6 @@ class TestInternalHelperBranchCoverage:
             def __str__(self) -> str:
                 raise RuntimeError("str() raises")
 
-        # StrRaises is a BaseException if we subclass it; we need isinstance(obj, BaseException)
-        # to be True so that str(obj) is called in rule 9.
         class BadError(Exception):
             def __str__(self) -> str:
                 raise RuntimeError("str() raises")
@@ -1034,7 +963,6 @@ class TestInternalHelperBranchCoverage:
 
     def test_extract_reset_at_non_list_content_returns_none(self) -> None:
         """_extract_reset_at_from_content returns None when content is not list/tuple."""
-        # Trigger via rule 7 with non-list content
         obj = SimpleNamespace(error="rate_limit", content="not-a-list")
         result = detect_quota_error(obj)
         assert result is not None
@@ -1043,10 +971,8 @@ class TestInternalHelperBranchCoverage:
 
     def test_extract_reset_at_block_content_field_non_str_continues_loop(self) -> None:
         """When block.content is not a str, loop continues to next block without reset."""
-        # First block: text=None (no .text attribute), content=non-string -> skip content branch
-        # Second block: text with parseable reset
         clock = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        block_no_str_content = SimpleNamespace(content=42)  # content is int, not str
+        block_no_str_content = SimpleNamespace(content=42)
         block_with_reset = SimpleNamespace(text="resets 4:10pm (UTC)")
         obj = SimpleNamespace(error="rate_limit", content=[block_no_str_content, block_with_reset])
         with patch("devbench.quota._get_current_utc", return_value=clock):
@@ -1055,11 +981,6 @@ class TestInternalHelperBranchCoverage:
         assert isinstance(result, SubscriptionRateLimitError)
         assert result.reset_at is not None
         assert result.reset_at.hour == 16
-
-
-# ---------------------------------------------------------------------------
-# QuotaCheckpoint dataclass
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1086,11 +1007,6 @@ class TestQuotaCheckpoint:
             session_name="default",
         )
         assert cp.reset_at is None
-
-
-# ---------------------------------------------------------------------------
-# save_checkpoint / load_checkpoint / remove_checkpoint
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1190,9 +1106,7 @@ class TestCheckpointRoundTrip:
     def test_remove_checkpoint_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            # Remove when no checkpoint exists -- should not raise.
             remove_checkpoint(root)
-            # Save and remove.
             saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
             cp = QuotaCheckpoint(
                 reason="x",
@@ -1204,7 +1118,6 @@ class TestCheckpointRoundTrip:
             assert (root / ".devbench" / "quota_pause.json").exists()
             remove_checkpoint(root)
             assert not (root / ".devbench" / "quota_pause.json").exists()
-            # Second remove is idempotent.
             remove_checkpoint(root)
 
     def test_save_fails_fast_on_empty_reason(self) -> None:
@@ -1224,7 +1137,6 @@ class TestCheckpointRoundTrip:
         """save_checkpoint rejects naive datetimes (no tzinfo) for saved_at."""
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            # Intentionally naive (no tzinfo) to test validation.
             naive_dt = datetime.fromisoformat("2026-01-01T10:00:00")
             cp = QuotaCheckpoint(
                 reason="subscription_rate_limit",
@@ -1240,7 +1152,6 @@ class TestCheckpointRoundTrip:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
-            # Intentionally naive (no tzinfo) to test validation.
             naive_dt = datetime.fromisoformat("2026-01-01T16:10:00")
             cp = QuotaCheckpoint(
                 reason="subscription_rate_limit",
@@ -1250,11 +1161,6 @@ class TestCheckpointRoundTrip:
             )
             with pytest.raises(ValueError, match="timezone"):
                 save_checkpoint(cp, root)
-
-
-# ---------------------------------------------------------------------------
-# wait_for_reset
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1276,7 +1182,6 @@ class TestWaitForReset:
                         max_wait_seconds=18000,
                         probe_fn=probe,
                     )
-                    # Initial sleep must be <= max_wait_seconds
                     if mock_sleep.call_args_list:
                         assert mock_sleep.call_args_list[0].args[0] <= 18000
             return result
@@ -1288,8 +1193,8 @@ class TestWaitForReset:
     def test_past_reset_resumes_without_probing(self) -> None:
         """TDI-003a: when reset_at has elapsed, resume immediately without calling the probe."""
         probe = MagicMock(return_value=True)
-        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past
-        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)  # clock after reset_at
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
+        clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
 
         async def run() -> bool:
             with patch("devbench.quota._get_current_utc", return_value=clock):
@@ -1300,14 +1205,12 @@ class TestWaitForReset:
                         max_wait_seconds=18000,
                         probe_fn=probe,
                     )
-                    # Initial sleep is capped at max(0, reset_at-now) = 0
                     if mock_sleep.call_args_list:
                         assert mock_sleep.call_args_list[0].args[0] == 0
             return result
 
         result = asyncio.run(run())
         assert result is True
-        # The elapsed reset time is authoritative -- the probe must NOT be consulted.
         probe.assert_not_called()
 
     def test_max_wait_zero_returns_false(self) -> None:
@@ -1335,7 +1238,7 @@ class TestWaitForReset:
         probe = MagicMock(return_value=True)
         reset_at = datetime(2026, 1, 1, 16, 10, 0, tzinfo=UTC)
         clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
-        max_wait = 60  # small max_wait but reset is 6+ hours away
+        max_wait = 60
 
         async def run() -> list[float]:
             sleep_calls: list[float] = []
@@ -1343,7 +1246,6 @@ class TestWaitForReset:
 
                 async def fake_sleep(seconds: float) -> None:
                     sleep_calls.append(seconds)
-                    # Don't actually sleep
 
                 with patch("asyncio.sleep", side_effect=fake_sleep):
                     await wait_for_reset(
@@ -1355,7 +1257,6 @@ class TestWaitForReset:
             return sleep_calls
 
         sleep_calls = asyncio.run(run())
-        # Initial sleep must be <= max_wait
         if sleep_calls:
             assert sleep_calls[0] <= max_wait
 
@@ -1384,7 +1285,7 @@ class TestWaitForReset:
     def test_probe_unavailable_with_elapsed_reset_returns_true(self) -> None:
         """Probe unavailable but reset_at has passed -> resume on the provider-stated reset."""
         probe = MagicMock(side_effect=RecoveryProbeUnavailableError("no credential"))
-        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)  # past
+        reset_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC)
         clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
 
         async def run() -> bool:
@@ -1430,7 +1331,7 @@ class TestWaitForReset:
             with patch("devbench.quota._get_current_utc", return_value=clock):
                 await wait_for_reset(
                     reset_at=reset_at,
-                    poll_interval_seconds=60,  # != backoff.initial_seconds=45
+                    poll_interval_seconds=60,
                     max_wait_seconds=18000,
                     probe_fn=probe,
                     backoff_config=backoff,
@@ -1449,11 +1350,8 @@ class TestWaitForReset:
         def probe() -> bool:
             nonlocal call_count
             call_count += 1
-            # Only succeed on the 4th call
             return call_count >= 4
 
-        # reset_at=None so the probe/backoff loop runs (a known elapsed reset
-        # would short-circuit before any probe -- TDI-003a).
         clock = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
         backoff = BackoffConfig(initial_seconds=30, max_seconds=600, multiplier=2.0, jitter=0.2)
 
@@ -1465,15 +1363,14 @@ class TestWaitForReset:
                 with patch("asyncio.sleep", side_effect=fake_sleep):
                     await wait_for_reset(
                         reset_at=None,
-                        poll_interval_seconds=30,  # matches backoff.initial_seconds
+                        poll_interval_seconds=30,
                         max_wait_seconds=18000,
                         probe_fn=probe,
                         backoff_config=backoff,
                     )
 
         asyncio.run(run())
-        # All delays (excluding the initial sleep of 0) must be <= max_seconds
-        backoff_delays = delays[1:]  # skip initial sleep
+        backoff_delays = delays[1:]
         for delay in backoff_delays:
             assert delay <= 600, f"delay {delay} exceeds max_seconds=600"
 
@@ -1516,7 +1413,6 @@ class TestWaitForReset:
 
         heartbeats = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
         assert len(heartbeats) == 3, f"expected one heartbeat per poll (3), got {heartbeats}"
-        # Each heartbeat is informative: elapsed, probe index, and next-poll delay.
         first = heartbeats[0]
         assert "elapsed=" in first
         assert "probe=" in first
@@ -1544,17 +1440,13 @@ class TestWaitForReset:
         probe = MagicMock(return_value=True)
         poll_interval = 30
         start = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
-        reset_at = start + timedelta(seconds=poll_interval * 5)  # 150s ahead
-        # The provider reset is the only readiness signal; the probe must never
-        # be consulted on this path even once.
+        reset_at = start + timedelta(seconds=poll_interval * 5)
         elapsed_holder = {"seconds": 0.0}
 
         def fake_clock() -> datetime:
             return start + timedelta(seconds=elapsed_holder["seconds"])
 
         async def fake_sleep(seconds: float) -> None:
-            # Advancing the simulated clock by each requested sleep is what lets
-            # the interval-driven loop make progress without real time passing.
             elapsed_holder["seconds"] += float(seconds)
 
         backoff = BackoffConfig(initial_seconds=poll_interval, max_seconds=600, multiplier=2.0, jitter=0.2)
@@ -1574,7 +1466,6 @@ class TestWaitForReset:
             result = asyncio.run(run())
 
         assert result is True
-        # TDI-003a: the elapsed provider reset is authoritative -- never probe.
         probe.assert_not_called()
         heartbeats = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
         assert len(heartbeats) >= 1, (
@@ -1687,9 +1578,6 @@ class TestWaitForReset:
 
         quota_logger = logging.getLogger("devbench.quota")
         handler = _ExplodingHandler()
-        # raiseExceptions=True (the default) would still swallow handler errors via
-        # logging's own handleError, so force it surfacing by making the call site
-        # robust: the production code must not let a logging failure escape.
         backoff = BackoffConfig(initial_seconds=poll_interval, max_seconds=600, multiplier=2.0, jitter=0.2)
 
         async def run() -> bool:
@@ -1712,7 +1600,6 @@ class TestWaitForReset:
             logging.raiseExceptions = prev_raise
             quota_logger.removeHandler(handler)
 
-        # The wait completed and resumed despite the logging handler raising.
         assert result is True
 
     def test_max_wait_timeout_returns_false(self) -> None:
@@ -1724,11 +1611,10 @@ class TestWaitForReset:
         """
         probe = MagicMock(return_value=False)
         reset_at = None
-        # Simulate clock advancing past max_wait by returning increasing times
         clock_calls: list[datetime] = [
             datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
-            datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),  # initial
-            datetime(2026, 1, 1, 15, 0, 0, tzinfo=UTC),  # after max_wait elapsed
+            datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+            datetime(2026, 1, 1, 15, 0, 0, tzinfo=UTC),
         ]
         clock_iter = iter(clock_calls)
 
@@ -1744,17 +1630,12 @@ class TestWaitForReset:
                     return await wait_for_reset(
                         reset_at=reset_at,
                         poll_interval_seconds=60,
-                        max_wait_seconds=3600,  # 1 hour
+                        max_wait_seconds=3600,
                         probe_fn=probe,
                     )
 
         result = asyncio.run(run())
         assert result is False
-
-
-# ---------------------------------------------------------------------------
-# recovery_probe
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1825,11 +1706,6 @@ class TestRecoveryProbe:
         assert result is False
 
 
-# ---------------------------------------------------------------------------
-# _apply_resume_strategy
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestApplyResumeStrategy:
     """_apply_resume_strategy dispatches to the correct resume action."""
@@ -1840,7 +1716,6 @@ class TestApplyResumeStrategy:
     )
     def test_known_strategies_do_not_raise(self, strategy: str) -> None:
         """All known strategy names are accepted without raising."""
-        # We verify dispatch by confirming no ValueError is raised.
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             saved_at = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
@@ -1891,11 +1766,6 @@ class TestApplyResumeStrategy:
             mock_drain.assert_called_once()
 
 
-# ---------------------------------------------------------------------------
-# save_checkpoint -- exception cleanup branch (lines 538-541)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestSaveCheckpointExceptionCleanup:
     """save_checkpoint cleans up temp file and re-raises on write failure."""
@@ -1911,22 +1781,14 @@ class TestSaveCheckpointExceptionCleanup:
                 saved_at=saved_at,
                 session_name="default",
             )
-            # Ensure destination parent exists so mkstemp succeeds.
             dest_dir = root / ".devbench"
             dest_dir.mkdir(parents=True, exist_ok=True)
             os_error = OSError("simulated write failure")
-            # _os is a local alias for the standard os module inside save_checkpoint.
             with patch("os.fdopen", side_effect=os_error):
                 with pytest.raises(OSError, match="simulated write failure"):
                     save_checkpoint(cp, root)
-            # The .tmp file must have been cleaned up.
             tmp_files = list(dest_dir.glob("*.tmp"))
             assert tmp_files == [], f"Temp file not cleaned up: {tmp_files}"
-
-
-# ---------------------------------------------------------------------------
-# load_checkpoint -- invalid reset_at datetime branch (lines 583-584)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1950,11 +1812,6 @@ class TestLoadCheckpointInvalidResetAt:
                 load_checkpoint(root)
 
 
-# ---------------------------------------------------------------------------
-# _probe_api_call -- direct invocation with mocked anthropic (lines 625-632)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestProbeApiCallBody:
     """_probe_api_call calls anthropic.Anthropic and messages.create with correct args."""
@@ -1965,7 +1822,6 @@ class TestProbeApiCallBody:
 
         mock_client = MagicMock()
         mock_anthropic_cls = MagicMock(return_value=mock_client)
-        # anthropic is imported inside the function body, so patch at the source module.
         with patch("anthropic.Anthropic", mock_anthropic_cls):
             _probe_api_call(timeout_seconds=5.0, request_size_tokens=3)
 
@@ -1976,11 +1832,6 @@ class TestProbeApiCallBody:
             f"Expected model={RECOVERY_PROBE_MODEL!r}, got call: {call_kwargs}"
         )
         assert call_kwargs.kwargs.get("max_tokens") == 1
-
-
-# ---------------------------------------------------------------------------
-# _force_status_in_queue -- mocked BacklogManager/BacklogParser (lines 684-693)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -2008,7 +1859,6 @@ class TestForceStatusInQueue:
         ):
             _force_status_in_queue(Path("/fake/workspace"))
 
-        # Only in-progress units should have force_status called.
         assert mock_manager_instance.force_status.call_count == 2
         call_args_list = mock_manager_instance.force_status.call_args_list
         called_ids = {call.args[2] for call in call_args_list}

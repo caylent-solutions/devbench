@@ -15,19 +15,10 @@ import pytest
 from devbench import cli
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-# ---------------------------------------------------------------------------
-# Verbatim error string (spec AC-H1-1)
-# ---------------------------------------------------------------------------
-
 _VERBATIM_SET_STATUS_ERROR = (
     "ERROR: 'set-status done' is not allowed; completion must go through"
     " 'mark-done' (enforces the done-gate: all required judges passed)"
 )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_task(unit_id: str, status: WorkUnitStatus = WorkUnitStatus.IN_QUEUE) -> WorkUnit:
@@ -61,11 +52,6 @@ def _write_index(tmp_path: Path, unit_id: str, status: str = "in-queue") -> Path
     return index
 
 
-# ---------------------------------------------------------------------------
-# AC-H1-1: single set-status <id> done
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestCmdSetStatusSingleRefusesDone:
     """set-status <id> done exits 1 with verbatim stderr, writes nothing."""
@@ -92,7 +78,7 @@ class TestCmdSetStatusSingleRefusesDone:
             rc = cli.cmd_set_status(unit_id, "done")
 
         assert rc == 1
-        _ = wu  # referenced to show we care about the file
+        _ = wu
 
     def test_emits_verbatim_error_to_stderr(
         self,
@@ -167,11 +153,6 @@ class TestCmdSetStatusSingleRefusesDone:
 
         assert rc == 1
         assert _VERBATIM_SET_STATUS_ERROR in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# AC-H1-1: bulk set-status --include <tokens> done
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

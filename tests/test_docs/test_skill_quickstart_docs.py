@@ -65,14 +65,12 @@ class TestSkillDocContent:
         assert skill_slug in lower, (
             f"docs/skills/{skill_name}.md must contain the skill name '{skill_name}' in its content (AC-191-9)."
         )
-        # Must have at least one markdown heading.
         assert "#" in text, f"docs/skills/{skill_name}.md must contain at least one markdown heading (AC-191-9)."
 
     @pytest.mark.parametrize("skill_name,doc_path", ALL_SKILL_DOCS)
     def test_skill_doc_has_invocation_example(self, skill_name: str, doc_path: Path) -> None:
         """Each doc must show how to invoke the skill."""
         text = doc_path.read_text(encoding="utf-8")
-        # The doc should show a 'claude run' or skill invocation pattern.
         has_invocation = (
             "claude run" in text
             or "devbench:" + skill_name in text
@@ -279,13 +277,12 @@ class TestSkillDocsHaveCrossReferences:
     def test_skill_doc_has_cross_references(self, skill_name: str, doc_path: Path) -> None:
         """Each skill doc must include at least one cross-reference link."""
         text = doc_path.read_text(encoding="utf-8")
-        # Cross-references in markdown use [text](link) syntax or bare refs.
         has_cross_ref = (
-            "](" in text  # markdown link
-            or "docs/" in text  # reference to another doc
-            or "SKILL.md" in text  # link to the skill source
-            or "zero-to-ready" in text  # reference to onboarding guide
-            or "onboarding" in text.lower()  # reference to onboarding
+            "](" in text
+            or "docs/" in text
+            or "SKILL.md" in text
+            or "zero-to-ready" in text
+            or "onboarding" in text.lower()
         )
         assert has_cross_ref, (
             f"docs/skills/{skill_name}.md must include cross-references to "

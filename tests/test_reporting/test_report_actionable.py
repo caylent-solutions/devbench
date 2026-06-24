@@ -144,7 +144,6 @@ class TestNoActionableLineSurfacesInFlightWork:
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [in_review, blocked]
-        # An IN_REVIEW unit is NOT a claimable candidate (correct semantics).
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = [blocked]
@@ -152,14 +151,11 @@ class TestNoActionableLineSurfacesInFlightWork:
         with patch("devbench.reporting.report.BacklogParser", return_value=mock_parser):
             report = generate_report(log_path=log_file)
 
-        # The bare "No actionable units." form must NOT appear -- work is in flight.
         assert "No actionable units." not in report
-        # The headline distinguishes busy from idle and names the in-review count.
         assert "No claimable units;" in report
         assert "1 in-review" in report
         assert "0 in-progress" in report
         assert "1 blocked" in report
-        # And names the in-review unit id so the operator sees what is reconciling.
         assert "E0-F1-S1-T1" in report
 
     def test_in_progress_unit_surfaced(self, tmp_path: Path) -> None:
@@ -169,8 +165,6 @@ class TestNoActionableLineSurfacesInFlightWork:
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [in_progress, blocked]
-        # get_parallel_candidates may return the in-progress unit; the report's
-        # active-set exclusion (its own id) leaves no NEW claimable candidate.
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = [blocked]
@@ -197,6 +191,5 @@ class TestNoActionableLineSurfacesInFlightWork:
         with patch("devbench.reporting.report.BacklogParser", return_value=mock_parser):
             report = generate_report(log_path=log_file)
 
-        # With truly zero active units, the original verbatim form is preserved.
         assert "No actionable units. 1 blocked." in report
         assert "No claimable units;" not in report

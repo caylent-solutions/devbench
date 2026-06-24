@@ -47,7 +47,7 @@ class TestWriteSnapshot:
         log.write_text("hello world")
         write_snapshot(tmp_path, "REPORT", log)
         payload = _json.loads(snapshot_path(tmp_path).read_text())
-        assert payload["schema_version"] == 2  # issue #168: schema-bump for shard freshness keys
+        assert payload["schema_version"] == 2
         assert payload["report_text"] == "REPORT"
         assert payload["log_size"] == len("hello world")
         assert isinstance(payload["log_mtime_ns"], int)
@@ -68,12 +68,10 @@ class TestWriteSnapshot:
         log = tmp_path / "log"
         log.write_text("a")
         write_snapshot(tmp_path, "FIRST", log)
-        log.write_text("ab")  # bumps mtime + size
+        log.write_text("ab")
         write_snapshot(tmp_path, "SECOND", log)
-        # Canonical file holds the latest payload.
         payload = _json.loads(snapshot_path(tmp_path).read_text())
         assert payload["report_text"] == "SECOND"
-        # No leftover .tmp file.
         leftover = snapshot_path(tmp_path).with_suffix(snapshot_path(tmp_path).suffix + ".tmp")
         assert not leftover.exists()
 
@@ -114,7 +112,7 @@ class TestReadSnapshot:
         log = tmp_path / "log"
         log.write_text("hello world")
         write_snapshot(tmp_path, "R", log)
-        log.write_text("hi")  # smaller; mtime may also advance
+        log.write_text("hi")
         assert read_snapshot(tmp_path, log) is None
 
     def test_returns_none_on_corrupt_json(self, tmp_path: Path) -> None:
@@ -134,7 +132,7 @@ class TestReadSnapshot:
         snapshot_path(tmp_path).write_text(
             _json.dumps(
                 {
-                    "schema_version": 999,  # future version this code can't read
+                    "schema_version": 999,
                     "log_mtime_ns": log.stat().st_mtime_ns,
                     "log_size": log.stat().st_size,
                     "report_text": "R",
@@ -150,9 +148,7 @@ class TestReadSnapshot:
         log = tmp_path / "log"
         log.write_text("a")
         snapshot_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
-        snapshot_path(tmp_path).write_text(
-            _json.dumps({"schema_version": 1, "log_mtime_ns": 0})  # missing log_size + report_text
-        )
+        snapshot_path(tmp_path).write_text(_json.dumps({"schema_version": 1, "log_mtime_ns": 0}))
         assert read_snapshot(tmp_path, log) is None
 
     def test_returns_none_on_wrong_field_type(self, tmp_path: Path) -> None:
@@ -225,9 +221,6 @@ class TestShardedFreshnessKey:
         write_snapshot(tmp_path, "REPORT", live_log)
         assert read_snapshot(tmp_path, live_log) is not None
 
-        # Mutate the shard file: append a new line so size advances.
-        # mtime alone may have nanosecond-precision collisions; combining
-        # mtime + size makes the freshness check reliable.
         shard = tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl"
         with shard.open("a") as fh:
             fh.write("2026-05-04T11:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n")
@@ -242,7 +235,7 @@ class TestShardedFreshnessKey:
         snapshot_path(tmp_path).write_text(
             _json.dumps(
                 {
-                    "schema_version": 1,  # old version
+                    "schema_version": 1,
                     "log_mtime_ns": live_log.stat().st_mtime_ns,
                     "log_size": live_log.stat().st_size,
                     "report_text": "R",
@@ -260,7 +253,6 @@ class TestShardedFreshnessKey:
         write_snapshot(tmp_path, "REPORT", live_log)
         assert read_snapshot(tmp_path, live_log) is not None
 
-        # Create a sharded layout post-write.
         shard = tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl"
         shard.parent.mkdir(parents=True)
         shard.write_text("2026-05-04T10:00:00Z [devbench.cli] INFO event\n")
@@ -275,7 +267,6 @@ class TestShardedFreshnessKey:
         assert payload["schema_version"] == 2
         assert isinstance(payload["shard_keys"], list)
         assert len(payload["shard_keys"]) == 1
-        # Each shard key is [mtime_ns, size]; both ints, both non-zero.
         shard_mtime, shard_size = payload["shard_keys"][0]
         assert isinstance(shard_mtime, int)
         assert isinstance(shard_size, int)
@@ -314,7 +305,6 @@ class TestShardedFreshnessKey:
                     "log_mtime_ns": live_log.stat().st_mtime_ns,
                     "log_size": live_log.stat().st_size,
                     "report_text": "R",
-                    # shard_keys missing
                 }
             )
         )

@@ -46,8 +46,6 @@ from devbench.constants import (
 if TYPE_CHECKING:
     from devbench.config_loader import AgentModelsConfig
 
-# Top-level agent field-name (snake_case, matching AgentModelsConfig) ->
-# relative path under the canonical plugin tree (kebab-case file names).
 _AGENT_FILES: dict[str, str] = {
     "executor": "agents/executor.md",
     "blocker_resolver": "agents/blocker-resolver.md",
@@ -58,7 +56,6 @@ _AGENT_FILES: dict[str, str] = {
     "iac_deploy_reviewer": "agents/iac-deploy-reviewer.md",
 }
 
-# Nested review_team field-name -> relative path under the canonical plugin tree.
 _REVIEW_TEAM_FILES: dict[str, str] = {
     "code_reviewer": "agents/review_team/code-reviewer.md",
     "test_reviewer": "agents/review_team/test-reviewer.md",
@@ -66,15 +63,8 @@ _REVIEW_TEAM_FILES: dict[str, str] = {
     "changes_manifest": "agents/review_team/changes-manifest.md",
 }
 
-# Matches the ``model: <value>`` line in an agent .md frontmatter block. The
-# pattern is anchored at line start (MULTILINE) and consumes the value up to
-# end-of-line; ``subn`` replaces only the first match so the file body cannot
-# accidentally be mutated.
 _MODEL_LINE_RE: re.Pattern[str] = re.compile(r"^model:[ \t]+\S.*$", re.MULTILINE)
 
-# Relative-path prefix (POSIX separators, as produced by ``str(PurePosixPath)``
-# / ``str(Path)`` on the POSIX hosts this module targets) identifying agent
-# definition files inside the canonical plugin tree.
 _AGENTS_DIR_PREFIX = "agents/"
 
 
@@ -422,8 +412,6 @@ def materialise_shadow_plugin(
         clear_shadow_plugin(workspace_root)
         return None
 
-    # Verify every overridden path exists in the canonical tree BEFORE
-    # touching the filesystem. Fail fast on typos / structural drift.
     for rel_path in overrides:
         if not (canonical_plugin_dir / rel_path).is_file():
             raise ValueError(
@@ -436,15 +424,10 @@ def materialise_shadow_plugin(
     shadow_root = shadow_plugin_path(workspace_root)
     fingerprint = _overrides_fingerprint(overrides)
 
-    # Reuse path: an up-to-date shadow already exists. Register this process
-    # as an additional owner and return without clearing or rebuilding so a
-    # live sibling session is shared rather than clobbered.
     if shadow_root.exists() and _read_fingerprint(workspace_root) == fingerprint:
         write_pid_sentinel(workspace_root, os.getpid())
         return shadow_root
 
-    # Stale shadow held by a live owner: a rebuild would yank the plugin files
-    # out from under the running sibling. Fail fast naming the owner(s).
     if shadow_root.exists():
         live = _live_owner_pids(workspace_root)
         if live:

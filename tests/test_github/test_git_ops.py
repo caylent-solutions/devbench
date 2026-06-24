@@ -76,10 +76,6 @@ class TestCommitAndPush:
             with pytest.raises(RuntimeError, match="git failed"):
                 judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "b", "m")
 
-    # ------------------------------------------------------------------
-    # Happy path: changes present → commit and push
-    # ------------------------------------------------------------------
-
     def test_commits_and_pushes_when_changes_present(self, tmp_path: Path) -> None:
         """Full commit + push sequence runs when the working tree has changes."""
         judge = GitOpsService()
@@ -100,10 +96,6 @@ class TestCommitAndPush:
         assert ["commit", "-m", "commit msg"] in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
 
-    # ------------------------------------------------------------------
-    # Restart scenarios: nothing to commit
-    # ------------------------------------------------------------------
-
     def test_nothing_to_commit_skips_commit_and_push_when_remote_up_to_date(self, tmp_path: Path) -> None:
         """When working tree is clean and remote matches local HEAD, both commit and push are skipped."""
         judge = GitOpsService()
@@ -112,16 +104,15 @@ class TestCommitAndPush:
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
-                return (0, "", "")  # clean
+                return (0, "", "")
             if args == ["rev-parse", "HEAD"]:
                 return (0, "abc123\n", "")
             if args == ["rev-parse", "origin/feature/x"]:
-                return (0, "abc123\n", "")  # same SHA → up to date
+                return (0, "abc123\n", "")
             if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
                 return (0, "feature/x", "")
             return (0, "", "")
 
-        # show-ref for origin/feature/x → rc=0 (remote exists)
         with (
             patch.object(judge, "_git", side_effect=stub),
             patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
@@ -139,12 +130,11 @@ class TestCommitAndPush:
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
-                return (0, "", "")  # clean
+                return (0, "", "")
             if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
                 return (0, "feature/x", "")
             return (0, "", "")
 
-        # Only run_command call = rev-parse --verify origin/feature/x → rc=1 (absent).
         run_command_responses = iter([(1, "", "")])
 
         with (
@@ -164,16 +154,15 @@ class TestCommitAndPush:
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
-                return (0, "", "")  # clean
+                return (0, "", "")
             if args == ["rev-parse", "HEAD"]:
                 return (0, "newsha\n", "")
             if args == ["rev-parse", "origin/feature/x"]:
-                return (0, "oldsha\n", "")  # different → local is ahead
+                return (0, "oldsha\n", "")
             if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
                 return (0, "feature/x", "")
             return (0, "", "")
 
-        # run_command for rev-parse --verify origin/feature/x → rc=0 (remote exists)
         with (
             patch.object(judge, "_git", side_effect=stub),
             patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
@@ -183,10 +172,6 @@ class TestCommitAndPush:
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
 
-    # ------------------------------------------------------------------
-    # AC-2: commit_and_push must not call git checkout
-    # ------------------------------------------------------------------
-
     def test_commit_and_push_does_not_call_git_checkout(self, tmp_path: Path) -> None:
         """commit_and_push never calls git checkout -- branch setup is ensure_branch's job. AC-2"""
         judge = GitOpsService()
@@ -195,7 +180,7 @@ class TestCommitAndPush:
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
-                return (0, "M file.py\n", "")  # has changes → commit path
+                return (0, "M file.py\n", "")
             if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
                 return (0, "feature/x", "")
             return (0, "", "")
@@ -248,7 +233,6 @@ class TestEnsureBranch:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command calls: status → clean, show-ref → branch exists
         run_command_responses = iter([(0, "", ""), (0, "", "")])
 
         with (
@@ -277,7 +261,6 @@ class TestEnsureBranch:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command: status → staged changes, show-ref → branch exists
         run_command_responses = iter([(0, "M  file.py\n", ""), (0, "", "")])
 
         with (
@@ -289,7 +272,6 @@ class TestEnsureBranch:
         assert ["stash"] in git_calls
         assert ["checkout", "feature/x"] in git_calls
         assert ["stash", "pop"] in git_calls
-        # Verify order: stash before checkout, pop after
         stash_idx = git_calls.index(["stash"])
         checkout_idx = git_calls.index(["checkout", "feature/x"])
         pop_idx = git_calls.index(["stash", "pop"])
@@ -310,7 +292,6 @@ class TestEnsureBranch:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command: status → unstaged changes, show-ref → branch exists
         run_command_responses = iter([(0, " M file.py\n", ""), (0, "", "")])
 
         with (
@@ -337,7 +318,6 @@ class TestEnsureBranch:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command: status → clean, show-ref → branch absent
         run_command_responses = iter([(0, "", ""), (1, "", "")])
 
         with (
@@ -384,7 +364,6 @@ class TestEnsureBranch:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command: status → non-zero exit (git error)
         run_command_responses = iter([(1, "", "fatal: not a git repository")])
 
         with (
@@ -429,7 +408,6 @@ class TestLocalOnlyMode:
             "ensure_branch must NOT call 'git fetch origin' under local_only=true"
         )
         assert ["checkout", "-b", "new-branch", "refs/heads/main"] in git_calls
-        # Sanity: the origin-based form must NOT be used.
         assert ["checkout", "-b", "new-branch", "origin/main"] not in git_calls
 
     def test_ensure_branch_noop_when_already_on_branch_local_only(self, tmp_path: Path) -> None:
@@ -450,7 +428,6 @@ class TestLocalOnlyMode:
             mock_cfg.git_ops.local_only = True
             judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
 
-        # Only the rev-parse call; no fetch, no checkout.
         assert git_calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
 
     def test_commit_and_push_raises_when_local_only(self, tmp_path: Path) -> None:
@@ -503,9 +480,6 @@ class TestCreatePr:
         with pytest.raises(ValueError, match="not allowed"):
             judge.create_pr("evil/repo", "branch", "title", "body")
 
-    # _gh is invoked twice now: once for `pr list --head` (find_open_pr) and
-    # once for `pr create`. The list-call returns "[]" (no existing PR) so the
-    # create path runs.
     _LIST_NO_EXISTING = (0, "[]", "")
 
     def test_returns_pr_url(self, tmp_path: Path) -> None:
@@ -536,7 +510,6 @@ class TestCreatePr:
         ) as mock_gh:
             judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
 
-        # Inspect the second call (the actual create); list-call kwargs already validated by find_open_pr coverage.
         _, create_kwargs = mock_gh.call_args_list[1]
         assert create_kwargs.get("cwd") == tmp_path
         assert create_kwargs.get("repo") == "caylent-solutions/git-repo"
@@ -640,7 +613,6 @@ class TestCreatePrExistingPrReuse:
         with patch.object(judge, "_gh", side_effect=[list_response]) as mock_gh:
             url = judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
         assert url == "https://github.com/org/repo/pull/20"
-        # Exactly one _gh call (the list call); the create call must not run.
         assert mock_gh.call_count == 1
         cmd_args, _ = mock_gh.call_args_list[0]
         assert "create" not in cmd_args[0]
@@ -655,7 +627,6 @@ class TestCreatePrExistingPrReuse:
             url = judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
         assert url == "https://github.com/org/repo/pull/99"
         assert mock_gh.call_count == 2
-        # Second call must be the actual create.
         create_cmd_args, _ = mock_gh.call_args_list[1]
         assert create_cmd_args[0][0:2] == ["pr", "create"]
 
@@ -971,7 +942,6 @@ class TestCheckoutDefaultBranch:
 
         assert ["checkout", "main"] in git_calls
         assert ["pull", "origin", "main"] in git_calls
-        # Verify order: checkout before pull
         checkout_idx = git_calls.index(["checkout", "main"])
         pull_idx = git_calls.index(["pull", "origin", "main"])
         assert checkout_idx < pull_idx
@@ -1022,7 +992,6 @@ class TestEnsureBranchNewBranchBase:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command: status → clean, show-ref → branch absent
         run_command_responses = iter([(0, "", ""), (1, "", "")])
 
         with (
@@ -1034,7 +1003,6 @@ class TestEnsureBranchNewBranchBase:
 
         assert ["fetch", "origin"] in git_calls
         assert ["checkout", "-b", "new-branch", "origin/main"] in git_calls
-        # Plain checkout -b without the base must NOT appear
         assert ["checkout", "-b", "new-branch"] not in git_calls
 
     def test_ensure_branch_existing_branch_no_fetch(self, tmp_path: Path) -> None:
@@ -1052,7 +1020,6 @@ class TestEnsureBranchNewBranchBase:
                 return (0, "main", "")
             return (0, "", "")
 
-        # run_command: status → clean, show-ref → branch exists
         run_command_responses = iter([(0, "", ""), (0, "", "")])
 
         with (
@@ -1090,7 +1057,6 @@ class TestConflictingPRError:
         with patch.object(judge, "_gh", return_value=(1, "", "some other error")):
             with pytest.raises(RuntimeError) as exc_info:
                 judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
-        # Must not be a ConflictingPRError for generic failures
         assert type(exc_info.value) is RuntimeError
 
 
@@ -1120,7 +1086,6 @@ class TestRebaseAndForcePush:
         assert ["fetch", "origin"] in git_calls
         assert ["rebase", "origin/main"] in git_calls
         assert ["push", "--force-with-lease", "origin", "feature/x"] in git_calls
-        # Verify order
         fetch_idx = git_calls.index(["fetch", "origin"])
         rebase_idx = git_calls.index(["rebase", "origin/main"])
         push_idx = git_calls.index(["push", "--force-with-lease", "origin", "feature/x"])
@@ -1154,7 +1119,6 @@ class TestCommitLocal:
         assert ["add", "-A"] in git_calls
         assert ["status", "--porcelain"] in git_calls
         assert ["commit", "-m", "local commit"] in git_calls
-        # Verify push was NOT called (commit_local is local only)
         push_calls = [c for c in git_calls if c[0] == "push"]
         assert push_calls == []
 
@@ -1181,7 +1145,6 @@ class TestCommitLocal:
 
         assert ["add", "-A"] in git_calls
         assert ["status", "--porcelain"] in git_calls
-        # Commit should NOT have been called
         commit_calls = [c for c in git_calls if c[0] == "commit"]
         assert commit_calls == []
 
@@ -1217,7 +1180,6 @@ class TestCommitLocal:
 
         committed = _committed_files_at_head(repo_path)
         assert committed == ["unit_a.txt"], f"expected only unit_a.txt committed, got {committed}"
-        # The foreign file must still be sitting uncommitted in the working tree.
         assert "unit_b_parked.txt" in _untracked_files(repo_path)
 
     def test_commit_local_with_manifest_paths_stages_tracked_deletion(self, tmp_path: Path) -> None:
@@ -1234,7 +1196,6 @@ class TestCommitLocal:
         _git_in(repo_path, ["commit", "-m", "seed: add to_delete.txt"])
 
         doomed.unlink()
-        # A foreign file sits uncommitted alongside the deletion.
         foreign = repo_path / "foreign.txt"
         foreign.write_text("foreign\n", encoding="utf-8")
 
@@ -1247,10 +1208,8 @@ class TestCommitLocal:
             manifest_paths=["to_delete.txt"],
         )
 
-        # The deletion is recorded in the new commit.
         _, head_files, _ = _git_in(repo_path, ["ls-tree", "-r", "--name-only", "HEAD"])
         assert "to_delete.txt" not in head_files.split()
-        # The foreign file was not swept into the deletion commit.
         assert "foreign.txt" in _untracked_files(repo_path)
 
     def test_commit_local_none_manifest_falls_back_to_add_all(self, tmp_path: Path) -> None:
@@ -1276,7 +1235,6 @@ class TestCommitLocal:
             )
 
         assert ["add", "-A"] in git_calls
-        # No per-path staging is performed in the fallback path.
         assert not any(c[:2] == ["add", "--"] for c in git_calls)
 
 
@@ -1286,7 +1244,7 @@ class TestAssertOnBranch:
     def test_passes_when_head_matches(self, tmp_path: Path) -> None:
         judge = GitOpsService()
         with patch.object(judge, "_git", return_value=(0, "feature/x\n", "")):
-            judge.assert_on_branch(tmp_path, "feature/x")  # no raise
+            judge.assert_on_branch(tmp_path, "feature/x")
 
     def test_strips_trailing_newline(self, tmp_path: Path) -> None:
         judge = GitOpsService()
@@ -1429,7 +1387,6 @@ class TestGetLatestFailingRunId:
             assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
 
     def test_skips_non_dict_entries_in_array(self, tmp_path: Path) -> None:
-        # Defensive: gh API response may include non-dict entries (e.g. nulls).
         judge = GitOpsService()
         gh_json = (
             '[null, "string", {"name":"lint","state":"FAILURE","link":"https://github.com/x/y/actions/runs/77/job/9"}]'
@@ -1590,9 +1547,6 @@ class TestPollPrReviewResolution:
             sleep_calls: list[int] = []
 
             def fake_sleep(secs: int) -> None:
-                # Append once, then bump time forward by raising a sentinel
-                # via monotonic-shift is awkward; instead patch monotonic to
-                # advance past the deadline after the first sleep.
                 sleep_calls.append(secs)
 
             monotonic_calls = iter([0.0, 0.0, 100.0, 100.0, 100.0])
@@ -1609,7 +1563,6 @@ class TestPollPrReviewResolution:
                     settle_seconds=10,
                     poll_interval=2,
                 )
-        # The loop slept at least once before the deadline elapsed.
         assert sleep_calls
         assert resolution.resolved is True
 
@@ -1635,11 +1588,6 @@ class TestPollPrReviewResolution:
                 )
         assert resolution.resolved is True
         assert resolution.unresolved_reviews == []
-
-
-# ---------------------------------------------------------------------------
-# CIResult and wait_for_checks_and_classify tests (E7-F1-S1-T1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -1706,10 +1654,6 @@ class TestFirstFailingJobLink:
 class TestWaitForChecksAndClassify:
     """Golden-fixture tests for GitOpsService.wait_for_checks_and_classify."""
 
-    # ------------------------------------------------------------------
-    # Internal fixture builder
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _one_failing_check_json(run_id: str, state: str = "FAILURE") -> str:
         """Return JSON for 'gh pr checks --json name,state,link' with one failing entry."""
@@ -1757,10 +1701,6 @@ class TestWaitForChecksAndClassify:
         ):
             return judge.wait_for_checks_and_classify(pr_url, repo_path)
 
-    # ------------------------------------------------------------------
-    # AC-FUNC-001: GREEN
-    # ------------------------------------------------------------------
-
     def test_returns_green_when_all_checks_pass(self, tmp_path: Path) -> None:
         """wait_for_checks returns True (rc=0) => CIResult.GREEN."""
         judge = GitOpsService()
@@ -1777,10 +1717,6 @@ class TestWaitForChecksAndClassify:
             result = judge.wait_for_checks_and_classify(pr_url, tmp_path)
         assert result is CIResult.GREEN
 
-    # ------------------------------------------------------------------
-    # AC-FUNC-004: TIMEOUT
-    # ------------------------------------------------------------------
-
     def test_returns_timeout_when_gh_pr_checks_watch_times_out(self, tmp_path: Path) -> None:
         """subprocess.TimeoutExpired during wait_for_checks => CIResult.TIMEOUT."""
         judge = GitOpsService()
@@ -1792,10 +1728,6 @@ class TestWaitForChecksAndClassify:
         ):
             result = judge.wait_for_checks_and_classify(pr_url, tmp_path)
         assert result is CIResult.TIMEOUT
-
-    # ------------------------------------------------------------------
-    # AC-FUNC-002: FAILED_KNOWN_TASK
-    # ------------------------------------------------------------------
 
     def test_returns_failed_known_task_single_marker_in_log(self, tmp_path: Path) -> None:
         """Exactly one task marker in the failing job log => FAILED_KNOWN_TASK."""
@@ -1860,10 +1792,6 @@ class TestWaitForChecksAndClassify:
         )
         assert isinstance(result, CIResult.FAILED_KNOWN_TASK)
         assert result.task_id == "E7-F1-S1-T1"
-
-    # ------------------------------------------------------------------
-    # AC-FUNC-003: FAILED_UNKNOWN sub-cases
-    # ------------------------------------------------------------------
 
     def test_returns_failed_unknown_when_no_marker_in_log(self, tmp_path: Path) -> None:
         """No task marker in the log => FAILED_UNKNOWN."""

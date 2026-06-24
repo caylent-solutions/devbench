@@ -29,10 +29,6 @@ from devbench.config_loader import (
     load_runtime_config,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 _MINIMAL_REPOS_YAML = textwrap.dedent("""\
     repos:
       example-org/example-repo:
@@ -40,13 +36,6 @@ _MINIMAL_REPOS_YAML = textwrap.dedent("""\
         checkout_directory: example-repo
 """)
 
-# YAML block that mirrors every annotated default shown in configure-devbench
-# SKILL.md for the sections with code-defined defaults: task_factory,
-# manifest_amendment, validate, stop_hook, backlog, skills, quota_handling,
-# done_gate. Sections whose fields are env-derived (hook_tail, debug,
-# orchestrate) are excluded because their loader fields default to None, not a
-# fixed value. optional_judges is a plain dict (not a dataclass) and is covered
-# by the dedicated loader tests rather than this dataclasses.asdict comparison.
 _GENERATED_DEFAULTS_YAML = textwrap.dedent("""\
     repos:
       example-org/example-repo:
@@ -107,11 +96,6 @@ def _load(path: Path) -> RuntimeConfig:
     return load_runtime_config(path, {})
 
 
-# ---------------------------------------------------------------------------
-# AC-260-1: field-by-field equality for all relevant sections
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestConfigLoaderDefaultsEquality:
     """AC-260-1: relevant config sections are field-by-field equal between
@@ -149,7 +133,6 @@ class TestConfigLoaderDefaultsEquality:
         empty_section = getattr(empty_cfg, section_name)
         generated_section = getattr(generated_cfg, section_name)
 
-        # Use dataclasses.asdict for deep equality that surfaces field names.
         empty_dict = dataclasses.asdict(empty_section)
         generated_dict = dataclasses.asdict(generated_section)
 

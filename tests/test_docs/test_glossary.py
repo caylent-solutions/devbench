@@ -21,10 +21,8 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 GLOSSARY = REPO_ROOT / "docs" / "glossary.md"
 DOCS_DIR = REPO_ROOT / "docs"
 
-# Minimum character threshold for meaningful glossary content.
 MIN_GLOSSARY_CHARS = 200
 
-# Canonical terms from spec section 1.2 that must appear in the glossary.
 CANONICAL_TERMS = [
     "draft",
     "in-queue",
@@ -137,7 +135,6 @@ class TestTerminologyConsistencyInDocs:
         uses_lowercase_draft = False
         for doc in doc_files:
             text = doc.read_text(encoding="utf-8")
-            # The canonical form 'draft' (lower-case) must appear in at least one doc.
             if "`draft`" in text or "status `draft`" in text or "draft status" in text.lower():
                 uses_lowercase_draft = True
                 break

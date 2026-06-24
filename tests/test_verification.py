@@ -46,15 +46,10 @@ from devbench.verification import (
     write_evidence_ledger,
 )
 
-# ---------------------------------------------------------------------------
-# IaC tool detection
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
-        # Tool invoked with a lifecycle verb/subcommand -> detected (TDI-007).
         ("terraform apply -auto-approve", "terraform"),
         ("terraform validate", "terraform"),
         ("terraform init -backend=false", "terraform"),
@@ -81,14 +76,11 @@ def test_detect_iac_tool_matrix(command: str, expected: str) -> None:
         "pytest -q",
         "make lint",
         "echo hello",
-        # TDI-007: a tool name appearing only as a PATH OPERAND (no lifecycle
-        # verb) must NOT be detected as an IaC invocation.
         "test -d terragrunt/common/sandbox/000",
         "jq -e . terragrunt/common/accounts.json",
         "grep -q region providers/aws/references/vpc-network/main.tf",
         "cat terraform.tfvars",
         "test -f providers/aws/primitives/spice-kms/variables.tf",
-        # aws CLI without a CloudFormation provisioning verb is not IaC.
         "aws s3 ls",
         "aws ec2 describe-instances",
     ],
@@ -98,13 +90,7 @@ def test_detect_iac_tool_negative(command: str | None) -> None:
 
 
 def test_terragrunt_precedence_over_other_tools() -> None:
-    # A terragrunt command that also mentions aws must classify as terragrunt.
     assert detect_iac_tool("terragrunt apply") == "terragrunt"
-
-
-# ---------------------------------------------------------------------------
-# Execution-verb detection (validator lint)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -135,32 +121,21 @@ def test_text_has_execution_verb_negative(text: str) -> None:
     assert text_has_execution_verb(text) is False
 
 
-# ---------------------------------------------------------------------------
-# Command-path extraction + classification (TDI-001 / 004 / 005)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
         (None, []),
         ("", []),
-        # Slash paths are operands; the command word and flags are not.
         ("test -d terragrunt/common/sandbox/000", ["terragrunt/common/sandbox/000"]),
         ("grep -q x providers/aws/references/vpc/main.tf", ["providers/aws/references/vpc/main.tf"]),
-        # Bare filename with a known extension counts; the command word does not.
         ("cat terraform.tfvars", ["terraform.tfvars"]),
-        # Command substitutions are stripped, so their contents are not operands.
         ("grep -rnE PATTERN $(find providers -name '*.tf')", []),
         ("echo `cat providers/aws/x.tf`", []),
-        # Excluded shapes: flags, key=value, var refs, globs, bare words.
         ("terraform validate -backend=false", []),
         ("jq -e . ${CONFIG}", []),
         ("ls providers/*.tf", []),
         ("make lint", []),
-        # De-duplication, order preserved.
         ("diff a/x.tf a/x.tf", ["a/x.tf"]),
-        # Unknown extension on a slash-less token is NOT a path operand.
         ("run something.zzz", []),
     ],
 )
@@ -175,7 +150,6 @@ def test_extract_command_paths(command: str | None, expected: list[str]) -> None
         ("", False),
         ("! grep -rnE PATTERN $(find providers/aws -name '*.tf')", True),
         ("grep -q x $(find . -name '*.py')", True),
-        # A plain grep against explicit files does not feed from find.
         ("grep -q x providers/aws/main.tf", False),
         ("terraform validate", False),
     ],
@@ -189,15 +163,12 @@ def test_command_substitution_feeds_grep(command: str | None, expected: bool) ->
     [
         (None, None),
         ("", None),
-        # Mis-classified: names a runnable tool with no live/operator signal.
         ("requires the Terraform toolchain the orchestrator runs at execution time", "Terraform"),
         ("runs terraform init -backend=false && terraform validate", "terraform"),
         ("pytest must run for this check", "pytest"),
-        # Genuinely operator-only: vetoed even though it names a tool.
         ("real production terragrunt apply against a live account", None),
         ("prod apply is operator-only", None),
         ("requires AWS credentials the orchestrator must not hold", None),
-        # No tool named at all.
         ("a human must visually inspect the dashboard", None),
     ],
 )
@@ -208,10 +179,6 @@ def test_deferred_reason_names_runnable_tool(reason: str | None, expected_match:
     else:
         assert result is not None and result.lower() == expected_match.lower()
 
-
-# ---------------------------------------------------------------------------
-# Section detection + directive parsing
-# ---------------------------------------------------------------------------
 
 _WU_WITH_VERIFICATION = """# E1-F1-S1-T1: Example
 
@@ -247,9 +214,7 @@ def test_parse_verification_section_items() -> None:
     assert terratest.tool == "terragrunt"
     assert terratest.command == "make tf-test UNIT=sandbox/000/x"
     assert terratest.expect_exit == 0
-    # The smoke command contains a literal pipe inside backticks -- must survive splitting.
     assert items[1].command == 'bash -c "curl -sf $URL | grep ok"'
-    # Deferred carries owner + reason (quotes stripped).
     assert items[2].owner == "operator"
     assert items[2].reason == "prod apply is operator-only"
 
@@ -257,7 +222,7 @@ def test_parse_verification_section_items() -> None:
 def test_parse_item_multiple_ac_ids_and_inferred_tool() -> None:
     item = parse_verification_item(" AC-3, AC-5 | type=apply | cmd=`terraform apply`")
     assert item.ac_ids == ("AC-3", "AC-5")
-    assert item.tool == "terraform"  # inferred from cmd since no explicit tool=
+    assert item.tool == "terraform"
     assert item.expect_exit == 0
 
 
@@ -286,11 +251,6 @@ def test_parse_item_bad_expect_exit_raises() -> None:
         parse_verification_item(" AC-1 | type=command | cmd=`x` | expect-exit=abc")
 
 
-# ---------------------------------------------------------------------------
-# Classification
-# ---------------------------------------------------------------------------
-
-
 def test_executable_and_infra_type_sets() -> None:
     assert VerificationType.TERRATEST in EXECUTABLE_TYPES
     assert VerificationType.JUDGE not in EXECUTABLE_TYPES
@@ -305,7 +265,7 @@ def test_item_is_executable_and_is_infra() -> None:
     assert apply.is_infra() is True
 
     cmd_infra = VerificationItem(ac_ids=("AC-2",), vtype=VerificationType.COMMAND, command="cdk deploy S")
-    assert cmd_infra.is_infra() is True  # via cmd pattern
+    assert cmd_infra.is_infra() is True
 
     cmd_plain = VerificationItem(ac_ids=("AC-3",), vtype=VerificationType.COMMAND, command="pytest -q")
     assert cmd_plain.is_executable() is True
@@ -322,11 +282,6 @@ def test_executable_and_deferred_filters() -> None:
     assert [i.vtype for i in deferred_items(items)] == [VerificationType.DEFERRED]
 
 
-# ---------------------------------------------------------------------------
-# iac_review applicability
-# ---------------------------------------------------------------------------
-
-
 def test_unit_requires_iac_judge_true_for_infra() -> None:
     assert unit_requires_iac_judge(_WU_WITH_VERIFICATION) is True
 
@@ -337,14 +292,11 @@ def test_unit_requires_iac_judge_false_when_no_infra() -> None:
 
 
 def test_unit_requires_iac_judge_false_on_malformed() -> None:
-    # A malformed directive must not raise here; the validator reports it separately.
     content = "# T1\n\n## Verification\n- VERIFY AC-1 | type=bogus\n"
     assert unit_requires_iac_judge(content) is False
 
 
 def test_unit_requires_iac_judge_false_for_path_substring_only() -> None:
-    # TDI-007 AC-1: type=command directives that only run jq/test/grep against
-    # IaC-named paths (no lifecycle verb) must NOT require the iac_review judge.
     content = (
         "# T1\n\n## Verification\n"
         "- VERIFY AC-1 | type=command | cmd=`test -d terragrunt/common/sandbox/000`\n"
@@ -363,15 +315,8 @@ def test_unit_requires_iac_judge_false_for_path_substring_only() -> None:
     ],
 )
 def test_unit_requires_iac_judge_true_for_lifecycle_verb(cmd: str) -> None:
-    # TDI-007 AC-2: a directive that actually invokes an IaC tool with a
-    # lifecycle verb requires the iac_review judge.
     content = f"# T1\n\n## Verification\n- VERIFY AC-1 | type=command | cmd=`{cmd}`\n"
     assert unit_requires_iac_judge(content) is True
-
-
-# ---------------------------------------------------------------------------
-# Evidence model + completeness gate
-# ---------------------------------------------------------------------------
 
 
 def test_evidence_record_round_trip() -> None:
@@ -393,7 +338,7 @@ def test_evidence_record_round_trip() -> None:
 def test_evidence_record_from_dict_defaults() -> None:
     rec = EvidenceRecord.from_dict({"vtype": "smoke"})
     assert rec.ac_ids == []
-    assert rec.exit_code == 1  # fail-closed default
+    assert rec.exit_code == 1
     assert rec.command is None
 
 
@@ -454,10 +399,6 @@ def test_deferred_blocks_by_default_and_allow_overrides() -> None:
     assert allowed.complete is True
 
 
-# ---------------------------------------------------------------------------
-# Evidence ledger persistence (the on-disk layout shared by runner + gate)
-# ---------------------------------------------------------------------------
-
 _TASK = "E1-F1-S1-T1"
 
 
@@ -472,18 +413,16 @@ def test_sanitize_ac_label_joins_and_replaces() -> None:
 
 def test_sanitize_ac_label_empty_falls_back() -> None:
     assert sanitize_ac_label([]) == "unknown"
-    # A non-empty id made entirely of disallowed chars collapses to a single
-    # underscore -- still a stable, non-empty, directory-safe label.
     assert sanitize_ac_label(["//"]) == "_"
 
 
 @pytest.mark.parametrize(
     ("text", "cap"),
     [
-        ("short", 100),  # under cap -> unchanged
-        ("abcdef", 0),  # non-positive cap disables trimming
+        ("short", 100),
+        ("abcdef", 0),
         ("abcdef", -1),
-        ("a" * 100, 100),  # exactly at cap -> unchanged
+        ("a" * 100, 100),
     ],
 )
 def test_trim_log_within_budget_or_disabled_is_verbatim(text: str, cap: int) -> None:
@@ -497,13 +436,9 @@ def test_trim_log_no_sentinels_is_bounded_near_max_bytes() -> None:
     cap = 600
     trimmed = trim_log(text, cap)
     assert trimmed != text
-    # Bounded near the cap (head + tail windows + one elision marker), never blown.
     assert len(trimmed) <= cap + len("[... 999999 bytes elided ...]")
-    # Head context survives (old tail-only slice dropped it entirely).
     assert "plain line 0000" in trimmed
-    # Trailing summary survives.
     assert "plain line 1999" in trimmed
-    # A gap marker records the dropped middle.
     assert "bytes elided" in trimmed
 
 
@@ -525,8 +460,6 @@ def test_trim_log_retains_head_apply_destroy_and_tail_summary() -> None:
         "Destroy complete! Resources: 7 destroyed.",
         "--- PASS: TestExampleApply (93.43s)",
     ]
-    # A large block of plan-only negative-test filler that pushes the apply
-    # sentinels out of any pure tail window.
     middle = [f"    plan_only_test.go:{i}: negative validation assertion {i:04d}" for i in range(4000)]
     tail = [
         "--- PASS: TestEmptyNameValidationError (0.84s)",
@@ -537,14 +470,11 @@ def test_trim_log_retains_head_apply_destroy_and_tail_summary() -> None:
     cap = 2048
     trimmed = trim_log(text, cap)
 
-    # AC-3 apply / idempotency / destroy proof retained from the HEAD.
     assert "Apply complete! Resources: 7 added, 0 changed, 0 destroyed." in trimmed
     assert "No changes. Your infrastructure matches the configuration." in trimmed
     assert "Destroy complete! Resources: 7 destroyed." in trimmed
     assert "--- PASS: TestExampleApply (93.43s)" in trimmed
-    # Trailing Go package summary retained from the TAIL.
     assert "ok  \tgithub.com/example/module/tests/default\t93.430s" in trimmed
-    # The plan-only filler in the middle was elided.
     assert "negative validation assertion 2000" not in trimmed
     assert "bytes elided" in trimmed
 
@@ -577,16 +507,16 @@ def test_trim_log_head_and_tail_windows_are_disjoint_no_double_count() -> None:
     stay within budget and a single elision marker bridges the dropped middle;
     no line appears more than once.
     """
-    lines = [f"line{i:03d}-payload" for i in range(400)]  # uniform short lines, no sentinels
+    lines = [f"line{i:03d}-payload" for i in range(400)]
     text = "\n".join(lines)
     cap = 400
     trimmed = trim_log(text, cap)
     out_lines = trimmed.split("\n")
     payload_lines = [ln for ln in out_lines if ln.startswith("line")]
-    assert len(payload_lines) == len(set(payload_lines))  # no duplicates
-    assert "line000-payload" in trimmed  # head survives
-    assert "line399-payload" in trimmed  # tail survives
-    assert trimmed.count("bytes elided") == 1  # exactly one bridged gap
+    assert len(payload_lines) == len(set(payload_lines))
+    assert "line000-payload" in trimmed
+    assert "line399-payload" in trimmed
+    assert trimmed.count("bytes elided") == 1
 
 
 def test_trim_log_skips_sentinel_that_exceeds_remaining_budget() -> None:
@@ -595,7 +525,6 @@ def test_trim_log_skips_sentinel_that_exceeds_remaining_budget() -> None:
     Exercises the sentinel-loop branch that skips an over-budget sentinel so the
     result never blows past *max_bytes* just to keep one more marker.
     """
-    # One short sentinel near the front fits; a second, very long sentinel cannot.
     short_sentinel = "Apply complete!"
     long_sentinel = "Error: " + ("x" * 5000)
     middle = [f"filler {i:04d}" for i in range(2000)]
@@ -603,12 +532,9 @@ def test_trim_log_skips_sentinel_that_exceeds_remaining_budget() -> None:
     text = "\n".join([short_sentinel, *middle, long_sentinel, *middle, *tail])
     cap = 400
     trimmed = trim_log(text, cap)
-    # The affordable sentinel and the tail summary are kept.
     assert short_sentinel in trimmed
     assert "ok  \tgithub.com/example/m\t1.0s" in trimmed
-    # The oversized sentinel was skipped rather than forced in.
     assert long_sentinel not in trimmed
-    # Result stays bounded near the cap despite the oversized sentinel existing.
     assert len(trimmed) <= cap + len(short_sentinel) + len("[... 9999999 bytes elided ...]\n") * 4
 
 
@@ -633,7 +559,7 @@ def test_next_attempt_ignores_non_numeric_children(tmp_path: Path) -> None:
     root.mkdir(parents=True)
     (root / "1").mkdir()
     (root / "notanattempt").mkdir()
-    (root / "latest.json").write_text("{}", encoding="utf-8")  # a file, not a dir
+    (root / "latest.json").write_text("{}", encoding="utf-8")
     assert next_attempt_number(tmp_path, _TASK) == 2
 
 
@@ -642,7 +568,6 @@ def test_write_and_read_latest_ledger_round_trip(tmp_path: Path) -> None:
     records = read_latest_evidence_ledger(tmp_path, _TASK)
     assert [r.ac_ids for r in records] == [["AC-1"], ["AC-2"]]
     assert [r.exit_code for r in records] == [0, 3]
-    # The ledger file is human-readable JSON.
     ledger = evidence_attempt_dir(tmp_path, _TASK, 1) / "evidence.json"
     assert isinstance(json.loads(ledger.read_text(encoding="utf-8")), list)
 
@@ -677,7 +602,6 @@ def test_latest_attempt_number_non_int_attempt(tmp_path: Path) -> None:
 
 
 def test_read_latest_ledger_missing_ledger_file(tmp_path: Path) -> None:
-    # Pointer claims attempt 5 but no ledger was written there.
     root = evidence_root(tmp_path, _TASK)
     root.mkdir(parents=True)
     (root / "latest.json").write_text(json.dumps({"attempt": 5}), encoding="utf-8")
@@ -711,11 +635,6 @@ def test_read_latest_ledger_skips_non_dict_entries(tmp_path: Path) -> None:
     assert records[0].ac_ids == ["AC-1"]
 
 
-# ---------------------------------------------------------------------------
-# Deterministic per-unit gate environment (TDI: AC-FINAL flaky-gate fix, item 1)
-# ---------------------------------------------------------------------------
-
-
 class TestDeterministicGateEnv:
     """``deterministic_gate_env`` pins the pytest ordering seed so a unit's
     completion gate is reproducible across runs (same input -> same verdict)."""
@@ -725,7 +644,6 @@ class TestDeterministicGateEnv:
         assert overlay["PYTHONHASHSEED"] == "12345"
 
     def test_pythonhashseed_pinned_even_when_randomly_not_pinned(self) -> None:
-        # The always-safe interpreter-level knob is set regardless of pin_randomly.
         overlay = deterministic_gate_env({}, seed=8, pin_randomly=False)
         assert overlay["PYTHONHASHSEED"] == "8"
 
@@ -734,8 +652,6 @@ class TestDeterministicGateEnv:
         assert "--randomly-seed=777" in overlay["PYTEST_ADDOPTS"]
 
     def test_no_addopts_injected_when_pin_randomly_false(self) -> None:
-        # A repo WITHOUT pytest-randomly would error on the unknown option, so
-        # the seed flag must NOT be injected when pin_randomly is False.
         overlay = deterministic_gate_env({}, seed=5, pin_randomly=False)
         assert "PYTEST_ADDOPTS" not in overlay
 
@@ -756,7 +672,6 @@ class TestDeterministicGateEnv:
         base = {"PYTEST_ADDOPTS": "--randomly-seed=99"}
         overlay = deterministic_gate_env(base, seed=5)
         addopts = overlay["PYTEST_ADDOPTS"]
-        # The pinned seed wins; the stale one must not survive as a duplicate.
         assert addopts.count("--randomly-seed") == 1
         assert "--randomly-seed=5" in addopts
         assert "--randomly-seed=99" not in addopts
@@ -791,7 +706,6 @@ class TestPytestRandomlyAvailable:
             return 0, "", ""
 
         assert pytest_randomly_available(tmp_path, runner) is True
-        # It probes by importing the plugin in the repo working dir.
         assert calls[0][0] == ["python", "-c", "import pytest_randomly"]
         assert calls[0][1] == tmp_path
 
@@ -802,7 +716,6 @@ class TestPytestRandomlyAvailable:
         assert pytest_randomly_available(tmp_path, runner) is False
 
     def test_false_when_interpreter_missing(self, tmp_path: Path) -> None:
-        # run_command returns 127 (never raises) when python is absent.
         def runner(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
             return 127, "", "python: command not found"
 

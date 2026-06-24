@@ -29,10 +29,6 @@ from devbench.backlog.amendment import (
 )
 from devbench.config_loader import AmendmentConfig
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 TASK_ID = "EX-F1-S1-T1"
 DONE_ID = "EX-F1-S1-T0"
 
@@ -174,11 +170,6 @@ def _gated_config(allow: bool) -> AmendmentConfig:
     return AmendmentConfig(allow_verification_directive_amendments=allow)
 
 
-# ---------------------------------------------------------------------------
-# Dataclass + serialisation
-# ---------------------------------------------------------------------------
-
-
 class TestVerificationPatchParsing:
     def test_reason_constant_registered(self) -> None:
         assert REASON_VERIFICATION_DIRECTIVE_DEFECT == "verification_directive_defect"
@@ -230,11 +221,6 @@ class TestVerificationPatchParsing:
     def test_identical_before_after_rejected(self) -> None:
         with pytest.raises(ValueError):
             _patch(after=DEFECTIVE_DIRECTIVE)
-
-
-# ---------------------------------------------------------------------------
-# Layer-1 pre-filter gating
-# ---------------------------------------------------------------------------
 
 
 class TestPreFilterGating:
@@ -289,11 +275,6 @@ class TestPreFilterGating:
             pf.run_all(req, prior_applied_count=0)
 
 
-# ---------------------------------------------------------------------------
-# apply_amendment: happy path + deterministic guards
-# ---------------------------------------------------------------------------
-
-
 class TestApplyVerificationAmendment:
     def _write_and_apply(self, workspace: Path, req: AmendmentRequest) -> None:
         write_request(workspace, req)
@@ -302,8 +283,6 @@ class TestApplyVerificationAmendment:
     def test_happy_path_rewrites_directive(self, workspace: Path) -> None:
         self._write_and_apply(workspace, _request(patches=[_patch(cited=[DONE_ID])]))
         content = (workspace / "backlog" / f"{TASK_ID}.md").read_text()
-        # The directive itself is rewritten; the defective line survives only
-        # inside the audit comment (which quotes before/after verbatim).
         verification_section = content.split("## Verification")[1].split("## Comments")[0]
         assert FIXED_DIRECTIVE in verification_section
         assert DEFECTIVE_DIRECTIVE not in verification_section
@@ -347,7 +326,7 @@ class TestApplyVerificationAmendment:
             apply_amendment(workspace, workspace / "BACKLOG.md", TASK_ID)
 
     def test_citation_of_non_done_unit_rejected(self, workspace: Path) -> None:
-        req = _request(patches=[_patch(cited=[TASK_ID])])  # in-progress, not done
+        req = _request(patches=[_patch(cited=[TASK_ID])])
         write_request(workspace, req)
         with pytest.raises(AmendmentError, match="done"):
             apply_amendment(workspace, workspace / "BACKLOG.md", TASK_ID)

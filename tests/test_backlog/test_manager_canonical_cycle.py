@@ -25,8 +25,6 @@ _REPO = "caylent-solutions/devbench"
 
 
 def _make_index(tmp_path: Path, unit_ids: list[str]) -> Path:
-    # The index dependency column is deliberately "none" for every row -- the
-    # cycle lives only in the work-unit ## Dependencies tables / markers.
     rows = "".join(
         f"| {uid} | Task Title | Task | in-queue | none | {_REPO} | `backlog/{uid}.md` |\n" for uid in unit_ids
     )
@@ -87,7 +85,6 @@ def test_dep_table_cycle_is_caught_even_when_index_is_clean(tmp_path: Path, back
     errors = _validate(tmp_path)
     cycle = _cycle_errors(errors)
     assert len(cycle) == 1
-    # AC-3: the diagnostic names the actual cycle members.
     assert "E1-F1-S1-T1" in cycle[0] and "E1-F1-S1-T2" in cycle[0]
 
 

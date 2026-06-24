@@ -161,7 +161,6 @@ def test_report_counts_match_backlog_index() -> None:
 
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
-    # Per-status breakdown rows added in B8.
     tasks_in_progress = tasks.get("in-progress", 0)
     tasks_remaining_total = tasks_active + tasks_blocked
     assert f"{tasks_done} of {tasks_total}" in report, "Tasks completed count mismatch"
@@ -184,7 +183,6 @@ def test_report_token_totals_match_independent_sum() -> None:
 
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
-    # The report formats numbers with thousands commas. Render expected values the same way.
     for key, label in [
         ("input", "input (uncached)"),
         ("cache_read", "cache reads"),
@@ -205,7 +203,6 @@ def test_report_api_processing_time_matches_hook_log_duration() -> None:
 
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
-    # Display rounds to 1 decimal place: "X.X h"
     expected_str = f"{api_hours:.1f} h"
     assert expected_str in report, f"Expected API processing time '{expected_str}' not found"
 
@@ -214,7 +211,6 @@ def test_report_stdout_has_no_log_lines() -> None:
     """B6: stdout must be data-only; log lines belong on stderr."""
     workspace = Path(WORKSPACE_ROOT_ENV)
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
-    # Logging format starts with ISO-8601 timestamp + bracketed logger name.
     log_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[", re.MULTILINE)
     matches = log_pattern.findall(report)
     assert not matches, f"Found log lines on stdout (should be on stderr): {matches!r}"
@@ -224,7 +220,6 @@ def test_report_no_negative_time_spans() -> None:
     """No window column may show a negative wall-time span."""
     workspace = Path(WORKSPACE_ROOT_ENV)
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
-    # Match patterns like "-0.5 h" in the Time span row.
     negatives = re.findall(r"-\d+\.\d+ h", report)
     assert not negatives, f"Negative time spans rendered: {negatives}"
 
@@ -236,7 +231,6 @@ def test_report_no_blocked_tasks_in_active_projection() -> None:
     tasks_blocked = counts.get("Task", {}).get("blocked", 0)
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
     if tasks_blocked > 0:
-        # When at least one task is blocked, the prose must call it out.
         assert "blocked" in report, "Prose must mention blocked tasks when any exist"
 
 
@@ -285,11 +279,8 @@ def test_report_renders_tables_side_by_side() -> None:
     workspace = Path(WORKSPACE_ROOT_ENV)
     report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
-    # At least one line must contain two top-left corners (\u250c) -- one per table.
     two_corner_lines = [ln for ln in report.splitlines() if ln.count("\u250c") >= 2]
     assert two_corner_lines, "Side-by-side layout missing -- expected two top-left corners on one line"
 
-    # And at least one line must contain both the 'Backlog state' header label and
-    # the 'Window stats' header label, confirming they're on the same row.
     header_lines = [ln for ln in report.splitlines() if "Backlog state" in ln and "Window stats" in ln]
     assert header_lines, "Expected a single line containing both table titles (side-by-side header row)"

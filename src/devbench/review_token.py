@@ -34,13 +34,10 @@ import json
 import secrets
 from pathlib import Path
 
-#: Token file name under ``<workspace>/.devbench/``. The guard reads this exact path.
 TOKEN_FILENAME = "review-round-token"
 
-#: Per-unit monotonic round-counter store under ``<workspace>/.devbench/``.
 COUNTER_FILENAME = "review-round-counters.json"
 
-#: Bytes of cryptographically secure randomness in the token suffix.
 _RANDOM_SUFFIX_BYTES = 6
 
 

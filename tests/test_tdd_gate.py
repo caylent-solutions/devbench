@@ -26,10 +26,6 @@ from devbench.tdd_gate import (
     parse_production_files,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures: TDD log comment fragments
-# ---------------------------------------------------------------------------
-
 _GENUINE_RED_COMMENT = (
     "- [RED] 2026-01-01T00:00:00+00:00 -- Tests: tests/test_foo.py. "
     "Command: make test-unit. Exit: 1. Failures: 3 failed, 0 passed. "
@@ -47,9 +43,6 @@ _NONZERO_EXIT_COMMENT = (
     "Command: make test-unit. Exit: 2. Failures: 1 failed, 0 passed."
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures: diff output fragments
-# ---------------------------------------------------------------------------
 
 _DIFF_WITH_PROD_FILES = """\
 diff --git a/src/devbench/tdd_gate.py b/src/devbench/tdd_gate.py
@@ -91,10 +84,6 @@ index 0000000..def5678
 _DIFF_EMPTY = "(no changes)"
 
 
-# ---------------------------------------------------------------------------
-# Work unit content helpers
-# ---------------------------------------------------------------------------
-
 _WU_TEMPLATE = """\
 # E0-F1-S1-T1: Sample Task
 
@@ -111,23 +100,16 @@ _WU_TEMPLATE = """\
 ## Comments
 """
 
-# Default Changes Manifest with a single real production file -- the normal
-# (non-verification-only) shape that exercises rules 1 and 2 unchanged.
 _MANIFEST_REAL_FILE = """\
 | File | Change |
 |------|--------|
 | `src/devbench/tdd_gate.py` | add |"""
 
-# A verification-only manifest: the single row is the `<verification-only>`
-# sentinel, so the unit authors no source and is structurally exempt from
-# the TDD RED/GREEN cycle (mirrors the per-module live-terratest units).
 _MANIFEST_VERIFICATION_ONLY = """\
 | File | Change |
 |------|--------|
 | `<verification-only>` | modify |"""
 
-# A manifest that mixes a sentinel row with a real file path. NOT
-# verification-only -- the real file means the gate still applies in full.
 _MANIFEST_MIXED_SENTINEL_AND_REAL = """\
 | File | Change |
 |------|--------|
@@ -146,11 +128,6 @@ def _make_wu(
         manifest=manifest,
         tdd_entries=tdd_entries,
     )
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: extract_red_exit_code
-# ---------------------------------------------------------------------------
 
 
 class TestExtractRedExitCode:
@@ -185,11 +162,6 @@ class TestExtractRedExitCode:
         entries = f"{_FAKE_RED_ZERO_EXIT_COMMENT}\n\n{_GENUINE_RED_COMMENT}"
         result = extract_red_exit_code(entries)
         assert result == 1
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: parse_production_files
-# ---------------------------------------------------------------------------
 
 
 class TestParseProductionFiles:
@@ -237,11 +209,6 @@ class TestParseProductionFiles:
         assert "src/devbench/test_helpers.py" in result
 
 
-# ---------------------------------------------------------------------------
-# Unit tests: extract_task_type
-# ---------------------------------------------------------------------------
-
-
 class TestExtractTaskType:
     """Verify extraction of ## Task Type: header from work unit content."""
 
@@ -264,11 +231,6 @@ class TestExtractTaskType:
         content = _make_wu(task_type="not-valid")
         with pytest.raises(ValueError, match=r"unknown.*Task Type.*not-valid"):
             extract_task_type(content)
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: check_tdd_gate -- reject paths
-# ---------------------------------------------------------------------------
 
 
 class TestCheckTddGateRejectRedExitZero:
@@ -317,11 +279,6 @@ class TestCheckTddGateRejectEmptyProductionFiles:
         assert result.message == TDD_CYCLE_MISSING_EMPTY_PROD
 
 
-# ---------------------------------------------------------------------------
-# Unit tests: check_tdd_gate -- pass paths
-# ---------------------------------------------------------------------------
-
-
 class TestCheckTddGatePass:
     """Gate passes for a genuine RED with production files changed."""
 
@@ -357,11 +314,6 @@ class TestCheckTddGatePass:
         assert result.passed is True
 
 
-# ---------------------------------------------------------------------------
-# Unit tests: check_tdd_gate -- exemptions
-# ---------------------------------------------------------------------------
-
-
 class TestCheckTddGateExemptions:
     """test-only and coverage-only Task Type headers exempt the prod-file check."""
 
@@ -390,11 +342,6 @@ class TestCheckTddGateExemptions:
         )
         assert result.passed is False
         assert result.message == TDD_CYCLE_MISSING_ZERO_EXIT
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: is_verification_only
-# ---------------------------------------------------------------------------
 
 
 class TestIsVerificationOnly:
@@ -437,11 +384,6 @@ class TestIsVerificationOnly:
         manifest = f"| File | Change |\n|------|--------|\n| `{sentinel}` | modify |"
         content = _make_wu(manifest=manifest)
         assert is_verification_only(content) is True
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: check_tdd_gate -- verification-only waiver
-# ---------------------------------------------------------------------------
 
 
 class TestCheckTddGateVerificationOnlyWaiver:
@@ -501,11 +443,6 @@ class TestCheckTddGateVerificationOnlyWaiver:
         assert result.message == TDD_CYCLE_MISSING_ZERO_EXIT
 
 
-# ---------------------------------------------------------------------------
-# Unit tests: TddGateResult dataclass
-# ---------------------------------------------------------------------------
-
-
 class TestTddGateResult:
     """Verify TddGateResult structure contracts."""
 
@@ -519,11 +456,6 @@ class TestTddGateResult:
         assert r.passed is False
         assert r.rejection_code == "TDD_CYCLE_MISSING"
         assert "exit code was 0" in r.message
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: verbatim rejection strings
-# ---------------------------------------------------------------------------
 
 
 class TestVerbatimRejectionStrings:

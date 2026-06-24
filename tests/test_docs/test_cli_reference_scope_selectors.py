@@ -31,8 +31,7 @@ def _extract_section(text: str, heading: str) -> str:
     if idx == -1:
         return ""
     section_text = text[idx:]
-    # Find the next heading at the same level (### for ### headings, ## for ## headings).
-    level = len(heading.split(" ", maxsplit=1)[0])  # count leading '#'
+    level = len(heading.split(" ", maxsplit=1)[0])
     marker = "\n" + "#" * level + " "
     next_idx = section_text.find(marker, 1)
     if next_idx != -1:
@@ -48,7 +47,6 @@ class TestScopeSelectorsSingleIDToken:
         """The doc must describe single-ID tokens matching a WU and its descendants."""
         text = _read_doc()
         lower = text.lower()
-        # Must mention single-ID tokens or individual IDs in the context of --include.
         assert "single" in lower or "single-id" in lower or "single id" in lower, (
             "docs/cli-reference.md must document single-ID token syntax for --include/--exclude "
             "(AC-190-1: a single-ID token matches that WU and all descendants)."
@@ -57,7 +55,6 @@ class TestScopeSelectorsSingleIDToken:
     def test_single_id_example_present(self) -> None:
         """The doc must show a single-ID example such as 'E5' or 'E5-F1-S2-T3'."""
         text = _read_doc()
-        # These are canonical single-ID examples from the spec (section 4.2.1).
         has_example = (
             '"E5"' in text
             or "'E5'" in text
@@ -87,7 +84,6 @@ class TestScopeSelectorsRangeToken:
     def test_range_example_present(self) -> None:
         """The doc must show a range token example such as 'E1-E3'."""
         text = _read_doc()
-        # E1-E3 is the canonical range example from the spec.
         has_range_example = "E1-E3" in text or "E1-E5" in text or "E1-E10" in text
         assert has_range_example, (
             "docs/cli-reference.md must include a worked range-token example such as 'E1-E3' or 'E1-E10' (AC-190-2)."
@@ -121,7 +117,6 @@ class TestScopeSelectorsMixedList:
     def test_mixed_list_example_present(self) -> None:
         """The doc must show a mixed token list example such as 'E1-E3, E5'."""
         text = _read_doc()
-        # Must have at least one example with a comma inside a token string.
         has_mixed = (
             "E1-E3, E5" in text or "E1-E3,E5" in text or "E1, E3" in text or "E1,E3" in text or "E1-E3, E5" in text
         )
@@ -155,8 +150,6 @@ class TestScopeSelectorsExcludeSubtraction:
         """The doc must state the evaluation order (include first, then exclude)."""
         text = _read_doc()
         lower = text.lower()
-        # The spec says: include set is built first, then exclude is subtracted.
-        # Must mention order or priority between include and exclude.
         has_order = "order" in lower or "first" in lower or "then" in lower or "evaluation" in lower
         assert has_order, (
             "docs/cli-reference.md must document the evaluation order for scope selectors: "
@@ -171,7 +164,6 @@ class TestScopeSelectorsComplexExample:
     def test_complex_example_e1_e10_exclude_e5_e7_f3(self) -> None:
         """The doc must show the canonical AC-190-7 example."""
         text = _read_doc()
-        # AC-190-7 requires: --include "E1-E10" --exclude "E5,E7-F3"
         has_complex = "E1-E10" in text and (
             ("E5" in text and "E7-F3" in text) or ("E7" in text and "--exclude" in text)
         )
@@ -429,17 +421,14 @@ class TestScopeSelectorsContentsTableUpdated:
     def test_contents_includes_scope_entry_or_backlog_write_section(self) -> None:
         """The Contents table or Backlog write section must reference scope."""
         text = _read_doc()
-        # Either the Contents table links to scope, or the Backlog write section heading
-        # contains the scope entry.
         contents_idx = text.find("## Contents")
         if contents_idx == -1:
-            return  # no Contents table; skip
+            return
         next_section = text.find("\n---", contents_idx)
         if next_section == -1:
             next_section = contents_idx + 500
         contents_block = text[contents_idx:next_section]
         lower = text.lower()
-        # Accept either a Contents link or "scope" appearing in the Backlog write section.
         has_scope_in_nav = "scope" in contents_block.lower() or "scope" in lower
         assert has_scope_in_nav, (
             "docs/cli-reference.md must reference the 'scope' subcommand in the navigation "

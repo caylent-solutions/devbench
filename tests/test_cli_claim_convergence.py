@@ -31,9 +31,6 @@ from devbench.cli import (
     _extract_failure_signature,
 )
 
-# Minimal backlog index + work-unit pair reused by the teardown tests so the
-# real ``_block_non_converging_claim`` resolves an on-disk unit (DRY with
-# ``TestBlockNonConvergingClaim``).
 _BLOCK_INDEX = """\
 # Backlog
 
@@ -118,9 +115,6 @@ def _wait_until_dead(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> 
     return proc.poll() is not None
 
 
-# --- Synthetic SDK message doubles (duck-typed like the real SDK messages) ---
-
-
 @dataclass
 class _ToolUseBlock:
     name: str
@@ -150,26 +144,15 @@ def _claim_msg(unit_id: str) -> _Msg:
 
 
 def _verify_fail(unit_id: str) -> _Msg:
-    # A repeated verify-ac re-run is the canonical "re-checking the same AC"
-    # signal the orchestrator observes for a non-converging unit.
     return _bash(f"uv run devbench verify-ac {unit_id}")
 
 
 def _pytest_run(target: str) -> _Msg:
-    # A repeated pytest re-run against the SAME target file is the signal that
-    # surfaced TDI #016 (a cold ``uv`` env makes the first run time out).
     return _bash(f"uv run pytest {target}")
 
 
 def _timeout_result(text: str = "Command timed out after 120s") -> _Msg:
-    # The Bash tool surfaces a kill-by-timeout as a ToolResultBlock carrying an
-    # error flag and timeout text -- NOT a captured assertion/collection failure.
     return _Msg(content=[_ToolResultBlock(content=text, is_error=True)])
-
-
-# ---------------------------------------------------------------------------
-# Signature extraction
-# ---------------------------------------------------------------------------
 
 
 class TestExtractFailureSignature:
@@ -190,7 +173,6 @@ class TestExtractFailureSignature:
         assert "alb-listener" in sig
 
     def test_non_failure_command_yields_none(self) -> None:
-        # A claim, a status read, an edit -- not a verification/test re-run.
         assert _extract_failure_signature(_claim_msg("E1-F1-S1-T1")) is None
         assert _extract_failure_signature(_bash("uv run devbench status")) is None
 
@@ -198,22 +180,12 @@ class TestExtractFailureSignature:
         assert _extract_failure_signature(object()) is None
 
 
-# ---------------------------------------------------------------------------
-# Tracker: repeated-identical-failure bound
-# ---------------------------------------------------------------------------
-
-
 class TestClaimConvergenceTrackerRepeatedFailure:
     def test_same_signature_n_times_trips_bound(self) -> None:
-        # AC-1: the SAME failing signature repeated max_within_claim_attempts
-        # times (with intervening tool-use, so the inactivity budget would NOT
-        # trip) blocks with the recurring failure named.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=4, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         result = None
         for i in range(4):
-            # intervening genuine tool-use (an edit) -- does NOT reset the
-            # repeated-failure count because it is not a NEW failure signature.
             tracker.observe(_bash("edit something"), now=float(i))
             result = tracker.observe(_verify_fail("E1-F1-S1-T1"), now=float(i))
         assert result is not None, "the bound must trip after the 4th identical failure"
@@ -226,10 +198,6 @@ class TestClaimConvergenceTrackerRepeatedFailure:
         assert all(r is None for r in results)
 
     def test_varying_progress_long_run_not_blocked(self) -> None:
-        # AC-2: a claim that makes genuine, VARYING progress across many turns
-        # before converging is NOT blocked (no false-positive on legit long
-        # live runs). Each round emits a DIFFERENT signature (a different
-        # module's live test), which resets the per-signature counts.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=4, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         modules = [f"providers/aws/mod-{i}" for i in range(40)]
@@ -245,14 +213,11 @@ class TestClaimConvergenceTrackerRepeatedFailure:
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         for i in range(3):
             tracker.observe(_verify_fail("E1-F1-S1-T1"), now=float(i))
-        # A NEW claim resets all per-signature counts.
         tracker.note_claim("E1-F1-S1-T2", now=10.0)
-        # The same signature text under the OLD unit should not carry over.
         r = tracker.observe(_verify_fail("E1-F1-S1-T1"), now=11.0)
         assert r is None
 
     def test_observe_before_claim_is_safe(self) -> None:
-        # Defensive: observing before any claim must not crash or trip.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=4, max_claim_wall_clock_seconds=0)
         assert tracker.observe(_verify_fail("E1-F1-S1-T1"), now=0.0) is None
 
@@ -262,10 +227,6 @@ class TestClaimConvergenceTrackerRepeatedFailure:
         assert tracker.current_unit_id == "E1-F1-S1-T1"
 
     def test_clear_current_claim_stops_retripping_blocked_unit(self) -> None:
-        # Block-and-continue: after a unit trips the bound and is blocked, the
-        # orchestrator clears the current claim so the SAME unit cannot re-trip
-        # the bound on every subsequent identical-failure message before the
-        # skill claims a new unit. ``observe`` must return None until note_claim.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=2, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         first = None
@@ -274,10 +235,8 @@ class TestClaimConvergenceTrackerRepeatedFailure:
         assert first is not None, "the bound trips on the 2nd identical failure"
         tracker.clear_current_claim()
         assert tracker.current_unit_id is None
-        # Further identical failures for the just-blocked unit must NOT re-trip.
         for i in range(5):
             assert tracker.observe(_verify_fail("E1-F1-S1-T1"), now=float(10 + i)) is None
-        # A NEW claim resumes tracking normally.
         tracker.note_claim("E1-F1-S1-T2", now=100.0)
         again = None
         for i in range(2):
@@ -287,9 +246,6 @@ class TestClaimConvergenceTrackerRepeatedFailure:
 
 class TestClaimConvergenceTrackerWallClock:
     def test_wall_clock_backstop_trips(self) -> None:
-        # AC-3 backstop: a claim that exceeds the generous wall-clock budget
-        # trips even without a repeated signature. Default backstop is set well
-        # above a 3.5h legit run; here we use a tiny budget to exercise the path.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=999, max_claim_wall_clock_seconds=100.0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         assert tracker.observe(_bash("edit"), now=50.0) is None
@@ -298,19 +254,14 @@ class TestClaimConvergenceTrackerWallClock:
         assert "wall-clock" in result.lower() or "E1-F1-S1-T1" in result
 
     def test_wall_clock_disabled_when_zero(self) -> None:
-        # A 3.5h-class run with NO repeated signature and the backstop disabled
-        # (0) is never blocked.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=4, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
-        # 3.5 hours of varying progress.
         result = None
         for i in range(50):
             result = tracker.observe(_bash(f"make tf-test MODULE_PATH=mod-{i}"), now=float(i) * 252.0)
         assert result is None
 
     def test_default_wall_clock_does_not_kill_legit_long_run(self) -> None:
-        # AC-3: with the DEFAULT backstop, a 3.5h legit live run (varying
-        # progress) is not killed.
         from devbench.constants import DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS
 
         assert DEFAULT_MAX_CLAIM_WALL_CLOCK_SECONDS > 3.5 * 3600
@@ -320,7 +271,6 @@ class TestClaimConvergenceTrackerWallClock:
         )
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         result = None
-        # 3.5h of varying progress, one new module per ~4 minutes.
         for i in range(52):
             result = tracker.observe(_bash(f"make tf-test MODULE_PATH=mod-{i}"), now=float(i) * 242.0)
         assert result is None
@@ -348,7 +298,6 @@ class TestClaimConvergenceTrackerNoClaimActivityBackstop:
             max_claim_wall_clock_seconds=0,
             max_no_claim_activity_seconds=300.0,
         )
-        # No claim ever noted; messages keep arriving (orphaned activity).
         assert tracker.observe(_bash("Read agent-transcript"), now=0.0) is None, (
             "the window only starts on the first no-claim message"
         )
@@ -374,13 +323,9 @@ class TestClaimConvergenceTrackerNoClaimActivityBackstop:
             max_claim_wall_clock_seconds=0,
             max_no_claim_activity_seconds=300.0,
         )
-        tracker.observe(_bash("Read"), now=0.0)  # no-claim window starts at t=0
-        tracker.note_claim("E1-F1-S1-T1", now=100.0)  # progress: a unit is claimed
-        # While a unit is claimed the no-claim backstop must NEVER fire, even
-        # long after the original no-claim window would have elapsed.
+        tracker.observe(_bash("Read"), now=0.0)
+        tracker.note_claim("E1-F1-S1-T1", now=100.0)
         assert tracker.observe(_bash("work"), now=10_000.0) is None
-        # After a force-block clears the claim, the window RESTARTS fresh (it
-        # does not retroactively count time spent while claimed).
         tracker.clear_current_claim()
         assert tracker.observe(_bash("Read"), now=10_001.0) is None
         assert tracker.observe(_bash("Read"), now=10_300.0) is None
@@ -389,8 +334,6 @@ class TestClaimConvergenceTrackerNoClaimActivityBackstop:
     def test_default_no_claim_backstop_is_set_and_generous(self) -> None:
         from devbench.constants import DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS
 
-        # Generous enough that a normal claim->work->claim cadence never trips,
-        # but bounded (not disabled) so a true wedge is caught.
         assert DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS > 0
         assert DEFAULT_MAX_NO_CLAIM_ACTIVITY_SECONDS >= 300
 
@@ -411,9 +354,6 @@ class TestNoClaimBackstopSuppressedByInProgressUnit:
     """
 
     def test_in_progress_claim_with_activity_does_not_trip_past_window(self) -> None:
-        # (a) Even though the tracker noted no claim (current_unit_id is None),
-        # the backlog reports an IN_PROGRESS unit and the executor keeps emitting
-        # messages WELL past the no-claim window -> the backstop must NOT fire.
         tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=4,
             max_claim_wall_clock_seconds=0,
@@ -429,8 +369,6 @@ class TestNoClaimBackstopSuppressedByInProgressUnit:
         )
 
     def test_zero_in_progress_still_trips_the_wedge(self) -> None:
-        # (b) With NO in-progress claim and activity past the window, the wedge
-        # STILL fires -- the backstop's actual purpose is preserved.
         tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=4,
             max_claim_wall_clock_seconds=0,
@@ -443,23 +381,14 @@ class TestNoClaimBackstopSuppressedByInProgressUnit:
         assert "no claim" in tripped.lower()
 
     def test_executor_activity_resets_the_timer(self) -> None:
-        # (c) Executor activity while a unit is in-progress resets the no-claim
-        # timer: a burst of in-progress activity (in_progress_count>=1) must clear
-        # the wedge timer so that even after the unit completes (count back to 0)
-        # the window is measured from the NEXT no-claim message, not retroactively.
         tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=4,
             max_claim_wall_clock_seconds=0,
             max_no_claim_activity_seconds=300.0,
         )
-        # Wedge timer starts at t=0 (no in-progress unit yet).
         assert tracker.observe(_bash("Read"), now=0.0, in_progress_count=0) is None
-        # A unit goes in-progress and the executor is active -> resets the timer.
         assert tracker.observe(_bash("work"), now=200.0, in_progress_count=1) is None
-        # The unit is still active far past the original window -> no trip.
         assert tracker.observe(_bash("work"), now=10_000.0, in_progress_count=1) is None
-        # Now the unit completes (count back to 0); the window is measured fresh
-        # from the next no-claim message, NOT from t=0.
         assert tracker.observe(_bash("Read"), now=10_001.0, in_progress_count=0) is None
         assert tracker.observe(_bash("Read"), now=10_300.0, in_progress_count=0) is None
         assert tracker.observe(_bash("Read"), now=10_301.0, in_progress_count=0) is not None
@@ -507,8 +436,6 @@ class TestCountInProgressUnits:
         parser = MagicMock()
         parser.parse_index.side_effect = ValueError("malformed backlog index")
         monkeypatch.setattr(cli, "BacklogParser", MagicMock(return_value=parser))
-        # A transient parse failure must NOT crash the orchestrate loop; it falls
-        # through to the wedge behaviour (0 in-progress).
         assert cli._count_in_progress_units() == 0
 
 
@@ -527,11 +454,6 @@ class TestResolveMaxNoClaimActivitySeconds:
         assert cli._resolve_max_no_claim_activity_seconds() == 123.5
 
 
-# ---------------------------------------------------------------------------
-# CLI plumbing: claim-id extraction, exit classification, force-block
-# ---------------------------------------------------------------------------
-
-
 class TestClaimedUnitId:
     def test_extracts_unit_id_from_claim_command(self) -> None:
         from devbench import cli
@@ -546,10 +468,6 @@ class TestClaimedUnitId:
 
 class TestClassifyOrchestratorExit:
     def test_too_many_non_converging_routes_through_auto_restart(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-        # Block-and-continue: a SINGLE non-converging claim no longer halts the
-        # session. Only the AGGREGATE valve -- K distinct non-converging units --
-        # produces a stop reason, and it routes through the normal auto-restart
-        # classification (so a restart picks up the remaining claimable units).
         from devbench import cli
 
         captured: dict[str, str] = {}
@@ -571,10 +489,6 @@ class TestClassifyOrchestratorExit:
         assert "(3)" in captured["reason"]
 
     def test_single_non_converging_does_not_halt(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-        # When the aggregate valve has NOT tripped (too_many_non_converging is 0)
-        # the exit is classified by the normal terminal-sentinel rules, NOT by a
-        # claim-not-converging stop reason. A session that blocked one unit and
-        # then reached NO_ACTIONABLE exits cleanly.
         from devbench import cli
 
         monkeypatch.setattr(cli, "_check_auto_restart_and_notify", lambda reason: (0, reason))
@@ -666,7 +580,6 @@ x
         assert "## Status: blocked" in updated
         assert CLAIM_NOT_CONVERGING_MARKER in updated
         assert "verify-ac::EX-F1-S1-T1" in updated
-        # Confirm the index/parser still reads the unit as blocked.
         parser = BacklogParser(backlog_root=backlog, backlog_index=tmp_path / "BACKLOG.md")
         unit = next(u for u in parser.parse_index() if u.id == "EX-F1-S1-T1")
         assert unit.status.value.lower() == "blocked"
@@ -693,11 +606,9 @@ x
         backlog.mkdir()
         monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog)
         monkeypatch.setattr(cli, "BACKLOG_INDEX", tmp_path / "BACKLOG.md")
-        # No crash when the unit is absent (parse_index raises -> swallowed).
         cli._block_non_converging_claim("EX-F1-S1-T9", "verify-ac::EX-F1-S1-T9")
 
     def test_unit_not_in_index_is_safe(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-        # _find_unit returns None -> warning branch, no crash.
         from types import SimpleNamespace
 
         from devbench import cli
@@ -707,7 +618,6 @@ x
         cli._block_non_converging_claim("EX-F1-S1-T9", "verify-ac::EX-F1-S1-T9")
 
     def test_unresolvable_file_is_safe(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-        # _resolve_unit_file returns None -> warning branch, no crash.
         from types import SimpleNamespace
 
         from devbench import cli
@@ -733,8 +643,6 @@ class TestResolveMaxNonConvergingClaims:
     def test_default_constant_is_sane(self) -> None:
         from devbench.constants import DEFAULT_MAX_NON_CONVERGING_CLAIMS
 
-        # A sane operator-attention valve: more than one defect tolerated, but
-        # bounded so a systemically-broken run still halts.
         assert DEFAULT_MAX_NON_CONVERGING_CLAIMS >= 2
 
     def test_env_overrides_yaml_and_default(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -769,7 +677,6 @@ class TestTerminateProcessGroup:
         try:
             signalled = cli._terminate_process_group(target_pgid)
             assert signalled is True
-            # The attributed group dies; the unrelated group keeps running.
             assert _wait_until_dead(target_proc), "attributed executor group was not torn down"
             assert bystander_proc.poll() is None, "an UNRELATED process group was killed"
         finally:
@@ -782,35 +689,26 @@ class TestTerminateProcessGroup:
     def test_refuses_init_and_kernel_groups(self) -> None:
         from devbench import cli
 
-        # pgid 0 (caller's group) and 1 (init) are NEVER signalled -- a broad
-        # kill guard. Returns False without raising.
         assert cli._terminate_process_group(0) is False
         assert cli._terminate_process_group(1) is False
 
     def test_refuses_own_process_group(self) -> None:
         from devbench import cli
 
-        # The orchestrator must never tear down its OWN process group (that
-        # would kill the daemon / unrelated in-flight work).
         own_pgid = os.getpgrp()
         assert cli._terminate_process_group(own_pgid) is False
 
     def test_missing_group_is_safe(self) -> None:
         from devbench import cli
 
-        # A group that already exited (ProcessLookupError) is a no-op success
-        # for teardown, not a fault.
         proc, pgid = _spawn_sleeper_group()
         os.killpg(pgid, signal.SIGKILL)
         proc.wait(timeout=5)
-        # Signalling the now-dead group must not raise.
         cli._terminate_process_group(pgid)
 
     def test_oserror_on_signal_returns_false(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         from devbench import cli
 
-        # killpg raising OSError (e.g. EPERM) is reported as a failed teardown
-        # (False), never swallowed silently.
         def _boom(_pgid: int, _sig: int) -> None:
             raise PermissionError("not permitted")
 
@@ -825,14 +723,12 @@ class TestRunClaimTeardownCleanupHook:
         from devbench import cli
 
         monkeypatch.setattr(cli, "run_command", lambda _cmd: (0, "ok", ""))
-        # Must not raise on rc=0.
         cli._run_claim_teardown_cleanup_hook("sweep")
 
     def test_nonzero_exit_is_logged_not_raised(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         from devbench import cli
 
         monkeypatch.setattr(cli, "run_command", lambda _cmd: (2, "", "sweep failed"))
-        # A non-zero exit is logged, not propagated (the loop must still exit).
         cli._run_claim_teardown_cleanup_hook("sweep")
 
 
@@ -850,8 +746,6 @@ class TestTeardownNonConvergingExecutor:
     def test_skips_cleanup_when_teardown_refused(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         from devbench import cli
 
-        # When the group is refused (e.g. it was the orchestrator's own pgid),
-        # the cleanup hook is NOT run.
         monkeypatch.setattr(cli, "_terminate_process_group", lambda _pgid: False)
         hook_calls: list[str] = []
         monkeypatch.setattr(cli, "_resolve_claim_teardown_cleanup_hook", lambda: "sweep")
@@ -872,7 +766,6 @@ class TestRegisterExecutorPgidErrorPath:
             raise OSError("disk full")
 
         monkeypatch.setattr(cli, "atomic_write_text", _boom)
-        # Must not raise -- the command still runs; only the teardown handle is lost.
         cli._register_executor_pgid(4242, session_name="alpha")
 
 
@@ -897,7 +790,6 @@ class TestBlockNonConvergingClaimTeardown:
                 "make tf-test::EX-F1-S1-T1",
                 executor_pgid=executor_pgid,
             )
-            # The unit is blocked AND the attributed group is torn down.
             updated = (tmp_path / "backlog" / "EX-F1-S1-T1.md").read_text(encoding="utf-8")
             assert "## Status: blocked" in updated
             assert CLAIM_NOT_CONVERGING_MARKER in updated
@@ -921,8 +813,6 @@ class TestBlockNonConvergingClaimTeardown:
             return True
 
         monkeypatch.setattr(cli, "_terminate_process_group", _record)
-        # No attributed executor pgid -> no teardown attempted (the prior
-        # behaviour is preserved for non-subprocess claims).
         cli._block_non_converging_claim("EX-F1-S1-T1", "verify-ac::EX-F1-S1-T1")
         assert captured == []
         updated = (tmp_path / "backlog" / "EX-F1-S1-T1.md").read_text(encoding="utf-8")
@@ -934,8 +824,6 @@ class TestBlockNonConvergingClaimTeardown:
         _write_block_backlog(tmp_path, monkeypatch)
         executor_proc, executor_pgid = _spawn_sleeper_group()
         sentinel = tmp_path / "cleanup-ran.txt"
-        # A sanctioned, run-id-scoped cleanup hook (e.g. the terratest sweep):
-        # config-driven, only invoked when configured.
         monkeypatch.setattr(cli, "_resolve_claim_teardown_cleanup_hook", lambda: f"touch {sentinel}")
         try:
             cli._block_non_converging_claim(
@@ -1014,7 +902,6 @@ class TestExecutorPgidRegistry:
         monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
         cli._register_executor_pgid(11, session_name="alpha")
         cli._register_executor_pgid(22, session_name="beta")
-        # Each session reads ONLY its own pgid -- never the other's.
         assert cli._read_attributed_executor_pgid(session_name="alpha") == 11
         assert cli._read_attributed_executor_pgid(session_name="beta") == 22
 
@@ -1022,7 +909,7 @@ class TestExecutorPgidRegistry:
         from devbench import cli
 
         monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
-        cli._register_executor_pgid(1, session_name="alpha")  # init -- never attributable
+        cli._register_executor_pgid(1, session_name="alpha")
         assert cli._read_attributed_executor_pgid(session_name="alpha") is None
 
     def test_read_is_none_on_malformed_file(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1067,11 +954,6 @@ class TestResolveClaimTeardownCleanupHook:
         assert cli._resolve_claim_teardown_cleanup_hook() == "yaml-sweep"
 
 
-# ---------------------------------------------------------------------------
-# TDI #016: a TIMED-OUT run (cold ``uv`` sync) must NOT accrue toward the bound
-# ---------------------------------------------------------------------------
-
-
 class TestTimeoutResultDetection:
     """``_is_timeout_result`` recognises a kill-by-timeout Bash result.
 
@@ -1087,7 +969,6 @@ class TestTimeoutResultDetection:
         assert _is_timeout_result(_timeout_result("Command timed out after 120s")) is True
 
     def test_run_command_style_timeout_text_is_timeout(self) -> None:
-        # The shared ``run_command`` helper renders ``<cmd>: timed out after Ns``.
         from devbench.cli import _is_timeout_result
 
         assert _is_timeout_result(_timeout_result("uv run pytest tests/unit/x.py: timed out after 3600s")) is True
@@ -1107,33 +988,21 @@ class TestTimeoutResultDetection:
 
 class TestTimeoutDoesNotAccrueConvergence:
     def test_timed_out_pytest_runs_do_not_trip_bound(self) -> None:
-        # The exact #016 shape: the SAME pytest command is re-run, and EVERY run
-        # is killed by the per-attempt timeout (cold ``uv`` sync). A timeout is
-        # non-deterministic provisioning latency, not a deterministic failure, so
-        # repeated timed-out runs must NOT trip CLAIM_NOT_CONVERGING.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=4, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E10-F3-S4-T1", now=0.0)
         trips: list[str] = []
         for i in range(8):
-            # The command is observed (assistant tool-use), then its result is a
-            # timeout (ToolResultBlock) -- the run was killed, not a real failure.
-            # The convergence bound must not trip on EITHER message.
             run = tracker.observe(_pytest_run("tests/unit/test_live_verify.py"), now=float(2 * i))
             res = tracker.observe(_timeout_result(), now=float(2 * i + 1))
             trips += [r for r in (run, res) if r is not None]
         assert trips == [], f"repeated TIMED-OUT runs must not trip the convergence bound (#016); got {trips}"
 
     def test_deterministic_failure_still_trips_after_timeouts(self) -> None:
-        # Once the env is warm and the SAME command produces a REAL deterministic
-        # failure (no timeout result), the bound must still trip normally -- the
-        # timeout exemption must not defeat genuine non-convergence detection.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=3, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
-        # Two cold timed-out runs first: these must not count.
         for i in range(2):
             tracker.observe(_pytest_run("tests/unit/x.py"), now=float(i))
             tracker.observe(_timeout_result(), now=float(i) + 0.5)
-        # Now three genuine deterministic failures (no timeout result follows).
         result = None
         for i in range(3):
             result = tracker.observe(_pytest_run("tests/unit/x.py"), now=10.0 + i)
@@ -1141,17 +1010,11 @@ class TestTimeoutDoesNotAccrueConvergence:
         assert "pytest" in result and "tests/unit/x.py" in result
 
     def test_timeout_result_only_exempts_the_preceding_run(self) -> None:
-        # A timeout result rolls back ONLY the signature of the run it terminated;
-        # it does not erase counts accrued by genuine prior deterministic failures
-        # of the SAME signature.
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=2, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
-        # One genuine deterministic failure (counts: 1).
         assert tracker.observe(_pytest_run("tests/unit/x.py"), now=0.0) is None
-        # One timed-out run (the increment it caused is rolled back: counts back to 1).
         tracker.observe(_pytest_run("tests/unit/x.py"), now=1.0)
         assert tracker.observe(_timeout_result(), now=1.5) is None
-        # A second genuine deterministic failure brings counts to 2 -> trips.
         result = tracker.observe(_pytest_run("tests/unit/x.py"), now=2.0)
         assert result is not None, "two genuine deterministic failures (1 timeout in between) must trip"
 
@@ -1162,8 +1025,6 @@ class TestTimeoutMarkersAndResultShapes:
 
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_TIMEOUT_RESULT_MARKERS", "deadline exceeded, killed by watchdog")
         assert _resolve_timeout_result_markers() == ("deadline exceeded", "killed by watchdog")
-        # A result phrased with the custom marker is now recognised as a timeout;
-        # the built-in defaults no longer apply once overridden.
         assert _is_timeout_result(_Msg(content=[_ToolResultBlock(content="job hit DEADLINE EXCEEDED")])) is True
         assert _is_timeout_result(_timeout_result("Command timed out after 5s")) is False
 
@@ -1175,34 +1036,18 @@ class TestTimeoutMarkersAndResultShapes:
         assert _resolve_timeout_result_markers() == TIMEOUT_RESULT_MARKERS
 
     def test_list_of_dicts_result_content_is_read(self) -> None:
-        # The SDK's other ToolResultBlock shape: content is a list of
-        # {"type": "text", "text": ...} parts rather than a bare string.
         from devbench.cli import _is_timeout_result
 
         msg = _Msg(content=[_ToolResultBlock(content=[{"type": "text", "text": "Command timed out after 60s"}])])
         assert _is_timeout_result(msg) is True
 
     def test_timed_out_run_still_hits_wall_clock_backstop(self) -> None:
-        # The wall-clock backstop must still fire on a timed-out result message
-        # (the timeout exemption rolls back the signature but does not bypass the
-        # secondary backstop for an implausibly long stuck claim).
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=999, max_claim_wall_clock_seconds=100.0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         tracker.observe(_pytest_run("tests/unit/x.py"), now=10.0)
         result = tracker.observe(_timeout_result(), now=150.0)
         assert result is not None and "wall-clock" in result.lower()
 
-
-# ---------------------------------------------------------------------------
-# Scoped convergence (root cause of tracked-issue 004)
-#
-# The executor sometimes runs the FULL repo test suite within a claim. A
-# whole-suite failure can be caused by an OUT-OF-SCOPE / other-unit defect even
-# when this unit's OWN scoped verify-ac is green -- so a whole-suite test-runner
-# failure must NOT count toward the within-claim non-converging bound. The
-# AUTHORITATIVE per-unit gate (devbench verify-ac) ALWAYS counts; a SCOPED test
-# failure (a specific test file or node id) still counts.
-# ---------------------------------------------------------------------------
 
 _REPO_ROOT = "/workspaces/telemetry/target/devbench"
 
@@ -1221,13 +1066,11 @@ class TestIsWholeSuiteTarget:
         return _is_whole_suite_target
 
     def test_verify_ac_is_never_whole_suite(self) -> None:
-        # The authoritative per-unit gate always counts, regardless of target.
         f = self._fn()
         assert f("devbench verify-ac", "E1-F1-S1-T1", (_REPO_ROOT,)) is False
         assert f("devbench verify-ac", "", (_REPO_ROOT,)) is False
 
     def test_empty_target_is_whole_suite(self) -> None:
-        # A bare `pytest` with no target token is a whole-suite run.
         f = self._fn()
         assert f("pytest", "", (_REPO_ROOT,)) is True
         assert f("make test", "", (_REPO_ROOT,)) is True
@@ -1240,7 +1083,6 @@ class TestIsWholeSuiteTarget:
 
     def test_repo_root_abs_path_is_whole_suite(self) -> None:
         f = self._fn()
-        # The checkout root itself, and a subdirectory of it, are whole-suite.
         assert f("pytest", _REPO_ROOT, (_REPO_ROOT,)) is True
         assert f("pytest", f"{_REPO_ROOT}/tests", (_REPO_ROOT,)) is True
         assert f("pytest", f"{_REPO_ROOT}/tests/unit", (_REPO_ROOT,)) is True
@@ -1252,10 +1094,6 @@ class TestIsWholeSuiteTarget:
         assert f("pytest", f"{_REPO_ROOT}/tests/unit/test_foo.py", (_REPO_ROOT,)) is False
 
     def test_parameterised_module_value_is_scoped(self) -> None:
-        # A KEY=value target (a specific module) names a specific thing -> scoped.
-        # The signature marker for `make tf-test MODULE_PATH=...` is `tf-test`
-        # (the matched _CLAIM_FAILURE_COMMAND_MARKERS entry), and tf-test/terratest
-        # always parameterise a specific module, never a whole suite.
         f = self._fn()
         assert f("tf-test", "providers/aws/alb-listener", (_REPO_ROOT,)) is False
         assert f("terratest", "providers/aws/vpc", (_REPO_ROOT,)) is False
@@ -1263,7 +1101,6 @@ class TestIsWholeSuiteTarget:
 
 class TestWholeSuiteFailureDoesNotConverge:
     def test_repeated_whole_suite_abs_path_does_not_trip(self) -> None:
-        # AC-(a): repeated pytest against the checkout-root abs path must NOT trip.
         tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=3,
             max_claim_wall_clock_seconds=0,
@@ -1290,12 +1127,10 @@ class TestWholeSuiteFailureDoesNotConverge:
             repo_roots=(_REPO_ROOT,),
         )
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
-        # Bare `pytest` with no target argument -> empty target token -> whole-suite.
         trips = [tracker.observe(_bash("uv run pytest"), now=float(i)) for i in range(8)]
         assert all(t is None for t in trips), "a bare pytest (empty target) must never trip the bound"
 
     def test_repeated_verify_ac_still_trips(self) -> None:
-        # AC-(b): the authoritative per-unit gate still converges.
         tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=3,
             max_claim_wall_clock_seconds=0,
@@ -1309,7 +1144,6 @@ class TestWholeSuiteFailureDoesNotConverge:
         assert "verify-ac" in result and "E1-F1-S1-T1" in result
 
     def test_repeated_scoped_test_file_still_trips(self) -> None:
-        # AC-(c): a scoped test naming a specific file still converges.
         tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=3,
             max_claim_wall_clock_seconds=0,
@@ -1338,8 +1172,6 @@ class TestWholeSuiteFailureDoesNotConverge:
         )
 
     def test_no_repo_roots_still_classifies_bare_dir_and_empty(self) -> None:
-        # Defensive: with no configured repo roots, the empty/bare-dir rules still
-        # apply (only the abs-path-prefix rule needs roots).
         tracker = ClaimConvergenceTracker(max_within_claim_attempts=3, max_claim_wall_clock_seconds=0)
         tracker.note_claim("E1-F1-S1-T1", now=0.0)
         trips = [tracker.observe(_pytest_run("tests/unit"), now=float(i)) for i in range(8)]

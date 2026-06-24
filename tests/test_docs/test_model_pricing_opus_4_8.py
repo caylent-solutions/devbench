@@ -37,11 +37,9 @@ class TestOpus48PricingDocBlock:
     def test_opus_4_8_input_rate_is_five_dollars(self) -> None:
         """AC-254-3 + D-254-1: input rate for Opus 4.8 must be $5 (same as 4.7)."""
         text = PRICING_DOC.read_text(encoding="utf-8")
-        # Find the Opus 4.8 table row and verify it contains $5 for input
         lines = text.splitlines()
         opus_4_8_rows = [line for line in lines if "Claude Opus 4.8" in line]
         assert opus_4_8_rows, "No table row containing 'Claude Opus 4.8' found."
-        # The input column value should be $5
         assert "$5" in opus_4_8_rows[0], (
             "The Claude Opus 4.8 table row must show $5 for input (D-254-1 pricing decision)."
         )
@@ -74,11 +72,9 @@ class TestOpus48PricingDocBlock:
     def test_one_million_context_note_includes_4_8(self) -> None:
         """AC-254-3: the 1M-context note must mention Opus 4.8 alongside 4.7 and 4.6."""
         text = PRICING_DOC.read_text(encoding="utf-8")
-        # Find the 1M-context note paragraph
         assert "1M-token context" in text or "1M context" in text or "1M-context" in text, (
             "A 1M-context note was not found in docs/model-pricing.md."
         )
-        # The note that mentions 1M must also include 4.8
         lines = text.splitlines()
         one_m_lines = [line for line in lines if "1M" in line and "context" in line]
         assert any("4.8" in line for line in one_m_lines), "The 1M-context note must mention Opus 4.8 (AC-254-3)."
@@ -94,10 +90,7 @@ class TestOpus48PricingDocBlock:
     def test_worked_example_uses_4_8_model_id(self) -> None:
         """AC-254b-1: the worked example must cite the 4.8 model id."""
         text = PRICING_DOC.read_text(encoding="utf-8")
-        # The worked example in cost-calibrate section cites the model in the correction_factor key
         assert "claude-opus-4-8" in text, "The worked example must use 'claude-opus-4-8' model id (AC-254b-1)."
-        # Verify the dollar figures in the worked example are unchanged
-        # The example cites $83.66 actual vs $39.57 reported
         assert "83.66" in text, "The worked example dollar figures must be unchanged (83.66 actual spend)."
         assert "39.57" in text, "The worked example dollar figures must be unchanged (39.57 reported cost)."
 

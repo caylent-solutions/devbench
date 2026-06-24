@@ -91,7 +91,7 @@ def _require_field(data: dict, *keys: str) -> str:
 class SecurityFinding:
     """A single security finding from GitHub scanning."""
 
-    source: str  # "codeql", "dependabot", "secret-scanning"
+    source: str
     rule_id: str
     severity: str
     description: str
@@ -147,15 +147,12 @@ def enable_security_features(repo: str) -> dict[str, bool]:
     validate_repo(repo)
     results: dict[str, bool] = {}
 
-    # Dependabot vulnerability alerts
     rc, _ = _gh_api(f"repos/{repo}/vulnerability-alerts", "PUT")
     results["dependabot_alerts"] = rc == 0
 
-    # Automated security fixes
     rc, _ = _gh_api(f"repos/{repo}/automated-security-fixes", "PUT")
     results["automated_fixes"] = rc == 0
 
-    # CodeQL default setup
     rc, output = _gh_api(
         f"repos/{repo}/code-scanning/default-setup",
         "PATCH",
@@ -166,7 +163,6 @@ def enable_security_features(repo: str) -> dict[str, bool]:
     if rc != 0:
         logger.warning("CodeQL setup failed for %s: %s", repo, output)
 
-    # Secret scanning
     rc, _ = _gh_api(
         f"repos/{repo}",
         "PATCH",

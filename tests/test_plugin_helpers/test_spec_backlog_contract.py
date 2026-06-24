@@ -18,10 +18,6 @@ from devbench.plugin_helpers.spec_backlog_contract import (
     extract_fr_list,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures -- spec text samples
-# ---------------------------------------------------------------------------
-
 MARKER_SPEC = f"""# My Project Spec
 
 ## Target Repository
@@ -138,11 +134,6 @@ FR-2: Do B.
 """
 
 
-# ---------------------------------------------------------------------------
-# AC_MARKER -- the constant must be a stable non-empty string
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestAcMarker:
     """AC_MARKER is a stable, non-empty string usable as a section delimiter."""
@@ -160,11 +151,6 @@ class TestAcMarker:
         import devbench.plugin_helpers.spec_backlog_contract as _sbc
 
         assert AC_MARKER is _sbc.AC_MARKER
-
-
-# ---------------------------------------------------------------------------
-# extract_fr_list -- pull FR-1..N lines from spec text
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -198,11 +184,6 @@ class TestExtractFrList:
         assert "system shall do X" in combined or "do X" in combined
 
 
-# ---------------------------------------------------------------------------
-# extract_ac_section -- marker-first with positional fallback
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestExtractAcSection:
     """extract_ac_section returns the AC-N text block from a spec."""
@@ -232,11 +213,6 @@ class TestExtractAcSection:
         bare_spec = "# Bare\n\n## Section 2\n\nsome content\n"
         with pytest.raises(ReadinessError, match="AC"):
             extract_ac_section(bare_spec)
-
-
-# ---------------------------------------------------------------------------
-# check_backlog_readiness -- fail-fast predicate
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

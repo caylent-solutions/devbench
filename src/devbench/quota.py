@@ -36,18 +36,11 @@ from devbench.drain import request_drain
 
 logger = logging.getLogger("devbench.quota")
 
-#: Audit marker emitted once per recovery-probe poll while waiting for a quota to
-#: reset, so a long wait is visibly alive between ``[QUOTA_WAITING]`` and
-#: ``[QUOTA_RESUMED]`` rather than looking dead.  Format:
-#: ``[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>``.
 _QUOTA_POLLING_AUDIT_PREFIX: str = "[QUOTA_POLLING]"
 
-# ---------------------------------------------------------------------------
-# Exception hierarchy
-# ---------------------------------------------------------------------------
 
 _QUOTA_MARKERS: tuple[str, ...] = (
-    "You\u2019ve hit your limit",  # verbatim CLI line -- real Unicode apostrophe
+    "You\u2019ve hit your limit",
     "You've hit your limit",
     "you've hit your limit",
     "You have hit your limit",
@@ -60,22 +53,11 @@ _BEDROCK_THROTTLE_CODES: frozenset[str] = frozenset(
     }
 )
 
-# Regex: matches "resets HH:MMam/pm (UTC)" -- case-insensitive meridiem.
-# Captures: hour (1-12), minute (00-59), meridiem (am/pm/AM/PM).
-# The (UTC) timezone label is required; any other label returns None.
 _RESET_AT_RE = re.compile(
     r"resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)",
     re.IGNORECASE,
 )
 
-# Regex: matches "rate limit" / "rate-limit" / "rate limits" ONLY when an
-# exhaustion verb follows immediately. This is the precise replacement for the
-# former bare ``"rate limit"`` substring marker, which falsely matched benign
-# prose such as "implement rate limiting", "missing rate limiting", or
-# "rate limit not exceeded" (the verb is not adjacent in those cases). The
-# genuine CLI limit line is still matched by the verbatim ``_QUOTA_MARKERS``
-# entries above; this regex only adds the non-verbatim "rate limit exceeded"
-# family.
 _RATE_LIMIT_RE = re.compile(
     r"rate[\s-]?limits?\s+(?:exceeded|reached|hit|exhausted|resets?|try\s+again)",
     re.IGNORECASE,
@@ -136,19 +118,9 @@ class RecoveryProbeUnavailableError(Exception):
     """
 
 
-# ---------------------------------------------------------------------------
-# Clock helper (injectable via mock in tests)
-# ---------------------------------------------------------------------------
-
-
 def _get_current_utc() -> datetime:
     """Return the current UTC datetime. Isolated for test-time mocking."""
     return datetime.now(tz=UTC)
-
-
-# ---------------------------------------------------------------------------
-# CLI-byte substring scanner
-# ---------------------------------------------------------------------------
 
 
 def _has_quota_marker(text: object) -> bool:
@@ -198,11 +170,6 @@ def _has_verbatim_quota_marker(text: object) -> bool:
     return any(marker in text for marker in _QUOTA_MARKERS)
 
 
-# ---------------------------------------------------------------------------
-# Reset-time parser
-# ---------------------------------------------------------------------------
-
-
 def _convert_to_24h(raw_hour: int, meridiem: str) -> int:
     """Convert a 12-hour clock value to 24-hour. Assumes validated input (1-12)."""
     if meridiem == "am":
@@ -232,7 +199,6 @@ def _parse_reset_at_from_text(text: object) -> datetime | None:
     raw_hour = int(match.group(1))
     raw_minute = int(match.group(2))
     meridiem = match.group(3).lower()
-    # Validate ranges: hour must be 1-12 for 12-hour clock; minute 0-59.
     if raw_hour < 1 or raw_hour > 12:
         return None
     if raw_minute < 0 or raw_minute > 59:
@@ -243,11 +209,6 @@ def _parse_reset_at_from_text(text: object) -> datetime | None:
     if candidate <= now:
         candidate += timedelta(days=1)
     return candidate
-
-
-# ---------------------------------------------------------------------------
-# Internal attribute helpers
-# ---------------------------------------------------------------------------
 
 
 def _safe_getattr(obj: object, name: str, default: Any = None) -> Any:
@@ -291,7 +252,6 @@ def _extract_reset_at_from_content(content: object) -> datetime | None:
             result = _parse_reset_at_from_text(text)
             if result is not None:
                 return result
-        # Also check the raw string of the block content field (ToolResultBlock)
         content_field = _safe_getattr(block, "content")
         if isinstance(content_field, str):
             result = _parse_reset_at_from_text(content_field)
@@ -300,26 +260,17 @@ def _extract_reset_at_from_content(content: object) -> datetime | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# detect_quota_error rule helpers
-# ---------------------------------------------------------------------------
-
-
 def _apply_rules_1_to_5(obj: object, status_code: object) -> QuotaExhaustedError | None:
     """Rules 1-5: already a quota error, HTTP status codes, Bedrock throttle."""
-    # Rule 1: passthrough
     if isinstance(obj, QuotaExhaustedError):
         return obj
-    # Rule 2: HTTP 429
     if status_code == 429:
         return SubscriptionRateLimitError(reset_at=None, raw_error=obj, source="anthropic-api")
-    # Rules 3 and 4: HTTP 402
     if status_code == 402:
         body = _safe_getattr(obj, "body", {})
         if _get_error_type(body) == "insufficient_quota":
             return SdkCreditExhaustedError(reset_at=None, raw_error=obj, source="sdk")
         return ApiBillingError(reset_at=None, raw_error=obj, source="anthropic-api")
-    # Rule 5: Bedrock throttle
     bedrock_code = _get_bedrock_error_code(obj)
     if bedrock_code is not None and bedrock_code in _BEDROCK_THROTTLE_CODES:
         return BedrockThrottleError(reset_at=None, raw_error=obj, source="bedrock")
@@ -328,17 +279,6 @@ def _apply_rules_1_to_5(obj: object, status_code: object) -> QuotaExhaustedError
 
 def _apply_rules_6_to_9(obj: object) -> QuotaExhaustedError | None:
     """Rules 6-9: CLI message surfaces and BaseException with quota marker."""
-    # Rule 6: UserMessage with ToolResultBlock (content blocks with .content field).
-    # Two-part gate (both required) so benign tool output never trips detection:
-    #   (a) ``is_error is True`` -- ONLY an explicit error tool result is a
-    #       candidate. A successful Read/Grep/Glob returns ``is_error=None`` and
-    #       Bash returns ``is_error=False``; neither is a quota signal -- their
-    #       content is arbitrary file/tool data. (A genuine sub-agent quota limit
-    #       surfaces as an *error* result.)
-    #   (b) verbatim marker only -- scan with ``_has_verbatim_quota_marker``, not
-    #       the broad ``_RATE_LIMIT_RE``, because tool content (e.g. devbench's
-    #       own ``amendment.py`` "Amendment rate limit exceeded: ...") legitimately
-    #       contains that phrasing while the agent debugs the quota/amendment code.
     content = _safe_getattr(obj, "content")
     if isinstance(content, (list, tuple)):
         for block in content:
@@ -351,17 +291,12 @@ def _apply_rules_6_to_9(obj: object) -> QuotaExhaustedError | None:
                     raw_error=obj,
                     source="claude-code-cli",
                 )
-    # Rule 7: AssistantMessage with error='rate_limit'
     if _safe_getattr(obj, "error") == "rate_limit":
         return SubscriptionRateLimitError(
             reset_at=_extract_reset_at_from_content(_safe_getattr(obj, "content")),
             raw_error=obj,
             source="claude-code-cli",
         )
-    # Rule 8: ResultMessage with is_error=True and a VERBATIM quota line in
-    # .result. The result text is arbitrary CLI output; a genuine subscription
-    # limit is the verbatim "You've hit your limit ... resets ...(UTC)" line, so
-    # the broad regex is not applied here (same rationale as Rule 6).
     if _safe_getattr(obj, "is_error") is True:
         result_field = _safe_getattr(obj, "result")
         if isinstance(result_field, str) and _has_verbatim_quota_marker(result_field):
@@ -370,7 +305,6 @@ def _apply_rules_6_to_9(obj: object) -> QuotaExhaustedError | None:
                 raw_error=obj,
                 source="claude-code-cli",
             )
-    # Rule 9: BaseException with quota marker in str(obj)
     if isinstance(obj, BaseException) and _has_quota_marker(str(obj)):
         return SubscriptionRateLimitError(
             reset_at=_parse_reset_at_from_text(str(obj)),
@@ -387,11 +321,6 @@ def _detect_quota_error_inner(obj: object) -> QuotaExhaustedError | None:
     if result is not None:
         return result
     return _apply_rules_6_to_9(obj)
-
-
-# ---------------------------------------------------------------------------
-# detect_quota_error -- ten ordered rules, never raises
-# ---------------------------------------------------------------------------
 
 
 def detect_quota_error(obj: object) -> QuotaExhaustedError | None:
@@ -434,11 +363,6 @@ def detect_quota_error(obj: object) -> QuotaExhaustedError | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# BackoffConfig dataclass
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class BackoffConfig:
     """Jittered exponential backoff configuration for ``wait_for_reset``.
@@ -459,10 +383,6 @@ class BackoffConfig:
     jitter: float = 0.2
 
 
-# ---------------------------------------------------------------------------
-# wait_for_reset
-# ---------------------------------------------------------------------------
-
 _DEFAULT_BACKOFF: BackoffConfig = BackoffConfig()
 
 
@@ -480,9 +400,6 @@ def _emit_polling_heartbeat(*, elapsed: float, probe: int, next_in: float) -> No
     depend on the line being written). This is the one place the module
     deliberately suppresses an error, and only for the cosmetic liveness line.
     """
-    # Heartbeat is best-effort: a logging/handler failure must never break or
-    # delay the wait or the resume -- the wait's correctness does not depend on
-    # this cosmetic liveness line being written, so any error is suppressed.
     with contextlib.suppress(Exception):
         logger.info(
             "%s elapsed=%ds probe=%d next_in=%ds",
@@ -603,12 +520,6 @@ async def wait_for_reset(
 
     start_time = _get_current_utc()
 
-    # Provider-stated-reset_at wait (the common production path): step toward the
-    # reset time in poll-interval-bounded sleeps, emitting a [QUOTA_POLLING]
-    # heartbeat each interval so a long wait is visibly alive in the log. This is
-    # a pure stepper -- the probe loop below remains the single source of truth
-    # for the outcome (short-circuits to True on the now-elapsed reset per
-    # TDI-003a, returns False on the max-wait timeout, or consults the probe).
     await _wait_toward_reset(
         reset_at=reset_at,
         poll_interval_seconds=poll_interval_seconds,
@@ -625,46 +536,24 @@ async def wait_for_reset(
         if elapsed >= max_wait_seconds:
             return False
 
-        # TDI-003a: a known, elapsed reset time is the authoritative readiness
-        # signal -- resume without probing. The recovery probe tests the raw
-        # Anthropic API channel, not the CLI/SDK subscription channel the
-        # orchestrator runs on, so once the provider-stated reset has passed the
-        # probe adds nothing (and on subscription auth can never succeed). The
-        # probe is best-effort and only consulted when reset_at is unknown.
         if reset_at is not None and now >= reset_at:
             return True
 
         probe_count += 1
-        # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.
-        # Computed before the probe so the heartbeat can report the delay that
-        # would follow a not-recovered probe (``next_in``).
         jitter_factor = 1.0 + rng.uniform(-backoff_config.jitter, backoff_config.jitter)
         delay = min(raw_delay * jitter_factor, float(backoff_config.max_seconds))
 
-        # Visible heartbeat: exactly one line per poll so an operator can SEE the
-        # orchestrator is actively polling during a long wait, rather than the
-        # log looking dead between [QUOTA_WAITING] and [QUOTA_RESUMED]. The
-        # backoff interval keeps this from being chatty. Best-effort: a logging
-        # failure must never break the probe (same guarantee as the reset_at path).
         _emit_polling_heartbeat(elapsed=elapsed, probe=probe_count, next_in=delay)
 
         try:
             if probe_fn():
                 return True
         except RecoveryProbeUnavailableError:
-            # The probe cannot confirm recovery (no/invalid credential) and no
-            # usable reset time is known (unknown, or not yet reached) -- fail
-            # fast rather than poll a probe that can never succeed. A known,
-            # elapsed reset time is handled by the short-circuit above.
             raise
 
         await asyncio.sleep(delay)
         raw_delay = min(raw_delay * backoff_config.multiplier, float(backoff_config.max_seconds))
 
-
-# ---------------------------------------------------------------------------
-# Checkpoint -- persist pause state across SIGTERM
-# ---------------------------------------------------------------------------
 
 _CHECKPOINT_DIR: str = ".devbench"
 _CHECKPOINT_FILENAME: str = "quota_pause.json"
@@ -804,11 +693,6 @@ def remove_checkpoint(workspace_root: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# recovery_probe -- thin API probe to confirm quota has cleared
-# ---------------------------------------------------------------------------
-
-
 def _probe_api_call(timeout_seconds: float, request_size_tokens: int) -> object:
     """Issue a minimal Anthropic messages.create call for quota probing.
 
@@ -828,7 +712,6 @@ def _probe_api_call(timeout_seconds: float, request_size_tokens: int) -> object:
     from devbench.constants import RECOVERY_PROBE_MODEL
 
     client = anthropic.Anthropic(timeout=timeout_seconds)
-    # Minimal prompt -- we only care whether the call succeeds.
     prompt = "x" * max(1, request_size_tokens)
     return client.messages.create(
         model=RECOVERY_PROBE_MODEL,
@@ -870,32 +753,21 @@ def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
     except QuotaExhaustedError:
         return False
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
-        # Rejected credentials -- permanent; waiting cannot fix it.
         raise RecoveryProbeUnavailableError(
             f"recovery probe could not authenticate to the Anthropic API ({type(exc).__name__}). "
             "Configure a valid API credential so quota recovery can be confirmed, "
             "or rely on the provider-supplied reset time."
         ) from exc
     except anthropic.APIError:
-        # Other API/network errors (incl. 429, connection, timeout) are
-        # transient -- treat as "still exhausted" and keep polling.
         return False
     except anthropic.AnthropicError as exc:
-        # Non-API AnthropicError = client construction/config failure, e.g. no
-        # API credential is configured at all -- permanent, not recoverable.
         raise RecoveryProbeUnavailableError(
             "recovery probe has no usable Anthropic API credential configured. "
             "Quota recovery cannot be probed; configure a credential or rely on "
             "the provider-supplied reset time."
         ) from exc
     except Exception:
-        # Any other transient error -- treat as "still exhausted"; do not crash.
         return False
-
-
-# ---------------------------------------------------------------------------
-# Resume strategy dispatcher
-# ---------------------------------------------------------------------------
 
 
 def _force_status_in_queue(_workspace_root: Path) -> None:
@@ -938,6 +810,6 @@ def _apply_resume_strategy(strategy: str, workspace_root: Path) -> None:
     elif strategy == "restart_wu":
         _force_status_in_queue(workspace_root)
         remove_checkpoint(workspace_root)
-    else:  # strategy == "drain_and_resume" (guard above ensures only valid values reach here)
+    else:
         remove_checkpoint(workspace_root)
         request_drain(workspace_root)

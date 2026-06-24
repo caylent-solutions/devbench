@@ -64,7 +64,6 @@ class TestAdr23NamedSessions:
         """The Decision section must describe per-session state directory layout."""
         text = ADR_23.read_text(encoding="utf-8")
         assert "session" in text.lower(), "ADR-23 must discuss the per-session state directory structure."
-        # Per spec 4.4.4 the per-session dir holds pid, scope.json, drain.signal, etc.
         assert "pid" in text.lower(), (
             "ADR-23 must reference the PID file used for liveness checks and SIGTERM delivery."
         )
@@ -127,7 +126,6 @@ class TestAdr23NamedSessions:
     def test_adr_23_mentions_safety_guarantees(self) -> None:
         """The Consequences section must call out safety guarantees."""
         text = ADR_23.read_text(encoding="utf-8")
-        # The ADR should mention what's protected: no two sessions can corrupt backlog
         assert "safe" in text.lower() or "corrupt" in text.lower() or "race" in text.lower(), (
             "ADR-23 must discuss the safety guarantees provided by flock serialisation."
         )

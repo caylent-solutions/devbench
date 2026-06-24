@@ -19,12 +19,7 @@ HOOK_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 ).resolve()
 
-# H3: reviewer agent type and round token needed for canonical verdicts.
 _REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
-# ADR-29: the round token now lives in a FILE
-# (<DEVBENCH_WORKSPACE_ROOT>/.devbench/review-round-token). Fix B: it must be
-# scoped to the unit under review (prefix "<unit-id>-"); the happy-path
-# canonical tests below use unit E0-F8.
 _ROUND_TOKEN = "E0-F8-r1-token"
 
 
@@ -110,7 +105,6 @@ class TestGuardVerdictFormat:
         assert result.returncode == 2
         assert "missing required argument" in result.stderr
         assert "Expected positional order: log-verdict <judge> <unit-id> <verdict> [feedback]" in result.stderr
-        # Must not report the misleading "invalid verdict ''" that the pre-fix code emitted.
         assert "invalid verdict" not in result.stderr
 
     def test_shell_redirection_does_not_count_as_positional(self) -> None:
@@ -118,7 +112,6 @@ class TestGuardVerdictFormat:
         result = _run("uv run devbench log-verdict 2>&1 | tail -20")
         assert result.returncode == 2
         assert "missing required argument" in result.stderr
-        # Must not flag the redirection token as an unknown judge.
         assert "'2>&1'" not in result.stderr
 
     def test_unknown_judge_shows_expected_order(self) -> None:

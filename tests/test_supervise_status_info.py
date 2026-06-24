@@ -36,10 +36,6 @@ from devbench.supervise import (
     reconcile_info_rows,
 )
 
-# ---------------------------------------------------------------------------
-# Pure status-line formatting helper (FR-9, FR-10)
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestFormatStatusLine:
@@ -104,11 +100,6 @@ class TestFormatStatusLine:
         assert "exit-reason=graceful-stop" in line
 
 
-# ---------------------------------------------------------------------------
-# Pure screen-ls parsing helper (FR-11)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestParseScreenLs:
     """``screen -ls`` output is parsed into the set of session names (FR-11)."""
@@ -129,11 +120,6 @@ class TestParseScreenLs:
     def test_ignores_non_screen_lines(self) -> None:
         output = "There is a screen on:\n\t9.something\t(Attached)\nblah blah\n1 Socket\n"
         assert parse_screen_ls(output) == {"something"}
-
-
-# ---------------------------------------------------------------------------
-# Pure info-row reconcile helper (FR-11)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -204,11 +190,6 @@ class TestReconcileInfoRows:
         assert [r.name for r in rows] == ["bulk", "fast"]
 
 
-# ---------------------------------------------------------------------------
-# cmd_supervise status (FR-9, FR-10)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestSuperviseStatusCli:
     """`supervise status` reads the registry and prints per/all-session lines."""
@@ -254,9 +235,6 @@ class TestSuperviseStatusCli:
 
         self._seed(tmp_path, "fast")
         self._seed(tmp_path, "bulk")
-        # default --name is "default"; without an explicit --name a status with
-        # the default name absent must still list all sessions, so the verb
-        # distinguishes "explicit --name" from "no --name".
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli._supervise_in_progress_id", return_value=None),
@@ -274,11 +252,6 @@ class TestSuperviseStatusCli:
             rc = cli.cmd_supervise("status")
         assert rc == 0
         assert "No supervise sessions." in capsys.readouterr().out
-
-
-# ---------------------------------------------------------------------------
-# cmd_supervise info (FR-11)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -340,10 +313,6 @@ class TestSuperviseInfoCli:
     def test_info_degrades_with_note_when_screen_unavailable(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # info is read-only: a real screen -ls failure must NOT crash it, but it
-        # MUST surface a distinct note so "screen unavailable" is not silently
-        # indistinguishable from "no screens" (the operator-decision the verifier
-        # flagged). Sessions still list (reconciled against an empty live set).
         from unittest.mock import patch
 
         self._seed(tmp_path, "ghost")
@@ -355,12 +324,7 @@ class TestSuperviseInfoCli:
         assert rc == 0
         out = capsys.readouterr().out
         assert "screen list unavailable" in out
-        assert "ghost" in out  # the registry row still lists
-
-
-# ---------------------------------------------------------------------------
-# CLI seam helpers (real subprocess / backlog reads)
-# ---------------------------------------------------------------------------
+        assert "ghost" in out
 
 
 @pytest.mark.unit

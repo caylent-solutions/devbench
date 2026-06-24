@@ -45,8 +45,6 @@ _HELD = "HELD"
 _BLOCKED_ON_HELD = "BLOCKED_ON_HELD"
 _AMENDMENT_RECOVERY = "AWAITING_AMENDMENT_RECOVERY"
 
-# Maps the test fixture's classification token to the notify_* attribute name
-# in :mod:`devbench.notifications` that should fire for that classification.
 _NOTIFY_FN_BY_CLASS = {
     _OPERATOR: "notify_work_unit_blocked_operator",
     _AWAITING: "notify_work_unit_blocked_awaiting_dependency",

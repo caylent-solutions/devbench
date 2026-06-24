@@ -41,43 +41,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("devbench.activity")
 
-# ---------------------------------------------------------------------------
-# Tunables -- constants, not magic numbers
-# ---------------------------------------------------------------------------
 
-# Maximum characters from the latest agent "text" block to display. Text
-# longer than this is truncated with an ellipsis marker so the dashboard
-# stays at ~40 lines.
 MAX_AGENT_TEXT_CHARS: int = 500
 
-# Maximum characters per tool-call summary. Long shell commands truncate
-# to this width so the recent-tools list stays readable.
 MAX_TOOL_SUMMARY_CHARS: int = 80
 
-# Maximum number of tool calls to surface in the "Recent tool calls" panel.
 DEFAULT_MAX_TOOLS: int = 5
 
-# Maximum number of devbench.cli log entries to surface in the "Recent
-# devbench CLI calls" panel.
 DEFAULT_MAX_CLI_EVENTS: int = 3
 
-# Idle threshold: if the most recent tool call is older than this, the
-# dashboard labels the run "idle for Ns" rather than just showing the phase.
-# Configurable per-tick; kept here so both `collect_snapshot` and the
-# renderer agree on the cutoff.
 IDLE_THRESHOLD_SECONDS: int = 30
 
-# Subprocess timeout for every git read. Derived at call time from
-# ``RuntimeConfig.timeouts.command`` when available, otherwise this default.
 DEFAULT_GIT_READ_TIMEOUT: int = DEFAULT_COMMAND_TIMEOUT
 
-# Pending amendment-request directory under the workspace root.
 AMENDMENT_DIR_NAME: str = ".devbench/amendments"
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -149,11 +126,6 @@ class ActivitySnapshot:
     idle_seconds: int
 
 
-# ---------------------------------------------------------------------------
-# Discovery helpers
-# ---------------------------------------------------------------------------
-
-
 def discover_session_dir(hook_log_path: Path) -> Path | None:
     """Return the Claude Code session directory inferred from the hook log.
 
@@ -214,11 +186,6 @@ def find_active_subagent(session_dir: Path) -> Path | None:
         return None
     candidates.sort(key=lambda kv: kv[0], reverse=True)
     return candidates[0][1]
-
-
-# ---------------------------------------------------------------------------
-# Subagent transcript parser
-# ---------------------------------------------------------------------------
 
 
 def _parse_iso_timestamp(raw: str) -> datetime | None:
@@ -377,15 +344,13 @@ def parse_subagent_recent_activity(
         if at is not None and (last_activity_at is None or at > last_activity_at):
             last_activity_at = at
 
-        # Subagent type is written by Claude Code on the session-start record
-        # or as metadata on each message. Keep the most recent non-empty value.
         raw_type = entry.get("subagent_type") or entry.get("agentType") or entry.get("agent_type")
         if isinstance(raw_type, str) and raw_type:
             subagent_type = raw_type
 
         text = _extract_latest_text_from_entry(entry)
         if text is not None:
-            latest_text = text  # last-write-wins; we iterate in file order
+            latest_text = text
 
         tools.extend(_extract_tools_from_entry(entry, at))
 
@@ -400,11 +365,6 @@ def parse_subagent_recent_activity(
         recent_tools=tools,
         last_activity_at=last_activity_at,
     )
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator log parser
-# ---------------------------------------------------------------------------
 
 
 def parse_orchestrator_recent_cli(
@@ -466,11 +426,6 @@ def _split_log_line(line: str) -> tuple[str | None, str | None, datetime | None]
     if close < 0:
         return None, None, None
     return rest[1:close], rest[close + 1 :].lstrip(), at
-
-
-# ---------------------------------------------------------------------------
-# Target-repo git state
-# ---------------------------------------------------------------------------
 
 
 def parse_repo_state(repo_path: Path, *, timeout: int = DEFAULT_GIT_READ_TIMEOUT) -> RepoState:
@@ -535,11 +490,6 @@ def _run_git(repo_path: Path, args: list[str], *, timeout: int) -> tuple[int, st
     return result.returncode, result.stdout or ""
 
 
-# ---------------------------------------------------------------------------
-# Amendment pending-request check
-# ---------------------------------------------------------------------------
-
-
 def check_amendment_request(workspace_root: Path, task_id: str) -> AmendmentState:
     """Return the pending amendment request for ``task_id``, or a stub state.
 
@@ -565,11 +515,6 @@ def check_amendment_request(workspace_root: Path, task_id: str) -> AmendmentStat
                     if isinstance(path, str) and path:
                         files_to_add.append(path)
     return AmendmentState(task_id=task_id, exists=True, reason=reason, files_to_add=files_to_add)
-
-
-# ---------------------------------------------------------------------------
-# Phase inference
-# ---------------------------------------------------------------------------
 
 
 def detect_phase(
@@ -599,13 +544,10 @@ def detect_phase(
         return "idle"
 
     if subagent_type:
-        # Map Claude Code subagent identifiers to dashboard phase labels.
         mapped = _phase_label_from_subagent(subagent_type)
         if mapped is not None:
             return mapped
 
-    # Fallback: look at the most recent devbench.cli event, which captures
-    # status transitions (claimed, done, blocked) and agent comments.
     if recent_cli:
         latest_message = recent_cli[-1].message.lower()
         for token, label in _PHASE_MESSAGE_HINTS:
@@ -645,11 +587,6 @@ def _phase_label_from_subagent(subagent_type: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Git-ops mode label
-# ---------------------------------------------------------------------------
-
-
 def mode_label(runtime_config: RuntimeConfig) -> str:
     """Return a short human-readable label for the current git-ops mode.
 
@@ -667,7 +604,6 @@ def mode_label(runtime_config: RuntimeConfig) -> str:
     if deferred and not single:
         return "deferred-PR (no shared branch)  [invalid config]"
 
-    # Defensive: detect a hypothetical future flag without hard-depending on it.
     pause_flag = getattr(git_ops, "pause_before_merge", None)
     if pause_flag:
         return "multi-PR with pause-before-merge"
@@ -675,12 +611,7 @@ def mode_label(runtime_config: RuntimeConfig) -> str:
     return "standard multi-PR"
 
 
-# ---------------------------------------------------------------------------
-# High-level snapshot collector
-# ---------------------------------------------------------------------------
-
-
-RepoPathResolver = Any  # typed as Callable[[str], Path | None] at call sites
+RepoPathResolver = Any
 
 
 def collect_snapshot(
@@ -792,8 +723,6 @@ def _find_active_task(backlog_index: Path) -> _ActiveTask | None:
     display fallback so the dashboard always has a focal point. Returns
     ``None`` when the backlog is empty or fails to parse.
     """
-    # Import lazily so this module doesn't trigger BacklogParser's config
-    # resolution at import time (important for unit tests that patch config).
     from devbench.backlog.parser import BacklogParser
     from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
 
@@ -830,8 +759,6 @@ def _find_most_recent_claim(log_path: Path, unit_id: str) -> datetime | None:
         if marker not in raw_line:
             continue
         event = _parse_log_line(raw_line)
-        # _parse_log_line filters to logger name "devbench.cli" only; the
-        # Claimed line is emitted by that exact logger so this is sufficient.
         if event is not None:
             latest = event.at
     return latest
@@ -845,11 +772,6 @@ def _compute_idle_seconds(now: datetime, last_activity_at: datetime | None) -> i
     if delta < timedelta(seconds=0):
         return 0
     return int(delta.total_seconds())
-
-
-# ---------------------------------------------------------------------------
-# Renderer
-# ---------------------------------------------------------------------------
 
 
 def render_snapshot(snapshot: ActivitySnapshot) -> str:

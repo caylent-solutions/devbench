@@ -13,12 +13,7 @@ SCRIPT_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 )
 
-# H3: an agent type permitted to write canonical reviewer verdicts.
 _REVIEWER_AGENT_TYPE = "devbench-orchestrate:review-supervisor"
-# A per-round token written to the round-token FILE each review round (H3 second
-# factor; ADR-29 replaced the env var with a file). Fix B: it must be scoped to
-# the unit under review (prefix "<unit-id>-"); the canonical-judge test below
-# uses unit E201-F1-S2-T1.
 _ROUND_TOKEN = "E201-F1-S2-T1-r1-token"
 
 
@@ -98,14 +93,10 @@ def _make_payload(command: str, agent_type: str | None = None) -> dict:
 class TestGuardVerdictFormatHook:
     """Tests for guard-verdict-format.sh PreToolUse hook."""
 
-    # ------------------------------------------------------------------ AC-1
-
     def test_script_exists_and_is_executable(self) -> None:
         """AC-1: The script must exist and be executable."""
         assert SCRIPT_PATH.exists(), f"Script not found at {SCRIPT_PATH}"
         assert os.access(SCRIPT_PATH, os.X_OK), f"Script is not executable: {SCRIPT_PATH}"
-
-    # ------------------------------------------------------------------ AC-2: verdict validation
 
     def test_invalid_verdict_value_exits_2(self) -> None:
         """AC-2: Exit 2 when verdict value is neither 'pass' nor 'fail'."""
@@ -149,8 +140,6 @@ class TestGuardVerdictFormatHook:
         result = _run_hook(payload)
         assert result.returncode == 0, f"stderr: {result.stderr}"
 
-    # ------------------------------------------------------------------ AC-2: all known judge names accepted
-
     @pytest.mark.parametrize(
         "judge_name",
         [
@@ -185,15 +174,12 @@ class TestGuardVerdictFormatHook:
         result = _run_hook(payload)
         assert result.returncode == 0, f"judge '{judge_name}' was incorrectly rejected: {result.stderr}"
 
-    # ------------------------------------------------------------------ H3: round-token file fail-closed
-
     def test_canonical_verdict_without_token_file_exits_2(self, tmp_path: Path) -> None:
         """H3/ADR-29: a reviewer agent with no round-token FILE is blocked from a canonical verdict."""
         payload = _make_payload(
             "uv run devbench log-verdict code_review E201-F1-S2-T1 pass",
             agent_type=_REVIEWER_AGENT_TYPE,
         )
-        # workspace_root set but no token written -> the file is absent.
         result = _run_hook(payload, workspace_root=tmp_path, round_token=None)
         assert result.returncode == 2
         assert "guard-verdict-format" in result.stderr
@@ -215,12 +201,9 @@ class TestGuardVerdictFormatHook:
             "uv run devbench log-verdict code_review E201-F1-S2-T1 pass",
             agent_type=_REVIEWER_AGENT_TYPE,
         )
-        # No workspace_root -> DEVBENCH_WORKSPACE_ROOT stays unset.
         result = _run_hook(payload)
         assert result.returncode == 2
         assert "DEVBENCH_WORKSPACE_ROOT" in result.stderr
-
-    # ------------------------------------------------------------------ AC-3: non-log-verdict commands allowed
 
     def test_non_log_verdict_command_exits_0(self) -> None:
         """AC-3: Non-log-verdict Bash commands are always allowed."""
@@ -252,14 +235,11 @@ class TestGuardVerdictFormatHook:
         result = _run_hook(payload)
         assert result.returncode == 0
 
-    # ------------------------------------------------------------------ error message quality
-
     def test_error_message_includes_actionable_fix(self) -> None:
         """AC-2: Error message must be clear and actionable."""
         payload = _make_payload("uv run devbench log-verdict executor E201-F1-S2-T1 maybe")
         result = _run_hook(payload)
         assert result.returncode == 2
-        # Should include the offending command or fix guidance
         assert len(result.stderr.strip()) > 0
 
     def test_fail_verdict_error_mentions_feedback_requirement(self) -> None:

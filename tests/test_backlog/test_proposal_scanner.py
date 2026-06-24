@@ -41,7 +41,7 @@ class TestFindMatchingPendingProposal:
     """Pin the scanner contract."""
 
     def test_returns_match_when_signature_present(self, tmp_path: Path) -> None:
-        sig = "abc123" * 10  # any non-empty string works
+        sig = "abc123" * 10
         _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
         path = _seed_proposal(tmp_path, "E0-F1-S1-T1", sig)
 
@@ -121,7 +121,6 @@ class TestFindMatchingPendingProposal:
         sig = "stable-sig"
         _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
         path = _seed_proposal(tmp_path, "E0-F1-S1-T1", sig)
-        # Hand-edit: tweak rejection_reason; do not touch fix_signature.
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["rejection_reason"] = "operator hand-edit -- expanded the explanation text"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -138,7 +137,6 @@ class TestFindMatchingPendingProposal:
         proposals_dir = tmp_path / ".devbench" / "proposals"
         proposals_dir.mkdir(parents=True)
         sig = "valid-sig"
-        # Bad proposal with empty source_task_id.
         bad_path = proposals_dir / "AAA-broken.json"
         bad_path.write_text(
             json.dumps(
@@ -152,7 +150,6 @@ class TestFindMatchingPendingProposal:
             ),
             encoding="utf-8",
         )
-        # Good proposal with the same signature should be returned instead.
         _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
         _seed_proposal(tmp_path, "E0-F1-S1-T1", sig)
 
@@ -180,8 +177,6 @@ class TestFindMatchingPendingProposal:
             ),
             encoding="utf-8",
         )
-        # No backlog/ dir -- terminal-state check returns False, scanner
-        # treats the proposal as a legitimate match.
         result = find_matching_pending_proposal(tmp_path, sig)
         assert result is not None
         assert result.source_task_id == "E0-F1-S1-T1"
@@ -206,7 +201,6 @@ class TestFindMatchingPendingProposal:
         )
         backlog = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         backlog.mkdir(parents=True)
-        # Markdown without `## Status:` line.
         (backlog / "E0-F1-S1-T1.md").write_text("# E0-F1-S1-T1: fixture\n\nNo status line here.\n", encoding="utf-8")
 
         result = find_matching_pending_proposal(tmp_path, sig)
@@ -220,7 +214,6 @@ class TestFindMatchingPendingProposal:
         to read the good proposal first because it sorts earlier)."""
         proposals_dir = tmp_path / ".devbench" / "proposals"
         proposals_dir.mkdir(parents=True)
-        # Use a filename that sorts BEFORE any proposal id starting with E.
         (proposals_dir / "AAA-malformed.json").write_text("{this is not valid json", encoding="utf-8")
         sig = "valid-sig"
         _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
@@ -268,7 +261,6 @@ class TestFindMatchingPendingProposal:
             ),
             encoding="utf-8",
         )
-        # Backlog dir exists with unrelated content but no E0-F1-S1-T1.md.
         backlog = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         backlog.mkdir(parents=True)
         (backlog / "OTHER-T1.md").write_text("# OTHER-T1\n\n## Status: in-queue\n", encoding="utf-8")

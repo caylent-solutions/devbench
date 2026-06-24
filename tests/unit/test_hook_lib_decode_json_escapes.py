@@ -37,7 +37,6 @@ def _run_decode(escaped: str) -> str:
     sees the literal byte sequence (no shell-level interpretation of
     backslashes).
     """
-    # Build the bash snippet with escaped single quotes for safety.
     quoted = "'" + escaped.replace("'", "'\\''") + "'"
     cmd = [
         "bash",
@@ -68,14 +67,9 @@ def test_decode_json_escapes_no_nameref_in_function_body() -> None:
     in the file does not false-positive the test.
     """
     body = SCRIPT_PATH.read_text(encoding="utf-8")
-    # Extract just the function body so the issue #120 comment that
-    # mentions "local -n" elsewhere in the file does not match.
     start = body.index("decode_json_escapes() {")
     end = body.index("\n}\n", start)
     function_body = body[start:end]
-    # Strip comment lines so the rationale comment inside the function
-    # (which legitimately mentions "local -n" as the thing we removed)
-    # does not trigger the assertion.
     code_lines = [line for line in function_body.splitlines() if not line.strip().startswith("#")]
     code = "\n".join(code_lines)
     assert "local -n" not in code, (

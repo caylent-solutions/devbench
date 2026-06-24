@@ -27,10 +27,6 @@ from devbench.constants import (
 from devbench.reporting.report import _orchestrator_liveness_banner, _session_banner_lines
 from devbench.session import Session, SessionRegistry
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _write_pid(pid_path: Path, pid: int) -> None:
     """Write a minimal PID file so ``read_pid_file`` succeeds."""
@@ -77,11 +73,6 @@ def _write_traceback_tail(log_path: Path) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# PID-authoritative decision tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestBannerPidAuthoritative:
     """Banner must derive state from live-PID presence, not log recency."""
@@ -91,7 +82,6 @@ class TestBannerPidAuthoritative:
         log = tmp_path / "orch.log"
         pid_file = tmp_path / ".devbench" / "orchestrator.pid"
         _write_pid(pid_file, 99999)
-        # Log is 10 minutes old -- beyond any reasonable threshold.
         _write_log_with_ts(log, "2026-03-05T09:50:00Z")
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
 
@@ -109,7 +99,6 @@ class TestBannerPidAuthoritative:
         log = tmp_path / "orch.log"
         pid_file = tmp_path / ".devbench" / "orchestrator.pid"
         _write_pid(pid_file, 99999)
-        # Log is only 10 seconds old -- within any reasonable threshold.
         _write_log_with_ts(log, "2026-03-05T09:59:50Z")
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
 
@@ -126,7 +115,6 @@ class TestBannerPidAuthoritative:
         """Missing PID file means no live PID -- banner must report STOPPED."""
         log = tmp_path / "orch.log"
         pid_file = tmp_path / ".devbench" / "orchestrator.pid"
-        # No PID file written.
         _write_log_with_ts(log, "2026-03-05T09:59:50Z")
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
 
@@ -237,11 +225,6 @@ class TestBannerPidAuthoritative:
         assert expected_tag in banner
 
 
-# ---------------------------------------------------------------------------
-# Session-aware banner tests (report banner not session-aware in multi-session)
-# ---------------------------------------------------------------------------
-
-
 def _make_session(workspace_root: Path, name: str, pid: int, scope: list[str]) -> Session:
     """Build a :class:`Session` whose ``state_dir`` lives under *workspace_root*.
 
@@ -317,7 +300,7 @@ class TestSessionAwareBanner:
     def test_single_session_alive(self, tmp_path: Path) -> None:
         """One ALIVE session -> one ``[SESSION <name> ALIVE]`` line; no global STOPPED."""
         sess = _make_session(tmp_path, "vpc", 4242, ["E1-F1-S1-T1"])
-        _write_session_log(sess, "2026-03-05T09:59:56Z")  # 4s before now
+        _write_session_log(sess, "2026-03-05T09:59:56Z")
         _save_registry(tmp_path, [sess])
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         with (
@@ -334,7 +317,7 @@ class TestSessionAwareBanner:
     def test_single_session_stopped(self, tmp_path: Path) -> None:
         """One dead-PID session -> ``[SESSION <name> STOPPED]`` even with a fresh log."""
         sess = _make_session(tmp_path, "p2", 4243, ["E1-F1-S1-T2"])
-        _write_session_log(sess, "2026-03-05T09:59:54Z")  # fresh log, but PID dead
+        _write_session_log(sess, "2026-03-05T09:59:54Z")
         _save_registry(tmp_path, [sess])
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         with (
@@ -367,9 +350,9 @@ class TestSessionAwareBanner:
         alive_a = _make_session(tmp_path, "vpc", 5001, ["E1-F1-S1-T1"])
         alive_b = _make_session(tmp_path, "p1", 5002, ["E1-F1-S1-T2"])
         dead = _make_session(tmp_path, "p2", 5003, ["E1-F1-S1-T3"])
-        _write_session_log(alive_a, "2026-03-05T09:59:56Z")  # 4s ago
-        _write_session_log(alive_b, "2026-03-05T09:59:53Z")  # 7s ago
-        _write_session_log(dead, "2026-03-05T09:54:00Z")  # 6m ago
+        _write_session_log(alive_a, "2026-03-05T09:59:56Z")
+        _write_session_log(alive_b, "2026-03-05T09:59:53Z")
+        _write_session_log(dead, "2026-03-05T09:54:00Z")
         _save_registry(tmp_path, [alive_a, alive_b, dead])
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
 
@@ -392,13 +375,12 @@ class TestSessionAwareBanner:
         assert "[SESSION p1 ALIVE]" in joined
         assert "7s ago" in joined
         assert "[SESSION p2 STOPPED]" in joined
-        # Critical: no single global STOPPED line while two daemons are alive.
         assert "[ORCHESTRATOR STOPPED]" not in joined
 
     def test_draining_session_shown_as_draining(self, tmp_path: Path) -> None:
         """A live + drain-pending session -> ``[SESSION <name> DRAINING]`` + drain marker."""
         sess = _make_session(tmp_path, "serial", 6001, ["E1-F1-S1-T1"])
-        _write_session_log(sess, "2026-03-05T09:59:57Z")  # 3s ago
+        _write_session_log(sess, "2026-03-05T09:59:57Z")
         _write_session_drain(sess)
         _save_registry(tmp_path, [sess])
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
@@ -412,7 +394,6 @@ class TestSessionAwareBanner:
         assert "[SESSION serial DRAINING]" in result[0]
         assert "drain=pending" in result[0]
         assert "3s ago" in result[0]
-        # A draining session is NOT reported as plain ALIVE.
         assert "[SESSION serial ALIVE]" not in result[0]
 
     def test_draining_overrides_alive_only_for_that_session(self, tmp_path: Path) -> None:
@@ -438,7 +419,6 @@ class TestSessionAwareBanner:
     def test_stopped_session_with_no_log(self, tmp_path: Path) -> None:
         """Dead PID + no per-session log -> STOPPED 'no activity recorded' (uses threshold)."""
         sess = _make_session(tmp_path, "ghost", 4250, [])
-        # No log file written at all.
         _save_registry(tmp_path, [sess])
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         with (
@@ -487,7 +467,6 @@ class TestSessionAwareBanner:
         ):
             result = _session_banner_lines(tmp_path, 180, now=now)
         assert result is not None
-        # Alive -> green; stopped -> red; both terminated with reset.
         assert result[0].startswith("\033[32m")
         assert result[1].startswith("\033[91m")
         assert all(line.endswith("\033[0m") for line in result)

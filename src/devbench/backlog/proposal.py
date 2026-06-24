@@ -57,21 +57,9 @@ PROPOSAL_DIR_NAME = ".devbench/proposals"
 REJECTED_PROPOSAL_DIR_NAME = ".devbench/rejected-proposals"
 LOCK_FILE_NAME = ".devbench/task-factory.lock"
 
-#: Deterministic audit marker written when a cross-unit-defect escalation
-#: materialises a fix-proposal (one proposed task per out-of-scope file).
 ESCALATION_PROPOSAL_WRITTEN_MARKER: str = "[ESCALATION_PROPOSAL_WRITTEN]"
-#: Deterministic audit marker written when an escalation block has NO
-#: out-of-scope attributed file to decompose (so no proposal is created) --
-#: lets a watching operator/loop detect "blocked with no auto-resolution
-#: draft" without reading prose.
 ESCALATION_NO_PROPOSAL_MARKER: str = "[ESCALATION_NO_PROPOSAL]"
 
-# Minimum character length for a ``suggested_approach`` field. Enforced by
-# ``materialise_proposal`` as a fail-fast contract against thin auto-generated
-# drafts that previously required operator hand-editing on every promotion.
-# Threshold calibrated to the four-section minimum (Context + Scope + TDD
-# approach + Verify) that ``blocker-resolver.md`` now requires: a genuinely
-# complete approach narrative cannot fit under 160 characters.
 _SUGGESTED_APPROACH_MIN_CHARS: int = 160
 
 
@@ -144,9 +132,6 @@ def classify_proposed_task(backlog_root: Path, workspace_root: Path, suggested_i
         return ProposalTaskState.DONE
     if status_value == STATUS_DECLINED:
         return ProposalTaskState.DECLINED
-    # in-queue / in-progress / in-review / blocked all count as PROMOTED:
-    # proposal-lifecycle tracking only cares whether the draft has advanced
-    # past operator review, not what activity the draft is currently in.
     return ProposalTaskState.PROMOTED
 
 
@@ -197,24 +182,10 @@ class BlockedTaskState(Enum):
     HELD = "held"
     BLOCKED_ON_HELD = "blocked-on-held"
     OPERATOR_ACTION_REQUIRED = "operator-action-required"
-    # Issue #183(d): orchestrator runtime degraded (review-supervisor
-    # lost Agent-tool access). Distinct from OPERATOR_ACTION_REQUIRED
-    # so the operator sees that a ``make start`` restart -- not a code
-    # fix -- is what resolves the task.
     RUNTIME_DEGRADATION = "runtime-degradation"
-    # TDI-002: unit force-blocked by the SIGTERM shutdown safeguard with no
-    # structural co-blocker. Auto-requeued on the next sweep; distinct from
-    # OPERATOR_ACTION_REQUIRED so a benign interruption is not mistaken for a
-    # case that needs human judgement.
     INTERRUPTED_ON_STOP = "interrupted-on-stop"
 
 
-# Recovery audit-comment heuristics. Used by ``classify_blocked_task``
-# when no [BLOCKED_PENDING_PROPOSAL] marker is present yet but the
-# orchestrator's loop has logged a recent block from one of the recovery
-# agents -- that is, devbench WILL run blocker-resolver / task-factory
-# on the next iteration. The agent-tag and body-pattern allowlists keep
-# the heuristic narrow so unrelated [BLOCKED] comments do not trigger.
 _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
     {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender", "agent/backlog_manager"}
 )
@@ -248,45 +219,20 @@ _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
     r"|will auto-requeue when",
     re.IGNORECASE,
 )
-# Issue #200 / AC-200-4: structured [AMENDMENT_REJECTED] tags written by
-# manifest-amender differ from the prose ``amendment rejected`` form matched
-# by ``_RECOVERY_BODY_RE``. A separate matcher avoids widening the prose
-# regex to bracket-enclosed tokens, keeping each matcher's intent clear.
-# Pattern is intentionally case-sensitive: the structured tag is always
-# emitted in upper-case by the manifest-amender; a lower-case occurrence
-# is a prose quote of the tag, not the tag itself.
 _REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
-# Issue #183(d): structured payloads emitted by review-supervisor's
-# Step 0 self-check when the Agent tool drops out of the session. The
-# orchestrator's runtime is degraded; only an operator-driven
-# ``make start`` restart can recover. Matching the exact phrasing the
-# agent emits keeps the classifier honest -- unrelated [BLOCKED] rows
-# from other agents must not trigger this bucket.
 _RUNTIME_DEGRADATION_BODY_RE: re.Pattern[str] = re.compile(
     r"agent-tool-unavailable|review-supervisor[^\n]*only\s+Bash",
     re.IGNORECASE,
 )
-# Window after which a degradation comment is considered stale. 24h
-# matches the default review cycle; a longer-lived degradation marker
-# implies the operator already saw the alert and (perhaps) is debugging.
 _RUNTIME_DEGRADATION_WINDOW_SECONDS: int = 24 * 60 * 60
 
-# Issue #241: marker written by ``cmd_claim`` when the target repo cannot
-# be resolved. A work unit carrying this marker requires operator action
-# (fix the repo name in the WU file); no automated recovery is possible.
-# Pattern matches the bracketed tag appearing anywhere in the Comments
-# section content. Case-sensitive: the tag is always upper-case.
 _TARGET_REPO_UNRESOLVED_RE: re.Pattern[str] = re.compile(
     re.escape(BLOCKED_TARGET_REPO_UNRESOLVED_MARKER),
 )
 
-# TDI-002: marker the SIGTERM handler writes when it force-blocks the in-flight
-# unit on orchestrator stop (``[FORCED_BLOCKED_ON_STOP] session=<name>``). When
-# this is the unit's only blocking signal, the work was merely interrupted and
-# is safe to auto-requeue. Case-sensitive: the tag is always upper-case.
 _FORCED_BLOCKED_ON_STOP_RE: re.Pattern[str] = re.compile(r"\[FORCED_BLOCKED_ON_STOP\]")
 
 
@@ -429,16 +375,8 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
     ts, agent, body = most_recent
     if (now - ts).total_seconds() > window_seconds:
         return False
-    # Issue #211: writers emit either ``agent/manifest_amender`` (canonical
-    # underscore form) or ``agent/manifest-amender`` (hyphen form, e.g.
-    # ``amendment.py::AMENDER_AGENT_ID``). Normalise before the membership
-    # check so both spellings classify identically.
     if _normalize_agent_tag(agent) not in _RECOVERY_AGENT_TAGS:
         return False
-    # Issue #200 / AC-200-4: check the structured-tag matcher FIRST so that
-    # ``[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK:
-    # ...`` lines are classified even when the prose body lacks the
-    # ``amendment reject`` phrase that ``_RECOVERY_BODY_RE`` requires.
     return bool(_REJECTION_TAG_RE.search(body) or _RECOVERY_BODY_RE.search(body))
 
 
@@ -484,13 +422,6 @@ def classify_blocked_task(
     """
     source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
 
-    # Priority 0: RUNTIME_DEGRADATION -- the orchestrator runtime is
-    # degraded. Checked BEFORE every other bucket so a degraded session
-    # is surfaced even if the task also looks held / blocked-on-held;
-    # only restarting ``make start`` can let the work resume in any case.
-    # Issue #215: an operator-driven restart writes
-    # ``<workspace>/.devbench/last-restart`` which bounds the audit-row
-    # scan so audit rows from the pre-restart instance are NOT counted.
     if source_file is not None:
         restart_marker = _read_last_restart_marker(workspace_root) if workspace_root is not None else None
         if _has_runtime_degradation_signal(
@@ -587,17 +518,12 @@ def _classify_structural_bucket(
 
     Never returns ``RUNTIME_DEGRADATION``.
     """
-    # Priority 1: HELD -- the task itself is in hold status.
     if _task_status_is_hold(backlog_root, backlog_index, task_id):
         return BlockedTaskState.HELD
 
     if source_file is None:
         return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    # Priority 1a: OPERATOR_ACTION_REQUIRED -- the WU file carries the
-    # [BLOCKED_TARGET_REPO_UNRESOLVED] marker (issue #241). The target repo
-    # is not in the allowed-repos list; no automated recovery can proceed
-    # until the operator corrects the repo name in the WU file.
     if _has_unresolved_repo_marker(source_file):
         return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
@@ -609,18 +535,11 @@ def _classify_structural_bucket(
         marker_result = _classify_with_markers(mgr, backlog_index, marker_ids)
         if marker_result is not None:
             return marker_result
-        # _classify_with_markers returned None: every marker target is
-        # terminal. Issue #186 compat: fall through to the regular-dep
-        # and recovery-signal checks first; only return
-        # AUTO_CLEARING_VIA_PROPOSAL when none of those apply (AC-200-1).
         all_markers_terminal = True
 
-    # Priority 4: AWAITING_DEPENDENCY -- regular deps still in flight.
     if _regular_deps_unsatisfied(backlog_root, backlog_index, task_id):
         return BlockedTaskState.AWAITING_DEPENDENCY
 
-    # Priority 3 (late path, AC-200-1) / 5 / 6: satisfied-markers fallback
-    # vs recovery-signal vs operator attention.
     return _classify_late(
         source_file=source_file,
         task_id=task_id,
@@ -750,10 +669,6 @@ def _classify_with_markers(
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        # All markers terminal. Signal to caller by returning None so it
-        # can apply the priority-4 / priority-5 checks. When no regular
-        # dep or recovery signal blocks progress, the caller returns
-        # AUTO_CLEARING_VIA_PROPOSAL (AC-200-1).
         return None
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
@@ -818,9 +733,6 @@ def _classify_recovery_or_attention(
         )
         if _recent_recovery_audit_comment(source_file, effective_now, effective_window):
             return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
-    # TDI-002: every structural blocker has been ruled out; if the only blocking
-    # signal is the forced-stop marker the unit was merely interrupted on
-    # shutdown and is safe to auto-requeue.
     if _has_forced_blocked_on_stop_signal(source_file):
         return BlockedTaskState.INTERRUPTED_ON_STOP
     return BlockedTaskState.OPERATOR_ACTION_REQUIRED
@@ -856,23 +768,13 @@ def _read_draft_status(draft_path: Path) -> str:
     return ""
 
 
-# Matches valid Story IDs such as ``E0-F1-S1``. Used by ``allocate_next_ids``
-# to derive the on-disk directory layout (``backlog/E0/E0-F1/E0-F1-S1/``).
 _STORY_ID_RE = re.compile(r"^E\d+-F\d+-S\d+$")
 
-# Matches task IDs under a given story (e.g. ``E0-F1-S1-T<N>``).
 _TASK_ID_SUFFIX_RE = re.compile(r"^T(\d+)$")
 
-# Matches the ``## Status:`` line and rewrites the value.
 _STATUS_LINE_RE = re.compile(r"^(##\s*Status:\s*)(.+)$", re.MULTILINE)
 
-# Captures backlog-index rows: ``| ID | ... |``.
 _BACKLOG_ROW_RE = re.compile(r"^\|\s*(\S+)\s*\|", re.MULTILINE)
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -885,14 +787,6 @@ class ProposedTask:
     linked_scenarios: list[str]
     suggested_acs: list[str]
     suggested_approach: str
-    #: The PARENT (blocked) unit's failing executable ``VERIFY`` directive, carried
-    #: verbatim so the materialised fix unit's ``## Verification`` re-runs the
-    #: parent's exact gate command -- not only the fix's own narrow diagnostic.
-    #: ``verify-ac`` then executes the parent gate, so a fix that merely RELOCATES
-    #: the failure (trades one error class for another) cannot reach ``done``
-    #: (tracked issue: fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
-    #: ``None`` (the default) preserves the legacy narrow-only behaviour for
-    #: proposals that do not carry a parent gate.
     parent_verify_directive: str | None = None
 
 
@@ -914,16 +808,7 @@ class Proposal:
     proposed_tasks: list[ProposedTask]
     affected_task_ids: list[str] = field(default_factory=list)
     source_dep_direction: str = ""
-    # Issue #141: stable hash over (target_repo, sorted(files_to_own),
-    # normalised intent_phrase) -- empty string for proposals authored
-    # before the dedup feature shipped. Set by cmd_write_proposal at
-    # emission time so the next blocker-resolver invocation finds a
-    # match cheaply.
     fix_signature: str = ""
-    # Issue #144: depth in the recovery cascade. Depth 0 = first-class
-    # recovery (the source task is a "real" backlog task that surfaced a
-    # blocker). Depth N+1 = parent's depth + 1. Configurable cap via
-    # `orchestrate.max_cascade_depth` YAML field.
     cascade_depth: int = 0
 
     def to_dict(self) -> dict:
@@ -983,18 +868,12 @@ class Proposal:
 
         source_id = str(data["source_task_id"]).strip()
         affected = _parse_affected_task_ids(data.get("affected_task_ids", []), source_id)
-        # source_dep_direction is optional; "" preserves default behavior
-        # (source.depends_on(new)). "test_validates_source" inverts the
-        # auto-wired dep so the test waits on the source. See
-        # docs/task-factory.md "When to use --no-dep-on-source".
         source_dep_direction = str(data.get("source_dep_direction", "")).strip()
         if source_dep_direction not in ("", "test_validates_source"):
             raise ValueError(
                 f"Proposal.source_dep_direction must be empty or 'test_validates_source'; got {source_dep_direction!r}"
             )
 
-        # Issue #141 / #144: optional fix_signature + cascade_depth. Absent
-        # in proposals authored before these features shipped (forward-compat).
         fix_signature = str(data.get("fix_signature", "") or "")
         cascade_depth_raw = data.get("cascade_depth", 0)
         try:
@@ -1062,14 +941,6 @@ class CascadeDepthError(RuntimeError):
     """
 
 
-# ---------------------------------------------------------------------------
-# Dedup-signature helpers (issue #141)
-# ---------------------------------------------------------------------------
-
-# Verbs that signal "fix the spec / Manifest / placeholder" so the intent
-# phrase normalises to a stable key. Order matters: longer matches first
-# so "drop-row" beats "drop". Each entry maps a regex pattern (matched
-# against lower-cased Approach text) -> normalised intent token.
 _INTENT_VERB_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bremove\s+the\s+\S+\s+row\b", "remove-row"),
     (r"\bdelete\s+the\s+\S+\s+entry\b", "delete-entry"),
@@ -1181,9 +1052,6 @@ def find_matching_pending_proposal(workspace_root: Path, signature: str) -> Prop
         source_id = str(payload.get("source_task_id", "")).strip()
         if not source_id:
             continue
-        # Skip if the existing source task is in a terminal state -- the
-        # proposal is stale (operator declined; or the proposal was
-        # never promoted and the source task moved on).
         if _source_task_in_terminal_state(workspace_root, source_id):
             continue
         return ProposalMatch(
@@ -1238,10 +1106,6 @@ def enforce_cascade_depth(proposal_payload: dict, max_depth: int) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# TODO/TBD placeholder rejection (issue #143)
-# ---------------------------------------------------------------------------
-
 _PLACEHOLDER_PATTERNS: tuple[str, ...] = ("todo", "tbd")
 
 
@@ -1276,19 +1140,9 @@ def detect_placeholder_descriptions(proposal: Proposal) -> list[str]:
     return issues
 
 
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
-
-
 def proposal_path(workspace_root: Path, source_task_id: str) -> Path:
     """Return the on-disk path for the blocker-resolver's proposal JSON."""
     return workspace_root / PROPOSAL_DIR_NAME / f"{source_task_id}.json"
-
-
-# ---------------------------------------------------------------------------
-# Concurrency-safe ID allocator
-# ---------------------------------------------------------------------------
 
 
 @contextmanager
@@ -1352,11 +1206,6 @@ def allocate_next_ids(workspace_root: Path, backlog_root: Path, story_id: str, c
         return [f"{story_id}-T{max_task_num + i + 1}" for i in range(count)]
 
 
-# ---------------------------------------------------------------------------
-# Proposal I/O
-# ---------------------------------------------------------------------------
-
-
 def build_escalation_proposal(
     *,
     source_task_id: str,
@@ -1401,7 +1250,6 @@ def build_escalation_proposal(
             dropping a fix task).
     """
     in_scope = set(manifest_files)
-    # Preserve order, dedupe, and keep only out-of-scope files.
     seen: set[str] = set()
     out_of_scope: list[str] = []
     for path in attributed_files:
@@ -1518,11 +1366,6 @@ def delete_proposal(workspace_root: Path, source_task_id: str) -> None:
         target.unlink()
 
 
-# ---------------------------------------------------------------------------
-# Draft generation
-# ---------------------------------------------------------------------------
-
-
 DRAFT_TEMPLATE: str = """\
 # {task_id}: {title}
 
@@ -1586,12 +1429,8 @@ DRAFT_TEMPLATE: str = """\
 """
 
 
-#: AC-id token recogniser shared with the verification parser, used to seed the
-#: auto-generated ``## Verification`` stub with the draft's first AC id.
 _DRAFT_AC_ID_RE: re.Pattern[str] = re.compile(r"AC-[A-Za-z0-9-]+")
 
-#: AC id emitted by the fallback Acceptance Criteria line when no AC is suggested;
-#: the ``## Verification`` stub references the same id so the stub stays consistent.
 _DRAFT_FALLBACK_AC_ID = "AC-TODO-001"
 
 
@@ -1609,9 +1448,6 @@ def _first_ac_id(suggested_acs: list[str]) -> str:
     return _DRAFT_FALLBACK_AC_ID
 
 
-#: Manifest sentinel used when a proposal lists no concrete ``files_to_own``.
-#: Matches ``sentinels.SENTINEL_PATTERN`` so the validator skips it (it is not a
-#: real path) -- a documented placeholder, never the rejected ``TODO`` form.
 _DRAFT_MANIFEST_SENTINEL = "<resolution-targets-determined-at-execution>"
 
 
@@ -1627,9 +1463,6 @@ def _draft_manifest_block(files_to_own: list[str]) -> str:
     return f"| `{_DRAFT_MANIFEST_SENTINEL}` | add |"
 
 
-#: Recognises a Python test file in a proposal's Changes Manifest from which a
-#: concrete ``uv run pytest <file>`` command can be derived. Matches pytest's own
-#: default discovery globs (``test_*.py`` / ``*_test.py``) anywhere in the path.
 _DRAFT_TEST_FILE_RE: re.Pattern[str] = re.compile(r"(?:^|/)(?:test_[^/]+|[^/]+_test)\.py$")
 
 
@@ -1681,8 +1514,6 @@ def _draft_verification_block(
     """
     from devbench.verification import text_has_execution_verb
 
-    # When a parent gate is supplied, find the fix AC whose text asserts the parent
-    # re-run so its directive runs the PARENT command (not the narrow pytest).
     parent_gate_ac = _parent_rerun_ac_id(suggested_acs) if parent_verify_directive else None
 
     derived_command = _derive_command_for_ac(files_to_own)
@@ -1697,7 +1528,6 @@ def _draft_verification_block(
             continue
         seen.append(ac_id)
         if parent_verify_directive is not None and ac_id == parent_gate_ac:
-            # Re-run the PARENT's exact failing gate command for this AC.
             directives.append(_relabel_verify_directive(parent_verify_directive, ac_id))
         elif text_has_execution_verb(line) and derived_command is not None:
             directives.append(f"- VERIFY {ac_id} | type=command | cmd=`{derived_command}` | expect-exit=0")
@@ -1738,9 +1568,6 @@ def _relabel_verify_directive(directive: str, ac_id: str) -> str:
     PARENT's exact gate command is re-run.
     """
     body = directive.strip()
-    # Strip any leading list-bullet and the ``VERIFY`` keyword in either form
-    # (``- VERIFY ...`` from a markdown line, or ``VERIFY ...`` from a parsed
-    # VerificationItem.raw) so the rebuilt directive carries exactly one ``VERIFY``.
     if body.startswith("- "):
         body = body[2:].lstrip()
     if body.startswith("VERIFY"):
@@ -1792,11 +1619,6 @@ def generate_draft_md(
     )
 
 
-# ---------------------------------------------------------------------------
-# BACKLOG.md row manipulation
-# ---------------------------------------------------------------------------
-
-
 def _render_backlog_row(task_id: str, title: str, status: str, repo: str, rel_path: str) -> str:
     """Return one BACKLOG.md Full Work Unit Index row for the given task."""
     return f"| {task_id} | {title} | Task | {status} | None | {repo} | `{rel_path}` |\n"
@@ -1808,8 +1630,6 @@ def _append_backlog_row(backlog_index: Path, row: str) -> None:
     marker = "## Full Work Unit Index"
     if marker not in content:
         raise ProposalError(f"BACKLOG.md at {backlog_index} has no '## Full Work Unit Index' section")
-    # Append at EOF (end of index block); after every existing row the
-    # Status Summary regeneration will pick this up.
     content = content.rstrip("\n") + "\n" + row
     atomic_write_text(backlog_index, content)
 
@@ -1829,11 +1649,6 @@ def _remove_backlog_row(backlog_index: Path, task_id: str) -> None:
     if not removed:
         raise ProposalError(f"Row for {task_id} not found in {backlog_index}")
     atomic_write_text(backlog_index, "".join(kept))
-
-
-# ---------------------------------------------------------------------------
-# Materialisation
-# ---------------------------------------------------------------------------
 
 
 def materialise_proposal(
@@ -1868,23 +1683,7 @@ def materialise_proposal(
     NOT by ``backlog.default_status_for_new_work_units`` (which governs
     operator-authored units only).
     """
-    # Every proposal is materialised at the dedicated ``proposed`` staging
-    # state. Promotion to ``in-queue`` is gated by
-    # ``task_factory.auto_accept_proposals`` -- applied by the propose /
-    # write-proposal call sites and by ``devbench sweep-proposals`` (which
-    # promote ``proposed`` -> ``in-queue`` when the flag is true, or leave the
-    # draft at ``proposed`` for operator review when false).
-    # ``backlog.default_status_for_new_work_units`` deliberately does NOT apply
-    # here -- it governs operator-authored (spec-to-backlog) units only.
-    # Writing a proposal at ``draft`` would make ``classify_proposed_task``
-    # report it as PROMOTED, so the auto-accept sweep would never promote it:
-    # exactly the defect this status decoupling fixes.
     new_wu_status: str = STATUS_PROPOSED
-    # Thin-approach refusal -- fail fast before any file write so a partial
-    # materialisation cannot leave the backlog half-written. Applies to the
-    # whole proposal, even if some tasks are already resolved, because a
-    # JSON with thin content should not be accepted regardless of which
-    # specific tasks would be created on this call.
     for proposed in proposal.proposed_tasks:
         approach = (proposed.suggested_approach or "").strip()
         if len(approach) < _SUGGESTED_APPROACH_MIN_CHARS:
@@ -1895,21 +1694,12 @@ def materialise_proposal(
                 "four-section structure documented in blocker-resolver.md."
             )
 
-    # Classify every task up front so we know which ones actually need
-    # creating. The classifier is the single source of truth for proposal
-    # lifecycle state -- it reads the backlog tree AND the
-    # rejected-proposals/ archive, so a previously-rejected draft classifies
-    # as REJECTED (not UNMATERIALISED) and is skipped here.
     classifications = [
         (proposed, classify_proposed_task(backlog_root, workspace_root, proposed.suggested_id))
         for proposed in proposal.proposed_tasks
     ]
     needs_create = any(state is ProposalTaskState.UNMATERIALISED for _, state in classifications)
 
-    # Unresolved-prior-proposals guard applies only when this call would
-    # actually create new `proposed` rows. Exclude this proposal's own
-    # task IDs so a partial re-materialise (some tasks already PROPOSED)
-    # doesn't see itself as the blocker.
     if needs_create:
         exclude = frozenset(t.suggested_id for t in proposal.proposed_tasks)
         if _has_unresolved_proposals(backlog_index, exclude_task_ids=exclude):
@@ -1922,29 +1712,8 @@ def materialise_proposal(
     remapped = False
     mgr = BacklogManager()
     for index, (proposed, state) in enumerate(classifications):
-        # ``task`` is the (possibly re-homed) unit materialised this iteration.
-        # A collision re-home rebinds it to a free id without mutating the
-        # loop variable (ProposedTask is frozen; the loop var is read-only).
         task = proposed
         if state is not ProposalTaskState.UNMATERIALISED:
-            # A draft (or reject archive) already exists for this id. Two very
-            # different situations land here:
-            #
-            #   (a) Idempotent re-materialise of THIS proposal's own work -- a
-            #       draft we authored (provenance cites this source task) or a
-            #       draft we materialised and the operator later rejected
-            #       (REJECTED via archive, no live draft). Skipping is correct:
-            #       recreating would resurrect rejected work or duplicate
-            #       in-flight work.
-            #
-            #   (b) COLLISION with an UNRELATED pre-existing unit that merely
-            #       occupies the suggested id. Silently skipping here is the bug
-            #       (tracked issue: materialise-proposal-skips-by-id-on-collision):
-            #       the orchestrator-proposed fix unit would be dropped and the
-            #       blocked unit it unblocks would stay blocked forever. Instead,
-            #       allocate the next free id and materialise the fix unit there,
-            #       re-pointing the proposal so downstream promote-proposal wiring
-            #       targets the real fix unit.
             existing_draft = _find_draft_file(backlog_root, proposed.suggested_id)
             is_own_work = existing_draft is not None and _draft_authored_by_source(
                 existing_draft, proposal.source_task_id
@@ -1967,11 +1736,6 @@ def materialise_proposal(
                 state.value,
                 free_id,
             )
-            # Re-point the proposal so the materialised draft's provenance and the
-            # downstream wiring (promote-proposal matches the proposal's
-            # suggested_id against the live draft id) follow the new id.
-            # ProposedTask is frozen, so build a replacement and swap it back into
-            # the shared list the caller holds (so it can re-persist the JSON).
             task = replace(proposed, suggested_id=free_id)
             proposal.proposed_tasks[index] = task
             remapped = True
@@ -1998,24 +1762,10 @@ def materialise_proposal(
         _append_backlog_row(backlog_index, row)
         drafts.append(target)
         logger.info("Materialised proposed task %s -> %s", task.suggested_id, target)
-        # Operator-block Slack-gap spec F-proposal / AC-3: fire the
-        # ``work_unit_materialised`` event once per draft created from the
-        # proposal.  Best-effort + per-event-toggle gated inside the helper;
-        # never breaks materialisation on a notification failure.
         _notify_materialised(target, task.suggested_id, proposal.source_task_id)
     if drafts:
-        # Rebuild Status Summary counts so the `proposed` rows appear.
-        # Skipped entirely when no drafts were created -- the summary is
-        # already correct.
         mgr._update_status_summary(backlog_index)
     if remapped:
-        # A collision re-homed at least one proposed task to a free id. Persist
-        # the updated proposal JSON (keyed by source_task_id, which is unchanged)
-        # so the downstream promote-proposal wiring -- which matches the on-disk
-        # proposal's suggested_id against the live draft id -- targets the real
-        # fix unit rather than the colliding pre-existing one. Only re-persist
-        # when the JSON actually exists on disk (some call paths pass an
-        # in-memory proposal that was never written).
         _persist_proposal_if_present(workspace_root, proposal)
     return drafts
 
@@ -2064,11 +1814,6 @@ def _extract_story_id(task_id: str) -> str:
     if len(parts) < 4:
         raise ProposalError(f"Cannot derive story_id from task_id {task_id!r}")
     return "-".join(parts[:3])
-
-
-# ---------------------------------------------------------------------------
-# Promote / reject
-# ---------------------------------------------------------------------------
 
 
 def list_proposals(workspace_root: Path) -> list[Proposal]:
@@ -2181,7 +1926,6 @@ def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) 
         if match is None or match.group(1) != task_id:
             continue
         cells = line.split("|")
-        # Cells layout: ['', ' ID ', ' Title ', ' Type ', ' Status ', ' Deps ', ' Repo ', ' Path ', '']
         if len(cells) >= 5:
             cells[4] = f" {new_status} "
             lines[i] = "|".join(cells)
@@ -2202,12 +1946,9 @@ def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source
     idx = content.find(marker)
     if idx == -1:
         raise ProposalError(f"Source task file {source_unit} has no '## Dependencies' section")
-    # Find the end of the Dependencies section and append a row inside it.
     next_section = content.find("\n## ", idx + 1)
     section = content[idx : next_section if next_section != -1 else len(content)]
     remainder = content[next_section:] if next_section != -1 else ""
-    # Replace a placeholder ``| none | | |`` row when the dependencies table
-    # is currently empty; otherwise append a new row to the end of the table.
     none_row_re = re.compile(r"^\|\s*none\s*\|\s*\|\s*\|\s*$", re.IGNORECASE | re.MULTILINE)
     if none_row_re.search(section):
         section = none_row_re.sub(f"| {new_dep_id} | (auto) | proposed |", section, count=1)
@@ -2245,10 +1986,6 @@ class PromoteResult:
     wired_targets: list[str]
 
 
-#: An unresolved angle-bracket placeholder operand, e.g.
-#: ``<fill-in the command ...>`` or ``<the-test-file>``. Matches a ``<...>`` span
-#: that contains no ``>`` (so a shell redirection like ``2>&1`` is not flagged --
-#: that has no opening ``<`` immediately followed by placeholder prose).
 _COMMAND_PLACEHOLDER_RE: re.Pattern[str] = re.compile(r"<[^<>]*>")
 
 
@@ -2332,36 +2069,20 @@ def promote_proposal(
     draft = _find_draft_file(backlog_root, task_id)
     if draft is None:
         raise ProposalError(f"No draft file for proposed task {task_id}")
-    # Fail-closed gate (run BEFORE any write): a placeholder cmd in a
-    # type=command directive can never pass verify-ac, so it must not enter the
-    # queue. Raises ProposalError naming the offending AC.
     _assert_verification_has_no_command_placeholder(draft, task_id)
     _rewrite_status(draft, STATUS_IN_QUEUE)
     _rewrite_backlog_status(backlog_index, task_id, STATUS_IN_QUEUE)
-    # Refresh Status Summary counts after the status flip.
     BacklogManager()._update_status_summary(backlog_index)
-    # Operator-block Slack-gap spec F-proposal / AC-3: fire the (already-defined
-    # but previously dead) ``work_unit_promoted`` event once per unit promoted
-    # to ``in-queue``.  ``promote_all_from_source`` loops this function, so a
-    # single hook here covers the bulk path too -- one ping per unit.  Routed
-    # via the helper so the best-effort + per-event-toggle gating lives in one
-    # place; never breaks the promote on a notification failure.
     _notify_promoted(draft, task_id)
 
     wired_targets: list[str] = []
     proposal = _find_originating_proposal(workspace_root, task_id)
     if proposal is not None:
-        # Compute the dedup'd, order-preserved target list.
         targets: list[str] = [proposal.source_task_id]
         for extra in proposal.affected_task_ids:
             if extra not in targets:
                 targets.append(extra)
 
-        # Fail-fast: every affected target must exist in the backlog.
-        # _find_originating_proposal always returns the actual source so it
-        # is guaranteed to be present; we only need to validate the affected
-        # entries. Validation happens BEFORE any write so a missing peer does
-        # not leave the source half-wired.
         for target_id in targets[1:]:
             if _find_source_task_file(backlog_root, backlog_index, target_id) is None:
                 raise ProposalError(
@@ -2369,13 +2090,9 @@ def promote_proposal(
                     "not found in backlog index; cannot wire dependency."
                 )
 
-        # Now wire every target. Writes are idempotent-per-file individually
-        # (the helpers append but do not duplicate existing rows/markers).
         for target_id in targets:
             source_file = _find_source_task_file(backlog_root, backlog_index, target_id)
             if source_file is None:
-                # Source itself was not in index; back-compat with pre-ADR-10
-                # tests that build minimal fixtures without a full backlog.
                 continue
             if dep_on_source or target_id != proposal.source_task_id:
                 _append_dependency_to_source(backlog_root, backlog_index, target_id, task_id)
@@ -2477,8 +2194,6 @@ def _comments_have_marker(source_file: Path, marker_task_id: str) -> bool:
 def _dep_row_has_task(source_file: Path, dep_task_id: str) -> bool:
     """Return True when the source file's ``## Dependencies`` table already lists ``dep_task_id``."""
     text = source_file.read_text(encoding="utf-8")
-    # Match "| <id> |" in a Dependencies row; conservative enough to catch
-    # pre-existing rows written by _append_dependency_to_source or hand-edits.
     return f"| {dep_task_id} |" in text
 
 
@@ -2537,10 +2252,6 @@ def add_dep(
             f"(status={blocker_unit.status.value}); wiring a dep on a terminal task is a no-op."
         )
 
-    # Reverse-edge cycle guard (issue #253b): fail fast when the blocker's file
-    # already declares a dependency on the blocked task -- either via a dep-table
-    # row or a [BLOCKED_PENDING_PROPOSAL] marker.  Wiring the edge would produce
-    # a direct cycle: blocked -> blocker -> blocked.
     if _dep_row_has_task(blocker_file, blocked_task_id) or _comments_have_marker(blocker_file, blocked_task_id):
         raise ProposalError(f"add-dep would create a cycle: {blocker_task_id} already depends on {blocked_task_id}")
 
@@ -2557,14 +2268,8 @@ def add_dep(
     return wrote_row or wrote_marker
 
 
-# Matches a single ``## Dependencies`` data row whose first cell is the dep ID.
-# The header row (``| ID | Title | Status |``) and separator (``|----|...``)
-# never match because their first cell is the literal ``ID`` / a dash run, not
-# a task ID. Group 1 captures the first-cell ID so the substituter can drop only
-# the row whose ID equals the blocker being removed.
 _DEP_ROW_RE: re.Pattern[str] = re.compile(r"^\|\s*([^|\s][^|]*?)\s*\|[^\n]*\|\s*$", re.MULTILINE)
 
-# Canonical empty Dependencies placeholder row written when the table empties.
 _DEP_NONE_ROW: str = "| none | | |"
 
 
@@ -2602,20 +2307,17 @@ def _remove_dependency_from_source(
     def _drop_if_match(match: re.Match[str]) -> str:
         first_cell = match.group(1).strip()
         if first_cell == "ID":
-            return match.group(0)  # header row -- keep
+            return match.group(0)
         if separator_re.match(match.group(0)):
-            return match.group(0)  # separator row -- keep
+            return match.group(0)
         return "" if first_cell == dep_id else match.group(0)
 
     updated_section = _DEP_ROW_RE.sub(_drop_if_match, section)
     if updated_section == section:
         return False
 
-    # Collapse any blank-line run left by the removed row.
     updated_section = re.sub(r"\n{3,}", "\n\n", updated_section)
 
-    # Re-insert the canonical placeholder when no data rows remain. A data row
-    # is any pipe-delimited line that is neither the header nor the separator.
     data_rows = [
         line
         for line in updated_section.splitlines()
@@ -2799,9 +2501,6 @@ def reject_proposal(
     if not reason or not reason.strip():
         raise ProposalError("reject_proposal requires a non-empty reason")
 
-    # Fail-fast on the mutual exclusion guard. Either form must be chosen
-    # explicitly; the defaults (empty strings) are what ``cmd_reject_proposal``
-    # passes when a flag was not supplied.
     has_task_id = bool(task_id)
     has_source_id = bool(unmaterialised_source_id)
     if has_task_id and has_source_id:
@@ -2846,29 +2545,15 @@ def _reject_per_draft_proposal(
         draft.rename(archive)
     with contextlib.suppress(ProposalError):
         _remove_backlog_row(backlog_index, task_id)
-    # Suppress is intentional here: rejection is idempotent, so a missing
-    # BACKLOG.md row (e.g. already rejected) is a no-op.
 
     source = _find_originating_source_task(workspace_root, task_id)
     if source is not None:
         source_file = _find_source_task_file(backlog_root, backlog_index, source)
         if source_file is not None:
             _append_reject_audit_comment(source_file, task_id, reason)
-            # Strip the BLOCKED_PENDING_PROPOSAL marker for this specific
-            # rejected task so the auto-requeue cascade can correctly
-            # evaluate the remaining markers. Without this strip, the
-            # cascade would see a marker pointing at a now-rejected ID,
-            # treat it as non-terminal (unknown), and refuse to requeue
-            # even when all other markers are terminal.
             _strip_pending_proposal_marker(source_file, task_id)
-            # Invoke the cascade on the just-rejected id as the "newly
-            # terminal" signal for the scan's dependent walk. Source gets
-            # re-evaluated; remaining markers all terminal -> source flips.
-            # Remaining markers include non-terminal OR no markers remain ->
-            # scan abstains per the existing ADR-07 contract.
             BacklogManager()._auto_requeue_marker_dependents(backlog_index, task_id)
 
-    # Refresh Status Summary so the deleted row is no longer counted.
     BacklogManager()._update_status_summary(backlog_index)
     return archive
 
@@ -2902,8 +2587,6 @@ def _reject_unmaterialised_proposal(
                 f"or resolve the draft first."
             )
 
-    # Archive the JSON. Use a dedicated suffix so audit-reviewers can tell
-    # un-materialised rejections apart from per-draft rejections at a glance.
     archive_dir = workspace_root / REJECTED_PROPOSAL_DIR_NAME
     archive_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -2938,12 +2621,6 @@ def _append_reject_audit_comment(source_file: Path, task_id: str, reason: str) -
     atomic_write_text(source_file, content)
 
 
-# Single-marker regex lifted from manager.py. Duplicated here (as a constant,
-# not an import) to keep the proposal <-> manager module seam one-way: manager
-# depends on nothing in proposal; proposal depends on manager for the cascade
-# invocation. If the marker format ever changes, both constants must move in
-# lockstep -- the pin in tests/test_plugin/test_agent_structure.py catches
-# drift.
 _REJECT_MARKER_STRIP_RE = re.compile(r"^.*\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+).*$\n?", re.MULTILINE)
 
 
@@ -2964,7 +2641,6 @@ def _strip_pending_proposal_marker(source_file: Path, rejected_task_id: str) -> 
         return "" if match.group(1) == rejected_task_id else match.group(0)
 
     updated = _REJECT_MARKER_STRIP_RE.sub(_drop_if_match, content)
-    # Collapse runs of 3+ newlines down to 2 (one blank line between paragraphs).
     updated = re.sub(r"\n{3,}", "\n\n", updated)
     if updated != content:
         atomic_write_text(source_file, updated)

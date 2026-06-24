@@ -200,8 +200,6 @@ class TestGuardCommentFormatRejectsForbiddenPhrases:
         result = _run_hook(payload)
         assert result.returncode == 2
         stderr_lower = result.stderr.lower()
-        # The error must point the agent to the documented rule and offer
-        # at least one rewrite example so the agent can self-correct.
         assert "skill" in stderr_lower or "executor.md" in stderr_lower or "halt-discipline" in stderr_lower
         assert "fix:" in stderr_lower
 
@@ -230,8 +228,6 @@ class TestGuardCommentFormatAcceptsCleanMessages:
 
     def test_message_mentioning_halt_in_a_filename_passes(self) -> None:
         """A non-imperative use of halt-related words in identifiers does not match a forbidden phrase."""
-        # 'halt_state.py' contains 'halt' but not any of the imperative phrases
-        # in the forbidden list. Substring matching is on whole phrases.
         message = "Updated halt_state.py to record the new shutdown reason field."
         payload = _make_payload(f'uv run devbench log-comment executor E1-F1-S1-T1 "{message}"')
         result = _run_hook(payload)

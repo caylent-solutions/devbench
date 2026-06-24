@@ -30,7 +30,6 @@ YAML_REFERENCE = DOCS / "devbench-yaml-reference.md"
 LLM_AUTH = DOCS / "llm-authentication.md"
 QUOTA_TODO = REPO_ROOT / "spec" / "devbench-supervise-screen-orchestrator" / "QUOTA-VERIFICATION-TODO.md"
 
-#: The six operator-facing verbs the docs must enumerate (FR-1).
 SUPERVISE_VERBS: tuple[str, ...] = ("start", "stop", "restart", "status", "info", "attach")
 
 _ALL_SUPERVISE_DOCS = (
@@ -100,7 +99,6 @@ class TestAdr31:
         text = ADR_31.read_text(encoding="utf-8")
         lower = text.lower()
         assert "subscription" in lower, "ADR-31 must record the subscription-billing rationale."
-        # WHY interactive-CLI over SDK/API, and WHY not -p/--print.
         assert "sdk" in lower, "ADR-31 must contrast the interactive path with the SDK/API path."
         assert "--print" in text or "-p" in text, "ADR-31 must record WHY -p/--print is excluded."
 
@@ -110,8 +108,6 @@ class TestAdr31:
         assert "log" in lower and "tail" in lower, "ADR-31 must record the hybrid log-tail mitigation."
 
     def test_has_standard_adr_headings(self) -> None:
-        # Mirror the repo ADR convention (see ADR-24 / ADR-30): a bold **Status:**
-        # metadata line plus Context / Decision / Consequences section headings.
         lower = ADR_31.read_text(encoding="utf-8").lower()
         assert "**status:**" in lower, "ADR-31 must carry a bold Status metadata line."
         assert "## context" in lower, "ADR-31 must have a Context heading."
@@ -144,7 +140,6 @@ class TestEditedDocsCoverSupervise:
         assert "`supervise:`" in text or "## `supervise" in text, (
             "docs/devbench-yaml-reference.md must document the supervise: config block."
         )
-        # Key fields the block must document.
         for field in ("screen_name_prefix", "detection_patterns", "injectable_commands"):
             assert field in text, f"docs/devbench-yaml-reference.md must document supervise.{field}."
 
@@ -173,13 +168,10 @@ class TestQuotaVerificationTodoStatus:
         assert "Phase 6 status" in text, (
             "QUOTA-VERIFICATION-TODO.md must record the Phase-6 discovery-item outcomes for operator review."
         )
-        # Every discovery item the plan flagged must be accounted for.
         for di in ("DI-1", "DI-3", "DI-4", "DI-5"):
             assert di in text, f"the Phase-6 status section must account for {di}."
 
     def test_di5_is_recorded_as_still_pending_a_real_quota_event(self) -> None:
-        # DI-5 is the only correctness-critical item still pending a live quota event;
-        # the reference must make that unambiguous so AC-29 stays tracked as deferred.
         text = QUOTA_TODO.read_text(encoding="utf-8").lower()
         assert "di-5" in text and "pending" in text, (
             "QUOTA-VERIFICATION-TODO.md must record DI-5 as still PENDING a real quota event."

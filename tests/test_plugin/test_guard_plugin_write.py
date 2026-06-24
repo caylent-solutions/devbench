@@ -72,32 +72,26 @@ class TestGuardPluginWriteBlocks:
     @pytest.mark.parametrize(
         ("file_path", "label"),
         [
-            # Category 1: a plugin's guard scripts.
             (
                 "/workspaces/telemetry/devbench/plugin/devbench-orchestrate/scripts/guard-verdict-format.sh",
                 "plugin-script",
             ),
-            # Category 1: a plugin's hook config.
             (
                 "/workspaces/telemetry/devbench/plugin/devbench-orchestrate/hooks/hooks.json",
                 "hooks-json",
             ),
-            # Category 1: relative (workspace-relative) plugin script path.
             (
                 "plugin/devbench-orchestrate/scripts/guard-bash.sh",
                 "plugin-script-relative",
             ),
-            # Category 2: the workspace shadow plugin.
             (
                 "/workspaces/telemetry/tools-telemetry-backlog/.devbench/plugin-shadow/scripts/x.sh",
                 "plugin-shadow",
             ),
-            # Category 3: a Claude settings file (settings.local.json).
             (
                 "/workspaces/telemetry/devbench/.claude/settings.local.json",
                 "claude-settings-local",
             ),
-            # Category 3: a Claude settings file (settings.json).
             (
                 "/home/user/project/.claude/settings.json",
                 "claude-settings",
@@ -133,7 +127,7 @@ class TestGuardPluginWriteBlocks:
         every Write when BASH_ENV is empty).
         """
         plain = tmp_path / "regular.txt"
-        result = _run(str(plain))  # _run strips BASH_ENV from the env
+        result = _run(str(plain))
         assert result.returncode == 0, (
             f"with BASH_ENV unset, a plain file must be allowed; got rc={result.returncode}, stderr={result.stderr!r}"
         )

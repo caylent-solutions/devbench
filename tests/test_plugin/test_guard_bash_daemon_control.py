@@ -96,8 +96,6 @@ class TestGuardBashAllowsLegitimateCommands:
             ("git status --porcelain=v1", "git-status"),
             ("ls -la", "ls"),
             ("pytest tests/test_cli.py", "pytest"),
-            # A non-daemon-control verb whose name merely CONTAINS a blocked
-            # verb as a substring must not be wrongly blocked.
             ("uv run devbench stop-instance abc123", "stop-instance"),
         ],
     )

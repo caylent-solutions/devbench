@@ -122,7 +122,6 @@ class TestRoundTrip:
             assert loaded_record.remediation == "re-queue"
             assert loaded_record.success_count == 3
             assert loaded_record.failure_count == 1
-            # Timestamp round-trips to UTC
             assert loaded_record.last_applied == ts
 
     def test_round_trip_multiple_records(self) -> None:
@@ -204,7 +203,6 @@ class TestAtomicWrite:
             with patch.object(pathlib.Path, "replace", capturing_replace):
                 save_catalog(root, {})
 
-            # At least one replace call must have been made to the catalog path
             expected = catalog_path(root)
             assert any(p == expected for p in replace_calls), (
                 f"Expected replace() to be called with {expected}; got {replace_calls}"
@@ -213,7 +211,6 @@ class TestAtomicWrite:
     def test_devbench_dir_created_if_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # .devbench does NOT exist yet
             assert not (root / ".devbench").exists()
             save_catalog(root, {})
             assert catalog_path(root).exists()
@@ -237,7 +234,6 @@ class TestSelfHealingLoad:
             path.write_text("NOT VALID JSON {{{", encoding="utf-8")
             loaded = load_catalog(root)
             assert loaded == {}
-            # A warning must be emitted to stderr
             captured = capsys.readouterr()
             assert "WARNING" in captured.err or "malformed" in captured.err.lower()
 
@@ -261,7 +257,6 @@ class TestSelfHealingLoad:
             root = pathlib.Path(tmpdir)
             path = catalog_path(root)
             path.parent.mkdir(parents=True, exist_ok=True)
-            # Valid JSON but no schema_version key
             path.write_text(json.dumps({"entries": {}}), encoding="utf-8")
             loaded = load_catalog(root)
             assert loaded == {}
@@ -273,7 +268,6 @@ class TestSelfHealingLoad:
             root = pathlib.Path(tmpdir)
             path = catalog_path(root)
             path.parent.mkdir(parents=True, exist_ok=True)
-            # schema_version correct but entries is a list, not a dict
             bad_payload = {
                 "schema_version": CATALOG_SCHEMA_VERSION,
                 "entries": ["not", "a", "dict"],
@@ -302,7 +296,6 @@ class TestSelfHealingLoad:
             root = pathlib.Path(tmpdir)
             path = catalog_path(root)
             path.parent.mkdir(parents=True, exist_ok=True)
-            # Write a catalog with a naive datetime (no tz offset in ISO string)
             naive_ts = "2026-01-01T00:00:00"
             payload = {
                 "schema_version": CATALOG_SCHEMA_VERSION,
@@ -349,7 +342,6 @@ class TestSelfHealingLoad:
             }
             path.write_text(json.dumps(payload), encoding="utf-8")
             loaded = load_catalog(root)
-            # The bad entry is skipped, catalog loads as empty
             assert "CLS:sig" not in loaded
 
     def test_entry_that_is_not_a_dict_is_skipped(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -358,7 +350,6 @@ class TestSelfHealingLoad:
             root = pathlib.Path(tmpdir)
             path = catalog_path(root)
             path.parent.mkdir(parents=True, exist_ok=True)
-            # An entry whose value is a string (not a dict) must be skipped
             payload = {
                 "schema_version": CATALOG_SCHEMA_VERSION,
                 "entries": {
@@ -414,10 +405,8 @@ class TestLookupEntry:
                 last_applied=ts,
             )
             save_catalog(root, {"CLS_X:sig-y": record})
-            # Lookup with matching classification + signature
             result = lookup_entry(root, "CLS_X", "sig-y")
             assert result is not None
-            # Lookup with mismatched components
             assert lookup_entry(root, "CLS_X", "sig-z") is None
             assert lookup_entry(root, "CLS_Z", "sig-y") is None
 
@@ -513,9 +502,7 @@ class TestRecordOutcome:
             )
             result = lookup_entry(root, "CLS", "sig")
             assert result is not None
-            # last_applied must be a timezone-aware UTC datetime
             assert result.last_applied.tzinfo is not None
-            # It should be very recent (within the last 60 seconds)
             now = datetime.now(UTC)
             delta = now - result.last_applied
             assert delta.total_seconds() < 60
@@ -552,7 +539,6 @@ class TestRecordOutcome:
     def test_record_outcome_valid_outcomes(self, outcome: str) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Must not raise for any valid outcome
             record_outcome(
                 root,
                 classification="CLS",
@@ -661,7 +647,6 @@ class TestNovelSignatureRecord:
         """'novel' is accepted as a valid outcome and does not raise."""
         with tempfile.TemporaryDirectory() as tmpdir:
             root = pathlib.Path(tmpdir)
-            # Must not raise
             record_outcome(
                 root,
                 classification="CLS",

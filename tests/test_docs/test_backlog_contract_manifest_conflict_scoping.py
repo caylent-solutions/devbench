@@ -186,13 +186,9 @@ class TestChangelogIssue267Entry:
     def test_changelog_no_em_dash_in_issue_267_entry(self) -> None:
         """No em-dash characters in the bullet that references issue #267."""
         text = CHANGELOG_DOC.read_text(encoding="utf-8")
-        # Find the bullet point that mentions #267 and verify it has no em-dash.
         entry_start = text.find("#267")
         assert entry_start != -1, "CHANGELOG.md must contain a reference to issue #267."
-        # Scope to the bullet (find start of bullet line, end at next bullet or blank+bullet).
-        # Walk back to the start of the bullet line.
         line_start = text.rfind("\n", 0, entry_start) + 1
-        # Walk forward to the end of the bullet block (next line starting with '-' or '##').
         after = text[entry_start:]
         next_bullet = re.search(r"\n(-|\s*##)", after)
         entry_text = text[line_start : entry_start + next_bullet.start()] if next_bullet else text[line_start:]

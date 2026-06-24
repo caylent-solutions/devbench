@@ -48,10 +48,6 @@ LEGACY_DIR_NAME = "logs/legacy"
 LEGACY_LOG_NAME = "orchestrator.log"
 META_SHARD_NAME = "orchestrator-meta.jsonl"
 
-# Capture (a) the YYYY-MM portion of every log line's timestamp and
-# (b) the task id when the line is a state transition. Both groups are
-# used for partitioning -- by-month into the date directory, by-task
-# into the per-task shard.
 _TIMESTAMP_RE = re.compile(r"^(?P<ts>\d{4}-\d{2})-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _TASK_TRANSITION_RE = re.compile(r"Set (?P<task_id>E\S+) to '[^']+'")
 
@@ -85,9 +81,6 @@ def _classify_line(line: str) -> tuple[str | None, str | None]:
     if task_match is None:
         return (month, None)
     task_id = task_match.group("task_id")
-    # Stories / Features / Epics share the E<...> prefix but their
-    # state is auto-rolled; group those with the meta shard so they
-    # don't generate empty shards per non-task transition.
     if "-T" not in task_id:
         return (month, None)
     return (month, task_id)
@@ -119,7 +112,6 @@ def migrate_flat_to_sharded(workspace_root: Path, source_log: Path) -> dict[str,
     if not source_log.is_file():
         raise FileNotFoundError(f"orchestrator log not found at {source_log}")
 
-    # Group by (month, task_id_or_none) -> list[str].
     buckets: dict[tuple[str, str | None], list[str]] = {}
     last_key: tuple[str, str | None] | None = None
     leading_untimestamped: list[str] = []
@@ -129,12 +121,6 @@ def migrate_flat_to_sharded(workspace_root: Path, source_log: Path) -> dict[str,
             stripped = line.rstrip("\n")
             month, task_id = _classify_line(stripped)
             if month is None:
-                # No timestamp -- a continuation line from a multi-line
-                # log record. Attach to the most-recent bucket so
-                # readers see the same byte sequence the source had.
-                # If no bucket has been opened yet (log starts mid-
-                # record), queue the lines and prepend them to the
-                # first real bucket so we don't drop bytes.
                 if last_key is None:
                     leading_untimestamped.append(stripped)
                 else:
@@ -150,21 +136,14 @@ def migrate_flat_to_sharded(workspace_root: Path, source_log: Path) -> dict[str,
             last_key = key
 
     if leading_untimestamped:
-        # Source log was entirely untimestamped lines -- nothing to
-        # partition by month. Route to the meta shard under the latest
-        # observed month if any (none here, so write nothing). The
-        # unrecognised content is preserved in the legacy archive
-        # below.
         pass
 
-    # Write each bucket to its shard file.
     shards_written = 0
     meta_shards_written = 0
     lines_processed = 0
     for (month, task_id), lines in buckets.items():
         out_path = _shard_path(workspace_root, month, task_id)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # Append: idempotent re-runs keep accumulating into the same shard.
         with out_path.open("a", encoding="utf-8") as fh:
             for entry in lines:
                 fh.write(entry + "\n")
@@ -174,15 +153,9 @@ def migrate_flat_to_sharded(workspace_root: Path, source_log: Path) -> dict[str,
         else:
             shards_written += 1
 
-    # Atomically archive the source flat log to logs/legacy/. Reversible:
-    # operators can restore by renaming back. Failures before this step
-    # leave the source intact (transactional fail-safe).
     legacy_dir = workspace_root / LEGACY_DIR_NAME
     legacy_dir.mkdir(parents=True, exist_ok=True)
     legacy_path = legacy_dir / LEGACY_LOG_NAME
-    # Use shutil.move so the rename works across filesystems too. On the
-    # same filesystem this is an atomic os.rename; across filesystems it
-    # falls back to copy+unlink.
     shutil.move(str(source_log), str(legacy_path))
 
     return {

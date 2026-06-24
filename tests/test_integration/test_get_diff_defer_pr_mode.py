@@ -80,8 +80,6 @@ def _build_workspace(tmp_path: Path) -> tuple[Path, Path]:
     (repo / "README.md").write_text("seed\n", encoding="utf-8")
     _run_git(repo, "add", "README.md")
     _run_git(repo, "commit", "-m", "seed")
-    # Simulate an `origin/main` remote-tracking ref pointing at the seed
-    # commit, so `git diff origin/main` has a target in both modes.
     _run_git(repo, "update-ref", "refs/remotes/origin/main", "main")
     _run_git(repo, "checkout", "-b", "feat/shared")
 

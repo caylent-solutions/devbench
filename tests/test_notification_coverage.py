@@ -36,33 +36,9 @@ import pytest
 from devbench import notifications
 from devbench.backlog.proposal import BlockedTaskState
 
-# ---------------------------------------------------------------------------
-# Source-tree roots
-# ---------------------------------------------------------------------------
-
-# ``tests/`` -> repo-root ``src/devbench``.  Computed relative to this file so
-# the scan is workspace-agnostic and does not depend on the invocation cwd.
 _SRC_ROOT: Path = Path(__file__).resolve().parents[1] / "src" / "devbench"
 
-# The notifications module DEFINES every ``notify_*`` helper, so a reference to
-# the helper name inside it is the definition, not a lifecycle call site.  It is
-# excluded from the call-graph scan; Inv-1 asserts a reference OUTSIDE this file.
 _NOTIFICATIONS_MODULE: Path = (_SRC_ROOT / "notifications.py").resolve()
-
-
-# ---------------------------------------------------------------------------
-# Event-kind -> reachability target
-# ---------------------------------------------------------------------------
-#
-# Inv-1 asserts every event is reachable.  Most events are reached by their own
-# ``notify_<event>`` helper being called from a lifecycle path.  The seven
-# per-class blocked buckets are NOT called directly -- they are dispatched by
-# ``notify_blocked_classification_transition`` keyed on the classifier's return
-# value (see ``_EVENT_BY_CLASSIFICATION``).  For those events the reachable
-# call-graph symbol is the dispatcher, not the per-class helper, so the scan
-# tolerates indirection by mapping each blocked event-kind to the dispatcher
-# name (spec Section 11: assert event-kind reachability, not a literal helper
-# grep).
 
 
 def _direct_helper_name(event_kind: str) -> str:
@@ -70,14 +46,8 @@ def _direct_helper_name(event_kind: str) -> str:
     return f"notify_{event_kind}"
 
 
-# The dispatcher that routes every per-class blocked event.  A blocked bucket is
-# "reachable" iff this dispatcher has a lifecycle call site AND the bucket maps
-# to an event-kind in ``_EVENT_BY_CLASSIFICATION`` (Inv-2 guarantees the latter).
 _BLOCKED_DISPATCHER: str = "notify_blocked_classification_transition"
 
-# The set of event-kinds reached through the dispatcher rather than a direct
-# ``notify_<event>`` helper.  Derived from the classification map so it cannot
-# drift from the dispatcher's actual routing table.
 _DISPATCHER_ROUTED_EVENTS: frozenset[str] = frozenset(notifications._EVENT_BY_CLASSIFICATION.values())
 
 
@@ -90,11 +60,6 @@ def _reachability_symbol(event_kind: str) -> str:
     if event_kind in _DISPATCHER_ROUTED_EVENTS:
         return _BLOCKED_DISPATCHER
     return _direct_helper_name(event_kind)
-
-
-# ---------------------------------------------------------------------------
-# Static call-graph scan
-# ---------------------------------------------------------------------------
 
 
 def _iter_engine_modules() -> list[Path]:
@@ -143,11 +108,6 @@ def engine_referenced_names() -> set[str]:
     return _collect_referenced_names(_iter_engine_modules())
 
 
-# ---------------------------------------------------------------------------
-# Inv-1: every event has a reachable lifecycle call site
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestInv1EveryEventFires:
     """Every ``ALL_EVENTS`` member is reachable from a lifecycle call site."""
@@ -180,11 +140,6 @@ class TestInv1EveryEventFires:
             f"the blocked-classification dispatcher {_BLOCKED_DISPATCHER!r} has no engine "
             "call site; every per-class blocked event is unreachable."
         )
-
-
-# ---------------------------------------------------------------------------
-# Inv-2: every BlockedTaskState bucket is mapped or explicitly silent
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

@@ -80,53 +80,18 @@ if TYPE_CHECKING:
 
     from devbench.verification import EvidenceCompleteness, VerificationItem
 
-# Terminal statuses for parent-rollup purposes: a child in either state is
-# "finalised" and does not block its parent from rolling to done. Kept at
-# module level so tests can import and assert the exact set.
 _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLINED})
 
-# Statuses evaluated by the draft/hold manifest-conflict check (Check 12-draft).
-# Kept at module level so the constant is defined once and easy to assert on.
 _DRAFT_HOLD_STATUSES: frozenset[str] = frozenset({STATUS_DRAFT, STATUS_HOLD})
 
-# Marker written by ``promote-proposal`` to the source task's Comments section
-# whenever a proposed draft is wired as a dependency. The auto-requeue scan
-# (``_auto_requeue_marker_dependents``) reads these to discriminate blocks
-# caused by a promoted proposal chain (auto-recoverable) from blocks caused by
-# review failures, git-ops errors, or operator decisions (stay manual). The
-# regex captures the target task ID in group 1; the scan is scoped to the
-# Comments section so markers quoted in Description/Approach text cannot
-# trigger the cascade.
-#
-# Issue #200 / AC-200-3: the original ``\S+`` capture group was too broad --
-# it matched any non-whitespace word, including prose words like "Amendment"
-# in lines such as ``[BLOCKED_PENDING_PROPOSAL] Amendment rejected``. This
-# caused the auto-requeue cascade to treat "Amendment" as an unknown task ID
-# (non-terminal), preventing the cascade from firing even when the real marker
-# target (e.g. E5-F3-S1-T4) was terminal. The fix narrows the pattern to only
-# capture canonical task IDs matching ``E\d+(-F\d+)?(-S\d+)?(-T\d+)?``.
 _BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
     r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)"
 )
 
 
-# ``# <id>: <title>`` heading regex used by the operator-notification helper
-# below.  Single source of truth so the manager does not re-parse work-unit
-# files just to surface a Slack-friendly title.
 _WU_TITLE_RE: re.Pattern[str] = re.compile(r"^#\s+\S+:\s*(.+?)\s*$", re.MULTILINE)
 
 
-# Canonical verdict line shape emitted by ``cmd_log_verdict``.
-#
-# Shape: ``[YYYY-MM-DD HH:MM UTC] [judge/<name>] [<action>] <feedback>``
-#
-# Anchored at start-of-line (``^``) so an indented or mid-line occurrence
-# cannot be counted.  Requires ``[judge/`` (not ``[agent/``) so audit-only
-# entries written by workflow agents are structurally excluded.  The ``<action>``
-# group captures the token inside the third bracket pair; callers inspect it to
-# discriminate ``REVIEW_PASS``, ``REVIEW_REJECTED``, and ``REVIEW_FAIL``.
-#
-# Private to this module -- do NOT export via constants.py (source-test-atomicity).
 _CANONICAL_VERDICT_RE: re.Pattern[str] = re.compile(
     r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\] \[judge/(?P<judge>[^\]]+)\] \[(?P<action>[^\]]+)\]"
 )
@@ -162,13 +127,7 @@ class BacklogManager:
                 ``logging.getLogger("devbench.backlog_manager")`` when omitted.
         """
         self.logger = logger or logging.getLogger("devbench.backlog_manager")
-        # Idempotency guard for the auto-requeue cascade (issue #147). A
-        # ``(backlog_index, unit_id)`` pair is added when the cascade runs;
-        # subsequent ``_set_status`` calls for the same terminal target skip
-        # the scan. The set is per-instance so independent ``BacklogManager``
-        # constructions get their own guard (tests share no state).
         self._cascade_fired_for: set[tuple[str, str]] = set()
-        # Populated by ``validate(fix=True)``: ``(fix_count, files_fixed)``.
         self._fix_summary: tuple[int, int] = (0, 0)
 
     def force_status(
@@ -229,11 +188,6 @@ class BacklogManager:
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
             )
-        # Deterministic AC evidence gate (ADR-27): a unit declaring a
-        # ``## Verification`` contract cannot reach done until every executable
-        # Acceptance Criterion has a tool-captured exit-0 record in the latest
-        # ``verify-ac`` evidence ledger. Units with NO ``## Verification``
-        # section are unaffected (pure back-compat for pre-existing units).
         from devbench import verification
 
         content = work_unit_path.read_text(encoding="utf-8")
@@ -246,9 +200,6 @@ class BacklogManager:
                     f"executable AC has a tool-captured exit-0 record."
                 )
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
-        # Operator notification (PR #202).  notify_* helpers are best-effort
-        # and gated by the per-event toggle in devbench.yaml; safe to call
-        # unconditionally.
         from devbench.notifications import notify_work_unit_done
 
         title = _extract_wu_title(work_unit_path, unit_id)
@@ -337,8 +288,6 @@ class BacklogManager:
             f"completed on tool-captured verify-ac exit-0 evidence (attempt={attempt}, "
             f"ACs={', '.join(executable_acs)}) in lieu of an attributable diff.",
         )
-        # _set_status reads the file fresh, so the audit comment appended above
-        # is preserved alongside the status flip.
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
 
         from devbench.notifications import notify_work_unit_done
@@ -359,15 +308,6 @@ class BacklogManager:
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
-        # Append the ``[BLOCKED] <reason>`` audit comment BEFORE the status
-        # write so the operator-notification routed off ``_set_status`` (spec
-        # F1) can read this call's reason from the audit trail for the Slack
-        # context block.  ``_set_status`` then fires the transition-aware
-        # blocked notification for every caller (mark_blocked, force_status,
-        # the orchestrator's ``set-status blocked``, the done-gate-refusal
-        # path, and the reconcile sweep) -- this method no longer notifies
-        # directly, so a single write-surface hook covers all of them and the
-        # done-gate-refusal block now pages (G1).
         self._append_comment(work_unit_path, "BLOCKED", reason)
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
 
@@ -487,7 +427,6 @@ class BacklogManager:
                 default timeout.
             OSError: An unexpected OS error from ``fcntl.flock`` or file I/O.
         """
-        # Validate status early -- fail fast before acquiring the lock.
         canonical = VALID_STATUSES.get(new_status.lower())
         if canonical is None:
             raise ValueError(f"Invalid status '{new_status}'. Valid statuses: {', '.join(sorted(VALID_STATUSES))}")
@@ -693,7 +632,6 @@ class BacklogManager:
         expected_block = self._build_summary_block(epic_counts, epic_titles)
 
         content = backlog_index.read_text(encoding="utf-8")
-        # Derive what the Status Summary section would look like after reconciliation.
         stripped = self._strip_summary_section(content)
         full_index_marker = "## Full Work Unit Index"
         if full_index_marker in stripped:
@@ -710,15 +648,12 @@ class BacklogManager:
         if not drift:
             return 0, reconciled
 
-        # Drift was detected.
         if check_only:
             return 1, reconciled
 
         if not force:
-            # No-flag mode: report drift only, no write.
             return 0, reconciled
 
-        # --force: atomic rewrite of the index region only.
         try:
             atomic_write_text(backlog_index, reconciled)
         except OSError:
@@ -853,9 +788,6 @@ class BacklogManager:
         prepended = BacklogManager._format_header_validation_errors(
             backlog_index, header_text_cells, separator_cells, real_row_count
         )
-        # Prepend in reverse so the order in ``errors`` matches the order
-        # we appended (header issue first, separator issue second, row
-        # count third).
         for msg in reversed(prepended):
             errors.insert(0, msg)
 
@@ -1035,8 +967,6 @@ class BacklogManager:
         content = backlog_index.read_text(encoding="utf-8")
         in_full_index = False
         for line in content.splitlines():
-            # Section tracking: dependency parsing is valid only inside the
-            # Full Work Unit Index section. Any other ## header closes it.
             stripped = line.strip()
             if stripped.startswith("## "):
                 in_full_index = "Full Work Unit Index" in stripped
@@ -1200,7 +1130,6 @@ class BacklogManager:
                 graph[row_id] = []
                 continue
             marker_targets = self._extract_pending_proposal_markers(wu_path)
-            # Restrict edges to indexed IDs only -- unknown targets are skipped.
             graph[row_id] = [t for t in sorted(marker_targets) if t in known_ids]
         return graph
 
@@ -1242,7 +1171,6 @@ class BacklogManager:
             stack.append(node)
             for nxt in graph.get(node, ()):
                 if color[nxt] == 1:
-                    # Back-edge: extract cycle, normalise, and dedupe.
                     cycle_start = stack.index(nxt)
                     cycle = tuple(stack[cycle_start:])
                     rotation = cycle.index(min(cycle))
@@ -1291,11 +1219,6 @@ class BacklogManager:
 
         self.logger.info("Logged traceability: %s -> %s", spec_ref, test_ref)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    # Target section headings whose checkboxes are ticked on done.
     _TICK_SECTIONS: frozenset[str] = frozenset({"Acceptance Criteria", "Definition of Done"})
 
     def _tick_completion_checkboxes(self, work_unit_path: Path) -> None:
@@ -1326,7 +1249,6 @@ class BacklogManager:
 
         for line in lines:
             stripped = line.rstrip("\n")
-            # Track section changes on ``## `` headings
             if stripped.startswith("## "):
                 section_title = stripped[3:].strip()
                 in_target_section = section_title in self._TICK_SECTIONS
@@ -1334,14 +1256,12 @@ class BacklogManager:
                 continue
 
             if in_target_section:
-                # Match ``- [ ] ...`` (unchecked)
                 if stripped.startswith("- [ ] "):
                     body = stripped[6:]
                     new_line = f"- [x] {body} {green_check}\n"
                     new_lines.append(new_line)
                     changed = True
                     continue
-                # Match ``- [x] ...`` without a trailing green-check (legacy ticked)
                 if stripped.startswith("- [x] ") and not stripped.endswith(green_check):
                     body = stripped[6:]
                     new_line = f"- [x] {body} {green_check}\n"
@@ -1392,14 +1312,6 @@ class BacklogManager:
             canonical,
         )
 
-        # Issue #185 / spec 4.4.2 / AC-192-5: every transition into
-        # ``in-progress`` writes a ``[WU_CLAIMED]`` audit-comment row.
-        # Issue #192 / spec 4.4.7 / AC-192-6: when a named session is active
-        # (``session_name`` is provided), the comment is extended with
-        # ``session=<name>`` so the audit trail records which session
-        # performed the claim.
-        # Skips Stories / Features / Epics whose status is auto-rolled from
-        # children (no human ever claims those directly).
         if canonical == STATUS_IN_PROGRESS and "-T" in unit_id:
             claim_body = f"[WU_CLAIMED] Set {unit_id} to 'in-progress'"
             if session_name:
@@ -1413,14 +1325,6 @@ class BacklogManager:
         if canonical == STATUS_DONE:
             self._tick_completion_checkboxes(work_unit_path)
 
-        # Issue #162 Phase 2 (ADR-17): every task-state transition lands
-        # in a per-task aggregate JSON at
-        # ``<workspace>/.devbench/window-stats/<task-id>.json`` so the
-        # reporter can read aggregates instead of re-scanning the log.
-        # Single hook point: every public transition method routes
-        # through ``_set_status``, so this one call covers all of them.
-        # Stories / Features / Epics are skipped (their state is auto-
-        # rolled from children; window-stats only tracks tasks).
         if "-T" in unit_id:
             from datetime import UTC, datetime
 
@@ -1430,38 +1334,14 @@ class BacklogManager:
             update_aggregate(workspace_root, unit_id, canonical, datetime.now(UTC))
 
         if canonical in _TERMINAL_CHILD_STATUSES:
-            # Issue #147: every terminal transition (``done`` AND ``declined``)
-            # fires the auto-requeue cascade. Previously only ``mark_done``
-            # routed through here; ``mark_declined`` / ``force_status declined``
-            # silently skipped the scan, leaving downstream blocked tasks
-            # marooned. The idempotency guard prevents a redundant scan when
-            # the same target is set to the same terminal status twice in
-            # one process lifetime (e.g. via repeated ``set-status`` calls).
             cascade_key = (str(backlog_index), unit_id)
             if cascade_key not in self._cascade_fired_for:
                 self._cascade_fired_for.add(cascade_key)
-                # Auto-requeue reverse-dependents first so the rollup check
-                # that follows sees any freshly-unblocked children as
-                # non-terminal and correctly declines to promote the parent
-                # to done.
                 self._auto_requeue_marker_dependents(backlog_index, unit_id)
-                # Issue #208 follow-up: the marker cascade only covers tasks
-                # carrying a ``[BLOCKED_PENDING_PROPOSAL]`` marker. Tasks that
-                # landed in ``blocked`` via ``cmd_sync_blocked`` (regular
-                # Dependencies table, no marker) were marooned. The regular-dep
-                # cascade closes that gap.
                 self._auto_requeue_regular_dep_dependents(backlog_index, unit_id)
             if canonical == STATUS_DONE:
                 self._rollup_parent_status(backlog_index, unit_id)
 
-        # Operator-block Slack-gap spec F1 / F2: route the blocked-classification
-        # notification (and the leave-blocked cache invalidation) off this shared
-        # status-write surface so EVERY path that writes a status notifies, not
-        # only ``mark_blocked``.  This closes G1 -- the done-gate-refusal /
-        # orchestrator ``set-status blocked`` path now pages because the
-        # notification is keyed on the write, not the caller.  Best-effort and
-        # gated by the per-event toggle; runs LAST so a classify/notify/IO
-        # failure can never break or delay the status write itself.
         self._fire_status_transition_notifications(work_unit_path, backlog_index, unit_id, canonical)
 
     def _fire_status_transition_notifications(
@@ -1513,17 +1393,10 @@ class BacklogManager:
                 )
                 title = _extract_wu_title(work_unit_path, unit_id)
                 reason = self._latest_block_reason(work_unit_path, unit_id)
-                # Issue #207 + #209 + operator-block Slack-gap spec: the
-                # transition-aware dispatcher fires the right per-class
-                # ``notify_work_unit_blocked_*`` helper on every transition INTO
-                # a blocked class, deduped via the per-workspace cache so a unit
-                # that stays blocked across many writes pages only once.
                 notify_blocked_classification_transition(unit_id, title, reason, state.name, workspace_root)
             else:
                 invalidate_notification_state_for_unit(workspace_root, unit_id)
         except (OSError, ValueError, ImportError):
-            # Classifier / notifier / cache I/O failures must never break or
-            # delay the status write (best-effort notification contract).
             pass
 
     @staticmethod
@@ -1645,15 +1518,14 @@ class BacklogManager:
         for line in reversed(content.splitlines()):
             m = _CANONICAL_VERDICT_RE.match(line)
             if m is None:
-                continue  # not a canonical verdict line -- skip entirely
+                continue
             action = m.group("action")
             if action == "REVIEW_REJECTED":
-                break  # canonical round boundary -- prior round; stop
+                break
             if action == "REVIEW_PASS":
                 judge = m.group("judge")
                 if judge in required:
                     passed.add(judge)
-            # REVIEW_FAIL (or any other canonical action) -- do not count, do not reset
         return passed >= required
 
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:
@@ -1680,10 +1552,8 @@ class BacklogManager:
             return
 
         self.logger.info("All children of %s are done -- rolling up status", parent_id)
-        # _set_status: atomic write to both files; cascades via _rollup_parent_status.
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
-        # Write audit comment to parent work unit
         timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
         rollup_comment = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
@@ -1784,13 +1654,6 @@ class BacklogManager:
                 )
                 continue
 
-            # Issue #200 / AC-200-2: the trigger condition is relaxed to accept
-            # ``newly_done_id`` appearing EITHER in the declared Dependencies
-            # table OR as a ``[BLOCKED_PENDING_PROPOSAL]`` marker in the
-            # Comments section.  Previously only the dep-table path was checked,
-            # which silently skipped tasks where task-factory wired the dep via
-            # a marker-only reference (no Dependencies-table row), leaving them
-            # stuck in ``blocked`` after the marker target reached ``done``.
             content = candidate_file.read_text(encoding="utf-8")
             marker_ids = self._extract_pending_proposal_markers(candidate_file)
             if not marker_ids:
@@ -1809,10 +1672,6 @@ class BacklogManager:
                 sorted_markers,
             )
             self.force_status(candidate_file, backlog_index, row_id, STATUS_IN_QUEUE)
-            # Issue #153: emit ``[CASCADE_RESOLVED]`` so the status-detail
-            # panel renderer can supersede the earlier ``[BLOCKED]`` audit
-            # row. ``[AUTO_UNBLOCKED]`` is retained alongside for backward
-            # compatibility with operator tooling that already greps for it.
             self._append_agent_comment(
                 candidate_file,
                 "backlog_manager",
@@ -1878,7 +1737,6 @@ class BacklogManager:
                 )
                 continue
 
-            # Marker cascade owns marker-bearing candidates.
             if self._extract_pending_proposal_markers(candidate_file):
                 continue
 
@@ -1974,7 +1832,7 @@ class BacklogManager:
             if row_id == parent_id:
                 parent_found = True
                 if status == STATUS_DONE:
-                    return False  # Already done
+                    return False
                 continue
 
             if row_id.startswith(parent_id + "-") and row_id.count("-") == parent_depth + 1:
@@ -2016,7 +1874,6 @@ class BacklogManager:
         if not backlog_index.exists():
             raise FileNotFoundError(f"Backlog index not found: {backlog_index}")
 
-        # Build a case-insensitive lookup of recognized statuses
         recognized = {v.lower() for v in TABLE_STATUS_VALUES} | {v.lower() for v in VALID_STATUSES}
 
         content = backlog_index.read_text(encoding="utf-8")
@@ -2027,7 +1884,6 @@ class BacklogManager:
             if not line.strip().startswith("|"):
                 continue
             cells = line.split("|")
-            # Match the ID cell exactly (cells[0] is empty before first |)
             row_id = cells[1].strip() if len(cells) > 1 else ""
             if row_id != unit_id:
                 continue
@@ -2152,13 +2008,9 @@ class BacklogManager:
         next_section_idx = self._find_next_section_index(lines, tdd_heading_idx)
 
         if next_section_idx == -1:
-            # ## TDD Cycle Log is the last section -- append to EOF.
             content = content.rstrip("\n") + "\n\n" + entry
         else:
-            # Insert before the next ## heading, preserving exactly one blank
-            # line above the entry and exactly one blank line below it.
             before_next = lines[:next_section_idx]
-            # Strip trailing blank lines from the block before the next heading.
             while before_next and before_next[-1].strip() == "":
                 before_next.pop()
             new_lines = before_next + ["", entry.rstrip("\n"), "", lines[next_section_idx]]
@@ -2185,11 +2037,9 @@ class BacklogManager:
 
         content = backlog_index.read_text(encoding="utf-8")
 
-        # Remove any existing Status Summary section
         if STATUS_SUMMARY_SECTION_HEADER in content:
             content = self._strip_summary_section(content)
 
-        # Insert before the Full Work Unit Index heading
         full_index_marker = "## Full Work Unit Index"
         if full_index_marker in content:
             content = content.replace(
@@ -2279,7 +2129,6 @@ class BacklogManager:
     def _strip_summary_section(self, content: str) -> str:
         """Remove the existing Status Summary section from BACKLOG.md content."""
         without_summary = STRIP_SUMMARY_RE.sub("", content)
-        # Collapse any resulting triple+ blank lines to double blank lines
         return re.sub(r"\n{3,}", "\n\n", without_summary)
 
     def _check_status_summary(
@@ -2297,7 +2146,6 @@ class BacklogManager:
             )
             return
 
-        # Compute expected counts and parse the actual table
         epic_counts = self._compute_epic_counts(rows)
         actual_counts = self._parse_summary_table(content)
 
@@ -2338,12 +2186,6 @@ class BacklogManager:
             if not in_summary or not line.strip().startswith("|"):
                 continue
             cells = [c.strip() for c in line.split("|")]
-            # Splitting "|" around a pipe-delimited row produces empty flank
-            # cells, so a 6-data-column row yields 8 cells total, a
-            # 7-data-column row (with the Declined column) yields 9, and an
-            # 8-data-column row (with both Declined and Draft columns) yields
-            # 10. Both older shapes are accepted for backward compatibility;
-            # missing columns default to 0 until the backlog is regenerated.
             if len(cells) < 7:
                 continue
             row_id = cells[1]
@@ -2387,32 +2229,27 @@ class BacklogManager:
 
             wu_path = workspace_root / file_path_str
             if not wu_path.exists():
-                continue  # Already reported by _check_files_and_statuses
+                continue
 
             content = wu_path.read_text(encoding="utf-8")
             sections = self._extract_sections(content)
 
-            # Check 6: non-empty Description
             if "Description" not in sections:
                 errors.append(f"{row_id}: missing required '## Description' section")
             elif not sections["Description"].strip():
                 errors.append(f"{row_id}: '## Description' section is empty")
 
-            # Check 7: Acceptance Criteria with AC- items
             if "Acceptance Criteria" not in sections:
                 errors.append(f"{row_id}: missing required '## Acceptance Criteria' section")
             elif "AC-" not in sections["Acceptance Criteria"]:
                 errors.append(f"{row_id}: '## Acceptance Criteria' has no AC- items")
 
-            # Check 8: Changes Manifest with entries
             if "Changes Manifest" not in sections:
                 errors.append(f"{row_id}: missing required '## Changes Manifest' section")
 
-            # Check 9: Definition of Done
             if "Definition of Done" not in sections:
                 errors.append(f"{row_id}: missing required '## Definition of Done' section")
 
-            # Check 10: no em-dash (U+2014)
             if EM_DASH in content:
                 errors.append(f"{row_id}: contains em-dash character (U+2014) -- use double hyphen instead")
 
@@ -2450,7 +2287,7 @@ class BacklogManager:
 
             wu_path = workspace_root / file_path_str
             if not wu_path.exists():
-                continue  # already reported by _check_files_and_statuses
+                continue
 
             content = wu_path.read_text(encoding="utf-8")
             repo = self._extract_repo(content)
@@ -2471,12 +2308,6 @@ class BacklogManager:
                         f"see docs/backlog-contract.md."
                     )
 
-    # Language tier classification used by the source-test pair and
-    # language-AC-alignment rules. Mirrors docs/acceptance-criteria-canonical.md
-    # tier table. Production-source globs identify paths whose Python files
-    # require a sibling test entry in the same Manifest per
-    # docs/source-test-atomicity.md; the test-path globs are the matching
-    # locations the rule searches for that sibling.
     _PYTHON_EXTS: ClassVar[tuple[str, ...]] = (".py",)
     _NON_PY_EXTS_TO_TIER: ClassVar[dict[str, str]] = {
         ".hcl": "HCL",
@@ -2544,10 +2375,8 @@ class BacklogManager:
         """
         if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
             return False
-        # Exclude test files
         if path.startswith("tests/") or "/tests/" in path:
             return False
-        # Exclude package marker files
         from pathlib import PurePosixPath
 
         if PurePosixPath(path).name == "__init__.py":
@@ -2597,19 +2426,12 @@ class BacklogManager:
         for (repo, path), owners in ownership.items():
             if len(owners) < 2:
                 continue
-            # Filter to tasks not in done/declined/in-progress -- those are not
-            # in flight any more or are actively being executed; the conflict
-            # rule targets in-queue/proposed/blocked overlap.
             relevant = [(tid, st) for tid, st in owners if st in ("in-queue", "proposed", "blocked")]
             if len(relevant) < 2:
                 continue
-            # Check whether every pair is comparable via the transitive
-            # dep graph (any DAG that totally orders the set is sufficient).
             ids = [tid for tid, _ in relevant]
             if self._tasks_form_dep_chain(ids, deps_by_task):
                 continue
-            # Order the chain so an ``add``er of the shared path runs before any
-            # ``modify``/``delete``r of it (falls back to lexicographic).
             chain_ids = self._order_conflict_chain(ids, verbs_by_path.get((repo, path), {}))
             chain_hint = "\n".join(
                 f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(chain_ids)
@@ -2652,8 +2474,6 @@ class BacklogManager:
             ids = [tid for tid, _ in relevant]
             if self._tasks_form_dep_chain(ids, deps_by_task):
                 continue
-            # Order the chain so an ``add``er of the shared path runs before any
-            # ``modify``/``delete``r of it (falls back to lexicographic).
             chain_ids = self._order_conflict_chain(ids, verbs_by_path.get((repo, path), {}))
             chain_hint = "\n".join(
                 f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(chain_ids)
@@ -2715,9 +2535,6 @@ class BacklogManager:
             try:
                 manifest_rows = parse_manifest(content)
             except ManifestParseError:
-                # Other validate rules (TestValidateContent) emit the missing
-                # Manifest error; conflict detection treats unparseable
-                # Manifests as having zero entries to avoid duplicate noise.
                 manifest_rows = []
             for manifest_row in manifest_rows:
                 if not self._is_real_manifest_path(manifest_row.file):
@@ -2729,12 +2546,6 @@ class BacklogManager:
 
         return ownership, deps_by_task, verbs_by_path
 
-    # Leading-word verb families used to classify a Changes Manifest ``change``
-    # cell. The verb is the first whitespace-delimited token, matched
-    # case-insensitively; trailing description (e.g. ``add per-suite README``)
-    # is ignored. ``ADD`` means the task creates the path; ``EDIT`` means it
-    # modifies or deletes an existing path. Anything else is ``UNKNOWN`` and
-    # does not disambiguate the chain order.
     _MANIFEST_ADD_VERBS: frozenset[str] = frozenset({"add", "new", "create", "created"})
     _MANIFEST_EDIT_VERBS: frozenset[str] = frozenset(
         {
@@ -2769,7 +2580,6 @@ class BacklogManager:
         first = change.strip().split(maxsplit=1)
         if not first:
             return "unknown"
-        # Strip a trailing ``:`` so ``add:`` matches ``add`` (a real convention).
         word = first[0].rstrip(":").lower()
         if word in cls._MANIFEST_ADD_VERBS:
             return "add"
@@ -2816,20 +2626,16 @@ class BacklogManager:
                 continue
             if not stripped.startswith("|"):
                 continue
-            # `startswith("|")` guarantees at least 2 cells after split.
             cells = [c.strip() for c in stripped.split("|")]
             cell = cells[1]
             if not cell or cell.lower() == "id" or cell.startswith("-"):
                 continue
             if cell in DEPENDENCY_NONE_VALUES:
                 continue
-            # Cell may contain a comma-separated dep list
             for raw in cell.split(","):
                 token = raw.strip()
-                # Allow IDs with ":" suffix variants; keep core ID
                 if not token:
                     continue
-                # Validate against task-id shape
                 if re.fullmatch(r"E\d+(-F\d+)?(-S\d+)?(-T\d+)?", token):
                     deps.add(token)
         return deps
@@ -2899,13 +2705,8 @@ class BacklogManager:
                 continue
             tier = self._classify_manifest_tier(paths)
             if tier in ("", "Python", "Mixed"):
-                # Mixed tasks have at least one .py file -> Python ACs apply
-                # to that subset; do not emit warnings.
                 continue
 
-            # Walk AC-FINAL lines; for each Python-tier AC ID, require the
-            # N/A suffix unless the line is missing entirely (handled by
-            # other rules).
             for line in content.splitlines():
                 stripped = line.strip()
                 if not stripped.startswith("- ["):
@@ -2975,18 +2776,10 @@ class BacklogManager:
                         f"docs/backlog-contract.md 'Manifest Glob Rejection'."
                     )
 
-    # Words that betray a sentinel standing in for committable files (vs a
-    # no-op marker). Compiled once; matched only after the recognised-prefix
-    # exemption below, so a ``<decision-only: chose a template engine>`` row
-    # is never flagged for merely naming a keyword.
     _COMMITTABLE_SENTINEL_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"\b(files?|templates?|examples?)\b", re.IGNORECASE
     )
 
-    # The sanctioned no-op / undetermined sentinel families. Their exact forms
-    # live in ``devbench.backlog.sentinels.BACKLOG_SENTINEL_VALUES``; this tuple
-    # additionally exempts operator-defined per-task variants of the same family
-    # (e.g. ``<verification-only:E1-F1-S1-T2>``) from the committable-file rule.
     _RECOGNISED_NOOP_SENTINELS: ClassVar[tuple[str, ...]] = (
         "verification-only",
         "decision-only",
@@ -3113,12 +2906,6 @@ class BacklogManager:
                 source_stem = self._source_stem_for_pair_match(source_path)
                 if not source_stem:
                     continue
-                # A test pair is any `test_*.py` (or `*_test.py`) entry in the
-                # SAME Manifest whose basename contains the source stem as a
-                # substring. This accepts project naming conventions such as
-                # `test_telemetry_event.py` for `event.py`, while still
-                # catching the split-Manifest anti-pattern (where the test
-                # file lives in a sibling task's Manifest entirely).
                 has_pair = any(self._test_filename_pairs_with_stem(p, source_stem) for p in paths)
                 if not has_pair:
                     errors.append(
@@ -3129,37 +2916,16 @@ class BacklogManager:
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
 
-    # ------------------------------------------------------------------
-    # E209: Backlog-Contract Alignment hardening rules
-    # ------------------------------------------------------------------
-
     _REQUIRED_TASK_SECTIONS: ClassVar[tuple[str, ...]] = ("Status", "Dependencies", "Changes Manifest")
-    # Accepts the canonical Epic shape ``E\d+`` plus the test-harness
-    # convention ``EX``. Anything else (a free-text dep, a typo) fails
-    # the rule. Mirrors the ``EPIC_ID_RE`` shape in constants.py while
-    # adding the optional Feature/Story/Task suffixes.
     _DEP_ID_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?$")
 
-    # C7: canonical path-shape regexes for each unit type.
-    # A BACKLOG.md file-path cell must end with ``/<ID>.md`` where the
-    # basename matches the regex for the row's unit type.
-    # The patterns are anchored to match anywhere in the path so both
-    # flat (``backlog/E1-F1-S1-T1.md``) and nested
-    # (``backlog/.../E1-F1-S1-T1.md``) layouts are accepted.
-    # ``E[A-Z0-9]+`` (not ``E\d+``) mirrors ``_DEP_ID_PATTERN`` so
-    # test-harness IDs like ``EX-F1-S1-T1`` satisfy the regex.
     _EPIC_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+\.md$")
     _FEATURE_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+-F\d+\.md$")
     _STORY_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+-F\d+-S\d+\.md$")
     _TASK_PATH_RE: ClassVar[re.Pattern[str]] = re.compile(r"^backlog/.*E[A-Z0-9]+-F\d+-S\d+-T\d+\.md$")
 
-    # Regex to detect a multi-repo prefix in a manifest row file cell.
-    # Format: ``\`<repo>\` -- \`<path>\``` (the prefix is the first backtick group).
     _MANIFEST_REPO_PREFIX_RE: ClassVar[re.Pattern[str]] = re.compile(r"^`([^`]+)`\s+--\s+`[^`]+`$")
 
-    # Regex to extract the body of the ``## Changes Manifest`` section.
-    # Mirrors ``devbench.backlog.manifest._SECTION_RE`` but kept here so
-    # C3 can access it without importing a private symbol.
     _MANIFEST_SECTION_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"^(##\s+Changes Manifest\s*\n)(.*?)(?=^##\s|\Z)",
         re.MULTILINE | re.DOTALL,
@@ -3226,8 +2992,6 @@ class BacklogManager:
             content = wu_path.read_text(encoding="utf-8")
             match = STATUS_LINE_RE.search(content)
             if match is None:
-                # Missing status line is reported by _check_files_and_statuses;
-                # don't double-report here.
                 continue
             raw_status = match.group(2).strip().lower()
             if raw_status not in VALID_STATUSES:
@@ -3359,10 +3123,6 @@ class BacklogManager:
                     f"'Branch Uniqueness Rule'."
                 )
 
-    # Issue #117: the changes_manifest reviewer was passing work units whose
-    # Manifest still contained the placeholder row authors are supposed to
-    # replace. Catch the placeholder at validate-backlog time so the orchestrator
-    # never even claims the task; the executor cannot build atop a TBD manifest.
     _PLACEHOLDER_MANIFEST_RE: ClassVar[re.Pattern[str]] = re.compile(r"^TBD\b", re.IGNORECASE)
     _ACTIVE_TASK_STATUSES_FOR_PLACEHOLDER_CHECK: ClassVar[frozenset[str]] = frozenset(
         {STATUS_IN_QUEUE, STATUS_IN_PROGRESS, STATUS_BLOCKED}
@@ -3433,23 +3193,12 @@ class BacklogManager:
             if not cell or cell.startswith("-"):
                 continue
             if not seen_header:
-                # First non-separator row is the header; skip it.
                 seen_header = True
                 continue
             if cls._PLACEHOLDER_MANIFEST_RE.match(cell):
                 return cell
         return ""
 
-    # Rule 20: orphan path tokens in AC / DoD. The Manifest is the single
-    # source of truth for files a Task produces; AC / DoD that restate
-    # paths is redundancy that drifts. The check is gated by
-    # ``RUNTIME_CONFIG.validate.check_orphan_path_tokens`` so existing
-    # backlogs see no behaviour change until they opt in.
-    #
-    # Token regex: a single-backtick group whose body has no whitespace.
-    # The optional second group captures a trailing `` (ref)`` marker --
-    # an inline escape hatch declaring the token a read-only reference
-    # (e.g. an external config file the Task reads but does not modify).
     _ORPHAN_TOKEN_RE: ClassVar[re.Pattern[str]] = re.compile(r"`([^`\s]+)`(\s*\(ref\))?")
     _ORPHAN_PATH_EXTS: ClassVar[tuple[str, ...]] = (
         ".md",
@@ -3516,9 +3265,6 @@ class BacklogManager:
         for ext in cls._ORPHAN_PATH_EXTS:
             if lower.endswith(ext):
                 stem = token[: -len(ext)]
-                # Require a directory separator OR a real filename stem.
-                # Bare ``.md`` / ``.py`` / etc. (literal extension in prose)
-                # have an empty stem and MUST NOT be treated as paths.
                 return "/" in stem or bool(stem and any(c.isalnum() for c in stem))
         if any(token.startswith(p) for p in cls._ORPHAN_KNOWN_PREFIXES):
             return True
@@ -3607,7 +3353,6 @@ class BacklogManager:
         try:
             manifest_rows = parse_manifest(content)
         except ManifestParseError:
-            # Already reported by other rules; skip this task quietly.
             return
 
         repo = self._extract_repo(content)
@@ -3683,7 +3428,6 @@ class BacklogManager:
                 continue
             self._check_unit_verification_contract(row_id, wu_path, errors, route)
 
-    # Compiled once: AC id token and a generic markdown checkbox line.
     _AC_ID_RE: ClassVar[re.Pattern[str]] = re.compile(r"AC-[A-Za-z0-9-]+")
     _CHECKBOX_RE: ClassVar[re.Pattern[str]] = re.compile(r"^\s*-\s*\[[^\]]*\]\s*(.+)$")
 
@@ -3716,15 +3460,11 @@ class BacklogManager:
             errors.append(f"{row_id}: malformed '## Verification' directive: {exc}")
             return
 
-        # ACs that carry an executable-or-deferred VERIFY directive (i.e. provable
-        # or explicitly deferred). A judge-only directive does NOT cover an
-        # executable AC.
         covered: set[str] = set()
         for item in items:
             if item.is_executable() or item.vtype is VerificationType.DEFERRED:
                 covered.update(item.ac_ids)
 
-        # Finding 1 + collect the set of declared AC ids for Finding 2.
         existing_ac_ids: set[str] = set()
         for line in sections.get("Acceptance Criteria", "").splitlines():
             match = self._CHECKBOX_RE.match(line)
@@ -3745,7 +3485,6 @@ class BacklogManager:
                         f"docs/backlog-contract.md 'Verification Contract'."
                     )
 
-        # Finding 2: DoD items asserting runnable outcomes must trace to an AC.
         for line in sections.get("Definition of Done", "").splitlines():
             match = self._CHECKBOX_RE.match(line)
             if match is None:
@@ -3762,14 +3501,10 @@ class BacklogManager:
                     f"docs/backlog-contract.md 'Verification Contract'."
                 )
 
-    # Existence-assertion language in an AC: the line claims a concrete path
-    # must exist / resolve / be present (TDI-005 referential integrity).
     _EXISTENCE_ASSERTION_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"\b(exists?|resolves?|present|on disk|must point to|already (?:exists|present))\b",
         re.IGNORECASE,
     )
-    # External / out-of-repo carve-out signals on an AC line: a required path
-    # explicitly declared not-in-this-repo is an allowed resolution.
     _EXTERNAL_CARVEOUT_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"\b(external|out[- ]of[- ]repo|third[- ]party|pinned|upstream|published)\b",
         re.IGNORECASE,
@@ -3820,7 +3555,7 @@ class BacklogManager:
             try:
                 items = parse_verification_section(content)
             except ValueError:
-                continue  # malformed: reported by _check_verification_contract
+                continue
             repo = self._extract_repo(content)
             checkout_name: str | None = None
             if repo is not None and repo in RUNTIME_CONFIG.repos:
@@ -3960,7 +3695,7 @@ class BacklogManager:
             repo_cfg = RUNTIME_CONFIG.repos[repo]
             checkout_path = repo_cfg.resolved_checkout_path
             if checkout_path is None or not checkout_path.is_dir():
-                continue  # cannot assert absence without the checkout
+                continue
             self._check_unit_referential_integrity(
                 row_id, content, checkout_path, repo_cfg.checkout_directory, created, route
             )
@@ -3993,7 +3728,7 @@ class BacklogManager:
             acs = ", ".join(item.ac_ids)
             for operand in extract_command_paths(item.command):
                 if prefix is not None and (operand == bare or operand.startswith(prefix)):
-                    continue  # workspace-prefix smell -- reported by the path-contract check
+                    continue
                 required.append((f"VERIFY {acs}", operand))
 
         sections = self._extract_sections(content)
@@ -4031,10 +3766,6 @@ class BacklogManager:
                 f"carve-out (trailing ' (ref)'). See docs/backlog-contract.md 'AC Referential Integrity'."
             )
 
-    # ------------------------------------------------------------------
-    # C1/C3/C4/C6/C7: impossibility checks (issue #240a / AC-240-1)
-    # ------------------------------------------------------------------
-
     def _check_target_repo_resolves(
         self,
         rows: list[tuple[str, str, str]],
@@ -4063,11 +3794,11 @@ class BacklogManager:
                 continue
             wu_path = workspace_root / file_path_str
             if not wu_path.is_file():
-                continue  # already reported by _check_files_and_statuses
+                continue
             content = wu_path.read_text(encoding="utf-8")
             repo = self._extract_repo(content)
             if repo is None:
-                continue  # no Target Repository section; check does not apply
+                continue
             if repo not in RUNTIME_CONFIG.repos:
                 errors.append(
                     f"{row_id}: target repo {repo!r} is not recognised; "
@@ -4096,7 +3827,7 @@ class BacklogManager:
                 continue
             wu_path = workspace_root / file_path_str
             if not wu_path.is_file():
-                continue  # already reported by _check_files_and_statuses
+                continue
 
             content = wu_path.read_text(encoding="utf-8")
             match = self._MANIFEST_SECTION_RE.search(content)
@@ -4158,7 +3889,6 @@ class BacklogManager:
         Skips dep IDs that are not in the index at all (already reported by
         check 4) to avoid duplicate noise.
         """
-        # Build a map from id -> file_path for fast lookup
         id_to_path: dict[str, str] = {}
         for row_id, _, file_path_str in rows:
             if row_id and not row_id.startswith("-") and row_id.lower() != "id" and file_path_str:
@@ -4171,12 +3901,12 @@ class BacklogManager:
                 continue
             wu_path = workspace_root / file_path_str
             if not wu_path.is_file():
-                continue  # already reported by _check_files_and_statuses
+                continue
 
             content = wu_path.read_text(encoding="utf-8")
             for dep_id in self._iter_dep_ids(content):
                 if dep_id not in id_to_path:
-                    continue  # already reported by _check_dependencies (check 4)
+                    continue
                 dep_file_path = id_to_path[dep_id]
                 dep_wu_path = workspace_root / dep_file_path
                 if not dep_wu_path.is_file():
@@ -4243,7 +3973,7 @@ class BacklogManager:
                 continue
             wu_path = workspace_root / file_path_str
             if not wu_path.is_file():
-                continue  # already reported by _check_files_and_statuses
+                continue
 
             content = wu_path.read_text(encoding="utf-8")
             wu_title: str | None = None
@@ -4256,7 +3986,7 @@ class BacklogManager:
                 wu_title = heading_match.group(1).strip()
 
             if wu_title is None:
-                continue  # no parseable heading; not a C6 violation
+                continue
 
             index_title = index_titles[row_id].strip()
             if wu_title != index_title:
@@ -4290,7 +4020,6 @@ class BacklogManager:
             if not file_path_str:
                 continue
 
-            # Select the appropriate regex for the unit type
             if self._is_task_id(row_id):
                 expected_re = self._TASK_PATH_RE
                 unit_type_label = "Task"
@@ -4503,7 +4232,6 @@ class BacklogManager:
                 if current_name is not None:
                     sections[current_name] = "\n".join(current_lines)
                 heading = line[3:].strip()
-                # Handle "## Status: in-queue" -> key "Status"
                 current_name = heading.split(":")[0].strip()
                 current_lines = []
             elif current_name is not None:

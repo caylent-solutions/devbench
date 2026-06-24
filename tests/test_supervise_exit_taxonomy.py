@@ -39,18 +39,12 @@ class TestCleanOutcomes:
         assert outcome.exit_code == 0
 
     def test_bare_clean_exit_no_marker_is_clean(self) -> None:
-        # A child that exits 0 with NO terminal sentinel on the PTY is a bare clean
-        # process exit -> clean "all-done" (Section 4.6: 0 = clean). This is the
-        # fallthrough after the quota / non-zero-exit / clean-marker / fault-marker
-        # rules, exercised when the CLI exits silently.
         outcome = classify_supervise_outcome(marker=None, child_exitstatus=0)
         assert outcome.is_clean is True
         assert outcome.exit_code == 0
         assert outcome.exit_reason == "all-done"
 
     def test_clean_exit_unknown_exitstatus_is_clean(self) -> None:
-        # The child EOF was observed before the OS reaped it (exitstatus None) and no
-        # marker is present: still a bare clean exit (not a fault).
         outcome = classify_supervise_outcome(marker=None, child_exitstatus=None)
         assert outcome.is_clean is True
         assert outcome.exit_reason == "all-done"
@@ -105,9 +99,6 @@ class TestFaultOutcomes:
         assert outcome.exit_reason == "quota-resume-cap-exhausted"
 
     def test_progress_stall_restart_cap_exhausted_is_fault(self) -> None:
-        # The progress watchdog tripped, the loop restarted within the budget, but
-        # the stall recurred past supervise.restart.max_attempts: a classified
-        # non-zero fault (design point 3), distinct from the exit-42 restart-cap.
         from devbench.supervise import _OUTCOME_MARKER_PROGRESS_STALL_CAP
 
         outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_PROGRESS_STALL_CAP, child_exitstatus=None)
@@ -117,8 +108,6 @@ class TestFaultOutcomes:
         assert outcome.exit_reason == "progress-stall-restart-cap-exhausted"
 
     def test_clean_marker_but_nonzero_child_exit_is_fault(self) -> None:
-        # ALL_DONE marker but the child still exited non-zero: a clean sentinel
-        # cannot launder a non-zero process exit (defense in depth).
         outcome = classify_supervise_outcome(marker="ALL_DONE", child_exitstatus=5)
         assert outcome.is_clean is False
         assert outcome.exit_code == SUPERVISE_FAULT_EXIT_CODE
@@ -133,8 +122,6 @@ class TestQuotaIsNotAnExit:
         outcome = classify_supervise_outcome(marker="quota_limit", child_exitstatus=None)
         assert outcome.is_quota is True
         assert outcome.is_clean is False
-        # exit_code is None: quota never exits (the caller transitions to
-        # quota-waiting instead of returning an exit code).
         assert outcome.exit_code is None
         assert outcome.exit_reason == "quota-waiting"
 
@@ -144,9 +131,6 @@ class TestOutcomeIsValueObject:
     """SuperviseOutcome is a value object: same inputs classify to equal outcomes."""
 
     def test_same_inputs_are_equal(self) -> None:
-        # A frozen dataclass derives value equality; two clean ALL_DONE outcomes
-        # compare equal, proving the classifier is deterministic and the result is
-        # a comparable value object (not an identity-based holder).
         first = classify_supervise_outcome(marker="ALL_DONE", child_exitstatus=0)
         second = classify_supervise_outcome(marker="ALL_DONE", child_exitstatus=0)
         assert first == second

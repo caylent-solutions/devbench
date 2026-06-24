@@ -37,7 +37,6 @@ class TestSuperviseRegistration:
         assert isinstance(desc, str)
 
     def test_supervise_is_variadic(self) -> None:
-        # The sub-verb + flags need raw argv -- it must own its parsing.
         assert "supervise" in cli._VARIADIC_COMMANDS
 
     def test_help_lists_all_six_subverbs(self) -> None:
@@ -69,12 +68,10 @@ class TestSuperviseSubverbDispatch:
         assert rc == 2
         err = capsys.readouterr().err
         assert "frobnicate" in err
-        assert "start" in err  # usage lists the valid sub-verbs
+        assert "start" in err
 
     @pytest.mark.parametrize("sub", ["status", "info"])
     def test_readonly_subverb_lists_empty_registry(self, sub: str, tmp_path) -> None:
-        # status/info are read-only listings (Phase 4): on an empty registry they
-        # are routed and return 0 (NOT "unknown", NOT NotImplementedError).
         from unittest.mock import patch
 
         with (
@@ -88,8 +85,6 @@ class TestSuperviseSubverbDispatch:
     def test_implemented_subverb_fails_fast_on_missing_session(
         self, sub: str, tmp_path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # stop/restart are now implemented; with no matching session they fail
-        # fast (exit 2), never a silent success.
         from unittest.mock import patch
 
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
@@ -104,7 +99,6 @@ class TestSuperviseNameValidation:
 
     @pytest.mark.parametrize("name", ["default", "nightly", "fast-1", "A_b-2"])
     def test_valid_names_accepted(self, name: str) -> None:
-        # Should not raise.
         cli._validate_supervise_name(name)
 
     @pytest.mark.parametrize("name", ["", "-leading", "_under", "has space", "a/b", "..", "../x", "a..b"])
@@ -127,8 +121,6 @@ class TestSuperviseArgParsing:
         assert args.effort is None
         assert args.hard is False
         assert args.screen is False
-        # --billing-mode is unset on the parsed args (resolved later, flag > env >
-        # config > default); an unset flag is None so the resolver can fall through.
         assert args.billing_mode is None
 
     def test_billing_mode_flag_parsed(self) -> None:
@@ -187,19 +179,16 @@ class TestSuperviseSubverbFailFast:
     """
 
     def test_invalid_name_through_dispatch_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
-        # A bad --name is caught before any body runs and surfaces as exit 2.
         rc = cli.cmd_supervise("start", "--name", "../escape")
         assert rc == 2
         assert "invalid session name" in capsys.readouterr().err
 
     def test_unknown_flag_through_dispatch_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
-        # An unknown flag surfaces as exit 2 (caught during arg parsing).
         rc = cli.cmd_supervise("start", "--bogus")
         assert rc == 2
         assert "unknown flag" in capsys.readouterr().err
 
     def test_attach_screen_gated_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
-        # Phase 2: attach --screen is fail-fast-disabled (AC-33) until DI-4.
         rc = cli.cmd_supervise("attach", "--name", "nightly", "--screen")
         assert rc == 2
         assert "--screen attach is not enabled" in capsys.readouterr().err

@@ -19,7 +19,6 @@ class TestSetupLogging:
     def setup_method(self) -> None:
         """Reset the configured flag before each test."""
         log_setup_mod._state[0] = False
-        # Clear root handlers
         logging.getLogger().handlers.clear()
 
     def test_creates_log_directory(self, tmp_path: Path) -> None:
@@ -53,9 +52,6 @@ class TestSetupLogging:
         assert "StreamHandler" in handler_types
         assert "FileHandler" in handler_types
 
-        # `type(h).__name__ == "StreamHandler"` matches *only* the base StreamHandler
-        # (not FileHandler, which inherits from it). Use isinstance + exact type check
-        # so mypy narrows `handler` to StreamHandler and can see the `.stream` attribute.
         stream_handlers = [
             h for h in root.handlers if isinstance(h, logging.StreamHandler) and type(h) is logging.StreamHandler
         ]
@@ -82,7 +78,6 @@ class TestSetupLogging:
         test_logger = logging.getLogger("test.write")
         test_logger.info("Hello from test")
 
-        # Flush handlers
         for handler in logging.getLogger().handlers:
             handler.flush()
 
@@ -262,9 +257,7 @@ class TestPerSessionLogRouting:
             os.environ.pop("DEVBENCH_SESSION_NAME", None) if session_env_value is None else None
             log_setup_mod.setup_logging()
 
-        # Only the aggregate FileHandler should exist; no session-scoped handler
         file_handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
-        # Should have exactly 1 FileHandler (the aggregate log, not a session log)
         session_dir_path = str(tmp_path / SESSION_SESSIONS_BASE_DIR)
         session_handlers = [h for h in file_handlers if session_dir_path in h.baseFilename]
         assert session_handlers == [], (

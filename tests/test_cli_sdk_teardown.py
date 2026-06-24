@@ -93,8 +93,6 @@ class TestSdkTeardownFilterNotPresent:
 
     def test_sdk_teardown_filter_module_file_does_not_exist(self) -> None:
         """AC-255-1: src/devbench/sdk_teardown_filter.py must not exist."""
-        # Resolve from this test file's location up to the repo root,
-        # then to the production module path.
         repo_root = Path(__file__).parent.parent
         module_path = repo_root / "src" / "devbench" / "sdk_teardown_filter.py"
         assert not module_path.exists(), (
@@ -104,7 +102,6 @@ class TestSdkTeardownFilterNotPresent:
 
     def test_sdk_teardown_filter_not_importable(self) -> None:
         """AC-255-1: importing devbench.sdk_teardown_filter must raise ModuleNotFoundError."""
-        # Remove from sys.modules if a prior test somehow populated it.
         sys.modules.pop("devbench.sdk_teardown_filter", None)
         spec = importlib.util.find_spec("devbench.sdk_teardown_filter")
         assert spec is None, (

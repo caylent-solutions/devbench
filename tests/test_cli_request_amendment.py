@@ -18,11 +18,6 @@ import pytest
 from devbench import cli
 from devbench.backlog.amendment import request_path
 
-# ---------------------------------------------------------------------------
-# Shared fixture content
-# ---------------------------------------------------------------------------
-
-
 BACKLOG_INDEX_TEMPLATE = """\
 # Backlog
 
@@ -112,21 +107,11 @@ def _normal_payload(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-# ---------------------------------------------------------------------------
-# Variadic dispatch: request-amendment is in _VARIADIC_COMMANDS
-# ---------------------------------------------------------------------------
-
-
 class TestRequestAmendmentIsVariadic:
     """request-amendment must appear in _VARIADIC_COMMANDS so --operator-mode is passed through."""
 
     def test_variadic_commands_includes_request_amendment(self) -> None:
         assert "request-amendment" in cli._VARIADIC_COMMANDS
-
-
-# ---------------------------------------------------------------------------
-# Normal (non-operator) mode: unchanged behaviour
-# ---------------------------------------------------------------------------
 
 
 class TestRequestAmendmentNormalMode:
@@ -168,13 +153,7 @@ class TestRequestAmendmentNormalMode:
         with patch("devbench.cli.WORKSPACE_ROOT", workspace):
             cli.cmd_request_amendment("EX-F1-S1-T1")
         wu_content = (workspace / "backlog" / "EX-F1-S1-T1.md").read_text(encoding="utf-8")
-        # Manifest row for new_parser.py must NOT appear (not yet applied)
         assert "new_parser.py" not in wu_content
-
-
-# ---------------------------------------------------------------------------
-# Operator mode: --operator-mode bypasses in-progress gate
-# ---------------------------------------------------------------------------
 
 
 class TestRequestAmendmentOperatorModeBypassesInProgressGate:
@@ -222,15 +201,9 @@ class TestRequestAmendmentOperatorModeBypassesInProgressGate:
         ):
             rc = cli.cmd_request_amendment("EX-F1-S1-T1", "--operator-mode")
         assert rc == 0, capsys.readouterr().err
-        # No pending request written -- it was applied synchronously
         from devbench.backlog.amendment import request_path as _rp
 
         assert not _rp(workspace, "EX-F1-S1-T1").exists()
-
-
-# ---------------------------------------------------------------------------
-# Operator mode: synchronous apply
-# ---------------------------------------------------------------------------
 
 
 class TestRequestAmendmentOperatorModeAppliesSynchronously:
@@ -253,7 +226,6 @@ class TestRequestAmendmentOperatorModeAppliesSynchronously:
         ):
             rc = cli.cmd_request_amendment("EX-F1-S1-T1", "--operator-mode")
         assert rc == 0, capsys.readouterr().err
-        # Pending request file must NOT exist -- applied synchronously
         assert not request_path(workspace, "EX-F1-S1-T1").exists()
 
     def test_operator_mode_adds_file_to_manifest(
@@ -293,11 +265,6 @@ class TestRequestAmendmentOperatorModeAppliesSynchronously:
         ):
             rc = cli.cmd_request_amendment("EX-F1-S1-T1", "--operator-mode")
         assert rc == 0, capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# Operator mode: audit marker
-# ---------------------------------------------------------------------------
 
 
 class TestRequestAmendmentOperatorModeAuditMarker:
@@ -343,11 +310,6 @@ class TestRequestAmendmentOperatorModeAuditMarker:
         assert "rc=0" in wu_content
 
 
-# ---------------------------------------------------------------------------
-# Operator mode: Layer-3 post-check is executed
-# ---------------------------------------------------------------------------
-
-
 class TestRequestAmendmentOperatorModeLayer3:
     """Layer-3 post-check runs; if it fails the WU is restored and rc=1."""
 
@@ -359,11 +321,8 @@ class TestRequestAmendmentOperatorModeLayer3:
     ) -> None:
         """The em-dash post-check fires if the patch content contains U+2014."""
         workspace = _build_workspace(tmp_path, status="blocked")
-        # Inject em-dash into the WU content directly to trigger the em-dash check
         wu_path = workspace / "backlog" / "EX-F1-S1-T1.md"
         original = wu_path.read_text(encoding="utf-8")
-        # Patch the task file to already contain an em-dash before the amendment --
-        # the post-check sees it and must reject
         wu_path.write_text(original + "\n\u2014 em-dash line\n", encoding="utf-8")
         payload = _operator_payload()
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
@@ -399,11 +358,6 @@ class TestRequestAmendmentOperatorModeLayer3:
         assert content_after == content_before
 
 
-# ---------------------------------------------------------------------------
-# Operator mode: output JSON
-# ---------------------------------------------------------------------------
-
-
 class TestRequestAmendmentOperatorModeOutput:
     """cmd_request_amendment in operator mode prints a JSON summary to stdout."""
 
@@ -427,11 +381,6 @@ class TestRequestAmendmentOperatorModeOutput:
         assert out["task_id"] == "EX-F1-S1-T1"
         assert out["status"] == "applied"
         assert out["operator_mode"] is True
-
-
-# ---------------------------------------------------------------------------
-# Operator mode: invalid payload is rejected
-# ---------------------------------------------------------------------------
 
 
 class TestRequestAmendmentOperatorModeInvalidPayload:
@@ -477,11 +426,6 @@ class TestRequestAmendmentOperatorModeInvalidPayload:
         assert rc == 1
         captured = capsys.readouterr()
         assert "ERROR:" in captured.err
-
-
-# ---------------------------------------------------------------------------
-# Parametrize: all seven new patch fields round-trip through operator mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

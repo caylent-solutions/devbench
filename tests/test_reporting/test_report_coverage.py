@@ -165,7 +165,6 @@ class TestParseTranscriptMetricsEdgeLines:
         tdir = tmp_path / "transcripts"
         tdir.mkdir()
         tfile = tdir / "a.jsonl"
-        # blank, malformed json, out-of-window entry, in-window entry
         in_window = (
             '{"timestamp": "2030-01-01T00:00:00Z", "attributionAgent": "devbench-orchestrate:executor", '
             '"message": {"usage": {"input_tokens": 7}, "id": "new"}}\n'
@@ -178,7 +177,6 @@ class TestParseTranscriptMetricsEdgeLines:
             encoding="utf-8",
         )
         out = _parse_transcript_metrics_by_role(tdir, datetime(2025, 1, 1, tzinfo=UTC))
-        # Only the in-window entry is bucketed.
         assert "executor" in out
         assert out["executor"].input_tokens == 7
 
@@ -217,11 +215,9 @@ class TestParseHookLogMetricsEdgeLines:
             '{"timestamp": "2030-01-01T00:00:00Z", "input": {"tool_response": {"totalDurationMs": 100}}}\n',
             encoding="utf-8",
         )
-        # log_path's parent.parent is tmp_path -- hook_log_path resolves there.
         log_path = hook_dir / "orchestrator.log"
         log_path.write_text("", encoding="utf-8")
         result = _parse_hook_log_metrics(log_path, datetime(2025, 1, 1, tzinfo=UTC))
-        # Only the in-window entry contributes 100ms.
         assert result.total_duration_ms == 100
 
 
@@ -241,7 +237,6 @@ class TestRecentPerTaskCostFallbackPath:
             "E1-F1-S1-T1": datetime(2025, 1, 1, 0, 30, 0, tzinfo=UTC),
             "E1-F1-S1-T2": datetime(2025, 1, 1, 1, 30, 0, tzinfo=UTC),
         }
-        # With n=2 and event_index=None, function takes the fallback branch.
         result = _recent_per_task_cost(
             log_path=log,
             done_times=done_times,
@@ -249,7 +244,6 @@ class TestRecentPerTaskCostFallbackPath:
             n=2,
             event_index=None,
         )
-        # No hook log present -> no cost data -> per-task cost is 0.0
         assert result == pytest.approx(0.0)
 
 
@@ -265,7 +259,6 @@ class TestFormatDuration:
     """Line 1071: hours < 24 branch."""
 
     def test_hours_under_one_day(self) -> None:
-        # 2h 30m -> 2h 30m
         assert _format_duration(2 * 3600 + 30 * 60) == "2h 30m"
 
 
@@ -287,7 +280,7 @@ class TestReadLastLogTimestamp:
 
     def test_seeks_when_file_larger_than_tail_buffer(self, tmp_path: Path) -> None:
         log = tmp_path / "log"
-        big_blob = ("x" * 100 + "\n") * 1000  # ~101KB
+        big_blob = ("x" * 100 + "\n") * 1000
         log.write_text(
             big_blob + "2025-01-01T00:00:00Z [judges.executor] INFO last line\n",
             encoding="utf-8",
@@ -338,7 +331,6 @@ class TestRenderGroupedProgressTableEmptySections:
             sections=sections,
         )
         joined = "\n".join(lines)
-        # EMPTY section's label must NOT appear because its rows list is empty.
         assert "EMPTY" not in joined
         assert "STATE" in joined
 
@@ -421,9 +413,6 @@ class TestBacklogTotalsExceptionBranches:
     def test_classify_exception_routes_to_operator_action_required(self, tmp_path: Path) -> None:
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-        # Create a single BLOCKED task that the classifier will fail to
-        # classify.  ``_backlog_totals_from_units`` reads BACKLOG_ROOT /
-        # BACKLOG_INDEX; mock classify_blocked_task to raise.
         wu_file = tmp_path / "wu.md"
         wu_file.write_text("status: blocked\n", encoding="utf-8")
         u = WorkUnit(
@@ -515,8 +504,6 @@ class TestClassifyBlockedUnitIntoBucketsHeldAndUnhandled:
             file_path=wu_file,
             repo="r",
         )
-        # A sentinel string is not a BlockedTaskState member -- the
-        # else-branch fires.
         auto: list = []
         amend: list = []
         dep: list = []

@@ -58,28 +58,10 @@ logger = logging.getLogger(__name__)
 
 AMENDMENT_DIR_NAME = ".devbench/amendments"
 REJECTED_REQUESTS_DIR_NAME = ".devbench/rejected-requests"
-# Issue #154 (v1, deprecated): per-task feedback log written on every
-# manifest-amender rejection at ``.devbench/amender-rejections/<task-id>-<n>.json``.
-# Issue #156 (v2, current): unified path for every review judge AND the
-# amender at ``.devbench/review-failures/<task-id>-<judge>-<n>.json``. The
-# legacy directory name is preserved as a forward-compat read path -- the
-# executor-feedback collector still reads it -- but new writes always go to
-# REVIEW_FAILURES_DIR_NAME.
 AMENDER_REJECTIONS_DIR_NAME = ".devbench/amender-rejections"
 REVIEW_FAILURES_DIR_NAME = ".devbench/review-failures"
-#: Amendment reason for repairing an objectively-defective ``## Verification``
-#: directive (stale assertion superseded by a DONE unit, syntactic bug, or
-#: identifier rename landed by a DONE sibling). Config-gated by
-#: ``manifest_amendment.allow_verification_directive_amendments``.
 REASON_VERIFICATION_DIRECTIVE_DEFECT: str = "verification_directive_defect"
 
-#: Executor-facing amendment reason for removing a Changes Manifest row whose
-#: file a DONE sibling renamed/deleted (a row the executor cannot otherwise
-#: clear, deterministically re-failing git-ops). Config-gated by
-#: ``manifest_amendment.allow_manifest_row_superseded_amendments``. Deterministic
-#: guards require the row's file ABSENT on disk, every cited unit ``done``, and
-#: the staged diff not touching the removed path; never removes a row whose file
-#: still exists.
 REASON_MANIFEST_ROW_SUPERSEDED: str = "manifest_row_superseded"
 
 ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset(
@@ -90,22 +72,15 @@ ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset(
     }
 )
 
-#: Audit-comment action tag written when a verification-directive amendment is applied.
 VERIFICATION_AMENDMENT_ACTION: str = "VERIFICATION_AMENDMENT"
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
 OPERATOR_AMENDMENT_ACTION = "OPERATOR_AMENDMENT"
-#: Audit-comment action tag written when an amendment removes a stale Changes
-#: Manifest row (a row whose file a DONE sibling renamed/deleted). The tag
-#: names the removed row(s) so the audit trail is actionable.
 MANIFEST_ROW_REMOVED_ACTION = "MANIFEST_ROW_REMOVED"
 AMENDER_AGENT_ID = "agent/manifest-amender"
 OPERATOR_AGENT_ID = "operator"
 COMMENTS_SECTION_HEADER = "## Comments"
 
-# Issue #154: canonical taxonomy of amender-rejection categories. The
-# blocker-resolver / executor-feedback consumer keys retry decisions off
-# these values, so the literal strings are part of the contract.
 AMENDER_REJECTION_CATEGORIES: frozenset[str] = frozenset(
     {
         "SCOPE",
@@ -246,7 +221,6 @@ class AmendmentRequest:
     justification: str
     files_to_add: list[AmendmentFileEntry]
     linked_acs: list[str]
-    # Operator-mode fields (Appendix D-7)
     operator_mode: bool = False
     files_to_remove: list[str] = dataclass_field(default_factory=list)
     target_repository: str = ""
@@ -255,11 +229,7 @@ class AmendmentRequest:
     title_patch: str = ""
     dod_patch: str = ""
     section_patches: dict[str, str] = dataclass_field(default_factory=dict)
-    # Verification-directive amendment fields
     verification_patches: list[VerificationPatch] = dataclass_field(default_factory=list)
-    # Manifest-row-superseded amendment fields (executor self-removal of a
-    # row a DONE sibling renamed/deleted). Only valid (and required) when
-    # ``reason`` is ``manifest_row_superseded``.
     manifest_row_superseded_claims: list[ManifestRowSupersededClaim] = dataclass_field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -305,7 +275,6 @@ class AmendmentRequest:
         if not justification:
             raise ValueError("justification must be a non-empty string")
 
-        # Operator-mode fields (Appendix D-7)
         operator_mode = _parse_operator_mode(data)
         files_to_remove = _parse_files_to_remove(data)
         target_repository = _parse_string_field(data, "target_repository")
@@ -342,11 +311,6 @@ def _require_keys(data: dict[str, Any], keys: list[str]) -> None:
     missing = [k for k in keys if k not in data]
     if missing:
         raise ValueError(f"missing required field(s): {', '.join(missing)}")
-
-
-# ---------------------------------------------------------------------------
-# Operator-mode field parsers (Appendix D-7)
-# ---------------------------------------------------------------------------
 
 
 def _parse_operator_mode(data: dict[str, Any]) -> bool:
@@ -632,7 +596,6 @@ def apply_amendment(
     except ValueError as exc:
         raise AmendmentError(f"Amendment contains invalid manifest row: {exc}") from exc
 
-    # Remove stale rows first (fail-fast before any write when a path is absent).
     working_content = _apply_files_to_remove(original_content, request)
 
     try:
@@ -890,10 +853,8 @@ def apply_operator_amendment(backlog_index: Path, task_id: str, request: Amendme
 
     working_content = original_content
 
-    # Remove stale rows first (fail-fast before any write when a path is absent).
     working_content = _apply_files_to_remove(working_content, request)
 
-    # Apply files_to_add rows when present.
     if request.files_to_add:
         try:
             manifest_rows = [ManifestRow(file=f.path, change=f.change) for f in request.files_to_add]
@@ -904,7 +865,6 @@ def apply_operator_amendment(backlog_index: Path, task_id: str, request: Amendme
         except ManifestParseError as exc:
             raise AmendmentError(f"Cannot apply operator amendment: {exc}") from exc
 
-    # Run Layer-3 post-check and capture its result code.
     timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
     audit_rc = 0
     try:
@@ -964,18 +924,7 @@ def reject_amendment(
     updated = _append_audit_comment(content, audit_entry)
     atomic_write_text(wu_file, updated)
 
-    # Issue #210: write the rejected-requests archive + rejection-feedback JSON
-    # BEFORE calling mark_blocked.  mark_blocked runs classify_blocked_task
-    # inline; the classifier's AWAITING_AMENDMENT_RECOVERY signal is the
-    # presence of the archive on disk.  Pre-fix the writes happened AFTER
-    # mark_blocked, so the classifier saw no recovery signal and fell through
-    # to OPERATOR_ACTION_REQUIRED -- the wrong per-class Slack toggle fired.
     archive_rejected_request(workspace_root, task_id)
-    # Issue #154: persist the rejection feedback so the executor-feedback
-    # collector / blocker-resolver can ingest it on the next retry. The
-    # JSON is bounded to ``MAX_RETRY_ATTEMPTS`` files per task -- once the
-    # budget is exhausted the executor will not be re-invoked anyway, so
-    # the cap is an upper bound, never a silently dropped record.
     persist_rejection_feedback(
         workspace_root=workspace_root,
         task_id=task_id,
@@ -1042,8 +991,6 @@ def persist_rejection_feedback(
         ],
         "raw_verdict_text": rejection_reason,
         "capped": capped,
-        # Preserve original-shape fields that downstream consumers (and tests
-        # written for issue #154) still inspect alongside the new schema.
         "reason_category": category_code,
         "reason_text": rejection_reason,
         "request": request.to_dict(),
@@ -1100,11 +1047,6 @@ def _categorise_rejection_reason(rejection_reason: str) -> str:
     return "OTHER"
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
 def _resolve_task_file(backlog_index: Path, task_id: str) -> Path:
     """Resolve a task ID to its work-unit Markdown file path.
 
@@ -1121,8 +1063,6 @@ def _resolve_task_file(backlog_index: Path, task_id: str) -> Path:
 
     for unit in units:
         if unit.id == task_id:
-            # BacklogParser.parse_work_unit_file has already verified the file exists,
-            # so unit.file_path is guaranteed to be on disk when we reach this point.
             return unit.file_path
 
     raise AmendmentError(f"Task {task_id} not found in backlog index {backlog_index}")
@@ -1203,11 +1143,6 @@ def _post_check(content: str, backlog_index: Path) -> None:
         raise AmendmentError(
             f"Post-check: backlog integrity violated after amendment ({len(errors)} error(s)): " + "; ".join(errors)
         )
-
-
-# ---------------------------------------------------------------------------
-# Layer 1 deterministic pre-filter
-# ---------------------------------------------------------------------------
 
 
 class PreFilter:

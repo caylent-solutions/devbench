@@ -76,7 +76,6 @@ class TestWriteSessionScope:
             backlog_ids=["E1-F1-S1-T1"],
         )
         data = json.loads(session_scope_file_path(tmp_path, "n").read_text(encoding="utf-8"))
-        # The ScopeFilter.to_file canonical schema (Section 5.6).
         for key in ("include", "exclude", "expanded_ids", "started_at", "started_by"):
             assert key in data
         assert expanded == sorted(expanded)

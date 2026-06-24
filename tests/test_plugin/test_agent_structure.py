@@ -62,7 +62,6 @@ class TestReviewSupervisorFrontmatter:
         """
         content = self._SUPERVISOR_PATH.read_text()
 
-        # Extract frontmatter block between --- delimiters
         lines = content.splitlines()
         assert lines[0].strip() == "---", "review-supervisor.md must start with --- frontmatter delimiter"
 
@@ -395,7 +394,6 @@ class TestReviewerJsonEnvelope:
         agent_path = REVIEW_TEAM_DIR / agent_filename
         content = agent_path.read_text()
 
-        # Verify the prompt states the JSON envelope is the last thing output
         assert re.search(
             r"last\s+(thing|content|output)\b",
             content,
@@ -409,11 +407,6 @@ _SKILL_PATH = (
 
 _REVIEW_TEAM_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "review_team"
 
-# ADR-28: reviewers are dispatched by their REGISTERED namespaced slug. Claude
-# Code namespaces a plugin sub-agent by its agents/ subdirectory, so a file at
-# ``agents/review_team/<name>.md`` registers as
-# ``devbench-orchestrate:review_team:<name>`` -- NOT the flat
-# ``devbench-orchestrate:<name>`` form.
 _REVIEW_TEAM_AGENT_TYPES = [
     "devbench-orchestrate:review_team:code-reviewer",
     "devbench-orchestrate:review_team:test-reviewer",
@@ -666,7 +659,6 @@ class TestSkillIacReviewConditionalDispatch:
         content = self._SKILL_PATH.read_text()
         heading_pos = content.find("7b.")
         assert heading_pos >= 0
-        # The iac dispatch region (between 7b and step 8).
         next_step_pos = content.find("\n8. ", heading_pos)
         region = content[heading_pos:next_step_pos] if next_step_pos > heading_pos else content[heading_pos:]
         assert "DEVBENCH_REVIEW_ROUND_TOKEN" not in region, (
@@ -809,7 +801,6 @@ class TestExecutorNoLiteralEmDashGuidance:
     """
 
     _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
-    # Built from an escape so this test file itself never embeds a literal U+2014.
     _EM_DASH = chr(0x2014)
 
     def test_executor_prompt_has_no_literal_em_dash(self) -> None:
@@ -927,7 +918,6 @@ class TestExecutorPreFlightAndAmendmentScope:
         """Amendment-scope tightening must forbid pulling unrelated dirty files into an amendment."""
         content = self._EXECUTOR_PATH.read_text().lower()
         assert "amendment" in content, "executor.md must reference amendments."
-        # The key rule: do not include pre-existing pollution in an amendment request.
         assert "pre-existing" in content or "unrelated" in content, (
             "executor.md amendment section must explicitly forbid including pre-existing / unrelated "
             "dirty files in an amendment request."
@@ -950,8 +940,6 @@ class TestBlockerResolverAffectedTaskIdsInstruction:
     def test_blocker_resolver_describes_evidence_rubric(self) -> None:
         """The prompt must tell the agent what evidence qualifies a peer for the field."""
         content = self._BLOCKER_RESOLVER_PATH.read_text().lower()
-        # Evidence rubric keywords -- at least one of these three must appear near
-        # the affected_task_ids discussion so the agent doesn't speculate.
         assert "evidence" in content, "blocker-resolver.md must require evidence before populating affected_task_ids"
         assert "same failing test" in content or "same production file" in content, (
             "blocker-resolver.md must list concrete shared-blocker evidence examples"
@@ -961,7 +949,6 @@ class TestBlockerResolverAffectedTaskIdsInstruction:
         """The prompt must warn against listing source_task_id itself in affected_task_ids."""
         content = self._BLOCKER_RESOLVER_PATH.read_text()
         assert "source_task_id" in content and "affected_task_ids" in content
-        # Look for the "do not list source" directive somewhere in the same file.
         lowered = content.lower()
         assert "do not list" in lowered or "must not appear" in lowered or "do not speculate" in lowered, (
             "blocker-resolver.md must instruct the agent not to list source_task_id or speculate"
@@ -1094,7 +1081,6 @@ class TestNoAgentFrontmatterPinsHaiku:
         content = agent_path.read_text(encoding="utf-8")
         model_value = _extract_frontmatter_model(content)
         if model_value is None:
-            # No model line in frontmatter -- acceptable, uses SDK default.
             return
         assert "haiku" not in model_value.lower(), (
             f"{agent_path.name}: frontmatter declares 'model: {model_value}'. "

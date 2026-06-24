@@ -103,8 +103,6 @@ class TestParseResetAt:
         assert waiter.parse_reset_at("You've hit your limit") is None
 
     def test_invalid_hour_returns_none(self) -> None:
-        # A pattern with a custom reset_at regex that captures an out-of-range
-        # hour (13) -> parse_reset_at rejects it (fail-fast on bad input).
         from dataclasses import replace
 
         from devbench.supervise import DetectionPatterns
@@ -138,12 +136,9 @@ class TestQuotaWaitDelegatesAndRecovers:
 
         decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=0)
 
-        # The wait was delegated with the configured cadence + window.
         assert waited == [(reset_at, 60, 18000)]
-        # A checkpoint was persisted so the expected-resume survives a restart.
         assert len(saved) == 1
         assert saved[0].reset_at == reset_at
-        # The decision permits a resume (still under cap) and is NOT a fault exit.
         assert decision.action is QuotaDecision.RESUME
         assert decision.expected_resume == reset_at
 
@@ -151,8 +146,6 @@ class TestQuotaWaitDelegatesAndRecovers:
         waiter = _waiter(wait_recovered=False, max_resumes=3)
         reset_at = datetime.now(UTC) + timedelta(hours=1)
         decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=0)
-        # A timed-out wait does not recover -> the caller keeps waiting (still
-        # never a non-zero exit). action is WAIT (not RESUME, not FAULT).
         assert decision.action is QuotaDecision.WAIT
 
 
@@ -169,15 +162,11 @@ class TestQuotaResumeCapBound:
     def test_resume_at_cap_is_fault(self) -> None:
         waiter = _waiter(wait_recovered=True, max_resumes=2)
         reset_at = datetime.now(UTC) + timedelta(hours=1)
-        # resumes_used == cap: a further resume would exceed the bound -> the only
-        # fault path quota has (Section 4.9: quota-resume-cap-exhausted).
         decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=2)
         assert decision.action is QuotaDecision.FAULT
         assert decision.exit_reason == "quota-resume-cap-exhausted"
 
     def test_cap_checked_before_wait(self) -> None:
-        # When the cap is already exhausted the waiter must NOT even start a wait
-        # (no point waiting when no resume is permitted afterwards).
         waited: list = []
         waiter = _waiter(wait_recovered=True, max_resumes=1, waited=waited)
         reset_at = datetime.now(UTC) + timedelta(hours=1)
@@ -209,17 +198,12 @@ class TestQuotaWaitDisabledInBedrockMode:
         )
         reset_at = datetime.now(UTC) + timedelta(hours=1)
         decision = waiter.wait_and_decide(reset_at=reset_at, resumes_used=0)
-        # The 5-hour subscription wait must NOT have been delegated.
         assert waited == []
-        # No subscription checkpoint was persisted.
         assert saved == []
-        # It fails fast (a quota window does not exist for Bedrock) rather than
-        # looping; the SDK path's Bedrock throttle handling is the real mechanism.
         assert decision.action is QuotaDecision.FAULT
         assert decision.exit_reason == "quota-wait-disabled-bedrock"
 
     def test_subscription_mode_still_engages_wait(self) -> None:
-        # Guard against a regression that disables the wait in subscription mode.
         waited: list = []
         waiter = _waiter(
             wait_recovered=True,
@@ -239,7 +223,6 @@ class TestInSessionWaitChoice:
 
     def test_offers_in_session_choice_when_prompt_matches(self) -> None:
         waiter = _waiter()
-        # The default quota_wait_prompt regex matches "wait ... reset".
         assert waiter.is_in_session_wait_prompt("Press 1 to wait for the reset") is True
 
     def test_no_in_session_choice_when_prompt_absent(self) -> None:

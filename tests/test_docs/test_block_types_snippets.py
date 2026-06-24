@@ -55,8 +55,6 @@ def _compile_snippet(snippet: str) -> re.Pattern[str]:
     return re.compile(combined, re.IGNORECASE)
 
 
-# -- Positive cases: derived from the production regex -----------------------
-
 _POSITIVE_CASES: list[tuple[str, str]] = [
     ("amendment-reject", "kebab-case base form"),
     ("Amendment-reject", "kebab-case title-case (IGNORECASE)"),
@@ -67,7 +65,6 @@ _POSITIVE_CASES: list[tuple[str, str]] = [
     ("dep bar not yet terminal", "dependency short form"),
 ]
 
-# -- Negative cases ----------------------------------------------------------
 
 _NEGATIVE_CASES: list[tuple[str, str]] = [
     ("unrelated blocked reason", "unrelated text"),
@@ -172,7 +169,6 @@ class TestRecoveryBodyRePatternTable:
     def test_line_reference_matches_production(self) -> None:
         """Verify the heading line reference matches the actual line in proposal.py."""
         doc_text = BLOCK_TYPES_DOC.read_text(encoding="utf-8")
-        # The heading should reference the correct line number
         assert "(line 221)" in doc_text, (
             "The _RECOVERY_BODY_RE heading must reference line 221 (current production line in proposal.py)"
         )

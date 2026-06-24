@@ -7,13 +7,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
-# Set required env vars before any devbench modules are imported.
-# config.py raises RuntimeError at import time if DEVBENCH_WORKSPACE_ROOT is unset.
 os.environ.setdefault("DEVBENCH_CLAUDE_MODEL", "test-model")
 os.environ.setdefault("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
 os.environ.setdefault("DEVBENCH_LOG_FILE", "/tmp/judges-test-orchestrator.log")
-# Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
-# from the YAML repos section (the only supported source).
 os.environ.setdefault(
     "DEVBENCH_CONFIG_PATH",
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
@@ -87,7 +83,6 @@ def tmp_repo_dir(tmp_path: Path) -> Path:
         capture_output=True,
         check=True,
     )
-    # Create initial commit
     readme = repo_dir / "README.md"
     readme.write_text("# Test Repo\n")
     subprocess.run(
@@ -102,15 +97,12 @@ def tmp_repo_dir(tmp_path: Path) -> Path:
         capture_output=True,
         check=True,
     )
-    # Ensure branch is called "main" regardless of system git defaults
     subprocess.run(
         ["git", "branch", "-M", "main"],
         cwd=repo_dir,
         capture_output=True,
         check=True,
     )
-    # Set up origin so _get_default_branch() works: point origin at self,
-    # fetch to create origin/main, then write origin/HEAD symref.
     subprocess.run(
         ["git", "remote", "add", "origin", repo_dir.as_posix()],
         cwd=repo_dir,
@@ -149,8 +141,6 @@ def mock_backlog_index(tmp_path: Path) -> Path:
     index_path = tmp_path / "BACKLOG.md"
     index_path.write_text(content)
 
-    # Create the work-unit files referenced by the index so parse_index can
-    # delegate to parse_work_unit_file for each row.
     backlog_dir = tmp_path / "backlog"
     backlog_dir.mkdir(exist_ok=True)
     _work_units = [
@@ -227,18 +217,6 @@ def fresh_config(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
         yield _config
     finally:
         importlib.reload(_config)
-
-
-# ---------------------------------------------------------------------------
-# TD-8: every collected test gets a marker.
-#
-# The pyproject's ``[tool.pytest.ini_options].markers`` registry defines
-# ``unit`` and ``functional``. Files under ``tests/test_integration/``
-# default to ``functional``; everything else defaults to ``unit``. Tests
-# that already declare a marker explicitly (via ``@pytest.mark.<name>``
-# at function/class level OR ``pytestmark`` at module level) keep that
-# marker -- the hook is purely additive.
-# ---------------------------------------------------------------------------
 
 
 def pytest_configure(config: pytest.Config) -> None:

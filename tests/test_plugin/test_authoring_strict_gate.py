@@ -52,11 +52,6 @@ def _section(text: str, heading: str) -> str:
     return text[idx:nxt] if nxt != -1 else text[idx:]
 
 
-# ---------------------------------------------------------------------------
-# G1 -- checkbox AC form mandated in spec-to-backlog
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestG1CheckboxACForm:
     """G1: spec-to-backlog mandates the registerable ``- [ ] AC-N:`` checkbox form."""
@@ -91,11 +86,6 @@ class TestG1CheckboxACForm:
         assert "FAIL" in rubric and "- [ ] AC-N:" in rubric, (
             "The checkbox-AC rubric item must specify the `- [ ] AC-N:` form and a FAIL condition."
         )
-
-
-# ---------------------------------------------------------------------------
-# G2 -- deterministic strict gate (keystone)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -160,11 +150,6 @@ class TestG2DeterministicStrictGate:
         )
 
 
-# ---------------------------------------------------------------------------
-# G3 -- verb-aware serial-dep injection (adds-before-modifies)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestG3VerbAwareSerialDep:
     """G3: serial-dep injection is verb-aware (adds-before-modifies)."""
@@ -215,11 +200,6 @@ class TestG3VerbAwareSerialDep:
             "spec-to-backlog SKILL.md must keep the positional fallback for when verbs do not "
             "disambiguate (all-modify / multiple-adders) (G3)."
         )
-
-
-# ---------------------------------------------------------------------------
-# create-spec C1/C2/C3
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -281,22 +261,10 @@ class TestCreateSpecC1C2C3:
         )
 
 
-# ---------------------------------------------------------------------------
-# AC-6 -- both skills remain domain-agnostic
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestSkillsRemainDomainAgnostic:
     """AC-6: the G*/C* edits introduce no coupling to a specific stack, repo, or workspace."""
 
-    # Tokens that would indicate coupling to a concrete workspace/domain. The
-    # generic execution-verb vocabulary the skills already ship (terraform,
-    # pytest, make, ...) is domain-neutral and intentionally NOT listed here.
-    # NOTE: pre-existing worked-example tokens (e.g. the illustrative
-    # ``tools-telemetry`` TDI-001 example) predate this change set; AC-6 forbids
-    # *new* coupling, so this list is checked against the lines this change set
-    # ADDED, not the whole file -- see test_edits_introduce_no_new_coupling.
     _FORBIDDEN_DOMAIN_TOKENS = (
         "tools-telemetry",
         "telemetry-collector",

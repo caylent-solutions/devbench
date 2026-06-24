@@ -31,19 +31,11 @@ from coverage import Coverage
 
 pytestmark = pytest.mark.unit
 
-#: Floor used by the gate (mirrors the Makefile ``--fail-under`` value).
 _FLOOR = 98
-#: 440 of 449 statements covered -> 97.9955% which rounds to 98.00% at
-#: precision 2: the exact "rounds up to the floor" boundary that triggered the
-#: misleading pytest-cov FAIL message while the gate decision was a pass.
 _TOTAL_STATEMENTS = 449
 _COVERED_AT_BOUNDARY = 440
-#: Well below the floor: 400 of 449 -> ~89%, an unambiguous failure.
 _COVERED_BELOW = 400
 
-#: Substrings that indicate a failure was reported in the gate output. Includes
-#: both coverage.py's CLI phrasing and pytest-cov's, so the boundary test fails
-#: loudly if either ever emits a failure line on a passing run.
 _FAILURE_MARKERS = ("Coverage failure", "FAIL ", "not reached")
 
 
@@ -90,11 +82,8 @@ def test_gate_at_rounds_up_boundary_passes_with_no_failure_line(tmp_path: Path) 
     result = _run_gate(data_file, tmp_path)
     combined = result.stdout + result.stderr
 
-    # The displayed total is exactly the floor at precision 2.
     assert "98.00%" in combined
-    # Decision: pass.
     assert result.returncode == 0
-    # Message: no failure line, so the printed output matches the exit code.
     for marker in _FAILURE_MARKERS:
         assert marker not in combined
 

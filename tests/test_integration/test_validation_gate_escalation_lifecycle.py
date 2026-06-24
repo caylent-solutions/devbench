@@ -307,7 +307,6 @@ class TestValidationGateEscalationIndependentOfAmendmentPath:
         assert proposal_path.is_file()
         proposal_json = proposal_path.read_text()
 
-        # Schema fields required for task-factory consumption:
         assert "source_task_id" in proposal_json
         assert "generated_at" in proposal_json
         assert "rejection_reason" in proposal_json

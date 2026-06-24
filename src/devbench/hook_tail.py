@@ -38,12 +38,6 @@ from devbench.config import (
     HOOK_TAIL_TOOL_WIDTH,
 )
 
-# ---------------------------------------------------------------------------
-# Formatting constants. Single source of truth; tests import from here so
-# layout drift breaks loudly.
-# ---------------------------------------------------------------------------
-
-# Event -> two-char glyph. Identical to the bash hooktail script's mapping.
 EVENT_LABELS: dict[str, str] = {
     "PreToolUse": "->",
     "PostToolUse": "<-",
@@ -57,12 +51,6 @@ EVENT_LABELS: dict[str, str] = {
     "Notification": "No",
 }
 
-# Column-width / truncation caps. Resolved env > YAML > default at module
-# import time via devbench.config (issue #134); operators tune these in
-# `backlog/config/devbench.yaml` under `hook_tail:`. Defaults: 12 / 8 / 120 /
-# 80. EVENT_WIDTH stays a plain constant -- the arrow column is intrinsic to
-# the format (`->`, `<-`, `+s`, `-s`, `!!`, `U>`, `Cp`, `P?`, `No`) and 2
-# chars is the only sensible width.
 AGENT_WIDTH = HOOK_TAIL_AGENT_WIDTH
 TOOL_WIDTH = HOOK_TAIL_TOOL_WIDTH
 DESCRIPTION_MAX = HOOK_TAIL_DESCRIPTION_MAX
@@ -71,15 +59,12 @@ EVENT_WIDTH = 2
 POLL_SECONDS_DEFAULT = 0.25
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
 
-# ANSI SGR color codes. Named so call sites stay readable.
 _ANSI_RESET = "\033[0m"
 _ANSI_GRAY = "\033[90m"
 _ANSI_CYAN = "\033[36m"
 _ANSI_YELLOW = "\033[33m"
 _ANSI_GREEN = "\033[32m"
 
-# Sentinels surfaced when the corresponding field is missing or malformed.
-# Explicit constants so operators can grep for them across a long run.
 _MISSING_TIMESTAMP = "--:--:--"
 _MISSING_EVENT = "?"
 _DEFAULT_AGENT = "orch"
@@ -93,11 +78,6 @@ class InvalidTimezoneError(ValueError):
     Separate from ``ZoneInfoNotFoundError`` so callers don't have to import
     the zoneinfo module to handle the failure.
     """
-
-
-# ---------------------------------------------------------------------------
-# Timezone resolution
-# ---------------------------------------------------------------------------
 
 
 def resolve_timezone(name: str | None):
@@ -143,11 +123,6 @@ def timezone_display(tz) -> tuple[str, str]:
     iana = getattr(tz, "key", None) or str(tz)
     abbrev = datetime.now(tz).strftime("%Z") or iana
     return iana, abbrev
-
-
-# ---------------------------------------------------------------------------
-# Row formatter
-# ---------------------------------------------------------------------------
 
 
 def _pad(width: int, value: str) -> str:
@@ -275,24 +250,15 @@ def format_entry(entry: dict, tz, *, color: bool = True) -> str:
     return line
 
 
-# ---------------------------------------------------------------------------
-# Tail-follow loop
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class FollowOptions:
     """Config bundle for ``follow``. Frozen so tests can't accidentally mutate."""
 
-    tz: object  # tzinfo
+    tz: object
     from_start: bool = False
     no_follow: bool = False
     color: bool = True
     poll_seconds: float = POLL_SECONDS_DEFAULT
-    # Phase 11 (E230): when set, hook-tail emits ONLY events whose
-    # ``orchestrator_session`` field equals this value. Enables the
-    # orchestrator pane to filter out tool calls fired by side-pane
-    # Claude sessions sharing the same DEVBENCH_WORKSPACE_ROOT.
     orchestrator_session_id: str | None = None
 
 
@@ -391,11 +357,9 @@ def _follow_loop(path: Path, options: FollowOptions, output: TextIO) -> int:
                     output.flush()
                 continue
 
-            # Empty readline -> EOF as of this moment.
             if options.no_follow:
                 return 0
 
-            # Check for rotation: a new file at the same path means reopen.
             new_inode = _current_inode(path)
             if new_inode is not None and new_inode != inode:
                 handle.close()
@@ -406,11 +370,6 @@ def _follow_loop(path: Path, options: FollowOptions, output: TextIO) -> int:
             time.sleep(options.poll_seconds)
     finally:
         handle.close()
-
-
-# ---------------------------------------------------------------------------
-# Header helpers (used by cli.cmd_hook_tail)
-# ---------------------------------------------------------------------------
 
 
 def render_header(path: Path, tz, *, color: bool = True) -> str:

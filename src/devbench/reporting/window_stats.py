@@ -43,14 +43,8 @@ _log = logging.getLogger("devbench.reporting.window_stats")
 
 WINDOW_STATS_DIR_NAME = ".devbench/window-stats"
 
-# Bump whenever the on-disk aggregate schema changes incompatibly.
-# A version mismatch on read yields an empty aggregate; the next
-# update_aggregate call writes the new schema verbatim.
 _SCHEMA_VERSION = 1
 
-# Match the orchestrator's structured state-transition log line. The
-# format is fixed by ``BacklogManager._set_status``:
-#     YYYY-MM-DDTHH:MM:SSZ [...] Set <id> to '<status>' in both work-unit ...
 _TRANSITION_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (?P<task_id>E\S+) to '(?P<status>[^']+)'",
     re.MULTILINE,
@@ -181,9 +175,6 @@ def rebuild_from_log(workspace_root: Path, log_path: Path) -> int:
     aggregates: dict[str, TaskAggregate] = {}
     for match in _TRANSITION_RE.finditer(text):
         task_id = match.group("task_id")
-        # Only persist task-level transitions. Story / Feature / Epic IDs
-        # also trip the regex (they share the ``E<...>`` prefix) but their
-        # rollup state is auto-derived; we don't track them in window-stats.
         if "-T" not in task_id:
             continue
         status = match.group("status")

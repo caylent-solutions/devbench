@@ -192,7 +192,6 @@ class TestStep7dSerialDepWiring:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # Must have some language indicating success is blocked while conflict remains
         blocks_premature_success = (
             "must not" in lower
             or "do not" in lower
@@ -214,8 +213,6 @@ class TestStep7dSerialDepWiring:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # The auto-injection step is documented in Step 5 under "Dependency wiring"
-        # Step 7d should reference the existing mechanism rather than inventing new logic
         references_existing_mechanism = (
             "auto-inject" in lower or "step 5" in lower or "existing" in lower or "dep" in lower
         )
@@ -236,7 +233,6 @@ class TestStep7dTwoTaskFixtureRegressionShape:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # The section must describe the scenario that drives the regression
         has_conflict_scenario = (
             "same" in lower
             or "conflict" in lower
@@ -255,7 +251,6 @@ class TestStep7dTwoTaskFixtureRegressionShape:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # The step must describe that the strict check fails before wiring
         reports_initial_failure = (
             "non-zero" in lower or "fail" in lower or "error" in lower or "conflict found" in lower
         )
@@ -270,7 +265,6 @@ class TestStep7dTwoTaskFixtureRegressionShape:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # The step must describe that the check passes after wiring
         reports_pass_after_wiring = (
             "rc=0" in section
             or "passes" in lower
@@ -289,7 +283,6 @@ class TestStep7dTwoTaskFixtureRegressionShape:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # The step must describe that the later task in the ordering gets the dep
         has_ordering_language = (
             "later" in lower
             or "earlier" in lower
@@ -314,7 +307,6 @@ class TestStep7dValidateBacklogStrictSemantics:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # The strict flag escalates draft/hold conflicts from warning to error
         has_escalation_language = "error" in lower or "strict" in lower or "escalat" in lower
         assert has_escalation_language, (
             "ERROR: spec-to-backlog/SKILL.md Step 7d must note that '--strict' "
@@ -345,7 +337,6 @@ class TestStep7dValidateBacklogStrictSemantics:
         content = _read_skill()
         section = _extract_step7d(content)
         lower = section.lower()
-        # Must gate success on the strict check being clean
         gates_success = "rc=0" in section or "zero" in lower or "clean" in lower or "passes" in lower or "only" in lower
         assert gates_success, (
             "ERROR: spec-to-backlog/SKILL.md Step 7d must gate success on the "

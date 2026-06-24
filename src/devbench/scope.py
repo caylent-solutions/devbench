@@ -34,7 +34,6 @@ from devbench.constants import SESSION_SESSIONS_BASE_DIR
 
 logger = logging.getLogger(__name__)
 
-# Subdirectory under the workspace root where devbench state files live.
 _DEVBENCH_SUBDIR = ".devbench"
 _SCOPE_FILENAME = "scope.json"
 
@@ -47,11 +46,6 @@ class InvalidScopeError(ValueError):
     The error message includes the offending token and the expected order so the
     caller can surface an actionable diagnostic.
     """
-
-
-# ---------------------------------------------------------------------------
-# Public path resolver
-# ---------------------------------------------------------------------------
 
 
 def resolve_scope_file_path(workspace_root: Path) -> Path:
@@ -105,11 +99,6 @@ def session_scope_file_path(workspace_root: Path, session_name: str) -> Path:
             "Use a simple alphanumeric name without directory traversal."
         )
     return workspace_root / SESSION_SESSIONS_BASE_DIR / session_name / _SCOPE_FILENAME
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _scope_file_path(workspace_root: Path) -> Path:
@@ -194,19 +183,15 @@ def _expand_token(token: str, backlog_ids: list[str]) -> set[str]:
     """
     _validate_token(token)
     parts = token.split("-")
-    # Detect range: last two parts share the same letter prefix (E/F/S/T)
-    # but differ in their integer value.
     if len(parts) >= 2:
         last = parts[-1]
         second_last = parts[-2]
         last_letter = _letter_prefix(last)
         second_last_letter = _letter_prefix(second_last)
         if last_letter and last_letter == second_last_letter:
-            # Both segments are the same type -- this is a range token.
             start_num = _numeric_suffix(second_last)
             end_num = _numeric_suffix(last)
             if start_num is None or end_num is None:
-                # Not numeric; treat as single-ID
                 pass
             else:
                 if end_num < start_num:
@@ -229,7 +214,6 @@ def _expand_token(token: str, backlog_ids: list[str]) -> set[str]:
                     )
                 return matched
 
-    # Single-ID token (no range detected or only one segment).
     result = _expand_prefix(token, backlog_ids)
     if not result:
         logger.warning(
@@ -273,7 +257,6 @@ def _letter_prefix(segment: str) -> str | None:
     while i < len(segment) and segment[i].isalpha():
         i += 1
     if i == 0 or i == len(segment):
-        # All letters (no trailing number) or no letters at all
         return None
     return segment[:i]
 
@@ -297,11 +280,6 @@ def _numeric_suffix(segment: str) -> int | None:
     return int(tail)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ScopeFilter:
     """Compiled scope filter ready for membership checks.
@@ -319,10 +297,6 @@ class ScopeFilter:
     include: list[str]
     exclude: list[str]
     expanded_ids: set[str] = field(default_factory=set)
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
 
     @classmethod
     def parse(cls, include_str: str, exclude_str: str, backlog_ids: list[str]) -> ScopeFilter:
@@ -351,16 +325,13 @@ class ScopeFilter:
         include_tokens = _tokenise(include_str)
         exclude_tokens = _tokenise(exclude_str)
 
-        # Build the include set
         if include_tokens:
             include_set: set[str] = set()
             for tok in include_tokens:
                 include_set |= _expand_token(tok, backlog_ids)
         else:
-            # Empty include means "all"
             include_set = set(backlog_ids)
 
-        # Build the exclude set and subtract
         exclude_set: set[str] = set()
         for tok in exclude_tokens:
             exclude_set |= _expand_token(tok, backlog_ids)
@@ -372,10 +343,6 @@ class ScopeFilter:
             exclude=exclude_tokens,
             expanded_ids=expanded,
         )
-
-    # ------------------------------------------------------------------
-    # Membership check
-    # ------------------------------------------------------------------
 
     def allows(self, unit_id: str) -> bool:
         """Return ``True`` when ``unit_id`` is within this scope.
@@ -389,10 +356,6 @@ class ScopeFilter:
             ``True`` iff ``unit_id`` is in ``expanded_ids``.
         """
         return unit_id in self.expanded_ids
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
 
     def to_file(self, workspace_root: Path, *, path: Path | None = None) -> Path:
         """Write this filter to ``<workspace_root>/.devbench/scope.json``.
@@ -509,11 +472,6 @@ class ScopeFilter:
         scope_path = path if path is not None else _scope_file_path(workspace_root)
         with contextlib.suppress(FileNotFoundError):
             scope_path.unlink()
-
-
-# ---------------------------------------------------------------------------
-# Private utilities
-# ---------------------------------------------------------------------------
 
 
 def _current_user() -> str:

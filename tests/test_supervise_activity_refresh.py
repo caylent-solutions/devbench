@@ -51,12 +51,10 @@ class TestEventLoopInvokesOnActivity:
     """The loop fires on_activity when it observes ongoing working activity."""
 
     def test_on_activity_called_on_working_activity(self) -> None:
-        # Two working-activity reads, then a clean terminal: on_activity must fire
-        # for the ongoing-work reads (not only on the terminal transition).
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="esc to interrupt"),  # working activity 1
-                _ScriptStep(emit="esc to interrupt"),  # working activity 2
+                _ScriptStep(emit="esc to interrupt"),
+                _ScriptStep(emit="esc to interrupt"),
                 _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )

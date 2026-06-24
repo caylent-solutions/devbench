@@ -14,10 +14,6 @@ import pytest
 
 from devbench.backlog.manager import BacklogManager
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 _INDEX_HEADER = (
     "# Backlog\n\n"
     "## Full Work Unit Index\n\n"
@@ -57,11 +53,6 @@ def _build_fixture(
     index = tmp_path / "BACKLOG.md"
     index.write_text(_INDEX_HEADER + "\n".join(rows) + "\n", encoding="utf-8")
     return index, tmp_path
-
-
-# ---------------------------------------------------------------------------
-# 2-node marker-cycle tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -126,11 +117,6 @@ class TestMarkerCycleTwoNode:
         assert any("marker cycle" in e for e in errors)
 
 
-# ---------------------------------------------------------------------------
-# 3-node (N-node) marker-cycle tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestMarkerCycleNNode:
     """validate() reports N-node marker cycles in arrow form, reported once."""
@@ -147,13 +133,10 @@ class TestMarkerCycleNNode:
             },
         )
         errors = BacklogManager()._check_marker_cycles(index, ws)
-        # The cycle should use arrow form and wrap back to start
         cycle_errors = [e for e in errors if "marker cycle" in e]
         assert len(cycle_errors) == 1, f"Expected 1 N-node error; got: {errors}"
         assert "<->" not in cycle_errors[0], "3-node cycle must use arrow form, not <->"
         assert "->" in cycle_errors[0], f"3-node cycle must use arrow form; got: {cycle_errors[0]}"
-        # The message must wrap back (last token == first node in chain)
-        # e.g. "marker cycle: A -> B -> C -> A"
         msg = cycle_errors[0]
         parts = msg.replace("marker cycle: ", "").split(" -> ")
         assert parts[0] == parts[-1], f"Arrow cycle must close: {parts}"
@@ -188,11 +171,6 @@ class TestMarkerCycleNNode:
         assert any("marker cycle" in e for e in errors)
 
 
-# ---------------------------------------------------------------------------
-# No-cycle / edge-case tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestMarkerCycleNegative:
     """validate() does not raise spurious marker-cycle errors."""
@@ -225,7 +203,6 @@ class TestMarkerCycleNegative:
             marker_map={"E1-F1-S1-T1": ["E9-F9-S9-T9"]},
         )
         errors = BacklogManager()._check_marker_cycles(index, ws)
-        # No crash; no cycle reported (the target is not in the index)
         assert not any("marker cycle" in e for e in errors)
 
     def test_missing_index_no_crash(self, tmp_path: Path) -> None:
@@ -257,7 +234,6 @@ class TestMarkerCycleNegative:
         """
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
-        # T2 has the marker in ## Description, not ## Comments -- must be ignored
         t2_content = (
             "# E1-F1-S1-T2: Title\n\n"
             "## Status: in-queue\n\n"
@@ -265,7 +241,6 @@ class TestMarkerCycleNegative:
             "[BLOCKED_PENDING_PROPOSAL] E1-F1-S1-T3\n\n"
             "## Comments\n\n"
         )
-        # T3 has the marker in ## Comments -- included
         t3_content = (
             "# E1-F1-S1-T3: Title\n\n## Status: in-queue\n\n## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E1-F1-S1-T2\n"
         )
@@ -279,15 +254,12 @@ class TestMarkerCycleNegative:
             encoding="utf-8",
         )
         errors = BacklogManager()._check_marker_cycles(index, tmp_path)
-        # T2 -> T3 edge is absent (marker in Description); T3 -> T2 edge exists.
-        # No cycle possible with only one directed edge.
         assert not any("marker cycle" in e for e in errors)
 
     def test_indexed_but_missing_wu_file_no_crash(self, tmp_path: Path) -> None:
         """An indexed unit whose work-unit file does not exist is treated as having no markers."""
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
-        # Only T2 file exists on disk; T1 is indexed but absent.
         (backlog_dir / "E1-F1-S1-T2.md").write_text(
             "# E1-F1-S1-T2: Title\n\n## Status: in-queue\n\n## Comments\n\n",
             encoding="utf-8",
@@ -301,11 +273,6 @@ class TestMarkerCycleNegative:
         )
         errors = BacklogManager()._check_marker_cycles(index, tmp_path)
         assert not any("marker cycle" in e for e in errors)
-
-
-# ---------------------------------------------------------------------------
-# Duplicate-cycle deduplication -- branch 975->983
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -342,8 +309,6 @@ class TestMarkerCycleDuplicateDeduplication:
             unit_ids=["E1-F1-S1-T1", "E1-F1-S1-T2"],
             marker_map={},
         )
-        # Inject a multigraph: T2 has two edges to T1, so the DFS back-edge
-        # fires twice for the same (T1, T2) cycle during T2's neighbour loop.
         injected_graph = {
             "E1-F1-S1-T1": ["E1-F1-S1-T2"],
             "E1-F1-S1-T2": ["E1-F1-S1-T1", "E1-F1-S1-T1"],

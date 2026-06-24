@@ -22,10 +22,6 @@ from devbench.backlog.proposal import (
     remove_dep,
 )
 
-# ---------------------------------------------------------------------------
-# Shared workspace helpers (mirrors test_proposal_add_dep.py conventions)
-# ---------------------------------------------------------------------------
-
 _BACKLOG_HEADER = (
     "# Backlog\n\n"
     "## Status Summary\n\n"
@@ -102,11 +98,6 @@ def _task_file(workspace: Path, task_id: str) -> Path:
     return workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / f"{task_id}.md"
 
 
-# ---------------------------------------------------------------------------
-# (a) removes a dep-table row
-# ---------------------------------------------------------------------------
-
-
 class TestRemoveDepRemovesRow:
     """remove_dep deletes the blocker's Dependencies-table row from the blocked file."""
 
@@ -140,7 +131,6 @@ class TestRemoveDepRemovesRow:
         backlog_root = workspace / "backlog"
         backlog_index = workspace / "BACKLOG.md"
 
-        # T1 depends on both T2 and T3.
         add_dep(
             backlog_root=backlog_root,
             backlog_index=backlog_index,
@@ -164,14 +154,7 @@ class TestRemoveDepRemovesRow:
 
         assert _dep_row_has_task(blocked_file, "E0-F1-S1-T2") is False
         assert _dep_row_has_task(blocked_file, "E0-F1-S1-T3") is True
-        # The remaining-table must NOT have collapsed to the placeholder row.
         assert "| none |" not in blocked_file.read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# (b) closes the marker so it is no longer seen as open + reverse add_dep
-#     no longer reports a cycle
-# ---------------------------------------------------------------------------
 
 
 class TestRemoveDepClosesMarker:
@@ -243,7 +226,6 @@ class TestRemoveDepClosesMarker:
             blocked_task_id="E0-F1-S1-T1",
             blocker_task_id="E0-F1-S1-T2",
         )
-        # Reverse edge would currently be a cycle.
         with pytest.raises(ProposalError, match="add-dep would create a cycle"):
             add_dep(
                 backlog_root=backlog_root,
@@ -252,7 +234,6 @@ class TestRemoveDepClosesMarker:
                 blocker_task_id="E0-F1-S1-T1",
             )
 
-        # Cut the original edge.
         remove_dep(
             backlog_root=backlog_root,
             backlog_index=backlog_index,
@@ -260,7 +241,6 @@ class TestRemoveDepClosesMarker:
             blocker_task_id="E0-F1-S1-T2",
         )
 
-        # Now the reverse edge must wire cleanly without a cycle error.
         wrote = add_dep(
             backlog_root=backlog_root,
             backlog_index=backlog_index,
@@ -295,11 +275,6 @@ class TestRemoveDepClosesMarker:
         assert "edge no longer required" in content
 
 
-# ---------------------------------------------------------------------------
-# (c) idempotent no-op on a non-existent edge
-# ---------------------------------------------------------------------------
-
-
 class TestRemoveDepIdempotent:
     """Removing a non-existent edge is a clean no-op returning False, not an error."""
 
@@ -308,7 +283,6 @@ class TestRemoveDepIdempotent:
         backlog_root = workspace / "backlog"
         backlog_index = workspace / "BACKLOG.md"
 
-        # No edge was ever wired between T1 and T2.
         removed = remove_dep(
             backlog_root=backlog_root,
             backlog_index=backlog_index,
@@ -345,11 +319,6 @@ class TestRemoveDepIdempotent:
         assert second is False
 
 
-# ---------------------------------------------------------------------------
-# (d) fail-fast on unknown ids
-# ---------------------------------------------------------------------------
-
-
 class TestRemoveDepFailFast:
     """remove_dep raises ProposalError when either task id is not in the index."""
 
@@ -381,11 +350,6 @@ class TestRemoveDepFailFast:
             )
 
 
-# ---------------------------------------------------------------------------
-# (e) collapse-to-| none | | | when the last dep row is removed
-# ---------------------------------------------------------------------------
-
-
 class TestRemoveDepCollapsesToNoneRow:
     """When the last dep row is removed the table collapses to the canonical
     placeholder row so the Dependencies table is never left header-only."""
@@ -402,7 +366,6 @@ class TestRemoveDepCollapsesToNoneRow:
             blocker_task_id="E0-F1-S1-T2",
         )
         blocked_file = _task_file(workspace, "E0-F1-S1-T1")
-        # add_dep replaced the | none | | | placeholder with the real row.
         assert "| none |" not in blocked_file.read_text(encoding="utf-8")
 
         remove_dep(
@@ -414,5 +377,4 @@ class TestRemoveDepCollapsesToNoneRow:
 
         content = blocked_file.read_text(encoding="utf-8")
         assert "| none | | |" in content
-        # The blocker row must be gone.
         assert _dep_row_has_task(blocked_file, "E0-F1-S1-T2") is False

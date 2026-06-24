@@ -15,10 +15,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _make_runtime_config(
     *,
@@ -44,21 +40,12 @@ def _make_runtime_config(
             repo_mock = MagicMock()
             repo_mock.local_only = lo
             repo_mocks[name] = repo_mock
-        # Use a MagicMock for repos so we can override .get without hitting
-        # the read-only attribute error on a plain dict.
         repos_mock = MagicMock()
         repos_mock.get = lambda key, default=None: repo_mocks.get(key, default)
-        # Truthy so the ``if RUNTIME_CONFIG.repos`` branch is taken.
         repos_mock.__bool__ = lambda self: True
         mock_config.repos = repos_mock
 
     return mock_config
-
-
-# ---------------------------------------------------------------------------
-# AC-FIX-001 / AC-FIX-002 / AC-FIX-003 / AC-FIX-005:
-# Parametrized unit tests for _effective_local_only
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -68,7 +55,6 @@ class TestEffectiveLocalOnlyHelper:
     @pytest.mark.parametrize(
         "repos, git_ops_local_only, repo_key, expected",
         [
-            # AC-FIX-001: per-repo True wins over git_ops.local_only=False
             pytest.param(
                 {"workspace-local": True},
                 False,
@@ -76,7 +62,6 @@ class TestEffectiveLocalOnlyHelper:
                 True,
                 id="per_repo_true_overrides_top_level_false",
             ),
-            # AC-FIX-001: per-repo False wins over git_ops.local_only=True
             pytest.param(
                 {"remote-repo": False},
                 True,
@@ -84,7 +69,6 @@ class TestEffectiveLocalOnlyHelper:
                 False,
                 id="per_repo_false_overrides_top_level_true",
             ),
-            # AC-FIX-002: repo not in repos -> fall back to git_ops.local_only True
             pytest.param(
                 {},
                 True,
@@ -92,7 +76,6 @@ class TestEffectiveLocalOnlyHelper:
                 True,
                 id="repo_absent_from_repos_fallback_to_top_level_true",
             ),
-            # AC-FIX-002: repo not in repos -> fall back to git_ops.local_only False
             pytest.param(
                 {},
                 False,
@@ -100,7 +83,6 @@ class TestEffectiveLocalOnlyHelper:
                 False,
                 id="repo_absent_from_repos_fallback_to_top_level_false",
             ),
-            # AC-FIX-003: RUNTIME_CONFIG.repos is None -> fall back to git_ops.local_only True
             pytest.param(
                 None,
                 True,
@@ -108,7 +90,6 @@ class TestEffectiveLocalOnlyHelper:
                 True,
                 id="repos_none_fallback_to_top_level_true",
             ),
-            # AC-FIX-003: RUNTIME_CONFIG.repos is None -> fall back to git_ops.local_only False
             pytest.param(
                 None,
                 False,
@@ -140,11 +121,6 @@ class TestEffectiveLocalOnlyHelper:
             f"Expected _effective_local_only({repo_key!r}) to be {expected} "
             f"(repos={repos!r}, git_ops.local_only={git_ops_local_only}), got {result}"
         )
-
-
-# ---------------------------------------------------------------------------
-# AC-FIX-004: ensure_branch delegates to _effective_local_only
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

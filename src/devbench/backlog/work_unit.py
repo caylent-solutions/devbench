@@ -87,10 +87,6 @@ class WorkUnit:
     description: str = ""
     branch: str = ""
 
-    # ------------------------------------------------------------------
-    # Type predicates
-    # ------------------------------------------------------------------
-
     def is_epic(self) -> bool:
         """Return ``True`` if this work unit is an Epic."""
         return self.unit_type is WorkUnitType.EPIC
@@ -107,10 +103,6 @@ class WorkUnit:
         """Return ``True`` if this work unit is a Task."""
         return self.unit_type is WorkUnitType.TASK
 
-    # ------------------------------------------------------------------
-    # ID parsing
-    # ------------------------------------------------------------------
-
     def parse_id(self) -> tuple[str, ...]:
         """Split the compound ID into its hierarchical parts.
 
@@ -120,10 +112,6 @@ class WorkUnit:
         if not parts or not all(parts):
             raise ValueError(f"Invalid work-unit ID format: '{self.id}'")
         return tuple(parts)
-
-    # ------------------------------------------------------------------
-    # Disk mutations
-    # ------------------------------------------------------------------
 
     def set_status(self, new_status: WorkUnitStatus) -> None:
         """Update the ``## Status:`` line in the backing Markdown file.

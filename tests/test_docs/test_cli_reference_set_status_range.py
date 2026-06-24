@@ -114,7 +114,6 @@ class TestSetStatusWorkedExamples:
     def test_promote_e1_example_present(self) -> None:
         """An example showing 'promote E1' (set all E1 WUs to in-queue) must be present."""
         section = _section_text()
-        # Must show --include "E1" with in-queue target or equivalent narrative.
         assert "E1" in section and "in-queue" in section, (
             "docs/cli-reference.md 'set-status' section must contain a worked example "
             "showing how to promote (set in-queue) all units under epic E1 (AC-194-2)."
@@ -131,7 +130,6 @@ class TestSetStatusWorkedExamples:
     def test_decline_range_example_present(self) -> None:
         """An example showing 'decline E2-F1-S1-T3-T7' must be present."""
         section = _section_text()
-        # Must show a range such as T3-T7 or T3:T7 with declined target.
         assert "declined" in section or "decline" in section.lower(), (
             "docs/cli-reference.md 'set-status' section must contain a worked example "
             "showing how to decline a range of tasks (e.g. T3-T7) (AC-194-2)."
@@ -144,11 +142,9 @@ class TestSetStatusWorkedExamples:
     def test_dry_run_example_present(self) -> None:
         """A worked example using --dry-run must appear in the section."""
         section = _section_text()
-        # Find set-status section code block content.
         assert "--dry-run" in section, (
             "docs/cli-reference.md 'set-status' section must contain a worked example using --dry-run (AC-194-2)."
         )
-        # Must also have a code fence demonstrating usage.
         assert "```" in section, (
             "docs/cli-reference.md 'set-status' section must contain at least one "
             "code block with worked examples (AC-194-2)."

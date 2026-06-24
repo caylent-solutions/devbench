@@ -39,7 +39,6 @@ class TestParseIndex:
         units = parser.parse_index()
 
         assert len(units) > 0
-        # Every parsed unit should have a non-empty id and title
         for unit in units:
             assert unit.id, f"Unit has empty id: {unit}"
             assert unit.title, f"Unit has empty title: {unit}"
@@ -47,7 +46,6 @@ class TestParseIndex:
             assert isinstance(unit.unit_type, WorkUnitType)
 
     def test_parse_index_from_mock(self, mock_backlog_index: Path) -> None:
-        # mock_backlog_index is at tmp_path/BACKLOG.md; backlog files are under tmp_path/backlog/
         workspace_root = mock_backlog_index.parent
         parser = BacklogParser(
             backlog_root=workspace_root / "backlog",
@@ -55,7 +53,6 @@ class TestParseIndex:
         )
         units = parser.parse_index()
 
-        # The mock has 3 Task rows, 1 Story row, 1 Feature row
         task_units = [u for u in units if u.unit_type is WorkUnitType.TASK]
         assert len(task_units) == 3
 
@@ -65,7 +62,6 @@ class TestParseIndex:
         feature_units = [u for u in units if u.unit_type is WorkUnitType.FEATURE]
         assert len(feature_units) == 1
 
-        # file_path must be absolute and rooted at the workspace root
         for unit in units:
             assert unit.file_path.is_absolute(), f"{unit.id}: file_path is not absolute: {unit.file_path}"
             assert unit.file_path.is_relative_to(workspace_root), (
@@ -110,7 +106,7 @@ class TestParseIndex:
             units = parser.parse_index()
 
         assert len(units) == 1
-        assert units[0].status.value == "In Progress"  # file is source of truth
+        assert units[0].status.value == "In Progress"
         assert any("mismatch" in r.message.lower() for r in caplog.records)
 
 
@@ -143,7 +139,7 @@ class TestParseIndexFNFRetry:
         from unittest.mock import patch
 
         parser, wu_file = self._build_minimal_backlog(tmp_path)
-        real = parser.parse_work_unit_file  # bind unwrapped reference
+        real = parser.parse_work_unit_file
 
         call_count = {"n": 0}
 
@@ -687,8 +683,6 @@ class TestGetParallelCandidatesTopologicalOrder:
         """
         parser = self._make_parser()
         units = [
-            # Insert scrambled so the test catches regressions where the
-            # parser falls back to insertion order.
             self._task("G1", deps=["F1", "F2"]),
             self._task("F0", status=WorkUnitStatus.DONE),
             self._task("E2", deps=["F2"]),
@@ -710,25 +704,21 @@ class TestGetParallelCandidatesTopologicalOrder:
         parser = self._make_parser()
         units = [
             self._task("A1", status=WorkUnitStatus.DONE),
-            self._task("B1", deps=["A1"]),  # depth 1
-            self._task("C1", deps=["B1"]),  # depth 2 -- B1 still in-queue, so C1 is NOT a candidate
-            self._task("B2"),  # depth 0
+            self._task("B1", deps=["A1"]),
+            self._task("C1", deps=["B1"]),
+            self._task("B2"),
         ]
         order = [u.id for u in parser.get_parallel_candidates(units)]
-        # B1 has its dep A1 done so it's actionable at depth 1.
-        # C1's dep B1 is in-queue (not done), so C1 is filtered out by deps_satisfied.
-        # B2 is depth 0 (no deps).
         assert order == ["B2", "B1"], f"Got {order!r}"
 
     def test_in_progress_priority_beats_topological_depth(self) -> None:
         """The status priority (IN_PROGRESS first) wins over depth ordering."""
         parser = self._make_parser()
         units = [
-            self._task("A1"),  # depth 0, IN_QUEUE
-            self._task("D1", status=WorkUnitStatus.IN_PROGRESS, deps=[]),  # IN_PROGRESS, depth 0
+            self._task("A1"),
+            self._task("D1", status=WorkUnitStatus.IN_PROGRESS, deps=[]),
         ]
         order = [u.id for u in parser.get_parallel_candidates(units)]
-        # IN_PROGRESS first regardless of depth.
         assert order == ["D1", "A1"], f"Got {order!r}"
 
     def test_unknown_dep_id_does_not_raise(self) -> None:
@@ -740,8 +730,8 @@ class TestGetParallelCandidatesTopologicalOrder:
         wins the lexicographic tiebreak)."""
         parser = self._make_parser()
         units = [
-            self._task("X1", deps=["NONEXISTENT-T1"]),  # depth 1 (declared dep, unresolvable)
-            self._task("Y1"),  # depth 0
+            self._task("X1", deps=["NONEXISTENT-T1"]),
+            self._task("Y1"),
         ]
         order = [u.id for u in parser.get_parallel_candidates(units)]
         assert order == ["Y1", "X1"], f"Got {order!r}"
@@ -779,9 +769,6 @@ class TestGetParallelCandidatesTopologicalOrder:
         parser = self._make_parser()
         units = [self._task("Z1", deps=["Z1"])]
         order = [u.id for u in parser.get_parallel_candidates(units)]
-        # Z1 fails _deps_satisfied (it depends on itself, in-queue), so the
-        # candidate list is empty. The important assertion is that the call
-        # terminates without RecursionError.
         assert order == []
 
 
@@ -829,7 +816,6 @@ class TestParseIndexEdgeCases:
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
         index_path = tmp_path / "BACKLOG.md"
-        # Row claims type "Story" but ID E0-F1-S1-T1 implies "Task"
         index_path.write_text(
             "# Backlog\n\n## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
@@ -870,7 +856,6 @@ class TestParseIndexEdgeCases:
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
         index_path = tmp_path / "BACKLOG.md"
-        # One valid Task row and one invalid "Doc" type row
         index_path.write_text(
             "# Backlog\n\n## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
@@ -883,7 +868,6 @@ class TestParseIndexEdgeCases:
 
         parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index_path)
         units = parser.parse_index()
-        # Only the valid Task row should be parsed; the Doc row is skipped
         assert len(units) == 1
         assert units[0].id == "E0-F1-S1-T1"
 
@@ -941,8 +925,6 @@ class TestDepsSatisfiedHierarchical:
         assert BacklogParser._deps_satisfied(units[1], units_by_id) is True
 
     def test_story_dep_unsatisfied_when_descendant_task_in_queue(self) -> None:
-        # E0-F1-S2-T1 depends on the entire E0-F1-S1 story; one of S1's
-        # children is still in-queue, so the dep MUST NOT be satisfied.
         units = [
             self._wu("E0-F1-S1", WorkUnitStatus.IN_QUEUE, WorkUnitType.STORY),
             self._wu("E0-F1-S1-T1", WorkUnitStatus.DONE, WorkUnitType.TASK),
@@ -973,9 +955,6 @@ class TestDepsSatisfiedHierarchical:
         assert BacklogParser._deps_satisfied(units[3], units_by_id) is True
 
     def test_feature_dep_walks_two_hierarchy_levels(self) -> None:
-        # A dep on E0-F1 must require every descendant TASK across every
-        # Story under F1 to be terminal. Mix DONE + DECLINED + one IN_QUEUE
-        # to prove the in-queue child blocks satisfaction.
         units = [
             self._wu("E0-F1", WorkUnitStatus.IN_QUEUE, WorkUnitType.FEATURE),
             self._wu("E0-F1-S1", WorkUnitStatus.IN_QUEUE, WorkUnitType.STORY),
@@ -988,10 +967,6 @@ class TestDepsSatisfiedHierarchical:
         assert BacklogParser._deps_satisfied(units[5], units_by_id) is False
 
     def test_epic_dep_with_no_descendants_is_vacuously_satisfied(self) -> None:
-        # If a dep names an epic that has zero TASK descendants in the
-        # parsed index, the dep is treated as satisfied -- there's
-        # nothing to wait on. validate-backlog separately reports any
-        # epic with no children, so this can never silently hide work.
         units = [
             self._wu("E9", WorkUnitStatus.IN_QUEUE, WorkUnitType.EPIC),
             self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E9"]),
@@ -1000,8 +975,6 @@ class TestDepsSatisfiedHierarchical:
         assert BacklogParser._deps_satisfied(units[1], units_by_id) is True
 
     def test_unknown_dep_id_treated_as_satisfied(self) -> None:
-        # validate-backlog reports unknown IDs separately. The parser's
-        # actionability scan must not deadlock on a typo'd ID.
         units = [
             self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E9-F9-S9-T9"]),
         ]
@@ -1009,8 +982,6 @@ class TestDepsSatisfiedHierarchical:
         assert BacklogParser._deps_satisfied(units[0], units_by_id) is True
 
     def test_get_parallel_candidates_excludes_unit_with_unsatisfied_story_dep(self) -> None:
-        # End-to-end: a unit with a Story-level dep should NOT appear in
-        # get_parallel_candidates while any descendant task is in-queue.
         units = [
             self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK),
             self._wu(
@@ -1165,7 +1136,6 @@ class TestGetParallelCandidatesWithScope:
             self._task("E0-F1-S1-T1", status=WorkUnitStatus.IN_QUEUE),
             self._task("E0-F1-S1-T2", deps=["E0-F1-S1-T1"]),
         ]
-        # Both T1 and T2 are in scope, but T2 depends on T1 which is IN_QUEUE (not DONE).
         scope = ScopeFilter(
             include=["E0-F1-S1"],
             exclude=[],
@@ -1173,7 +1143,6 @@ class TestGetParallelCandidatesWithScope:
         )
         candidates = parser.get_parallel_candidates(units, scope=scope)
         candidate_ids = {u.id for u in candidates}
-        # T1 is actionable and in scope; T2 is not actionable (dep unsatisfied).
         assert "E0-F1-S1-T1" in candidate_ids
         assert "E0-F1-S1-T2" not in candidate_ids
 
@@ -1192,7 +1161,6 @@ class TestGetParallelCandidatesWithScope:
         )
         candidates = parser.get_parallel_candidates(units, scope=scope)
         assert len(candidates) == 2
-        # Both at same depth; sorted by id (T2 before T3).
         assert candidates[0].id == "E0-F1-S1-T2"
         assert candidates[1].id == "E0-F1-S1-T3"
 

@@ -46,11 +46,6 @@ from devbench.backlog.proposal import (
     write_proposal,
 )
 
-# ---------------------------------------------------------------------------
-# Shared fixture builders
-# ---------------------------------------------------------------------------
-
-
 _SOURCE_ROW = (
     "| E0-F1-S1-T1 | Source Task | Task | blocked | None "
     "| caylent-solutions/example | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"
@@ -141,11 +136,6 @@ def _sample_proposal(source_task_id: str = "E0-F1-S1-T1", *, task_ids: list[str]
     )
 
 
-# ---------------------------------------------------------------------------
-# Proposal dataclass + schema helpers
-# ---------------------------------------------------------------------------
-
-
 class TestProposalDataclass:
     def test_to_dict_roundtrip(self) -> None:
         proposal = _sample_proposal()
@@ -181,8 +171,6 @@ class TestProposalDataclass:
             Proposal.from_dict(payload)
 
     def test_source_dep_direction_default_is_empty(self) -> None:
-        # Default Proposal omits the field; to_dict + from_dict roundtrip
-        # must preserve the empty string and not surface as a schema change.
         proposal = _sample_proposal()
         assert proposal.source_dep_direction == ""
         payload = proposal.to_dict()
@@ -191,9 +179,6 @@ class TestProposalDataclass:
         assert restored.source_dep_direction == ""
 
     def test_source_dep_direction_test_validates_source_roundtrips(self) -> None:
-        # The only non-default value the schema accepts is the explicit
-        # string "test_validates_source"; cmd_promote_proposal reads this
-        # to auto-apply --no-dep-on-source.
         proposal = Proposal(
             source_task_id="E0-F1-S1-T1",
             generated_at="2026-04-18T03:25:00Z",
@@ -205,25 +190,16 @@ class TestProposalDataclass:
         assert restored.source_dep_direction == "test_validates_source"
 
     def test_source_dep_direction_rejects_unknown_value(self) -> None:
-        # Any string outside the {"", "test_validates_source"} allowlist
-        # must raise ValueError so typos surface at promotion time.
         payload = _sample_proposal().to_dict()
         payload["source_dep_direction"] = "source_validates_test"
         with pytest.raises(ValueError, match="must be empty or 'test_validates_source'"):
             Proposal.from_dict(payload)
 
     def test_source_dep_direction_missing_in_json_defaults_to_empty(self) -> None:
-        # Older proposal JSON files written before the field existed must
-        # continue to load as "" (no behavior change).
         payload = _sample_proposal().to_dict()
         del payload["source_dep_direction"]
         restored = Proposal.from_dict(payload)
         assert restored.source_dep_direction == ""
-
-
-# ---------------------------------------------------------------------------
-# Path / lock helpers
-# ---------------------------------------------------------------------------
 
 
 class TestPathHelpers:
@@ -252,11 +228,6 @@ class TestPathHelpers:
         assert DRAFT_TEMPLATE
 
 
-# ---------------------------------------------------------------------------
-# scan_story_for_task_ids + allocate_next_ids
-# ---------------------------------------------------------------------------
-
-
 class TestScanStoryForTaskIds:
     def test_empty_dir_returns_empty_set(self, tmp_path: Path) -> None:
         assert scan_story_for_task_ids(tmp_path, "E0-F1-S1") == set()
@@ -266,9 +237,9 @@ class TestScanStoryForTaskIds:
         story_dir.mkdir(parents=True)
         (story_dir / "E0-F1-S1-T1.md").write_text("# x\n")
         (story_dir / "E0-F1-S1-T2.md").write_text("# x\n")
-        (story_dir / "E0-F1-S1.md").write_text("# story\n")  # not a task
-        (story_dir / "README.md").write_text("# other\n")  # not a task
-        (story_dir / "ignored.txt").write_text("")  # not .md
+        (story_dir / "E0-F1-S1.md").write_text("# story\n")
+        (story_dir / "README.md").write_text("# other\n")
+        (story_dir / "ignored.txt").write_text("")
         assert scan_story_for_task_ids(tmp_path, "E0-F1-S1") == {"E0-F1-S1-T1", "E0-F1-S1-T2"}
 
 
@@ -296,16 +267,12 @@ class TestAllocateNextIds:
         def worker(slot: int) -> None:
             try:
                 results[slot] = allocate_next_ids(tmp_path, backlog_root, "E0-F1-S1", 3)
-                # Now materialise the IDs so the other thread sees them as existing.
                 story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
                 for tid in results[slot]:
                     (story_dir / f"{tid}.md").write_text("# x\n")
             except (AssertionError, RuntimeError, OSError) as exc:
                 errors.append(exc)
 
-        # Staged execution: run the two threads sequentially through the lock so the
-        # second sees the first's writes and returns disjoint IDs. Concurrency is
-        # exercised by the lock-scope exception test below.
         t0 = threading.Thread(target=worker, args=(0,))
         t0.start()
         t0.join()
@@ -320,8 +287,6 @@ class TestAllocateNextIds:
         backlog_root = tmp_path / "backlog"
         (backlog_root / "E0" / "E0-F1" / "E0-F1-S1").mkdir(parents=True)
 
-        # Patch scan_story_for_task_ids to raise on the first call; the
-        # lock MUST still release so the second call succeeds.
         calls = {"n": 0}
         real_scan = proposal_mod.scan_story_for_task_ids
 
@@ -334,14 +299,8 @@ class TestAllocateNextIds:
         monkeypatch.setattr(proposal_mod, "scan_story_for_task_ids", fake_scan)
         with pytest.raises(RuntimeError, match="boom"):
             allocate_next_ids(tmp_path, backlog_root, "E0-F1-S1", 1)
-        # Second call must succeed (lock released).
         ids = allocate_next_ids(tmp_path, backlog_root, "E0-F1-S1", 1)
         assert ids == ["E0-F1-S1-T1"]
-
-
-# ---------------------------------------------------------------------------
-# Proposal I/O
-# ---------------------------------------------------------------------------
 
 
 class TestProposalIO:
@@ -376,18 +335,13 @@ class TestProposalIO:
             read_proposal(tmp_path, "E0-F1-S1-T1")
 
     def test_delete_noop_when_absent(self, tmp_path: Path) -> None:
-        delete_proposal(tmp_path, "E0-F1-S1-T1")  # no raise
+        delete_proposal(tmp_path, "E0-F1-S1-T1")
 
     def test_delete_existing(self, tmp_path: Path) -> None:
         proposal = _sample_proposal()
         written = write_proposal(tmp_path, proposal)
         delete_proposal(tmp_path, proposal.source_task_id)
         assert not written.exists()
-
-
-# ---------------------------------------------------------------------------
-# generate_draft_md
-# ---------------------------------------------------------------------------
 
 
 class TestGenerateDraftMd:
@@ -405,14 +359,11 @@ class TestGenerateDraftMd:
         assert "## Status: proposed" in md
         assert "Do the thing." in md
         assert "- [ ] AC-FUNC-001 foo" in md
-        # TDI-008: concrete add rows, never a TODO cell.
         assert "| `src/a.py` | add |" in md
         assert "| `src/b.py` | add |" in md
         assert "TODO -- describe change" not in md
         assert "SC-01, SC-02" in md
         assert "generated by task-factory" in md
-        # The auto-generated draft carries a real ## Verification directive per AC;
-        # a qualitative AC ("foo") is type=judge.
         assert "## Verification" in md
         assert "- VERIFY AC-FUNC-001 | type=judge" in md
 
@@ -428,12 +379,9 @@ class TestGenerateDraftMd:
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
         assert "Resolution approach to be completed by the executor." in md
         assert "AC-TODO-001 human must author AC" in md
-        # TDI-008: undetermined file set -> a documented sentinel row, never TODO.
         assert "| `<resolution-targets-determined-at-execution>` | add |" in md
         assert "TODO -- describe change" not in md
         assert "(none documented)" in md
-        # With no suggested ACs the directive references the fallback AC id used by
-        # the fallback Acceptance Criteria line, keeping the two consistent.
         assert "## Verification" in md
         assert "- VERIFY AC-TODO-001 | type=judge" in md
 
@@ -467,7 +415,6 @@ class TestFirstAcId:
         assert len(items) == 1
         assert items[0].ac_ids == ("AC-FUNC-001",)
         assert items[0].vtype is VerificationType.JUDGE
-        # type=judge is never an executable item, so the draft never demands evidence.
         assert not items[0].is_executable()
 
 
@@ -483,8 +430,6 @@ class TestDraftVerificationNoPlaceholder:
     def test_executable_ac_without_derivable_command_falls_back_to_judge(self) -> None:
         from devbench.verification import VerificationType, parse_verification_section
 
-        # AC text carries an execution verb ("succeeds"/"deploy") but the manifest
-        # has no test file from which a concrete command can be derived.
         task = ProposedTask(
             suggested_id="E0-F1-S1-T9",
             title="Scope IAM policy",
@@ -494,7 +439,6 @@ class TestDraftVerificationNoPlaceholder:
             suggested_approach="Scope the policy.",
         )
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
-        # The bug: this used to emit `cmd=\`<fill-in ...>\``.
         assert "<fill-in" not in md
         items = parse_verification_section(md)
         assert len(items) == 1
@@ -505,7 +449,6 @@ class TestDraftVerificationNoPlaceholder:
     def test_executable_ac_with_test_file_in_manifest_emits_concrete_command(self) -> None:
         from devbench.verification import VerificationType, parse_verification_section
 
-        # A pytest test file in the manifest IS a derivable concrete command.
         task = ProposedTask(
             suggested_id="E0-F1-S1-T9",
             title="Re-author em-dash test",
@@ -522,11 +465,9 @@ class TestDraftVerificationNoPlaceholder:
         assert items[0].vtype is VerificationType.COMMAND
         assert items[0].command is not None
         assert "tests/test_widget.py" in items[0].command
-        # A concrete command parses as an executable item carrying exit-code evidence.
         assert items[0].is_executable()
 
     def test_no_fill_in_placeholder_for_any_executable_ac_combination(self) -> None:
-        # Even with multiple executable ACs and no test file, none becomes a placeholder.
         task = ProposedTask(
             suggested_id="E0-F1-S1-T9",
             title="Deploy + provision",
@@ -540,17 +481,11 @@ class TestDraftVerificationNoPlaceholder:
         )
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
         assert "<fill-in" not in md
-        # Nothing derivable from the manifest -> every directive is type=judge.
         from devbench.verification import VerificationType, parse_verification_section
 
         items = parse_verification_section(md)
         assert len(items) == 2
         assert all(item.vtype is VerificationType.JUDGE for item in items)
-
-
-# ---------------------------------------------------------------------------
-# BACKLOG.md manipulation
-# ---------------------------------------------------------------------------
 
 
 class TestBacklogRowHelpers:
@@ -619,11 +554,6 @@ class TestRewriteStatus:
             _rewrite_backlog_status(workspace / "BACKLOG.md", "DOES-NOT-EXIST", "in-queue")
 
 
-# ---------------------------------------------------------------------------
-# materialise_proposal
-# ---------------------------------------------------------------------------
-
-
 class TestMaterialiseProposal:
     def test_creates_drafts_and_appends_rows(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
@@ -638,8 +568,6 @@ class TestMaterialiseProposal:
         assert len(drafts) == 2
         for draft in drafts:
             assert draft.is_file()
-            # Proposals are materialised at the dedicated ``proposed`` staging
-            # state regardless of backlog.default_status_for_new_work_units.
             assert "## Status: proposed" in draft.read_text()
         backlog = (workspace / "BACKLOG.md").read_text()
         assert "E0-F1-S1-T2" in backlog
@@ -647,7 +575,6 @@ class TestMaterialiseProposal:
 
     def test_refuses_when_unresolved_proposed_rows_exist(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
-        # Seed BACKLOG.md with an existing proposed row BEFORE materialising a fresh proposal.
         _append_backlog_row(
             workspace / "BACKLOG.md",
             _render_backlog_row(
@@ -689,12 +616,9 @@ class TestMaterialiseProposal:
             repo="caylent-solutions/example",
         )
 
-        # The fix unit is materialised under the next free id (T3), not dropped.
         assert len(drafts) == 1
         assert drafts[0].name == "E0-F1-S1-T3.md"
-        # The unrelated pre-existing unit is left untouched (no overwrite).
         assert "existing" in existing_path.read_text()
-        # The proposal's suggested_id is re-pointed so promote wiring follows it.
         assert proposal.proposed_tasks[0].suggested_id == "E0-F1-S1-T3"
 
 
@@ -709,7 +633,6 @@ class TestMaterialiseProposalIdempotent:
         from devbench.backlog.proposal import REJECTED_PROPOSAL_DIR_NAME
 
         workspace = _build_workspace(tmp_path)
-        # Seed a per-draft reject archive for T2 at the canonical location.
         archive_dir = workspace / REJECTED_PROPOSAL_DIR_NAME
         archive_dir.mkdir(parents=True, exist_ok=True)
         (archive_dir / "E0-F1-S1-T2-20260419T000000Z.md").write_text("archived draft body")
@@ -726,7 +649,6 @@ class TestMaterialiseProposalIdempotent:
         assert drafts == []
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         assert not (story_dir / "E0-F1-S1-T2.md").exists(), "rejected draft must not be resurrected"
-        # BACKLOG.md must not have gained a row for the skipped task.
         assert "E0-F1-S1-T2" not in (workspace / "BACKLOG.md").read_text()
 
     @pytest.mark.parametrize("status_value", ["in-queue", "in-progress", "in-review", "blocked", "done", "declined"])
@@ -751,7 +673,6 @@ class TestMaterialiseProposalIdempotent:
             proposal=_sample_proposal(task_ids=["E0-F1-S1-T2"]),
             repo="caylent-solutions/example",
         )
-        # The fix unit is re-homed to the next free id; the unrelated unit untouched.
         assert len(drafts) == 1
         assert drafts[0].name == "E0-F1-S1-T3.md"
         assert draft.read_text() == original_body
@@ -761,7 +682,6 @@ class TestMaterialiseProposalIdempotent:
         from devbench.backlog.proposal import REJECTED_PROPOSAL_DIR_NAME
 
         workspace = _build_workspace(tmp_path)
-        # Reject T2 via archive; T3 should still materialise on the same call.
         archive_dir = workspace / REJECTED_PROPOSAL_DIR_NAME
         archive_dir.mkdir(parents=True, exist_ok=True)
         (archive_dir / "E0-F1-S1-T2-20260419T000000Z.md").write_text("archived")
@@ -794,8 +714,6 @@ class TestMaterialiseProposalIdempotent:
         )
         assert len(first) == 2
 
-        # Second call: every task now classifies as PROPOSED (draft file has
-        # Status: proposed). materialise must skip both and return empty.
         second = materialise_proposal(
             workspace_root=workspace,
             backlog_root=workspace / "backlog",
@@ -805,9 +723,6 @@ class TestMaterialiseProposalIdempotent:
         )
         assert second == []
 
-        # BACKLOG.md has exactly one row per task (no duplicates). Each row
-        # mentions the id twice (id cell + file-path cell); count the
-        # row-start form to measure row count.
         backlog_text = (workspace / "BACKLOG.md").read_text()
         assert backlog_text.count("| E0-F1-S1-T2 |") == 1
         assert backlog_text.count("| E0-F1-S1-T3 |") == 1
@@ -831,7 +746,6 @@ class TestMaterialiseProposalIdempotent:
             task_id="E0-F1-S1-T2",
             reason="superseded",
         )
-        # T2's draft is archived now. Re-materialise the same JSON.
         result = materialise_proposal(
             workspace_root=workspace,
             backlog_root=workspace / "backlog",
@@ -842,11 +756,6 @@ class TestMaterialiseProposalIdempotent:
         assert result == [], "rejected draft must not be resurrected on re-materialise"
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         assert not (story_dir / "E0-F1-S1-T2.md").exists()
-
-
-# ---------------------------------------------------------------------------
-# materialise_proposal -- proposals are born at the ``proposed`` staging state
-# ---------------------------------------------------------------------------
 
 
 class TestMaterialiseProposalWritesProposed:
@@ -953,15 +862,8 @@ class TestHasUnresolvedProposals:
                 "backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md",
             ),
         )
-        # Without the exclude set, this row makes the guard fire.
         assert _has_unresolved_proposals(workspace / "BACKLOG.md") is True
-        # Excluding the same id returns False -- the row is ignored.
         assert _has_unresolved_proposals(workspace / "BACKLOG.md", exclude_task_ids=frozenset({"E0-F1-S1-T2"})) is False
-
-
-# ---------------------------------------------------------------------------
-# list_proposals
-# ---------------------------------------------------------------------------
 
 
 class TestListProposals:
@@ -980,16 +882,10 @@ class TestListProposals:
         d.mkdir(parents=True)
         (d / "junk.json").write_text("not json")
         (d / "readme.txt").write_text("skip non-json extension")
-        # Also add a valid one so the final output is non-empty.
         p = _sample_proposal()
         write_proposal(tmp_path, p)
         out = list_proposals(tmp_path)
         assert any(pp == p for pp in out)
-
-
-# ---------------------------------------------------------------------------
-# promote_proposal / reject_proposal
-# ---------------------------------------------------------------------------
 
 
 class TestPromoteProposal:
@@ -1021,14 +917,10 @@ class TestPromoteProposal:
             task_id="E0-F1-S1-T2",
         )
         assert result.draft_path.is_file()
-        # Draft status flipped.
         assert "## Status: in-queue" in result.draft_path.read_text()
-        # Source task was the sole wired target (no affected_task_ids in fixture).
         assert result.wired_targets == ["E0-F1-S1-T1"]
-        # Source task now has a dep on the promoted task.
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         assert "| E0-F1-S1-T2 |" in source.read_text()
-        # Audit comment was added.
         assert "[PROPOSAL_PROMOTED]" in source.read_text()
 
     def test_refuses_when_verification_has_fill_in_placeholder(self, tmp_path: Path) -> None:
@@ -1052,7 +944,6 @@ class TestPromoteProposal:
         )
         draft = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
         content = draft.read_text()
-        # Inject a placeholder directive that a malformed/legacy draft might carry.
         content = content.replace(
             "- VERIFY AC-FUNC-001 | type=judge",
             "- VERIFY AC-FUNC-001 | type=command "
@@ -1068,7 +959,6 @@ class TestPromoteProposal:
                 backlog_index=workspace / "BACKLOG.md",
                 task_id="E0-F1-S1-T2",
             )
-        # Fail-closed BEFORE any wiring write: source task is never wired.
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         assert "| E0-F1-S1-T2 |" not in source.read_text()
         assert "[PROPOSAL_PROMOTED]" not in source.read_text()
@@ -1157,9 +1047,9 @@ class TestPromoteProposal:
     @pytest.mark.parametrize(
         "cmd",
         [
-            "uv run pytest tests/test_x.py 2>&1",  # shell redirection, not a placeholder
-            "cat < input.txt",  # input redirection, no closing '>'
-            "grep -r foo src/ > out.txt",  # output redirection, no opening '<'
+            "uv run pytest tests/test_x.py 2>&1",
+            "cat < input.txt",
+            "grep -r foo src/ > out.txt",
             "make test && echo done",
         ],
     )
@@ -1237,7 +1127,6 @@ class TestPromoteProposal:
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         source_text = source.read_text()
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in source_text
-        # Both markers should be on the same audit comment line.
         for line in source_text.splitlines():
             if "[PROPOSAL_PROMOTED] E0-F1-S1-T2" in line:
                 assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in line
@@ -1496,7 +1385,6 @@ class TestPromoteProposalAffectedWiring:
             task_id="E0-F1-S1-T2",
         )
         assert result.wired_targets == ["E0-F1-S1-T1", "E0-F1-S1-T3", "E0-F1-S1-T4"]
-        # Marker lands on every target's Comments.
         for tid in result.wired_targets:
             text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / f"{tid}.md").read_text()
             assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in text
@@ -1504,7 +1392,6 @@ class TestPromoteProposalAffectedWiring:
     def test_promote_fails_fast_when_affected_target_missing_from_backlog(self, tmp_path: Path) -> None:
         """Missing peer ID raises before any write so the source is never half-wired."""
         workspace = self._build_workspace_with_peers(tmp_path, peer_ids=[])
-        # peer T99 is in affected_task_ids but does NOT exist in backlog.
         self._materialise_fixture(workspace, peer_ids=["E0-F1-S1-T99"])
 
         with pytest.raises(ProposalError, match=r"E0-F1-S1-T99.*not found in backlog"):
@@ -1514,7 +1401,6 @@ class TestPromoteProposalAffectedWiring:
                 backlog_index=workspace / "BACKLOG.md",
                 task_id="E0-F1-S1-T2",
             )
-        # Source task must NOT have been partially wired -- no marker written.
         source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" not in source_text
 
@@ -1531,10 +1417,8 @@ class TestPromoteProposalAffectedWiring:
             dep_on_source=False,
         )
         assert result.wired_targets == ["E0-F1-S1-T3"]
-        # Source did NOT get the marker.
         source = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
         assert "[BLOCKED_PENDING_PROPOSAL]" not in source
-        # Peer DID get the marker.
         peer = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T3.md").read_text()
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in peer
 
@@ -1549,7 +1433,6 @@ class TestPromoteProposalAffectedWiring:
             backlog_index=workspace / "BACKLOG.md",
             task_id="E0-F1-S1-T2",
         )
-        # Source first, then affected in declared order.
         assert result.wired_targets == ["E0-F1-S1-T1", "E0-F1-S1-T4", "E0-F1-S1-T3"]
 
 
@@ -1611,7 +1494,6 @@ class TestAddDepCoreHelper:
         )
         assert first is True
         assert second is False
-        # Marker appears exactly once.
         text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
         assert text.count("[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2") == 1
 
@@ -1643,7 +1525,6 @@ class TestAddDepCoreHelper:
         from devbench.backlog.proposal import add_dep
 
         workspace = self._workspace(tmp_path)
-        # Flip T2 to done manually.
         t2 = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
         t2.write_text(t2.read_text().replace("## Status: blocked", "## Status: done"))
         idx = workspace / "BACKLOG.md"
@@ -1694,7 +1575,6 @@ class TestRejectProposal:
         )
         assert archive is not None and archive.is_file()
         assert "E0-F1-S1-T2" not in (workspace / "BACKLOG.md").read_text()
-        # Source task got an audit comment.
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         assert "[PROPOSAL_REJECTED]" in source.read_text()
 
@@ -1709,11 +1589,6 @@ class TestRejectProposal:
             reason="already gone",
         )
         assert archive is None
-
-
-# ---------------------------------------------------------------------------
-# Find helpers used by promote / reject
-# ---------------------------------------------------------------------------
 
 
 class TestFindHelpers:
@@ -1731,7 +1606,6 @@ class TestFindHelpers:
 class TestAppendDependencyToSource:
     def test_appends_when_no_none(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
-        # Overwrite source task with a non-empty Dependencies section (no "none").
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         content = source.read_text().replace(
             "| none | | |",
@@ -1745,7 +1619,6 @@ class TestAppendDependencyToSource:
     def test_raises_without_dependencies_section(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
-        # Keep a valid parser-readable header but drop the Dependencies section.
         source.write_text(
             "# E0-F1-S1-T1: Source Task\n\n"
             "## Status: blocked\n\n"
@@ -1779,7 +1652,6 @@ class TestSourceCommentsSectionAlreadyPresent:
 
     def test_reject_appends_to_existing_comments(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
-        # Write a source task that already has a ## Comments section.
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         content = source.read_text() + "\n## Comments\n\n[2026-04-17 10:00 UTC] [agent/orchestrator] prior entry\n"
         source.write_text(content)
@@ -1817,11 +1689,6 @@ class TestAppendPromoteCommentNoExistingComments:
         updated = source_file.read_text()
         assert "## Comments" in updated
         assert "[PROPOSAL_PROMOTED]" in updated
-
-
-# ---------------------------------------------------------------------------
-# Proposal-lifecycle observability + cleanup (ADR-08 slices A / E / F / H).
-# ---------------------------------------------------------------------------
 
 
 def _draft_body(status: str, task_id: str = "E0-F1-S1-T1") -> str:
@@ -1926,7 +1793,6 @@ class TestClassifyBlockedTask:
         story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
 
-        # Source task with the markers in its Comments section.
         comments_block = "\n## Comments\n\n" + "\n".join(
             f"[2026-04-20 00:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] {tid} "
             f"promoted and wired as dependency of E0-F1-S1-T1. [BLOCKED_PENDING_PROPOSAL] {tid}"
@@ -1939,7 +1805,6 @@ class TestClassifyBlockedTask:
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n" + comments_block
         )
 
-        # Marker target files and BACKLOG.md rows.
         rows = ["| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"]
         for tid, status in marker_target_status_pairs:
             (story_dir / f"{tid}.md").write_text(f"# {tid}: X\n\n## Status: {status}\n")
@@ -1987,7 +1852,6 @@ class TestClassifyBlockedTask:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "in-queue")])
-        # Add a second marker pointing at an ID with no backlog row.
         source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         source_file.write_text(
             source_file.read_text()
@@ -2132,10 +1996,8 @@ class TestManualDepCommentNoCommentsSection:
         )
         _append_manual_dep_comment(f, "E0-F1-S1-T1", "E0-F1-S1-T2", "")
         text = f.read_text()
-        # Prior entry still there + the new marker.
         assert "prior entry" in text
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in text
-        # Only ONE "## Comments" header (we did not append a duplicate section).
         assert text.count("## Comments") == 1
 
 
@@ -2161,9 +2023,6 @@ class TestPromoteProposalSourceFileMissing:
             proposal=proposal,
             repo="caylent-solutions/example",
         )
-        # Single-task proposal means the fail-fast loop skips _find_source_task_file
-        # (targets[1:] is empty); the wire loop then calls it once for the source.
-        # Patch it to return None so the continue branch is exercised.
         monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: None)
         result = proposal_mod.promote_proposal(
             workspace_root=workspace,
@@ -2377,16 +2236,13 @@ class TestRejectUnmaterialisedProposal:
             reason="redundant with T3",
         )
 
-        # Archive created with the '-unmaterialised-' infix.
         assert archive is not None
         assert archive.is_file()
         assert archive.parent == workspace / REJECTED_PROPOSAL_DIR_NAME
         assert "unmaterialised" in archive.name
 
-        # Live JSON removed.
         assert not (workspace / PROPOSAL_DIR_NAME / "E0-F1-S1-T1.json").exists()
 
-        # Source task has the audit comment.
         source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
         assert "[PROPOSAL_JSON_REJECTED]" in source_text
         assert "redundant with T3" in source_text
@@ -2396,7 +2252,6 @@ class TestRejectUnmaterialisedProposal:
         from devbench.backlog.proposal import ProposalError, reject_proposal
 
         workspace = self._mini_workspace(tmp_path)
-        # Materialise the T2 draft out-of-band so it's in PROPOSED state.
         _seed_draft(workspace / "backlog", "E0-F1-S1-T2", "proposed")
 
         with pytest.raises(ProposalError, match="already in state"):
@@ -2506,7 +2361,6 @@ class TestRejectProposalMarkerStrip:
             "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T3.md` |\n"
         )
         (backlog_dir / "E0.md").write_text("# E0: Ex\n\n## Status: in-queue\n")
-        # Seed a proposal JSON so _find_originating_source_task resolves T2's source.
         (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True, exist_ok=True)
         write_proposal(
             tmp_path,
@@ -2559,11 +2413,8 @@ class TestRejectProposalMarkerStrip:
         )
 
         updated = source_file.read_text()
-        # T2 marker stripped.
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" not in updated
-        # T3 marker preserved.
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in updated
-        # Cascade fired: source auto-flipped because remaining marker (T3) is terminal.
         assert "## Status: in-queue" in updated
         assert "[AUTO_UNBLOCKED]" in updated
 
@@ -2584,7 +2435,6 @@ class TestRejectProposalMarkerStrip:
         updated = source_file.read_text()
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" not in updated
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in updated
-        # T3 still non-terminal -> source stays blocked.
         assert "## Status: blocked" in updated
         assert "[AUTO_UNBLOCKED]" not in updated
 
@@ -2678,7 +2528,6 @@ class TestClassifyBlockedTaskAwaitingRecovery:
         )
 
         workspace = self._workspace_no_marker(tmp_path)
-        # Append a recent recovery-shaped [BLOCKED] line to the source file.
         source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
         ts = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -2762,8 +2611,6 @@ class TestClassifyBlockedTaskAwaitingRecovery:
         assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
     def test_no_workspace_root_falls_back_to_operator_action_required(self, tmp_path: Path) -> None:
-        # Older callers that pass only backlog_root + backlog_index still
-        # get operator-action-required (formerly the two-state fallback).
         from devbench.backlog.proposal import (
             BlockedTaskState,
             classify_blocked_task,
@@ -2773,7 +2620,6 @@ class TestClassifyBlockedTaskAwaitingRecovery:
         proposals_dir = workspace / ".devbench" / "proposals"
         proposals_dir.mkdir(parents=True)
         (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
-        # Without workspace_root, recovery signals are invisible.
         state = classify_blocked_task(
             workspace / "backlog",
             workspace / "BACKLOG.md",
@@ -2808,10 +2654,6 @@ class TestRecoverySignalForTask:
         from devbench.backlog.proposal import recovery_signal_for_task
 
         signal = recovery_signal_for_task(tmp_path, "E0-T1")
-        # No artefact on disk, so the function returns the audit-comment
-        # fallback string. The classifier itself is responsible for
-        # deciding whether the audit comment actually qualifies; this
-        # helper just supplies the human-facing label.
         assert "audit comment" in signal
 
 
@@ -2834,7 +2676,6 @@ class TestRecentRecoveryAuditCommentEdgeCases:
         now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
         ts = now.strftime("%Y-%m-%d %H:%M UTC")
         wu.write_text(f"## Comments\n\n[{ts}] [agent/orchestrator] [BLOCKED_PENDING_PROPOSAL] E0-T9\n")
-        # Only marker-style line; helper must return False (cascade state, not recovery).
         assert _recent_recovery_audit_comment(wu, now, 300) is False
 
     def test_malformed_timestamp_is_skipped(self, tmp_path: Path) -> None:
@@ -2843,16 +2684,8 @@ class TestRecentRecoveryAuditCommentEdgeCases:
         from devbench.backlog.proposal import _recent_recovery_audit_comment
 
         wu = tmp_path / "wu.md"
-        # Regex matches the shape but the values are not a valid
-        # calendar date, so strptime raises ValueError. The helper
-        # must continue past it rather than crashing.
         wu.write_text("## Comments\n\n[9999-99-99 99:99 UTC] [agent/orchestrator] [BLOCKED] amendment-reject\n")
         assert _recent_recovery_audit_comment(wu, datetime(2026, 5, 1, 12, 0, tzinfo=UTC), 300) is False
-
-
-# ---------------------------------------------------------------------------
-# Issue #211: agent-tag hyphen vs underscore parity
-# ---------------------------------------------------------------------------
 
 
 class TestRecoveryAgentTagHyphenUnderscoreParity:
@@ -2966,11 +2799,6 @@ class TestRecoveryAgentTagHyphenUnderscoreParity:
         assert _normalize_agent_tag("operator/manifest-amender") == "operator/manifest-amender"
 
 
-# ---------------------------------------------------------------------------
-# Issue #211 end-to-end: classify_blocked_task on a hyphen-form amender audit
-# ---------------------------------------------------------------------------
-
-
 class TestClassifyBlockedTaskHyphenFormAmenderAudit:
     """Issue #211 reproducer: a work unit whose Comments section carries
     only a ``[BLOCKED] [AMENDMENT_REJECTED]`` audit from
@@ -3016,12 +2844,6 @@ class TestClassifyBlockedTaskHyphenFormAmenderAudit:
             recovery_window_seconds=300,
         )
         assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
-
-
-# ---------------------------------------------------------------------------
-# E8-F1-S1-T1 / issue #195: _RECOVERY_BODY_RE must match English forms
-# and auto-requeue phrase
-# ---------------------------------------------------------------------------
 
 
 class TestRecoveryBodyRegex:
@@ -3163,12 +2985,6 @@ class TestRecoveryBodyRegexIntegration:
         assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
 
 
-# ---------------------------------------------------------------------------
-# E8-F1-S1-T3 / issue #195: classify_blocked_task end-to-end integration
-# with 'Amendment rejected' audit -- false-positive loophole regression
-# ---------------------------------------------------------------------------
-
-
 class TestClassifyBlockedTaskAmendmentRejectedEndToEnd:
     """Issue #195 false-positive loophole: a task blocked with a recent
     ``[BLOCKED] Amendment rejected ...`` audit comment, no
@@ -3302,7 +3118,6 @@ class TestClassifyBlockedTaskAmendmentRejectedEndToEnd:
             workspace / "backlog",
             workspace / "BACKLOG.md",
             "E0-F1-S1-T1",
-            # workspace_root deliberately omitted
             now=now,
             recovery_window_seconds=300,
         )
@@ -3322,7 +3137,6 @@ class TestClassifyBlockedTaskAmendmentRejectedEndToEnd:
             tmp_path,
             audit_body="Amendment rejected -- emitting fix proposal",
         )
-        # Set now to 10 minutes after the audit timestamp (window is 300s / 5min)
         now = datetime(2026, 5, 15, 14, 10, tzinfo=UTC)
 
         state = classify_blocked_task(
@@ -3335,11 +3149,6 @@ class TestClassifyBlockedTaskAmendmentRejectedEndToEnd:
         )
 
         assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
-
-
-# ---------------------------------------------------------------------------
-# E2-F1-S1-T1 / issue #183(d): BlockedTaskState classifier tests
-# ---------------------------------------------------------------------------
 
 
 class TestBlockedTaskStateCanonicalValues:
@@ -3529,14 +3338,12 @@ class TestClassifyBlockedTaskRuntimeDegradation:
         from devbench.constants import LAST_RESTART_MARKER_PATH
 
         now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
-        # Audit row was emitted 30 minutes ago by the OLD instance.
         old_audit_ts = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
         workspace = self._workspace(
             tmp_path,
             f"[{old_audit_ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: "
             "session subprocess dropped Agent tool\n",
         )
-        # Operator restarted 5 minutes ago -- AFTER the audit row.
         marker = workspace / LAST_RESTART_MARKER_PATH
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text((now - timedelta(minutes=5)).isoformat(), encoding="utf-8")
@@ -3564,8 +3371,6 @@ class TestClassifyBlockedTaskRuntimeDegradation:
         from devbench.constants import LAST_RESTART_MARKER_PATH
 
         now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
-        # Operator restarted 30 minutes ago.
-        # Audit row was emitted 5 minutes ago by the NEW instance.
         new_audit_ts = (now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M UTC")
         workspace = self._workspace(
             tmp_path,
@@ -3603,7 +3408,6 @@ class TestClassifyBlockedTaskRuntimeDegradation:
             tmp_path,
             f"[{ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: cold-boot\n",
         )
-        # No marker written.
         state = classify_blocked_task(
             workspace / "backlog",
             workspace / "BACKLOG.md",
@@ -3766,8 +3570,6 @@ class TestClassifyBlockedTaskAwaitingDependency:
         """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
-        # Build the workspace: T1 has a stale marker on terminal T2 AND
-        # a regular dep on still-in-queue T3.
         backlog_dir = tmp_path / "backlog"
         story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
@@ -3994,19 +3796,16 @@ class TestClassifyBlockedTaskEndToEnd:
         story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
         story_dir.mkdir(parents=True)
 
-        # Task T10: HOLD status -> HELD
         (story_dir / "E0-F1-S1-T10.md").write_text(
             "# E0-F1-S1-T10: Hold Task\n\n## Status: hold\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
         )
-        # Task T11: blocked, marker pointing at T10 (HOLD) -> BLOCKED_ON_HELD
         (story_dir / "E0-F1-S1-T11.md").write_text(
             "# E0-F1-S1-T11: Blocked On Hold\n\n## Status: blocked\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Comments\n\n"
             "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T10\n"
         )
-        # Task T12: blocked, marker pointing at in-queue target -> AUTO_CLEARING_VIA_PROPOSAL
         (story_dir / "E0-F1-S1-T12.md").write_text(
             "# E0-F1-S1-T12: Auto Clearing\n\n## Status: blocked\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
@@ -4014,7 +3813,6 @@ class TestClassifyBlockedTaskEndToEnd:
             "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T13\n"
         )
         (story_dir / "E0-F1-S1-T13.md").write_text("# E0-F1-S1-T13: In Queue\n\n## Status: in-queue\n")
-        # Task T14: blocked, regular dep row pointing at in-queue T15, no marker
         (story_dir / "E0-F1-S1-T14.md").write_text(
             "# E0-F1-S1-T14: Awaiting Dep\n\n## Status: blocked\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
@@ -4022,7 +3820,6 @@ class TestClassifyBlockedTaskEndToEnd:
             "## Comments\n"
         )
         (story_dir / "E0-F1-S1-T15.md").write_text("# E0-F1-S1-T15: Dep\n\n## Status: in-queue\n")
-        # Task T16: blocked, no marker, no dep, recent recovery comment
         now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
         ts = now.strftime("%Y-%m-%d %H:%M UTC")
         (story_dir / "E0-F1-S1-T16.md").write_text(
@@ -4031,7 +3828,6 @@ class TestClassifyBlockedTaskEndToEnd:
             f"## Comments\n\n[{ts}] [agent/backlog_manager] [BLOCKED] "
             "dependency 'E0-F1-S1-T15' not yet terminal\n"
         )
-        # Task T17: blocked, no marker, no dep, no recovery signal
         (story_dir / "E0-F1-S1-T17.md").write_text(
             "# E0-F1-S1-T17: Operator Required\n\n## Status: blocked\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
@@ -4073,14 +3869,6 @@ class TestClassifyBlockedTaskEndToEnd:
                 recovery_window_seconds=300,
             )
             assert state is expected, f"{task_id}: expected {expected.name}, got {state.name}"
-
-
-# ---------------------------------------------------------------------------
-# Issue #200 / AC-200-1: classifier returns AUTO_CLEARING_VIA_PROPOSAL
-# even when ALL [BLOCKED_PENDING_PROPOSAL] marker targets are terminal.
-# Before the fix, _classify_with_markers returned None for all-terminal
-# markers, causing a fall-through to OPERATOR_ACTION_REQUIRED.
-# ---------------------------------------------------------------------------
 
 
 class TestClassifyBlockedTaskSatisfiedMarkers:
@@ -4178,12 +3966,6 @@ class TestClassifyBlockedTaskSatisfiedMarkers:
         assert state is getattr(BlockedTaskState, expected_state), (
             f"Expected {expected_state}, got {state.name}. Pairs: {pairs}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Issue #200 / AC-200-4: _REJECTION_TAG_RE matches [AMENDMENT_REJECTED]
-# structured-tag audits and causes AWAITING_AMENDMENT_RECOVERY classification.
-# ---------------------------------------------------------------------------
 
 
 class TestRejectionTagRegex:

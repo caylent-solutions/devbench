@@ -14,10 +14,6 @@ import pytest
 from devbench.backlog.manager import BacklogManager
 from devbench.constants import STATUS_DONE
 
-# ---------------------------------------------------------------------------
-# Minimal fixture helpers
-# ---------------------------------------------------------------------------
-
 _INDEX_HEADER = (
     "# Backlog\n\n"
     "## Full Work Unit Index\n\n"
@@ -42,13 +38,7 @@ def _make_wu(tmp_path: Path, unit_id: str, status: str = "in-queue") -> Path:
     return wu
 
 
-# ---------------------------------------------------------------------------
-# AC-H1-1: force_status raises the verbatim ValueError on done
-# ---------------------------------------------------------------------------
-
-
 _VERBATIM_FORCE_STATUS_ERROR = "force_status must not write 'done'; use mark_done (done-gate enforced)"
-# Regex-safe fragment for pytest.raises(match=...) -- parentheses are re-escaped.
 _FORCE_STATUS_ERROR_MATCH = r"force_status must not write 'done'; use mark_done \(done-gate enforced\)"
 
 
@@ -108,6 +98,5 @@ class TestForceStatusRefusesDone:
         index = _make_index(tmp_path, "E0-F1-S1-T1")
 
         mgr = BacklogManager()
-        # Must not raise
         mgr.force_status(wu, index, "E0-F1-S1-T1", non_done_status)
         assert f"## Status: {non_done_status}" in wu.read_text()

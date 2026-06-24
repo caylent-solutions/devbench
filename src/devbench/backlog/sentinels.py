@@ -28,8 +28,6 @@ from __future__ import annotations
 
 import re
 
-# Explicit allowlist of sentinel Manifest values recognised by the validator.
-# Adding a sentinel here is documentation -- the regex below already covers it.
 BACKLOG_SENTINEL_VALUES: frozenset[str] = frozenset(
     {
         "<verification-only>",
@@ -40,10 +38,6 @@ BACKLOG_SENTINEL_VALUES: frozenset[str] = frozenset(
     }
 )
 
-# Regex form: any token shaped as ``<name>`` is treated as a sentinel. This
-# covers operator-defined per-task variants without requiring the validator
-# to know about each one. The pattern is anchored to require the entire
-# value (not just a substring) to be of the sentinel shape.
 SENTINEL_PATTERN: re.Pattern[str] = re.compile(r"^<[^>]+>$")
 
 

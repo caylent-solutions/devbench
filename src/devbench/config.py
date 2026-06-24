@@ -163,14 +163,6 @@ def _resolve_str_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return default
 
 
-# ---------------------------------------------------------------------------
-# Repository allow-list
-# ---------------------------------------------------------------------------
-# When set, restricts all GitHub operations to this org only.
-# Unset or empty to allow any org in the allow-list.
-# Read before WORKSPACE_ROOT, before CLAUDE_MODEL, before any git operation,
-# so a missing repo allow-list surfaces at import-time rather than from the
-# first command that touches GitHub.
 ALLOWED_GH_ORG: str = _read_env("DEVBENCH_GH_ORG") or ""
 
 
@@ -192,14 +184,11 @@ def _require_env(name: str, hint: str) -> str:
     """
     value = _read_env(name) or ""
     if not value:
-        # Print + sys.exit(2) so the operator gets a clean, single-line
-        # error.  Fail-fast (CLAUDE.md): no fallback, no silent default.
         print(f"devbench: {name} environment variable is not set. {hint}", file=sys.stderr)
         sys.exit(2)
     return value
 
 
-# Absolute path to the workspace root directory containing all repo clones.
 WORKSPACE_ROOT: Path = Path(
     _require_env(
         "DEVBENCH_WORKSPACE_ROOT",
@@ -207,25 +196,15 @@ WORKSPACE_ROOT: Path = Path(
     )
 )
 
-# ---------------------------------------------------------------------------
-# YAML config loading
-# ---------------------------------------------------------------------------
-# Resolve config path and load YAML.  Fails fast if the file cannot be found.
 _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
 RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
 
-# ---------------------------------------------------------------------------
-# Allowed repos -- sourced exclusively from YAML config.
-# ---------------------------------------------------------------------------
 ALLOWED_REPOS: frozenset[str] = frozenset(RUNTIME_CONFIG.repos)
 
 REPO_LOCAL_PATHS: dict[str, Path] = {
     repo: get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT) for repo in ALLOWED_REPOS
 }
 
-# Short name -> full name mapping for backlog compatibility.
-# The backlog table uses short names (e.g., "git-repo") while the allow-list
-# uses fully-qualified names (e.g., "caylent-solutions/git-repo").
 REPO_SHORT_TO_FULL: dict[str, str] = {repo.split("/", maxsplit=1)[1]: repo for repo in ALLOWED_REPOS}
 
 
@@ -246,15 +225,9 @@ def resolve_repo(short_or_full: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Backlog paths -- derived from WORKSPACE_ROOT.
-# ---------------------------------------------------------------------------
 BACKLOG_ROOT: Path = WORKSPACE_ROOT / BACKLOG_SUBDIR
 BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
 
-# ---------------------------------------------------------------------------
-# Operational parameters
-# ---------------------------------------------------------------------------
 MAX_RETRY_ATTEMPTS: int = _resolve_int(
     "DEVBENCH_MAX_RETRIES", RUNTIME_CONFIG.max_executor_retries, DEFAULT_MAX_RETRY_ATTEMPTS
 )
@@ -263,13 +236,6 @@ GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
     RUNTIME_CONFIG.timeouts.github_check,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
 )
-# Issue #114: workflow-registration race defence. The retry loop runs
-# `gh pr checks` up to CHECK_REGISTRATION_RETRIES times when the local
-# `<repo>/.github/workflows/*.y[a]ml` glob proves CI exists but `gh`
-# returns "no checks reported" (Actions has not yet enqueued the run).
-# Lives under the YAML `debug:` section because operators only tune
-# these when investigating an unusual orchestrator cadence; everyday
-# workspaces leave them at the constant default.
 CHECK_REGISTRATION_RETRIES: int = _resolve_int(
     "DEVBENCH_CHECK_REGISTRATION_RETRIES",
     RUNTIME_CONFIG.debug.check_registration_retries,
@@ -280,38 +246,26 @@ CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
     RUNTIME_CONFIG.debug.check_registration_delay_seconds,
     DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
 )
-# Recency cap for the AWAITING_AUTO_RECOVERY audit-comment heuristic in
-# the 3-state blocked-task classifier. Lives under YAML `debug:` for
-# the same reason as the registration knobs above.
 BLOCKED_RECOVERY_WINDOW_SECONDS: int = _resolve_int(
     "DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS",
     RUNTIME_CONFIG.debug.blocked_recovery_window_seconds,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
 )
-# Phase 1: inline orphan-cleanup. Default-on; YAML
-# `git_ops.inline_orphan_cleanup: false` or env
-# `DEVBENCH_INLINE_ORPHAN_CLEANUP=0` (or `false` / `no` / `off`) opts out.
 INLINE_ORPHAN_CLEANUP_ENABLED: bool = _resolve_bool(
     "DEVBENCH_INLINE_ORPHAN_CLEANUP",
     RUNTIME_CONFIG.git_ops.inline_orphan_cleanup,
     DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
 )
-# Phase 2 (#115): CI-failure feedback log byte cap.
 CI_FAILURE_LOG_BYTES: int = _resolve_int(
     "DEVBENCH_CI_FAILURE_LOG_BYTES",
     RUNTIME_CONFIG.limits.ci_failure_log_bytes,
     DEFAULT_CI_FAILURE_LOG_BYTES,
 )
-# Phase 2 (#115): CI-failure executor retry. Default-on (FLIPPED in the
-# v-next release); YAML `git_ops.ci_failure_retry: false` or env
-# `DEVBENCH_CI_FAILURE_RETRY_ENABLED=0` opts out.
 CI_FAILURE_RETRY_ENABLED: bool = _resolve_bool(
     "DEVBENCH_CI_FAILURE_RETRY_ENABLED",
     RUNTIME_CONFIG.git_ops.ci_failure_retry,
     DEFAULT_CI_FAILURE_RETRY_ENABLED,
 )
-# Phase 3 (#116): PR review-comment polling. Default-off; YAML
-# `git_ops.pr_review_resolution.enabled: true` + `agents: [...]` opts in.
 PR_REVIEW_SETTLE_SECONDS: int = _resolve_int(
     "DEVBENCH_PR_REVIEW_SETTLE_SECONDS",
     RUNTIME_CONFIG.git_ops.pr_review_resolution.settle_seconds,
@@ -336,10 +290,6 @@ PR_REVIEW_RESOLUTION_ENABLED: bool = _resolve_bool(
     RUNTIME_CONFIG.git_ops.pr_review_resolution.enabled,
     DEFAULT_PR_REVIEW_RESOLUTION_ENABLED,
 )
-# Issue #101: pause-before-merge. Default-off; YAML
-# `git_ops.pause_before_merge: true` or env `DEVBENCH_PAUSE_BEFORE_MERGE=1`
-# opts in. Mutually exclusive with `defer_pr` and `single_branch`
-# (validated at YAML load).
 PAUSE_BEFORE_MERGE: bool = _resolve_bool(
     "DEVBENCH_PAUSE_BEFORE_MERGE",
     RUNTIME_CONFIG.git_ops.pause_before_merge,
@@ -364,7 +314,6 @@ class MergeStrategy(StrEnum):
         return f"--{self.value}"
 
 
-# Merge strategy for PRs. Defaults to squash.
 _merge_strategy = _read_env("DEVBENCH_MERGE_STRATEGY") or "squash"
 try:
     MERGE_STRATEGY: MergeStrategy = MergeStrategy(_merge_strategy)
@@ -412,35 +361,15 @@ AUTO_FINALIZE: bool = RUNTIME_CONFIG.git_ops.auto_finalize
 AUTO_MERGE: bool = RUNTIME_CONFIG.git_ops.auto_merge
 MANIFEST_AMENDMENT_CONFIG = RUNTIME_CONFIG.manifest_amendment
 TASK_FACTORY_CONFIG = RUNTIME_CONFIG.task_factory
-# Per-model token-pricing table (issue #223).  Operators set per-model rates
-# in ``backlog/config/devbench.yaml`` under ``report.models``; we merge that
-# with ``DEFAULT_MODEL_RATES`` so the operator's overrides win for the model
-# ids they list and the canonical Anthropic defaults apply for everything
-# else.  The retired scalar token-cost constants are no longer exposed --
-# callers consume ``REPORT_MODEL_RATES`` instead.  Removed per CLAUDE.md
-# "Complete Replacement of Superseded Code"; no deprecation shim.
 REPORT_MODEL_RATES: dict[str, ModelRates] = {
     **DEFAULT_MODEL_RATES,
     **RUNTIME_CONFIG.report.models,
 }
-# Rates applied to the ``"<unknown>"`` aggregation bucket (transcript
-# messages with no ``model`` field, or model ids not present in
-# REPORT_MODEL_RATES).  Operator override via ``report.default_model``;
-# falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` (Opus 4.7 list rates).
 REPORT_DEFAULT_MODEL_RATES: ModelRates = RUNTIME_CONFIG.report.default_model
-# IANA timezone name for displaying timestamps in `devbench report`.
-# None means "use the host's system local timezone." Resolution: env > YAML > None.
 REPORT_DISPLAY_TIMEZONE: str | None = _resolve_optional_str(
     "DEVBENCH_REPORT_TIMEZONE", RUNTIME_CONFIG.report.display_timezone
 )
-# Global display timezone applied by every devbench command that renders
-# timestamps (report, hook-tail, watch, any future command). IANA name.
-# None means "use the OS local timezone". Resolution: env > YAML > None.
-# Per-command surfaces may still override with their own CLI flag or
-# command-specific env var (e.g. hook-tail --tz or DEVBENCH_REPORT_TIMEZONE).
 DISPLAY_TIMEZONE: str | None = _resolve_optional_str("DEVBENCH_DISPLAY_TIMEZONE", RUNTIME_CONFIG.display_timezone)
-# Cost-calculation multipliers for `devbench report`. Defaults match Anthropic's
-# published pricing structure (see constants.py for source).
 REPORT_CACHE_READ_MULTIPLIER: float = _resolve_float(
     "DEVBENCH_REPORT_CACHE_READ_MULTIPLIER",
     RUNTIME_CONFIG.report.cache_read_multiplier,
@@ -466,17 +395,11 @@ REPORT_FAST_MODE_MULTIPLIER: float = _resolve_float(
     RUNTIME_CONFIG.report.fast_mode_multiplier,
     DEFAULT_FAST_MODE_MULTIPLIER,
 )
-# Number of most-recent task completions averaged for the "Recent pace"
-# projection in `devbench report`. Resolution precedence: env > YAML > constant.
 RECENT_PACE_TASKS: int = _resolve_int(
     "DEVBENCH_REPORT_RECENT_PACE_TASKS",
     RUNTIME_CONFIG.report.recent_pace_tasks,
     DEFAULT_RECENT_PACE_TASKS,
 )
-# Streaming-report loop bounds (TDI-005). The always-on `devbench report`
-# streaming loop must not spin a CPU core or grow RSS unbounded under an
-# actively-writing orchestrator. env > default (no YAML field; these are
-# operator-tunable safety bounds, not part of the report cost model).
 REPORT_STREAM_RENDER_BUDGET_SECONDS: float = _resolve_float(
     "DEVBENCH_REPORT_STREAM_RENDER_BUDGET_SECONDS",
     None,
@@ -492,9 +415,6 @@ REPORT_STREAM_TAIL_BYTES: int = _resolve_int(
     None,
     DEFAULT_REPORT_STREAM_TAIL_BYTES,
 )
-# Hook-tail column caps (issue #134). Resolution precedence: env > YAML >
-# constant. EVENT_WIDTH stays a hook_tail.py-local constant; the four below
-# are the operator-tunable knobs.
 HOOK_TAIL_AGENT_WIDTH: int = _resolve_int(
     "DEVBENCH_HOOK_TAIL_AGENT_WIDTH",
     RUNTIME_CONFIG.hook_tail.agent_width,
@@ -515,7 +435,6 @@ HOOK_TAIL_STDOUT_PREVIEW_MAX: int = _resolve_int(
     RUNTIME_CONFIG.hook_tail.stdout_preview_max,
     DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
 )
-# Recovery-cascade depth cap (issue #144). env > YAML > default.
 MAX_CASCADE_DEPTH: int = _resolve_int(
     "DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH",
     RUNTIME_CONFIG.orchestrate.max_cascade_depth,
@@ -547,13 +466,6 @@ BEDROCK_REGION: str = _resolve_str(
     os.environ.get("AWS_REGION", DEFAULT_BEDROCK_REGION),
 )
 
-# ---------------------------------------------------------------------------
-# Per-agent model overrides (ADR-25, Option A shadow-plugin-dir)
-# ---------------------------------------------------------------------------
-# Merge DEVBENCH_AGENT_MODEL_<NAME> env vars over the YAML-loaded
-# RUNTIME_CONFIG.agent_models. Precedence: env > YAML > frontmatter (None).
-#
-# Each tuple: (env_var, attr_path).
 _AGENT_MODEL_ENV_VARS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("DEVBENCH_AGENT_MODEL_EXECUTOR", ("executor",)),
     ("DEVBENCH_AGENT_MODEL_BLOCKER_RESOLVER", ("blocker_resolver",)),
@@ -590,11 +502,6 @@ def _apply_agent_model_env_overrides() -> None:
             target = getattr(target, attr)
         setattr(target, attr_path[-1], value)
 
-    # Re-validate every still-present YAML value against the resolved
-    # USE_BEDROCK. The loader already validated against the YAML flag; this
-    # second pass catches the DEVBENCH_USE_BEDROCK-overrides-YAML case where the
-    # operator flipped the Bedrock toggle via env without rewriting the YAML
-    # model strings.
     for _, attr_path in _AGENT_MODEL_ENV_VARS:
         target = RUNTIME_CONFIG.agent_models
         for attr in attr_path:
@@ -641,15 +548,6 @@ _apply_notifications_env_overrides()
 NOTIFICATIONS = RUNTIME_CONFIG.notifications
 
 
-# ---------------------------------------------------------------------------
-# Optional-judge enablement + done-gate env-override parity
-# ---------------------------------------------------------------------------
-# The done-gate (BacklogManager) reads RUNTIME_CONFIG.optional_judges and
-# RUNTIME_CONFIG.done_gate directly, so env overrides are applied by mutating
-# those fields in place (same pattern as _apply_notifications_env_overrides).
-# Precedence: env var > YAML > default.
-
-# env var -> optional-judge name (must be in OPTIONAL_JUDGE_NAMES).
 _OPTIONAL_JUDGE_ENV_VARS: tuple[tuple[str, str], ...] = (("DEVBENCH_JUDGE_IAC_REVIEW_ENABLED", "iac_review"),)
 
 
@@ -695,11 +593,6 @@ OPTIONAL_JUDGES = RUNTIME_CONFIG.optional_judges
 DONE_GATE = RUNTIME_CONFIG.done_gate
 
 
-# ---------------------------------------------------------------------------
-# Orchestrator stop-class mention-level mapping (E14-F2-S1-T1, issue #271)
-# ---------------------------------------------------------------------------
-
-
 def resolve_orchestrator_stop_mention_map(yaml_map: dict[str, str] | None) -> dict[str, str]:
     """Resolve the stop-class to mention-level mapping.
 
@@ -738,7 +631,6 @@ def resolve_orchestrator_stop_mention_map(yaml_map: dict[str, str] | None) -> di
         DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP,
     )
 
-    # Validate yaml_map keys before merging so the error names the bad key.
     if yaml_map:
         for cls in yaml_map:
             if cls not in ALL_STOP_CLASSES:
@@ -774,9 +666,6 @@ def resolve_orchestrator_stop_mention_map(yaml_map: dict[str, str] | None) -> di
 ORCHESTRATOR_STOP_MENTION_MAP: dict[str, str] = resolve_orchestrator_stop_mention_map(None)
 
 
-# ---------------------------------------------------------------------------
-# Timeouts -- all values in seconds
-# ---------------------------------------------------------------------------
 GH_API_TIMEOUT: int = _resolve_int("DEVBENCH_GH_API_TIMEOUT", RUNTIME_CONFIG.timeouts.gh_api, DEFAULT_GH_API_TIMEOUT)
 TEST_TIMEOUT: int = _resolve_int("DEVBENCH_TEST_TIMEOUT", RUNTIME_CONFIG.timeouts.test, DEFAULT_TEST_TIMEOUT)
 SECURITY_FETCH_TIMEOUT: int = _resolve_int(
@@ -789,22 +678,8 @@ COMMAND_TIMEOUT: int = _resolve_int(
     "DEVBENCH_COMMAND_TIMEOUT", RUNTIME_CONFIG.timeouts.command, DEFAULT_COMMAND_TIMEOUT
 )
 
-# ---------------------------------------------------------------------------
-# Deterministic per-unit verification-gate ordering seed
-# ---------------------------------------------------------------------------
-# ``devbench verify-ac`` pins ``pytest-randomly``'s seed (+ ``PYTHONHASHSEED``)
-# so a unit's ``## Verification`` pytest gate is reproducible run-to-run -- an
-# order-dependent sibling test can no longer block an unrelated unit
-# non-deterministically by the wall-clock seed it happened to draw. Resolution
-# precedence: ``DEVBENCH_VERIFY_AC_PYTEST_SEED`` env var > constant default.
-# Sourced from env-with-default (not YAML) deliberately: it is a verify-ac
-# execution knob an operator may rotate for a one-off reproduction, not a
-# per-workspace backlog setting.
 VERIFY_AC_PYTEST_SEED: int = _resolve_int("DEVBENCH_VERIFY_AC_PYTEST_SEED", None, DEFAULT_VERIFY_AC_PYTEST_SEED)
 
-# ---------------------------------------------------------------------------
-# Thresholds and limits
-# ---------------------------------------------------------------------------
 ALERT_SUMMARY_LIMIT: int = _resolve_int(
     "DEVBENCH_ALERT_SUMMARY_LIMIT",
     RUNTIME_CONFIG.limits.alert_summary,
@@ -821,9 +696,6 @@ LLM_EVIDENCE_TRUNCATION: int = _resolve_int(
     DEFAULT_LLM_EVIDENCE_TRUNCATION,
 )
 
-# ---------------------------------------------------------------------------
-# LLM context limits
-# ---------------------------------------------------------------------------
 LLM_FILE_CONTEXT_LIMIT: int = _resolve_int(
     "DEVBENCH_LLM_FILE_CONTEXT_LIMIT",
     RUNTIME_CONFIG.limits.llm_file_context,
@@ -835,27 +707,18 @@ LLM_FILE_PREVIEW_CHARS: int = _resolve_int(
     DEFAULT_LLM_FILE_PREVIEW_CHARS,
 )
 
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
 ORCHESTRATOR_POLL_INTERVAL: int = _resolve_int(
     "DEVBENCH_ORCHESTRATOR_POLL_INTERVAL",
     RUNTIME_CONFIG.timeouts.orchestrator_poll_interval,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
 )
 
-# Issue #262 (E10-F2-S1): per-message inactivity timeout.
-# env var > YAML > DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS.
-# A value <= 0 disables the asyncio.wait_for wrap in cmd_start._run.
 ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS: float = _resolve_float(
     "DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS",
     RUNTIME_CONFIG.timeouts.orchestrator_inactivity_timeout,
     DEFAULT_ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS,
 )
 
-# ---------------------------------------------------------------------------
-# Credentials
-# ---------------------------------------------------------------------------
 GH_TOKEN_FILE: Path = Path(_read_env("DEVBENCH_GH_TOKEN_FILE") or str(Path.home() / ".gh_token_env"))
 CLAUDE_CREDENTIALS_FILE: Path = Path(
     _read_env("DEVBENCH_CLAUDE_CREDENTIALS_FILE") or str(Path.home() / ".claude" / ".credentials.json")
@@ -917,14 +780,6 @@ def get_anthropic_api_key() -> str:
     return token
 
 
-# ---------------------------------------------------------------------------
-# Auto-resolve engine (issue #263, E11-F1-S1)
-# ---------------------------------------------------------------------------
-# Resolve auto_resolve.enabled via _resolve_bool with env precedence:
-#   DEVBENCH_AUTO_RESOLVE_ENABLED env var > YAML auto_resolve.enabled > DEFAULT_AUTO_RESOLVE_ENABLED (false).
-# The YAML value (RUNTIME_CONFIG.auto_resolve.enabled) was already loaded from YAML above.
-# config.py re-resolves it here so the env-var override layer is applied consistently
-# with every other boolean knob in this module.
 AUTO_RESOLVE_ENABLED: bool = _resolve_bool(
     DEVBENCH_AUTO_RESOLVE_ENABLED_ENV,
     RUNTIME_CONFIG.auto_resolve.enabled,
@@ -935,32 +790,21 @@ AUTO_RESOLVE_MAX_ATTEMPTS: int = _resolve_int(
     RUNTIME_CONFIG.auto_resolve.max_attempts,
     DEFAULT_AUTO_RESOLVE_MAX_ATTEMPTS,
 )
-# Resolved AutoResolveConfig for consumption by the auto-resolve engine module.
 AUTO_RESOLVE_CONFIG: AutoResolveConfig = AutoResolveConfig(
     enabled=AUTO_RESOLVE_ENABLED,
     max_attempts=AUTO_RESOLVE_MAX_ATTEMPTS,
 )
 
-# ---------------------------------------------------------------------------
-# Skills Workflow fan-out (issue #266, E12-F1-S1-T1)
-# ---------------------------------------------------------------------------
-# Resolve skills.use_workflow via _resolve_bool with env precedence:
-#   DEVBENCH_SKILLS_USE_WORKFLOW env var > YAML skills.use_workflow > DEFAULT_SKILLS_USE_WORKFLOW (false).
-# Unset-safe: absent env and YAML yields False (opt-in only).
 SKILLS_USE_WORKFLOW: bool = _resolve_bool(
     DEVBENCH_SKILLS_USE_WORKFLOW_ENV,
     RUNTIME_CONFIG.skills.use_workflow,
     DEFAULT_SKILLS_USE_WORKFLOW,
 )
-# Resolve skills.workflow_chunk_size via _resolve_int with env precedence.
-# Provider rate-limiting is observed near 15 concurrent agents; default 3.
 SKILLS_WORKFLOW_CHUNK_SIZE: int = _resolve_int(
     DEVBENCH_SKILLS_WORKFLOW_CHUNK_SIZE_ENV,
     RUNTIME_CONFIG.skills.workflow_chunk_size,
     DEFAULT_SKILLS_WORKFLOW_CHUNK_SIZE,
 )
-# Resolve skills.adversarial_review_threshold via _resolve_int with env precedence.
-# Consumed by E12-F2 to gate the adversarial-review hardening pass.
 SKILLS_ADVERSARIAL_REVIEW_THRESHOLD: int = _resolve_int(
     DEVBENCH_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD_ENV,
     RUNTIME_CONFIG.skills.adversarial_review_threshold,

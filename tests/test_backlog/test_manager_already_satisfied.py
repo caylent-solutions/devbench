@@ -131,7 +131,7 @@ class TestAlreadySatisfiedAllows:
         """
         idx = _make_index(tmp_path)
         wu = _make_unit(tmp_path, manifest=_VERIFICATION_ONLY_MANIFEST, verification_block=_VERIFICATION_BLOCK)
-        assert not BacklogManager()._last_round_all_passed(wu)  # no judge passes present
+        assert not BacklogManager()._last_round_all_passed(wu)
         _write_evidence(tmp_path, exit_code=0)
         mgr = BacklogManager()
         with patch("devbench.config.RUNTIME_CONFIG", _runtime_config()):
@@ -145,7 +145,7 @@ class TestAlreadySatisfiedRefusesNonVerificationOnly:
     def test_real_manifest_refused(self, tmp_path: Path) -> None:
         idx = _make_index(tmp_path)
         wu = _make_unit(tmp_path, manifest=_REAL_MANIFEST, verification_block=_VERIFICATION_BLOCK)
-        _write_evidence(tmp_path, exit_code=0)  # even with green evidence
+        _write_evidence(tmp_path, exit_code=0)
         mgr = BacklogManager()
         with patch("devbench.config.RUNTIME_CONFIG", _runtime_config()):
             with pytest.raises(RuntimeError, match="verification-only"):
@@ -173,7 +173,6 @@ class TestAlreadySatisfiedRequiresGreenEvidence:
     def test_missing_evidence_refused(self, tmp_path: Path) -> None:
         idx = _make_index(tmp_path)
         wu = _make_unit(tmp_path, manifest=_VERIFICATION_ONLY_MANIFEST, verification_block=_VERIFICATION_BLOCK)
-        # No evidence ledger written.
         mgr = BacklogManager()
         with patch("devbench.config.RUNTIME_CONFIG", _runtime_config()):
             with pytest.raises(RuntimeError, match="evidence incomplete"):

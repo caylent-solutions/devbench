@@ -35,7 +35,6 @@ SCRIPT_PATH = (
 
 def _run_hook(payload: dict, env: dict | None = None) -> subprocess.CompletedProcess:
     """Invoke the hook with the given JSON payload + env."""
-    # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
     runtime_env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if env:
         runtime_env.update(env)
@@ -143,6 +142,5 @@ class TestBashMutationsStillBlocked:
         assert "review-supervisor agent attempted rm" in result.stderr
 
     def test_log_comment_allowed(self) -> None:
-        # Reviewers must be able to record their findings.
         result = _run_hook(_bash_payload("uv run devbench log-comment review_supervisor E0-T1 'finding'"))
         assert result.returncode == 0

@@ -24,16 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Pattern the asyncio loop logs when a Task's exception is never retrieved.
-# The removal of the sdk_teardown_filter workaround (PR #255) means this
-# pattern must NOT appear under a cleanly-closing fake SDK.
-# ---------------------------------------------------------------------------
 _TEARDOWN_PATTERN = re.compile(r"Task exception was never retrieved", re.IGNORECASE)
-
-# ---------------------------------------------------------------------------
-# Fake SDK factory
-# ---------------------------------------------------------------------------
 
 
 def _make_clean_sdk(messages: list[object]) -> types.ModuleType:
@@ -89,11 +80,6 @@ def _make_clean_sdk(messages: list[object]) -> types.ModuleType:
     return fake_sdk
 
 
-# ---------------------------------------------------------------------------
-# Loop factory that wires the exception handler before the run starts
-# ---------------------------------------------------------------------------
-
-
 def _make_exception_recording_loop(
     captured: list[dict[str, Any]],
 ) -> asyncio.AbstractEventLoop:
@@ -125,11 +111,6 @@ def _make_exception_recording_loop(
 
     loop.set_exception_handler(_recording_handler)
     return loop
-
-
-# ---------------------------------------------------------------------------
-# Regression test
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.functional
@@ -195,7 +176,6 @@ class TestNoAsyncioTeardownErrors:
 
         assert result == 0, f"cmd_start returned non-zero exit code: {result}"
 
-        # Check the recording exception handler caught nothing matching the pattern.
         teardown_contexts = [ctx for ctx in exception_contexts if _TEARDOWN_PATTERN.search(str(ctx.get("message", "")))]
         assert teardown_contexts == [], (
             f"Expected zero asyncio 'Task exception was never retrieved' records "
@@ -205,12 +185,10 @@ class TestNoAsyncioTeardownErrors:
             "before the event loop is torn down."
         )
 
-        # Also assert that caplog at ERROR captured no matching records.
         teardown_log_records = [
             record
             for record in caplog.records
-            if record.levelno >= 40  # logging.ERROR
-            and _TEARDOWN_PATTERN.search(record.getMessage())
+            if record.levelno >= 40 and _TEARDOWN_PATTERN.search(record.getMessage())
         ]
         assert teardown_log_records == [], (
             f"Expected zero ERROR-level log records matching the teardown pattern "

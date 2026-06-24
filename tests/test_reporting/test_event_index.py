@@ -40,20 +40,17 @@ class TestSchemaInitialisation:
 
     def test_open_is_idempotent(self, workspace: Path) -> None:
         EventIndex.open(workspace).close()
-        # Second open must not raise; schema is reapplied via CREATE IF NOT EXISTS.
         EventIndex.open(workspace).close()
 
     def test_open_rebuilds_on_schema_version_mismatch(self, workspace: Path) -> None:
         idx = EventIndex.open(workspace)
         idx.close()
         db = workspace / ".devbench" / "report-cache" / "events.sqlite"
-        # Force a stale schema version; reopen should wipe + rebuild.
         with sqlite3.connect(str(db)) as conn:
             conn.execute("PRAGMA user_version = 0")
             conn.execute("CREATE TABLE rogue (a INTEGER)")
         idx = EventIndex.open(workspace)
         try:
-            # ``rogue`` table from the old version was wiped during rebuild.
             with pytest.raises(sqlite3.OperationalError):
                 idx._conn.execute("SELECT * FROM rogue").fetchone()
         finally:
@@ -63,11 +60,9 @@ class TestSchemaInitialisation:
         cache_dir = workspace / ".devbench" / "report-cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         db = cache_dir / "events.sqlite"
-        # Garbage bytes that aren't a valid SQLite header.
         db.write_bytes(b"\x00" * 200)
         idx = EventIndex.open(workspace)
         try:
-            # Cache must function after the rebuild.
             ts = idx.task_transition_times(workspace / "no-such.log", "done")
             assert ts == {}
         finally:
@@ -90,7 +85,6 @@ class TestOrchestratorLogIncremental:
         try:
             idx.refresh_orchestrator_log(log)
             first_done = idx.task_transition_times(log, "done")
-            # Second refresh against an unchanged file: rows must not duplicate.
             idx.refresh_orchestrator_log(log)
             second_done = idx.task_transition_times(log, "done")
             assert first_done == second_done
@@ -110,7 +104,6 @@ class TestOrchestratorLogIncremental:
             idx.refresh_orchestrator_log(log)
             assert idx.task_transition_times(log, "done") == {}
             initial_offset = idx._conn.execute("SELECT parsed_offset FROM source_files").fetchone()[0]
-            # Append a line; mtime must advance for the cache to notice.
             time.sleep(0.01)
             with log.open("a") as f:
                 f.write("2026-05-04T10:05:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n")
@@ -135,7 +128,6 @@ class TestOrchestratorLogIncremental:
         try:
             idx.refresh_orchestrator_log(log)
             assert len(idx.task_transition_times(log, "done")) == 2
-            # Replace with a much shorter file (= truncation / rotation).
             log.write_text(
                 "2026-05-04T10:10:00Z [devbench.cli] INFO Set E0-F1-S1-T9 to 'done'\n",
                 encoding="utf-8",
@@ -148,7 +140,6 @@ class TestOrchestratorLogIncremental:
 
     def test_partial_unterminated_line_is_skipped_until_flush(self, workspace: Path) -> None:
         log = workspace / "orch.log"
-        # No trailing newline -> the writer hasn't finished flushing the line.
         log.write_text(
             "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
             encoding="utf-8",
@@ -156,9 +147,7 @@ class TestOrchestratorLogIncremental:
         idx = EventIndex.open(workspace)
         try:
             idx.refresh_orchestrator_log(log)
-            # Partial line must NOT enter the cache.
             assert idx.task_transition_times(log, "done") == {}
-            # After the writer finishes the line, the next refresh picks it up.
             time.sleep(0.01)
             log.write_text(
                 "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n",
@@ -196,7 +185,6 @@ class TestQueryFiltering:
         try:
             idx.refresh_orchestrator_log(log_a)
             idx.refresh_orchestrator_log(log_b)
-            # Each query must see only its own source's events.
             assert "E0-F1-S1-T1" in idx.task_transition_times(log_a, "done")
             assert "E0-F1-S1-T9" not in idx.task_transition_times(log_a, "done")
             assert "E0-F1-S1-T9" in idx.task_transition_times(log_b, "done")
@@ -219,7 +207,7 @@ class TestQueryFiltering:
             idx.refresh_orchestrator_log(log)
             non_noise = idx.non_noise_log_timestamps(log, "judges.log_setup")
             assert len(non_noise) == 2
-            assert all(ts.minute != 0 or ts.second != 30 for ts in non_noise)  # 10:00:30 entry filtered
+            assert all(ts.minute != 0 or ts.second != 30 for ts in non_noise)
         finally:
             idx.close()
 
@@ -260,8 +248,6 @@ class TestHookLogAggregation:
 
     def test_unparseable_timestamp_entry_is_always_in_window(self, workspace: Path) -> None:
         hook = workspace / "hook-logs.jsonl"
-        # One unparseable-timestamp entry; legacy ``_entry_in_window`` includes
-        # it in every window so cost data is not silently dropped.
         _write_jsonl(
             hook,
             [
@@ -375,7 +361,7 @@ class TestTranscriptAggregation:
             [
                 {
                     "timestamp": "2026-05-04T10:00:00.000000+00:00",
-                    "message": {"role": "user", "content": "hi"},  # no usage
+                    "message": {"role": "user", "content": "hi"},
                 },
                 {
                     "timestamp": "2026-05-04T10:01:00.000000+00:00",
@@ -414,7 +400,6 @@ class TestTranscriptResumedSessionDedupIndexed:
     def test_duplicate_message_ids_across_files_are_counted_once(self, workspace: Path) -> None:
         tdir = workspace / "transcripts"
         tdir.mkdir()
-        # File A: m1, m2, m3. File B: m2 + m3 carried-forward + new m4.
         _write_jsonl(
             tdir / "a.jsonl",
             [
@@ -435,7 +420,6 @@ class TestTranscriptResumedSessionDedupIndexed:
         try:
             idx.refresh_transcripts(tdir)
             agg = idx.aggregate_transcript_window(tdir, datetime(2026, 5, 4, 9, 0, tzinfo=UTC))
-            # Deduped: m1+m2+m3+m4 = 100 input / 32 output / 4 entries
             assert agg["input_tokens"] == 100
             assert agg["output_tokens"] == 32
             assert agg["entries_with_usage"] == 4
@@ -479,7 +463,7 @@ class TestTranscriptResumedSessionDedupIndexed:
         _write_jsonl(
             tdir / "b.jsonl",
             [
-                self._msg_entry("2026-05-04T10:02:00.000000+00:00", "m2", 20, 7),  # dup of A's m2
+                self._msg_entry("2026-05-04T10:02:00.000000+00:00", "m2", 20, 7),
                 self._msg_entry("2026-05-04T10:03:00.000000+00:00", "m3", 30, 9),
             ],
         )
@@ -642,13 +626,9 @@ class TestParityAgainstParserPath:
                 tasks_active=0,
                 event_index=None,
             )
-            # Token totals identical.
             assert indexed.totals == parsed.totals
-            # Cost totals identical.
             assert indexed.cost.total_cost == pytest.approx(parsed.cost.total_cost)
-            # API hours identical.
             assert indexed.api_hours == pytest.approx(parsed.api_hours)
-            # Tasks-in-window count identical.
             assert indexed.tasks_in_window == parsed.tasks_in_window
         finally:
             idx.close()
@@ -660,7 +640,6 @@ class TestParityAgainstParserPath:
         )
 
         log = workspace / "orch.log"
-        # Session boundary at 10:01 (gap > 10 minutes between earlier 09:00 and later 10:01).
         _write_orch_log(
             log,
             [
@@ -691,7 +670,6 @@ class TestRefreshOrchLogSourcesShardAware:
         and the live log is empty (mirrors the post-migration state we
         hit on caylent-telemetry-spec). Returns the live log path."""
         (tmp_path / ".devbench").mkdir()
-        # Shards under logs/2026-04/ + logs/2026-05/.
         shard_apr = tmp_path / "logs" / "2026-04" / "E0-F1-S1-T1.jsonl"
         shard_apr.parent.mkdir(parents=True)
         _write_orch_log(
@@ -710,8 +688,6 @@ class TestRefreshOrchLogSourcesShardAware:
                 "2026-05-01T09:30:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'blocked'",
             ],
         )
-        # Live flat log -- empty (operator hasn't started a new orchestrate
-        # session post-migration yet).
         live_log = tmp_path / "logs" / "orchestrator.log"
         live_log.write_text("", encoding="utf-8")
         return live_log
@@ -733,7 +709,6 @@ class TestRefreshOrchLogSourcesShardAware:
         """When the live log has post-migration events AND shards exist,
         both contribute to the union."""
         live_log = self._seed_post_migration_workspace(tmp_path)
-        # New post-migration event lands in the live flat log.
         _write_orch_log(
             live_log,
             ["2026-05-10T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T3 to 'done'"],
@@ -743,7 +718,6 @@ class TestRefreshOrchLogSourcesShardAware:
         try:
             idx.refresh_orch_log_sources(tmp_path, live_log)
             done = idx.task_transition_times_for_workspace(tmp_path, live_log, "done")
-            # Both the shard (T1 done) AND the live log (T3 done) appear.
             assert "E0-F1-S1-T1" in done
             assert "E0-F1-S1-T3" in done
         finally:
@@ -794,7 +768,6 @@ class TestRefreshOrchLogSourcesShardAware:
         try:
             idx.refresh_orch_log_sources(tmp_path, live_log)
             timestamps = idx.all_log_timestamps_for_workspace(tmp_path, live_log)
-            # 2 lines in April shard + 2 lines in May shard.
             assert len(timestamps) == 4
             assert timestamps == sorted(timestamps)
         finally:
@@ -819,15 +792,9 @@ class TestRefreshOrchLogSourcesShardAware:
         try:
             idx.refresh_orch_log_sources(tmp_path, live_log)
             timestamps = idx.non_noise_log_timestamps_for_workspace(tmp_path, live_log, "noise.tick")
-            # Two real events; noise tick dropped.
             assert len(timestamps) == 2
         finally:
             idx.close()
-
-
-# ---------------------------------------------------------------------------
-# Issue #223: per-model attribution in SQL index + per-model aggregators
-# ---------------------------------------------------------------------------
 
 
 class TestPerModelAttribution:
@@ -883,7 +850,7 @@ class TestPerModelAttribution:
         """
         from devbench.reporting.event_index import _KIND_TRANSCRIPT
 
-        del _KIND_TRANSCRIPT  # imported to confirm module symbol exists
+        del _KIND_TRANSCRIPT
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
         transcript_file = transcript_dir / "session.jsonl"
@@ -949,7 +916,6 @@ class TestPerModelAttribution:
                 {
                     "timestamp": "2026-05-04T10:02:00.000000+00:00",
                     "input": {
-                        # No model attribution -- aggregates under "<unknown>".
                         "tool_response": {"usage": {"input_tokens": 500, "output_tokens": 100}},
                     },
                 },
@@ -964,7 +930,6 @@ class TestPerModelAttribution:
             assert by_model["claude-sonnet-4-6"]["input_tokens"] == 1000
             assert by_model["claude-opus-4-7"]["input_tokens"] == 3000
             assert by_model["<unknown>"]["input_tokens"] == 500
-            # Roll-up sanity check.
             rollup = idx.aggregate_hook_window(hook, window_start)
             assert rollup["input_tokens"] == sum(b["input_tokens"] for b in by_model.values())
             assert rollup["output_tokens"] == sum(b["output_tokens"] for b in by_model.values())

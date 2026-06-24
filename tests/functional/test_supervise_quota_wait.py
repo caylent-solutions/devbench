@@ -38,7 +38,6 @@ class TestStubQuotaWaitAndResume:
     def test_quota_surfaces_waiting_then_resumes_clean(self, tmp_path: Path) -> None:
         config = functional_supervise_config()
         state_file = tmp_path / "stub-seq.state"
-        # Launch 1 emits the quota prompt + reset line and exits; launch 2 is clean.
         stub_env = stub_sequence_env(
             sequence="quota,clean",
             state_file=state_file,
@@ -48,13 +47,10 @@ class TestStubQuotaWaitAndResume:
         captured: dict[str, object] = {}
 
         def fast_wait_for_reset(*, reset_at, poll_interval_seconds, max_wait_seconds):
-            # At the instant the wait begins, the registry MUST already reflect
-            # quota-waiting + the parsed expected-resume (status surfacing, FR-16).
             waiting = SuperviseRegistry(tmp_path).read_state("q1")
             captured["state_during_wait"] = waiting.state if waiting else None
             captured["expected_resume_during_wait"] = waiting.expected_resume if waiting else None
             captured["reset_at"] = reset_at
-            # Recovery: the (test-shortened) window has refreshed -> resume.
             return True
 
         with (
@@ -63,22 +59,16 @@ class TestStubQuotaWaitAndResume:
         ):
             rc = cli.cmd_supervise("__run", "--name", "q1", "--model", "claude-opus-4-8")
 
-        # The quota event NEVER yields a non-zero exit (Section 4.9, FR-13).
         assert rc == 0
-        # The supervisor surfaced quota-waiting with the expected-resume DURING the wait.
         assert captured["state_during_wait"] == "quota-waiting"
         assert isinstance(captured["expected_resume_during_wait"], datetime)
-        # The shared wait was handed the parsed provider reset time, not None.
         assert isinstance(captured["reset_at"], datetime)
-        # After the window refreshed, the relaunch completed clean; one resume used.
         final = SuperviseRegistry(tmp_path).read_state("q1")
         assert final is not None
         assert final.state == "completed-clean"
         assert final.resumes_used == 1
 
     def test_status_line_shows_expected_resume_for_quota_waiting(self, tmp_path: Path) -> None:
-        # FR-10/FR-16: the persisted quota-waiting state renders an expected-resume +
-        # resumes-used on the status line (the surface an operator reads, Goal G-3).
         config = functional_supervise_config()
         state_file = tmp_path / "stub-seq.state"
         stub_env = stub_sequence_env(

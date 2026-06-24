@@ -22,8 +22,6 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent.parent
 GUARD_SCRIPT = REPO_ROOT / "plugin" / "devbench-orchestrate" / "scripts" / "guard-work-unit-write.sh"
 
-# Exact stderr captured pre-split from the same script when invoked with a
-# backlog/*.md write attempt. Pinned by issue #224 amendment 2 AC-11.
 EXPECTED_STDERR_LINES = (
     "guard-work-unit-write: blocked write to work unit file: ",
     "Fix: work unit .md files under backlog/ are managed exclusively by the orchestrate skill.",
@@ -40,8 +38,6 @@ class TestWorkUnitWriteBlockMessage:
     """
 
     def test_blocks_with_exact_message(self, tmp_path: Path) -> None:
-        # Construct a fake workspace + work-unit file path so the guard
-        # has a backlog/*.md target to reject.
         fake_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
         payload = '{"tool_name":"Write","tool_input":{"file_path":"' + str(fake_path) + '"}}'
         result = subprocess.run(

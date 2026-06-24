@@ -50,18 +50,11 @@ class TestManifestAmenderPreConflict:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # The check itself.
             "scan every other work-unit's Changes Manifest table for the same file path",
-            # The terminal-status allow path. Issue #142 changed the wording
-            # from "recommend dep edge" to "auto-wire the dep"; the
-            # [CONFLICT_AUTODEP] audit shape is preserved.
             "If the conflict task is in a terminal state (`done` / `declined`)",
             "[CONFLICT_AUTODEP]",
-            # The default reject path.
             "REJECT the amendment with a structured reason naming the conflict task",
-            # Why: prevents the cascade-then-recover loop.
             "prevents new conflicts from being authored in the first place",
-            # Cross-link to this regression test.
             "test_manifest_amender_pre_conflict.py",
         ],
     )
@@ -83,7 +76,6 @@ class TestManifestAmenderPreConflict:
             assert question in prompt_text, (
                 f"manifest-amender.md should ask all four semantic questions; missing: {question!r}"
             )
-        # Verify the count update happened in the trailing sentence.
         assert "any of the four questions" in prompt_text, (
             "The trailing 'if the answer to any of the X questions is unclear or "
             "negative, reject' sentence must say 'four' now (was 'three')."

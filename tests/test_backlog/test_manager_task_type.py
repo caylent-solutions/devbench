@@ -129,9 +129,6 @@ class TestValidateBacklogTaskTypeHeader:
         """When a work-unit file is missing, the task type check is skipped (not an error)."""
         task_id = "E0-F1-S1-T1"
         index = _make_backlog_index(tmp_path, task_id)
-        # Do NOT create the work-unit file -- it is absent on disk.
-        # validate() already reports a separate file-missing error; the
-        # task type check must not double-report or crash.
         mgr = BacklogManager()
         errors = mgr.validate(index, tmp_path)
         task_type_errors = [e for e in errors if "Task Type" in e or "unknown" in e]
@@ -139,11 +136,8 @@ class TestValidateBacklogTaskTypeHeader:
 
     def test_skips_non_task_rows_silently(self, tmp_path: Path) -> None:
         """Non-Task rows (Epics, Features, Stories) are skipped without error."""
-        # Call _check_task_type_header directly with a non-Task row to exercise
-        # the 'if not self._is_task_id(row_id): continue' branch.
         mgr = BacklogManager()
         errors: list[str] = []
-        # E0 is an Epic ID (no -F or -T segment) -- not a Task
         non_task_rows: list[tuple[str, str, str]] = [
             ("E0", "Sample Epic", "backlog/E0.md"),
         ]

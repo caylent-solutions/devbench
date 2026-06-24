@@ -42,8 +42,8 @@ class TestGenerateReport:
         )
 
         report = generate_report(log_path=log_file)
-        assert "\u250c" in report  # top-left corner
-        assert "\u2514" in report  # bottom-left corner
+        assert "\u250c" in report
+        assert "\u2514" in report
         assert "Tasks completed" in report
         assert "Tasks remaining" in report
         assert "Average time per task" in report
@@ -64,7 +64,6 @@ class TestGenerateReport:
 
         since = datetime(2026, 3, 5, 9, 0, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
-        # Only 1 task should be in this session (T2, after 09:00)
         assert "Tasks in this session" in report
 
     def test_report_uses_session_start_for_tasks_started_before_since(self, tmp_path: Path) -> None:
@@ -88,7 +87,6 @@ class TestGenerateReport:
 
         since = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
-        # Three tasks done at 30 min each -> avg 30 min per task in window
         assert "30.0 min" in report
 
     def test_report_keeps_latest_in_progress_timestamp(self, tmp_path: Path) -> None:
@@ -112,7 +110,6 @@ class TestGenerateReport:
 
         since = datetime(2026, 3, 5, 9, 0, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
-        # Three tasks done at 20 min each -> avg 20 min per task in window
         assert "20.0 min" in report
 
     def test_report_handles_empty_log(self, tmp_path: Path) -> None:
@@ -121,8 +118,6 @@ class TestGenerateReport:
 
         report = generate_report(log_path=log_file)
         assert "Tasks completed" in report
-        # With no completed tasks, per-task averages are "n/a" (not "0.0 minutes")
-        # since 0 is misleading (suggests pace, not absence of data).
         assert "n/a" in report
 
     def test_report_handles_missing_log(self, tmp_path: Path) -> None:
@@ -143,8 +138,6 @@ class TestGenerateReport:
         )
 
         report = generate_report(log_path=log_file)
-        # Backlog parser is mocked to return zero units, so tasks_active = 0;
-        # the summary line takes the "All tasks complete." branch.
         assert "All tasks complete." in report
 
 
@@ -161,7 +154,6 @@ class TestTokenCostReport:
                 ]
             )
         )
-        # Create a hook-logs.jsonl with token data
         hook_log = tmp_path / "hook-logs.jsonl"
         hook_log.write_text(
             '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
@@ -169,7 +161,6 @@ class TestTokenCostReport:
             '{"timestamp":"2026-03-05T10:05:00Z","event":"PostToolUse","input":{"tool_response":'
             '{"usage":{"input_tokens":30000}}}}\n'
         )
-        # Patch BACKLOG_INDEX to point to tmp_path so hook-logs.jsonl is found
         from unittest.mock import patch
 
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -190,7 +181,6 @@ class TestTokenCostReport:
                 ]
             )
         )
-        # No hook-logs.jsonl created
         from unittest.mock import patch
 
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -241,8 +231,6 @@ class TestEpicsDoneReport:
 
             report = generate_report(log_path=log_file)
 
-        # The Backlog state table renders the combined "Stories / Features / Epics" row;
-        # since the test backlog has 1 epic done, the value cell shows "0 / 0 / 1".
         assert "Stories / Features / Epics auto-rolled to done" in report
         assert "0 / 0 / 1" in report
 
@@ -272,7 +260,6 @@ class TestHookLogDurationMetrics:
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file)
 
-        # 60000 + 120000 = 180000 ms = 180 s = 0.05 hours
         assert "API processing time" in report
 
     def test_hook_log_entry_before_since_is_excluded(self, tmp_path: Path) -> None:
@@ -288,10 +275,8 @@ class TestHookLogDurationMetrics:
         )
         hook_log = tmp_path / "hook-logs.jsonl"
         hook_log.write_text(
-            # This entry is before session_start, should be excluded
             '{"timestamp":"2026-03-05T08:00:00Z","event":"PostToolUse","input":{"tool_response":'
             '{"totalDurationMs":999999,"usage":{"input_tokens":99999}}}}\n'
-            # This entry is within session, should be included
             '{"timestamp":"2026-03-05T10:03:00Z","event":"PostToolUse","input":{"tool_response":'
             '{"totalDurationMs":60000,"usage":{"input_tokens":10000}}}}\n'
         )
@@ -300,7 +285,6 @@ class TestHookLogDurationMetrics:
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file, since=since)
 
-        # Only 10,000 tokens should be counted (the pre-session entry excluded)
         assert "10,000" in report
 
     def test_hook_log_skips_blank_lines(self, tmp_path: Path) -> None:
@@ -372,7 +356,6 @@ class TestHookLogDurationMetrics:
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file)
 
-        # Even with invalid timestamp, the tokens should be counted (falls through ValueError)
         assert "12,000" in report
 
 
@@ -391,17 +374,11 @@ class TestDualWindowReport:
             )
         )
         report = generate_report(log_path=log_file)
-        # Multi-column header includes both window labels
         assert "All-time" in report
         assert "Session" in report
-        # Consolidated grouped table uses uppercase section headers for
-        # BACKLOG STATE and the windowed sections.
         assert "BACKLOG STATE" in report
         assert "THROUGHPUT" in report
-        # No "This run <timestamp>" column header when not in watch mode.
-        # ("This run" appears in the trailing prose explanation, so check the
-        # header form specifically.)
-        assert "This run 0" not in report  # would match "This run YYYY-..." column header
+        assert "This run 0" not in report
 
     def test_session_boundary_detected_at_large_gap(self, tmp_path: Path) -> None:
         """A gap > 30 minutes (DEFAULT_SESSION_GAP_MINUTES) starts a new session."""
@@ -409,19 +386,16 @@ class TestDualWindowReport:
         log_file.write_text(
             _make_log(
                 [
-                    # Two tasks in the "old" session
                     "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
                     "2026-03-05T08:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
                     "2026-03-05T08:10:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
                     "2026-03-05T08:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                    # 60-minute gap (well over the 30-minute threshold)
                     "2026-03-05T09:15:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
                     "2026-03-05T09:20:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
         report = generate_report(log_path=log_file)
-        # Session column header includes the post-gap timestamp (in local time, MM-DD HH:MM format)
         gap_local = datetime(2026, 3, 5, 9, 15, 0, tzinfo=UTC).astimezone().strftime("%m-%d %H:%M")
         log_start_local = datetime(2026, 3, 5, 8, 0, 0, tzinfo=UTC).astimezone().strftime("%m-%d %H:%M")
         assert f"Session {gap_local}" in report
@@ -433,20 +407,15 @@ class TestDualWindowReport:
         log_file.write_text(
             _make_log(
                 [
-                    # An orchestration event, then a long gap of pure noise, then more orchestration.
-                    # Without filtering, the noise would prevent a "real" gap from being detected.
                     "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
                     "2026-03-05T08:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                    # Noise entries every 3 seconds for 1 hour (just one example to prove filtering)
                     "2026-03-05T08:30:00Z [judges.log_setup] INFO Logging to stdout and ...",
                     "2026-03-05T09:00:00Z [judges.log_setup] INFO Logging to stdout and ...",
-                    # A real orchestration event 70 minutes after the last real one -- new session
                     "2026-03-05T09:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
                 ]
             )
         )
         report = generate_report(log_path=log_file)
-        # Session should start at the post-gap orchestration event, not at any noise entry
         session_local = datetime(2026, 3, 5, 9, 15, 0, tzinfo=UTC).astimezone().strftime("%m-%d %H:%M")
         assert f"Session {session_local}" in report
 
@@ -465,7 +434,6 @@ class TestDualWindowReport:
         )
         report = generate_report(log_path=log_file)
         same_local = datetime(2026, 3, 5, 8, 0, 0, tzinfo=UTC).astimezone().strftime("%m-%d %H:%M")
-        # Both columns should show the same timestamp in their headers
         assert f"All-time {same_local}" in report
         assert f"Session {same_local}" in report
 
@@ -499,10 +467,8 @@ class TestDualWindowReport:
         since = datetime(2026, 3, 5, 7, 30, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
         since_local = since.astimezone().strftime("%Y-%m-%d %H:%M %Z")
-        # Single-window mode shows "Window (since ...)" not the multi-column layout
         assert f"Window (since {since_local})" in report
-        assert "Window stats" not in report  # multi-column header NOT rendered in --since mode
-        # Backward-compat label preserved for callers grepping for "Tasks in this session"
+        assert "Window stats" not in report
         assert "Tasks in this session" in report
 
 
@@ -532,10 +498,8 @@ class TestFindCurrentSessionStart:
         from devbench.reporting.report import _find_current_session_start
 
         log = (
-            "2026-03-05T08:00:00Z [judges.cli] INFO first event\n"
-            "2026-03-05T08:03:00Z [judges.cli] INFO second event\n"  # 3 min later
+            "2026-03-05T08:00:00Z [judges.cli] INFO first event\n2026-03-05T08:03:00Z [judges.cli] INFO second event\n"
         )
-        # With a 2-min threshold, the 3-min gap counts; session starts at the second event.
         result = _find_current_session_start(log, gap_minutes=2)
         assert result == datetime(2026, 3, 5, 8, 3, 0, tzinfo=UTC)
 
@@ -558,9 +522,6 @@ class TestDisplayTimezone:
         )
         with _patch("devbench.reporting.report.REPORT_DISPLAY_TIMEZONE", "America/Denver"):
             report = generate_report(log_path=log_file)
-        # Multi-column headers use compact "MM-DD HH:MM" format (no TZ abbrev).
-        # 2026-03-05 12:00 UTC = 2026-03-05 05:00 MST (Denver, no DST in March 5).
-        # Validate the compact-format timestamp; if rendered in any other TZ this would differ.
         assert "03-05 05:00" in report
 
     def test_invalid_tz_falls_back_to_local(self, tmp_path: Path) -> None:
@@ -576,10 +537,8 @@ class TestDisplayTimezone:
                 ]
             )
         )
-        # "Not_A_Real_Zone" is invalid; should fall back to local.
         with _patch("devbench.reporting.report.REPORT_DISPLAY_TIMEZONE", "Not_A_Real_Zone"):
             report = generate_report(log_path=log_file)
-        # Just check report rendered -- no exception, has the expected sections.
         assert "All-time" in report
         assert "Session" in report
 
@@ -598,7 +557,6 @@ class TestDisplayTimezone:
         )
         with _patch("devbench.reporting.report.REPORT_DISPLAY_TIMEZONE", None):
             report = generate_report(log_path=log_file)
-        # Multi-column header uses compact "MM-DD HH:MM" host-local format.
         log_start_local = datetime(2026, 3, 5, 12, 0, 0, tzinfo=UTC).astimezone().strftime("%m-%d %H:%M")
         assert f"All-time {log_start_local}" in report
 
@@ -617,11 +575,10 @@ class TestAccurateCost:
             cache_write_5m_tokens=1_000_000,
             cache_write_1h_tokens=1_000_000,
         )
-        # Use Opus 4.7 rates: $5 input, $25 output, multipliers 0.10 / 1.25 / 2.0
         cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0)
         assert cost.input_cost == pytest.approx(5.0)
         assert cost.output_cost == pytest.approx(25.0)
-        assert cost.cache_read_cost == pytest.approx(0.50)  # 1M * 5 * 0.10 / 1M
+        assert cost.cache_read_cost == pytest.approx(0.50)
         assert cost.cache_write_5m_cost == pytest.approx(6.25)
         assert cost.cache_write_1h_cost == pytest.approx(10.0)
         assert cost.total_cost == pytest.approx(46.75)
@@ -646,10 +603,9 @@ class TestAccurateCost:
         totals = HookLogTotals(
             input_tokens=2_000_000,
             output_tokens=0,
-            us_only_input_tokens=1_000_000,  # half of inputs were us-only
+            us_only_input_tokens=1_000_000,
         )
         cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0, data_residency_multiplier=1.10)
-        # Base: 2M * 5 / 1M = 10.0. US-only boost: 1M * 5 * 0.10 / 1M = 0.5. Total: 10.5.
         assert cost.input_cost == pytest.approx(10.5)
         assert cost.total_cost == pytest.approx(10.5)
 
@@ -659,10 +615,9 @@ class TestAccurateCost:
 
         totals = HookLogTotals(
             output_tokens=1_000_000,
-            fast_output_tokens=1_000_000,  # all output was fast-mode
+            fast_output_tokens=1_000_000,
         )
         cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0, fast_mode_multiplier=6.0)
-        # Base: 1M * 25 / 1M = 25. Fast boost: 1M * 25 * 5 / 1M = 125. Total: 150.
         assert cost.output_cost == pytest.approx(150.0)
         assert cost.total_cost == pytest.approx(150.0)
 
@@ -673,8 +628,8 @@ class TestAccurateCost:
 
         totals = HookLogTotals(
             cache_read_tokens=1_000_000,
-            us_only_cache_read_tokens=1_000_000,  # all cache reads were us-only
-            fast_cache_read_tokens=1_000_000,  # AND all were fast-mode
+            us_only_cache_read_tokens=1_000_000,
+            fast_cache_read_tokens=1_000_000,
         )
         cost = _compute_cost(
             totals,
@@ -686,10 +641,6 @@ class TestAccurateCost:
             data_residency_multiplier=1.10,
             fast_mode_multiplier=6.0,
         )
-        # Base cache_read: 1M * 5 * 0.10 / 1M = 0.50.
-        # Residency boost: 1M * 5 * 0.10 / 1M * (1.10-1) = 0.05.
-        # Fast boost: 1M * 5 * 0.10 / 1M * (6.0-1) = 2.50.
-        # Total cache_read: 0.50 + 0.05 + 2.50 = 3.05.
         assert cost.cache_read_cost == pytest.approx(3.05)
         assert cost.total_cost == pytest.approx(3.05)
 
@@ -704,15 +655,12 @@ class TestAccurateCost:
             fast_output_tokens=500_000,
         )
         cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0)
-        # Base: 1M*5 + 1M*25 = 30. No boost because multipliers default to 1.0.
         assert cost.total_cost == pytest.approx(30.0)
 
     def test_compute_cost_realistic_high_cache_hit(self) -> None:
         """A heavily-cached call (99% hit rate) costs a small fraction of a naive blended estimate."""
         from devbench.reporting.report import HookLogTotals, _compute_cost
 
-        # Mirror the real example from user's hook log: 1 input, 332 output,
-        # 38712 cache reads, 458 cache writes 5-min.
         totals = HookLogTotals(
             input_tokens=1,
             output_tokens=332,
@@ -720,13 +668,8 @@ class TestAccurateCost:
             cache_write_5m_tokens=458,
         )
         cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0)
-        # Hand-calculated: 1*5/1M + 332*25/1M + 38712*0.5/1M + 458*6.25/1M
-        # = 0.000005 + 0.0083 + 0.019356 + 0.0028625 = ~0.030524
         assert cost.total_cost == pytest.approx(0.030524, abs=1e-5)
 
-        # A naive totalTokens * blended-rate estimate would give $0.355527 for
-        # the same call -- confirming per-token-type costing is >10x lower for
-        # cache-heavy workloads. Naive: (1+332+38712+458) * 9 / 1M.
         naive_blended_cost = (1 + 332 + 38712 + 458) * 9.0 / 1_000_000
         assert naive_blended_cost / cost.total_cost > 10
 
@@ -745,11 +688,8 @@ class TestAccurateCost:
         with _patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file)
 
-        # Token breakdown rows live in the TOKENS section of the consolidated
-        # table now (no more duplicated "Lifetime X" rows -- those were the
-        # same data as the All-time column and have been consolidated away).
         assert "Tokens consumed" in report
-        assert "1,000" in report  # cache reads
+        assert "1,000" in report
         assert "Cache hit rate" in report
 
     def test_input_share_property(self) -> None:
@@ -776,7 +716,6 @@ class TestAccurateCost:
             api_hours=0.0,
             api_efficiency=None,
         )
-        # input-side = 100 + 1000 + 50 = 1150; total = 1200; share = 1150/1200 ≈ 0.9583
         assert ws.input_share == pytest.approx(1150 / 1200)
 
     def test_input_share_none_when_no_tokens(self) -> None:
@@ -810,14 +749,11 @@ class TestAccurateCost:
             '{"timestamp":"2026-03-05T10:01:00Z","event":"PostToolUse","input":{"tool_response":{"usage":'
             '{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1000000}}}}\n'
         )
-        # With Anthropic default 0.10 multiplier and Opus 4.7 input rate $5: 1M reads = $0.50
-        # If we override to 0.20: same reads = $1.00
         with (
             _patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             _patch("devbench.reporting.report.REPORT_CACHE_READ_MULTIPLIER", 0.20),
         ):
             report = generate_report(log_path=log_file)
-        # The cost should reflect the doubled multiplier.
         assert "~$1.00" in report
 
 
@@ -843,7 +779,6 @@ class TestTranscriptParsing:
         from devbench.reporting.report import _discover_transcript_dir
 
         assert _discover_transcript_dir(tmp_path / "nope.jsonl") is None
-        # Empty hook log
         empty = tmp_path / "empty.jsonl"
         empty.write_text("")
         assert _discover_transcript_dir(empty) is None
@@ -855,7 +790,6 @@ class TestTranscriptParsing:
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
         (transcript_dir / "session1.jsonl").write_text(
-            # Two assistant turns with usage data
             '{"timestamp":"2026-03-05T10:01:00Z","message":{"role":"assistant",'
             '"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000}}}\n'
             '{"timestamp":"2026-03-05T10:02:00Z","message":{"role":"assistant",'
@@ -878,7 +812,6 @@ class TestTranscriptParsing:
             '{"timestamp":"2026-03-05T11:00:00Z","message":{"usage":{"output_tokens":42}}}\n'
         )
         result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
-        # Only the 11:00 entry counts (08:00 is before window_start)
         assert result.output_tokens == 42
 
     def test_parse_transcript_metrics_handles_missing_dir(self) -> None:
@@ -900,9 +833,6 @@ class TestTranscriptParsing:
 
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
-        # Three turns across three roles: orchestrator (no attribution),
-        # executor, and code_review (note the canonical normalisation:
-        # ``devbench-orchestrate:code-reviewer`` -> ``code_review``).
         (transcript_dir / "session1.jsonl").write_text(
             '{"timestamp":"2026-03-05T10:01:00Z","message":{"role":"assistant",'
             '"usage":{"input_tokens":100,"output_tokens":50}}}\n'
@@ -916,13 +846,11 @@ class TestTranscriptParsing:
 
         assert "orchestrator" in by_role
         assert "executor" in by_role
-        assert "code_review" in by_role  # devbench-orchestrate:code-reviewer -> code_review
+        assert "code_review" in by_role
         assert by_role["orchestrator"].input_tokens == 100
         assert by_role["executor"].input_tokens == 200
         assert by_role["code_review"].input_tokens == 40
 
-        # Aggregate row contract (AC-FUNC-003): summed totals match the
-        # existing global figure.
         global_totals = _parse_transcript_metrics(transcript_dir, window_start)
         assert sum(t.input_tokens for t in by_role.values()) == global_totals.input_tokens
         assert sum(t.output_tokens for t in by_role.values()) == global_totals.output_tokens
@@ -945,7 +873,6 @@ class TestTranscriptParsing:
         assert _role_for_entry({"attributionAgent": "devbench-orchestrate:blocker-resolver"}) == "blocker_resolver"
         assert _role_for_entry({"attributionAgent": "devbench-orchestrate:manifest-amender"}) == "manifest_amender"
         assert _role_for_entry({"attributionAgent": "devbench-orchestrate:task-factory"}) == "task_factory"
-        # Missing or malformed -> orchestrator bucket.
         assert _role_for_entry({"attributionAgent": None}) == "orchestrator"
         assert _role_for_entry({}) == "orchestrator"
 
@@ -982,21 +909,17 @@ class TestTranscriptResumedSessionDedup:
 
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
-        # File A: m1, m2, m3 (10/5, 20/7, 30/9 = 60/21 total)
         (transcript_dir / "a.jsonl").write_text(
             self._msg_line("2026-03-05T10:01:00Z", "m1", 10, 5)
             + self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
             + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
         )
-        # File B: m2, m3 carried forward from A + new m4.
-        # If naive sum: m2+m3 are counted twice. Deduped: counted once.
         (transcript_dir / "b.jsonl").write_text(
             self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
             + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
             + self._msg_line("2026-03-05T10:04:00Z", "m4", 40, 11)
         )
         result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
-        # Deduped: m1+m2+m3+m4 = 100 input / 32 output / 4 entries
         assert result.input_tokens == 100
         assert result.output_tokens == 32
         assert result.entries_with_usage == 4
@@ -1011,7 +934,6 @@ class TestTranscriptResumedSessionDedup:
             self._msg_line("2026-03-05T10:01:00Z", None, 10, 5) + self._msg_line("2026-03-05T10:02:00Z", None, 20, 7)
         )
         result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
-        # Both entries count -- dedup is opt-in on a stable id, not a bar against missing ones.
         assert result.input_tokens == 30
         assert result.output_tokens == 12
         assert result.entries_with_usage == 2
@@ -1026,7 +948,6 @@ class TestTranscriptResumedSessionDedup:
 
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
-        # Same dup pattern as the basic test; orchestrator role implied (no attributionAgent).
         (transcript_dir / "a.jsonl").write_text(
             self._msg_line("2026-03-05T10:01:00Z", "m1", 10, 5) + self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
         )
@@ -1036,11 +957,9 @@ class TestTranscriptResumedSessionDedup:
         window_start = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         global_totals = _parse_transcript_metrics(transcript_dir, window_start)
         by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
-        # Both deduped to m1+m2+m3 = 60 input / 21 output / 3 entries
         assert global_totals.input_tokens == 60
         assert global_totals.output_tokens == 21
         assert global_totals.entries_with_usage == 3
-        # Per-role sum equals the global dedupped figure (aggregate-row contract).
         assert sum(t.input_tokens for t in by_role.values()) == global_totals.input_tokens
         assert sum(t.output_tokens for t in by_role.values()) == global_totals.output_tokens
         assert sum(t.entries_with_usage for t in by_role.values()) == global_totals.entries_with_usage
@@ -1052,8 +971,6 @@ class TestBedrockConfig:
     def test_use_bedrock_false_by_default(self) -> None:
         from devbench.config import USE_BEDROCK
 
-        # In test env, DEVBENCH_USE_BEDROCK is not set
-        # Value depends on test environment, just verify it's a bool
         assert isinstance(USE_BEDROCK, bool)
 
     def test_bedrock_region_has_default(self) -> None:
@@ -1070,7 +987,6 @@ class TestResolveWindowEndpoints:
     def test_window_end_uses_now_when_logs_are_older(self) -> None:
         from devbench.reporting.report import _resolve_window_endpoints
 
-        # All log timestamps are an hour old.
         old = datetime.now(UTC) - timedelta(hours=1)
         log_ts = [old, old + timedelta(minutes=10), old + timedelta(minutes=30)]
 
@@ -1080,7 +996,6 @@ class TestResolveWindowEndpoints:
 
         assert log_start == old
         assert log_started == old
-        # window_end must be at least "now" (clamped above the latest log entry)
         assert window_end >= before
         assert window_end <= after
 
@@ -1102,12 +1017,8 @@ class TestResolveWindowEndpoints:
 
         old = datetime.now(UTC) - timedelta(hours=1)
         _, window_end, _ = _resolve_window_endpoints([old])
-        run_start = datetime.now(UTC)  # later than every log entry
-        # window_end is bounded by now, so the span is at least 0 (within microseconds).
+        run_start = datetime.now(UTC)
         span = (window_end - run_start).total_seconds()
-        # Allow tiny negative drift caused by datetime.now() racing with the
-        # window_end computation; anything within 100ms is non-negative for
-        # display purposes.
         assert span >= -0.1
 
 
@@ -1137,7 +1048,6 @@ class TestApiUtilizationDisplay:
         from devbench.reporting.report import _stats_to_value_list
 
         values = _stats_to_value_list(self._make_stats(719.0))
-        # API utilization is the 6th value (index 5) in METRIC_LABELS order.
         assert ">100% (parallel)" in values
 
     def test_efficiency_at_or_below_100_shows_raw_percentage(self) -> None:
@@ -1228,7 +1138,6 @@ class TestActiveVsBlockedRemaining:
         assert rows["Tasks in-progress"] == "1"
         assert rows["Tasks blocked"] == "4"
         assert rows["Tasks remaining (total)"] == "5"
-        # Old labels must be gone.
         assert "Tasks remaining (active)" not in rows
         assert "Tasks remaining (blocked, excluded from ETA)" not in rows
 
@@ -1260,9 +1169,6 @@ class TestActiveVsBlockedRemaining:
             prog,
             tasks_active=1,
         )
-        # 3 tasks * 20 min -> avg 20 min; only 3 completions log-wide but
-        # RECENT_PACE_TASKS default is 10, so recent_pace_minutes is None and
-        # est_hours falls back to avg_minutes.
         assert stats.avg_minutes == pytest.approx(20.0)
         assert stats.pace_sample_count == 3
         assert stats.est_hours == pytest.approx(20.0 / 60.0)
@@ -1296,7 +1202,6 @@ class TestActiveVsBlockedRemaining:
         from devbench.constants import MIN_PACE_SAMPLES
         from devbench.reporting.report import _compute_window_stats
 
-        # Use only 1 completed task (well below MIN_PACE_SAMPLES=3).
         log_file = tmp_path / "test.log"
         log_file.write_text("ignored\n")
         done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, 30, tzinfo=UTC)}
@@ -1312,9 +1217,9 @@ class TestActiveVsBlockedRemaining:
         )
         assert MIN_PACE_SAMPLES >= 3
         assert stats.pace_sample_count == 1
-        assert stats.avg_minutes == 0.0  # below threshold → reported as 0
-        assert stats.recent_pace_minutes is None  # only 1 completion log-wide
-        assert stats.est_hours == 0.0  # no usable pace → no projection
+        assert stats.avg_minutes == 0.0
+        assert stats.recent_pace_minutes is None
+        assert stats.est_hours == 0.0
 
     def test_n_equals_1_renders_as_na_with_sample_count(self) -> None:
         """B3 display: n/a (N=1 sample) appears in the rendered row when below threshold."""
@@ -1347,14 +1252,12 @@ class TestActiveVsBlockedRemaining:
 
         log_file = tmp_path / "test.log"
         log_file.write_text("ignored\n")
-        # Build N+1 done tasks with last 10 averaging 50 min each, earlier ones 5 min.
         done = {}
         prog = {}
         n_total = RECENT_PACE_TASKS + 5
         base = datetime(2026, 4, 15, 8, 0, tzinfo=UTC)
         for i in range(n_total):
             tid = f"E0-F1-S1-T{i + 1}"
-            # Recent 10 tasks: 50 min each. Older: 5 min each.
             dur = 50 if i >= n_total - RECENT_PACE_TASKS else 5
             start = base + timedelta(hours=i)
             prog[tid] = start
@@ -1368,9 +1271,7 @@ class TestActiveVsBlockedRemaining:
             prog,
             tasks_active=2,
         )
-        # avg_minutes mixes 5- and 50-min tasks; recent_pace_minutes is exactly 50.
         assert stats.recent_pace_minutes == pytest.approx(50.0)
-        # est_hours uses recent pace x tasks_active: 50 x 2 / 60 = 1.667h
         assert stats.est_hours == pytest.approx(50.0 * 2 / 60.0)
 
     def test_recent_per_task_cost_returns_none_with_fewer_than_n_completions(self, tmp_path: Path) -> None:
@@ -1380,7 +1281,6 @@ class TestActiveVsBlockedRemaining:
 
         log_file = tmp_path / "test.log"
         log_file.write_text("ignored\n")
-        # Only 2 completions; RECENT_PACE_TASKS is 5 by default.
         done = {f"E0-F1-S1-T{i}": datetime(2026, 4, 15, 10 + i, tzinfo=UTC) for i in range(2)}
         prog = {f"E0-F1-S1-T{i}": datetime(2026, 4, 15, 9 + i, tzinfo=UTC) for i in range(2)}
         result = _recent_per_task_cost(log_file, done, prog, RECENT_PACE_TASKS)
@@ -1395,19 +1295,15 @@ class TestActiveVsBlockedRemaining:
         IS provided it overrides the per-window denominator."""
         from devbench.reporting.report import _compute_window_stats
 
-        # AC-CODE-001: prevent _hook_log_path from falling back to the live
-        # workspace hook-logs.jsonl when log_path is inside tmp_path.
         nonexistent = tmp_path / "hook-logs.jsonl"
         monkeypatch.setattr("devbench.reporting.report._hook_log_path", lambda _p: nonexistent)
         monkeypatch.setattr("devbench.reporting.report._discover_transcript_dir", lambda _p: None)
 
         log_file = tmp_path / "test.log"
-        log_file.write_text("")  # empty log -> all costs are zero
+        log_file.write_text("")
         done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 11, tzinfo=UTC)}
         prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, tzinfo=UTC)}
 
-        # No recent_per_task_cost supplied -> fallback path; with empty
-        # log every cost is zero so est_total_cost should also be zero.
         stats_fallback = _compute_window_stats(
             log_file,
             datetime(2026, 4, 15, 10, tzinfo=UTC),
@@ -1418,7 +1314,6 @@ class TestActiveVsBlockedRemaining:
         )
         assert stats_fallback.est_total_cost == pytest.approx(0.0)
 
-        # With recent_per_task_cost=$50, projection = 0 + 50 * 10 = 500
         stats_global = _compute_window_stats(
             log_file,
             datetime(2026, 4, 15, 10, tzinfo=UTC),
@@ -1442,8 +1337,6 @@ class TestActiveVsBlockedRemaining:
         """
         from devbench.reporting.report import _compute_window_stats
 
-        # AC-CODE-001: prevent _hook_log_path from falling back to the live
-        # workspace hook-logs.jsonl when log_path is inside tmp_path.
         nonexistent = tmp_path / "hook-logs.jsonl"
         monkeypatch.setattr("devbench.reporting.report._hook_log_path", lambda _p: nonexistent)
         monkeypatch.setattr("devbench.reporting.report._discover_transcript_dir", lambda _p: None)
@@ -1453,8 +1346,6 @@ class TestActiveVsBlockedRemaining:
         done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 11, tzinfo=UTC)}
         prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, tzinfo=UTC)}
 
-        # No lifetime_total_cost: legacy formula (cost.total_cost is 0 from
-        # empty log), projection = 0 + 50 * 10 = 500.
         stats_legacy = _compute_window_stats(
             log_file,
             datetime(2026, 4, 15, 10, tzinfo=UTC),
@@ -1466,10 +1357,6 @@ class TestActiveVsBlockedRemaining:
         )
         assert stats_legacy.est_total_cost == pytest.approx(500.0)
 
-        # With lifetime_total_cost=$1000 (the All-time cost passed in by
-        # generate_report), projection = 1000 + 50 * 10 = 1500. This is
-        # the same number every column produces because it is computed
-        # from a single global pair (lifetime cost, recent rate).
         stats_lifetime = _compute_window_stats(
             log_file,
             datetime(2026, 4, 15, 10, tzinfo=UTC),
@@ -1488,8 +1375,6 @@ class TestActiveVsBlockedRemaining:
         from devbench.reporting.report import _SPANNING_METRIC_LABELS, _merge_spanning_values
 
         assert "Estimated total cost at completion" in _SPANNING_METRIC_LABELS
-        # When every column carries the same value, _merge_spanning_values
-        # collapses to a single string.
         result = _merge_spanning_values("Estimated total cost at completion", ["~$500.00"] * 3)
         assert isinstance(result, str)
         assert result == "~$500.00"
@@ -1516,7 +1401,7 @@ class TestActiveVsBlockedRemaining:
         )
         line = _summary_line(stats, tasks_active=1, tasks_blocked=4)
         assert "At the Recent pace of ~31.4 minutes per task" in line
-        assert "All-time pace" not in line  # superseded when recent is available
+        assert "All-time pace" not in line
 
     def test_summary_line_reports_when_only_blocked_remain(self) -> None:
         from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _summary_line
@@ -1579,7 +1464,6 @@ class TestBacklogStatusBreakdown:
         assert b.tasks_in_queue == 2
         assert b.tasks_in_review == 1
         assert b.tasks_blocked == 2
-        # Invariant: every non-Done task is in exactly one status bucket.
         assert (b.tasks_in_progress + b.tasks_in_queue + b.tasks_in_review + b.tasks_blocked) == b.tasks_remaining
 
 
@@ -1609,7 +1493,6 @@ class TestBacklogTotalsSixBlockedFields:
         """AC-FUNC-004: _BacklogTotals has the six per-state blocked count fields."""
         from devbench.reporting.report import _BacklogTotals
 
-        # Construct a minimal _BacklogTotals instance to confirm the six fields exist.
         b = _BacklogTotals(
             tasks_total=6,
             tasks_done=0,
@@ -1639,7 +1522,6 @@ class TestBacklogTotalsSixBlockedFields:
         assert b.tasks_blocked_held == 1
         assert b.tasks_blocked_on_held == 1
         assert b.tasks_blocked_operator == 1
-        # Sum of all six equals total blocked count.
         assert (
             b.tasks_blocked_auto_clearing
             + b.tasks_blocked_amendment_recovery
@@ -1730,9 +1612,7 @@ class TestBacklogTotalsSixBlockedFields:
             return fake_state
 
         monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
-        # Tolerate the BlockedTaskState identity-check noise; what we care
-        # about is that the renderer rejects the unhandled enum value.
-        del BlockedTaskState  # only imported for clarity above
+        del BlockedTaskState
         with pytest.raises(RuntimeError, match="Unhandled BlockedTaskState"):
             _backlog_totals_from_units([unit])
 
@@ -1761,9 +1641,6 @@ class TestUnitListings:
         units = [self._mk_unit("E0-F1-S1-T1", "Active task", WorkUnitStatus.IN_PROGRESS)]
         lines = _in_progress_listing(units)
         assert lines[1] == "In-progress tasks:"
-        # Issue #158: row always carries an in-progress suffix; when no
-        # transition timestamp is parseable the helper renders
-        # ``(in-progress, timer unavailable)`` rather than silently omitting.
         assert lines[2].startswith("  - E0-F1-S1-T1: Active task")
         assert "(in-progress" in lines[2]
 
@@ -1799,9 +1676,7 @@ class TestUnitListings:
         lines = report_mod._blocked_listing([unit_auto, unit_attn])
         assert "Blocked tasks (auto-clearing via proposal) (1):" in lines
         assert "Blocked tasks (operator action required) (1):" in lines
-        # Auto-clearing row names the waiting-on target.
         assert any("E0-F1-S1-T1" in line and "waiting on" in line for line in lines)
-        # Every attn-panel row carries an annotation from _ATTN_RANK.
         assert any(
             line.startswith("  - E0-F1-S1-T2: Needs attention") and "[operator action required]" in line
             for line in lines
@@ -1817,10 +1692,7 @@ class TestUnitListings:
             self._mk_unit("E0-F5-S2-T2", "Pipeline tests", WorkUnitStatus.BLOCKED),
         ]
         lines = _blocked_listing(units)
-        # Fake units have no work-unit file on disk; classifier returns
-        # OPERATOR_ACTION_REQUIRED, so only the attn panel renders.
         assert "Blocked tasks (operator action required) (2):" in lines
-        # Each attn row carries the OPERATOR_ACTION_REQUIRED annotation.
         assert any(
             line.startswith("  - E0-F2-S1-T3: Disable pager") and "[operator action required]" in line for line in lines
         )
@@ -1828,7 +1700,6 @@ class TestUnitListings:
             line.startswith("  - E0-F5-S2-T2: Pipeline tests") and "[operator action required]" in line
             for line in lines
         )
-        # Auto panel NOT rendered because no auto-clearing tasks in fixture.
         assert not any("auto-clearing" in line for line in lines)
 
     def test_blocked_listing_renders_hold_unit_in_held_panel(self) -> None:
@@ -1838,14 +1709,10 @@ class TestUnitListings:
 
         units = [self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync-blocker", WorkUnitStatus.HOLD)]
         lines = _blocked_listing(units)
-        # Held panel rendered with count 1.
         assert "Blocked tasks (held) (1):" in lines
-        # Hint line immediately follows the header.
         held_idx = lines.index("Blocked tasks (held) (1):")
         assert lines[held_idx + 1] == "On hold by operator; unhold to release."
-        # Row carries the [HOLD] annotation.
         assert any(line.startswith("  - E0-F5-S1-T1: kanon-main2-sync-blocker") and "[HOLD]" in line for line in lines)
-        # Old combined "operator action required" panel does not appear for a pure HOLD fixture.
         assert not any("operator action required" in line for line in lines)
 
     def test_blocked_listing_held_and_on_held_render_in_separate_panels(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1868,21 +1735,16 @@ class TestUnitListings:
         )
 
         lines = report_mod._blocked_listing([dep_unit, hold_unit])
-        # Both panels present.
         assert "Blocked tasks (held) (1):" in lines
         assert "Blocked tasks (blocked-on-held) (1):" in lines
-        # The held panel precedes the blocked-on-held panel (canonical order).
         assert lines.index("Blocked tasks (held) (1):") < lines.index("Blocked tasks (blocked-on-held) (1):")
-        # HELD unit in held panel.
         assert any(line.startswith("  - E0-F5-S1-T1") and "[HOLD]" in line for line in lines)
-        # BLOCKED_ON_HELD unit in its panel.
         assert any(line.startswith("  - E4-F2-S4-T1") and "[blocked-on-held]" in line for line in lines)
 
     def test_listings_empty_when_no_matching_tasks(self) -> None:
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _blocked_listing, _in_progress_listing
 
-        # Only done tasks -- no in-progress, no blocked.
         units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.DONE)]
         assert _in_progress_listing(units) == []
         assert _blocked_listing(units) == []
@@ -1917,7 +1779,6 @@ class TestUnitListings:
         ]
         lines = _proposed_listing(units)
         assert lines[1] == "Proposed (2):"
-        # Each row: title (with padding) then file path.
         assert any("Fix the gitdir guard" in line for line in lines)
         assert any("Enable version subcommand" in line for line in lines)
 
@@ -2002,7 +1863,6 @@ class TestUnitListings:
 
         lines = report_mod._blocked_listing(units)
 
-        # Every panel header must appear, in canonical display order.
         panel_headers = [line for line in lines if line.startswith("Blocked tasks (")]
         assert len(panel_headers) == 8, f"Expected 8 panel headers, got {len(panel_headers)}: {panel_headers}"
 
@@ -2018,7 +1878,6 @@ class TestUnitListings:
         ]
         assert panel_headers == expected_order, f"Panel order mismatch: {panel_headers}"
 
-        # Each header must be immediately followed by its canonical hint line.
         def _panel_header(name: str) -> str:
             return f"Blocked tasks ({name}) (1):"
 
@@ -2052,7 +1911,6 @@ class TestUnitListings:
         ]
         for header, expected_hint in canonical_hints:
             header_idx = lines.index(header)
-            # The hint line must appear immediately after the header.
             actual = lines[header_idx + 1]
             assert actual == expected_hint, f"After {header!r} expected {expected_hint!r} but got {actual!r}"
 
@@ -2161,7 +2019,6 @@ class TestUnitListings:
                 ],
             ),
         )
-        # Materialise out-of-band by writing a draft .md under the story dir.
         story = _story_dir(backlog_root, _extract_story_id("E1-F1-S2-T6"))
         story.mkdir(parents=True, exist_ok=True)
         (story / "E1-F1-S2-T6.md").write_text("# E1-F1-S2-T6: Fix\n\n## Status: proposed\n\n## Description\n\nx\n")
@@ -2180,14 +2037,12 @@ class TestSideBySideLayout:
         from devbench.reporting.report import _render_side_by_side
 
         merged = _render_side_by_side(["AAA", "BBB"], ["X", "Y", "Z"], gap=4)
-        # Left width = 3, gap = 4 → blank-left line is "   " + "    " + "Z" = "       Z"
         assert merged == ["AAA    X", "BBB    Y", "       Z"]
 
     def test_right_shorter_is_padded(self) -> None:
         from devbench.reporting.report import _render_side_by_side
 
         merged = _render_side_by_side(["AAAA", "BBBB", "CCCC"], ["X", "Y"], gap=2)
-        # Third line should have the right side padded with spaces (width 1).
         assert merged == ["AAAA  X", "BBBB  Y", "CCCC   "]
 
     def test_empty_side_returns_other(self) -> None:
@@ -2211,10 +2066,8 @@ class TestSideBySideLayout:
             )
         )
         report = generate_report(log_path=log_file)
-        # Single table -- exactly ONE top-left corner appears in the output.
         top_corners = report.count("\u250c")
         assert top_corners == 1, f"Expected 1 grouped table, got {top_corners} top-left corners in report"
-        # Section headers in the required order.
         for section in ("BACKLOG STATE", "THROUGHPUT", "API USAGE", "TOKENS", "COST"):
             assert section in report, f"Missing section header: {section}"
         backlog_idx = report.find("BACKLOG STATE")
@@ -2222,8 +2075,6 @@ class TestSideBySideLayout:
         tokens_idx = report.find("TOKENS")
         cost_idx = report.find("COST")
         assert backlog_idx < throughput_idx < tokens_idx < cost_idx, "Section headers must appear in plan order"
-        # First column is labelled "Metric"; the old "Backlog state" and
-        # "Window stats" table titles are gone.
         assert "Metric " in report
 
 
@@ -2264,7 +2115,6 @@ class TestSpanningRows:
             ],
         )
         pace_line = next(ln for ln in lines if "Recent pace" in ln)
-        # Spanning rows have 3 │ (left + metric-sep + right), normal rows have 4.
         assert pace_line.count("\u2502") == 3, f"Expected 3 │ in spanning row, got: {pace_line!r}"
         assert pace_line.count("31.4 min") == 1
 
@@ -2428,8 +2278,6 @@ class TestSpanningRows:
 
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-        # Build 10 completed tasks so recent pace has enough samples (>= RECENT_PACE_TASKS=10)
-        # and one in-progress task so tasks_active > 0 and est_hours > 0.
         log_lines = []
         for i in range(10):
             start = f"2026-03-05T10:{i * 5:02d}:00Z"
@@ -2463,24 +2311,16 @@ class TestSpanningRows:
             )
         )
 
-        # Override the autouse mock_backlog_parser fixture's empty-list default.
         with patch("devbench.reporting.report.BacklogParser") as mock_cls:
             mock_cls.return_value.parse_index.return_value = fake_units
             report = generate_report(log_path=log_file)
 
-        # Pull the window-stats half of each spanning row. Side-by-side rendering
-        # means each line also carries bars from the Backlog-state table on the
-        # left, so counting total │ chars is ambiguous. Instead, find each row
-        # and assert its window-table value string occurs exactly ONCE (not 2x/3x).
         for row_label, expected_substr in (
-            ("Recent pace (last 10 tasks)", "4.5 min"),  # avg of 4m30s per task
+            ("Recent pace (last 10 tasks)", "4.5 min"),
             ("Est. time to complete remaining", " h"),
         ):
             row_line = next((ln for ln in report.splitlines() if row_label in ln), None)
             assert row_line is not None, f"Row '{row_label}' not found"
-            # The window-stats side of the row starts after the 4-space side-by-side gap.
-            # After splitting on that gap, the right half is the Window stats row; the
-            # spanning value must appear exactly once in that half.
             right_half = row_line.split("    ", 1)[-1]
             occurrences = right_half.count(expected_substr)
             assert occurrences == 1, (
@@ -2498,37 +2338,23 @@ class TestSpanningRows:
         """
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-        # Build 10 completed tasks split across an explicit session boundary so
-        # the All-time and Session windows carry different ``cost.total_cost``
-        # values. The session start line ([ORCHESTRATOR STARTING]) splits the
-        # log into pre- and post-session task batches; combined with hook-log
-        # usage spanning both halves, the All-time cost > Session cost.
         log_lines = []
-        # First 5 completions BEFORE session boundary.
         for i in range(5):
             start = f"2026-03-05T08:{i * 5:02d}:00Z"
             done = f"2026-03-05T08:{i * 5 + 4:02d}:30Z"
             log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
             log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
-        # Session-start marker between the two batches.
         log_lines.append("2026-03-05T10:00:00Z [judges.cli] INFO [ORCHESTRATOR STARTING]")
-        # Next 5 completions AFTER the session boundary.
         for i in range(5, 10):
             start = f"2026-03-05T10:{(i - 5) * 5:02d}:00Z"
             done = f"2026-03-05T10:{(i - 5) * 5 + 4:02d}:30Z"
             log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
             log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
-        # _hook_log_path resolves hook-logs.jsonl relative to log_path.parent.parent
-        # so put the orchestrator log under a logs/ subdir and the hook log
-        # alongside it at tmp_path/hook-logs.jsonl.
         logs_dir = tmp_path / "logs"
         logs_dir.mkdir()
         log_file = logs_dir / "orchestrator.log"
         log_file.write_text(_make_log(log_lines))
 
-        # Hook-log usage spans both halves so per-window cost.total_cost
-        # actually differs (All-time covers all 4 entries; Session covers
-        # only the post-10:00 entries).
         hook_log = tmp_path / "hook-logs.jsonl"
         hook_log.write_text(
             '{"timestamp":"2026-03-05T08:04:00Z","event":"PostToolUse","input":{"tool_response":'
@@ -2572,8 +2398,6 @@ class TestSpanningRows:
         row_line = next((ln for ln in report.splitlines() if "Estimated total cost at completion" in ln), None)
         assert row_line is not None, "Row 'Estimated total cost at completion' not found"
         right_half = row_line.split("    ", 1)[-1]
-        # Spanning collapse: exactly ONE dollar value in the windowed half.
-        # Pre-fix this was 2-3 different values per column.
         dollar_count = right_half.count("$")
         assert dollar_count == 1, (
             f"Estimated total cost at completion must span (one $ value); got {dollar_count} in row half: "
@@ -2629,10 +2453,7 @@ class TestPerModelCorrectionFactor:
             clear=False,
         ):
             cost = _compute_cost_by_model({"claude-opus-4-7": self._totals()})
-        # 1000 input * $5/1M + 200 output * $25/1M = 0.005 + 0.005 = 0.01.
         assert abs(cost.total_cost - 0.01) < 1e-9
-        # And the per-bucket totals sum to the rollup -- the existing
-        # CostBreakdown row-sum invariant must hold for the per-model path too.
         assert (
             abs(
                 cost.input_cost
@@ -2653,7 +2474,6 @@ class TestPerModelCorrectionFactor:
         rates = {"claude-opus-4-7": ModelRates(input=5.0, output=25.0, correction_factor=0.5)}
         with patch.dict(report_mod.REPORT_MODEL_RATES, rates, clear=False):
             cost = _compute_cost_by_model({"claude-opus-4-7": self._totals()})
-        # Half of the un-corrected $0.01 == $0.005.
         assert abs(cost.total_cost - 0.005) < 1e-9
 
     def test_correction_factor_isolated_per_model(self) -> None:
@@ -2671,8 +2491,8 @@ class TestPerModelCorrectionFactor:
         with patch.dict(report_mod.REPORT_MODEL_RATES, rates, clear=False):
             cost = _compute_cost_by_model(
                 {
-                    "claude-opus-4-7": self._totals(),  # un-corrected: 0.005 + 0.005 = 0.01; with cf=2.0 -> 0.02
-                    "claude-sonnet-4-6": self._totals(),  # 1000*$3/1M + 200*$15/1M = 0.003 + 0.003 = 0.006
+                    "claude-opus-4-7": self._totals(),
+                    "claude-sonnet-4-6": self._totals(),
                 }
             )
         assert abs(cost.total_cost - (0.02 + 0.006)) < 1e-9
@@ -2699,7 +2519,6 @@ class TestPerModelCostComputation:
             "claude-sonnet-4-6": ModelRates(input=3.0, output=15.0),
             "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
         }
-        # Exactly 1,000,000 input tokens per model, zero output / cache.
         totals_by_model = {
             "claude-sonnet-4-6": HookLogTotals(input_tokens=1_000_000),
             "claude-opus-4-7": HookLogTotals(input_tokens=1_000_000),
@@ -2763,8 +2582,6 @@ class TestEstCompletionDatetime:
                 ]
             )
         )
-        # BacklogParser is patched to return one in-progress task, so tasks_active=1,
-        # pace data exists (1 completion), est_hours will be non-zero.
         from devbench.backlog.work_unit import WorkUnit
 
         mock_units = [
@@ -2784,7 +2601,6 @@ class TestEstCompletionDatetime:
         ):
             mock_cls.return_value.parse_index.return_value = mock_units
             report = generate_report(log_path=log_file)
-        # The row must be present in the rendered report.
         assert "Est. completion date/time" in report
 
     def test_completion_renders_na_when_no_pace_data(self, tmp_path: Path) -> None:
@@ -2799,7 +2615,6 @@ class TestEstCompletionDatetime:
         )
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file)
-        # "Est. completion date/time" row exists and renders as n/a (no pace data).
         lines = [ln for ln in report.splitlines() if "Est. completion date/time" in ln]
         assert lines, f"Est. completion row missing in report:\n{report}"
         assert "n/a" in lines[0]
@@ -2831,9 +2646,7 @@ class TestEstCompletionDatetime:
             est_completion_at=anchored,
         )
         values = _stats_to_value_list(stats, display_tz=ZoneInfo("America/New_York"))
-        # Index 5 = Est. completion date/time (per _METRIC_LABELS order).
         completion_cell = values[5]
-        # March 5 in NY is EST (winter).
         assert "EST" in completion_cell, f"expected EST in {completion_cell!r}"
 
     def test_completion_row_lives_in_throughput_section(self) -> None:
@@ -2845,7 +2658,6 @@ class TestEstCompletionDatetime:
         from devbench.reporting.report import _section_for_metric
 
         assert _section_for_metric("Est. completion date/time") == "Throughput"
-        # Pin the sibling so this test catches any future rename that splits the pair.
         assert _section_for_metric("Est. time to complete remaining") == "Throughput"
 
 
@@ -2889,11 +2701,6 @@ class TestDisplayTimezoneFallbackChain:
         assert _resolve_display_timezone(report_tz or global_tz) is None
 
 
-# ---------------------------------------------------------------------------
-# Divergence warning -- BACKLOG STATE done count vs THROUGHPUT log-derived count
-# ---------------------------------------------------------------------------
-
-
 class TestThroughputDivergenceWarning:
     """The report emits a one-line WARNING when the BACKLOG.md done count
     is non-zero but the All-time throughput window finds zero
@@ -2934,8 +2741,6 @@ class TestThroughputDivergenceWarning:
         return units
 
     def test_warning_fires_when_backlog_done_but_log_throughput_zero(self, tmp_path: Path) -> None:
-        # Empty log => throughput finds 0 events. Backlog says 3 done.
-        # Warning must fire; reader is on the wrong log.
         log_file = tmp_path / "wrong.log"
         log_file.write_text(_make_log(["2026-03-05T10:00:00Z [unrelated] INFO some entry"]))
         units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=3)
@@ -2945,11 +2750,9 @@ class TestThroughputDivergenceWarning:
         assert "WARNING" in report
         assert "BACKLOG.md shows 3 done" in report
         assert "DEVBENCH_LOG_FILE" in report
-        assert "shows 0" in report  # the throughput count
+        assert "shows 0" in report
 
     def test_warning_silent_when_log_matches_backlog(self, tmp_path: Path) -> None:
-        # Log contains the canonical Set...to 'done' line for every backlog
-        # done task. Throughput count matches backlog count => no warning.
         log_file = tmp_path / "right.log"
         log_file.write_text(
             _make_log(
@@ -2970,8 +2773,6 @@ class TestThroughputDivergenceWarning:
         assert "WARNING: BACKLOG.md reports" not in report
 
     def test_warning_silent_when_backlog_has_no_done_tasks(self, tmp_path: Path) -> None:
-        # Edge case: brand-new backlog, zero done tasks. Throughput is
-        # also 0; the divergence WARNING must NOT fire (both counts agree).
         log_file = tmp_path / "fresh.log"
         log_file.write_text(_make_log(["2026-03-05T10:00:00Z [c] INFO startup"]))
         units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=0)
@@ -2981,9 +2782,6 @@ class TestThroughputDivergenceWarning:
         assert "WARNING: BACKLOG.md reports" not in report
 
     def test_warning_message_includes_log_path(self, tmp_path: Path) -> None:
-        # The error message must name the log file path so the operator
-        # can immediately identify which file got read; this is the
-        # actionable signal that lets them set DEVBENCH_LOG_FILE correctly.
         log_file = tmp_path / "specific-name.log"
         log_file.write_text("")
         units = self._patch_backlog_with_done_tasks(backlog_total=2, backlog_done=1)
@@ -3022,7 +2820,6 @@ class TestReportRowColors:
             return generate_report(log_path=log_file)
 
     def test_no_color_when_not_tty(self, tmp_path: Path) -> None:
-        # Pytest captures stdout so isatty() is False -- no escape codes anywhere.
         report = self._seed_report(tmp_path)
         assert "\033[" not in report
 
@@ -3049,7 +2846,6 @@ class TestReportRowColors:
             assert line.endswith("\033[0m")
 
     def test_magenta_wraps_estimated_cost_so_far(self, tmp_path: Path) -> None:
-        # Cost row only renders when there's token data; seed a hook log.
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
@@ -3075,8 +2871,6 @@ class TestReportRowColors:
             assert line.endswith("\033[0m")
 
     def test_estimated_total_cost_row_is_not_coloured(self, tmp_path: Path) -> None:
-        # User explicitly asked only 'Estimated cost so far' to be magenta;
-        # 'Estimated total cost at completion' must remain plain.
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
@@ -3101,11 +2895,6 @@ class TestReportRowColors:
                 assert "\033[" not in line, f"'Estimated total cost at completion' must not be coloured: {line!r}"
 
 
-# ---------------------------------------------------------------------------
-# Issue #157: ETA includes blocked-recovery + blocked-auto buckets
-# ---------------------------------------------------------------------------
-
-
 class TestEtaIncludesBlockedRecoveryAndAuto:
     """Issue #157 + issue #183 follow-up: the ETA denominator includes
     every auto-recoverable bucket -- recovery, auto-clearing, and
@@ -3115,7 +2904,6 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
     def test_compute_window_stats_uses_combined_denominator(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _compute_window_stats
 
-        # Seed enough done samples that recent_pace_minutes resolves.
         now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
         done_times: dict[str, datetime] = {}
         progress_times: dict[str, datetime] = {}
@@ -3136,13 +2924,10 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
             tasks_blocked_auto=27,
             tasks_blocked_runtime_degradation=2,
         )
-        # ETA bucket counts surface on the WindowStats dataclass.
         assert stats.eta_active == 4
         assert stats.eta_blocked_recovery == 60
         assert stats.eta_blocked_auto == 27
         assert stats.eta_blocked_runtime_degradation == 2
-        # est_hours scales with (4 + 60 + 27 + 2) -- denominator
-        # includes every auto-recoverable bucket.
         assert stats.est_hours > 0
 
     def test_runtime_degradation_changes_eta_total(self, tmp_path: Path) -> None:
@@ -3186,7 +2971,6 @@ class TestEtaFallsBackOnInsufficientPaceData:
     def test_render_returns_n_a_when_recent_pace_unknown(self) -> None:
         from devbench.reporting.report import _format_est_hours_display
 
-        # Inputs: no est_hours -> "n/a" branch.
         stats = WindowStats(
             window_start=datetime(2026, 5, 2, tzinfo=UTC),
             window_hours=1.0,
@@ -3227,7 +3011,7 @@ class TestEtaFallsBackOnInsufficientPaceData:
             est_total_cost=0,
             api_hours=0,
             api_efficiency=None,
-            recent_pace_minutes=None,  # Recent pace fragile -> bare-hours branch.
+            recent_pace_minutes=None,
         )
         assert _format_est_hours_display(stats) == "~1.5 h"
 
@@ -3368,7 +3152,6 @@ class TestOrchestratorAliveBanner:
 
         log = tmp_path / "orch.log"
         pid_file = tmp_path / ".devbench" / "orchestrator.pid"
-        # Log is fresh (10s old) but PID is dead.
         self._write_log(log, "2026-03-05T09:59:50Z")
         self._write_pid(pid_file)
         now = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
@@ -3438,7 +3221,6 @@ class TestOrchestratorAliveBanner:
 
         log = tmp_path / "orch.log"
         pid_file = tmp_path / ".devbench" / "orchestrator.pid"
-        # Log is 10 minutes old -- far past any typical threshold.
         self._write_log(log, "2026-03-05T10:00:00Z")
         self._write_pid(pid_file)
         now = datetime(2026, 3, 5, 10, 10, 0, tzinfo=UTC)
@@ -3454,7 +3236,6 @@ class TestOrchestratorAliveBanner:
         from devbench.reporting.report import _orchestrator_liveness_banner
 
         log = tmp_path / "orch.log"
-        # Fresh log but no pid_file supplied.
         self._write_log(log, "2026-03-05T10:00:00Z")
         now = datetime(2026, 3, 5, 10, 0, 10, tzinfo=UTC)
         with patch("devbench.reporting.report._should_use_color", return_value=False):
@@ -3516,7 +3297,6 @@ class TestOrchestratorAliveBanner:
             )
         )
         with (
-            # No registry -> single-line fallback path.
             patch("devbench.reporting.report._session_banner_lines", return_value=None),
             patch(
                 "devbench.reporting.report._orchestrator_liveness_banner",
@@ -3545,7 +3325,6 @@ class TestOrchestratorAliveBanner:
         ]
         with (
             patch("devbench.reporting.report._session_banner_lines", return_value=session_lines),
-            # The single-line helper must NOT drive the banner when sessions exist.
             patch(
                 "devbench.reporting.report._orchestrator_liveness_banner",
                 return_value="[ORCHESTRATOR FIXTURE] single-line",
@@ -3566,11 +3345,9 @@ class TestOrchestratorAliveBanner:
         pid_file = tmp_path / ".devbench" / "orchestrator.pid"
         self._write_log(log, "2026-03-05T10:00:00Z")
         self._write_pid(pid_file)
-        # First tick: last log line 30s ago -> ALIVE, "30s ago".
         now1 = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
         with patch("devbench.reporting.report.is_pid_alive", return_value=True):
             banner1 = _orchestrator_liveness_banner(log, "sess-A", 180, pid_file=pid_file, now=now1)
-        # Log advances; orchestrator wrote another line at exactly now1.
         log.write_text(
             "2026-03-05T09:00:00Z [devbench.orch] INFO Started\n"
             "2026-03-05T10:00:00Z [devbench.orch] INFO Tick\n"
@@ -3731,7 +3508,6 @@ class TestBacklogTotalsDraftColumn:
             self._mk("E0-F1-S1-T3", WorkUnitStatus.DRAFT),
         ]
         b = _backlog_totals_from_units(units)
-        # tasks_remaining = total(3) - done(1) - proposed(0) - declined(0) - draft(1) = 1
         assert b.tasks_remaining == 1
         assert b.tasks_active == 1
         assert b.tasks_draft == 1
@@ -3790,11 +3566,6 @@ class TestBacklogTotalsDraftColumn:
             + b.tasks_draft
         )
         assert total == b.tasks_total
-
-
-# ---------------------------------------------------------------------------
-# AC-190-10 / AC-190-11: generate_report scope_filter parameter (E2-F2-S2-T2)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -3873,7 +3644,6 @@ class TestGenerateReportScopeFilter:
             mock_cls.return_value.parse_index.return_value = self._units()
             report = generate_report(log_path=log_file, scope_filter=None)
 
-        # 4 units total; report should show Tasks remaining > 0.
         assert "Tasks completed" in report
 
     def test_scope_filter_restricts_to_include_set(self, tmp_path: Path) -> None:
@@ -3883,7 +3653,6 @@ class TestGenerateReportScopeFilter:
         log_file = tmp_path / "test.log"
         log_file.write_text("")
 
-        # E1 filter: only E1-F1-S1-T1 (DONE) should remain.
         all_ids = [u.id for u in self._units()]
         sf = ScopeFilter.parse("E1", "", all_ids)
 
@@ -3891,7 +3660,6 @@ class TestGenerateReportScopeFilter:
             mock_cls.return_value.parse_index.return_value = self._units()
             from devbench.reporting.report import _backlog_totals_from_units
 
-            # Verify directly via _backlog_totals_from_units on filtered list.
             filtered = [u for u in self._units() if sf.allows(u.id)]
             totals = _backlog_totals_from_units(filtered)
 
@@ -3905,8 +3673,6 @@ class TestGenerateReportScopeFilter:
         log_file = tmp_path / "test.log"
         log_file.write_text("")
 
-        # Build a ScopeFilter with include tokens but empty expanded_ids (as
-        # cmd_report does when --include is passed as a CLI flag).
         sf = ScopeFilter(include=["E1"], exclude=[], expanded_ids=set())
 
         captured_units: list = []
@@ -3922,7 +3688,6 @@ class TestGenerateReportScopeFilter:
             mock_cls.return_value.parse_index.return_value = self._units()
             generate_report(log_path=log_file, scope_filter=sf)
 
-        # Only E1-F1-S1-T1 should have survived the filter.
         unit_ids = [u.id for u in captured_units]
         assert "E1-F1-S1-T1" in unit_ids
         assert "E2-F1-S1-T1" not in unit_ids
@@ -3936,7 +3701,6 @@ class TestGenerateReportScopeFilter:
         log_file.write_text("")
 
         all_ids = [u.id for u in self._units()]
-        # Exclude E2 subtree; only E1-F1-S1-T1 should remain.
         sf = ScopeFilter.parse("", "E2", all_ids)
 
         captured_units: list = []
@@ -3957,10 +3721,6 @@ class TestGenerateReportScopeFilter:
         assert not any(uid.startswith("E2") for uid in unit_ids)
 
 
-# AC-192-12 / AC-192-13: generate_report session_name parameter (E4-F6-S1-T2)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestGenerateReportSessionFilter:
     """generate_report correctly filters work units when session_name is provided.
@@ -3968,8 +3728,6 @@ class TestGenerateReportSessionFilter:
     AC-192-12: Session-filtered report works correctly.
     AC-192-13: Aggregated report (no session_name) sums correctly across sessions.
     """
-
-    # ------------------------------------------------------------------ helpers
 
     @staticmethod
     def _make_unit(uid: str, status: WorkUnitStatus, tmp_path: Path, session: str | None) -> WorkUnit:
@@ -4026,8 +3784,6 @@ class TestGenerateReportSessionFilter:
             self._make_unit("E2-F1-S1-T2", WorkUnitStatus.IN_PROGRESS, tmp_path, session="beta"),
             self._make_unit("E3-F1-S1-T1", WorkUnitStatus.IN_QUEUE, tmp_path, session=None),
         ]
-
-    # ------------------------------------------------------------------ AC-192-12: session filter
 
     def test_session_name_filters_units_to_matching_session(self, tmp_path: Path) -> None:
         """generate_report(session_name='alpha') passes only alpha-session WUs to aggregation."""
@@ -4097,8 +3853,6 @@ class TestGenerateReportSessionFilter:
 
         assert captured_units == []
 
-    # ------------------------------------------------------------------ AC-192-13: aggregation (no session)
-
     def test_session_name_none_includes_all_units(self, tmp_path: Path) -> None:
         """generate_report(session_name=None) passes all WUs to aggregation (no filtering)."""
         log_file = tmp_path / "test.log"
@@ -4123,8 +3877,6 @@ class TestGenerateReportSessionFilter:
         assert "E2-F1-S1-T2" in unit_ids
         assert "E3-F1-S1-T1" in unit_ids
 
-    # ------------------------------------------------------------------ session filter composition
-
     def test_session_filter_and_scope_filter_compose(self, tmp_path: Path) -> None:
         """session_name and scope_filter compose correctly (intersection)."""
         from devbench.scope import ScopeFilter
@@ -4134,8 +3886,6 @@ class TestGenerateReportSessionFilter:
 
         all_units = self._units(tmp_path)
         all_ids = [u.id for u in all_units]
-        # Scope includes E1 only; session beta includes E2 units only.
-        # Intersection should be empty.
         sf = ScopeFilter.parse("E1", "", all_ids)
 
         captured_units: list = []
@@ -4151,7 +3901,6 @@ class TestGenerateReportSessionFilter:
             mock_cls.return_value.parse_index.return_value = all_units
             generate_report(log_path=log_file, session_name="beta", scope_filter=sf)
 
-        # E1 is alpha session; beta session has E2 units but scope only allows E1 -- no overlap.
         assert captured_units == []
 
 
@@ -4286,8 +4035,6 @@ class TestByRolePanel:
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
         transcript = transcript_dir / "session.jsonl"
-        # Two messages, one per role, so the per-role panel has two
-        # data rows to print.
         transcript.write_text(
             '{"timestamp":"2026-05-04T10:30:00.000000+00:00","type":"assistant",'
             '"attributionAgent":"devbench-orchestrate:executor","message":{"id":"m1",'
@@ -4317,11 +4064,8 @@ class TestByRolePanel:
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             output = generate_report(log_path=log, by_role=True)
         assert "Per-role cost breakdown" in output
-        # Both roles appear as their canonical bucket names (devbench:
-        # prefix stripped; -reviewer normalised to _review).
         assert "executor" in output
         assert "code_review" in output
-        # TOTAL row sits at the bottom of the panel.
         assert "TOTAL" in output
 
     def test_panel_omitted_when_no_transcripts(self, tmp_path: Path) -> None:
@@ -4346,7 +4090,6 @@ class TestByRolePanelTotalsConsistency:
     def test_total_row_equals_sum_of_role_rows(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _render_by_role_panel
 
-        # Build a transcript directory with two roles.
         transcript_dir = tmp_path / "transcripts"
         transcript_dir.mkdir()
         (transcript_dir / "session.jsonl").write_text(
@@ -4371,8 +4114,6 @@ class TestByRolePanelTotalsConsistency:
 
         with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             lines = _render_by_role_panel(log_path=log, window_start=datetime(2026, 1, 1, tzinfo=UTC))
-        # Find the TOTAL row and the two data rows; assert that input
-        # tokens sum (which we know is 1M+1M=2M) appears in TOTAL.
         total_lines = [line for line in lines if "TOTAL" in line]
         assert len(total_lines) == 1
         assert "2,000,000" in total_lines[0]

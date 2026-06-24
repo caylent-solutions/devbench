@@ -23,8 +23,6 @@ SPEC_TO_BACKLOG_SKILL_PATH = (
     REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / "spec-to-backlog" / "SKILL.md"
 )
 
-# The six required patterns from spec Section 4 E12-F1-S2 AC-1.
-# Each entry is a tuple of (pattern_key, expected_section_heading_fragment).
 REQUIRED_PATTERNS = [
     ("dimension-fan-out", "dimension fan-out"),
     ("per-finding-adversarial-verification", "per-finding adversarial verification"),
@@ -34,9 +32,6 @@ REQUIRED_PATTERNS = [
     ("file-based-agent-output", "file-based agent output"),
 ]
 
-# Relative path used in cross-references inside both SKILL.md files.
-# The link target must be exactly this string so both skills refer to the
-# canonical location unambiguously.
 SHARED_DOC_RELATIVE_LINK = "docs/workflow-authoring-patterns.md"
 
 
@@ -94,8 +89,6 @@ class TestSharedDocApplicationAgnostic:
         """The doc must describe generic patterns, not domain-specific ones."""
         assert SHARED_DOC_PATH.exists(), f"File missing: {SHARED_DOC_PATH}"
         content = SHARED_DOC_PATH.read_text().lower()
-        # Domain identifiers would tie the doc to a specific application; none
-        # of these strings should appear as content anchored to a domain concept.
         domain_markers = [
             "devbench-specific",
             "this workspace",

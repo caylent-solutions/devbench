@@ -42,7 +42,6 @@ def _materialise_workspace(tmp_path: Path) -> Path:
 
     session_dir = tmp_path / "session"
     session_dir.mkdir()
-    # Create the main-session stub so the session_dir parent resolves cleanly.
     (session_dir / "main-session.jsonl").write_text("")
     subagents_dir = session_dir / "subagents"
     subagents_dir.mkdir()
@@ -61,8 +60,6 @@ def _run_watch(workspace: Path) -> subprocess.CompletedProcess[str]:
     env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
     env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
     env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
-    # Use the same Python interpreter pytest is running under; invoke the
-    # module directly so we don't depend on `uv run` being in PATH.
     return subprocess.run(
         [sys.executable, "-m", "devbench.cli", "watch"],
         capture_output=True,
@@ -85,13 +82,9 @@ class TestWatchAgainstFixtures:
         assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
         out = result.stdout
-        # Mode label is rendered.
         assert "Mode: standard multi-PR" in out
-        # Active task surfaces the backlog row.
         assert "EX-F1-S1-T1" in out
-        # Latest agent text from the fixture transcript appears.
         assert "Looking at the test failures" in out
-        # Footer is always emitted.
         assert "Ctrl+C to stop" in out
 
     def test_exit_code_zero_and_no_tracebacks(self, populated_workspace: Path) -> None:

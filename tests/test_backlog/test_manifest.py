@@ -16,10 +16,6 @@ from devbench.backlog.manifest import (
     render_manifest_rows,
 )
 
-# ---------------------------------------------------------------------------
-# Sample work-unit content used across tests
-# ---------------------------------------------------------------------------
-
 SAMPLE_ONE_ROW = """\
 # T1: Sample Task
 
@@ -78,11 +74,6 @@ SAMPLE_SECTION_AT_END = """\
 """
 
 
-# ---------------------------------------------------------------------------
-# ManifestRow validation tests
-# ---------------------------------------------------------------------------
-
-
 class TestManifestRow:
     """ManifestRow construction validates its fields."""
 
@@ -123,11 +114,6 @@ class TestManifestRow:
     def test_equality(self) -> None:
         assert ManifestRow(file="a", change="b") == ManifestRow(file="a", change="b")
         assert ManifestRow(file="a", change="b") != ManifestRow(file="a", change="c")
-
-
-# ---------------------------------------------------------------------------
-# parse_manifest tests
-# ---------------------------------------------------------------------------
 
 
 class TestParseManifest:
@@ -256,11 +242,6 @@ More trailing prose.
         assert rows == [ManifestRow(file="src/example/parser.py", change="add feature")]
 
 
-# ---------------------------------------------------------------------------
-# render_manifest_rows tests
-# ---------------------------------------------------------------------------
-
-
 class TestRenderManifestRows:
     """render_manifest_rows produces a stable Markdown table."""
 
@@ -295,11 +276,6 @@ class TestRenderManifestRows:
         second_wrapped = f"# T: x\n\n## Changes Manifest\n\n{second_render}\n## Foo\n"
         second_pass = parse_manifest(second_wrapped)
         assert second_pass == original
-
-
-# ---------------------------------------------------------------------------
-# append_rows tests
-# ---------------------------------------------------------------------------
 
 
 class TestAppendRows:
@@ -341,14 +317,12 @@ class TestAppendRows:
     def test_preserves_content_before_section(self) -> None:
         new_rows = [ManifestRow(file="src/new.py", change="new")]
         out = append_rows(SAMPLE_ONE_ROW, new_rows)
-        # Everything up to "## Changes Manifest" should be byte-identical
         prefix = SAMPLE_ONE_ROW.split("## Changes Manifest", 1)[0]
         assert out.startswith(prefix)
 
     def test_preserves_content_after_section(self) -> None:
         new_rows = [ManifestRow(file="src/new.py", change="new")]
         out = append_rows(SAMPLE_ONE_ROW, new_rows)
-        # Everything from "## Definition of Done" to the end should be byte-identical
         suffix = "## Definition of Done" + SAMPLE_ONE_ROW.split("## Definition of Done", 1)[1]
         assert suffix in out
         assert out.endswith(suffix)
@@ -376,11 +350,6 @@ class TestAppendRows:
 """
         with pytest.raises(ManifestParseError, match="2 columns"):
             append_rows(bad, [ManifestRow(file="a", change="b")])
-
-
-# ---------------------------------------------------------------------------
-# remove_rows tests
-# ---------------------------------------------------------------------------
 
 
 class TestRemoveRows:
@@ -412,11 +381,9 @@ class TestRemoveRows:
             remove_rows(SAMPLE_MANY_ROWS, ["src/not_present.py"])
         msg = str(exc.value)
         assert "src/not_present.py" in msg
-        # The error names what the manifest actually declares so the operator can act.
         assert "src/example/parser.py" in msg
 
     def test_absent_path_among_present_paths_raises(self) -> None:
-        # Even when some paths match, a single absent path fails the whole call (fail-fast).
         with pytest.raises(ManifestRowNotFoundError) as exc:
             remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py", "src/ghost.py"])
         assert "src/ghost.py" in str(exc.value)
@@ -455,7 +422,6 @@ class TestRemoveRows:
             remove_rows(bad, ["three"])
 
     def test_remove_repo_prefixed_row_by_plain_path(self) -> None:
-        # Repo-prefixed rows parse to the bare path; removal keys off that bare path.
         content = (
             "## Changes Manifest\n\n"
             "| File | Change |\n"
@@ -468,10 +434,6 @@ class TestRemoveRows:
         parsed = parse_manifest(out)
         assert parsed == [ManifestRow(file="terragrunt/root.hcl", change="modify")]
 
-
-# ---------------------------------------------------------------------------
-# Slice 3b: list_staged_files + assert_staged_matches_manifest
-# ---------------------------------------------------------------------------
 
 import subprocess as _subprocess  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
@@ -519,7 +481,7 @@ class TestListStagedFiles:
 class TestAssertStagedMatchesManifest:
     def test_empty_staged_passes(self, tmp_path: _Path) -> None:
         _init_repo_with_file(tmp_path, "README.md")
-        assert_staged_matches_manifest(tmp_path, ["src/a.py"])  # no raise
+        assert_staged_matches_manifest(tmp_path, ["src/a.py"])
 
     def test_all_staged_in_manifest_passes(self, tmp_path: _Path) -> None:
         _init_repo_with_file(tmp_path, "src/a.py")
@@ -535,13 +497,7 @@ class TestAssertStagedMatchesManifest:
         msg = str(exc.value)
         assert "Manifest scope violation" in msg
         assert "TRACE_FILE" in msg
-        # src/a.py appears in the "Manifest declares" list but not in the offender list
         assert "staged file(s) not in Changes Manifest: ['TRACE_FILE']" in msg
-
-
-# ---------------------------------------------------------------------------
-# Issue #221 B1: markdown-escaped pipes inside cells are literal pipes
-# ---------------------------------------------------------------------------
 
 
 class TestMarkdownPipeEscapes:

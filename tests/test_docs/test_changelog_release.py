@@ -17,10 +17,6 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 ADR_DONE_INTEGRITY = REPO_ROOT / "docs" / "adr" / "25-done-integrity.md"
 ADR_SELF_COMPLETION = REPO_ROOT / "docs" / "adr" / "26-self-completion-autonomy.md"
 
-# Epic labels that must appear in the CHANGELOG (AC-E9-3).
-# Each entry is a tuple of (epic_id, one representative token that must appear
-# in the per-epic entry -- presence of the epic reference plus this token
-# confirms the entry is substantive, not a stray mention).
 _EPIC_TOKENS: list[tuple[str, str]] = [
     ("E0", "Opus 4.8"),
     ("E1", "SDK"),
@@ -33,10 +29,8 @@ _EPIC_TOKENS: list[tuple[str, str]] = [
     ("E8", "Done-Integrity"),
 ]
 
-# Release-entry sentinel that must appear in the top-level release section.
 _RELEASE_ENTRY_SENTINEL = "## [0.2.0]"
 
-# Minimum version (inclusive) from Section 6 of the spec.
 _MIN_VERSION_TUPLE: tuple[int, int, int] = (0, 2, 0)
 
 
@@ -143,7 +137,6 @@ class TestChangelogReleaseEntry:
             return
         start = text.index(_RELEASE_ENTRY_SENTINEL)
         rest = text[start + len(_RELEASE_ENTRY_SENTINEL) :]
-        # Find the next top-level section header to bound the check
         next_header_pos = rest.find("\n## [")
         section_body = rest[:next_header_pos] if next_header_pos != -1 else rest
         assert "\u2014" not in section_body, (
@@ -159,7 +152,6 @@ class TestChangelogPerEpicEntries:
     @pytest.mark.parametrize("epic_id,token", _EPIC_TOKENS)
     def test_epic_entry_present(self, epic_id: str, token: str) -> None:
         text = CHANGELOG.read_text(encoding="utf-8")
-        # Find the 0.2.0 section
         assert _RELEASE_ENTRY_SENTINEL in text, (
             f"'{_RELEASE_ENTRY_SENTINEL}' section not found; cannot check per-epic entries."
         )

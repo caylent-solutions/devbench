@@ -35,14 +35,12 @@ class TestRunWithLongOpHeartbeat:
             first_beat.set()
 
         def _run() -> str:
-            # Block (event-driven, NOT a fixed sleep) until the heartbeat thread has
-            # fired at least once, proving the heartbeat runs DURING the op.
             assert first_beat.wait(timeout=5), "heartbeat thread did not fire"
             return "op-result"
 
         result = cli.run_with_long_op_heartbeat(
             run=_run,
-            heartbeat_interval_seconds=0,  # 0 -> fire immediately each loop (fast test)
+            heartbeat_interval_seconds=0,
             emit_heartbeat=_emit,
         )
         assert result == "op-result"
@@ -52,14 +50,12 @@ class TestRunWithLongOpHeartbeat:
         sentinel = (127, "out", "err")
         result = cli.run_with_long_op_heartbeat(
             run=lambda: sentinel,
-            heartbeat_interval_seconds=3600,  # never fires within the test
+            heartbeat_interval_seconds=3600,
             emit_heartbeat=lambda *, elapsed: None,
         )
         assert result == sentinel
 
     def test_heartbeat_thread_stops_after_op_returns(self) -> None:
-        # After the op returns, the heartbeat thread must be stopped + joined: no
-        # heartbeats may be emitted after completion (no leaked daemon).
         beats: list[int] = []
         first_beat = threading.Event()
 
@@ -77,11 +73,9 @@ class TestRunWithLongOpHeartbeat:
             emit_heartbeat=_emit,
         )
         count_at_return = len(beats)
-        # The thread is joined inside the wrapper, so no further beats can arrive.
         assert len(beats) == count_at_return
 
     def test_op_exception_still_stops_heartbeat(self) -> None:
-        # A raising op must not leak the heartbeat thread (stop+join in a finally).
         first_beat = threading.Event()
 
         def _emit(*, elapsed: int) -> None:

@@ -222,7 +222,6 @@ class TestCmdNextNoActionableDiagnostic:
         assert rc == 0
         out = capsys.readouterr().out
         reason_line = out.splitlines()[1]
-        # Two in-queue tasks (held_dep is HOLD, not in-queue; blocked_a and blocked_b are in-queue)
         assert "2 in-queue" in reason_line
 
     @pytest.mark.unit
@@ -281,7 +280,6 @@ class TestCmdNextSerializeInProgressCap:
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [in_progress, in_queue]
-        # get_parallel_candidates returns IN_PROGRESS before IN_QUEUE (resume-first order).
         mock_parser.get_parallel_candidates.return_value = [in_progress, in_queue]
         mock_parser.all_done.return_value = False
 
@@ -290,7 +288,6 @@ class TestCmdNextSerializeInProgressCap:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # The IN_PROGRESS unit may be offered (resume), but the IN_QUEUE unit must NOT be.
         assert "E1-F1-S1-T2" not in out, "a NEW in-queue unit must not be offered while the cap is saturated"
         assert "E1-F1-S1-T1" in out, "the in-progress unit should still be resumable"
 
@@ -304,8 +301,6 @@ class TestCmdNextSerializeInProgressCap:
         exists, a distinct, clearly-labeled serialized reason names the in-progress id so the
         operator/loop can tell "serialized, busy" from "genuinely stalled".
         """
-        # The in-progress unit is NOT in get_parallel_candidates (e.g. its deps regressed),
-        # so the only actionable candidate is the in-queue one -- which the cap drops.
         in_progress = _task("E1-F1-S1-T1", status=WorkUnitStatus.IN_PROGRESS)
         in_queue = _task("E1-F1-S1-T2", status=WorkUnitStatus.IN_QUEUE)
 
@@ -347,7 +342,6 @@ class TestCmdNextSerializeInProgressCap:
 
         assert rc == 0
         out = capsys.readouterr().out
-        # 1 in-progress < cap of 2, so the in-queue candidate survives the filter and is offered.
         assert "E1-F1-S1-T2" in out, "with cap=2 and only 1 in-progress, the in-queue unit may be offered"
 
     @pytest.mark.unit
@@ -398,7 +392,6 @@ class TestCmdNextSerializeInProgressCap:
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [in_progress]
-        # A scope was applied and nothing matched -> the scope path returns [].
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = False
 

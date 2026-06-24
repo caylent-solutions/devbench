@@ -17,8 +17,6 @@ from pathlib import Path
 
 import pytest
 
-# Repo root is two levels above this test file:
-# tests/test_integration/test_make_targets.py -> tests/test_integration -> tests -> repo root
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
 
@@ -112,13 +110,10 @@ class TestStartUnchanged:
         regardless of the recipe's specific exit code, so we assert rc != 0
         + the cap-exhausted message on stderr to pin the actual behaviour
         rather than make's wrapping."""
-        # Build a fake shim repo with a Makefile copy + stub python wrapper.
         shim_repo = tmp_path / "shim_repo"
         shim_repo.mkdir()
-        # Copy real Makefile so we exercise the actual recipe text.
         real_makefile = (_REPO_ROOT / "Makefile").read_text(encoding="utf-8")
         (shim_repo / "Makefile").write_text(real_makefile, encoding="utf-8")
-        # Stub `uv` that increments a counter and always exits 42.
         counter = shim_repo / "calls.txt"
         stub_uv = shim_repo / "uv"
         stub_uv.write_text(
@@ -248,7 +243,6 @@ class TestHelpEnvVarTokens:
         lines = output.splitlines()
         start_interactive_lines = [ln for ln in lines if "start-interactive" in ln]
         assert start_interactive_lines, f"No 'start-interactive' line found in help output:\n{output}"
-        # At least one line must contain the full env-var token
         token = "[DEVBENCH_WORKSPACE_ROOT, DEVBENCH_CLAUDE_MODEL, DEVBENCH_SAFE_PERMISSIONS]"
         matching = [ln for ln in start_interactive_lines if token in ln]
         assert matching, f"Expected a line containing '{token}' but start-interactive lines were:\n" + "\n".join(
@@ -288,12 +282,6 @@ class TestCoverageGate:
         assert "--cov=devbench" in output, f"Expected '--cov=devbench' in make -n test-coverage output, got:\n{output}"
 
     def test_test_coverage_enforces_98_percent_floor_via_coverage_cli(self) -> None:
-        # The floor is gated by coverage.py's own CLI (``coverage report
-        # --fail-under``), NOT pytest-cov's ``--cov-fail-under``: pytest-cov
-        # rounds the total for its exit decision but compares the raw float for
-        # its message, printing a spurious ``FAIL ... not reached`` line on a
-        # passing run at exactly the floor. coverage.py's CLI keeps message and
-        # exit consistent.
         output = _make_dry_run("test-coverage")
         assert "coverage report" in output, (
             f"Expected 'coverage report' gate in make -n test-coverage output, got:\n{output}"
@@ -301,7 +289,6 @@ class TestCoverageGate:
         assert "--fail-under=98" in output, (
             f"Expected '--fail-under=98' in make -n test-coverage output, got:\n{output}"
         )
-        # The buggy pytest-cov gate must be gone (complete replacement).
         assert "--cov-fail-under" not in output, (
             f"pytest-cov's --cov-fail-under should be replaced by the coverage CLI gate, got:\n{output}"
         )

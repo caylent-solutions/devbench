@@ -34,14 +34,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-#: The :func:`utils.process.run_command` shape -- ``(cmd, cwd=...) -> (rc, out, err)``.
-#: Declared here (rather than importing the function) so :mod:`verification`
-#: stays dependency-light and the runner can be injected in tests.
 CommandRunner = Callable[..., tuple[int, str, str]]
-
-# ---------------------------------------------------------------------------
-# Verification types
-# ---------------------------------------------------------------------------
 
 
 class VerificationType(Enum):
@@ -58,7 +51,6 @@ class VerificationType(Enum):
     JUDGE = "judge"
 
 
-#: Types whose AC must carry tool-captured exit-0 evidence before ``mark-done``.
 EXECUTABLE_TYPES: frozenset[VerificationType] = frozenset(
     {
         VerificationType.TERRATEST,
@@ -71,9 +63,6 @@ EXECUTABLE_TYPES: frozenset[VerificationType] = frozenset(
     }
 )
 
-#: Types that intrinsically denote infrastructure / deploy work (independent of the
-#: command text). A unit with any of these -- or any ``command`` whose ``cmd`` matches
-#: :data:`IAC_TOOL_PATTERNS` -- requires the optional ``iac_review`` judge when enabled.
 INFRA_TYPES: frozenset[VerificationType] = frozenset(
     {
         VerificationType.TERRATEST,
@@ -85,24 +74,7 @@ INFRA_TYPES: frozenset[VerificationType] = frozenset(
     }
 )
 
-# ---------------------------------------------------------------------------
-# IaC tool matrix -- the single maintained, extensible source of truth.
-# Adding support for a new IaC tool is a one-line addition here.
-#
-# Each pattern matches the tool only when it is the **invoked command paired
-# with an IaC lifecycle verb/subcommand** (e.g. ``terraform validate``,
-# ``terragrunt run-all apply``, ``cdk deploy``) -- never when the tool's name
-# appears solely as a **path operand** (e.g. ``test -d terragrunt/common/x``,
-# ``jq . providers/aws/accounts.json``). Path-substring matches were the
-# proximate cause of data-file tasks being routed to the optional ``iac_review``
-# judge unnecessarily (TDI-007); requiring an adjacent lifecycle verb makes the
-# predicate precise. The terratest test-runners (``go test``, ``make tf-test``,
-# ``terratest``) are matched as invocation tokens, never as path components.
-# ---------------------------------------------------------------------------
 
-#: Lifecycle subcommands shared by the terraform/opentofu/terragrunt family.
-#: Their presence immediately after the tool name is what distinguishes an
-#: actual provisioning/plan/validate/destroy invocation from a path operand.
 _IAC_LIFECYCLE_VERB: str = (
     r"(?:init|validate|plan|apply|destroy|refresh|import|output|state|providers|"
     r"graph|fmt|workspace|console|show|taint|untaint|force-unlock|"
@@ -113,8 +85,6 @@ IAC_TOOL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("terraform", re.compile(rf"\bterraform\s+{_IAC_LIFECYCLE_VERB}\b", re.IGNORECASE)),
     ("opentofu", re.compile(rf"\btofu\s+{_IAC_LIFECYCLE_VERB}\b", re.IGNORECASE)),
     ("terragrunt", re.compile(rf"\bterragrunt\s+{_IAC_LIFECYCLE_VERB}\b", re.IGNORECASE)),
-    # Terratest is exercised via Go tests and/or the conventional ``make tf-test``
-    # target. Anchored so a path component named ``terratest/`` does not match.
     ("terratest", re.compile(r"(?<![\w/-])(?:tf-test|terratest)(?![\w/-])|\bgo\s+test\b", re.IGNORECASE)),
     ("cdktf", re.compile(r"\bcdktf\s+(?:deploy|synth|destroy|diff|plan|apply)\b", re.IGNORECASE)),
     ("aws-cdk", re.compile(r"\bcdk\s+(?:deploy|synth|destroy|diff)\b", re.IGNORECASE)),
@@ -147,12 +117,6 @@ def detect_iac_tool(command: str | None) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Execution-verb detection for the validator lint (Workstream A).
-# Any AC/DoD item whose prose contains one of these verbs MUST be backed by a
-# VERIFY directive -- this is what makes "a real terragrunt apply succeeds"
-# un-checkable without proof.
-# ---------------------------------------------------------------------------
 _EXECUTION_VERB_RE: re.Pattern[str] = re.compile(
     r"\b("
     r"terraform|tofu|terragrunt|terratest|tf-test|tf-apply|tg-apply|tf-destroy|tg-destroy|"
@@ -174,44 +138,6 @@ def text_has_execution_verb(text: str) -> bool:
     return bool(_EXECUTION_VERB_RE.search(text or ""))
 
 
-# ---------------------------------------------------------------------------
-# Deterministic per-unit gate environment.
-#
-# A unit's ``## Verification`` pytest gate must be *reproducible*: the same
-# input must yield the same verdict on every run. When the target repo uses
-# ``pytest-randomly`` (random test order per run, seeded from the clock by
-# default), an order-dependent sibling test can pass on one seed and fail on
-# the next -- so an otherwise-complete, unrelated unit is blocked
-# non-deterministically by a seed it did not choose. Pinning the seed makes
-# the gate's verdict a deterministic function of the code under test; the
-# orthogonal randomized-order signal is surfaced by a separate scheduled pass
-# (an epic-capstone / CI gate), never as a random per-unit block.
-#
-# We pin via environment variables overlaid on the runner's environment so the
-# mechanism requires no change to the target repo's pyproject/pytest config:
-#   * ``PYTHONHASHSEED`` -- ALWAYS set. Removes hash-ordering nondeterminism in
-#     the interpreter itself (dict/set iteration order under the hood). Safe in
-#     every environment; no plugin dependency.
-#   * ``PYTEST_ADDOPTS`` -- set ONLY when ``pin_randomly`` is True (i.e. the
-#     target repo has ``pytest-randomly`` installed). Pins the plugin's seed
-#     (``--randomly-seed=<seed>``) so test ORDER is fixed run-to-run. Keeping
-#     randomization active with a *fixed* seed (rather than disabling it) means
-#     order-dependence is still exercised -- just deterministically -- so a unit
-#     that genuinely breaks ordering still fails its own gate, while a
-#     pre-existing sibling flake is reproducible.
-#
-# ``--randomly-seed`` is a CLI option that ONLY exists when ``pytest-randomly``
-# is installed; injecting it into ``PYTEST_ADDOPTS`` for a repo WITHOUT the
-# plugin would make every pytest invocation error on an unknown option. So the
-# caller probes the target repo once (``pytest_randomly_available``) and passes
-# the result as ``pin_randomly`` -- fail-safe: when the plugin is absent we
-# still pin ``PYTHONHASHSEED`` and never destabilise the gate.
-# ---------------------------------------------------------------------------
-
-#: pytest-randomly's seed flag. A directive that already sets a seed in
-#: ``PYTEST_ADDOPTS`` is normalised so the pinned seed is the only one present
-#: (a duplicate flag would let pytest-randomly pick the last-wins value
-#: silently, defeating reproducibility).
 _RANDOMLY_SEED_FLAG_RE: re.Pattern[str] = re.compile(r"--randomly-seed=\S+")
 
 
@@ -287,24 +213,10 @@ def pytest_randomly_available(repo_path: Path, runner: CommandRunner) -> bool:
     return rc == 0
 
 
-# ---------------------------------------------------------------------------
-# Command-path extraction + classification for the validator path lints
-# (TDI-001 verify-ac working-directory contract, TDI-004 deferred-vs-command,
-# TDI-005 AC referential integrity). Pure, stdlib-only, fully unit-testable.
-# ---------------------------------------------------------------------------
-
-#: A ``$(...)`` command substitution or a backtick substitution. Stripped before
-#: extracting literal path operands so a substitution's contents are not mistaken
-#: for a literal path the author must back.
 _CMD_SUBSTITUTION_RE: re.Pattern[str] = re.compile(r"\$\([^)]*\)|`[^`]*`")
 
-#: A ``grep`` (optionally negated) whose file operands come from a ``$(find ...)``
-#: substitution. When ``find`` yields zero operands the recursive ``grep`` falls
-#: back to scanning the whole working tree -- a silent, unbounded check (TDI-001
-#: layer 3 / AC-5). Matched on the command head + the substitution operand.
 _FIND_FEEDS_GREP_RE: re.Pattern[str] = re.compile(r"\bgrep\b[^|;&]*\$\(\s*find\b", re.IGNORECASE)
 
-#: File extensions that mark a bare (slash-less) token as a path operand.
 _PATH_EXTENSIONS: tuple[str, ...] = (
     ".tf",
     ".tfvars",
@@ -378,10 +290,6 @@ def command_substitution_feeds_grep(command: str | None) -> bool:
     return bool(_FIND_FEEDS_GREP_RE.search(command))
 
 
-#: Runnable project tools/test-runners available in the orchestrator's execution
-#: environment (the same environment ``verify-ac`` and the review judges run in).
-#: A ``type=deferred`` directive whose reason names one of these is almost always
-#: a mis-classified runnable check (TDI-004).
 _RUNNABLE_TOOL_RE: re.Pattern[str] = re.compile(
     r"\b("
     r"terraform|terragrunt|tofu|terratest|tf-test|cdktf|cdk|sam|"
@@ -391,11 +299,6 @@ _RUNNABLE_TOOL_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-#: Signals that a deferred check genuinely cannot run in the orchestrator
-#: environment (live mutation, credentials, manual sign-off). When present these
-#: veto the runnable-tool finding so a legitimately operator-only directive that
-#: happens to name a tool (e.g. "real production terragrunt apply against a live
-#: account") is not flagged.
 _OPERATOR_ONLY_RE: re.Pattern[str] = re.compile(
     r"\b("
     r"live|prod|production|operator[- ]only|manual|human|sign[- ]?off|"
@@ -425,17 +328,10 @@ def deferred_reason_names_runnable_tool(reason: str | None) -> str | None:
     return match.group(1) if match is not None else None
 
 
-# ---------------------------------------------------------------------------
-# Verification item model + parser
-# ---------------------------------------------------------------------------
-
 _VERIFICATION_HEADER = "Verification"
 
-# A ``## Verification`` directive line begins with ``- VERIFY``.
 _VERIFY_LINE_RE: re.Pattern[str] = re.compile(r"^\s*-\s*VERIFY\b(.*)$", re.MULTILINE)
-# ``cmd=`...```` -- captured first so a ``|`` inside the command does not break field splitting.
 _CMD_FIELD_RE: re.Pattern[str] = re.compile(r"cmd\s*=\s*`([^`]*)`")
-# AC ids in the leading segment (before the first ``|``): ``AC-3``, ``AC-FINAL-001`` ...
 _AC_ID_RE: re.Pattern[str] = re.compile(r"AC-[A-Za-z0-9-]+")
 
 
@@ -450,10 +346,6 @@ class VerificationItem:
     expect_exit: int = 0
     owner: str | None = None
     reason: str | None = None
-    #: Per-AC command-execution timeout override (seconds). ``None`` means the
-    #: runner falls back to the global ``DEVBENCH_TEST_TIMEOUT`` / default.
-    #: Lets a backlog derive a directive's bound from the test's own declared
-    #: timeout (e.g. a 90-minute live terratest) without changing the global.
     timeout: int | None = None
     raw: str = ""
 
@@ -504,7 +396,6 @@ def parse_verification_item(line_body: str) -> VerificationItem:
     (no AC id, or an unknown ``type``) so ``validate-backlog`` fails fast.
     """
     raw = "VERIFY" + line_body
-    # Extract cmd first (it may contain a literal ``|``), then strip it out.
     command: str | None = None
     cmd_match = _CMD_FIELD_RE.search(line_body)
     if cmd_match is not None:
@@ -608,12 +499,6 @@ def unit_requires_iac_judge(content: str) -> bool:
     return any(i.is_infra() for i in items)
 
 
-# ---------------------------------------------------------------------------
-# Evidence model -- the ledger written by ``devbench verify-ac`` and read by the
-# done-gate (deterministic) and the iac_review judge (qualitative).
-# ---------------------------------------------------------------------------
-
-
 def _optional_str(value: object) -> str | None:
     """Coerce a deserialised ledger value to ``str`` or ``None`` (never other types)."""
     if value is None:
@@ -712,7 +597,6 @@ def evidence_completeness(
         ``complete`` flag is ``True`` only when there are no missing, failed, or
         (unless allowed) deferred ACs.
     """
-    # Map each AC id to the best (lowest |exit - expect|) record covering it.
     records_by_ac: dict[str, list[EvidenceRecord]] = {}
     for rec in records:
         for ac in rec.ac_ids:
@@ -745,26 +629,9 @@ def evidence_completeness(
     )
 
 
-# ---------------------------------------------------------------------------
-# Evidence ledger persistence -- the single source of truth for the on-disk
-# layout, shared by the writer (``devbench verify-ac``) and the readers (the
-# done-gate in ``BacklogManager`` and the ``iac_review`` judge). Keeping the
-# path convention here (rather than duplicating it in the CLI and the manager)
-# is what lets the gate reliably load exactly what the runner wrote.
-#
-# Layout under the workspace root::
-#
-#     .devbench/evidence/<task-id>/<attempt>/<sanitized-ac>.log   (per-AC artifact)
-#     .devbench/evidence/<task-id>/<attempt>/evidence.json        (ledger: list[EvidenceRecord])
-#     .devbench/evidence/<task-id>/latest.json                    ({"attempt": <n>}) pointer
-# ---------------------------------------------------------------------------
-
 _EVIDENCE_SUBDIR = ".devbench/evidence"
 _LEDGER_FILENAME = "evidence.json"
 _LATEST_POINTER_FILENAME = "latest.json"
-#: Characters allowed verbatim in an artifact filename; everything else is
-#: collapsed to ``_`` so a multi-AC item or an exotic AC id cannot escape the
-#: attempt directory or collide with the ledger filename.
 _SANITIZE_RE: re.Pattern[str] = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -790,27 +657,19 @@ def sanitize_ac_label(ac_ids: list[str] | tuple[str, ...]) -> str:
     return _SANITIZE_RE.sub("_", "-".join(ac_ids))
 
 
-#: Proof sentinels a trimmed log must retain regardless of position. These are
-#: generic CI/IaC/test markers (not coupled to any backlog or provider): a log
-#: that contains none of them falls back to a pure head+tail window, which is
-#: still strictly better than the old tail-only slice. Substrings are matched
-#: anywhere in a line; line-prefix markers (``ok ``/``FAIL ``) are the Go test
-#: per-package summary lines and are matched after stripping leading whitespace.
 _TRIM_SENTINEL_SUBSTRINGS: tuple[str, ...] = (
-    "Apply complete!",  # terraform/terratest real apply succeeded
-    "Destroy complete!",  # terraform/terratest cleanup succeeded
-    "No changes.",  # terraform idempotency re-plan (no drift)
-    "--- PASS:",  # go test per-test pass
-    "--- FAIL:",  # go test per-test fail
-    "panic:",  # go/runtime panic
-    "Error:",  # generic tool error line
+    "Apply complete!",
+    "Destroy complete!",
+    "No changes.",
+    "--- PASS:",
+    "--- FAIL:",
+    "panic:",
+    "Error:",
 )
 _TRIM_SENTINEL_LINE_PREFIXES: tuple[str, ...] = (
-    "ok ",  # go test package summary (pass)
-    "FAIL ",  # go test package summary (fail)
+    "ok ",
+    "FAIL ",
 )
-#: Marker emitted between two non-contiguous retained regions. ``{n}`` is the
-#: number of bytes (characters) dropped between them.
 _TRIM_ELISION_TEMPLATE = "[... {n} bytes elided ...]"
 
 
@@ -846,21 +705,13 @@ def trim_log(text: str, max_bytes: int) -> str:
         return text
 
     lines = text.split("\n")
-    # Per-line byte cost including the newline that joins it to the next line.
-    # The final line carries no trailing newline, matching ``"\n".join``.
     line_costs = [len(line) + (1 if i < len(lines) - 1 else 0) for i, line in enumerate(lines)]
 
-    # Reserve roughly a quarter of the budget for head context and a quarter for
-    # the trailing summary; the middle half is spent on sentinel lines. The tail
-    # is favoured on ties so the package summary is never the casualty.
     head_budget = max_bytes // 4
     tail_budget = max_bytes // 4
 
     keep: list[bool] = [False] * len(lines)
 
-    # (1) Head window: take whole lines from the front until the head budget runs
-    # out. ``head_kept`` is the count of retained leading lines, used to bound the
-    # tail loop so the two windows cannot collide.
     used = 0
     head_kept = 0
     for i, cost in enumerate(line_costs):
@@ -870,10 +721,6 @@ def trim_log(text: str, max_bytes: int) -> str:
         used += cost
         head_kept = i + 1
 
-    # (3) Tail window: take whole lines from the back until the tail budget runs
-    # out. The head loop stops at <= max_bytes // 4 bytes, so with the over-budget
-    # guard above (len(text) > max_bytes) the head and tail windows are always
-    # disjoint and need no overlap check here.
     used = 0
     for i in range(len(lines) - 1, head_kept - 1, -1):
         cost = line_costs[i]
@@ -882,10 +729,8 @@ def trim_log(text: str, max_bytes: int) -> str:
         keep[i] = True
         used += cost
 
-    # Running total of everything already retained by head + tail.
     retained = sum(cost for i, cost in enumerate(line_costs) if keep[i])
 
-    # (2) Sentinel lines, in original order, until the overall budget is reached.
     for i, line in enumerate(lines):
         if keep[i] or not _line_is_sentinel(line):
             continue
@@ -895,8 +740,6 @@ def trim_log(text: str, max_bytes: int) -> str:
         keep[i] = True
         retained += cost
 
-    # Re-assemble in original order, inserting an elision marker for every gap
-    # of dropped lines between two retained regions.
     out: list[str] = []
     gap_bytes = 0
     for i, line in enumerate(lines):

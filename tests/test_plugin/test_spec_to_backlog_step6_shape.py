@@ -55,7 +55,6 @@ def _extract_table_header_from_fenced_block(section: str, block_contains: str) -
 
     Returns the header row string (stripped), or None if the block is not found.
     """
-    # Find all fenced code blocks in the section.
     blocks = re.findall(r"```[^\n]*\n(.*?)```", section, re.DOTALL)
     for block in blocks:
         if block_contains in block:
@@ -106,7 +105,6 @@ class TestStep6FullWorkUnitIndexHeader:
 
         full_index_header = _extract_table_header_from_fenced_block(step6, "File Path")
         if full_index_header is None:
-            # Attempt to find by known canonical column names
             full_index_header = _extract_table_header_from_fenced_block(step6, "ID")
         assert full_index_header is not None, (
             "ERROR: Step 6 of spec-to-backlog/SKILL.md does not contain a fenced "
@@ -133,13 +131,11 @@ class TestStep6FullWorkUnitIndexHeader:
         content = _read_skill()
         step6 = _extract_step6(content)
         stale_columns = ("Branch", "Depends On", "Changed Files")
-        # Find the Full Work Unit Index fenced block
         blocks = re.findall(r"```[^\n]*\n(.*?)```", step6, re.DOTALL)
         for stale in stale_columns:
             for block in blocks:
                 lines = block.splitlines()
                 if lines and "|" in lines[0]:
-                    # Only check table-like blocks
                     assert stale not in lines[0], (
                         f"ERROR: spec-to-backlog/SKILL.md Step 6 Full Work Unit Index "
                         f"header still contains stale column '{stale}'. "
@@ -157,11 +153,8 @@ class TestStep6StatusSummaryHeader:
         content = _read_skill()
         step6 = _extract_step6(content)
 
-        # Look for the Status Summary fenced block -- it contains 'Epic' but not 'File Path'
         status_summary_header = _extract_table_header_from_fenced_block(step6, "Epic")
-        # If also found File Path block first -- pick the one WITHOUT File Path
         if status_summary_header is not None and "File Path" in status_summary_header:
-            # Need to find a different block
             blocks = re.findall(r"```[^\n]*\n(.*?)```", step6, re.DOTALL)
             status_summary_header = None
             for block in blocks:
@@ -202,11 +195,9 @@ class TestStep6StatusSummaryHeader:
         content = _read_skill()
         step6 = _extract_step6(content)
         expected = _canonical_status_summary_header()
-        # The expected header from constants does not have 'Total' or 'In Review'
         assert "Total" not in expected or "Total" not in step6.split("### Full Work Unit Index")[0], (
             "The canonical STATUS_SUMMARY_TABLE_HEADER must be used; it does not include a 'Total' column."
         )
-        # Verify the expected canonical header itself doesn't have 'In Review'
         assert "In Review" not in expected, (
             "The canonical STATUS_SUMMARY_TABLE_HEADER from constants.py must not contain 'In Review' -- "
             "verify that constants.py has not been changed unexpectedly."

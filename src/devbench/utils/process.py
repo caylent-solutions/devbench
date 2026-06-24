@@ -18,11 +18,6 @@ from pathlib import Path
 from devbench.config import COMMAND_TIMEOUT, OUTPUT_TRUNCATION_LIMIT
 from devbench.constants import SUBPROCESS_ERROR_EXIT_CODE
 
-# Truncation marker injected between the retained head and tail windows when a
-# captured command output exceeds the configured budget.  ``{n}`` records how
-# many characters were elided and ``{max}`` echoes the budget so an operator
-# reading the transcript knows the output was bounded (not the real end of the
-# tool's output) and can re-run the command for the full firehose.
 _OUTPUT_TRUNCATED_TEMPLATE = "\n[OUTPUT_TRUNCATED: {n} bytes elided, kept head+tail within {max} bytes]\n"
 
 
@@ -53,9 +48,6 @@ def bound_output(text: str, *, max_bytes: int) -> str:
     """
     if max_bytes <= 0 or len(text) <= max_bytes:
         return text
-    # Split the budget between a leading and a trailing window so both the
-    # setup context and the final summary/error survive.  Integer halves; any
-    # odd byte favours the head.
     tail_budget = max_bytes // 2
     head_budget = max_bytes - tail_budget
     head = text[:head_budget]
@@ -190,8 +182,6 @@ def run_command_in_process_group(
     try:
         out, err = proc.communicate(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
-        # Reap the WHOLE group (the live subtree), not just the direct child, so
-        # no grandchild apply survives. SIGTERM, then SIGKILL the stragglers.
         _kill_process_group(proc)
         out, err = proc.communicate()
         if on_complete is not None:

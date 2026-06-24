@@ -59,31 +59,16 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-# Regex matching the start of a Changes Manifest section in a work-unit file.
 _MANIFEST_HEADER_RE = re.compile(r"^##\s+Changes Manifest\s*$", re.MULTILINE)
 
-# Regex matching the start of the NEXT level-2 heading after Changes Manifest.
 _NEXT_H2_RE = re.compile(r"^##\s+", re.MULTILINE)
 
-# Regex matching a single Manifest table row (excluding header + separator).
-# The Manifest is a 2-column markdown table: ``| <path> | <annotation> |``.
 _MANIFEST_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$")
 
-# Regex matching a path-shaped backtick token used in AC / DoD prose.
-# Matches ``foo/bar.py`` or ``foo/bar`` or ``.github/workflows/x.yml`` -- any
-# backtick-quoted token that contains a ``/``. Used by suffix_ref_on_orphan_paths
-# to identify candidates needing a trailing ``(ref)`` suffix.
 _BACKTICK_PATH_RE = re.compile(r"`([^`\s]+/[^`\s]+)`")
 
-# Regex extracting the ``## Status:`` value from a work-unit file. Used by
-# ``_is_terminal_status`` to decide whether to skip a file. Mirrors the
-# canonical status-line shape every work unit ships with.
 _STATUS_LINE_RE = re.compile(r"^##\s+Status:\s*(\S+)", re.MULTILINE)
 
-# Statuses considered terminal: passes never modify a file in one of these
-# states unless ``force_terminal=True`` is passed. ``declined`` is included
-# alongside ``done`` because a declined work unit is also frozen --
-# retroactive mechanical edits would reopen settled decisions.
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "declined"})
 
 
@@ -264,7 +249,6 @@ def _collapse_manifest_block(block: str) -> tuple[str, bool]:
     """
     lines = block.splitlines(keepends=True)
 
-    # Locate the header row (first non-separator pipe line).
     header_idx: int | None = None
     header_cells: list[str] = []
     for i, line in enumerate(lines):
@@ -281,16 +265,12 @@ def _collapse_manifest_block(block: str) -> tuple[str, bool]:
     if header_idx is None or len(header_cells) <= 2:
         return block, False
 
-    # Locate the separator row (first ``|---|---|`` line after the header).
     sep_idx: int | None = None
     for i in range(header_idx + 1, len(lines)):
         if lines[i].rstrip("\n").strip().startswith("|-"):
             sep_idx = i
             break
 
-    # When the header is ``| Repo | Path | Action |`` we collapse the
-    # first two columns into the File cell; otherwise we treat the
-    # first column as File and join the rest into Change with `` -- ``.
     repo_first = header_cells[0].lower() == "repo"
 
     new_lines: list[str] = []
@@ -317,10 +297,6 @@ def _collapse_manifest_block(block: str) -> tuple[str, bool]:
             file_cell = cells[0].strip().strip("`").strip()
             change_cell = " -- ".join(c.strip() for c in cells[1:] if c.strip())
         if not change_cell:
-            # An N-column row whose tail cells were all empty collapses to
-            # a single-column row, which is malformed. Skip the rewrite for
-            # that row so the validator surfaces the underlying defect
-            # instead of silently absorbing it.
             new_lines.append(line)
             continue
         new_lines.append(f"| `{file_cell}` | {change_cell} |\n")
@@ -373,14 +349,10 @@ def sanitize_markdown_pipes_in_manifest(
             if not stripped.startswith("|") or stripped.startswith("|-"):
                 new_lines.append(line)
                 continue
-            # Header line (``| File | Change |``) is 3 pipes; rows are 3 pipes.
-            # Anything more is an extra in-cell ``|`` we need to escape.
             pipe_count = stripped.count("|") - stripped.count("\\|")
             if pipe_count <= 3:
                 new_lines.append(line)
                 continue
-            # Walk the line and escape every pipe except the first, the second
-            # (column separator), and the trailing pipe.
             new_line = _escape_inner_pipes(stripped) + ("\n" if line.endswith("\n") else "")
             new_lines.append(new_line)
             changed = True
@@ -397,7 +369,6 @@ def _escape_inner_pipes(row: str) -> str:
     trailing) and escapes every other unescaped pipe. Input is a single
     Manifest row stripped of its trailing newline.
     """
-    # Find the positions of unescaped pipes.
     positions: list[int] = []
     for idx, char in enumerate(row):
         if char != "|":
@@ -407,8 +378,6 @@ def _escape_inner_pipes(row: str) -> str:
         positions.append(idx)
     if len(positions) <= 3:
         return row
-    # Preserve the first (leading), the second (column separator), and the last
-    # (trailing). Escape everything between the 2nd and the last.
     preserve = {positions[0], positions[1], positions[-1]}
     result: list[str] = []
     for idx, char in enumerate(row):
@@ -574,7 +543,6 @@ def _suffix_orphans_in_text(text: str, in_manifest: set[str]) -> str:
     if not ac_section and not dod_section:
         return text
 
-    # Operate on the two scopes individually; build a fresh string.
     def _substitute(match: re.Match[str]) -> str:
         return _maybe_suffix(match, in_manifest)
 
@@ -591,7 +559,6 @@ def _maybe_suffix(match: re.Match[str], in_manifest: set[str]) -> str:
     token = match.group(1)
     if token in in_manifest:
         return match.group(0)
-    # Look one char ahead to see if the operator already wrote ``(ref)``.
     end = match.end()
     suffix_window = match.string[end : end + 6]
     if suffix_window.startswith((" (ref)", "(ref)")):
@@ -610,15 +577,10 @@ def _find_section_bounds(text: str, header: str) -> tuple[int, int] | None:
     return section_start, section_end
 
 
-# Canonical regex matching one task ID -- ``E<digits>-F<digits>-S<digits>-T<digits>``.
-# Used by ``suffix_na_on_non_python_tasks`` to detect Task work units (skipping
-# Epic / Feature / Story files, which never carry AC-FINAL lines).
 _TASK_ID_RE = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
 
-# Canonical regex matching any work-unit ID at any of the four levels.
 _WORK_UNIT_ID_RE = re.compile(r"^E\d+(?:-F\d+(?:-S\d+(?:-T\d+)?)?)?$")
 
-# Canonical regex matching an Epic ID specifically (level 1).
 _EPIC_ID_RE = re.compile(r"^E\d+$")
 
 
@@ -686,25 +648,17 @@ def regenerate_backlog_index(
 
     materialised_scope: list[Path] | None = list(scope_paths) if scope_paths is not None else None
 
-    # Gather (id, type, status, file_path) tuples for every work-unit
-    # file under the requested scope. ``_TASK_ID_RE`` and friends
-    # classify the level from the filename stem.
     new_rows = _collect_work_unit_rows(backlog_dir, materialised_scope, workspace_root)
 
     if not backlog_md.exists():
-        # Greenfield: skip this pass; the skill's existing write path
-        # handles greenfield invocations.
         return 0
 
     existing_text = backlog_md.read_text(encoding="utf-8")
     existing_ids = _parse_existing_index_ids(existing_text)
 
-    # Filter new rows to the ones not already in the existing index.
     rows_to_append = []
     for row in new_rows:
         if row["id"] in existing_ids:
-            # Collision: the same ID appears in the existing index but
-            # may reference a different file. Compare paths.
             if existing_ids[row["id"]] != row["path"]:
                 raise BacklogAppendCollisionError(
                     f"Cannot append {row['id']}: existing index row references "
@@ -712,7 +666,6 @@ def regenerate_backlog_index(
                     f"{row['path']!r}. Resolve by re-numbering the new epic or "
                     f"renaming the existing directory."
                 )
-            # Same ID + same path: already present, no append needed.
             continue
         rows_to_append.append(row)
 
@@ -761,13 +714,11 @@ def _collect_work_unit_rows(
         status = status_match.group(1).strip().lower() if status_match else ""
         title_match = re.search(r"^#\s+([^\n]+)\n", text)
         title = title_match.group(1).strip() if title_match else path.stem
-        # Strip the ID prefix from the title if the H1 is ``# <ID>: <title>``.
         if ":" in title and title.split(":", 1)[0].strip() == path.stem:
             title = title.split(":", 1)[1].strip()
         try:
             rel_path = path.relative_to(workspace_root).as_posix()
         except ValueError:
-            # File is outside workspace_root; record the absolute path.
             rel_path = str(path)
         rows.append(
             {
@@ -800,8 +751,6 @@ def _parse_existing_index_ids(content: str) -> dict[str, str]:
         first = cells[0].strip()
         if not _WORK_UNIT_ID_RE.match(first):
             continue
-        # Find the file path in the row: look for a backtick-wrapped
-        # ``backlog/.../*.md`` token in any cell.
         file_path = ""
         for cell in cells:
             token = cell.strip().strip("`")
@@ -825,7 +774,6 @@ def _append_rows_to_backlog_index(existing_text: str, rows: list[dict[str, str]]
 
     Existing rows in both tables are byte-for-byte preserved.
     """
-    # Group new rows by epic for Status Summary aggregation.
     by_epic: dict[str, list[dict[str, str]]] = {}
     new_epics: list[str] = []
     new_epic_titles: dict[str, str] = {}
@@ -856,25 +804,16 @@ def _table_body_end(text: str, after_header: int) -> int | None:
     text does not contain a valid Markdown table starting at this
     header.
     """
-    # ``after_header`` points to the position of the header row's
-    # trailing newline character (or end-of-string). Advance past it.
     pos = after_header
     if pos < len(text) and text[pos] == "\n":
         pos += 1
-    # The separator row follows. Match it explicitly. The character
-    # class explicitly excludes ``\n`` so the greedy ``+`` cannot
-    # overflow into the next data row -- ``\s`` would include ``\n``
-    # and an overflowing greedy match plus backtrack would land the
-    # match end one char inside the data row.
     sep_match = re.match(r"\|[-| \t]+\|[ \t]*\n?", text[pos:])
     if sep_match is None:
         return None
     pos += sep_match.end()
-    # Walk forward through every consecutive pipe-prefixed line.
     while pos < len(text):
         line_end = text.find("\n", pos)
         if line_end < 0:
-            # Last line without trailing newline.
             line = text[pos:]
             if line.startswith("|"):
                 pos = len(text)
@@ -898,7 +837,6 @@ def _append_status_summary_rows(
     ``_compute_epic_counts`` semantics (issue #229 fix). The table's
     column order is preserved verbatim from the existing header.
     """
-    # Locate the Status Summary table (header row that starts ``| Epic |``).
     header_match = re.search(r"^\| Epic \| [^\n]+ \|\s*$", text, re.MULTILINE)
     if header_match is None:
         return text
@@ -906,11 +844,9 @@ def _append_status_summary_rows(
     if body_end is None:
         return text
 
-    # Parse the header to learn column order.
     header_cells = _split_row_cells(text[header_match.start() : header_match.end()].strip())
     if header_cells is None:
         return text
-    # Build new rows matching the column order.
     status_columns = [c.strip().lower() for c in header_cells]
     new_rows_text = ""
     for epic_id in new_epics:
@@ -994,10 +930,6 @@ def _append_full_index_rows(text: str, rows: list[dict[str, str]]) -> str:
     from the row dict (e.g., custom operator-added columns) are left
     blank.
     """
-    # Locate the Full Work Unit Index header. Typical shapes:
-    #   | ID | Title | Type | Status | Dependencies | Repo | File Path |
-    #   | ID | Title | Status | Repo | Branch | Depends On | Changed Files |
-    # The header always starts with ``| ID |``.
     header_match = re.search(r"^\| ID \| [^\n]+ \|\s*$", text, re.MULTILINE)
     if header_match is None:
         return text
@@ -1020,16 +952,9 @@ def _append_full_index_rows(text: str, rows: list[dict[str, str]]) -> str:
     return text[:body_end] + new_rows_text + text[body_end:]
 
 
-# Regex matching an Acceptance Criteria checkbox row. Captures the AC ID so
-# the pass can decide whether the row is one of the Python-tooling
-# AC-FINAL-* lines.
 _AC_CHECKBOX_RE = re.compile(r"^(\s*- \[[ xX]\] )(AC-FINAL-\d{3})\b(.*)$")
 
 
-# Regex matching the canonical task-ID form ``E<n>[-F<n>][-S<n>][-T<n>]``.
-# Used by ``normalize_dep_ids`` to strip slug-suffix material after the
-# canonical prefix when the operator wrote ``E16-test-cleanup`` instead
-# of the bare canonical ``E16``.
 _CANONICAL_ID_PREFIX_RE = re.compile(r"^(E\d+(?:-F\d+(?:-S\d+(?:-T\d+)?)?)?)")
 
 
@@ -1087,8 +1012,6 @@ def _normalize_dep_ids_in_text(text: str) -> tuple[str, bool]:
     Returns ``(new_text, changed)``. ``changed`` is ``False`` when no
     rewrites were necessary.
     """
-    # Find both dep-table sections and rewrite each in place. The two
-    # sections live at different heading levels; we handle both.
     sections = (
         ("## Dependencies", "## "),
         ("### Depends On This", "### "),
@@ -1119,16 +1042,13 @@ def _find_dep_section_bounds(text: str, header: str) -> tuple[int, int] | None:
     if idx < 0:
         return None
     body_start = idx + len(header)
-    # Advance past the header's trailing newline.
     nl = text.find("\n", body_start)
     if nl < 0:
         return None
     body_start = nl + 1
     if header.startswith("### "):
-        # Level-3 header: stops at next level-2 or level-3 heading.
         next_heading = re.compile(r"^(##|###)\s+", re.MULTILINE)
     else:
-        # Level-2 header: stops at next level-2 heading.
         next_heading = re.compile(r"^##\s+", re.MULTILINE)
     match = next_heading.search(text, body_start)
     body_end = match.start() if match else len(text)
@@ -1140,7 +1060,6 @@ def _rewrite_dep_table_first_cells(body: str) -> str:
     new_lines: list[str] = []
     for line in body.splitlines(keepends=True):
         stripped = line.rstrip("\n").strip()
-        # Skip non-table lines and header / separator rows.
         if not stripped.startswith("|") or stripped.startswith("|-"):
             new_lines.append(line)
             continue
@@ -1149,8 +1068,6 @@ def _rewrite_dep_table_first_cells(body: str) -> str:
             new_lines.append(line)
             continue
         first = cells[0].strip()
-        # Skip the table header ``| ID | Title | Status |`` and the
-        # ``| none | | |`` sentinel.
         if first.lower() in ("id", "none", ""):
             new_lines.append(line)
             continue
@@ -1160,18 +1077,13 @@ def _rewrite_dep_table_first_cells(body: str) -> str:
             continue
         canonical = match.group(1)
         if canonical == first:
-            # Already canonical; nothing to rewrite.
             new_lines.append(line)
             continue
-        # Replace the slug-form ID with the canonical prefix. Preserve
-        # the cell padding the original row used (the leading column is
-        # ``| <ID> |``).
         old_cell = f"| {first} |"
         new_cell = f"| {canonical} |"
         if old_cell in line:
             new_lines.append(line.replace(old_cell, new_cell, 1))
             continue
-        # Fall back to a regex replace tolerant of variable whitespace.
         new_lines.append(re.sub(rf"\|\s*{re.escape(first)}\s*\|", new_cell, line, count=1))
     return "".join(new_lines)
 
@@ -1211,9 +1123,6 @@ def suffix_na_on_non_python_tasks(
 
     Returns the number of files modified.
     """
-    # Imported here so the module has no import-time dependency on the
-    # validator class (and the post-processor remains usable from
-    # standalone scripts even if the validator side-effects change).
     from devbench.backlog.manager import BacklogManager
     from devbench.backlog.manifest import ManifestParseError, parse_manifest
 
@@ -1229,8 +1138,6 @@ def suffix_na_on_non_python_tasks(
         try:
             manifest_rows = parse_manifest(text)
         except ManifestParseError:
-            # Other validator rules surface the underlying defect; this
-            # pass cannot reason about an unparseable Manifest.
             continue
         paths = [row.file for row in manifest_rows]
         tier = BacklogManager._classify_manifest_tier(paths)
@@ -1253,8 +1160,6 @@ def suffix_na_on_non_python_tasks(
             if "-- N/A" in tail:
                 new_lines.append(line)
                 continue
-            # Append the suffix at the end of the line (preserving the
-            # trailing newline if present).
             ending = "\n" if line.endswith("\n") else ""
             new_lines.append(f"{match.group(1)}{ac_id}{tail}{suffix}{ending}")
             changed = True
@@ -1314,8 +1219,6 @@ def verify_code_standards_canonical(
             "<WORKSPACE_CLAUDE_MD>",
             str(workspace_root / "CLAUDE.md"),
         )
-    # The carve-outs placeholder is set to its empty-list rendering so
-    # tasks that emit no carve-outs match the canonical exactly.
     canonical_trimmed = canonical_trimmed.replace("<REPO_CARVE_OUTS>", "(none)")
 
     drifted = 0
@@ -1347,11 +1250,9 @@ def _extract_code_standards_block_excluding_error_contract(text: str) -> str | N
     start = text.find(start_marker)
     if start < 0:
         return None
-    # Find the section's end: the next ``##``-level heading or end-of-file.
     next_h2 = re.search(r"^##\s+", text[start + len(start_marker) :], re.MULTILINE)
     end = (start + len(start_marker) + next_h2.start()) if next_h2 else len(text)
     section = text[start:end]
-    # Trim the Error Handling Contract subsection.
     error_marker = "#### Error Handling Contract"
     error_idx = section.find(error_marker)
     if error_idx >= 0:
@@ -1387,9 +1288,6 @@ def run_all(
     only behavioural change for legacy callers is that terminal-status
     files are now skipped by default (this is the issue #226 fix).
     """
-    # The scope list is materialised once so each pass walks the same
-    # set of files. Without this, an iterable would be exhausted by the
-    # first pass and subsequent passes would silently no-op.
     materialised_scope = list(scope_paths) if scope_paths is not None else None
     return {
         "normalize_manifest_column_count": normalize_manifest_column_count(

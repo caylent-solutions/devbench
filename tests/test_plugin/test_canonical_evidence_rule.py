@@ -35,16 +35,11 @@ SPEC_TO_BACKLOG_SKILL = (
 )
 SHARED_DOC = REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "docs" / "workflow-authoring-patterns.md"
 
-# Both SKILL.md files must carry the canonical evidence rule text. The shared
-# doc carries the full generic Pattern 7 definition.
 SKILL_FILES = [
     pytest.param(CREATE_SPEC_SKILL, id="create-spec"),
     pytest.param(SPEC_TO_BACKLOG_SKILL, id="spec-to-backlog"),
 ]
 
-# The canonical vendored/generated directory exclusion list (issue Section 3.2).
-# Every one of these directory names must appear in the rule text so a count is
-# never contaminated by third-party copies.
 CANONICAL_EXCLUSION_DIRS = [
     ".terraform/",
     "node_modules/",

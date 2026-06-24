@@ -69,9 +69,6 @@ class TestScopeConveyance:
         captured: dict[str, dict[str, str]] = {}
 
         def _fake_launch(*, name, screen_name, env, run_argv, screen_path):
-            # Capture the env the supervisor would export into the screen session
-            # (the claude child inherits it) and stamp a running state so start's
-            # post-launch confirmation passes -- no real screen is created in CI.
             captured["env"] = dict(env)
             from devbench.constants import SUPERVISE_STATE_RUNNING
             from devbench.supervise import new_session_state
@@ -104,8 +101,6 @@ class TestScopeConveyance:
 
         assert rc == 0
 
-        # (1) scope.json written at the canonical session-tree path with the
-        #     ScopeFilter.to_file schema and E11-filtered expanded_ids.
         scope_path = session_scope_file_path(tmp_path, "conv1")
         assert scope_path.exists()
         scope = json.loads(scope_path.read_text(encoding="utf-8"))
@@ -114,18 +109,13 @@ class TestScopeConveyance:
         assert "E12-F1-S1-T1" not in scope["expanded_ids"]
         assert "started_at" in scope and "started_by" in scope
 
-        # (2) The three conveyance vars are exported into the screen session env.
         env = captured["env"]
         assert env["DEVBENCH_WORKSPACE_ROOT"] == str(tmp_path)
         assert env["DEVBENCH_SESSION_NAME"] == "conv1"
         assert env["DEVBENCH_CLAUDE_MODEL"] == "claude-opus-4-8"
-        # The API-routing vars are NEVER exported (subscription billing, FR-21).
         assert "ANTHROPIC_API_KEY" not in env
 
     def test_devbench_next_honours_session_routed_scope(self, tmp_path: Path) -> None:
-        # Write the session-routed scope.json exactly as start does (the SDK writer),
-        # then prove `DEVBENCH_SESSION_NAME=<n> devbench next` honours it: it returns
-        # only the in-scope E11 unit and never the out-of-scope E12 unit (FR-8, DI-3).
         from devbench.supervise import write_session_scope
 
         write_session_scope(
@@ -139,9 +129,6 @@ class TestScopeConveyance:
         from devbench.backlog.parser import BacklogParser
 
         units = [_task("E11-F1-S1-T1"), _task("E11-F1-S1-T2"), _task("E12-F1-S1-T1")]
-        # A REAL BacklogParser so the real get_parallel_candidates + real scope
-        # filtering run; only the file parse is replaced with the crafted units
-        # (mirroring the repo's own cmd_next tests).
         parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "BACKLOG.md")
 
         captured_out: list[str] = []
@@ -156,7 +143,6 @@ class TestScopeConveyance:
 
         assert rc == 0
         printed = "\n".join(captured_out)
-        # The session-routed scope (E11 only) selected an E11 unit, never E12.
         emitted = json.loads(printed)
         assert emitted["id"].startswith("E11-")
         assert "E12" not in printed

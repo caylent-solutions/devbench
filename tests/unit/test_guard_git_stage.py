@@ -15,7 +15,6 @@ SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchest
 
 def _run_hook(payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
     env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if cwd is not None:
         env["PWD"] = cwd
@@ -58,21 +57,16 @@ def _init_git_repo(path: Path) -> None:
 class TestGuardGitStageHook:
     """Tests for guard-git-stage.sh PreToolUse hook."""
 
-    # ------------------------------------------------------------------ AC-1
-
     def test_script_exists_and_is_executable(self) -> None:
         """AC-1: The script must exist and be executable."""
         assert SCRIPT_PATH.exists(), f"Script not found at {SCRIPT_PATH}"
         assert os.access(SCRIPT_PATH, os.X_OK), f"Script is not executable: {SCRIPT_PATH}"
-
-    # ------------------------------------------------------------------ AC-2: blocks git commit when no staged changes
 
     def test_git_commit_with_no_staged_changes_exits_2(self) -> None:
         """AC-2: Exit 2 when git commit is attempted but no files are staged."""
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_path = Path(tmpdir)
             _init_git_repo(repo_path)
-            # Create an unstaged file (not added to index)
             (repo_path / "file.txt").write_text("hello")
             payload = _make_payload("git commit -m 'initial'")
             result = _run_hook(payload, cwd=str(repo_path))
@@ -88,7 +82,6 @@ class TestGuardGitStageHook:
             result = _run_hook(payload, cwd=str(repo_path))
         assert result.returncode == 2
         stderr_lower = result.stderr.lower()
-        # Must mention staging, git add, or similar guidance
         assert any(word in stderr_lower for word in ["stage", "git add", "staged", "nothing"]), (
             f"Error message not actionable: {result.stderr}"
         )
@@ -103,14 +96,11 @@ class TestGuardGitStageHook:
         assert result.returncode == 2
         assert "git add" in result.stderr
 
-    # ------------------------------------------------------------------ AC-3: git commit allowed when staged
-
     def test_git_commit_with_staged_changes_exits_0(self) -> None:
         """AC-3: Exit 0 when git commit is attempted and files are staged."""
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_path = Path(tmpdir)
             _init_git_repo(repo_path)
-            # Create and stage a file
             test_file = repo_path / "file.txt"
             test_file.write_text("hello")
             subprocess.run(
@@ -128,7 +118,6 @@ class TestGuardGitStageHook:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_path = Path(tmpdir)
             _init_git_repo(repo_path)
-            # Create initial commit
             (repo_path / "file.txt").write_text("initial")
             subprocess.run(["git", "add", "file.txt"], check=True, capture_output=True, cwd=str(repo_path))
             subprocess.run(
@@ -137,14 +126,11 @@ class TestGuardGitStageHook:
                 capture_output=True,
                 cwd=str(repo_path),
             )
-            # Stage a new change
             (repo_path / "file2.txt").write_text("update")
             subprocess.run(["git", "add", "file2.txt"], check=True, capture_output=True, cwd=str(repo_path))
             payload = _make_payload("git commit --amend -m 'amended'")
             result = _run_hook(payload, cwd=str(repo_path))
         assert result.returncode == 0, f"stderr: {result.stderr}"
-
-    # ------------------------------------------------------------------ AC-4: non-commit bash commands allowed
 
     def test_non_commit_git_command_exits_0(self) -> None:
         """AC-4: git status is not a commit command and is always allowed."""
@@ -194,8 +180,6 @@ class TestGuardGitStageHook:
         result = _run_hook(payload)
         assert result.returncode == 0
 
-    # ------------------------------------------------------------------ edge cases
-
     @pytest.mark.parametrize(
         "command",
         [
@@ -220,7 +204,6 @@ class TestGuardGitStageHook:
         """AC-4: A command that contains 'git commit' as a substring in another context is handled correctly."""
         payload = _make_payload("echo 'git commit -m test'")
         result = _run_hook(payload)
-        # This is an echo command, not a real git commit -- should be allowed
         assert result.returncode == 0
 
 
@@ -245,7 +228,6 @@ class TestGuardGitStageManifestScope:
     """Slice 3b: `git add <path>` must target files listed in the active work unit's manifest."""
 
     def _env_with_unit(self, cwd: str, unit_path: Path) -> dict[str, str]:
-        # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
         env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
         env["PWD"] = cwd
         env["CURRENT_WORK_UNIT_FILE"] = str(unit_path)
@@ -281,8 +263,7 @@ class TestGuardGitStageManifestScope:
         result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
         assert result.returncode == 2
         assert "dst/pollution.py" in result.stderr
-        # src/a.py must NOT appear as an offender, only in the manifest listing
-        assert result.stderr.count("src/a.py") == 1  # only the manifest-declares line
+        assert result.stderr.count("src/a.py") == 1
 
     def test_blanket_add_dash_a_allowed_here_caught_at_commit(self, tmp_path: Path) -> None:
         """`git add -A` is allowed through the hook; the commit-time assert catches violations."""

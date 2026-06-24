@@ -28,22 +28,12 @@ def _write_minimal_config(path: Path, extra: str = "") -> None:
     path.write_text(content, encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# OrchestrateConfig dataclass defaults (None -> resolver falls through)
-# ---------------------------------------------------------------------------
-
-
 class TestOrchestrateConfigPresyncDefaults:
     def test_presync_fields_default_to_none(self) -> None:
         cfg = OrchestrateConfig()
         assert cfg.presync_environment is None
         assert cfg.presync_command is None
         assert cfg.presync_timeout_seconds is None
-
-
-# ---------------------------------------------------------------------------
-# load_runtime_config: presync_* from the orchestrate: section (schema-valid)
-# ---------------------------------------------------------------------------
 
 
 class TestLoadRuntimeConfigPresync:
@@ -73,34 +63,19 @@ class TestLoadRuntimeConfigPresync:
         assert cfg.orchestrate.presync_timeout_seconds == 1800
 
 
-# ---------------------------------------------------------------------------
-# Fail-fast: malformed values raise ValueError
-# ---------------------------------------------------------------------------
-
-
 class TestPresyncFailFast:
     @pytest.mark.parametrize("bad_value", [0, -1])
     def test_non_positive_timeout_raises(self, tmp_path: Path, bad_value: int) -> None:
         cfg_file = tmp_path / "devbench.yaml"
         _write_minimal_config(cfg_file, f"orchestrate:\n  presync_timeout_seconds: {bad_value}\n")
-        # Fail-fast either at the schema layer (minimum: 1) or the parser layer
-        # (must be >= 1) -- both reject a non-positive timeout with a ValueError
-        # naming the field.
         with pytest.raises(ValueError, match="presync_timeout_seconds"):
             load_runtime_config(cfg_file, {})
 
     def test_empty_command_list_raises(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "devbench.yaml"
         _write_minimal_config(cfg_file, "orchestrate:\n  presync_command: []\n")
-        # The schema's minItems:1 rejects an empty list before the parser runs.
         with pytest.raises(ValueError):
             load_runtime_config(cfg_file, {})
-
-
-# ---------------------------------------------------------------------------
-# Parser-layer fail-fast (defense in depth: covers the branches the JSON schema
-# would normally reject first, exercised by driving the parser directly).
-# ---------------------------------------------------------------------------
 
 
 class TestParseOrchestratePresyncDirect:
@@ -138,22 +113,16 @@ class TestParsePresyncCommandDirect:
     @pytest.mark.parametrize(
         "bad_value",
         [
-            "uv sync",  # a bare string is not a list
-            [],  # empty
-            ["uv", ""],  # contains an empty token
-            ["uv", "  "],  # contains a whitespace-only token
-            ["uv", 3],  # contains a non-string token
+            "uv sync",
+            [],
+            ["uv", ""],
+            ["uv", "  "],
+            ["uv", 3],
         ],
     )
     def test_malformed_command_raises(self, bad_value: object) -> None:
         with pytest.raises(ValueError, match="presync_command must be a non-empty list"):
             _parse_presync_command(self._PATH, {"presync_command": bad_value})
-
-
-# ---------------------------------------------------------------------------
-# Serialize claims: orchestrate.max_parallel_in_progress
-# (root cause of tracked-issue 002: shared-checkout cross-contamination)
-# ---------------------------------------------------------------------------
 
 
 class TestMaxParallelInProgressConfig:

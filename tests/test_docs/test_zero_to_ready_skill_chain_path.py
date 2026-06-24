@@ -57,7 +57,6 @@ class TestZeroToReadyTwoSetupPaths:
         """docs/zero-to-ready.md must clearly distinguish the manual vs skill paths (AC-191-9)."""
         text = self._text()
         lower = text.lower()
-        # The doc should have both 'manual' and 'skill' (or equivalent) to show two distinct paths.
         has_manual_path = "manual" in lower or "step-by-step" in lower or "step 1" in lower
         has_skill_path = "skill" in lower or "onboarding.md" in lower
         assert has_manual_path and has_skill_path, (

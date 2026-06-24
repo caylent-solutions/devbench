@@ -54,7 +54,6 @@ class TestEmitCodeStandardsBlock:
 
     def test_no_task_specific_paths_renders_none(self, tmp_path: Path) -> None:
         block = cst.emit_code_standards_block(tmp_path)
-        # Find the Task-specific section and confirm it renders ``(none)``.
         marker = "Task-specific error paths for this work unit:"
         assert marker in block
         tail = block.split(marker, 1)[1]
@@ -104,7 +103,6 @@ class TestEmitCodeStandardsBlock:
         assert "Custom workspace standards." in block
         assert str(tmp_path / "CLAUDE.md") in block
         assert "- custom-error" in block
-        # The shipped canonical body's distinctive opening line is NOT present.
         assert "These are checked by the LLM review judges" not in block
 
 
@@ -119,7 +117,6 @@ class TestCanonicalBodyExcludingErrorContract:
     def test_omits_error_handling_contract(self) -> None:
         body = cst.canonical_body_excluding_error_contract()
         assert "#### Error Handling Contract" not in body
-        # Task-specific marker also gone (it lives under Error Handling Contract).
         assert "<TASK_SPECIFIC_ERROR_PATHS>" not in body
 
     def test_keeps_other_subsections(self) -> None:

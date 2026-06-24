@@ -8,10 +8,6 @@ import pytest
 
 from devbench.backlog.proposal import ProposalError, add_dep
 
-# ---------------------------------------------------------------------------
-# Shared workspace helpers
-# ---------------------------------------------------------------------------
-
 _BACKLOG_HEADER = (
     "# Backlog\n\n"
     "## Status Summary\n\n"
@@ -76,11 +72,6 @@ def _build_two_task_workspace(tmp_path: Path, t1_status: str = "blocked", t2_sta
     return tmp_path
 
 
-# ---------------------------------------------------------------------------
-# Cycle detection via existing dep row
-# ---------------------------------------------------------------------------
-
-
 class TestAddDepCycleViaDepRow:
     """add_dep must reject a reverse edge when the blocker file already lists
     the blocked task as a dep row in its Dependencies table."""
@@ -90,7 +81,6 @@ class TestAddDepCycleViaDepRow:
         reverse edge exists as a dep row on the blocker's file."""
         workspace = _build_two_task_workspace(tmp_path)
 
-        # Wire T1 -> T2 first (T1 blocked on T2).
         add_dep(
             backlog_root=workspace / "backlog",
             backlog_index=workspace / "BACKLOG.md",
@@ -98,8 +88,6 @@ class TestAddDepCycleViaDepRow:
             blocker_task_id="E0-F1-S1-T2",
         )
 
-        # Now attempt to wire the reverse edge T2 -> T1 (T2 blocked on T1).
-        # The blocker file (T1) already has T2 as a dep, so this is a cycle.
         with pytest.raises(ProposalError, match="add-dep would create a cycle"):
             add_dep(
                 backlog_root=workspace / "backlog",
@@ -128,11 +116,6 @@ class TestAddDepCycleViaDepRow:
             )
 
 
-# ---------------------------------------------------------------------------
-# Cycle detection via existing marker
-# ---------------------------------------------------------------------------
-
-
 class TestAddDepCycleViaMarker:
     """add_dep must reject a reverse edge when the blocker file already carries
     a [BLOCKED_PENDING_PROPOSAL] marker for the blocked task."""
@@ -142,8 +125,6 @@ class TestAddDepCycleViaMarker:
         but T2's Dependencies table has no row for T1 yet."""
         workspace = _build_two_task_workspace(tmp_path, t1_status="blocked", t2_status="in-queue")
         t1_path = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
-        # Manually inject a marker onto T1 indicating T1 depends on T2,
-        # but without a dep-table row (tests that marker alone is sufficient for detection).
         content = t1_path.read_text(encoding="utf-8")
         content += "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
         t1_path.write_text(content, encoding="utf-8")
@@ -153,8 +134,6 @@ class TestAddDepCycleViaMarker:
         """AC-253-2: fail fast when the reverse edge exists only as a marker (no dep row)."""
         workspace = self._workspace_with_marker_on_blocker(tmp_path)
 
-        # T1 already has a [BLOCKED_PENDING_PROPOSAL] T2 marker -- attempting
-        # to wire T2 blocked-on T1 is a cycle.
         with pytest.raises(ProposalError, match="add-dep would create a cycle"):
             add_dep(
                 backlog_root=workspace / "backlog",
@@ -174,11 +153,6 @@ class TestAddDepCycleViaMarker:
                 blocked_task_id="E0-F1-S1-T2",
                 blocker_task_id="E0-F1-S1-T1",
             )
-
-
-# ---------------------------------------------------------------------------
-# Precise guard -- non-conflicting calls still succeed
-# ---------------------------------------------------------------------------
 
 
 class TestAddDepNonCyclicSucceeds:
@@ -206,7 +180,6 @@ class TestAddDepNonCyclicSucceeds:
             blocked_task_id="E0-F1-S1-T1",
             blocker_task_id="E0-F1-S1-T2",
         )
-        # Second call must be a no-op (idempotent), not raise a cycle error.
         wrote = add_dep(
             backlog_root=workspace / "backlog",
             backlog_index=workspace / "BACKLOG.md",

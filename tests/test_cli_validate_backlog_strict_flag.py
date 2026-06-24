@@ -18,10 +18,6 @@ import pytest
 from devbench import cli
 from devbench.constants import BACKLOG_SUBDIR
 
-# ---------------------------------------------------------------------------
-# Shared backlog-building helpers
-# ---------------------------------------------------------------------------
-
 _INDEX_HEADER = (
     "# Backlog\n\n"
     "## Status Summary\n\n"
@@ -67,12 +63,8 @@ Test task.
 - [ ] Done
 """
 
-# Use the recognized test repo so the target-repo-resolves check (rule C2)
-# does not fire alongside the conflict check.
 _TEST_REPO = "caylent-solutions/devbench"
 
-# Use a docs/ path to avoid triggering the source-test-atomicity rule
-# (which only applies to production source files under src/).
 _TEST_MANIFEST_PATH = "docs/config-reference.md"
 
 
@@ -100,11 +92,6 @@ def _build_draft_conflict_backlog(tmp_path: Path) -> Path:
     index_path = tmp_path / "BACKLOG.md"
     index_path.write_text(_INDEX_HEADER + index_rows, encoding="utf-8")
     return index_path
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

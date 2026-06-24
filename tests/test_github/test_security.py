@@ -107,13 +107,11 @@ class TestSetupAllRepos:
             }
             results = setup_all_repos()
 
-        # Verify all calls used allowed repos
         assert mock_enable.call_count == len(ALLOWED_REPOS)
 
         called_repos = {call.args[0] for call in mock_enable.call_args_list}
         assert called_repos == ALLOWED_REPOS
 
-        # Every repo should have results
         assert len(results) == len(ALLOWED_REPOS)
         for repo, features in results.items():
             assert repo in ALLOWED_REPOS
@@ -146,7 +144,6 @@ class TestEnableSecurityFeatures:
             mock_api.return_value = (0, "")
             results = enable_security_features("caylent-solutions/git-repo")
 
-        # Should have made multiple API calls for different features
         assert mock_api.call_count >= 3
         assert isinstance(results, dict)
 
@@ -318,7 +315,7 @@ class TestGetSecurityReport:
                 return (0, dependabot_data)
             if "secret-scanning" in endpoint:
                 return (0, "[]")
-            return (1, "")  # codeql fails
+            return (1, "")
 
         with patch("devbench.github.security._gh_api", side_effect=api_side_effect):
             report = get_security_report("caylent-solutions/git-repo")
@@ -362,7 +359,6 @@ class TestValidateGhKwargs:
         _validate_gh_kwargs({"state": "configured"})
 
     def test_bracketed_key_accepted(self) -> None:
-        # The Secret Scanning PATCH calls use security_and_analysis[...] syntax.
         from devbench.github.security import _validate_gh_kwargs
 
         _validate_gh_kwargs({"security_and_analysis[secret_scanning][status]": "enabled"})
@@ -378,9 +374,6 @@ class TestValidateGhKwargs:
 
         from devbench.github.security import _validate_gh_kwargs
 
-        # The runtime contract is "values must be str"; the cast is a
-        # test-only escape hatch that proves the runtime check fires
-        # without leaving a `# type: ignore` annotation in the source.
         bad_input = cast(dict[str, str], {"key": cast(Any, 42)})
         with pytest.raises(ValueError, match="must be str"):
             _validate_gh_kwargs(bad_input)
@@ -410,7 +403,6 @@ class TestSecurityFetchErrorWrapping:
         msg = str(exc_info.value)
         assert "code-scanning" in msg
         assert "x/repo" in msg
-        # The original cause must be preserved for DEBUG-level diagnostics.
         assert exc_info.value.__cause__ is not None
 
     def test_non_array_response_raises(self) -> None:

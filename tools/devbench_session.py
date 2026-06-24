@@ -111,9 +111,6 @@ def cmd_attach(session_id: int, *, home: Path | None = None, runner: Callable = 
     if not _screen_exists(paths.screen_name, runner=runner):
         print(f"ERROR: session {paths.screen_name} not found", file=sys.stderr)
         return 1
-    # screen -r is interactive and blocks until the screen session ends.
-    # subprocess.run with check=False keeps the calling shell's tty wired
-    # through and returns the exit code when the operator detaches.
     completed = subprocess.run(["screen", "-r", paths.screen_name], check=False)
     return completed.returncode
 

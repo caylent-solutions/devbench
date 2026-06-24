@@ -29,10 +29,6 @@ from devbench.plugin_helpers.resolved_decisions_ledger import (
     read_ledger,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _spec_dir(tmp_path: Path) -> Path:
     spec = tmp_path / "spec"
@@ -42,11 +38,6 @@ def _spec_dir(tmp_path: Path) -> Path:
 
 def _ledger_path(tmp_path: Path, name: str = "myproject") -> Path:
     return _spec_dir(tmp_path) / f"{name}-resolved-decisions.md"
-
-
-# ---------------------------------------------------------------------------
-# DecisionEntry dataclass
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -85,11 +76,6 @@ class TestDecisionEntry:
         assert "5" in repr(entry)
 
 
-# ---------------------------------------------------------------------------
-# LedgerEntry -- the serialised form returned by read_ledger
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestLedgerEntry:
     """LedgerEntry carries the raw markdown text alongside the parsed index."""
@@ -100,18 +86,12 @@ class TestLedgerEntry:
         assert "D3" in entry.raw
 
 
-# ---------------------------------------------------------------------------
-# next_index
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestNextIndex:
     """next_index returns the next sequential D<N> integer."""
 
     def test_returns_one_for_empty_ledger(self, tmp_path: Path) -> None:
         path = _ledger_path(tmp_path)
-        # File does not exist yet -- ledger is empty.
         assert next_index(path) == 1
 
     def test_returns_one_for_empty_file(self, tmp_path: Path) -> None:
@@ -121,7 +101,6 @@ class TestNextIndex:
 
     def test_returns_n_plus_one_after_existing_entries(self, tmp_path: Path) -> None:
         path = _ledger_path(tmp_path)
-        # Write two entries manually so next_index can parse them.
         path.write_text(
             "# Resolved Decisions\n\n## D1\n\ntext\n\n## D2\n\ntext\n",
             encoding="utf-8",
@@ -136,11 +115,6 @@ class TestNextIndex:
             encoding="utf-8",
         )
         assert next_index(path) == 4
-
-
-# ---------------------------------------------------------------------------
-# read_ledger
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -178,11 +152,6 @@ class TestReadLedger:
         assert "foo vs bar" in entries[0].raw
 
 
-# ---------------------------------------------------------------------------
-# append_decision
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestAppendDecision:
     """append_decision writes a new D<N> entry atomically."""
@@ -190,7 +159,7 @@ class TestAppendDecision:
     def test_creates_ledger_with_first_entry(self, tmp_path: Path) -> None:
         path = _ledger_path(tmp_path)
         decision = DecisionEntry(
-            index=0,  # index is assigned by append_decision
+            index=0,
             contradiction="Section 2 vs Section 4 on retry count",
             resolution="Use retry_count=3 from Section 4",
             rationale="Section 4 is the authoritative error-handling contract",
@@ -229,14 +198,13 @@ class TestAppendDecision:
 
         d_dup = DecisionEntry(
             index=0,
-            contradiction="Section 2 vs Section 4 on timeout",  # exact same contradiction
-            resolution="Use 60 s instead",  # conflicting resolution
+            contradiction="Section 2 vs Section 4 on timeout",
+            resolution="Use 60 s instead",
             rationale="different rationale",
         )
         with pytest.raises(DuplicateResolutionError) as exc_info:
             append_decision(path, d_dup)
 
-        # The ledger must not have been modified.
         assert path.read_text(encoding="utf-8") == original_content
         assert "D1" in str(exc_info.value)
 
@@ -245,12 +213,10 @@ class TestAppendDecision:
         path = _ledger_path(tmp_path)
         tmp_path_for_ledger = path.parent / (path.name + ".tmp")
 
-        # Capture the tmp file existence during the write.
         tmp_existed_during_write: list[bool] = []
         original_replace = Path.replace
 
         def spy_replace(self: Path, target: Path) -> Path:
-            # Check that the .tmp file exists at the moment of replace.
             tmp_existed_during_write.append(tmp_path_for_ledger.exists())
             return original_replace(self, target)
 
@@ -259,22 +225,18 @@ class TestAppendDecision:
             append_decision(path, decision)
 
         assert any(tmp_existed_during_write), "No atomic rename observed during write"
-        # The tmp file should be cleaned up after replace.
         assert not tmp_path_for_ledger.exists()
 
     def test_partial_write_failure_leaves_prior_ledger_intact(self, tmp_path: Path) -> None:
         """If the tmp-write fails, the original ledger file is untouched."""
         path = _ledger_path(tmp_path)
-        # Pre-populate the ledger with one entry.
         d1 = DecisionEntry(index=0, contradiction="c1", resolution="r1", rationale="rat1")
         append_decision(path, d1)
         original_content = path.read_text(encoding="utf-8")
 
-        # Simulate a write failure by raising OSError during the tmp write_text call.
         original_write_text = Path.write_text
 
         def failing_write_text(self: Path, data: str, **kwargs: str | None) -> int:
-            # Fail only when writing to the .tmp file (the atomic write path).
             if str(self).endswith(".tmp"):
                 raise OSError("Simulated disk error")
             return original_write_text(self, data, **kwargs)
@@ -284,7 +246,6 @@ class TestAppendDecision:
             with pytest.raises(OSError, match="Simulated disk error"):
                 append_decision(path, d2)
 
-        # The original ledger must be intact.
         assert path.read_text(encoding="utf-8") == original_content
 
     def test_ledger_file_name_uses_project_name(self, tmp_path: Path) -> None:
@@ -330,11 +291,6 @@ class TestAppendDecision:
         assert len(entries) == 1
         assert contradiction in entries[0].raw
         assert resolution in entries[0].raw
-
-
-# ---------------------------------------------------------------------------
-# DuplicateResolutionError
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

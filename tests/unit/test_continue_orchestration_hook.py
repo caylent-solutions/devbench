@@ -203,26 +203,21 @@ class TestCircuitBreaker:
     def test_circuit_breaker_allows_stop_after_max_blocks(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # Block max_blocks times (use env to set max to 2 for fast test).
         for _ in range(2):
             result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "2"})
             output = json.loads(result.stdout)
             assert output["decision"] == "block"
-        # Next call should allow stop (circuit breaker trips).
         result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "2"})
         assert result.stdout.strip() == ""
 
     def test_circuit_breaker_resets_after_window(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # Seed state file with a first_block_ts far in the past so the window has expired.
         old_ts = int(time.time()) - 300
         STATE_FILE.write_text(json.dumps({"count": 4, "first_block_ts": old_ts}))
-        # Should reset counter (window expired) and block normally.
         result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "5"})
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
-        # Verify counter was reset -- state file should show count 1.
         state = json.loads(STATE_FILE.read_text())
         assert state["count"] == 1
 
@@ -239,11 +234,9 @@ class TestCircuitBreaker:
         config_dir = tmp_path / "backlog" / "config"
         config_dir.mkdir(parents=True)
         (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\nstop_hook:\n  max_blocks: 1\n")
-        # First block.
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
-        # After 1 block, circuit breaker trips.
         result = _run_hook(str(tmp_path))
         assert result.stdout.strip() == ""
 
@@ -253,21 +246,18 @@ class TestCircuitBreaker:
         config_dir = tmp_path / "backlog" / "config"
         config_dir.mkdir(parents=True)
         (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\nstop_hook:\n  max_blocks: 10\n")
-        # Env var should override YAML -- set to 1.
         result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "1"})
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
-        # After 1 block, circuit breaker trips despite YAML saying 10.
         result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "1"})
         assert result.stdout.strip() == ""
 
     def test_defaults_when_no_yaml_no_env(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # No config file, no env vars -- should use default max_blocks=5.
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
-        assert "5" in output["reason"]  # "N/5 blocks"
+        assert "5" in output["reason"]
 
 
 class TestBlockedTransitionalState:
@@ -305,7 +295,6 @@ class TestStaleTaskDetection:
     def test_detects_stale_in_progress_task(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # Create log file with an old in-progress timestamp.
         log_dir = tmp_path.parent / "devbench" / "src" / "devbench" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         old_ts = "2026-04-13T01:00:00"
@@ -361,7 +350,6 @@ class TestBlockJsonSerialisationRobustness:
         serialisation failed' fallback)."""
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E2-F3-S2-T1 | /health | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # PATH=/usr/bin:/bin only -- no asdf, no kanon venv shims.
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
@@ -388,7 +376,6 @@ class TestBlockJsonSerialisationRobustness:
         diag = json.loads(diag_files[0].read_text(encoding="utf-8"))
         assert diag["task_id"] == "E2-F3-S2-T1"
         assert diag["block_count"] == 1
-        # emitted_stdout must be the same JSON the hook wrote to its stdout.
         assert diag["emitted_stdout"] == json.loads(result.stdout)
 
 
@@ -437,7 +424,6 @@ class TestActiveTaskSelection:
         assert "E3-F2-S3-T2" in output["reason"], (
             f"Active-task picker should have named E3-F2-S3-T2 (most recent claim); reason was: {output['reason']}"
         )
-        # The active task must come BEFORE the also-in-progress mention.
         active_idx = output["reason"].find("E3-F2-S3-T2")
         stale_idx = output["reason"].find("E1-F2-S1-T4")
         assert active_idx < stale_idx, (
@@ -462,11 +448,9 @@ class TestActiveTaskSelection:
         """Fresh checkout / never-launched workspace: no logs/ dir. The
         hook must still emit a block (alphabetic head -1 fallback), not crash."""
         self._seed_two_in_progress(tmp_path)
-        # No logs/ directory -> log-driven picker returns nothing -> fallback.
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
-        # E1-F2-S1-T4 sorts before E3-F2-S3-T2 alphabetically; head -1 picks it.
         assert "E1-F2-S1-T4" in output["reason"]
 
     def test_set_in_progress_log_entry_format_is_recognised(self, tmp_path: Path) -> None:
@@ -552,12 +536,10 @@ class TestPerSessionStateFile:
         env_a = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "DEVBENCH_STOP_MAX_BLOCKS": "2"}
         env_b = {"DEVBENCH_SESSION_NAME": self.SESSION_B, "DEVBENCH_STOP_MAX_BLOCKS": "2"}
 
-        # Session A: two blocks -- circuit breaker trips on the 3rd call.
         for _ in range(2):
             result = _run_hook(str(tmp_path), extra_env=env_a)
             assert json.loads(result.stdout)["decision"] == "block"
 
-        # Session B: one block -- must NOT be tripped yet.
         result_b = _run_hook(str(tmp_path), extra_env=env_b)
         assert result_b.stdout.strip() != "", (
             "Session B ran 1 block but should only trip after 2 blocks, not inherit Session A's count"
@@ -566,15 +548,12 @@ class TestPerSessionStateFile:
             "Session B should still block after 1 block (max=2); counters must be independent"
         )
 
-        # Verify session A's state reflects its count.
         state_a = json.loads(self.STATE_FILE_A.read_text())
         assert state_a["count"] == 2, f"Session A should have count=2, got {state_a['count']}"
 
-        # Verify session B's state reflects its count.
         state_b = json.loads(self.STATE_FILE_B.read_text())
         assert state_b["count"] == 1, f"Session B should have count=1, got {state_b['count']}"
 
-        # Session A trips circuit breaker on next call.
         result_a_tripped = _run_hook(str(tmp_path), extra_env=env_a)
         assert result_a_tripped.stdout.strip() == "", (
             "Session A should have tripped the circuit breaker (count reached max_blocks=2)"
@@ -584,11 +563,9 @@ class TestPerSessionStateFile:
         """When no in-progress tasks remain, the session-scoped state file must be removed."""
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # First, accumulate a block count.
         _run_hook(str(tmp_path), extra_env={"DEVBENCH_SESSION_NAME": self.SESSION_A})
         assert self.STATE_FILE_A.exists(), "Precondition: session state file should exist after one block"
 
-        # Now all tasks done -- hook should remove the session state file.
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | done | none | repo | `backlog/t1.md` |\n")
         result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_SESSION_NAME": self.SESSION_A})
         assert result.returncode == 0
@@ -602,14 +579,11 @@ class TestPerSessionStateFile:
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
         env = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "DEVBENCH_STOP_MAX_BLOCKS": "2"}
-        # Block twice.
         for _ in range(2):
             result = _run_hook(str(tmp_path), extra_env=env)
             assert json.loads(result.stdout)["decision"] == "block"
-        # Third call trips circuit breaker.
         result = _run_hook(str(tmp_path), extra_env=env)
         assert result.stdout.strip() == "", "Circuit breaker must trip after max_blocks for a named session"
-        # State file must be removed after circuit breaker trips.
         assert not self.STATE_FILE_A.exists(), "Session-scoped state file must be removed after circuit breaker trips"
 
 
@@ -638,10 +612,8 @@ class TestStopHookEnvelopeShape:
         backlog.write_text("| E2-F3-S2-T4 | example | Task | in-progress | none | repo | `backlog/t.md` |\n")
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
-        # Legacy shape (existing).
         assert output["decision"] == "block"
         assert output.get("reason")
-        # Modern shape (issue #139).
         assert "hookSpecificOutput" in output, (
             "BLOCK_JSON must include the hookSpecificOutput envelope so Claude "
             "Code 2.x honours the block decision regardless of which schema "

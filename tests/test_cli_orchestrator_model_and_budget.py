@@ -27,10 +27,6 @@ from devbench.constants import (
     ORCHESTRATOR_TURN_END_CONTINUATIONS_EXHAUSTED_EXIT_CODE,
 )
 
-# ---------------------------------------------------------------------------
-# Duck-typed SDK message fakes -- no SDK import, mirrors production duck typing
-# ---------------------------------------------------------------------------
-
 
 @dataclasses.dataclass
 class _FakeResultMsg:
@@ -151,11 +147,6 @@ def _run_cmd_start_capturing_reason(fake_sdk: Any, tmp_path: Path) -> tuple[int,
     return rc, captured
 
 
-# ---------------------------------------------------------------------------
-# detect_fatal_sdk_error -- pure helper
-# ---------------------------------------------------------------------------
-
-
 class TestDetectFatalSdkError:
     @pytest.mark.parametrize(
         "err,expected",
@@ -173,16 +164,10 @@ class TestDetectFatalSdkError:
 
     @pytest.mark.parametrize("err", ["rate_limit_error", "overloaded_error", "", None])
     def test_quota_and_empty_not_fatal(self, err: str | None) -> None:
-        # Quota / rate-limit must route to the quota path, NOT the fatal path.
         assert cli.detect_fatal_sdk_error(_FakeAssistantMsg(error=err)) is None
 
     def test_message_without_error_attr_is_none(self) -> None:
         assert cli.detect_fatal_sdk_error(_FakeResultMsg(result="x")) is None
-
-
-# ---------------------------------------------------------------------------
-# _resolve_orchestrator_model -- fail-fast, no fallback
-# ---------------------------------------------------------------------------
 
 
 class TestResolveOrchestratorModel:
@@ -201,18 +186,11 @@ class TestResolveOrchestratorModel:
             cli._resolve_orchestrator_model()
 
 
-# ---------------------------------------------------------------------------
-# cmd_start: model pinned into ClaudeAgentOptions + fail-fast when unset
-# ---------------------------------------------------------------------------
-
-
 class TestCmdStartModelPin:
     def test_options_built_with_configured_model(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cli.RUNTIME_CONFIG.orchestrate, "model", "claude-opus-4-8")
-        fake_sdk = _make_repeating_fake_sdk([])  # empty turn -> loop exhausts, clean exit
+        fake_sdk = _make_repeating_fake_sdk([])
         _run_cmd_start(fake_sdk, tmp_path)
-        # The orchestrate session must be constructed with the configured model,
-        # never inheriting the interactive Claude Code selection.
         kwargs = fake_sdk.ClaudeAgentOptions.call_args.kwargs
         assert kwargs.get("model") == "claude-opus-4-8", f"options model= not pinned: {kwargs!r}"
 
@@ -221,13 +199,7 @@ class TestCmdStartModelPin:
         fake_sdk = _make_repeating_fake_sdk([])
         rc = _run_cmd_start(fake_sdk, tmp_path)
         assert rc == 1, "cmd_start must fail fast (rc=1) when orchestrate.model is unset"
-        # And it must NOT have constructed the SDK session.
         assert fake_sdk.ClaudeAgentOptions.call_count == 0
-
-
-# ---------------------------------------------------------------------------
-# Bounded continuation budget + fatal-error fail-fast (the runaway fixes)
-# ---------------------------------------------------------------------------
 
 
 class TestContinuationBudgetBounded:
@@ -240,8 +212,6 @@ class TestContinuationBudgetBounded:
         the continuation-exhausted code.
         """
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "3")
-        # Each turn: a plain assistant message (not a claim, not fatal) then a
-        # non-terminal ResultMessage (empty result -> continuation).
         per_turn = [_FakeAssistantMsg(content="thinking, no tool call"), _FakeResultMsg(result="")]
         fake_sdk = _make_repeating_fake_sdk(per_turn)
         rc = _run_cmd_start(fake_sdk, tmp_path)
@@ -264,7 +234,6 @@ class TestContinuationBudgetBounded:
         """
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "3")
         tool_turn = [_FakeAssistantMsg(content=[_FakeToolUseBlock()]), _FakeResultMsg(result="")]
-        # 6 working turns (> budget of 3) then a terminal sentinel.
         turns = [tool_turn for _ in range(6)] + [[_FakeResultMsg(result="ALL_DONE")]]
         fake_sdk = _make_scripted_fake_sdk(turns)
         rc = _run_cmd_start(fake_sdk, tmp_path)
@@ -296,9 +265,6 @@ class TestWithinClaimConvergenceIntegration:
     """The convergence bound trips inside the real ``_run`` loop (not just the tracker)."""
 
     def test_repeated_identical_failure_blocks_unit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # AC-1: a claim that repeats the SAME verify-ac failure beyond the cap
-        # force-blocks the unit and exits the loop. The budget is set high so it
-        # is the CONVERGENCE bound (not the continuation budget) that fires.
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "3")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
@@ -308,13 +274,11 @@ class TestWithinClaimConvergenceIntegration:
             cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append((uid, recurring))
         )
 
-        # Turn 1 claims; subsequent turns re-run the SAME verify-ac (the failure).
         turns = [
             [_claim_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
             [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
             [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
             [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
-            # would loop forever on pre-fix code; a terminal sentinel as a safety net.
             [_FakeResultMsg(result="ALL_DONE")],
         ]
         fake_sdk = _make_scripted_fake_sdk(turns)
@@ -343,9 +307,6 @@ class TestWithinClaimConvergenceIntegration:
         assert not blocked, "a disabled convergence check must never block"
 
     def test_block_and_continue_attempts_remaining_units(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Block-and-continue: a non-converging defect on unit 1 BLOCKS unit 1 but
-        # the session keeps working its remaining in-queue units (2..N) in the
-        # SAME session instead of halting the whole orchestrator.
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "3")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
@@ -365,8 +326,6 @@ class TestWithinClaimConvergenceIntegration:
 
         monkeypatch.setattr(cli, "_claimed_unit_id", _spy_claimed_unit_id)
 
-        # Unit 1 repeats the same failure and trips the bound; unit 2 is then
-        # claimed and completes; ALL_DONE ends the session.
         turns = [
             [_claim_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
             [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
@@ -380,8 +339,6 @@ class TestWithinClaimConvergenceIntegration:
 
         assert blocked == ["E1-F1-S1-T1"], "exactly the non-converging unit is blocked"
         assert "E1-F1-S1-T2" in claims_seen, "the session must keep claiming remaining units after a block"
-        # The session terminated on the clean ALL_DONE sentinel, NOT on a
-        # claim-not-converging stop reason.
         assert reasons, "the always-fire stop notification must have a reason"
         assert "too many non-converging" not in reasons[-1]
         assert "claim not converging" not in reasons[-1]
@@ -389,9 +346,6 @@ class TestWithinClaimConvergenceIntegration:
     def test_aggregate_valve_trips_after_k_distinct_units(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Safety valve: when K=2 DISTINCT units each hit the convergence bound in
-        # the same session, the session halts with the aggregate stop reason so a
-        # systemically-broken run still surfaces to the operator.
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_WITHIN_CLAIM_ATTEMPTS", "2")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
@@ -400,9 +354,6 @@ class TestWithinClaimConvergenceIntegration:
         blocked: list[str] = []
         monkeypatch.setattr(cli, "_block_non_converging_claim", lambda uid, recurring, **kwargs: blocked.append(uid))
 
-        # Unit 1 trips (2 identical failures), unit 2 trips (2 identical failures)
-        # -> the 2nd distinct non-converging unit trips the aggregate valve. The
-        # trailing ALL_DONE would only be reached on a non-halting code path.
         turns = [
             [_claim_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
             [_verify_block("E1-F1-S1-T1"), _FakeResultMsg(result="")],
@@ -423,8 +374,6 @@ class TestWithinClaimConvergenceIntegration:
     def test_fully_non_actionable_scope_terminates_cleanly(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A scope with nothing actionable left terminates on the NO_ACTIONABLE
-        # sentinel with no infinite loop and no aggregate-valve trip.
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_TURN_END_CONTINUATIONS", "999")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_WITHIN_CLAIM_CONVERGENCE_CHECK", "true")
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_MAX_NON_CONVERGING_CLAIMS", "3")
@@ -440,11 +389,6 @@ class TestWithinClaimConvergenceIntegration:
         assert reasons
         assert "too many non-converging" not in reasons[-1]
         assert reasons[-1].startswith("clean")
-
-
-# ---------------------------------------------------------------------------
-# config_loader: orchestrate.model parsing + validation
-# ---------------------------------------------------------------------------
 
 
 class TestOrchestrateModelConfig:
@@ -486,7 +430,5 @@ class TestOrchestrateModelConfig:
         assert rc.orchestrate.max_non_converging_claims == 5
 
     def test_max_non_converging_claims_below_one_rejected(self) -> None:
-        # The JSON-schema minimum (1) is the authoritative gate; the loader-level
-        # >= 1 check is a defense-in-depth backstop. Either way, 0 fails fast.
         with pytest.raises(ValueError, match=r"max_non_converging_claims"):
             self._load("orchestrate:\n  model: sonnet\n  max_non_converging_claims: 0\n")

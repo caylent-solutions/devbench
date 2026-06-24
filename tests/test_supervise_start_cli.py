@@ -87,8 +87,6 @@ class TestStartLaunchesAndRecords:
     def test_scope_json_written_and_registry_recorded(self, tmp_path: Path, _creds: Path) -> None:
         patches = _patch_common(tmp_path, _creds)
         patches.append(patch("devbench.cli.shutil.which", lambda name: f"/usr/bin/{name}"))
-        # Mock the screen-spawn so no real screen/claude runs; it records the
-        # session as running (as the in-screen __run would via the registry).
         spawned: dict[str, Any] = {}
 
         def _fake_launch(*, name, screen_name, env, run_argv, screen_path):
@@ -96,7 +94,6 @@ class TestStartLaunchesAndRecords:
             spawned["screen_name"] = screen_name
             spawned["env"] = env
             spawned["run_argv"] = run_argv
-            # Mark running in the registry as __run would.
             reg = SuperviseRegistry(tmp_path)
             from devbench.constants import SUPERVISE_STATE_RUNNING
             from devbench.supervise import new_session_state
@@ -125,18 +122,15 @@ class TestStartLaunchesAndRecords:
         assert data["include"] == ["E1"]
         assert set(data["expanded_ids"]) == {"E1-F1-S1-T1"}
 
-        # Registry shows the running session.
         reg = SuperviseRegistry(tmp_path)
         state = reg.read_state("nightly")
         assert state is not None
         assert state.state == "running"
 
-        # The screen env carries the scope-conveyance vars (Section 5.6).
         env_passed = spawned["env"]
         assert env_passed["DEVBENCH_WORKSPACE_ROOT"] == str(tmp_path)
         assert env_passed["DEVBENCH_SESSION_NAME"] == "nightly"
         assert "ANTHROPIC_API_KEY" not in env_passed
-        # The run argv invokes the hidden __run sub-verb.
         assert "__run" in spawned["run_argv"]
 
 
@@ -150,12 +144,8 @@ class TestRunDrivesPexpectToRunning:
 
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="> "),  # ready prompt
-                # The orchestrate literal is a SLASH command: it is typed (no
-                # newline), the autocomplete render settles, then a single Enter
-                # (\r) submits it. Gate the ack on that submit \r so the
-                # render-settle quiescence wait does NOT prematurely consume it.
-                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),  # ack
+                _ScriptStep(emit="> "),
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),
             ]
         )
         driver = PtyDriver(
@@ -171,13 +161,7 @@ class TestRunDrivesPexpectToRunning:
             command_submit_settle_seconds=8,
         )
         assert sm.state == "running"
-        # Slash submission: type the literal then submit a single Enter.
         assert child.sent == ["/devbench-orchestrate:orchestrate", "\r"]
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 
 def _ctx(patches: list):

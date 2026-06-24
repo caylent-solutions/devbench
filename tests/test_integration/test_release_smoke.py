@@ -63,7 +63,6 @@ def _seed_repo(tmp_path: Path, with_orphan: bool = False) -> Path:
         capture_output=True,
     )
     if with_orphan:
-        # Tracked orphan: matches the standard "build/state" pattern set.
         (repo / ".coverage (1)").write_text("data", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "leak orphan"], cwd=repo, check=True, capture_output=True)
@@ -186,8 +185,6 @@ class TestReleaseSmoke:
         from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
 
         repo = _seed_repo(tmp_path, with_orphan=True)
-        # Re-stage some executor work alongside the orphan so the inline path
-        # has a real "preserve executor staging" job to do.
         (repo / "feature.py").write_text("x = 1\n", encoding="utf-8")
         subprocess.run(["git", "add", "feature.py"], cwd=repo, check=True, capture_output=True)
 
@@ -204,7 +201,6 @@ class TestReleaseSmoke:
             text=True,
         ).stdout.strip()
         assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
-        # Orphan removed from index.
         ls = subprocess.run(
             ["git", "-C", str(repo), "ls-files"],
             check=True,
@@ -212,7 +208,6 @@ class TestReleaseSmoke:
             text=True,
         ).stdout
         assert ".coverage (1)" not in ls
-        # Executor's intended file remains staged.
         staged = subprocess.run(
             ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
             check=True,

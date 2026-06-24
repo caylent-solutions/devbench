@@ -100,8 +100,6 @@ class TestIsPidAlive:
         assert is_pid_alive(-1) is False
 
     def test_definitely_dead_pid_is_dead(self) -> None:
-        # PID 2**31-1 is never assigned in practice; if it ever IS assigned,
-        # this test is wrong only transiently.
         assert is_pid_alive(2**31 - 1) is False
 
 
@@ -132,7 +130,6 @@ class TestDiscoverInstances:
         ws_b.mkdir()
         write_pid_file(ws_a, os.getpid(), model="x")
         write_pid_file(ws_b, os.getpid(), model="x")
-        # Same pid in two pid files -> dedup'd to one.
         out = discover_instances([tmp_path])
         assert len(out) == 1
 
@@ -141,7 +138,7 @@ class TestDiscoverInstances:
         ws.mkdir()
         write_pid_file(ws, os.getpid(), model="x")
         monkeypatch.setenv(INSTANCE_SEARCH_ROOTS_ENV, str(tmp_path))
-        out = discover_instances()  # no explicit roots
+        out = discover_instances()
         assert len(out) == 1
 
 
@@ -181,5 +178,4 @@ class TestRemovePidFile:
         assert not pid_file_path(ws).is_file()
 
     def test_noop_when_missing(self, tmp_path: Path) -> None:
-        # Should not raise.
         remove_pid_file(tmp_path / "no-such-workspace")

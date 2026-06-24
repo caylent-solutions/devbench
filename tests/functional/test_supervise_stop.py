@@ -35,8 +35,6 @@ class TestStubGracefulStopDrains:
     """AC-19: a pre-written stop.request drives __run to drain -> stopped exit 0."""
 
     def test_run_drains_to_stopped_on_stop_request(self, tmp_path: Path) -> None:
-        # The in-screen __run response in isolation: with the stop.request already
-        # present, the first running iteration drains the idle stub and stops.
         config = functional_supervise_config()
         stub_env = {"STUB_CLAUDE_SCRIPT": "idle"}
         with supervised_stub(workspace_root=tmp_path, config=config, stub_env=stub_env):
@@ -48,7 +46,6 @@ class TestStubGracefulStopDrains:
         assert state is not None
         assert state.state == "stopped"
         assert state.exit_reason == "graceful-stop"
-        # The drain command (/exit) was injected and reached the stub over the PTY.
         transcript = (tmp_path / ".devbench" / "supervise" / "g0" / "pty.log").read_text(encoding="utf-8")
         assert "/exit" in transcript
 
@@ -58,11 +55,6 @@ class TestStubGracefulStopEndToEnd:
     """AC-19: the operator `stop` verb signals a live __run, which drains -> stopped."""
 
     def test_stop_verb_drains_live_run(self, tmp_path: Path) -> None:
-        # The full operator handshake: a live __run (real pexpect + idle stub) on a
-        # background thread (the same program ``screen`` would host), signalled by the
-        # operator-facing graceful ``stop`` verb from the main thread. The verb writes
-        # the drain.signal + stop.request and DELEGATES teardown to __run, which drains
-        # the idle stub, sends /exit, and records ``stopped`` (Section 4.2, FR-5).
         from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME, SESSION_SESSIONS_BASE_DIR
 
         config = functional_supervise_config()
@@ -94,9 +86,6 @@ class TestStubGracefulStopEndToEnd:
         assert state is not None
         assert state.state == "stopped"
         assert state.exit_reason == "graceful-stop"
-        # The graceful stop routed the per-session drain signal (FR-5, Section 4.2
-        # step 1): the signal is consumed by __run's drain, but its per-session dir
-        # proves it was keyed on DEVBENCH_SESSION_NAME, not the workspace root.
         drain_dir = tmp_path / SESSION_SESSIONS_BASE_DIR / "g1"
         assert drain_dir.exists()
         assert (drain_dir / SESSION_DRAIN_SIGNAL_FILENAME).parent == drain_dir

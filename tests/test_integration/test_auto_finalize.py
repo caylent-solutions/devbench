@@ -214,10 +214,8 @@ class TestAutoFinalizeEdgeCases:
         """
         import devbench.config as cfg_mod
 
-        # Verify the module exports the constants at module level.
         assert hasattr(cfg_mod, "AUTO_FINALIZE"), "devbench.config must export AUTO_FINALIZE"
         assert hasattr(cfg_mod, "AUTO_MERGE"), "devbench.config must export AUTO_MERGE"
-        # Both are booleans.
         assert isinstance(cfg_mod.AUTO_FINALIZE, bool), "AUTO_FINALIZE must be a bool"
         assert isinstance(cfg_mod.AUTO_MERGE, bool), "AUTO_MERGE must be a bool"
 
@@ -232,8 +230,6 @@ class TestAutoFinalizeEdgeCases:
 
         assert hasattr(cfg_mod, "AUTO_MERGE"), "devbench.config must export AUTO_MERGE"
         assert isinstance(cfg_mod.AUTO_MERGE, bool), "AUTO_MERGE must be a bool"
-        # Verify that when auto_merge is False in the loaded config, AUTO_FINALIZE
-        # is also False (since auto_merge requires auto_finalize).
         if cfg_mod.AUTO_MERGE:
             assert cfg_mod.AUTO_FINALIZE, "AUTO_FINALIZE must be True when AUTO_MERGE is True"
 

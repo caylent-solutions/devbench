@@ -93,7 +93,6 @@ class TestSuperviseSessionStateSerialization:
         assert restored.billing_channel == SUPERVISE_BILLING_CHANNEL
 
     def test_to_dict_is_json_serializable(self) -> None:
-        # The registry persists JSON, so the dict must be serializable.
         json.dumps(_state("a", 1).to_dict())
 
     def test_from_dict_missing_key_fails_fast(self) -> None:
@@ -150,7 +149,6 @@ class TestSuperviseRegistryIO:
     def test_save_is_atomic_no_partial_temp_left(self, tmp_path: Path) -> None:
         reg = SuperviseRegistry(tmp_path)
         reg.save([_state("a", 1)])
-        # No leftover temp file beside the registry.
         registry_dir = (tmp_path / SUPERVISE_REGISTRY_PATH).parent
         leftovers = [p for p in registry_dir.iterdir() if p.name.endswith(".tmp")]
         assert leftovers == []
@@ -200,7 +198,6 @@ class TestSuperviseRegistryLiveness:
         assert SuperviseRegistry(tmp_path).is_alive(os.getpid()) is True
 
     def test_is_alive_false_for_dead_pid(self, tmp_path: Path) -> None:
-        # PID 2**31 - 1 is virtually never a live process.
         assert SuperviseRegistry(tmp_path).is_alive(2**31 - 1) is False
 
     def test_liveness_of_sessions(self, tmp_path: Path) -> None:
@@ -213,7 +210,6 @@ class TestSuperviseRegistryLiveness:
     def test_cleanup_stale_removes_dead_and_keeps_live(self, tmp_path: Path) -> None:
         reg = SuperviseRegistry(tmp_path)
         reg.save([_state("live", os.getpid()), _state("dead", 2**31 - 1)])
-        # Materialize a state dir for the dead session so cleanup must remove it.
         reg.write_state(_state("dead", 2**31 - 1))
         removed = reg.cleanup_stale_sessions()
         assert removed == ["dead"]
@@ -228,7 +224,6 @@ class TestSuperviseRegistryLiveness:
         assert [s.name for s in reg.load()] == ["live"]
 
     def test_is_alive_eperm_is_active(self, tmp_path: Path) -> None:
-        # EPERM (cross-user) means the process exists -> ACTIVE.
         reg = SuperviseRegistry(tmp_path)
         with patch("devbench.supervise.os.kill", side_effect=PermissionError):
             assert reg.is_alive(1234) is True
@@ -276,7 +271,6 @@ class TestSuperviseRegistryAtomicWriteFailure:
         with patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
             with pytest.raises(OSError, match="disk full"):
                 reg.save([_state("a", 1)])
-        # No leftover temp file.
         registry_dir = (tmp_path / SUPERVISE_REGISTRY_PATH).parent
         assert not any(p.name.endswith(".tmp") for p in registry_dir.iterdir())
 
@@ -322,8 +316,6 @@ class TestRegistryConcurrency:
     """Concurrent-write safety for two parallel supervise sessions (FR-17, FR-32)."""
 
     def test_unique_tmp_path_per_writer(self, tmp_path: Path) -> None:
-        # The atomic-write temp name is unique per writer (pid + counter) so two
-        # parallel sessions' renames never collide on a shared temp path.
         reg = SuperviseRegistry(tmp_path)
         first = reg._unique_tmp_path()
         second = reg._unique_tmp_path()
@@ -332,8 +324,6 @@ class TestRegistryConcurrency:
         assert str(first).endswith(".tmp")
 
     def test_concurrent_upserts_keep_both_entries(self, tmp_path: Path) -> None:
-        # Two threads each upsert their OWN session concurrently; the index lock
-        # serializes the read-modify-write so neither entry is clobbered (FR-32).
         reg = SuperviseRegistry(tmp_path)
         barrier = threading.Barrier(2)
         errors: list[Exception] = []
@@ -357,12 +347,10 @@ class TestRegistryConcurrency:
         assert names == {"alpha", "beta"}
 
     def test_index_lock_times_out_when_held(self, tmp_path: Path) -> None:
-        # An external holder of the inter-process flock makes the contention branch
-        # park then fail fast with a TimeoutError (Section 5.7, FR-30).
         from devbench import supervise
 
         reg = SuperviseRegistry(tmp_path)
-        reg.save([_state("seed", 1)])  # create the registry dir
+        reg.save([_state("seed", 1)])
         lock_path = reg._registry_path.with_name(reg._registry_path.name + ".lock")
 
         with (

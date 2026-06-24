@@ -47,12 +47,10 @@ class TestLaunchArgvAssembly:
             effort="xhigh",
             plugin_dir="/ws/plugin",
         )
-        # The whole point of the feature: never the non-interactive batch mode.
         assert "-p" not in argv
         assert "--print" not in argv
 
     def test_resume_flags_for_restart(self) -> None:
-        # FR-12 / Section 4.3: resume relaunch carries --resume <id> (or --continue).
         argv = build_claude_launch_argv(
             claude_path="claude",
             model="opus",
@@ -95,19 +93,15 @@ class TestReadyDetection:
     def test_ready_prompt_detected(self) -> None:
         child = FakePexpectChild([_ScriptStep(emit="> ")])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
-        # Should not raise.
         driver.wait_for_ready(timeout_seconds=5)
 
     def test_ready_timeout_raises(self) -> None:
-        # No scripted ready prompt -> the FakePexpectChild raises TIMEOUT, which
-        # the driver surfaces as a SuperviseReadyTimeoutError (fail-fast).
         child = FakePexpectChild([])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         with pytest.raises(SuperviseReadyTimeoutError):
             driver.wait_for_ready(timeout_seconds=1)
 
     def test_eof_before_ready_raises(self) -> None:
-        # The child exits before becoming ready -> fail-fast (Section 4.6).
         child = FakePexpectChild([_ScriptStep(emit="", eof=True, exitstatus=1)])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         with pytest.raises(SuperviseReadyTimeoutError, match="exited before"):
@@ -138,7 +132,6 @@ class TestPtyDriverSlashSubmission:
         child = FakePexpectChild([])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         driver.type_text("/devbench-orchestrate:orchestrate")
-        # No trailing newline: the raw payload is recorded exactly as typed.
         assert child.sent == ["/devbench-orchestrate:orchestrate"]
 
     def test_submit_sends_single_enter(self) -> None:
@@ -148,16 +141,11 @@ class TestPtyDriverSlashSubmission:
         assert child.sent == ["\r"]
 
     def test_wait_until_quiescent_returns_true_on_quiet_timeout(self) -> None:
-        # No scripted output -> the FakePexpectChild raises TIMEOUT on the first
-        # expect, which means the render has settled (no new output): return True.
         child = FakePexpectChild([])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=8) is True
 
     def test_wait_until_quiescent_consumes_render_then_settles(self, tmp_path) -> None:
-        # Two menu-render chunks then quiet (a third expect finds no step ->
-        # TIMEOUT). The rendered text is tee'd to pty.log (FR-24) and the loop
-        # settles (returns True) once output stops.
         from devbench.supervise import PtyLogWriter
 
         log = tmp_path / "pty.log"
@@ -185,11 +173,6 @@ class TestPtyDriverSlashSubmission:
         assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=8) is False
 
     def test_wait_until_quiescent_returns_false_when_iteration_cap_exhausted(self) -> None:
-        # Continuous output never goes quiet: every expect matches a ``.+`` step,
-        # so the bounded iteration cap (max(1, ceil(max/quiet))) is exhausted and
-        # the method returns False (the caller submits anyway). With quiet=1,
-        # max=3 the cap is 3 iterations; supply 4 always-matching steps so the
-        # cap (not a TIMEOUT/EOF) is what stops the loop.
         child = FakePexpectChild([_ScriptStep(emit=f"chunk {i}") for i in range(4)])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         assert driver.wait_until_quiescent(quiet_seconds=1, max_seconds=3) is False
@@ -226,7 +209,6 @@ class TestPtyDriverReadChunk:
         assert eof is False
         assert exitstatus is None
         assert "thinking" in text
-        # last_text() surfaces the chunk for reset-time parsing.
         assert "thinking" in driver.last_text()
 
     def test_read_chunk_eof_carries_exitstatus(self, tmp_path) -> None:
@@ -249,7 +231,7 @@ class TestPtyDriverReadChunk:
     def test_read_chunk_timeout_raises(self) -> None:
         from devbench.supervise import SupervisePromptTimeoutError
 
-        child = FakePexpectChild([])  # no scripted output -> TIMEOUT
+        child = FakePexpectChild([])
         driver = PtyDriver(child=child, patterns=DetectionPatterns(SuperviseDetectionPatternsConfig()))
         with pytest.raises(SupervisePromptTimeoutError, match="prompt-timeout-idle"):
             driver.read_chunk(timeout_seconds=1)

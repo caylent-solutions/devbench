@@ -179,8 +179,6 @@ class TestRebuildFromLog:
         rebuild_from_log(tmp_path, log)
         agg = read_aggregate(tmp_path, "E0-F1-S1-T1")
         assert agg is not None
-        # Idempotent: each rebuild overwrites the file with one entry per
-        # log line, so two log lines give two aggregate entries (not four).
         assert len(agg.transitions) == 2
 
 
@@ -193,7 +191,6 @@ class TestSetStatusHook:
         update_aggregate hook on every transition."""
         from devbench.backlog.manager import BacklogManager
 
-        # Minimal backlog: one work-unit file + one BACKLOG.md row.
         work_unit_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         work_unit_dir.mkdir(parents=True)
         unit_file = work_unit_dir / "E0-F1-S1-T1.md"
@@ -228,7 +225,6 @@ class TestSetStatusHook:
         aggregate (those units have no -T<N> segment)."""
         from devbench.backlog.manager import BacklogManager
 
-        # Minimal backlog with a Story unit (no task).
         story_dir = tmp_path / "backlog" / "E0" / "E0-F1"
         story_dir.mkdir(parents=True)
         story_file = story_dir / "E0-F1-S1.md"
@@ -252,7 +248,6 @@ class TestSetStatusHook:
         mgr = BacklogManager()
         mgr._set_status(story_file, backlog_index, "E0-F1-S1", "in-progress")
 
-        # No aggregate file should exist for the story.
         assert read_aggregate(tmp_path, "E0-F1-S1") is None
         assert not aggregate_dir(tmp_path).exists() or not any(aggregate_dir(tmp_path).iterdir())
 
@@ -271,10 +266,6 @@ class TestDataclasses:
         assert agg.transitions == []
         assert agg.schema_version == 1
 
-
-# ---------------------------------------------------------------------------
-# AC-192-16: proposal lifecycle stays workspace-shared across sessions
-# ---------------------------------------------------------------------------
 
 _PROPOSAL_SOURCE_TASK = "E0-F1-S1-T1"
 _PROPOSAL_SOURCE_TASK_2 = "E0-F1-S1-T2"
@@ -329,22 +320,18 @@ class TestProposalLifecycleWorkspaceShared:
 
         workspace = tmp_path
 
-        # Simulate session alpha state dir being present but NOT being used by proposals.
         (workspace / ".devbench" / "sessions" / "alpha").mkdir(parents=True)
         (workspace / ".devbench" / "sessions" / "beta").mkdir(parents=True)
 
         proposal = _make_minimal_proposal(_PROPOSAL_SOURCE_TASK)
 
-        # Session alpha writes the proposal (using workspace_root, not alpha-session-dir).
         written_path = write_proposal(workspace, proposal)
         assert written_path == workspace / ".devbench" / "proposals" / f"{_PROPOSAL_SOURCE_TASK}.json"
 
-        # Session beta lists proposals using the same workspace_root.
         proposals = list_proposals(workspace)
         assert len(proposals) == 1, f"Session beta expected to see 1 proposal, found {len(proposals)}"
         assert proposals[0].source_task_id == _PROPOSAL_SOURCE_TASK
 
-        # Session beta can read the specific proposal by task ID.
         loaded = read_proposal(workspace, _PROPOSAL_SOURCE_TASK)
         assert loaded.source_task_id == _PROPOSAL_SOURCE_TASK
         assert loaded.rejection_reason == proposal.rejection_reason
@@ -363,7 +350,6 @@ class TestProposalLifecycleWorkspaceShared:
         proposal = _make_minimal_proposal(_PROPOSAL_SOURCE_TASK)
         written_path = write_proposal(workspace, proposal)
 
-        # Must be under the workspace-shared proposals dir.
         expected_dir = workspace / ".devbench" / "proposals"
         assert written_path.parent == expected_dir, (
             f"Proposal written to {written_path.parent!r}, expected {expected_dir!r}"
@@ -415,11 +401,9 @@ class TestProposalLifecycleWorkspaceShared:
 
         workspace = tmp_path
 
-        # Pre-populate a proposal written by some arbitrary session.
         (workspace / ".devbench" / "sessions" / "origin-session").mkdir(parents=True)
         write_proposal(workspace, _make_minimal_proposal(_PROPOSAL_SOURCE_TASK))
 
-        # Now create the calling session's dir to simulate context.
         (workspace / ".devbench" / "sessions" / session_name).mkdir(parents=True, exist_ok=True)
 
         proposals = list_proposals(workspace)

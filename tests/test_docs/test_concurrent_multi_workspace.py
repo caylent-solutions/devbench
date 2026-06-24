@@ -106,8 +106,6 @@ class TestConcurrentMultiWorkspaceTwoClonePattern:
     def test_scope_examples_are_mutually_exclusive(self) -> None:
         """The doc must include worked examples with mutually exclusive scope tokens."""
         text = _read_doc()
-        # The doc must show at least two different --include examples that together
-        # partition the backlog (e.g., E1-E3 and E4-E6, or E1-E5 and E6-E10).
         has_partitioned_examples = (
             ("E1-E3" in text or "E1-E5" in text or "E1-E4" in text)
             and ("E4-E6" in text or "E6-E10" in text or "E5-E10" in text or "E5-E8" in text)

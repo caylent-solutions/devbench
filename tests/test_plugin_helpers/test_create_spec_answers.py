@@ -28,10 +28,6 @@ from devbench.plugin_helpers.create_spec_answers import (
     validate_answers,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _write_answers(path: Path, data: Any) -> Path:
     """Write a YAML answers file to *path* and return it."""
@@ -53,11 +49,6 @@ def _minimal_answers() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestConstants:
     """REQUIRED_BLOCKS and BLOCKED_MESSAGE_TEMPLATE are well-formed."""
@@ -66,7 +57,6 @@ class TestConstants:
         assert REQUIRED_BLOCKS == ["A", "B", "C", "D", "E", "F", "G"]
 
     def test_blocked_message_template_contains_placeholder(self) -> None:
-        # The template must produce the verbatim spec message when formatted.
         msg = BLOCKED_MESSAGE_TEMPLATE.format(block="A")
         assert msg == "[BLOCKED] create-spec headless: missing answer for Block A"
 
@@ -81,11 +71,6 @@ class TestConstants:
             "validate_answers",
         }
         assert set(_mod.__all__) == expected
-
-
-# ---------------------------------------------------------------------------
-# load_answers_file
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -116,18 +101,12 @@ class TestLoadAnswersFile:
             load_answers_file(list_yaml)
 
 
-# ---------------------------------------------------------------------------
-# validate_answers
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestValidateAnswers:
     """validate_answers checks that all required blocks are present."""
 
     def test_valid_answers_does_not_raise(self) -> None:
         data = _minimal_answers()
-        # No exception is raised for valid answers.
         validate_answers(data)
 
     @pytest.mark.parametrize("missing_block", ["A", "B", "C", "D", "E", "F", "G"])
@@ -151,20 +130,13 @@ class TestValidateAnswers:
         """Unknown keys beyond A-G do not raise."""
         data = _minimal_answers()
         data["Z"] = "extra block"
-        # No exception is raised when extra keys are present.
         validate_answers(data)
 
     def test_empty_string_value_is_valid(self) -> None:
         """Empty string answers are structurally valid (not a missing block)."""
         data = _minimal_answers()
         data["A"] = ""
-        # An empty string answer is structurally valid and does not raise.
         validate_answers(data)
-
-
-# ---------------------------------------------------------------------------
-# Round-trip: load_answers_file + validate_answers
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -174,7 +146,6 @@ class TestRoundTrip:
     def test_valid_file_passes_full_round_trip(self, tmp_path: Path) -> None:
         answers_path = _write_answers(tmp_path / "answers.yaml", _minimal_answers())
         data = load_answers_file(answers_path)
-        # The full round-trip of a valid file does not raise.
         validate_answers(data)
 
     def test_missing_block_in_file_fails_round_trip(self, tmp_path: Path) -> None:

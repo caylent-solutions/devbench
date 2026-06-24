@@ -71,12 +71,9 @@ class TestStartWaitsForFreshRunning:
     def test_prior_stopped_record_is_not_printed_as_launch_result(
         self, workspace: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # A prior STOPPED record exists from an earlier run (old pid 111).
         _seed_prior_record(workspace, name="telemetry", state=SUPERVISE_STATE_STOPPED, pid=111, age_seconds=3600)
 
         reg = SuperviseRegistry(workspace)
-        # Simulate the async daemon: on the 3rd read_state, a FRESH running record
-        # (new pid 222, started just now) appears -- the new __run wrote it.
         reads = {"n": 0}
         real_read = reg.read_state
 
@@ -101,14 +98,12 @@ class TestStartWaitsForFreshRunning:
             with (
                 patch("devbench.cli.SuperviseRegistry", return_value=reg),
                 patch.object(reg, "read_state", side_effect=_staged_read),
-                # Make the bounded park a no-op so the test does not actually sleep.
                 patch("devbench.cli._block_until_readable", lambda **kw: None),
             ):
                 rc = cli._cmd_supervise_start(_make_args("telemetry"))
 
         out = capsys.readouterr().out
         assert rc == 0, "start must succeed once the new daemon reaches running"
-        # It must print the NEW pid (222), NOT the stale prior pid (111).
         assert "pid=222" in out, f"start must report the NEW daemon's pid; got: {out!r}"
         assert "pid=111" not in out, "start must NOT print the stale prior record"
         assert "state=running" in out
@@ -121,7 +116,6 @@ class TestStartWaitsForFreshRunning:
         real_read = reg.read_state
 
         def _staged_read(name: str):
-            # The new daemon writes a FRESH faulted record (new pid, faulted now).
             fresh = new_session_state(
                 name=name,
                 pid=222,
@@ -154,9 +148,7 @@ class TestStartWaitsForFreshRunning:
         _seed_prior_record(workspace, name="telemetry", state=SUPERVISE_STATE_STOPPED, pid=111, age_seconds=3600)
 
         reg = SuperviseRegistry(workspace)
-        # The fresh daemon never writes -- only the stale record is ever present.
         patches = _preflight_patches(workspace)
-        # Drive the monotonic clock so the bounded wait exhausts immediately.
         clock = {"t": 0.0}
 
         def _now() -> float:

@@ -77,7 +77,6 @@ def test_forced_blocked_plus_unmet_dependency_is_awaiting_dependency(tmp_path: P
             "| E0-F1-S1-T2 | Dep | Task | in-queue | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |",
         ],
     )
-    # Materialise the dependency file so the parser sees it as non-terminal.
     (tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md").write_text(
         "# E0-F1-S1-T2: Dep\n\n## Status: in-queue\n"
     )

@@ -48,8 +48,6 @@ def _run_hook_tail(
     env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
     env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
     env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
-    # Force color off so the tests can assert on plain substrings without
-    # having to strip ANSI escapes from the output.
     env["NO_COLOR"] = "1"
     return subprocess.run(
         [sys.executable, "-m", "devbench.cli", "hook-tail", *extra_args],
@@ -105,7 +103,6 @@ class TestHookTailDefaultPath:
         assert "00:00:00" in result.stdout
         assert "00:00:05" in result.stdout
         assert "00:00:12" in result.stdout
-        # Event glyphs
         assert "U>" in result.stdout
         assert "->" in result.stdout
         assert "<-" in result.stdout
@@ -113,13 +110,11 @@ class TestHookTailDefaultPath:
     def test_stdout_preview_rendered_for_post_tool_use(self, populated_workspace: Path) -> None:
         result = _run_hook_tail(populated_workspace, "--no-follow", "--from-start")
         assert result.returncode == 0
-        # Last non-empty stdout line of the PostToolUse entry is the test-summary line.
         assert "42 passed" in result.stdout
 
     def test_seek_to_eof_default_produces_only_header(self, populated_workspace: Path) -> None:
         result = _run_hook_tail(populated_workspace, "--no-follow")
         assert result.returncode == 0
-        # Exactly the two header lines; no row output because we sought to EOF.
         non_header = [line for line in result.stdout.splitlines() if line and not line.startswith("# ")]
         assert non_header == []
 
@@ -138,7 +133,6 @@ class TestHookTailExplicitPath:
         assert result.returncode == 0
         assert str(custom) in result.stdout
         assert "09:09:09" in result.stdout
-        # The default workspace hook log was NOT read.
         assert "00:00:00" not in result.stdout
 
 
@@ -155,7 +149,6 @@ class TestHookTailTimezoneOverride:
         result = _run_hook_tail(populated_workspace, "--no-follow", "--from-start", "--tz", "America/New_York")
         assert result.returncode == 0
         assert "America/New_York" in result.stdout
-        # 2026-04-19 is EDT; 00:00:00 UTC -> 2026-04-18 20:00:00 EDT.
         assert "20:00:00" in result.stdout
 
     def test_invalid_tz_exits_2(self, populated_workspace: Path) -> None:
@@ -199,7 +192,6 @@ class TestHookTailArgumentHygiene:
         assert "unexpected positional argument" in result.stderr
 
     def test_missing_file_with_no_follow_exits_1(self, tmp_path: Path) -> None:
-        # No hook-logs.jsonl in this tmp workspace.
         result = _run_hook_tail(tmp_path, "--no-follow")
         assert result.returncode == 1
         assert "file not found" in result.stderr

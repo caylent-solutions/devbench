@@ -61,14 +61,11 @@ class TestAttachReadOnly:
         run_thread = threading.Thread(target=_run, name="supervise-run-obs")
         run_thread.start()
 
-        # A pipe standing in for the attach process's stdin. The follow's readiness
-        # park selects on its READ end; writing to the WRITE end "types" at the observer.
         stdin_read, stdin_write = os.pipe()
         followed: list[str] = []
         reads_done = {"n": 0}
 
         def _should_continue() -> bool:
-            # Observe a couple of read+park cycles, then stop (a bounded follow).
             return reads_done["n"] < 3
 
         def _block() -> None:
@@ -77,8 +74,6 @@ class TestAttachReadOnly:
 
         try:
             _await_running(tmp_path, "obs")
-            # The observer "types" the injection sentinel at the attach stdin. It wakes
-            # the follow's select() but must NEVER be forwarded to the claude child.
             os.write(stdin_write, (_INJECTED + "\n").encode("utf-8"))
             log_path = supervise_pty_log_path(tmp_path, "obs")
             follow_pty_log(
@@ -96,19 +91,12 @@ class TestAttachReadOnly:
 
         assert rc_out.get("rc") == 0
         transcript = "".join(followed)
-        # Read-only observation worked: the follow streamed the real PTY transcript
-        # (the supervisor-injected kickoff is visible).
         assert "/devbench-orchestrate:orchestrate" in transcript
-        # The injected operator keystroke NEVER reached the child: the stub echoes
-        # everything it receives on its own stdin as "[stub-claude] received: ...",
-        # and that echo is absent from BOTH the follow stream AND the child's log.
         assert _INJECTED not in transcript
         child_log = supervise_pty_log_path(tmp_path, "obs").read_text(encoding="utf-8")
         assert f"received: {_INJECTED}" not in child_log
 
     def test_attach_verb_rejects_unknown_session(self, tmp_path: Path) -> None:
-        # The attach verb fails fast (exit 2) for an unknown --name (FR-30); it never
-        # silently follows a non-existent transcript.
         with (
             patch.object(cli, "WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli._supervise_runtime_config", return_value=functional_supervise_config()),

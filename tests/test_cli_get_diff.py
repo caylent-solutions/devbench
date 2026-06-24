@@ -259,9 +259,6 @@ class TestGetDiffDeferTaskAttributedLookup:
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
                 return (0, "feat/flatten-review-pipeline\n", "")
-            # No staged/unstaged diff, no untracked files, and the grep for an
-            # attributable commit returns nothing (the value landed under a
-            # non-attributable batch commit).
             return (0, "", "")
 
         with (

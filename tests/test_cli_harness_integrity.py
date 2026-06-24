@@ -54,7 +54,6 @@ class TestHarnessIntegrityCheck:
         repo = _make_devbench_repo(tmp_path, dirty=True)
         monkeypatch.setattr(cli, "_devbench_repo_root", lambda: repo)
         assert cli._check_harness_integrity("off") is None
-        # No warning emitted when disabled.
         assert "HARNESS" not in capsys.readouterr().err
 
     def test_warn_returns_none_and_warns_when_dirty(
@@ -63,7 +62,7 @@ class TestHarnessIntegrityCheck:
         repo = _make_devbench_repo(tmp_path, dirty=True)
         monkeypatch.setattr(cli, "_devbench_repo_root", lambda: repo)
         rc = cli._check_harness_integrity("warn")
-        assert rc is None  # warn never blocks startup
+        assert rc is None
         err = capsys.readouterr().err
         assert "[HARNESS_INTEGRITY]" in err
         assert "src/devbench/cli.py" in err
@@ -92,8 +91,6 @@ class TestHarnessIntegrityCheck:
         assert cli._check_harness_integrity("fail") is None
 
     def test_non_git_checkout_does_not_crash(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A non-git checkout (e.g. an installed wheel) cannot have uncommitted
-        # edits; the check must degrade gracefully (no crash, no false block).
         repo = tmp_path / "no-git"
         (repo / "src" / "devbench").mkdir(parents=True)
         monkeypatch.setattr(cli, "_devbench_repo_root", lambda: repo)
@@ -109,7 +106,6 @@ class TestOrchestratorStartupGates:
         from pathlib import Path as _Path
 
         monkeypatch.setattr(cli, "_check_guard_hooks_registered", lambda _p: 7)
-        # Integrity + pre-sync must NOT run when the hook check already failed.
         monkeypatch.setattr(
             cli,
             "_check_harness_integrity",
@@ -127,7 +123,6 @@ class TestOrchestratorStartupGates:
 
         monkeypatch.setattr(cli, "_check_guard_hooks_registered", lambda _p: None)
         monkeypatch.setattr(cli, "_check_harness_integrity", lambda _m: 9)
-        # Pre-sync must NOT run when the integrity gate already failed.
         monkeypatch.setattr(
             cli,
             "_run_presync_if_enabled",

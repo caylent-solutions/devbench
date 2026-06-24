@@ -92,11 +92,6 @@ def _path_findings(items: list[str]) -> list[str]:
     return [i for i in items if "Verification Contract" in i or "AC Referential Integrity" in i]
 
 
-# ---------------------------------------------------------------------------
-# TDI-001: workspace-prefix smell
-# ---------------------------------------------------------------------------
-
-
 def test_command_path_with_checkout_prefix_warns_then_errors(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, ["E1-F1-S1-T1"])
     _make_task(
@@ -122,11 +117,6 @@ def test_command_repo_relative_path_is_clean(tmp_path: Path, backlog_dir: Path) 
     assert not any("checkout-directory name" in w for w in warnings)
 
 
-# ---------------------------------------------------------------------------
-# TDI-001: unbounded $(find ...) -> grep smell
-# ---------------------------------------------------------------------------
-
-
 def test_find_feeds_grep_is_flagged(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, ["E1-F1-S1-T1"])
     _make_task(
@@ -138,11 +128,6 @@ def test_find_feeds_grep_is_flagged(tmp_path: Path, backlog_dir: Path) -> None:
     )
     _, warnings = _validate(tmp_path)
     assert any("feeds a grep from $(find ...)" in w for w in warnings)
-
-
-# ---------------------------------------------------------------------------
-# TDI-004: mis-classified deferred
-# ---------------------------------------------------------------------------
 
 
 def test_deferred_naming_runnable_tool_is_flagged(tmp_path: Path, backlog_dir: Path) -> None:
@@ -175,11 +160,6 @@ def test_deferred_operator_only_is_clean(tmp_path: Path, backlog_dir: Path) -> N
     assert not any("names a runnable tool" in w for w in warnings)
 
 
-# ---------------------------------------------------------------------------
-# TDI-001 AC-3 / TDI-005: referential integrity (checkout present)
-# ---------------------------------------------------------------------------
-
-
 def test_command_path_absent_from_checkout_is_flagged(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, ["E1-F1-S1-T1"])
     _make_task(
@@ -198,7 +178,6 @@ def test_command_path_present_in_checkout_is_clean(tmp_path: Path, backlog_dir: 
         "E1-F1-S1-T1",
         verification_block="- VERIFY AC-1 | type=command | cmd=`test -d providers/aws/present` | expect-exit=0",
     )
-    # Create the path inside the checkout so it resolves.
     (tmp_path / _CHECKOUT / "providers" / "aws" / "present").mkdir(parents=True, exist_ok=True)
     _, warnings = _validate(tmp_path, checkout_present=True)
     assert not _path_findings(warnings)
@@ -206,7 +185,6 @@ def test_command_path_present_in_checkout_is_clean(tmp_path: Path, backlog_dir: 
 
 def test_required_path_created_by_sibling_task_is_clean(tmp_path: Path, backlog_dir: Path) -> None:
     _make_index(tmp_path, ["E1-F1-S1-T1", "E1-F1-S1-T2"])
-    # T1 asserts providers/aws/new/main.tf must exist; T2 adds it.
     _make_task(
         backlog_dir,
         "E1-F1-S1-T1",
@@ -244,9 +222,6 @@ def test_ac_existence_assertion_external_carveout_is_clean(tmp_path: Path, backl
 
 
 def test_referential_skips_non_command_and_prefix_operands(tmp_path: Path, backlog_dir: Path) -> None:
-    # A judge item (non-command) is skipped by the referential loop, and a
-    # command operand that begins with the checkout prefix is left to the
-    # path-contract check (not double-reported by referential integrity).
     _make_index(tmp_path, ["E1-F1-S1-T1"])
     _make_task(
         backlog_dir,
@@ -257,15 +232,11 @@ def test_referential_skips_non_command_and_prefix_operands(tmp_path: Path, backl
         ),
     )
     _, warnings = _validate(tmp_path, checkout_present=True)
-    # The prefixed operand is reported once (path-contract), not also as a
-    # referential-integrity finding.
     assert any("checkout-directory name" in w for w in warnings)
     assert not any("AC Referential Integrity" in w for w in warnings)
 
 
 def test_referential_handles_malformed_verification(tmp_path: Path, backlog_dir: Path) -> None:
-    # A malformed directive yields no parsed items in the referential check
-    # (the contract check reports the malformed error separately).
     _make_index(tmp_path, ["E1-F1-S1-T1"])
     _make_task(
         backlog_dir,
@@ -278,8 +249,6 @@ def test_referential_handles_malformed_verification(tmp_path: Path, backlog_dir:
 
 
 def test_ac_existence_assertion_non_path_token_is_ignored(tmp_path: Path, backlog_dir: Path) -> None:
-    # An existence-asserting AC whose backtick token is not a path (no '/')
-    # produces no referential finding.
     _make_index(tmp_path, ["E1-F1-S1-T1"])
     _make_task(
         backlog_dir,
@@ -297,6 +266,5 @@ def test_referential_integrity_skipped_without_checkout(tmp_path: Path, backlog_
         "E1-F1-S1-T1",
         verification_block="- VERIFY AC-1 | type=command | cmd=`test -d providers/aws/missing` | expect-exit=0",
     )
-    # No checkout on disk -> absence cannot be asserted -> no referential finding.
     _, warnings = _validate(tmp_path, checkout_present=False)
     assert not any("AC Referential Integrity" in w for w in warnings)

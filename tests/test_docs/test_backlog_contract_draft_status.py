@@ -46,15 +46,12 @@ class TestBacklogContractDraftStatusEnum:
     def test_status_values_table_draft_is_not_terminal(self) -> None:
         """The draft row must mark Terminal? as 'no'."""
         text = BACKLOG_CONTRACT_DOC.read_text(encoding="utf-8")
-        # The row must contain 'draft' and must NOT mark it as terminal.
-        # We look for the draft row and verify it ends with 'no'.
         lines = text.splitlines()
         draft_row_found = False
         for line in lines:
             normalised = line.lower()
             if "draft" in normalised and normalised.startswith("|") and "pre-" in normalised:
                 draft_row_found = True
-                # The terminal column must be 'no'.
                 assert "| no |" in line or line.rstrip().endswith("| no |") or line.rstrip().endswith("no |"), (
                     f"Draft Status row must mark 'Terminal?' as 'no', got: {line!r}"
                 )
@@ -75,7 +72,6 @@ class TestBacklogContractLifecycleDiagram:
         assert "draft" in text and "in-queue" in text, (
             "docs/backlog-contract.md must document both 'draft' and 'in-queue' statuses."
         )
-        # Check that the transition arrow appears somewhere in the doc.
         has_arrow = "->" in text or "-->" in text
         assert has_arrow, (
             "docs/backlog-contract.md must contain a lifecycle diagram or text showing "
@@ -85,7 +81,6 @@ class TestBacklogContractLifecycleDiagram:
     def test_lifecycle_draft_arrow_leads_to_in_queue(self) -> None:
         """The lifecycle must show draft -> in-queue, not some other target."""
         text = BACKLOG_CONTRACT_DOC.read_text(encoding="utf-8")
-        # The sequence 'draft -> in-queue' (or 'draft --> in-queue') must appear.
         assert "draft -> in-queue" in text or "draft --> in-queue" in text, (
             "docs/backlog-contract.md must contain 'draft -> in-queue' to document "
             "the canonical lifecycle transition from draft to in-queue."
@@ -94,7 +89,6 @@ class TestBacklogContractLifecycleDiagram:
     def test_lifecycle_full_happy_path_documented(self) -> None:
         """The lifecycle section must document the full happy-path flow."""
         text = BACKLOG_CONTRACT_DOC.read_text(encoding="utf-8")
-        # All five main states must appear in the happy-path sequence.
         for status in ("draft", "in-queue", "in-progress", "in-review", "done"):
             assert status in text, (
                 f"docs/backlog-contract.md must mention '{status}' in the lifecycle "
@@ -109,7 +103,6 @@ class TestBacklogContractDraftCallout:
     def test_draft_callout_mentions_not_yet_refined_or_approved(self) -> None:
         """The doc must include the required callout text about draft meaning."""
         text = BACKLOG_CONTRACT_DOC.read_text(encoding="utf-8")
-        # The callout must explain draft as the agile-standard term.
         assert "not yet refined" in text.lower() or "not yet approved" in text.lower(), (
             "docs/backlog-contract.md must include a callout explaining that 'draft' is the "
             "agile-standard term for items not yet refined / approved for autonomous claim."

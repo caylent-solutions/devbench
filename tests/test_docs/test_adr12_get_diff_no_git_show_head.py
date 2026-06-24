@@ -21,11 +21,8 @@ ARCHITECTURE = REPO_ROOT / "docs" / "architecture.md"
 ADR_12 = REPO_ROOT / "docs" / "adr" / "12-mode-aware-get-diff.md"
 FAQ = REPO_ROOT / "docs" / "faq.md"
 
-# The exact phrase used by the old fallback path, which must no longer appear
-# in any of the four doc files as a description of CURRENT behavior.
 _STALE_PHRASE = "git show HEAD"
 
-# The phrases that must be present to confirm the new behavior is documented.
 _NEW_BEHAVIOR_LOG_GREP = "git log --grep"
 _NEW_BEHAVIOR_EXIT_45 = "GET_DIFF_NO_ATTRIBUTABLE"
 _NEW_BEHAVIOR_EXIT_45_NUM = "exit 45"
@@ -38,8 +35,6 @@ class TestAdr12DocNoGitShowHeadFallback:
     Each file must not mention the old fallback and must describe the new
     task-attributed commit lookup + exit 45 behavior.
     """
-
-    # --- cli-reference.md (AC-DOC-001) ---
 
     def test_cli_reference_no_git_show_head(self) -> None:
         """docs/cli-reference.md must not describe git show HEAD as current defer-mode behavior."""
@@ -67,8 +62,6 @@ class TestAdr12DocNoGitShowHeadFallback:
             "diagnostic path introduced by E4-F1-S1-T1."
         )
 
-    # --- architecture.md (AC-DOC-002) ---
-
     def test_architecture_no_git_show_head(self) -> None:
         """docs/architecture.md must not describe git show HEAD as current defer-mode behavior."""
         text = ARCHITECTURE.read_text(encoding="utf-8")
@@ -87,13 +80,9 @@ class TestAdr12DocNoGitShowHeadFallback:
             "or reference GET_DIFF_NO_ATTRIBUTABLE to reflect the new behavior."
         )
 
-    # --- docs/adr/12-mode-aware-get-diff.md (AC-DOC-003) ---
-
     def test_adr12_consequences_no_git_show_head_as_current(self) -> None:
         """ADR-12 Consequences section must not state git show HEAD is returned post-commit."""
         text = ADR_12.read_text(encoding="utf-8")
-        # The phrase appears in the Consequences section describing OLD behavior;
-        # locate the section and check it.
         consequences_start = text.find("## Consequences")
         alternatives_start = text.find("## Alternatives")
         if consequences_start == -1:
@@ -118,8 +107,6 @@ class TestAdr12DocNoGitShowHeadFallback:
             "Update the cli.py bullet to describe the new task-attributed lookup behavior."
         )
 
-    # --- faq.md (AC-DOC-004) ---
-
     def test_faq_no_git_show_head(self) -> None:
         """docs/faq.md must not describe git show HEAD as current defer-mode behavior."""
         text = FAQ.read_text(encoding="utf-8")
@@ -137,8 +124,6 @@ class TestAdr12DocNoGitShowHeadFallback:
             "docs/faq.md must describe the git log --grep task-attributed commit lookup "
             "or reference GET_DIFF_NO_ATTRIBUTABLE to reflect the new behavior."
         )
-
-    # --- Cross-file (AC-DOC-005) ---
 
     def test_no_stale_references_in_any_target_file(self) -> None:
         """None of the four target doc files may contain the stale git show HEAD phrase."""

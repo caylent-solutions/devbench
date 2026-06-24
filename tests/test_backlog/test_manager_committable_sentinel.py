@@ -85,11 +85,6 @@ def _findings(items: list[str]) -> list[str]:
     return [i for i in items if _FINDING_MARKER in i]
 
 
-# ---------------------------------------------------------------------------
-# Committable-file sentinels are flagged (warning -> error under strict)
-# ---------------------------------------------------------------------------
-
-
 def test_path_separator_sentinel_warns_then_errors_under_strict(tmp_path: Path, backlog_dir: Path) -> None:
     """A sentinel naming a path fragment is the exact E9-F1-S1-T5 incident."""
     _make_index(tmp_path, "E1-F1-S1-T1")
@@ -122,11 +117,6 @@ def test_file_keyword_sentinel_without_separator_is_flagged(tmp_path: Path, back
     )
     errors, warnings = _validate(tmp_path, strict=True)
     assert _findings(errors), "a keyword-bearing committable sentinel must be flagged under strict"
-
-
-# ---------------------------------------------------------------------------
-# Recognised sentinels stay legal
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

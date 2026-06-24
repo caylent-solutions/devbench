@@ -49,11 +49,6 @@ def _repo(name: str, path: Path) -> RepoConfig:
     return RepoConfig(validated_repo=name, resolved_checkout_path=path)
 
 
-# ---------------------------------------------------------------------------
-# _presync_target_environments: runs the command once per configured repo
-# ---------------------------------------------------------------------------
-
-
 class TestPresyncTargetEnvironments:
     def test_runs_command_once_per_configured_repo(self, tmp_path: Path) -> None:
         a = tmp_path / "repo-a"
@@ -65,8 +60,6 @@ class TestPresyncTargetEnvironments:
 
         _presync_target_environments(repos, command=["uv", "sync"], runner=runner, timeout=900)
 
-        # Exactly one provisioning invocation per configured repo, each cwd'd to
-        # that repo's resolved checkout path.
         assert len(runner.calls) == 2
         assert {cwd for _, cwd in runner.calls} == {a, b}
         assert all(cmd == ["uv", "sync"] for cmd, _ in runner.calls)
@@ -82,20 +75,15 @@ class TestPresyncTargetEnvironments:
         assert runner.calls == [(["uv", "sync", "--frozen"], a)]
 
     def test_warm_env_is_a_fast_noop_success(self, tmp_path: Path) -> None:
-        # A warm env: ``uv sync`` returns 0 quickly. The helper succeeds and does
-        # NOT raise -- the idempotent provisioning command is the no-op-fast path.
         a = tmp_path / "repo-a"
         a.mkdir()
         repos = {"org/repo-a": _repo("org/repo-a", a)}
         runner = _RecordingRunner(returncode=0)
 
-        # Must not raise.
         _presync_target_environments(repos, command=["uv", "sync"], runner=runner, timeout=900)
         assert len(runner.calls) == 1
 
     def test_failed_presync_fails_fast(self, tmp_path: Path) -> None:
-        # A real provisioning failure must surface loudly at start (fail-fast),
-        # not silently inside a timed claim attempt.
         a = tmp_path / "repo-a"
         a.mkdir()
         repos = {"org/repo-a": _repo("org/repo-a", a)}
@@ -111,17 +99,10 @@ class TestPresyncTargetEnvironments:
         assert runner.calls == []
 
     def test_skips_repo_without_resolved_path(self, tmp_path: Path) -> None:
-        # A repo with no resolved checkout path cannot be provisioned; the helper
-        # raises rather than silently running the command in an unknown cwd.
         repos = {"org/repo-a": RepoConfig(validated_repo="org/repo-a", resolved_checkout_path=None)}
         runner = _RecordingRunner()
         with pytest.raises(cli.PresyncError):
             _presync_target_environments(repos, command=["uv", "sync"], runner=runner, timeout=900)
-
-
-# ---------------------------------------------------------------------------
-# Config resolvers (env > YAML > default)
-# ---------------------------------------------------------------------------
 
 
 class TestResolvePresyncEnvironment:
@@ -192,13 +173,7 @@ class TestPresyncDefaultsAreSane:
     def test_default_timeout_is_generous(self) -> None:
         from devbench.constants import DEFAULT_PRESYNC_TIMEOUT_SECONDS
 
-        # A cold sync can take minutes; the warm-up budget must be generous.
         assert DEFAULT_PRESYNC_TIMEOUT_SECONDS >= 300
-
-
-# ---------------------------------------------------------------------------
-# cmd_start wiring: _run_presync_if_enabled gates + delegates
-# ---------------------------------------------------------------------------
 
 
 class TestRunPresyncIfEnabled:

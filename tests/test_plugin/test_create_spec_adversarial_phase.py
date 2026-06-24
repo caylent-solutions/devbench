@@ -25,7 +25,6 @@ SKILL_PATH = REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / 
 
 SHARED_DOC_RELATIVE_LINK = "docs/workflow-authoring-patterns.md"
 
-# The five generic review dimensions from spec Section 4 E12-F2-S1 AC-1.
 FIVE_DIMENSIONS = [
     "implementability",
     "internal consistency",
@@ -34,7 +33,6 @@ FIVE_DIMENSIONS = [
     "citation",
 ]
 
-# Skeptic verdict vocabulary from spec Section 4 E12-F2-S1 AC-2.
 SKEPTIC_VERDICTS = [
     "CONFIRMED",
     "REJECTED",
@@ -67,7 +65,6 @@ class TestAdversarialPhaseGating:
     def test_gated_on_workflow_availability(self) -> None:
         """The phase must be conditional on the Workflow tool being available."""
         content = SKILL_PATH.read_text()
-        # Must reference workflow tool availability as a gate condition.
         assert "adversarial_review_threshold" in content, (
             "create-spec SKILL.md does not gate the adversarial phase on "
             "'skills.adversarial_review_threshold'. "
@@ -85,7 +82,6 @@ class TestAdversarialPhaseGating:
     def test_workflow_absent_fallback_preserved(self) -> None:
         """When Workflow is absent, the single-agent Step-4 fallback must run."""
         content = SKILL_PATH.read_text()
-        # The SKILL.md must explicitly preserve the Step-4 fallback path.
         lower = content.lower()
         assert "step 4" in lower or "step-4" in lower, (
             "create-spec SKILL.md does not reference the Step-4 fallback path. "
@@ -96,7 +92,6 @@ class TestAdversarialPhaseGating:
     def test_fallback_when_workflow_absent_is_explicit(self) -> None:
         """The SKILL.md must explicitly state the fallback condition (Workflow absent)."""
         content = SKILL_PATH.read_text()
-        # Must name what happens when Workflow is absent.
         lower = content.lower()
         has_absent_clause = (
             "workflow is absent" in lower
@@ -131,7 +126,6 @@ class TestFiveGenericDimensions:
         pre-baked domain taxonomy."""
         content = SKILL_PATH.read_text()
         lower = content.lower()
-        # Must state that finer checks come from the spec content itself.
         has_spec_content_clause = (
             "derived from the spec" in lower
             or "spec content" in lower
@@ -149,8 +143,6 @@ class TestFiveGenericDimensions:
         adversarial phase."""
         content = SKILL_PATH.read_text()
         lower = content.lower()
-        # The spec explicitly forbids a domain taxonomy -- finer checks must
-        # come from the spec's own content.
         assert "domain taxonomy" not in lower, (
             "create-spec SKILL.md mentions a 'domain taxonomy', which is forbidden. "
             "Finer checks must be derived from the spec content (spec Section 12)."
@@ -227,7 +219,6 @@ class TestCitationDimension:
         modules, flags, and versions against their named sources."""
         content = SKILL_PATH.read_text()
         lower = content.lower()
-        # Must reference external items being checked (modules, flags, versions).
         has_external_check = "external" in lower or "module" in lower or "version" in lower or "named source" in lower
         assert has_external_check, (
             "create-spec SKILL.md does not describe the citation dimension as "

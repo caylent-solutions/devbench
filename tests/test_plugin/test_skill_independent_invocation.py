@@ -28,10 +28,8 @@ from devbench.config_loader import RepoConfig, RuntimeConfig, load_runtime_confi
 
 _EXAMPLE_RT_CFG = RuntimeConfig(repos={"example-org/example-repo": RepoConfig()})
 
-# Absolute path to the repo root so tests are portable regardless of cwd.
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
-# Issue #224: all four authoring skills live in the authoring plugin after the split.
 _SKILLS_DIR = _REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills"
 
 _ONBOARDING_SKILLS = (
@@ -40,10 +38,6 @@ _ONBOARDING_SKILLS = (
     "bootstrap-environment",
     "configure-devbench",
 )
-
-# ---------------------------------------------------------------------------
-# Shared helpers -- pre-populate the valid input files each skill reads
-# ---------------------------------------------------------------------------
 
 
 def _write_valid_spec_input(workspace: Path, project_name: str) -> Path:
@@ -296,11 +290,6 @@ def _extract_step_content(skill_name: str, step_number: int) -> str:
     return "\n".join(step_lines)
 
 
-# ---------------------------------------------------------------------------
-# Parametrized tests shared across all four onboarding skills
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 @pytest.mark.parametrize("skill_name", _ONBOARDING_SKILLS)
 def test_skill_md_exists_and_is_readable(skill_name: str) -> None:
@@ -343,11 +332,6 @@ def test_skill_frontmatter_declares_model(skill_name: str) -> None:
         f"{skill_name} SKILL.md frontmatter must declare a 'model:' field for standalone invocation. "
         f"Got frontmatter:\n{frontmatter}"
     )
-
-
-# ---------------------------------------------------------------------------
-# TestCreateSpecIndependentInvocation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -413,8 +397,6 @@ class TestCreateSpecIndependentInvocation:
         output of spec-to-backlog, configure-devbench, or bootstrap-environment.
         """
         content = _read_skill_md(self._SKILL_NAME)
-        # create-spec must not mandate BACKLOG.md as an input to begin
-        # (it may reference BACKLOG.md in output examples, but must not require it upfront)
         assert "Read BACKLOG.md" not in content, (
             f"{self._SKILL_NAME} must not require BACKLOG.md as input -- "
             "it is the first skill in the chain and must be invocable without prior skill output"
@@ -436,11 +418,6 @@ class TestCreateSpecIndependentInvocation:
             "skeleton is sufficient). "
             f"Step 1 content:\n{step1_content}"
         )
-
-
-# ---------------------------------------------------------------------------
-# TestSpecToBacklogIndependentInvocation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -481,9 +458,7 @@ class TestSpecToBacklogIndependentInvocation:
         (a minimal BACKLOG.md + task files) satisfies the validate-backlog contract
         when the spec input was pre-populated without create-spec having run.
         """
-        # Pre-populate the spec input (normally produced by create-spec)
         _write_valid_spec_input(tmp_path, "standalone-project")
-        # Pre-populate spec-to-backlog's output to assert the contract
         backlog_file = _write_valid_backlog_input(tmp_path, self._REPO_SLUG)
         assert backlog_file.exists(), f"BACKLOG.md must be produceable independently: {backlog_file}"
         content = backlog_file.read_text(encoding="utf-8")
@@ -506,7 +481,6 @@ class TestSpecToBacklogIndependentInvocation:
         bootstrap-environment output), the generated backlog must still satisfy
         validate-backlog with rc=0.
         """
-        # Only the spec file is pre-populated -- no devbench.yaml, no target repo
         _write_valid_spec_input(tmp_path, "standalone-project")
         _write_valid_backlog_input(tmp_path, self._REPO_SLUG)
 
@@ -528,16 +502,10 @@ class TestSpecToBacklogIndependentInvocation:
         backlog/config/devbench.yaml.
         """
         step1_content = _extract_step_content(self._SKILL_NAME, 1)
-        # Step 1 must be about reading the exemplar or the spec -- not devbench.yaml
         assert "devbench.yaml" not in step1_content or "spec" in step1_content, (
             f"{self._SKILL_NAME} SKILL.md Step 1 must focus on reading the spec or kanon exemplar, "
             "not require devbench.yaml -- the skill must be invocable before configure-devbench runs"
         )
-
-
-# ---------------------------------------------------------------------------
-# TestBootstrapEnvironmentIndependentInvocation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -571,7 +539,6 @@ class TestBootstrapEnvironmentIndependentInvocation:
         asserts bootstrap-environment can parse its repos: section to determine
         checkout directories -- without spec or backlog files being present.
         """
-        # Pre-populate ONLY the devbench.yaml -- no spec, no backlog
         config_file = _write_valid_devbench_yaml_input(tmp_path, self._REPO_SLUG)
         assert config_file.exists(), f"devbench.yaml must exist for standalone bootstrap: {config_file}"
 
@@ -593,7 +560,6 @@ class TestBootstrapEnvironmentIndependentInvocation:
         Pre-populates devbench.yaml and a fake target repo (the two required inputs).
         Verifies the .git sentinel detection works without any spec or backlog files.
         """
-        # Pre-populate ONLY the devbench.yaml and the fake target repo
         _write_valid_devbench_yaml_input(tmp_path, self._REPO_SLUG)
         repo_dir = _write_valid_target_repo_input(tmp_path, self._CHECKOUT_DIR)
 
@@ -602,7 +568,6 @@ class TestBootstrapEnvironmentIndependentInvocation:
             f"bootstrap-environment's EXISTS detection relies on .git sentinel at: {git_sentinel}. "
             "Pre-existing .git directory must be detectable without spec or backlog present."
         )
-        # No BACKLOG.md, no spec/ -- bootstrap-environment must not require them
         assert not (tmp_path / "BACKLOG.md").exists(), (
             "BACKLOG.md must not be required for bootstrap-environment standalone invocation"
         )
@@ -617,7 +582,6 @@ class TestBootstrapEnvironmentIndependentInvocation:
         This test verifies the file is immediately loadable by devbench's own
         config_loader when provided as a standalone input -- without prior skill runs.
         """
-        # Only devbench.yaml present -- no spec, no backlog
         config_file = _write_valid_devbench_yaml_input(tmp_path, self._REPO_SLUG)
         env = {**os.environ, "DEVBENCH_WORKSPACE_ROOT": str(tmp_path)}
         try:
@@ -641,11 +605,6 @@ class TestBootstrapEnvironmentIndependentInvocation:
             f"{self._SKILL_NAME} SKILL.md Step 1 must not reference 'spec/' as a required input. "
             "bootstrap-environment must be invocable without spec-to-backlog having run."
         )
-
-
-# ---------------------------------------------------------------------------
-# TestConfigureDevbenchIndependentInvocation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -695,11 +654,9 @@ class TestConfigureDevbenchIndependentInvocation:
         The skill must run successfully when no spec/, BACKLOG.md, or target repo
         is present. The produced devbench.yaml must be loadable by RuntimeConfig.
         """
-        # Empty workspace -- no spec, no backlog, no target repo
         assert not (tmp_path / "spec").exists(), "spec/ must be absent for fresh-workspace test"
         assert not (tmp_path / "BACKLOG.md").exists(), "BACKLOG.md must be absent for fresh-workspace test"
 
-        # Simulate the YAML that configure-devbench produces (its output contract)
         config_file = _write_valid_devbench_yaml_input(tmp_path, self._REPO_SLUG)
         assert config_file.exists(), f"configure-devbench must produce devbench.yaml at: {config_file}"
 

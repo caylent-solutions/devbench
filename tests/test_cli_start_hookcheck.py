@@ -20,7 +20,6 @@ import pytest
 from devbench import cli
 from devbench.backlog.manager import BacklogManager
 
-#: Verbatim fail-closed message required by spec AC-H4-1.
 _VERBATIM_ERROR: str = (
     "ERROR: devbench guard hooks not loaded; refusing to run"
     " (done-integrity cannot be enforced)."
@@ -90,11 +89,6 @@ def _make_mock_sdk(messages: list[object]) -> types.ModuleType:
     return mock_sdk
 
 
-# ---------------------------------------------------------------------------
-# AC-H4-1: hook presence/absence gate
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestStartHookCheck:
     """AC-H4-1: cmd_start fails closed when guard hooks are absent."""
@@ -103,9 +97,6 @@ class TestStartHookCheck:
         """cmd_start returns rc 1 when the plugin has no hooks.json."""
         plugin_path = tmp_path / "plugin-no-hooks"
         plugin_path.mkdir()
-        # No hooks/ directory or hooks.json -- hooks are absent.
-        # Patch the SDK import so the test does not hang if the guard check
-        # is inadvertently bypassed during development.
         mock_sdk = _make_mock_sdk([])
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -138,7 +129,6 @@ class TestStartHookCheck:
         plugin_path = tmp_path / "plugin-empty-hooks"
         plugin_path.mkdir()
         (plugin_path / "hooks").mkdir()
-        # hooks/ directory exists but no hooks.json inside it.
         mock_sdk = _make_mock_sdk([])
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -168,11 +158,6 @@ class TestStartHookCheck:
         ):
             result = cli.cmd_start()
         assert result == 0, f"expected rc 0 when hooks present, got {result}"
-
-
-# ---------------------------------------------------------------------------
-# AC-H4-2: library-level done gates hold regardless of hook state
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

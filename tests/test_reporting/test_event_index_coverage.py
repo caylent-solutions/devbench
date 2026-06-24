@@ -67,9 +67,6 @@ class TestCorruptDbConnectionClosePath:
             def __getattr__(self, name: str) -> object:
                 return getattr(self._conn, name)
 
-        # Pre-create the cache DB at the EXPECTED schema version so the
-        # ``open()`` method enters the else-branch (line 261-263) which calls
-        # ``executescript`` defensively -- that's where our wrapper raises.
         cache_dir = workspace / ".devbench" / "report-cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         db = cache_dir / "events.sqlite"
@@ -93,11 +90,8 @@ class TestCorruptDbConnectionClosePath:
         with patch.object(ei_mod, "_open_connection", side_effect=open_wrapped):
             idx = EventIndex.open(workspace)
         try:
-            # The rebuild succeeded: schema-version pragma is set.
             (version,) = idx._conn.execute("PRAGMA user_version").fetchone()
             assert version == ei_mod._SCHEMA_VERSION
-            # The first connection was closed via the except-branch
-            # contextlib.suppress block.
             assert first_wrapper[0].close_called
         finally:
             idx.close()
@@ -122,13 +116,10 @@ class TestInvalidationOnRotation:
             }
             _write_jsonl(hook_log, [entry, entry, entry])
             idx.refresh_hook_log(hook_log)
-            # Truncate: rotation detected via size < cached_size.
             hook_log.write_text("", encoding="utf-8")
             idx.refresh_hook_log(hook_log)
-            # New entry after rotation.
             _write_jsonl(hook_log, [entry])
             idx.refresh_hook_log(hook_log)
-            # Only one row remains; the original three were invalidated.
             (count,) = idx._conn.execute("SELECT COUNT(*) FROM hook_entries").fetchone()
             assert count == 1
         finally:
@@ -146,7 +137,6 @@ class TestInvalidationOnRotation:
             }
             _write_jsonl(tfile, [entry, entry])
             idx.refresh_transcripts(tdir)
-            # Truncate: triggers invalidation branch.
             tfile.write_text("", encoding="utf-8")
             idx.refresh_transcripts(tdir)
             _write_jsonl(tfile, [entry])
@@ -189,15 +179,12 @@ class TestOrchLogParseErrors:
                 log,
                 [
                     "garbage line that does not match the [logger] pattern",
-                    # Valid prefix, but timestamp portion is bogus.
                     "9999-99-99T99:99:99Z [judges.executor] INFO doing X",
-                    # Valid line.
                     "2025-01-01T00:00:01Z [judges.executor] INFO transition E1-F1-S1-T1 -> done",
                 ],
             )
             idx.refresh_orchestrator_log(log)
             (count,) = idx._conn.execute("SELECT COUNT(*) FROM orch_log_events").fetchone()
-            # Only the valid line was inserted.
             assert count == 1
         finally:
             idx.close()
@@ -212,7 +199,6 @@ class TestHookLogParseErrors:
         idx = EventIndex.open(workspace)
         try:
             hook_log = workspace / "hook.jsonl"
-            # JSON top-level not a dict (a bare list).  Should be skipped.
             _write_jsonl(hook_log, [["not", "a", "dict"]])
             idx.refresh_hook_log(hook_log)
             (count,) = idx._conn.execute("SELECT COUNT(*) FROM hook_entries").fetchone()
@@ -224,7 +210,7 @@ class TestHookLogParseErrors:
         idx = EventIndex.open(workspace)
         try:
             hook_log = workspace / "hook.jsonl"
-            entry = {"input": {"tool_response": {"totalDurationMs": 7}}}  # no timestamp
+            entry = {"input": {"tool_response": {"totalDurationMs": 7}}}
             _write_jsonl(hook_log, [entry])
             idx.refresh_hook_log(hook_log)
             row = idx._conn.execute("SELECT ts_epoch_us FROM hook_entries").fetchone()
@@ -238,7 +224,7 @@ class TestHookLogParseErrors:
             hook_log = workspace / "hook.jsonl"
             entry = {
                 "timestamp": "2025-01-01T00:00:01Z",
-                "input": {"tool_response": "not-a-dict"},  # forces line 494
+                "input": {"tool_response": "not-a-dict"},
             }
             _write_jsonl(hook_log, [entry])
             idx.refresh_hook_log(hook_log)
@@ -264,8 +250,6 @@ class TestTranscriptParseErrors:
             _write_jsonl(tfile, [entry])
             idx.refresh_transcripts(tdir)
             (count1,) = idx._conn.execute("SELECT COUNT(*) FROM transcript_entries").fetchone()
-            # Second call without changing the file -- hits the
-            # "unchanged" early-return branch.
             idx.refresh_transcripts(tdir)
             (count2,) = idx._conn.execute("SELECT COUNT(*) FROM transcript_entries").fetchone()
             assert count1 == count2 == 1
@@ -278,8 +262,6 @@ class TestTranscriptParseErrors:
             tdir = workspace / "transcripts"
             tdir.mkdir()
             tfile = tdir / "a.jsonl"
-            # Blank line, malformed JSON, non-dict top-level, missing message,
-            # bad timestamp, valid entry.
             tfile.write_text(
                 "\n"
                 "{not valid json}\n"
@@ -291,8 +273,6 @@ class TestTranscriptParseErrors:
             )
             idx.refresh_transcripts(tdir)
             rows = idx._conn.execute("SELECT message_id, ts_epoch_us FROM transcript_entries ORDER BY rowid").fetchall()
-            # First insert from the bad-timestamp entry (ts=NULL because
-            # parsing failed); second from the valid entry.
             assert len(rows) == 2
             assert rows[0][1] is None
             assert rows[1][1] is not None
@@ -356,7 +336,6 @@ class TestSnapshotEdgeCases:
         try:
             log = workspace / "orch.log"
             log.write_text("data\n", encoding="utf-8")
-            # No write_snapshot call -- the row simply does not exist.
             assert idx.read_snapshot(log) is None
         finally:
             idx.close()
@@ -367,7 +346,6 @@ class TestSnapshotEdgeCases:
             log = workspace / "orch.log"
             log.write_text("data\n", encoding="utf-8")
             idx.write_snapshot(log, {"k": "v"})
-            # Manually corrupt the stored JSON payload.
             idx._conn.execute(
                 "UPDATE report_snapshot SET payload_json = ? WHERE snapshot_id = 1",
                 ("{not-valid-json",),
@@ -406,7 +384,6 @@ class TestHookLogEarlyReturns:
     def test_returns_when_file_does_not_exist(self, workspace: Path) -> None:
         idx = EventIndex.open(workspace)
         try:
-            # File does not exist -- refresh_hook_log returns at line 447.
             idx.refresh_hook_log(workspace / "no-such.jsonl")
             (count,) = idx._conn.execute("SELECT COUNT(*) FROM hook_entries").fetchone()
             assert count == 0
@@ -420,8 +397,6 @@ class TestHookLogEarlyReturns:
             entry = {"timestamp": "2025-01-01T00:00:01Z", "input": {}}
             _write_jsonl(hook_log, [entry])
             idx.refresh_hook_log(hook_log)
-            # Second call without modification hits the unchanged-file
-            # early return at line 457.
             idx.refresh_hook_log(hook_log)
             (count,) = idx._conn.execute("SELECT COUNT(*) FROM hook_entries").fetchone()
             assert count == 1
@@ -432,7 +407,6 @@ class TestHookLogEarlyReturns:
         idx = EventIndex.open(workspace)
         try:
             hook_log = workspace / "hook.jsonl"
-            # Blank line + malformed JSON + valid entry.
             hook_log.write_text(
                 '\n{not valid json}\n{"timestamp": "2025-01-01T00:00:01Z", "input": {}}\n',
                 encoding="utf-8",
@@ -452,7 +426,6 @@ class TestTranscriptDirEarlyReturn:
     def test_returns_when_dir_not_a_directory(self, workspace: Path) -> None:
         idx = EventIndex.open(workspace)
         try:
-            # Path to a regular file, not a directory.
             f = workspace / "file.txt"
             f.write_text("x", encoding="utf-8")
             idx.refresh_transcripts(f)
@@ -495,7 +468,7 @@ class TestTranscriptUnchangedFile:
             tdir = workspace / "transcripts"
             tdir.mkdir()
             tfile = tdir / "a.jsonl"
-            entry = {"message": {"usage": {"input_tokens": 1}, "id": "x"}}  # no timestamp
+            entry = {"message": {"usage": {"input_tokens": 1}, "id": "x"}}
             _write_jsonl(tfile, [entry])
             idx.refresh_transcripts(tdir)
             row = idx._conn.execute("SELECT ts_epoch_us FROM transcript_entries").fetchone()

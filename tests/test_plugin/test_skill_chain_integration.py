@@ -29,10 +29,8 @@ from devbench.config_loader import RepoConfig, RuntimeConfig, load_runtime_confi
 
 _EXAMPLE_RT_CFG = RuntimeConfig(repos={"example-org/example-repo": RepoConfig()})
 
-# Absolute path to the repo root so tests are portable regardless of cwd.
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
-# Issue #224: all four chain skills live in the authoring plugin after the split.
 _SKILLS_DIR = _REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills"
 _FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "skill_chain"
 
@@ -42,10 +40,6 @@ _SKILL_NAMES = (
     "configure-devbench",
     "bootstrap-environment",
 )
-
-# ---------------------------------------------------------------------------
-# Fixture helpers
-# ---------------------------------------------------------------------------
 
 
 def _build_minimal_spec(workspace: Path, project_name: str) -> Path:
@@ -158,8 +152,6 @@ def _build_minimal_backlog(workspace: Path, repo_slug: str) -> None:
     task_file = backlog_dir / "E1-F1-S1-T1.md"
     task_file.write_text(task_content, encoding="utf-8")
 
-    # The canonical 7-column BACKLOG.md format: | ID | Title | Type | Status | Dependencies | Repo | File Path |
-    # File Path is a relative path from the workspace root.
     backlog_index_content = (
         "# Backlog\n\n"
         "## Status Summary\n\n"
@@ -216,11 +208,6 @@ def _build_minimal_target_repo(workspace: Path, checkout_dir: str) -> Path:
     (repo_dir / ".git").mkdir(exist_ok=True)
     (repo_dir / "README.md").write_text("# Fake Target Repo\n", encoding="utf-8")
     return repo_dir
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -516,19 +503,14 @@ class TestSkillChainEndToEnd:
         Constructs the workspace by running each skill's output helper in sequence,
         then asserts every expected artefact is present.
         """
-        # create-spec output
         spec_file = _build_minimal_spec(tmp_path, self._PROJECT_NAME)
 
-        # spec-to-backlog output
         _build_minimal_backlog(tmp_path, self._REPO_SLUG)
 
-        # configure-devbench output
         config_file = _build_minimal_devbench_yaml(tmp_path, self._REPO_SLUG)
 
-        # bootstrap-environment precondition (existing checkout)
         _build_minimal_target_repo(tmp_path, self._CHECKOUT_DIR)
 
-        # Assert all artefacts are present
         assert spec_file.exists(), f"spec file missing: {spec_file}"
         assert (tmp_path / "BACKLOG.md").exists(), "BACKLOG.md missing"
         assert config_file.exists(), f"devbench.yaml missing: {config_file}"
@@ -592,7 +574,6 @@ class TestSkillChainEndToEnd:
             assert skill_name in content, (
                 f"docs/onboarding.md must mention skill '{skill_name}'. Got content (first 500 chars):\n{content[:500]}"
             )
-        # Verify ordering: each skill appears before the next in the chain
         positions = {skill: content.index(skill) for skill in _SKILL_NAMES}
         chain_order = list(_SKILL_NAMES)
         for i in range(len(chain_order) - 1):

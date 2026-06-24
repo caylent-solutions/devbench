@@ -36,8 +36,6 @@ def _import_gate() -> Any:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {GATE_MODULE_PATH}")
     module = importlib.util.module_from_spec(spec)
-    # Register in sys.modules before exec so @dataclass can resolve cls.__module__
-    # (required for Python 3.14 compatibility).
     sys.modules["release_acceptance"] = module
     cast(importlib.abc.Loader, spec.loader).exec_module(module)
     return module
@@ -155,7 +153,6 @@ class TestConditionCBranchCoverage:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = gate.check_branch_coverage(REPO_ROOT, cov_source="mymodule", cov_fail_under=90)
         assert result.passed is True
-        # Verify the custom parameters were passed to pytest
         called_cmd = mock_run.call_args[0][0]
         assert "--cov=mymodule" in called_cmd
         assert "--cov-fail-under=90" in called_cmd
@@ -215,7 +212,6 @@ class TestConditionEMirroredLists:
     def test_passes_when_judge_lists_are_in_sync(self, gate: Any) -> None:
         """Mirrored judge lists from constants.py and guard-verdict-format.sh must match."""
         result = gate.check_mirrored_lists(REPO_ROOT)
-        # In a real repo these should be in sync -- if not it's a real structural error
         assert result.label == "mirrored_lists"
         assert isinstance(result.passed, bool)
         assert result.passed is True
@@ -517,7 +513,6 @@ class TestLoadGuardScriptKnownJudges:
             gate._load_guard_script_known_judges(tmp_path)
 
     def test_raises_value_error_when_known_judges_array_missing(self, gate: Any, tmp_path: Any) -> None:
-        # Create a fake guard script without the KNOWN_JUDGES array
         guard_dir = tmp_path / "plugin" / "devbench-orchestrate" / "scripts"
         guard_dir.mkdir(parents=True)
         guard_script = guard_dir / "guard-verdict-format.sh"
@@ -535,12 +530,10 @@ class TestCheckMarketplacePluginVersionsInSync:
         assert result is False
 
     def test_returns_false_when_plugin_json_missing(self, gate: Any, tmp_path: Any) -> None:
-        # Create marketplace.json that references a plugin whose plugin.json doesn't exist
         plugin_dir = tmp_path / "plugin" / ".claude-plugin"
         plugin_dir.mkdir(parents=True)
         marketplace_data = {"plugins": [{"name": "nonexistent-plugin", "version": "1.0.0"}]}
         (plugin_dir / "marketplace.json").write_text(json.dumps(marketplace_data), encoding="utf-8")
-        # Also create the authoring marketplace.json so it doesn't fail first
         authoring_dir = tmp_path / "plugin-authoring" / ".claude-plugin"
         authoring_dir.mkdir(parents=True)
         authoring_marketplace_data: dict[str, list[Any]] = {"plugins": []}
@@ -549,7 +542,6 @@ class TestCheckMarketplacePluginVersionsInSync:
         assert result is False
 
     def test_returns_false_when_versions_mismatch(self, gate: Any, tmp_path: Any) -> None:
-        # plugin marketplace says 1.0.0 but plugin.json says 2.0.0
         plugin_dir = tmp_path / "plugin" / ".claude-plugin"
         plugin_dir.mkdir(parents=True)
         marketplace_data = {"plugins": [{"name": "my-plugin", "version": "1.0.0"}]}
@@ -558,7 +550,6 @@ class TestCheckMarketplacePluginVersionsInSync:
         my_plugin_dir.mkdir(parents=True)
         plugin_json_data = {"name": "my-plugin", "version": "2.0.0"}
         (my_plugin_dir / "plugin.json").write_text(json.dumps(plugin_json_data), encoding="utf-8")
-        # Also create the authoring marketplace.json so it doesn't fail first
         authoring_dir = tmp_path / "plugin-authoring" / ".claude-plugin"
         authoring_dir.mkdir(parents=True)
         authoring_marketplace_data2: dict[str, list[Any]] = {"plugins": []}

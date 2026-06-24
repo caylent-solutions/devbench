@@ -267,7 +267,6 @@ class TestBoundOutput:
         result = bound_output(big, max_bytes=2000)
         assert "[OUTPUT_TRUNCATED" in result
         assert len(result) < len(big)
-        # Bounded near the budget (head + tail + marker), not the firehose.
         assert len(result) <= 2000 + 200
 
     def test_truncation_preserves_head_and_tail(self) -> None:
@@ -284,7 +283,7 @@ class TestBoundOutput:
         result = bound_output(big, max_bytes=1500)
         assert first in result
         assert last in result
-        assert "noise-25000" not in result  # a mid-stream line was dropped
+        assert "noise-25000" not in result
 
     def test_marker_reports_elided_byte_count(self) -> None:
         """
@@ -295,7 +294,6 @@ class TestBoundOutput:
         big = "z" * 50_000
         result = bound_output(big, max_bytes=1000)
         assert "[OUTPUT_TRUNCATED" in result
-        # The elided byte count in the marker is positive and plausible.
         marker_line = next(ln for ln in result.split("\n") if "[OUTPUT_TRUNCATED" in ln)
         assert any(ch.isdigit() for ch in marker_line)
 
@@ -470,8 +468,6 @@ class TestRunCommandInProcessGroup:
         """
         published: list[int] = []
         completed: list[bool] = []
-        # A parent that launches a long-sleeping grandchild in the SAME group,
-        # then itself sleeps -- mimicking make -> go test -> terraform apply.
         script = (
             "import subprocess, sys, time; "
             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
@@ -487,18 +483,15 @@ class TestRunCommandInProcessGroup:
         assert "timed out" in stderr
         assert completed == [True]
         pgid = published[0]
-        # Give the kernel a moment to deliver SIGKILL to the group, then confirm
-        # the whole group is gone (no orphaned grandchild left running).
         deadline = time.monotonic() + 5.0
         alive = True
         while time.monotonic() < deadline:
             try:
-                os.killpg(pgid, 0)  # signal 0 = liveness probe
+                os.killpg(pgid, 0)
             except ProcessLookupError:
                 alive = False
                 break
             time.sleep(0.02)
-        # Best-effort final reap in case anything lingers, then assert.
         with contextlib.suppress(ProcessLookupError, OSError):
             os.killpg(pgid, signal.SIGKILL)
         assert alive is False, "timed-out command's process group was orphaned"
@@ -515,7 +508,6 @@ class TestKillProcessGroup:
         """
         proc = MagicMock()
         proc.pid = 4242
-        # The single poll after SIGTERM reports the group exited -> no escalation.
         proc.poll.return_value = 0
         with patch("devbench.utils.process.os.getpgid", return_value=4242):
             with patch("devbench.utils.process.os.killpg") as killpg:
@@ -531,7 +523,7 @@ class TestKillProcessGroup:
         """
         proc = MagicMock()
         proc.pid = 4242
-        proc.poll.return_value = None  # never reports dead
+        proc.poll.return_value = None
         with patch("devbench.utils.process.os.getpgid", return_value=4242):
             with patch("devbench.utils.process.os.killpg") as killpg:
                 _kill_process_group(proc)
@@ -562,4 +554,4 @@ class TestKillProcessGroup:
         proc.poll.return_value = None
         with patch("devbench.utils.process.os.getpgid", return_value=4242):
             with patch("devbench.utils.process.os.killpg", side_effect=OSError):
-                _kill_process_group(proc)  # must not raise
+                _kill_process_group(proc)

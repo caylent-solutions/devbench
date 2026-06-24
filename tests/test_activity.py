@@ -49,10 +49,6 @@ from devbench.activity import (
 )
 from devbench.config_loader import GitOpsConfig, RuntimeConfig
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
 
 def _write_jsonl(path: Path, entries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,11 +64,6 @@ def _make_runtime_config(
     """Return a minimal RuntimeConfig with optional GitOpsConfig overrides."""
     git_ops = GitOpsConfig(update_submodule=update_submodule, single_branch=single_branch, defer_pr=defer_pr)
     return RuntimeConfig(git_ops=git_ops)
-
-
-# ---------------------------------------------------------------------------
-# _parse_iso_timestamp
-# ---------------------------------------------------------------------------
 
 
 class TestParseIsoTimestamp:
@@ -98,11 +89,6 @@ class TestParseIsoTimestamp:
         assert dt.tzinfo is UTC
 
 
-# ---------------------------------------------------------------------------
-# _truncate
-# ---------------------------------------------------------------------------
-
-
 class TestTruncate:
     def test_no_change_when_under_limit(self) -> None:
         assert _truncate("hello", 10) == "hello"
@@ -113,14 +99,8 @@ class TestTruncate:
         assert len(out) == 8
 
     def test_handles_tiny_limit(self) -> None:
-        # Limits smaller than the ellipsis degrade gracefully (no IndexError).
         out = _truncate("abcdef", 2)
         assert out == "..."
-
-
-# ---------------------------------------------------------------------------
-# _extract_tool_summary
-# ---------------------------------------------------------------------------
 
 
 class TestExtractToolSummary:
@@ -163,11 +143,6 @@ class TestExtractToolSummary:
 
         out = _extract_tool_summary("CustomTool", {"obj": _NotJsonable()})
         assert out == ""
-
-
-# ---------------------------------------------------------------------------
-# _extract_latest_text_from_entry / _extract_tools_from_entry
-# ---------------------------------------------------------------------------
 
 
 class TestExtractLatestTextFromEntry:
@@ -274,11 +249,6 @@ class TestCoerceTranscriptTimestamp:
         assert dt == datetime(2026, 4, 18, 5, 0, 0, tzinfo=UTC)
 
 
-# ---------------------------------------------------------------------------
-# discover_session_dir
-# ---------------------------------------------------------------------------
-
-
 class TestDiscoverSessionDir:
     def test_returns_none_when_log_missing(self, tmp_path: Path) -> None:
         assert discover_session_dir(tmp_path / "missing.jsonl") is None
@@ -330,11 +300,6 @@ class TestDiscoverSessionDir:
         assert discover_session_dir(log) == Path("/c")
 
 
-# ---------------------------------------------------------------------------
-# find_active_subagent
-# ---------------------------------------------------------------------------
-
-
 class TestFindActiveSubagent:
     def test_returns_none_when_dir_missing(self, tmp_path: Path) -> None:
         assert find_active_subagent(tmp_path) is None
@@ -359,7 +324,7 @@ class TestFindActiveSubagent:
     def test_ignores_subdirectories(self, tmp_path: Path) -> None:
         sub = tmp_path / "subagents"
         sub.mkdir()
-        (sub / "agent-subdir.jsonl").mkdir()  # directory, not a file
+        (sub / "agent-subdir.jsonl").mkdir()
         (sub / "agent-valid.jsonl").write_text("{}\n")
         assert find_active_subagent(tmp_path) == (sub / "agent-valid.jsonl")
 
@@ -374,7 +339,6 @@ class TestFindActiveSubagent:
         f_old.write_text("{}\n")
         f_new = sub / "agent-new.jsonl"
         f_new.write_text("{}\n")
-        # Explicitly set f_old to an older mtime.
         import os
 
         os.utime(f_old, (1000.0, 1000.0))
@@ -396,11 +360,6 @@ class TestFindActiveSubagent:
 
         with patch.object(Path, "stat", _raise):
             assert find_active_subagent(tmp_path) is None
-
-
-# ---------------------------------------------------------------------------
-# parse_subagent_recent_activity
-# ---------------------------------------------------------------------------
 
 
 class TestParseSubagentRecentActivity:
@@ -502,11 +461,6 @@ class TestParseSubagentRecentActivity:
         assert out.subagent_type == "devbench-orchestrate:review-supervisor"
 
 
-# ---------------------------------------------------------------------------
-# parse_orchestrator_recent_cli / _parse_log_line
-# ---------------------------------------------------------------------------
-
-
 class TestParseOrchestratorRecentCli:
     def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
         assert parse_orchestrator_recent_cli(tmp_path / "missing.log") == []
@@ -572,25 +526,16 @@ class TestParseLogLine:
         assert event.message == "bare message"
 
     def test_line_without_space_after_ts(self) -> None:
-        # Missing trailing "[...]" section -> not parseable.
         assert _parse_log_line("2026-04-18T03:00:00Z") is None
 
     def test_malformed_bracket_no_close(self) -> None:
-        # Space-separated; remainder starts with "[" but has no closing "]".
         assert _parse_log_line("2026-04-18T03:00:00Z [incomplete") is None
 
     def test_remainder_not_starting_with_bracket(self) -> None:
-        # Space-separated, but the rest doesn't begin with "[".
         assert _parse_log_line("2026-04-18T03:00:00Z plain[x]text") is None
 
     def test_line_with_no_space_skipped(self) -> None:
-        # No space at all in the line -- split branch skipped.
         assert _parse_log_line("single-word-line") is None
-
-
-# ---------------------------------------------------------------------------
-# parse_repo_state / _run_git
-# ---------------------------------------------------------------------------
 
 
 def _init_git_repo(path: Path) -> None:
@@ -623,11 +568,8 @@ class TestParseRepoState:
 
     def test_categorises_status(self, tmp_path: Path) -> None:
         _init_git_repo(tmp_path)
-        # Unstaged modification
         (tmp_path / "README.md").write_text("# modified\n")
-        # Untracked file
         (tmp_path / "new.txt").write_text("new\n")
-        # Staged addition
         staged = tmp_path / "added.py"
         staged.write_text("print('x')\n")
         subprocess.run(["git", "add", "added.py"], cwd=tmp_path, check=True, capture_output=True)
@@ -667,8 +609,6 @@ class TestParseRepoState:
 
         def fake_run(cmd: list[str], **_kw: Any) -> Any:
             if cmd[3] == "status":
-                # Include a short (len<3) line among the normal entries. The
-                # short line must be skipped without raising.
                 return _FakeResult("M\n?? new.txt\n")
             return _FakeResult("deadbeef\n")
 
@@ -692,11 +632,6 @@ class TestRunGit:
             rc, out = _run_git(tmp_path, ["status"], timeout=30)
         assert rc == 1
         assert out == ""
-
-
-# ---------------------------------------------------------------------------
-# check_amendment_request
-# ---------------------------------------------------------------------------
 
 
 class TestCheckAmendmentRequest:
@@ -743,11 +678,6 @@ class TestCheckAmendmentRequest:
         target.write_text(json.dumps({"files_to_add": ["string", {"path": "ok.py", "change": "c"}, {"no_path": True}]}))
         out = check_amendment_request(tmp_path, "EX-T1")
         assert out.files_to_add == ["ok.py"]
-
-
-# ---------------------------------------------------------------------------
-# detect_phase
-# ---------------------------------------------------------------------------
 
 
 class TestDetectPhase:
@@ -816,11 +746,6 @@ class TestDetectPhase:
         assert detect_phase(subagent_type=None, recent_cli=events, idle_seconds=0) == "review-supervisor running"
 
 
-# ---------------------------------------------------------------------------
-# mode_label
-# ---------------------------------------------------------------------------
-
-
 class TestModeLabel:
     def test_standard_multi_pr(self) -> None:
         assert mode_label(_make_runtime_config()) == "standard multi-PR"
@@ -830,20 +755,13 @@ class TestModeLabel:
         assert mode_label(cfg) == "single-branch + defer_pr (branch: feat/x)"
 
     def test_defer_pr_without_single_branch_flags_invalid(self) -> None:
-        # Bypass GitOpsConfig validation by constructing it manually.
         cfg = RuntimeConfig(git_ops=GitOpsConfig(defer_pr=True))
         assert "invalid config" in mode_label(cfg)
 
     def test_pause_before_merge_defensive(self) -> None:
         cfg = _make_runtime_config()
-        # Simulate a future field without modifying GitOpsConfig today.
         object.__setattr__(cfg.git_ops, "pause_before_merge", True)
         assert mode_label(cfg) == "multi-PR with pause-before-merge"
-
-
-# ---------------------------------------------------------------------------
-# _compute_idle_seconds / _find_most_recent_claim / _find_active_task
-# ---------------------------------------------------------------------------
 
 
 class TestComputeIdleSeconds:
@@ -965,7 +883,6 @@ class TestFindActiveTask:
         assert out.status_value == "In Progress"
 
     def test_falls_back_to_in_review_or_blocked(self, tmp_path: Path) -> None:
-        # Rewrite T1 to 'blocked' so no in-progress/in-review task exists.
         index = _write_minimal_backlog(tmp_path, in_progress_status="blocked")
         out = _find_active_task(index)
         assert out is not None
@@ -973,7 +890,6 @@ class TestFindActiveTask:
         assert out.status_value == "Blocked"
 
     def test_returns_none_when_only_queue(self, tmp_path: Path) -> None:
-        # Both tasks in-queue -> no focal task available.
         (tmp_path / "BACKLOG.md").write_text(_BACKLOG_INDEX_TEMPLATE.replace("in-progress", "in-queue"))
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
@@ -994,13 +910,7 @@ class TestFindActiveTask:
     def test_returns_none_on_parse_error(self, tmp_path: Path) -> None:
         idx = tmp_path / "BACKLOG.md"
         idx.write_text("# header only\n")
-        # Empty table -> BacklogParser raises ValueError.
         assert _find_active_task(idx) is None
-
-
-# ---------------------------------------------------------------------------
-# collect_snapshot (integration through the parsers)
-# ---------------------------------------------------------------------------
 
 
 class TestCollectSnapshot:
@@ -1029,15 +939,12 @@ class TestCollectSnapshot:
 
         index = _write_minimal_backlog(tmp_path)
 
-        # Orchestrator log with a claim event and a recent devbench.cli line.
         log = tmp_path / "orchestrator.log"
         log.write_text(
             "2026-04-18T03:00:00Z [devbench.cli] INFO Claimed EX-F1-S1-T1 (set to in-progress)\n"
             "2026-04-18T03:05:00Z [devbench.cli] INFO TDD RED logged for EX-F1-S1-T1\n"
         )
 
-        # Hook log points to the outer session transcript; its parent is the
-        # Claude Code session directory that also holds subagents/agent-*.jsonl.
         session_dir = tmp_path / "session"
         session_dir.mkdir()
         main_session = session_dir / "main-session.jsonl"
@@ -1063,7 +970,6 @@ class TestCollectSnapshot:
         hook_log = tmp_path / "hook-logs.jsonl"
         _write_jsonl(hook_log, [{"input": {"transcript_path": str(main_session)}}])
 
-        # Amendment request file
         amendment_path = tmp_path / ".devbench" / "amendments" / "EX-F1-S1-T1.json"
         amendment_path.parent.mkdir(parents=True)
         amendment_path.write_text(
@@ -1075,7 +981,6 @@ class TestCollectSnapshot:
             )
         )
 
-        # Repo path resolver returns a real tmp git repo
         repo_dir = tmp_path / "example"
         repo_dir.mkdir()
         _init_git_repo(repo_dir)
@@ -1119,7 +1024,6 @@ class TestCollectSnapshot:
         ``last_tool_call_at`` promotes to the CLI timestamp."""
         index = _write_minimal_backlog(tmp_path)
 
-        # Subagent transcript last activity: 03:00:00
         session_dir = tmp_path / "session"
         session_dir.mkdir()
         main_session = session_dir / "main-session.jsonl"
@@ -1139,7 +1043,6 @@ class TestCollectSnapshot:
         hook_log = tmp_path / "hook-logs.jsonl"
         _write_jsonl(hook_log, [{"input": {"transcript_path": str(main_session)}}])
 
-        # CLI event is newer: 03:05:00.
         orch_log = tmp_path / "orchestrator.log"
         orch_log.write_text("2026-04-18T03:05:00Z [devbench.cli] INFO Claimed EX-F1-S1-T1 (set to in-progress)\n")
 
@@ -1153,11 +1056,6 @@ class TestCollectSnapshot:
             now=datetime(2026, 4, 18, 3, 6, 0, tzinfo=UTC),
         )
         assert snapshot.last_tool_call_at == datetime(2026, 4, 18, 3, 5, 0, tzinfo=UTC)
-
-
-# ---------------------------------------------------------------------------
-# render_snapshot -- golden output per scenario
-# ---------------------------------------------------------------------------
 
 
 def _sample_snapshot(
@@ -1314,11 +1212,6 @@ class TestRenderSnapshot:
         snap = _sample_snapshot()
         out = render_snapshot(snap)
         assert out.splitlines()[-1].startswith("Idle for ")
-
-
-# ---------------------------------------------------------------------------
-# Placeholder classes referenced at import time but untested directly above.
-# ---------------------------------------------------------------------------
 
 
 class TestActiveTaskDataclass:

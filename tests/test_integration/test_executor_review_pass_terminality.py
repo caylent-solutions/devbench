@@ -63,15 +63,11 @@ class TestSkillReviewPassTerminality:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # Terminality + branch-on-pass-vs-fail rule.
             "REVIEW_PASS is a terminal signal",
             "branch SOLELY on pass-vs-fail",
-            # Forbid inspecting verdict bodies for improvement signals.
             "do NOT inspect verdict bodies",
-            # Forbid acting on informational PASS-verdict content.
             "Informational content in PASS verdicts",
             "MUST NOT trigger additional executor work cycles",
-            # Same rule applies to security-reviewer.
             "Do NOT re-invoke executor based on the security_review verdict body",
         ],
     )
@@ -104,15 +100,11 @@ class TestExecutorReviewPassTerminality:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # Three (and only three) legitimate trigger scenarios.
             "first executor pass after claiming a task",
             "After a judge returns REVIEW_FAIL",
             "After git-ops returns exit code 2 (CI failure) or 3 (PR-bot review feedback)",
-            # Explicit 'never invoked because of PASS verdict content'.
             "**never** invoked because of the content of a passing verdict",
-            # Self-correcting heuristic.
             "If you find yourself reading a PASS verdict's body looking for things to fix, stop.",
-            # Cross-link to the regression test.
             "test_executor_review_pass_terminality.py",
         ],
     )

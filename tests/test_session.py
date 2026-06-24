@@ -32,10 +32,6 @@ from devbench.session import (
     flock_backlog,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers / fixtures
-# ---------------------------------------------------------------------------
-
 _NOW = datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC)
 
 
@@ -62,11 +58,6 @@ def workspace(tmp_path: Path) -> Path:
     """Minimal workspace directory with .devbench subdir."""
     (tmp_path / ".devbench").mkdir(parents=True, exist_ok=True)
     return tmp_path
-
-
-# ---------------------------------------------------------------------------
-# Session dataclass
-# ---------------------------------------------------------------------------
 
 
 class TestSessionDataclass:
@@ -120,7 +111,6 @@ class TestSessionDataclass:
             "pid": 1,
             "scope": [],
             "started_at": _NOW.isoformat(),
-            # started_by missing
             "state_dir": "/tmp",
         }
         with pytest.raises(KeyError):
@@ -144,17 +134,12 @@ class TestSessionDataclass:
             "name": "alpha",
             "pid": 1,
             "scope": [],
-            "started_at": "2026-05-15T12:00:00",  # naive
+            "started_at": "2026-05-15T12:00:00",
             "started_by": "alice",
             "state_dir": "/tmp",
         }
         s = Session.from_dict(d)
         assert s.started_at.tzinfo is not None
-
-
-# ---------------------------------------------------------------------------
-# ClaimRaceError
-# ---------------------------------------------------------------------------
 
 
 class TestClaimRaceError:
@@ -174,11 +159,6 @@ class TestClaimRaceError:
         assert err.unit_id == "T1"
         assert err.expected_status == "in-queue"
         assert err.actual_status == "blocked"
-
-
-# ---------------------------------------------------------------------------
-# SessionRegistry -- basic read/write
-# ---------------------------------------------------------------------------
 
 
 class TestSessionRegistryReadWrite:
@@ -241,7 +221,6 @@ class TestSessionRegistryReadWrite:
         reg = SessionRegistry(workspace)
         s = _make_session(state_dir=workspace / ".devbench" / "sessions" / "alpha")
         reg.save([s])
-        # Verify no leftover temp file
         tmp = workspace / ".devbench" / "sessions" / "registry.json.tmp"
         assert not tmp.exists()
 
@@ -249,15 +228,9 @@ class TestSessionRegistryReadWrite:
         """When write_text raises, the temp file is removed and the exception propagates."""
         reg = SessionRegistry(workspace)
         s = _make_session(state_dir=workspace / ".devbench" / "sessions" / "alpha")
-        # Patch Path.write_text to raise after the tmp file could be created
         with patch("devbench.session.Path.write_text", side_effect=OSError("disk full")):
             with pytest.raises(OSError, match="disk full"):
                 reg.save([s])
-
-
-# ---------------------------------------------------------------------------
-# SessionRegistry -- PID-file management
-# ---------------------------------------------------------------------------
 
 
 class TestSessionRegistryPidFile:
@@ -289,7 +262,6 @@ class TestSessionRegistryPidFile:
         reg = SessionRegistry(workspace)
         state_dir = workspace / ".devbench" / "sessions" / "ghost"
         state_dir.mkdir(parents=True, exist_ok=True)
-        # Should not raise even when pid file does not exist
         reg.delete_pid(state_dir)
 
     def test_read_pid_returns_int(self, workspace: Path) -> None:
@@ -314,11 +286,6 @@ class TestSessionRegistryPidFile:
             reg.read_pid(state_dir)
 
 
-# ---------------------------------------------------------------------------
-# SessionRegistry -- liveness check
-# ---------------------------------------------------------------------------
-
-
 class TestSessionRegistryLiveness:
     def test_is_alive_current_process(self, workspace: Path) -> None:
         """The current process is always alive."""
@@ -328,8 +295,6 @@ class TestSessionRegistryLiveness:
     def test_is_alive_returns_false_for_nonexistent_pid(self, workspace: Path) -> None:
         """PID 0 is not a valid signal target; a large sentinel PID should not exist."""
         reg = SessionRegistry(workspace)
-        # Use a PID that is very unlikely to be alive.
-        # We patch os.kill to simulate ESRCH (no such process).
         with patch("devbench.session.os.kill", side_effect=ProcessLookupError):
             assert reg.is_alive(99999999) is False
 
@@ -354,11 +319,6 @@ class TestSessionRegistryLiveness:
                 reg.is_alive(1)
 
 
-# ---------------------------------------------------------------------------
-# SessionRegistry -- liveness_of_sessions
-# ---------------------------------------------------------------------------
-
-
 class TestLivenessOfSessions:
     def test_active_session_labelled_active(self, workspace: Path) -> None:
         reg = SessionRegistry(workspace)
@@ -378,11 +338,6 @@ class TestLivenessOfSessions:
         assert reg.liveness_of_sessions([]) == {}
 
 
-# ---------------------------------------------------------------------------
-# flock_backlog
-# ---------------------------------------------------------------------------
-
-
 class TestFlockBacklog:
     def test_context_manager_creates_lock_file(self, workspace: Path) -> None:
         lock_path = workspace / ".devbench" / "BACKLOG.lock"
@@ -393,7 +348,6 @@ class TestFlockBacklog:
         """After the context exits, another thread should be able to acquire the lock."""
         with flock_backlog(workspace, timeout_seconds=5):
             pass
-        # Verify we can re-acquire
         with flock_backlog(workspace, timeout_seconds=5):
             pass
 
@@ -413,7 +367,6 @@ class TestFlockBacklog:
     def test_default_timeout_is_used_when_not_specified(self, workspace: Path) -> None:
         """flock_backlog with no timeout_seconds uses SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS."""
         with flock_backlog(workspace) as ctx:
-            # ctx is None (context manager yields None)
             assert ctx is None
 
     def test_lock_file_created_in_devbench_subdir(self, workspace: Path) -> None:
@@ -426,7 +379,6 @@ class TestFlockBacklog:
         with pytest.raises(RuntimeError, match="boom"):
             with flock_backlog(workspace, timeout_seconds=5):
                 raise RuntimeError("boom")
-        # After exception, the lock must be released so re-acquisition succeeds.
         with flock_backlog(workspace, timeout_seconds=1):
             pass
 
@@ -518,11 +470,6 @@ class TestFlockBacklog:
                     pass
 
 
-# ---------------------------------------------------------------------------
-# detect_scope_overlap
-# ---------------------------------------------------------------------------
-
-
 class TestDetectScopeOverlap:
     def test_no_overlap_returns_empty(self) -> None:
         existing = [_make_session(name="alpha", scope=["E1", "E2"])]
@@ -592,11 +539,6 @@ class TestDetectScopeOverlap:
         result = detect_scope_overlap(existing, ids_b)
         expected = sorted(f"E1-F1-S1-T{i}" for i in range(25, 50))
         assert result == expected
-
-
-# ---------------------------------------------------------------------------
-# Integration: write_pid / delete_pid round trip via registry context
-# ---------------------------------------------------------------------------
 
 
 class TestPidFileRoundTrip:
@@ -702,7 +644,6 @@ class TestCleanupStaleSessions:
         """
         reg = SessionRegistry(workspace)
         state_dir = workspace / ".devbench" / "sessions" / "ghost"
-        # Do NOT create state_dir -- it is already absent.
         s = _make_session(name="ghost", pid=99999999, state_dir=state_dir)
         reg.save([s])
         with patch("devbench.session.os.kill", side_effect=ProcessLookupError):
@@ -726,10 +667,6 @@ class TestCleanupStaleSessions:
         assert (workspace / ".devbench" / "sessions" / "a1").exists()
         assert (workspace / ".devbench" / "sessions" / "a2").exists()
 
-
-# ---------------------------------------------------------------------------
-# Integration: concurrent cmd_claim race via real flock_backlog (AC-192-3, AC-192-5)
-# ---------------------------------------------------------------------------
 
 _WU_ID = "RACE-F1-S1-T1"
 _BACKLOG_ROW_TEMPLATE = (
@@ -848,8 +785,6 @@ class TestCmdClaimRaceIntegration:
 
         results: list[int] = []
         errors: list[str] = []
-        # Use a Barrier so both threads start cmd_claim at the same moment,
-        # maximising the chance of a real concurrent-write race under the flock.
         barrier = threading.Barrier(2)
 
         def do_claim() -> None:
@@ -860,8 +795,6 @@ class TestCmdClaimRaceIntegration:
             except Exception as exc:
                 errors.append(f"{type(exc).__name__}: {exc}")
 
-        # Patch module constants in the main thread before spawning workers so
-        # all threads share the same patched state without concurrent-patch races.
         patchers = self._patch_cli_constants(workspace, backlog_root, backlog_index)
         try:
             t1 = threading.Thread(target=do_claim, name="claimer-1")
@@ -876,12 +809,9 @@ class TestCmdClaimRaceIntegration:
         assert not errors, f"Unexpected exceptions in claim threads: {errors}"
         assert len(results) == 2, f"Expected 2 results, got {len(results)}"
 
-        # Both threads must have completed without an unexpected exception.
-        # The flock ensures serial access so each sees a valid claimable status.
         for rc in results:
             assert rc in (0, 1), f"Unexpected return code {rc}"
 
-        # Verify no corruption: exactly one ``## Status:`` line, value is in-progress.
         content = wu_file.read_text(encoding="utf-8")
         status_lines = [line for line in content.splitlines() if line.strip().startswith("## Status:")]
         assert len(status_lines) == 1, (
@@ -924,7 +854,6 @@ class TestCmdClaimRaceIntegration:
 
         assert not errors, f"Unexpected exceptions in claim threads: {errors}"
 
-        # BACKLOG.md must be parseable and contain exactly one in-progress row for the WU.
         index_content = backlog_index.read_text(encoding="utf-8")
         in_progress_rows = [line for line in index_content.splitlines() if _WU_ID in line and "in-progress" in line]
         assert len(in_progress_rows) == 1, (
@@ -949,7 +878,6 @@ class TestCmdClaimRaceIntegration:
         workspace, backlog_root, backlog_index = _build_race_workspace(tmp_path)
         wu_file = backlog_root / f"{_WU_ID}.md"
 
-        # A pair of Events to coordinate the "winner" and "loser" threads.
         winner_holds_lock = threading.Event()
         winner_may_release = threading.Event()
         winner_errors: list[str] = []
@@ -960,35 +888,26 @@ class TestCmdClaimRaceIntegration:
             """Acquire the flock, write 'done' into the WU file, then hold until told to release."""
             try:
                 with flock_backlog(workspace, timeout_seconds=10):
-                    # Rewrite the WU file status to 'done' while holding the lock.
-                    # This simulates a competing session that marks the WU as done
-                    # before the loser thread can re-read the status under the lock.
                     done_content = wu_file.read_text(encoding="utf-8").replace("## Status: in-queue", "## Status: done")
                     wu_file.write_text(done_content, encoding="utf-8")
-                    # Also update BACKLOG.md so force_status won't fail on index lookup.
-                    # (The loser raises ClaimRaceError before reaching force_status,
-                    # but this ensures a fully realistic simulation.)
                     idx_content = backlog_index.read_text(encoding="utf-8").replace("in-queue", "done")
                     backlog_index.write_text(idx_content, encoding="utf-8")
-                    winner_holds_lock.set()  # signal: loser may now try to acquire
-                    winner_may_release.wait(timeout=10)  # hold lock until loser is done
+                    winner_holds_lock.set()
+                    winner_may_release.wait(timeout=10)
             except Exception as exc:
                 winner_errors.append(f"{type(exc).__name__}: {exc}")
-                winner_holds_lock.set()  # unblock the loser even on error
+                winner_holds_lock.set()
 
         def loser_thread() -> None:
             """Wait for the winner to hold the lock, then attempt cmd_claim -- expect rc=1."""
             winner_holds_lock.wait(timeout=10)
             try:
-                # At this point the winner holds the lock and has written 'done'.
-                # cmd_claim will block on flock until winner_may_release is set, then
-                # re-read the status, find 'done', raise ClaimRaceError -> rc=1.
                 rc = cli_mod.cmd_claim(_WU_ID)
                 loser_rc.append(rc)
             except Exception as exc:
                 loser_errors.append(f"{type(exc).__name__}: {exc}")
             finally:
-                winner_may_release.set()  # let the winner release its lock
+                winner_may_release.set()
 
         patchers = self._patch_cli_constants(workspace, backlog_root, backlog_index)
         try:
@@ -996,7 +915,6 @@ class TestCmdClaimRaceIntegration:
             lt = threading.Thread(target=loser_thread, name="race-loser")
             wt.start()
             lt.start()
-            # loser sets winner_may_release in its finally block; join both.
             lt.join(timeout=30)
             wt.join(timeout=30)
         finally:
@@ -1078,11 +996,6 @@ class TestCmdClaimRaceIntegration:
         )
 
 
-# ---------------------------------------------------------------------------
-# AC-192-16: window-stats + proposal lifecycle stay workspace-shared
-# ---------------------------------------------------------------------------
-
-# Minimal backlog structure used by the workspace-shared invariant tests.
 _SHARED_WU_ALPHA = "E0-F1-S1-T1"
 _SHARED_WU_BETA = "E0-F1-S1-T2"
 
@@ -1148,20 +1061,17 @@ class TestWorkspaceSharedWindowStats:
         wu_alpha_path = workspace / f"backlog/E0/E0-F1/E0-F1-S1/{_SHARED_WU_ALPHA}.md"
         wu_beta_path = workspace / f"backlog/E0/E0-F1/E0-F1-S1/{_SHARED_WU_BETA}.md"
 
-        # Simulate session "alpha" making a transition for its task.
         alpha_state_dir = workspace / ".devbench" / "sessions" / "alpha"
         alpha_state_dir.mkdir(parents=True)
 
         mgr = BacklogManager()
         mgr._set_status(wu_alpha_path, backlog_index, _SHARED_WU_ALPHA, "in-progress")
 
-        # Simulate session "beta" making a transition for its own task.
         beta_state_dir = workspace / ".devbench" / "sessions" / "beta"
         beta_state_dir.mkdir(parents=True)
 
         mgr._set_status(wu_beta_path, backlog_index, _SHARED_WU_BETA, "in-progress")
 
-        # Both aggregates must be in the workspace-shared window-stats dir.
         shared_dir = aggregate_dir(workspace)
         assert shared_dir.is_dir(), f"Workspace-shared window-stats dir missing at {shared_dir}"
 
@@ -1177,7 +1087,6 @@ class TestWorkspaceSharedWindowStats:
         )
         assert agg_beta.transitions[0].new_status == "in-progress"
 
-        # No aggregate must exist inside any per-session state directory.
         for session_name in ("alpha", "beta"):
             per_session_stats = workspace / ".devbench" / "sessions" / session_name / "window-stats"
             assert not per_session_stats.exists(), (
@@ -1195,18 +1104,14 @@ class TestWorkspaceSharedWindowStats:
 
         workspace = tmp_path
 
-        # Create several session dirs to ensure nothing bleeds their path into
-        # the aggregate calculation.
         for name in ("alpha", "beta", "gamma"):
             (workspace / ".devbench" / "sessions" / name).mkdir(parents=True)
 
         path = aggregate_path(workspace, "E0-F1-S1-T1")
 
-        # The aggregate path must be exactly <workspace>/.devbench/window-stats/E0-F1-S1-T1.json
         assert path == workspace / ".devbench" / "window-stats" / "E0-F1-S1-T1.json", (
             f"aggregate_path returned {path!r}; expected workspace-rooted path"
         )
-        # Must not contain any sessions/ component.
         assert "sessions" not in path.parts, f"aggregate_path contains 'sessions' component: {path}"
 
     @pytest.mark.parametrize(
@@ -1231,11 +1136,9 @@ class TestWorkspaceSharedWindowStats:
 
         workspace = tmp_path
 
-        # Write aggregate via session alpha's context (still uses workspace_root).
         ts = _dt.datetime(2026, 5, 16, tzinfo=_dt.UTC)
         update_aggregate(workspace, wu_id, "in-progress", ts)
 
-        # Read aggregate as if from session beta's context (same workspace_root).
         agg = read_aggregate(workspace, wu_id)
         assert agg is not None, (
             f"Aggregate for {wu_id!r} written by session {session_name!r} "

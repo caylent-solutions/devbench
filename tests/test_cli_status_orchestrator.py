@@ -85,7 +85,6 @@ class TestResolveOrchestratorStateNoPidFile:
         assert state.uptime is None
 
     def test_pid_file_directory_not_present(self, tmp_path: Path) -> None:
-        # .devbench/ directory does not exist
         state = _resolve_orchestrator_state(tmp_path)
         assert state.status == "stopped"
         assert state.detail == "no pid file"
@@ -96,7 +95,6 @@ class TestResolveOrchestratorStateStalePid:
     """_resolve_orchestrator_state returns stopped (stale pid file) for dead PIDs."""
 
     def test_dead_pid_returns_stale_state(self, tmp_path: Path) -> None:
-        # 2**31-1 is the maximum valid PID and is guaranteed to not be alive
         dead_pid = 2**31 - 1
         _write_pid_file(tmp_path, dead_pid, mode="daemon")
         state = _resolve_orchestrator_state(tmp_path)
@@ -126,13 +124,11 @@ class TestResolveOrchestratorStateLivePid:
 
     def test_live_pid_uptime_format_under_24h(self, tmp_path: Path) -> None:
         live_pid = os.getpid()
-        # Start time 1h 30m 15s ago
         started = datetime.now(tz=UTC) - timedelta(hours=1, minutes=30, seconds=15)
         started_at = started.strftime("%Y-%m-%dT%H:%M:%SZ")
         _write_pid_file(tmp_path, live_pid, mode="foreground", started_at=started_at)
         state = _resolve_orchestrator_state(tmp_path)
         assert state.status == "running"
-        # Uptime should be HH:MM:SS
         assert state.uptime is not None
         parts = state.uptime.split(":")
         assert len(parts) == 3, f"Expected HH:MM:SS, got {state.uptime!r}"
@@ -146,14 +142,12 @@ class TestResolveOrchestratorStateLivePid:
 
     def test_live_pid_over_24h_uptime_format(self, tmp_path: Path) -> None:
         live_pid = os.getpid()
-        # Start time more than 24 hours ago
         started = datetime.now(tz=UTC) - timedelta(days=2, hours=3, minutes=5, seconds=10)
         started_at = started.strftime("%Y-%m-%dT%H:%M:%SZ")
         _write_pid_file(tmp_path, live_pid, mode="daemon", started_at=started_at)
         state = _resolve_orchestrator_state(tmp_path)
         assert state.status == "running"
         assert state.uptime is not None
-        # Over 24h: Dd HH:MM:SS
         assert "d " in state.uptime, f"Expected Dd HH:MM:SS format for >24h, got {state.uptime!r}"
         day_part, time_part = state.uptime.split("d ", 1)
         assert day_part.isdigit()

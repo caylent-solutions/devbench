@@ -59,15 +59,11 @@ class TestSuperviseConfigDefaults:
         assert SuperviseConfig().timeouts.ready_prompt_seconds == SUPERVISE_TIMEOUT_READY_PROMPT_SECONDS_DEFAULT
 
     def test_default_poll_interval(self) -> None:
-        # The stop-wait registry-poll / attach tail re-read cadence (Section 4.2/4.7).
         from devbench.constants import SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
 
         assert SuperviseConfig().timeouts.poll_interval_seconds == SUPERVISE_TIMEOUT_POLL_INTERVAL_SECONDS_DEFAULT
 
     def test_default_command_invocation_timeout(self) -> None:
-        # The safety timeout (seconds) bounding the short, non-interactive
-        # subprocess.run command invocations (screen -ls / screen -X quit /
-        # <tool> --version). Config-driven per FR-19 / Section 7.4 (no literals).
         from devbench.constants import SUPERVISE_TIMEOUT_COMMAND_INVOCATION_SECONDS_DEFAULT
 
         assert (
@@ -76,8 +72,6 @@ class TestSuperviseConfigDefaults:
         )
 
     def test_default_command_submit_quiet_timeout(self) -> None:
-        # The no-output quiet window (seconds) the slash-command submission waits
-        # for the autocomplete menu render to settle before sending Enter.
         from devbench.constants import SUPERVISE_TIMEOUT_COMMAND_SUBMIT_QUIET_SECONDS_DEFAULT
 
         assert (
@@ -86,8 +80,6 @@ class TestSuperviseConfigDefaults:
         )
 
     def test_default_command_submit_settle_timeout(self) -> None:
-        # The max render-settle wait (seconds) bounding the slash-command submission
-        # quiescence loop before Enter is sent regardless.
         from devbench.constants import SUPERVISE_TIMEOUT_COMMAND_SUBMIT_SETTLE_SECONDS_DEFAULT
 
         assert (
@@ -96,9 +88,6 @@ class TestSuperviseConfigDefaults:
         )
 
     def test_default_progress_stall_timeout(self) -> None:
-        # The progress watchdog stall window: how long the orchestrator log may go
-        # without growing (and no long-op heartbeat) before the supervisor
-        # classifies a work-progress stall and auto-restarts (design point 2).
         from devbench.constants import SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
 
         assert SuperviseConfig().timeouts.progress_stall_seconds == SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT
@@ -109,17 +98,11 @@ class TestSuperviseConfigDefaults:
         assert SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT == 600
 
     def test_default_long_op_heartbeat_interval(self) -> None:
-        # The long-running-command heartbeat cadence: the verify-ac runner emits a
-        # benign [LONG_OP_HEARTBEAT] line to the orchestrator log on this interval
-        # so a genuine 30-60 min terraform apply / go test keeps the progress
-        # watchdog's log-growth signal advancing (design point 4, mechanism a).
         from devbench.constants import SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT
 
         assert SuperviseConfig().timeouts.long_op_heartbeat_seconds == SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT
 
     def test_long_op_heartbeat_is_strictly_below_progress_stall(self) -> None:
-        # The heartbeat MUST fire before the watchdog trips, else a genuine long op
-        # would false-stall. The defaults must satisfy heartbeat < progress_stall.
         from devbench.constants import (
             SUPERVISE_LONG_OP_HEARTBEAT_SECONDS_DEFAULT,
             SUPERVISE_TIMEOUT_PROGRESS_STALL_SECONDS_DEFAULT,
@@ -131,7 +114,6 @@ class TestSuperviseConfigDefaults:
         assert SuperviseConfig().restart.max_attempts == SUPERVISE_RESTART_MAX_ATTEMPTS_DEFAULT
 
     def test_default_quota_max_resumes_is_none(self) -> None:
-        # null -> falls through to DEFAULT_MAX_QUOTA_RESUMES / env (Section 5.1).
         assert SuperviseConfig().quota.max_quota_resumes is None
 
     def test_default_detection_patterns(self) -> None:
@@ -144,18 +126,11 @@ class TestSuperviseConfigDefaults:
         assert cmds["orchestrate"] == SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["orchestrate"]
 
     def test_default_injectable_commands_include_loop_continuation(self) -> None:
-        # The turn-continuation re-inject (design point 6): when claude's
-        # interactive turn ends with a unit still in progress, the supervisor
-        # re-injects this command to deterministically re-drive the orchestrate loop
-        # across the turn boundary (the root-cause gap was no re-inject at all).
         cmds = SuperviseConfig().injectable_commands
         assert "loop_continuation" in cmds
         assert cmds["loop_continuation"] == SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["loop_continuation"]
 
     def test_default_detection_patterns_include_idle_input_prompt(self) -> None:
-        # The idle-input / turn-end-awaiting-input prompt (design point 6): distinct
-        # from working_prompt (esc to interrupt). Recognizing it lets the supervisor
-        # re-inject the continuation instead of silently waiting for the watchdog.
         patterns = SuperviseConfig().detection_patterns
         assert patterns.idle_input_prompt == SUPERVISE_DETECTION_PATTERNS_DEFAULT["idle_input_prompt"]
 
@@ -298,14 +273,11 @@ class TestSuperviseConfigParse:
     def test_detection_pattern_override(self) -> None:
         cfg = _parse_supervise_config(Path("cfg.yaml"), {"detection_patterns": {"ready_prompt": "CUSTOM>"}})
         assert cfg.detection_patterns.ready_prompt == "CUSTOM>"
-        # Unset patterns keep their defaults.
         assert cfg.detection_patterns.reset_at == SUPERVISE_DETECTION_PATTERNS_DEFAULT["reset_at"]
 
     def test_injectable_commands_extend_via_config(self) -> None:
-        # FR-28: a new injectable command added only via config (no code change).
         cfg = _parse_supervise_config(Path("cfg.yaml"), {"injectable_commands": {"compact": "/compact"}})
         assert cfg.injectable_commands["compact"] == "/compact"
-        # Built-in defaults remain available.
         assert cfg.injectable_commands["orchestrate"] == SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["orchestrate"]
 
 
@@ -315,18 +287,11 @@ class TestSuperviseEnvDenyGuard:
 
     @pytest.mark.parametrize("always_deny", list(SUPERVISE_ALWAYS_DENY_ENV_VARS))
     def test_whitelist_always_deny_via_negation_fails_fast(self, always_deny: str) -> None:
-        # A config that tries to remove an always-deny var by negating it in the
-        # deny-list is a fail-fast config error (Section 3.6.1). The always-deny set
-        # is the UNION of both billing modes' routing vars; it is non-removable
-        # regardless of the active billing mode.
         with pytest.raises(ValueError, match="always-deny"):
             _parse_supervise_config(Path("cfg.yaml"), {"env": {"deny_vars": [f"!{always_deny}"]}})
 
     @pytest.mark.parametrize("aws_var", list(SUPERVISE_AWS_PASSTHROUGH_ENV_VARS))
     def test_aws_creds_are_not_in_the_non_removable_guard(self, aws_var: str) -> None:
-        # AWS workload creds + region are in NEITHER mode's deny set, so they are
-        # NOT non-removable: a config may list them in deny_vars without tripping
-        # the whitelist guard (they pass through by default).
         assert aws_var not in SUPERVISE_ALWAYS_DENY_ENV_VARS
 
     def test_extra_deny_vars_accepted(self) -> None:

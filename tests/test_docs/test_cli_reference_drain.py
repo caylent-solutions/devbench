@@ -31,7 +31,7 @@ def _extract_section(text: str, heading: str) -> str:
     if idx == -1:
         return ""
     section_text = text[idx:]
-    level = len(heading.split(" ", maxsplit=1)[0])  # count leading '#'
+    level = len(heading.split(" ", maxsplit=1)[0])
     marker = "\n" + "#" * level + " "
     next_idx = section_text.find(marker, 1)
     if next_idx != -1:
@@ -56,7 +56,6 @@ class TestDrainSubcommandExists:
         text = _read_doc()
         section = _extract_section(text, "### `drain`")
         assert section, "### `drain` section must exist in cli-reference.md"
-        # Must have at least some content lines beyond the heading itself.
         lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
         assert len(lines) > 2, (
             "docs/cli-reference.md '### `drain`' section must contain substantive "

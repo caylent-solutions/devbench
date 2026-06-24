@@ -36,7 +36,7 @@ class TestStartingToRunning:
     def test_ready_then_inject_reaches_running(self) -> None:
         sm = SupervisorStateMachine()
         sm.on_event("ready")
-        assert sm.state == SUPERVISE_STATE_STARTING  # ready alone is not enough
+        assert sm.state == SUPERVISE_STATE_STARTING
         sm.on_event("orchestrate-injected")
         assert sm.state == SUPERVISE_STATE_RUNNING
 
@@ -44,7 +44,6 @@ class TestStartingToRunning:
         sm = SupervisorStateMachine()
         sm.on_event("ready")
         sm.on_event("orchestrate-injected")
-        # History carries (from, to, event) tuples for the supervisor.log line.
         assert (SUPERVISE_STATE_STARTING, SUPERVISE_STATE_RUNNING, "orchestrate-injected") in sm.history
 
 
@@ -97,8 +96,6 @@ class TestGracefulDrainTransitions:
         assert sm.state == SUPERVISE_STATE_DRAINING
 
     def test_draining_drain_complete_reaches_stopped(self) -> None:
-        # The in-flight WU finished + /exit sent: the operator-initiated graceful
-        # stop completes in ``stopped`` (exit 0), NOT a spontaneous completed-clean.
         sm = self._running()
         sm.on_event("drain-requested")
         sm.on_event("drain-complete")
@@ -107,7 +104,6 @@ class TestGracefulDrainTransitions:
         assert (SUPERVISE_STATE_DRAINING, SUPERVISE_STATE_STOPPED, "drain-complete") in sm.history
 
     def test_draining_stop_hard_still_reaches_stopped(self) -> None:
-        # The escalate-to-hard edge (graceful timeout) remains valid (Section 4.8).
         sm = self._running()
         sm.on_event("drain-requested")
         sm.on_event("stop-hard")

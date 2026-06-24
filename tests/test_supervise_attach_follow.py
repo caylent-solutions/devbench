@@ -38,8 +38,6 @@ class TestFollowPtyLog:
         log = tmp_path / "pty.log"
         log.write_text("first chunk\n", encoding="utf-8")
         written: list[str] = []
-        # should_continue returns True for the first two reads then False so the
-        # loop is bounded; the block step appends the next chunk before the read.
         calls = {"n": 0}
 
         def _should_continue() -> bool:
@@ -55,9 +53,6 @@ class TestFollowPtyLog:
         assert "second chunk" in joined
 
     def test_blocks_between_reads_no_busy_spin(self, tmp_path: Path) -> None:
-        # The loop MUST block (kernel-parked) once per iteration rather than
-        # re-reading in a tight spin: assert ``block`` was called exactly as many
-        # times as ``should_continue`` returned True.
         log = tmp_path / "pty.log"
         log.write_text("x\n", encoding="utf-8")
         blocks = {"n": 0}
@@ -71,7 +66,6 @@ class TestFollowPtyLog:
             blocks["n"] += 1
 
         follow_pty_log(log, write=lambda _s: None, should_continue=_should_continue, block=_block)
-        # Three iterations ran the loop body -> block was consulted on each.
         assert blocks["n"] == 3
 
     def test_no_duplicate_emission_of_already_followed_bytes(self, tmp_path: Path) -> None:
@@ -82,7 +76,7 @@ class TestFollowPtyLog:
 
         def _should_continue() -> bool:
             calls["n"] += 1
-            return calls["n"] <= 2  # two extra polls, no new bytes appended
+            return calls["n"] <= 2
 
         follow_pty_log(log, write=written.append, should_continue=_should_continue, block=lambda: None)
         assert "".join(written).count("alpha") == 1
@@ -93,9 +87,6 @@ class TestFollowPtyLog:
             follow_pty_log(missing, write=lambda _s: None, should_continue=lambda: False, block=lambda: None)
 
     def test_handles_log_appearing_after_start(self, tmp_path: Path) -> None:
-        # When the log is absent at the first poll but appears on a later poll
-        # (the __run supervisor has not flushed yet), follow keeps polling (does
-        # not fail) when wait_for_log=True, then streams once it appears.
         log = tmp_path / "pty.log"
         written: list[str] = []
         calls = {"n": 0}
@@ -103,8 +94,6 @@ class TestFollowPtyLog:
         def _should_continue() -> bool:
             calls["n"] += 1
             if calls["n"] == 1:
-                # First iteration: log absent -> the loop continues without
-                # reading. Create it now so the SECOND iteration finds it.
                 assert not log.exists()
                 return True
             if calls["n"] == 2:
@@ -118,8 +107,6 @@ class TestFollowPtyLog:
         assert "late start" in "".join(written)
 
     def test_truncation_re_follows_from_new_start(self, tmp_path: Path) -> None:
-        # A truncated/rotated log (shorter than the last offset) is re-followed
-        # from its new start rather than skipped (exercises the offset reset).
         log = tmp_path / "pty.log"
         log.write_text("aaaaaaaaaa\n", encoding="utf-8")
         written: list[str] = []
@@ -128,10 +115,10 @@ class TestFollowPtyLog:
         def _should_continue() -> bool:
             calls["n"] += 1
             if calls["n"] == 1:
-                return True  # iteration 1 reads the long content, offset advances
+                return True
             if calls["n"] == 2:
-                log.write_text("b\n", encoding="utf-8")  # truncate to shorter
-                return True  # iteration 2 sees len(data) < offset -> reset + read
+                log.write_text("b\n", encoding="utf-8")
+                return True
             return False
 
         follow_pty_log(log, write=written.append, should_continue=_should_continue, block=lambda: None)
@@ -145,20 +132,13 @@ class TestFollowBlockUntilReadable:
     """The production blocking wait parks the process on stdin + a bounded timeout."""
 
     def test_block_until_readable_returns_on_timeout(self) -> None:
-        # With no readable fd activity the wait returns after the bounded poll
-        # interval (kernel select timeout) WITHOUT time.sleep, so the follow loop
-        # re-reads on a bounded cadence rather than spinning.
         from devbench.supervise import _block_until_readable
 
-        # A very short poll interval keeps the test fast; the call must return
-        # (not raise, not hang) when nothing is readable within the interval.
         _block_until_readable(poll_interval_seconds=0.01)
 
     def test_block_until_readable_returns_promptly_when_fd_readable(self) -> None:
         from devbench.supervise import _block_until_readable
 
-        # A readable pipe fd stands in for the operator's stdin: select wakes
-        # immediately, so the wait returns without consuming the poll interval.
         read_fd, write_fd = _os.pipe()
         try:
             _os.write(write_fd, b"x")
@@ -172,9 +152,6 @@ class TestFollowBlockUntilReadable:
 
         from devbench import supervise
 
-        # With no explicit fd the wait resolves the real stdin fd via
-        # _stdin_fileno(); a readable pipe stands in for that fd so the success
-        # branch (a usable fileno) is exercised and the wait returns promptly.
         read_fd, write_fd = _os.pipe()
         try:
             _os.write(write_fd, b"x")
@@ -190,8 +167,6 @@ class TestFollowBlockUntilReadable:
 
         from devbench import supervise
 
-        # A real readable stream with a valid fileno() returns that fd (the
-        # success branch); a stream whose fileno() raises returns None.
         read_fd, write_fd = _os.pipe()
         try:
             with patch.object(supervise.sys, "stdin", _os.fdopen(read_fd, "rb", closefd=False)):

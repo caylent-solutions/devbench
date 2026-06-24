@@ -25,10 +25,6 @@ from devbench.scope import (
     session_scope_file_path,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture()
 def backlog_ids() -> list[str]:
@@ -66,11 +62,6 @@ def backlog_ids() -> list[str]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# AC-190-1: Single-ID tokens
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_single_id_exact_match_task(backlog_ids: list[str]) -> None:
     """Single task-level token matches only that exact WU (no children)."""
@@ -88,7 +79,6 @@ def test_single_id_story_matches_story_and_descendants(backlog_ids: list[str]) -
     assert sf.allows("E1-F1-S1-T1")
     assert sf.allows("E1-F1-S1-T2")
     assert sf.allows("E1-F1-S1-T3")
-    # S2 tasks must NOT be included
     assert not sf.allows("E1-F1-S2-T1")
 
 
@@ -100,7 +90,6 @@ def test_single_id_feature_matches_feature_and_descendants(backlog_ids: list[str
     assert sf.allows("E1-F1-S1")
     assert sf.allows("E1-F1-S1-T1")
     assert sf.allows("E1-F1-S2-T1")
-    # F2 must NOT be included
     assert not sf.allows("E1-F2-S1-T1")
 
 
@@ -111,13 +100,7 @@ def test_single_id_epic_matches_all_descendants(backlog_ids: list[str]) -> None:
     assert sf.allows("E1")
     assert sf.allows("E1-F1-S1-T1")
     assert sf.allows("E1-F2-S1-T1")
-    # E2 must NOT be included
     assert not sf.allows("E2-F1-S1-T1")
-
-
-# ---------------------------------------------------------------------------
-# AC-190-2: Range tokens -- expand on final numeric segment
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -147,7 +130,6 @@ def test_range_task_level(backlog_ids: list[str]) -> None:
     assert sf.allows("E1-F1-S1-T1")
     assert sf.allows("E1-F1-S1-T2")
     assert sf.allows("E1-F1-S1-T3")
-    # Story-level row is not automatically included when only tasks are named
     assert not sf.allows("E1-F1-S1")
 
 
@@ -204,27 +186,14 @@ def test_single_segment_range_same_value_is_single_id(backlog_ids: list[str]) ->
     assert not sf.allows("E1-F1-S1-T1")
 
 
-# ---------------------------------------------------------------------------
-# AC-190-3: Mixed tokens union correctly
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_mixed_tokens_union(backlog_ids: list[str]) -> None:
     """Comma-separated mixed tokens produce the union of their expansions."""
     sf = ScopeFilter.parse("E1-F2, E2-F1-S1-T1", "", backlog_ids)
-    # From E1-F2
     assert sf.allows("E1-F2-S1-T1")
-    # From E2-F1-S1-T1
     assert sf.allows("E2-F1-S1-T1")
-    # Not in either
     assert not sf.allows("E1-F1-S1-T1")
     assert not sf.allows("E3-F1-S1-T1")
-
-
-# ---------------------------------------------------------------------------
-# AC-190-4: --exclude subtracts from include
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -242,13 +211,7 @@ def test_exclude_specific_feature(backlog_ids: list[str]) -> None:
     sf = ScopeFilter.parse("E1", "E1-F2", backlog_ids)
     assert sf.allows("E1-F1-S1-T1")
     assert not sf.allows("E1-F2-S1-T1")
-    # The parent epic itself stays (it matched the include token)
     assert sf.allows("E1")
-
-
-# ---------------------------------------------------------------------------
-# AC-190-5: Reverse ranges raise InvalidScopeError
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -265,25 +228,14 @@ def test_reverse_task_range_raises(backlog_ids: list[str]) -> None:
         ScopeFilter.parse("E1-F1-S1-T3-T1", "", backlog_ids)
 
 
-# ---------------------------------------------------------------------------
-# AC-190-6: Out-of-range tokens warn but don't abort
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_out_of_range_token_warns_not_raises(backlog_ids: list[str], caplog: pytest.LogCaptureFixture) -> None:
     """Tokens with no matching WU in the backlog emit a warning and don't abort."""
     with caplog.at_level(logging.WARNING, logger="devbench.scope"):
         sf = ScopeFilter.parse("E99-F1-S1-T1", "", backlog_ids)
     assert any("E99-F1-S1-T1" in record.message for record in caplog.records)
-    # The filter is still valid; no IDs matched
     assert not sf.allows("E99-F1-S1-T1")
     assert not sf.allows("E1-F1-S1-T1")
-
-
-# ---------------------------------------------------------------------------
-# AC-190-7: Complex --include/--exclude intersection
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -295,11 +247,6 @@ def test_include_e1_e5_exclude_e2_e3(backlog_ids: list[str]) -> None:
     assert not sf.allows("E3-F1-S1-T1")
     assert sf.allows("E4-F1-S1-T1")
     assert sf.allows("E5-F1-S1-T1")
-
-
-# ---------------------------------------------------------------------------
-# AC-190-9: Empty include_str means include everything
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -319,11 +266,6 @@ def test_empty_include_with_exclude(backlog_ids: list[str]) -> None:
     assert sf.allows("E3-F1-S1-T1")
 
 
-# ---------------------------------------------------------------------------
-# allows() -- O(1) set-membership check
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_allows_id_not_in_set_returns_false(backlog_ids: list[str]) -> None:
     """allows() returns False for an ID not in expanded_ids."""
@@ -338,11 +280,6 @@ def test_allows_is_o1_membership(backlog_ids: list[str]) -> None:
     assert isinstance(sf.expanded_ids, set)
 
 
-# ---------------------------------------------------------------------------
-# Persistence methods -- to_file, from_file, clear
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_to_file_writes_scope_json(tmp_path: Path, backlog_ids: list[str]) -> None:
     """to_file writes a valid scope.json under <workspace>/.devbench/scope.json."""
@@ -354,7 +291,6 @@ def test_to_file_writes_scope_json(tmp_path: Path, backlog_ids: list[str]) -> No
     assert data["include"] == sf.include
     assert data["exclude"] == sf.exclude
     assert set(data["expanded_ids"]) == sf.expanded_ids
-    # Optional metadata fields are present
     assert "started_at" in data
     assert "started_by" in data
 
@@ -401,13 +337,7 @@ def test_clear_removes_scope_json(tmp_path: Path, backlog_ids: list[str]) -> Non
 @pytest.mark.unit
 def test_clear_idempotent_when_absent(tmp_path: Path) -> None:
     """clear() is a no-op (no exception) when scope.json does not exist."""
-    # Should not raise
     ScopeFilter.clear(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# AC-190-8: scope.json includes raw + expanded sets (schema validation)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -425,11 +355,6 @@ def test_scope_json_schema_has_required_fields(tmp_path: Path, backlog_ids: list
     assert isinstance(data["started_by"], str)
 
 
-# ---------------------------------------------------------------------------
-# ScopeFilter dataclass field types
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_scopefilter_field_types(backlog_ids: list[str]) -> None:
     """ScopeFilter fields have correct types after parse()."""
@@ -443,14 +368,8 @@ def test_scopefilter_field_types(backlog_ids: list[str]) -> None:
 def test_scopefilter_include_stores_raw_tokens(backlog_ids: list[str]) -> None:
     """include and exclude fields store the raw tokenised strings, not expanded IDs."""
     sf = ScopeFilter.parse("E1-E3, E5", "E2", backlog_ids)
-    # Raw tokens after stripping whitespace
     assert "E1-E3" in sf.include or any("E1" in t for t in sf.include)
     assert "E2" in sf.exclude or any("E2" in t for t in sf.exclude)
-
-
-# ---------------------------------------------------------------------------
-# Edge cases: whitespace tolerance
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -470,13 +389,7 @@ def test_scopefilter_include_stores_raw_tokens(backlog_ids: list[str]) -> None:
 def test_whitespace_tolerant_parsing(include_str: str, backlog_ids: list[str]) -> None:
     """parse() strips whitespace from tokens regardless of spacing."""
     sf = ScopeFilter.parse(include_str, "", backlog_ids)
-    # E1 range always produces E1 descendants
     assert sf.allows("E1-F1-S1-T1")
-
-
-# ---------------------------------------------------------------------------
-# Edge case: empty exclude_str
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -487,20 +400,9 @@ def test_empty_exclude_str_no_subtraction(backlog_ids: list[str]) -> None:
     assert sf_with.expanded_ids == sf_without.expanded_ids
 
 
-# ---------------------------------------------------------------------------
-# Integration-style: full workflow against a constructed fixture workspace
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Internal helper coverage -- _letter_prefix, _numeric_suffix, _current_user
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_letter_prefix_all_letters_returns_none() -> None:
     """_letter_prefix returns None when the segment has no trailing digit."""
-    # Segment is purely alphabetic -- no trailing integer
     assert _letter_prefix("abc") is None
 
 
@@ -543,7 +445,6 @@ def test_current_user_fallback_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.unit
 def test_range_token_matches_nothing_warns(caplog: pytest.LogCaptureFixture) -> None:
     """A range token that expands but matches no backlog IDs emits a warning."""
-    # Use a range that references E90-E91, which don't exist in a tiny backlog
     tiny_ids = ["E1-F1-S1-T1", "E2-F1-S1-T1"]
     with caplog.at_level(logging.WARNING, logger="devbench.scope"):
         sf = ScopeFilter.parse("E90-E91", "", tiny_ids)
@@ -560,15 +461,8 @@ def test_non_numeric_shared_letter_prefix_treated_as_single_id(backlog_ids: list
     trailing integer (_numeric_suffix returns None), so the ``pass`` branch in
     _expand_token is taken and the whole token is used as a single-ID prefix.
     """
-    # 'E1' and 'E2a' share letter prefix 'E' but 'E2a' has no pure numeric suffix
     sf = ScopeFilter.parse("E1-E2a", "", backlog_ids)
-    # 'E1-E2a' as a prefix matches nothing in backlog_ids
     assert len(sf.expanded_ids) == 0
-
-
-# ---------------------------------------------------------------------------
-# AC-190-5 extension: malformed token syntax raises InvalidScopeError (fail-fast)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -613,37 +507,20 @@ def test_malformed_token_in_exclude_str_raises(bad_token: str, backlog_ids: list
         ScopeFilter.parse("E1", bad_token, backlog_ids)
 
 
-# ---------------------------------------------------------------------------
-# Integration-style: full workflow against a constructed fixture workspace
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_integration_parse_write_read_allows(tmp_path: Path, backlog_ids: list[str]) -> None:
     """End-to-end: parse -> write scope.json -> read back -> allows() works."""
-    # Parse with include E1-E2, exclude E2-F1
     sf = ScopeFilter.parse("E1-E2", "E2-F1", backlog_ids)
     sf.to_file(tmp_path)
 
-    # Read back
     loaded = ScopeFilter.from_file(tmp_path)
 
-    # E1 descendants present
     assert loaded.allows("E1-F1-S1-T1")
-    # E2-F1 descendants excluded
     assert not loaded.allows("E2-F1-S1-T1")
-    # E2 epic itself still in expanded if it matched include before exclude stripped F1
-    # (E2 epic row stays; only E2-F1* subtree is removed)
     assert loaded.allows("E2")
 
-    # Cleanup
     ScopeFilter.clear(tmp_path)
     assert not (tmp_path / ".devbench" / "scope.json").exists()
-
-
-# ---------------------------------------------------------------------------
-# AC-190-8 extension: to_file return value, from_file error paths, format checks
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -718,9 +595,9 @@ def test_to_file_no_temp_file_left_on_success(tmp_path: Path, backlog_ids: list[
 @pytest.mark.parametrize(
     "bad_payload",
     [
-        {"include": "E1", "exclude": [], "expanded_ids": []},  # include is str not list
-        {"include": [], "exclude": "E2", "expanded_ids": []},  # exclude is str not list
-        {"include": [], "exclude": [], "expanded_ids": "E1-F1-S1-T1"},  # expanded_ids is str not list
+        {"include": "E1", "exclude": [], "expanded_ids": []},
+        {"include": [], "exclude": "E2", "expanded_ids": []},
+        {"include": [], "exclude": [], "expanded_ids": "E1-F1-S1-T1"},
     ],
 )
 def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) -> None:
@@ -741,12 +618,12 @@ def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) 
 @pytest.mark.parametrize(
     "bad_top_level",
     [
-        "[]",  # empty list
-        "[1, 2, 3]",  # non-empty list
-        '"a-bare-string"',  # bare string
-        "42",  # bare integer
-        "null",  # JSON null
-        "true",  # JSON bool
+        "[]",
+        "[1, 2, 3]",
+        '"a-bare-string"',
+        "42",
+        "null",
+        "true",
     ],
 )
 def test_from_file_non_object_top_level_raises(tmp_path: Path, bad_top_level: str) -> None:
@@ -767,11 +644,6 @@ def test_from_file_non_object_top_level_raises(tmp_path: Path, bad_top_level: st
         ScopeFilter.from_file(tmp_path)
 
 
-# ---------------------------------------------------------------------------
-# Optional path= parameter on to_file() and clear()
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 def test_to_file_with_explicit_path_writes_to_that_path(tmp_path: Path, backlog_ids: list[str]) -> None:
     """to_file(workspace_root, path=custom) writes to the supplied path, not the canonical one."""
@@ -783,7 +655,6 @@ def test_to_file_with_explicit_path_writes_to_that_path(tmp_path: Path, backlog_
     assert custom_path.exists(), "File must be written to the supplied path"
     data = json.loads(custom_path.read_text())
     assert data["include"] == ["E1"]
-    # Canonical path must NOT be created
     canonical = tmp_path / ".devbench" / "scope.json"
     assert not canonical.exists(), "Canonical scope.json must not be created when path= is supplied"
 
@@ -816,7 +687,6 @@ def test_clear_with_explicit_path_deletes_that_file(tmp_path: Path, backlog_ids:
 
     ScopeFilter.clear(tmp_path, path=custom_path)
     assert not custom_path.exists(), "Supplied path must be deleted by clear()"
-    # Canonical path must remain untouched (was never created)
     canonical = tmp_path / ".devbench" / "scope.json"
     assert not canonical.exists()
 
@@ -825,35 +695,25 @@ def test_clear_with_explicit_path_deletes_that_file(tmp_path: Path, backlog_ids:
 def test_clear_with_explicit_path_idempotent_when_absent(tmp_path: Path) -> None:
     """clear(path=custom) is a no-op when the supplied path does not exist."""
     custom_path = tmp_path / "sessions" / "gamma" / "scope.json"
-    # Must not raise even though the path was never created
     ScopeFilter.clear(tmp_path, path=custom_path)
-
-
-# ---------------------------------------------------------------------------
-# Parametrised round-trip integration tests for cmd_scope selector shapes
-# (AC-196-5 spec section 4.2.6.5 -- E2-F7-S1-T2)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "include_str, exclude_str, present_ids, absent_ids",
     [
-        # Single ID: only that task is in scope
         (
             "E1-F1-S1-T1",
             "",
             ["E1-F1-S1-T1"],
             ["E1-F1-S1-T2", "E2-F1-S1-T1"],
         ),
-        # Range E1-E3 plus E5 (mixed comma-separated) -- covers AC-196-5 shape
         (
             "E1-E3, E5",
             "",
             ["E1-F1-S1-T1", "E2-F1-S1-T1", "E3-F1-S1-T1", "E5-F1-S1-T1"],
             ["E4-F1-S1-T1"],
         ),
-        # Range E1-E3 with exclude E2-F1 -- covers AC-196-5 include+exclude shape
         (
             "E1-E3",
             "E2-F1",
@@ -892,11 +752,6 @@ def test_round_trip_selector_shapes(
         assert loaded.allows(wid), f"{wid} must be in scope after round-trip"
     for wid in absent_ids:
         assert not loaded.allows(wid), f"{wid} must not be in scope after round-trip"
-
-
-# ---------------------------------------------------------------------------
-# resolve_scope_file_path -- per-session path routing (spec 4.4.4, AC-192-1)
-# ---------------------------------------------------------------------------
 
 
 class TestResolveScopeFilePath:
@@ -970,12 +825,6 @@ class TestResolveScopeFilePath:
         assert result.name == "scope.json"
 
 
-# ---------------------------------------------------------------------------
-# Per-session path routing integration -- public helpers use session path
-# when DEVBENCH_SESSION_NAME is set (spec 4.4.4, AC-192-1)
-# ---------------------------------------------------------------------------
-
-
 class TestPerSessionScopeRouting:
     """All public scope helpers use per-session path when DEVBENCH_SESSION_NAME is set."""
 
@@ -998,7 +847,6 @@ class TestPerSessionScopeRouting:
         expected = tmp_path / ".devbench" / "sessions" / "team-a" / "scope.json"
         assert written == expected
         assert written.exists()
-        # Workspace-root path must NOT be created
         assert not (tmp_path / ".devbench" / "scope.json").exists()
 
     @pytest.mark.unit
@@ -1010,7 +858,6 @@ class TestPerSessionScopeRouting:
             written = sf.to_file(tmp_path, path=explicit)
         assert written == explicit
         assert written.exists()
-        # Session path must NOT be created
         session_path = tmp_path / ".devbench" / "sessions" / "ignored-session" / "scope.json"
         assert not session_path.exists()
 
@@ -1045,12 +892,10 @@ class TestPerSessionScopeRouting:
         falling back to workspace-root scope.json is a forbidden silent fallback
         (spec Code Standards: NO FALLBACK LOGIC).
         """
-        # Write to workspace-root path (no session env)
         original = ScopeFilter.parse("E1", "", backlog_ids)
         env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
         with patch.dict(os.environ, env, clear=True):
             original.to_file(tmp_path)
-        # Now attempt to read with a session set -- must raise, not silently use workspace-root
         with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "nonexistent-session"}, clear=False):
             with pytest.raises(FileNotFoundError):
                 ScopeFilter.from_file(tmp_path)
@@ -1103,7 +948,6 @@ class TestPerSessionScopeRouting:
         assert loaded.expanded_ids == original.expanded_ids
         assert loaded.allows("E1-F1-S1-T1")
         assert not loaded.allows("E2-F1-S1-T1")
-        # Workspace-root path must NOT exist
         assert not (tmp_path / ".devbench" / "scope.json").exists()
 
     @pytest.mark.unit

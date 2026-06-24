@@ -26,10 +26,6 @@ from devbench.backlog.amendment import (
 )
 from devbench.backlog.manifest import parse_manifest
 
-# ---------------------------------------------------------------------------
-# Shared fixture content (generic, backlog-agnostic)
-# ---------------------------------------------------------------------------
-
 WORK_UNIT_TEMPLATE = """\
 # {task_id}: Sample Task
 
@@ -98,11 +94,6 @@ def _valid_payload() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Full lifecycle: request -> apply -> verify
-# ---------------------------------------------------------------------------
-
-
 class TestAmendmentLifecycleHappyPath:
     def test_request_and_apply_updates_manifest(
         self,
@@ -127,7 +118,6 @@ class TestAmendmentLifecycleHappyPath:
             rc_apply = cli.cmd_apply_amendment(task_id)
         assert rc_apply == 0, capsys.readouterr().err
 
-        # Manifest now has the new row + audit comment present, request file gone.
         wu_content = (workspace / "backlog" / f"{task_id}.md").read_text(encoding="utf-8")
         rows = parse_manifest(wu_content)
         assert len(rows) == 2
@@ -159,13 +149,10 @@ class TestAmendmentLifecycleRejectPath:
 
         wu_content = (workspace / "backlog" / f"{task_id}.md").read_text(encoding="utf-8")
         rows = parse_manifest(wu_content)
-        # Manifest unchanged (still only the original row)
         assert len(rows) == 1
         assert rows[0].file == "tests/test_example.py"
-        # Audit + blocked status present
         assert AMENDMENT_REJECTED_ACTION in wu_content
         assert "## Status: blocked" in wu_content
-        # Pending request moved to rejected-requests archive (not deleted)
         assert not request_path(workspace, task_id).exists()
         archive_dir = workspace / ".devbench" / "rejected-requests"
         assert archive_dir.is_dir()
@@ -189,8 +176,6 @@ class TestAmendmentLifecycleRejectCleansStagedFiles:
     ) -> None:
         import subprocess as sp
 
-        # Build a tmp repo with one committed file + one staged production
-        # edit + one untracked file that also appears in the amendment.
         repo = tmp_path / "repo"
         repo.mkdir()
         sp.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -202,14 +187,10 @@ class TestAmendmentLifecycleRejectCleansStagedFiles:
         sp.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
         sp.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
 
-        # Executor mutates a tracked file AND adds a new untracked one, then
-        # stages both (the mutated one changes; the new one is a new-file add).
         (repo / "src" / "parser.py").write_text("prod fix staged\n")
         (repo / "src" / "new_util.py").write_text("new module\n")
         sp.run(["git", "add", "src/parser.py", "src/new_util.py"], cwd=repo, check=True, capture_output=True)
 
-        # Build a minimal devbench workspace with a pending amendment whose
-        # files_to_add name both of those paths.
         workspace = _build_workspace(tmp_path)
         task_id = "EX-F1-S1-T1"
         from devbench.backlog.amendment import write_request as _write
@@ -219,22 +200,15 @@ class TestAmendmentLifecycleRejectCleansStagedFiles:
             _make_request(task_id, ["src/parser.py", "src/new_util.py"]),
         )
 
-        # Run the amender's reject-branch cleanup recipe directly. We expand
-        # the file list from the pending request and invoke git restore +
-        # checkout + clean for each file.
         import json as _json
 
         request_data = _json.loads((workspace / ".devbench" / "amendments" / f"{task_id}.json").read_text())
         for entry in request_data["files_to_add"]:
             path = entry["path"]
-            # Unstage, restore, and clean so tracked edits revert and
-            # untracked additions disappear. Mirrors the recipe the agent
-            # prompt now runs.
             sp.run(["git", "-C", str(repo), "restore", "--staged", path], check=False, capture_output=True)
             sp.run(["git", "-C", str(repo), "checkout", "--", path], check=False, capture_output=True)
             sp.run(["git", "-C", str(repo), "clean", "-f", "--", path], check=False, capture_output=True)
 
-        # Now invoke reject-amendment (which blocks the task + archives).
         with (
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
             patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
@@ -242,7 +216,6 @@ class TestAmendmentLifecycleRejectCleansStagedFiles:
             rc = cli.cmd_reject_amendment(task_id, "files extend beyond the linked AC")
         assert rc == 0
 
-        # Verify the tmp repo is clean (no staged/unstaged/untracked).
         result = sp.run(
             ["git", "-C", str(repo), "status", "--porcelain=v1"],
             capture_output=True,
@@ -250,11 +223,9 @@ class TestAmendmentLifecycleRejectCleansStagedFiles:
             check=True,
         )
         assert result.stdout.strip() == "", f"repo not clean:\n{result.stdout}"
-        # And src/parser.py matches the original committed content.
         assert (repo / "src" / "parser.py").read_text() == "original\n"
         assert not (repo / "src" / "new_util.py").exists()
 
-        # Reject step also blocked the task and archived the request.
         wu_content = (workspace / "backlog" / f"{task_id}.md").read_text(encoding="utf-8")
         assert "## Status: blocked" in wu_content
         assert AMENDMENT_REJECTED_ACTION in wu_content
@@ -293,7 +264,6 @@ class TestAmendmentLifecycleDuplicateRequest:
         with patch("devbench.cli.WORKSPACE_ROOT", workspace):
             assert cli.cmd_request_amendment(task_id) == 0
 
-        # Second call with identical payload must be refused.
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_valid_payload())))
         with patch("devbench.cli.WORKSPACE_ROOT", workspace):
             rc = cli.cmd_request_amendment(task_id)
@@ -307,8 +277,6 @@ class TestAmendmentLifecycleRollback:
         workspace = _build_workspace(tmp_path)
         task_id = "EX-F1-S1-T1"
 
-        # Create a pending request whose justification introduces an em-dash.
-        # Layer 3 post-check catches this and must roll back the write.
         bad_payload = _valid_payload()
         bad_payload["justification"] = "fix needed\u2014see AC-TEST-001"
         rp = request_path(workspace, task_id)
@@ -339,7 +307,6 @@ class TestAmendmentLifecyclePreFilterDisabled:
         task_id = "EX-F1-S1-T1"
         backlog_index = workspace / "BACKLOG.md"
 
-        # Construct a request (from_dict, since AmendmentRequest is frozen)
         req = AmendmentRequest.from_dict(
             {"task_id": task_id, "requested_at": "2026-04-18T00:00:00+00:00", **_valid_payload()}
         )

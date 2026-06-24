@@ -48,7 +48,6 @@ class TestDraftWorkflowSectionPresence:
             "docs/zero-to-ready.md must contain a section describing the operator "
             "workflow when work units land in draft status (AC-189-9)."
         )
-        # Must have a dedicated section heading (not just incidental mentions).
         has_heading = (
             "## Working with draft" in text
             or "### Working with draft" in text
@@ -66,7 +65,6 @@ class TestDraftWorkflowSectionPresence:
         """The doc must describe the step of reviewing the generated backlog in draft."""
         text = self._text()
         lower = text.lower()
-        # The doc must mention reviewing / inspecting the backlog when WUs land in draft.
         assert "draft" in lower and ("review" in lower or "inspect" in lower or "examine" in lower), (
             "docs/zero-to-ready.md must document the step where the operator reviews "
             "the generated backlog before promoting draft work units (AC-189-9)."
@@ -109,7 +107,6 @@ class TestDraftWorkflowSectionPresence:
         """The doc must note that existing workspaces are unaffected (default is in-queue)."""
         text = self._text()
         lower = text.lower()
-        # The section must convey that omitting the config leaves behaviour at in-queue.
         has_default_note = (
             "default" in lower
             and "in-queue" in lower
@@ -169,8 +166,6 @@ class TestDraftStatusTaskLevelConstraint:
         examples, because validate-backlog check_16 rejects draft on epics/features/stories.
         """
         text = self._text()
-        # Match 'set-status <id> draft' where <id> does NOT contain a -T segment.
-        # Epic IDs: E7, E7-F1, E7-F1-S1 -- no '-T<digits>' in them.
         bad_pattern = re.compile(
             r"set-status\s+([A-Z]\d+(?:-F\d+(?:-S\d+)?)?)\s+draft",
             re.IGNORECASE,

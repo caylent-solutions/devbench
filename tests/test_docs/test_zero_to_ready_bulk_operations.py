@@ -34,7 +34,6 @@ def _extract_section(text: str) -> str:
     idx = text.find(_SECTION_HEADING)
     if idx == -1:
         return ""
-    # Find the next H2 heading after this one.
     next_h2 = text.find("\n## ", idx + len(_SECTION_HEADING))
     if next_h2 != -1:
         return text[idx:next_h2]
@@ -163,7 +162,6 @@ class TestBulkOperationsCodeExamples:
     def test_dry_run_in_code_block(self) -> None:
         """--dry-run must appear inside a code block (not just prose)."""
         section = self._section()
-        # Extract content of all code blocks.
         code_blocks = re.findall(r"```[^\n]*\n(.*?)```", section, re.DOTALL)
         code_text = "\n".join(code_blocks)
         assert "--dry-run" in code_text, (
@@ -223,9 +221,6 @@ class TestBulkOperationsTocEntry:
     def test_toc_entry_links_to_bulk_operations(self) -> None:
         """The ToC must have an anchor link to 'Bulk operations on the backlog'."""
         text = _read_doc()
-        # ToC entries are typically formatted as '- [Section Title](#anchor)'
-        # The anchor for 'Bulk operations on the backlog' would be
-        # '#bulk-operations-on-the-backlog'.
         has_toc_anchor = "#bulk-operations-on-the-backlog" in text or "Bulk operations on the backlog" in text
         assert has_toc_anchor, (
             "docs/zero-to-ready.md table of contents must include "

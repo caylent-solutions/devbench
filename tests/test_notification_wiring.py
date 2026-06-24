@@ -38,10 +38,6 @@ from devbench.backlog.proposal import (
 from devbench.constants import STATUS_BLOCKED, STATUS_IN_QUEUE
 from devbench.notifications import NOTIFICATION_STATE_FILENAME
 
-# ---------------------------------------------------------------------------
-# Minimal workspace fixtures (workspace-agnostic, AC-10)
-# ---------------------------------------------------------------------------
-
 _SOURCE_ROW = (
     "| E0-F1-S1-T1 | Source Task | Task | blocked | None "
     "| caylent-solutions/example | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"
@@ -156,11 +152,6 @@ def _cache_path(workspace_root: Path) -> Path:
     return workspace_root / ".devbench" / NOTIFICATION_STATE_FILENAME
 
 
-# ---------------------------------------------------------------------------
-# AC-3 / G3: materialise + promote fire their events
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestMaterialiseFiresEvent:
     """``materialise_proposal`` fires ``work_unit_materialised`` per draft (AC-3)."""
@@ -182,7 +173,6 @@ class TestMaterialiseFiresEvent:
         assert materialised.call_count == 2
         materialised_ids = {call.args[0] for call in materialised.call_args_list}
         assert materialised_ids == {"E0-F1-S1-T2", "E0-F1-S1-T3"}
-        # Source task id carried through for the payload's "From source" field.
         assert all(call.args[2] == "E0-F1-S1-T1" for call in materialised.call_args_list)
 
 
@@ -235,11 +225,6 @@ class TestPromoteFiresEvent:
         assert promoted_ids == {"E0-F1-S1-T2", "E0-F1-S1-T3"}
 
 
-# ---------------------------------------------------------------------------
-# AC-1 / AC-9 / G1: blocked notification routes off the shared write surface
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestBlockedRoutesOffWriteSurface:
     """Any ``blocked`` write -- not only ``mark_blocked`` -- reaches the dispatcher."""
@@ -253,8 +238,6 @@ class TestBlockedRoutesOffWriteSurface:
         with patch("devbench.notifications.notify_blocked_classification_transition") as dispatch:
             BacklogManager().force_status(wu, index, "E0-F1-S1-T1", STATUS_BLOCKED)
         dispatch.assert_called_once()
-        # classification arg (index 3) is the BlockedTaskState name; a bare
-        # blocked task with no co-blocker classifies OPERATOR_ACTION_REQUIRED.
         assert dispatch.call_args.args[0] == "E0-F1-S1-T1"
         assert dispatch.call_args.args[3] == "OPERATOR_ACTION_REQUIRED"
 
@@ -266,8 +249,6 @@ class TestBlockedRoutesOffWriteSurface:
         with patch("devbench.notifications.notify_blocked_classification_transition") as dispatch:
             BacklogManager().mark_blocked(wu, index, "E0-F1-S1-T1", "done-gate refused mark-done")
         dispatch.assert_called_once()
-        # The reason flows from the [BLOCKED] audit comment written just before
-        # the status flip, so the Slack context carries this call's reason.
         assert "done-gate refused mark-done" in dispatch.call_args.args[2]
 
     def test_operator_blocked_ping_fires_once_at_block_time(self, tmp_path: Path) -> None:
@@ -291,13 +272,7 @@ class TestBlockedRoutesOffWriteSurface:
             side_effect=OSError("slack down"),
         ):
             BacklogManager().force_status(wu, index, "E0-F1-S1-T1", STATUS_BLOCKED)
-        # Status write succeeded despite the notifier raising.
         assert "## Status: blocked" in wu.read_text()
-
-
-# ---------------------------------------------------------------------------
-# AC-2 / G2: leave-blocked invalidates the cache so a re-block re-notifies
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -309,7 +284,6 @@ class TestLeaveBlockedInvalidatesCache:
         index = _make_task_index(tmp_path, "E0-F1-S1-T1")
         mgr = BacklogManager()
 
-        # First block writes the cache entry (toggle on so it fires + caches).
         with (
             patch("devbench.notifications.is_event_enabled", return_value=True),
             patch("devbench.notifications.notify_work_unit_blocked_operator"),
@@ -318,7 +292,6 @@ class TestLeaveBlockedInvalidatesCache:
         cache = json.loads(_cache_path(tmp_path).read_text(encoding="utf-8"))
         assert cache == {"E0-F1-S1-T1": "OPERATOR_ACTION_REQUIRED"}
 
-        # Requeue OUT of blocked -> the write-surface hook invalidates the entry.
         mgr.force_status(wu, index, "E0-F1-S1-T1", STATUS_IN_QUEUE)
         cache = json.loads(_cache_path(tmp_path).read_text(encoding="utf-8"))
         assert "E0-F1-S1-T1" not in cache

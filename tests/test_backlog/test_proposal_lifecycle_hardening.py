@@ -100,7 +100,6 @@ class TestEnforceCascadeDepth:
     """Issue #144."""
 
     def test_below_cap_passes(self) -> None:
-        # No exception.
         enforce_cascade_depth({"cascade_depth": 0}, 3)
         enforce_cascade_depth({"cascade_depth": 1}, 3)
         enforce_cascade_depth({"cascade_depth": 2}, 3)
@@ -307,7 +306,6 @@ class TestClassifyBlockedConsidersRegularDeps:
             regular_deps=[("E0-F1-S1-T2", "done")],
             markers=[],
         )
-        # Query an ID that is NOT in the parsed index.
         assert _regular_deps_unsatisfied(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T999") is False
 
     def test_regular_deps_helper_returns_false_when_index_missing(self, tmp_path) -> None:

@@ -79,22 +79,14 @@ from typing import IO, Any, NamedTuple
 
 import pexpect
 
-# Resolved once at import time so each watch tick doesn't re-PATH-search.
-# Used by `cmd_report --watch` to clear both the viewport AND the scrollback
-# between frames. The fallback escape sequence ``\033c`` is the VT100 RIS
-# (Reset to Initial State) -- works on every modern terminal but is more
-# disruptive (resets colors). Prefer the OS clear binary when available.
 _TERMINAL_CLEAR_CMD: str | None = shutil.which("clear") or shutil.which("cls")
 
 
-# Pre-parse --config before any devbench imports so that config.py loads the
-# correct YAML at module import time (config.py reads DEVBENCH_CONFIG_PATH on import).
 def _pre_parse_config(argv: list[str]) -> None:
     """Extract --config <path> from argv and set DEVBENCH_CONFIG_PATH env var."""
     for i, arg in enumerate(argv):
         if arg == "--config" and i + 1 < len(argv):
             os.environ["DEVBENCH_CONFIG_PATH"] = argv[i + 1]
-            # Remove --config and its value so downstream parsing is unaffected.
             argv.pop(i + 1)
             argv.pop(i)
             return
@@ -273,11 +265,6 @@ from devbench.quota import (
     save_checkpoint,
     wait_for_reset,
 )
-
-# Re-export from reporting so existing ``cli._format_duration`` callers and tests
-# resolve unchanged after the function moved to report.py for the issue #161
-# orchestrator-alive banner. Single source of truth lives in report.py because
-# the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
 from devbench.scope import (
     InvalidScopeError,
@@ -681,13 +668,11 @@ def _resolve_scope_for_status(parsed: _StatusArgs) -> _ScopeResolution:
         A :class:`_ScopeResolution` instance.  Check ``error`` first.
     """
     if parsed.include or parsed.exclude:
-        # One-off per-command override -- no persistence (AC-190-11).
         return _ScopeResolution(
             has_scope=True,
             include=_tokenise(parsed.include) if parsed.include else [],
             exclude=_tokenise(parsed.exclude) if parsed.exclude else [],
         )
-    # Consult active scope.json when no flags supplied (AC-190-10).
     try:
         raw = _read_scope_banner_data(WORKSPACE_ROOT)
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -737,7 +722,6 @@ def _extract_session_from_wu(wu: WorkUnit) -> str | None:
         return None
     content = wu.file_path.read_text(encoding="utf-8")
 
-    # Extract only the Comments section to avoid false matches in other sections.
     comments_start = content.find(COMMENTS_SECTION_HEADER)
     if comments_start == -1:
         return None
@@ -748,7 +732,6 @@ def _extract_session_from_wu(wu: WorkUnit) -> str | None:
     for line in comments_body.splitlines():
         if "[WU_CLAIMED]" not in line:
             continue
-        # Look for session=<token> in the line; token ends at next whitespace or EOL.
         idx = line.find(session_marker)
         if idx == -1:
             continue
@@ -802,9 +785,6 @@ def cmd_status(*argv: str) -> int:
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     all_units = parser.parse_index()
 
-    # AC-192-12: when --session <name> is given, filter to only WUs whose most
-    # recent [WU_CLAIMED] audit names that session.  Without --session, the full
-    # aggregated list is used (AC-192-13).
     units = [u for u in all_units if _extract_session_from_wu(u) == parsed.session] if parsed.session else all_units
 
     counts: dict[str, int] = {}
@@ -893,7 +873,6 @@ def _print_blocked_row(u: WorkUnit, units_by_id: dict[str, WorkUnit]) -> None:
     plus any unsuperseded ``[BLOCKED]`` audit lines beneath it."""
     wu_file = _resolve_unit_file(u)
     content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
-    # Issue #148: walk the markers and surface only non-terminal targets.
     markers = [
         marker
         for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
@@ -908,10 +887,6 @@ def _print_blocked_row(u: WorkUnit, units_by_id: dict[str, WorkUnit]) -> None:
         note_parts.append(f"blocker {unsatisfied}")
     note = ", ".join(note_parts) if note_parts else "no open marker / blocker found"
     print(f"  {u.id} -- {u.title}  ({note})")
-    # Issue #153: surface most-recent unsuperseded ``[BLOCKED]`` audit so
-    # the operator sees WHY the task is blocked. Audits superseded by a
-    # later ``[UNBLOCKED]`` / ``[CASCADE_RESOLVED]`` are filtered out
-    # (the file stays append-only; only the rendered panel hides stale rows).
     for audit in _unsuperseded_blocked_audits(content):
         print(f"      {audit}")
 
@@ -984,14 +959,10 @@ def _print_blocked_rejection_categories(blocked_tasks: list[WorkUnit]) -> None:
 
 _HOLD_COMMENT_RE: re.Pattern[str] = re.compile(r"\[HOLD\]\s+(.+?)(?:\n|$)")
 
-# Issue #158: regex matching the structured-log line:
-#   2026-05-02T12:34:56Z [logger] LEVEL ... Set <id> to 'in-progress'
 _LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
     r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (\S+) to 'in-progress'",
     re.MULTILINE,
 )
-# Fallback: agent-comment audit row of the form
-#   [2026-05-02 12:34 UTC] [agent/orchestrator] Set <id> to 'in-progress'
 _AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+UTC\][^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
 )
@@ -1153,7 +1124,6 @@ def _build_scope_for_next(
         except Exception as exc:
             return None, f"ERROR: invalid scope token: {exc}"
 
-    # No flags -- consult scope.json.
     try:
         raw = _read_scope_banner_data(WORKSPACE_ROOT)
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -1263,7 +1233,6 @@ def _classify_next_stall(
     if cyclic_ids:
         return in_queue_count, "cyclic", cyclic_ids
 
-    # Remaining case: awaiting-dep (dep not done, not hold, not cyclic).
     seen: set[str] = set()
     awaiting_ids: list[str] = []
     for task in in_queue_tasks:
@@ -1337,21 +1306,11 @@ def cmd_next(*argv: str) -> int:
 
     candidates = backlog_parser.get_parallel_candidates(units, scope=scope_filter)
 
-    # Serialize claims (tracked-issue 002): every claim shares ONE target-repo
-    # checkout, so a NEW in-queue unit must not be offered while the
-    # concurrently-in-progress cap is already saturated -- otherwise two
-    # in-progress units leak each other's uncommitted files into get-diff. Count
-    # the units currently IN-PROGRESS; if that meets the cap, drop IN_QUEUE
-    # candidates so only resumable IN_PROGRESS candidates remain.
     in_progress_ids = [u.id for u in units if u.status is WorkUnitStatus.IN_PROGRESS]
     serialize_cap = _resolve_max_parallel_in_progress()
     dropped_by_serialize = False
     if len(in_progress_ids) >= serialize_cap:
         kept = [c for c in candidates if c.status is WorkUnitStatus.IN_PROGRESS]
-        # The serialized reason is reported ONLY when the cap actually suppressed
-        # an otherwise-actionable in-queue candidate -- so a genuine dependency
-        # stall (candidates already empty before filtering) still reports its real
-        # cause rather than being masked as "serialized, busy".
         dropped_by_serialize = len(kept) < len(candidates)
         candidates = kept
 
@@ -1359,9 +1318,6 @@ def cmd_next(*argv: str) -> int:
         if scope_filter is not None:
             print("NO_ACTIONABLE_IN_SCOPE")
         elif dropped_by_serialize:
-            # Distinct from a genuine stall: the loop is serialized and busy, not
-            # wedged. Name the in-progress unit(s) so the operator/loop can tell
-            # "serialized, retry later" from "nothing actionable left".
             print("NO_ACTIONABLE")
             ids_str = ", ".join(in_progress_ids)
             print(
@@ -1430,10 +1386,6 @@ def cmd_claim(unit_id: str) -> int:
         print(placeholder_error, file=sys.stderr)
         return 1
 
-    # Pre-claim target-repo guard (issue #241) -> CLAIM_BLOCKED_PRECLAIM (44), and
-    # serialize-claims backstop (tracked-issue 002) -> CLAIM_DEFERRED_SERIALIZED
-    # (47). Both are folded into one pre-lock check that returns the exit code to
-    # surface (or None to proceed), keeping cmd_claim within the PLR0911 budget.
     preclaim_rc = _claim_preflight_guard(unit, wu_file, unit_id, units)
     if preclaim_rc is not None:
         return preclaim_rc
@@ -1444,10 +1396,6 @@ def cmd_claim(unit_id: str) -> int:
         print(error_message, file=sys.stderr)
         return 1
 
-    # TDI-006: before the executor starts, evict any foreign (non-manifest)
-    # orphaned WIP left in the target checkout by a prior interrupted unit so
-    # every executor begins from a known-clean tree. The claimed unit's own
-    # manifest work is preserved; evicted WIP is parked in a recoverable stash.
     _clean_foreign_wip_on_claim(unit)
 
     logger.info("Claimed %s (set to in-progress)", unit_id)
@@ -1485,9 +1433,7 @@ def _claim_write_unresolved_repo_marker(wu_file: Path, unit_id: str, repo: str) 
     if marker_tag in content:
         return
 
-    # Rewrite the status line to blocked in the WU file.
     updated = STATUS_LINE_RE.sub(r"\g<1>blocked", content)
-    # Append the audit comment embedding the marker tag.
     timestamp = datetime.now(UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = f"[{timestamp}] [backlog_manager] [BLOCKED] target repo unresolvable: {marker_tag}\n"
     if COMMENTS_SECTION_HEADER in updated:
@@ -1496,12 +1442,6 @@ def _claim_write_unresolved_repo_marker(wu_file: Path, unit_id: str, repo: str) 
         updated = updated.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
     wu_file.write_text(updated, encoding="utf-8")
 
-    # Synchronise the BACKLOG_INDEX row to ``blocked``. ``force_status`` updates
-    # both the WU file status line and the index row without appending a second
-    # audit comment (unlike ``mark_blocked`` which would append a duplicate).
-    # The WU file status is already ``blocked`` from the direct write above;
-    # ``_set_status`` rewrites it to the same value (idempotent on the WU file)
-    # while correctly updating the index row.
     BacklogManager().force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_BLOCKED)
 
 
@@ -1513,9 +1453,6 @@ def _claim_placeholder_error(wu_file: Path, unit_id: str) -> str | None:
     when the manifest is clean. Extracted so ``cmd_claim`` stays within the PLR0911
     return-statement budget.
     """
-    # Use a fresh import path so the unit-test layer's
-    # `patch("devbench.cli.BacklogManager", ...)` does not stub out the
-    # placeholder-detection classmethod via attribute lookup on the mock.
     from devbench.backlog.manager import BacklogManager as _BacklogManager
 
     placeholder = _BacklogManager._first_placeholder_manifest_cell(wu_file.read_text(encoding="utf-8"))
@@ -1610,13 +1547,11 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
     """
     try:
         with flock_backlog(WORKSPACE_ROOT):
-            # Re-read the on-disk status under the lock to detect concurrent claims.
             current_content = wu_file.read_text(encoding="utf-8")
             status_match = BACKLOG_STATUS_RE.search(current_content)
             if status_match is None:
                 return f"ERROR: cannot claim {unit_id!r}: no '## Status:' line found in {wu_file}"
             current_status = status_match.group(1).strip().lower()
-            # Only in-queue or in-progress (resume) are valid claim targets.
             if current_status not in (STATUS_IN_QUEUE, STATUS_IN_PROGRESS):
                 raise ClaimRaceError(
                     unit_id=unit_id,
@@ -1682,11 +1617,9 @@ def cmd_set_status(*argv: str) -> int:
     """
     args = list(argv)
 
-    # Detect bulk mode: --include flag present anywhere in args.
     if "--include" in args:
         return _cmd_set_status_bulk(args)
 
-    # Cascade mode: <id> <status> --cascade
     if "--cascade" in args:
         cascade_args = [a for a in args if a != "--cascade"]
         if len(cascade_args) != 2:
@@ -1714,7 +1647,6 @@ def cmd_set_status(*argv: str) -> int:
             BacklogManager(),
         )
 
-    # Single-ID form: exactly 2 positional args.
     if len(args) != 2:
         print(
             "ERROR: set-status usage: set-status <id> <status>  OR  "
@@ -2190,13 +2122,6 @@ def cmd_mark_done(*argv: str) -> int:
         print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
         return 1
 
-    # Issue #156: prior review-judge rejections must be either resolved
-    # ([REJECTION_FEEDBACK_RESOLVED] audit logged) or escalated via
-    # [NEEDS_DEP] before the task can transition to done. Otherwise the
-    # done-gate refuses with a clear actionable error and emits a
-    # [REJECTION_FEEDBACK_OUTSTANDING] audit so subsequent runs can see why.
-    # This guard applies to both paths: an already-satisfied unit must not
-    # carry unresolved rejection feedback either.
     outstanding = _outstanding_rejection_categories(unit_id, wu_file)
     if outstanding:
         mgr_audit = BacklogManager()
@@ -2522,24 +2447,11 @@ def cmd_sync_blocked() -> int:
                 continue
             content = wu_file.read_text(encoding="utf-8")
             if _has_open_proposal_marker(content, units_by_id):
-                # Issue #148: only skip when at least one marker target is
-                # still non-terminal. Stale markers pointing at finished
-                # tasks no longer represent active cascade work and must
-                # not pin this task in the blocked panel forever.
                 continue
             manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
-            # Issue #153: ``[UNBLOCKED] deps satisfied`` is the canonical
-            # supersession marker for the panel renderer.
             manager._append_comment(wu_file, "UNBLOCKED", "deps satisfied; sync-blocked dependencies now terminal")
             flipped_to_in_queue.append(unit.id)
 
-    # Issues #207, #209: classification-transition pass.  Re-classify every
-    # task still ``blocked`` after the sweep and route through the
-    # transition-aware notifier so a stale ``[BLOCKED]`` audit that has
-    # drifted into ANY of the seven blocked classes since the last
-    # write-site run produces exactly one Slack ping (gated by the
-    # per-class toggle in ``devbench.yaml``).  Cache-backed and
-    # idempotent: repeated ``sync-blocked`` calls do not duplicate pings.
     _notify_blocked_classification_transitions(units)
 
     output = {
@@ -2607,10 +2519,6 @@ def _notify_blocked_classification_transitions(units: list) -> None:
         title = (unit.title or unit.id).strip()
         reason = f"sync-blocked classification: {state.name}"
         notify_blocked_classification_transition(unit.id, title, reason, state.name, workspace_root)
-    # Prune any cache entries that no longer correspond to a blocked task --
-    # tasks that left ``blocked`` (to ``in-queue`` / ``done`` / etc.) since
-    # the last sweep.  Without this, re-entering ``blocked`` later with the
-    # same class would be silently suppressed by the stale cached value.
     prune_notification_state_for_unblocked(workspace_root, blocked_task_ids)
 
 
@@ -2673,7 +2581,6 @@ def cmd_reconcile_cascade() -> int:
         content = wu_file.read_text(encoding="utf-8")
         marker_ids = sorted(set(_BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)))
 
-        # Marker evaluation: every target must be terminal AND known.
         open_markers: list[str] = []
         unresolved_marker = ""
         for marker in marker_ids:
@@ -2702,7 +2609,6 @@ def cmd_reconcile_cascade() -> int:
             )
             continue
 
-        # Regular-dep evaluation.
         if not BacklogParser._deps_satisfied(unit, units_by_id):
             unsatisfied_dep_id = _first_unsatisfied_dep(unit, units_by_id)
             reason = (
@@ -2729,19 +2635,12 @@ def cmd_reconcile_cascade() -> int:
         if marker_ids:
             message = f"[CASCADE_RECONCILED] markers {marker_ids} terminal and regular deps satisfied; re-queuing"
         elif _FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX in content:
-            # TDI-002: the unit's only blocker was the SIGTERM shutdown safeguard
-            # (no marker, deps satisfied). It was merely interrupted; re-queue it
-            # with a distinct audit so the operator sees no action was required.
             message = "[REQUEUED_AFTER_STOP] interrupted on orchestrator stop; no structural blocker; re-queuing"
         else:
             message = "[CASCADE_RECONCILED] regular deps satisfied; re-queuing"
         manager._append_agent_comment(wu_file, "backlog_manager", message)
         flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
 
-    # Issues #207, #209: surface classification transitions for tasks that remain
-    # blocked after the reconcile sweep -- a stale ``[BLOCKED]`` audit that
-    # has drifted into ``OPERATOR_ACTION_REQUIRED`` produces exactly one
-    # Slack ping.  Cache-backed, idempotent across repeated invocations.
     _notify_blocked_classification_transitions(units)
 
     output: dict[str, object] = {"flipped": flipped, "skipped": skipped, "escalated": escalated}
@@ -2767,13 +2666,11 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
     for dep_id in unit.dependencies:
         dep = units_by_id.get(dep_id)
         if dep is None:
-            # Unknown dep -- treat as satisfied (validate-backlog reports it).
             continue
         if dep.unit_type is WorkUnitType.TASK:
             if dep.status not in terminal:
                 return dep_id
             continue
-        # Non-task dep: scan descendant tasks.
         for descendant in units_by_id.values():
             if (
                 descendant.id != dep_id
@@ -2857,7 +2754,6 @@ def _all_unsatisfied_deps(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> l
             if dep.status not in terminal:
                 result.append(dep_id)
             continue
-        # Non-task dep: scan descendant tasks.
         for descendant in units_by_id.values():
             if (
                 descendant.id != dep_id
@@ -2950,10 +2846,6 @@ def _cascade_circuit_breaker_fire(
     )
 
 
-# Captures the audit-comment classifier tag (``[BLOCKED]`` / ``[UNBLOCKED]`` /
-# ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk
-# the Comments section in chronological order and drop ``[BLOCKED]`` rows
-# that have been superseded by a later positive transition.
 _BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED)\](?P<rest>[^\n]*)")
 
 
@@ -2982,7 +2874,6 @@ def _unsuperseded_blocked_audits(content: str) -> list[str]:
         if tag == "BLOCKED":
             pending_audits.append(line.strip())
         else:
-            # UNBLOCKED / CASCADE_RESOLVED supersedes every prior BLOCKED.
             pending_audits = []
     return pending_audits
 
@@ -3102,20 +2993,11 @@ def _parse_id_and_reason_cascade(
     return task_id, reason, cascade
 
 
-# ---------------------------------------------------------------------------
-# Shared cascade traversal engine (issue #245)
-# ---------------------------------------------------------------------------
-
-#: Statuses ineligible for ``hold``: already held or terminal.
 _HOLD_INELIGIBLE: frozenset[WorkUnitStatus] = frozenset(
     {WorkUnitStatus.HOLD, WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
 )
 
-#: Statuses ineligible for ``decline``: already terminal.
 _DECLINE_INELIGIBLE: frozenset[WorkUnitStatus] = frozenset({WorkUnitStatus.DONE, WorkUnitStatus.DECLINED})
-
-#: Statuses ineligible for ``unhold``: all statuses except hold.
-#: (unhold eligibility = IS hold; ineligible = is NOT hold)
 
 
 def _cascade_depth_key(unit_id: str) -> int:
@@ -3193,7 +3075,6 @@ def cascade_status_mutation(
 
     units_by_id = {u.id: u for u in units}
 
-    # Sort depth-descending: Tasks (most hyphens) first, Epics last.
     sorted_ids = sorted(descendant_ids, key=_cascade_depth_key, reverse=True)
 
     cascade_reason = f"[CASCADE_FROM {root_id}] {reason}"
@@ -3202,7 +3083,6 @@ def cascade_status_mutation(
         unit = units_by_id[unit_id]
         current_status = unit.status.value.lower().replace(" ", "-")
 
-        # Evaluate eligibility for the requested operation.
         if op == "hold":
             eligible = unit.status not in _HOLD_INELIGIBLE
         elif op == "unhold":
@@ -3210,7 +3090,6 @@ def cascade_status_mutation(
         elif op == "decline":
             eligible = unit.status not in _DECLINE_INELIGIBLE
         else:
-            # set-status:<target>: skip terminal descendants.
             eligible = unit.status not in _DECLINE_INELIGIBLE
 
         if not eligible:
@@ -3232,7 +3111,6 @@ def cascade_status_mutation(
             mgr.mark_declined(wu_file, BACKLOG_INDEX, unit_id, cascade_reason)
             logger.info("Cascade declined %s from %s: %s", unit_id, root_id, reason)
         else:
-            # set-status:<target>
             target_status = op[len("set-status:") :]
             mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, target_status)
             mgr._append_agent_comment(
@@ -3349,7 +3227,6 @@ def cmd_unhold(*argv: str) -> int:
         return parsed
     task_id, reason, cascade = parsed
 
-    # Non-cascade path requires --reason (existing behaviour preserved).
     if not cascade and not reason:
         print("ERROR: unhold requires <id> --reason <message>", file=sys.stderr)
         return 1
@@ -3548,7 +3425,6 @@ def _promote_bulk(scope_id: str) -> int:
         )
         return 1
 
-    # Validate all files exist before writing anything (fail-fast, no partial writes)
     resolved: list[tuple[WorkUnit, Path]] = []
     for u in draft_units:
         wu_file = _resolve_unit_file(u)
@@ -3613,7 +3489,6 @@ def _promote_all(*, skip_confirmation: bool) -> int:
             print("Promotion aborted.", file=sys.stderr)
             return 1
 
-    # Validate all files exist before writing anything (fail-fast, no partial writes)
     resolved: list[tuple[WorkUnit, Path]] = []
     for u in draft_units:
         wu_file = _resolve_unit_file(u)
@@ -3658,7 +3533,6 @@ def cmd_validate_backlog(*argv: str) -> int:
     actionable error messages if any inconsistencies remain.
     """
     fix = "--fix" in argv
-    # Resolve strict mode: CLI flag overrides config default.
     config_strict = getattr(RUNTIME_CONFIG.validate, "strict_manifest_conflicts", False)
     strict = config_strict or ("--strict" in argv) or ("--include-draft" in argv)
     mgr = BacklogManager()
@@ -3699,16 +3573,10 @@ def cmd_reconcile_backlog_md(*argv: str) -> int:
     mgr = BacklogManager()
 
     if not force:
-        # No-flag and --check-only both need a drift report without writing.
-        # Delegate to reconcile_backlog_md to detect drift and obtain the
-        # reconciled content for reporting (avoids re-implementing the derivation).
         rc, reconciled = mgr.reconcile_backlog_md(WORKSPACE_ROOT, force=False, check_only=check_only)
         if rc == 1:
-            # check_only mode: drift detected
             return 1
         if not check_only:
-            # No-flag mode: print a mismatch report using the reconciled content
-            # returned by the manager; no write occurs.
             content = BACKLOG_INDEX.read_text(encoding="utf-8")
             if reconciled != content:
                 print("Status Summary drift detected -- run 'devbench reconcile-backlog-md --force' to fix.")
@@ -3716,7 +3584,6 @@ def cmd_reconcile_backlog_md(*argv: str) -> int:
                 print("Status Summary is consistent with the Full Work Unit Index.")
         return 0
 
-    # --force path
     rc, _reconciled = mgr.reconcile_backlog_md(WORKSPACE_ROOT, force=True, check_only=False)
     if rc == 2:
         print("ERROR: failed to rewrite BACKLOG.md -- check file permissions.", file=sys.stderr)
@@ -4101,10 +3968,6 @@ def cmd_cost_calibrate(*argv: str) -> int:
     event_index = EventIndex.open(WORKSPACE_ROOT)
     try:
         hook_log_path = WORKSPACE_ROOT / "hook-logs.jsonl"
-        # Refresh the hook-log cache FIRST so ``first_hook_transcript_path``
-        # has rows to read on the lookup that follows; without this order
-        # the lookup on a cold cache returns None even when the live hook
-        # log carries ``transcript_path`` entries.
         event_index.refresh_hook_log(hook_log_path)
         transcript_path_raw = event_index.first_hook_transcript_path(hook_log_path)
         transcript_dir = Path(transcript_path_raw).parent if transcript_path_raw else None
@@ -4119,11 +3982,6 @@ def cmd_cost_calibrate(*argv: str) -> int:
     finally:
         event_index.close()
 
-    # Sum per-model spend at the CURRENT rate table to derive each
-    # model's share of total reported spend.  We do NOT compose the
-    # existing correction_factor here -- the new factor replaces (not
-    # multiplies) whatever was there before so successive calibrations
-    # don't compound.
     per_model_spend: dict[str, float] = {}
     from devbench.reporting.report import _compute_cost
 
@@ -4148,11 +4006,6 @@ def cmd_cost_calibrate(*argv: str) -> int:
     print(f"cost-calibrate: reported total = ${reported_total:.4f}, actual = ${actual_usd:.4f}")
     print(f"cost-calibrate: derived global correction factor = {global_correction:.6f}")
 
-    # Same correction is applied to every observed model id because the
-    # operator only supplies one aggregate USD figure; per-model
-    # differentiation would require per-model invoice data, which
-    # Anthropic does not break out today.  Operators with a per-model
-    # invoice can edit the resulting yaml manually for finer control.
     write_per_model_correction_factors(config_yaml, per_model_spend.keys(), global_correction)
     print(f"cost-calibrate: wrote correction_factor={global_correction:.6f} for {len(per_model_spend)} model(s)")
     return 0
@@ -4190,9 +4043,6 @@ def write_per_model_correction_factors(config_yaml: Path, model_ids: Iterable[st
                 f"cost-calibrate: report.models.{model_id} is not a mapping in {config_yaml}; "
                 "cannot inject correction factor."
             )
-        # If the operator has NOT listed this model's input/output yet,
-        # seed them from the canonical defaults so the resulting yaml is
-        # immediately valid (the schema requires both fields).
         if "input" not in entry or "output" not in entry:
             from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES, DEFAULT_MODEL_RATES
 
@@ -4200,7 +4050,6 @@ def write_per_model_correction_factors(config_yaml: Path, model_ids: Iterable[st
             entry.setdefault("input", seed.input)
             entry.setdefault("output", seed.output)
         entry["correction_factor"] = float(correction_factor)
-    # Atomic write to avoid partial reads if cost-calibrate is interrupted.
     tmp = config_yaml.with_suffix(config_yaml.suffix + ".tmp")
     tmp.write_text(_yaml.safe_dump(raw, sort_keys=False, default_flow_style=False), encoding="utf-8")
     tmp.replace(config_yaml)
@@ -4262,7 +4111,6 @@ def cmd_report(
 
     from devbench.reporting.report import generate_report
 
-    # AC-192-12: resolve per-session log when --session is provided.
     session_name: str | None = session if session else None
     if session_name is not None:
         session_log = _resolve_session_report_log(session_name)
@@ -4272,14 +4120,8 @@ def cmd_report(
     else:
         log_file = _resolve_log_file_path()
 
-    # A pending drain is operationally load-bearing context (the orchestrator
-    # stops after the current WU) -- surface it in the report exactly as
-    # cmd_status does (AC-188-7 parity).
     _render_drain_banner(WORKSPACE_ROOT)
 
-    # Resolve scope (AC-190-10, AC-190-11): per-command flags take
-    # precedence over an active scope.json; when neither is present,
-    # scope_filter is None and generate_report uses the full backlog.
     scope_args = _StatusArgs(include=include, exclude=exclude)
     scope = _resolve_scope_for_status(scope_args)
     if scope.error:
@@ -4297,28 +4139,10 @@ def cmd_report(
     if since:
         since_dt = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
-    # Issue #163 streaming-default contract:
-    # - --since is always one-shot (a frozen-window snapshot doesn't
-    #   benefit from continuous refresh).
-    # - --once forces one-shot (script / CI consumer escape hatch).
-    # - stdout-not-a-TTY forces one-shot (piping / redirecting).
-    # - --watch N is deprecated but still works; falls through to
-    #   streaming mode with a warning.
-    # - default on TTY -> streaming.
     is_tty = sys.stdout.isatty()
     force_once = once or (since_dt is not None) or not is_tty
 
     if force_once:
-        # Issue #162 Phase 6: serve from the materialised snapshot when
-        # fresh (orchestrator log unchanged since the snapshot was
-        # written). Skips log parsing + per-window aggregation; falls
-        # back to live ``generate_report`` when the snapshot is stale,
-        # missing, or invalidated by a schema-version mismatch. The
-        # ``--since`` path always recomputes because a frozen-window
-        # snapshot is never the right answer for a custom-window query.
-        # When a scope filter or session filter is active, bypass the
-        # snapshot (the snapshot was rendered against the full backlog
-        # and the aggregate log, not a session-specific view).
         if since_dt is None and scope_filter is None and session_name is None:
             from devbench.reporting.snapshot import read_snapshot
 
@@ -4343,10 +4167,6 @@ def cmd_report(
             stacklevel=2,
         )
 
-    # Streaming mode. Build a closure over the constant inputs so the
-    # streaming loop's render_fn signature matches what
-    # devbench.reporting.streaming.stream_report expects (log_path
-    # keyword argument; everything else closed over).
     from devbench.reporting.streaming import stream_report
 
     report_started_at = datetime.now(UTC)
@@ -4447,9 +4267,6 @@ def cmd_write_snapshot(*argv: str) -> int:
     rebuilds via the live aggregation path.
     """
     if argv:
-        # No flags currently. Reject extras early so a future ``--force``
-        # flag etc. doesn't silently absorb garbage from an upgraded
-        # caller that uses a flag this version doesn't know.
         print(
             f"ERROR: cmd_write_snapshot takes no arguments; got {argv!r}",
             file=sys.stderr,
@@ -4820,9 +4637,6 @@ def run_with_long_op_heartbeat(
     started = time.monotonic()
 
     def _beat() -> None:
-        # Event-driven cadence: wait returns True the instant the op finishes
-        # (stop.set in the finally) -> loop exits; False on the interval timeout
-        # -> emit one beat. No fixed sleep, no busy-wait (CLAUDE.md Section 7.5).
         while not stop.wait(heartbeat_interval_seconds):
             emit_heartbeat(elapsed=int(time.monotonic() - started))
 
@@ -4835,13 +4649,6 @@ def run_with_long_op_heartbeat(
         thread.join()
 
 
-#: A coverage.py invocation: a ``pytest --cov`` flag (``--cov``, ``--cov=...``,
-#: ``--cov-report``, ``--cov-fail-under``) OR the ``coverage`` runner as a WORD
-#: (``coverage run`` / ``coverage report`` / ``coverage combine`` -- never a
-#: mere substring like ``discover`` / ``recover``). Such a command writes the
-#: coverage SQLite db to the shared default ``.coverage`` file in the checkout;
-#: repeated/overlapping runs in one checkout deadlock on its lock (tracked-issue
-#: 001), so verify-ac isolates each onto a unique ``COVERAGE_FILE``.
 _COVERAGE_COMMAND_RE: re.Pattern[str] = re.compile(r"--cov\b|\bcoverage\b")
 
 
@@ -4958,33 +4765,15 @@ def _run_verification_item(
         gate_env = verification.deterministic_gate_env(
             dict(os.environ), seed=VERIFY_AC_PYTEST_SEED, pin_randomly=pin_randomly
         )
-        # Tracked-issue 001: a coverage.py command writes to the shared default
-        # ``.coverage`` SQLite db in the checkout; repeated/overlapping verify-ac
-        # coverage runs contend on its lock and deadlock (a false
-        # CLAIM_NOT_CONVERGING). Isolate THIS run onto a unique COVERAGE_FILE so
-        # it can never contend, and clean it up after. A NON-coverage command is
-        # left untouched -- a command that legitimately READS an existing
-        # ``.coverage`` must not be surprised by an injected override.
         isolated_coverage_file: str | None = None
         if _command_uses_coverage(command):
             isolated_coverage_file = _unique_coverage_file_path()
             gate_env["COVERAGE_FILE"] = isolated_coverage_file
-        # The command can be a 30-60 min terraform apply / go test that produces
-        # NO orchestrator-log output while it blocks. Wrap it in the long-op
-        # heartbeat (design point 4): a benign [LONG_OP_HEARTBEAT] line is written
-        # to THIS process's logger (which IS the orchestrator log the supervise
-        # progress watchdog tails) on the configured cadence, so a healthy long op
-        # keeps the watchdog's log-growth signal advancing and is never false-stalled.
         heartbeat_interval = RUNTIME_CONFIG.supervise.timeouts.long_op_heartbeat_seconds
 
         def _emit_heartbeat(*, elapsed: int) -> None:
             logger.info(_format_long_op_heartbeat(verb="verify-ac", unit=task_id, elapsed_seconds=elapsed))
 
-        # Launch the live command in its OWN process group and register that
-        # pgid for the active session, so a [CLAIM_NOT_CONVERGING] block can tear
-        # down exactly this command's subtree (e.g. a live ``terraform apply`` /
-        # ``go test``) instead of orphaning it to init (Item B, tracked issue
-        # 015). The registration is cleared the instant the command terminates.
         try:
             rc, stdout, stderr = run_with_long_op_heartbeat(
                 run=lambda: run_command_in_process_group(
@@ -4999,9 +4788,6 @@ def _run_verification_item(
                 emit_heartbeat=_emit_heartbeat,
             )
         finally:
-            # Tracked-issue 001: always tear down the per-invocation isolated
-            # coverage data file (and any parallel siblings) so the temp path
-            # never accumulates -- even if the run raised.
             if isolated_coverage_file is not None:
                 _cleanup_coverage_data_files(isolated_coverage_file)
     finished_at = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
@@ -5092,10 +4878,6 @@ def cmd_verify_ac(unit_id: str) -> int:
     executable = verification.executable_items(items)
     attempt = verification.next_attempt_number(WORKSPACE_ROOT, unit_id)
 
-    # Probe the target repo ONCE: only pin pytest-randomly's seed flag when the
-    # plugin is actually installed there (otherwise pytest would error on the
-    # unknown ``--randomly-seed`` option). ``PYTHONHASHSEED`` is pinned either
-    # way. Skip the probe entirely when there is nothing executable to run.
     pin_randomly = bool(executable) and verification.pytest_randomly_available(repo_path, run_command)
 
     records: list[verification.EvidenceRecord] = []
@@ -5167,7 +4949,7 @@ def _run_tdd_gate_with_evidence(
     from devbench import tdd_gate
 
     if tdd_gate.extract_red_exit_code(content) is None:
-        return None  # no RED entry recorded -- gate not applicable
+        return None
 
     gate_content = content
     captured = _tool_captured_red_exit(records)
@@ -5252,18 +5034,6 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         print(f"ERROR: verdict must be 'pass' or 'fail', got '{verdict}'", file=sys.stderr)
         return 1
 
-    # Judge-name allowlist (single source of truth in
-    # ``devbench.constants.KNOWN_JUDGE_NAMES``). The set is intentionally
-    # broader than ``ALL_REQUIRED_JUDGE_NAMES``: only the canonical 5
-    # reviewer names satisfy the done-gate's
-    # ``_last_round_all_passed`` check, but workflow agents
-    # (``task_factory``, ``blocker_resolver``, ``manifest_amender``,
-    # ``executor``) legitimately write audit-only verdicts that are
-    # visible in the Comments section but do not count toward the gate.
-    # Refusing typos here prevents the malformed
-    # ``log-verdict <agent> <id> pass <message>`` shape from landing in
-    # the audit trail with a junk judge field that confuses reviewers
-    # and the done-gate's bookkeeping.
     judge_clean = judge_name.strip()
     if judge_clean not in KNOWN_JUDGE_NAMES:
         valid = ", ".join(sorted(KNOWN_JUDGE_NAMES))
@@ -5311,7 +5081,6 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
     atomic_write_text(wu_file, content)
 
-    # Log feedback for audit trail.
     if feedback:
         logger.info("%s judge feedback for %s: %s", judge_name, unit_id, feedback)
 
@@ -5500,28 +5269,11 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     wu_file = _resolve_unit_file(unit)
     mgr = BacklogManager()
 
-    # Re-affirm the working tree is on the configured branch before
-    # committing. ensure_branch is a no-op when HEAD is already correct
-    # but corrects drift (detached HEAD, switched branch from a previous
-    # task, etc.) without an operator round-trip. commit_local then runs
-    # its own assert_on_branch as a final fail-fast guard.
     ops.ensure_branch(canonical_repo, repo_path, branch)
 
-    # Orphan-pattern check: refuse to commit when any staged path matches
-    # a build/state pattern (terraform state, terragrunt cache, Python
-    # pycache, etc.). This guards against the class of pollution that
-    # bypasses the manifest-scope assertion when an agent's Manifest
-    # accidentally lists such a path or when files slip through unstaged
-    # paths. On detection, auto-emit a cleanup proposal so the cascade
-    # self-heals; the original task moves to blocked-pending-proposal.
     if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
         return 1
 
-    # Manifest-scope check: every staged path must be in the work unit's
-    # Changes Manifest. Catches the TRACE_FILE / dst/ / fixture-pollution
-    # class of bug deterministically before commit. Skipped only when the
-    # work-unit file isn't resolvable (orchestrator runs without a backlog
-    # context never reach this path in practice).
     manifest_paths: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
@@ -5882,10 +5634,6 @@ def _legacy_emit_orphan_cleanup_proposal(
         ],
     )
 
-    # Proposals are materialised at ``proposed`` (see materialise_proposal).
-    # Promotion to ``in-queue`` is gated by ``task_factory.auto_accept_proposals``:
-    # when true the cleanup task is promoted immediately so the orchestrator can
-    # claim it; when false it is left at ``proposed`` for operator review.
     auto_accept_proposals: bool = RUNTIME_CONFIG.task_factory.auto_accept_proposals
 
     try:
@@ -5959,7 +5707,7 @@ def _find_existing_cleanup_proposal(detected: list[str]) -> str | None:
     cleanup proposal targets the same global pattern set so any match is a
     valid de-duplication target.
     """
-    del detected  # reserved for future per-task pattern subsetting
+    del detected
     proposals_dir = WORKSPACE_ROOT / ".devbench" / "proposals"
     if not proposals_dir.is_dir():
         return None
@@ -6294,9 +6042,6 @@ def _wire_orphan_cleanup_dep_chain(
         peer_paths = {entry.file for entry in entries}
         if not peer_paths & target_paths:
             continue
-        # Add the dep on the EXISTING claimant -- it depends on the
-        # cleanup landing first, so the cleanup commits its
-        # devbench-managed block before the peer rebases on top.
         from devbench.backlog.proposal import add_dep
 
         add_dep(
@@ -6310,7 +6055,6 @@ def _wire_orphan_cleanup_dep_chain(
     return sorted(wired)
 
 
-# Mirror of git_orphans.DEVBENCH_GITIGNORE_HEADER for lazy-imported docstring contexts.
 DEVBENCH_GITIGNORE_HEADER_LITERAL: str = "# devbench-managed: tracked-orphan cleanup defaults"
 
 
@@ -6415,7 +6159,6 @@ def cmd_git_ops(unit_id: str) -> int:
     if DEFER_PR:
         return _git_ops_deferred(unit_id, unit, canonical_repo, repo_path, branch)
 
-    # Standard mode: commit, push, PR, CI, merge.
     commit_message = f"{unit_id}: {unit.title}"
     pr_title = f"{unit_id}: {unit.title}"
     pr_body = f"Automated PR for work unit {unit_id}.\n\n{unit.title}"
@@ -6430,14 +6173,9 @@ def cmd_git_ops(unit_id: str) -> int:
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
 
-    # Orphan-pattern check (see _git_ops_deferred for rationale): refuse
-    # the commit on detection, auto-emit cleanup proposal, return non-zero.
     if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
         return 1
 
-    # Manifest-scope check: every staged path must be in the work unit's
-    # Changes Manifest. Catches scope-violation pollution deterministically
-    # before commit. Skipped only when the work-unit file isn't resolvable.
     manifest_paths: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
@@ -6456,7 +6194,6 @@ def cmd_git_ops(unit_id: str) -> int:
 
     notify_pr_opened(unit_id, canonical_repo, pr_url)
 
-    # Extract PR number from URL (e.g. https://github.com/org/repo/pull/42)
     pr_number_str = pr_url.rstrip("/").split("/")[-1]
     if not pr_number_str.isdigit():
         print(f"ERROR: Could not parse PR number from URL: {pr_url}", file=sys.stderr)
@@ -6477,10 +6214,6 @@ def cmd_git_ops(unit_id: str) -> int:
             mgr=mgr,
         )
 
-    # Issue #116: PR review-comment polling phase. Returns non-zero rc=3 when
-    # an agent in the configured allowlist requests changes; the executor retry
-    # loop handles re-invocation. No-op (immediate merge) when the phase is
-    # disabled OR no signals are configured.
     review_rc = _handle_pr_review_resolution(
         ops=ops,
         unit_id=unit_id,
@@ -6859,10 +6592,6 @@ def _handle_finalize_known_task_failure(
     Returns 2 in all cases (cascade-capped or not).  Separated from
     :func:`_handle_finalize_ci_result` to reduce its branch count.
     """
-    # Cascade-depth cap: check if the first-level recovery (depth=1) would
-    # exceed MAX_CASCADE_DEPTH.  With MAX_CASCADE_DEPTH=1, even depth=1
-    # is capped (1 >= 1); with MAX_CASCADE_DEPTH=N, up to N-1 recovery
-    # levels are allowed.
     try:
         enforce_cascade_depth({"cascade_depth": 1}, MAX_CASCADE_DEPTH)
     except CascadeDepthError:
@@ -6929,10 +6658,6 @@ def _handle_finalize_ci_result(
             wu_file = _resolve_unit_file(most_recent)
             if wu_file is not None:
                 mgr._append_agent_comment(wu_file, "git_ops", f"[CI_GREEN] {pr_url}")
-        # Issue #219: fire `ci_pass` Slack ping so operators running
-        # ``auto_merge: false`` get an explicit "PR ready for manual merge"
-        # signal.  Default-off toggle (off in the schema) keeps existing
-        # workspaces silent on upgrade.
         from devbench.notifications import notify_ci_pass
 
         notify_unit_id = most_recent.id if most_recent is not None else "finalize"
@@ -6949,10 +6674,6 @@ def _handle_finalize_ci_result(
         return 2
 
     if isinstance(ci_result, CIResult.FAILED_KNOWN_TASK):
-        # Issue #219: fire `ci_failure` Slack ping at the dispatch point so
-        # the call happens regardless of the cascade-cap branch inside the
-        # known-task helper.  Attempt sentinel = 1 (the finalize path has no
-        # retry counter today; documented for future enhancement).
         from devbench.notifications import notify_ci_failure
 
         notify_ci_failure(ci_result.task_id, repo, pr_url, 1)
@@ -6963,7 +6684,6 @@ def _handle_finalize_ci_result(
             mgr=mgr,
         )
 
-    # FAILED_UNKNOWN: block the most-recent active task.
     if most_recent is not None:
         _finalize_audit_and_block(
             most_recent,
@@ -6971,10 +6691,6 @@ def _handle_finalize_ci_result(
             f"[CI_FAILED_BATCH_PR] {pr_url} (unknown attribution)",
             mgr,
         )
-    # Issue #219: fire `ci_failure` Slack ping even on unknown-attribution
-    # failures so the operator knows the batch PR's CI failed.  Use the
-    # most-recent active task as the representative unit; fall back to the
-    # symbolic "finalize" sentinel when no WU is in flight.
     from devbench.notifications import notify_ci_failure
 
     notify_unit_id = most_recent.id if most_recent is not None else "finalize"
@@ -7047,21 +6763,10 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
     logger.info("Pushed branch %s to %s", branch, canonical_repo)
 
-    # Issue #220: probe for an existing open PR BEFORE calling create_pr so
-    # we can distinguish fresh creation from re-encountering an
-    # already-open PR.  Without this check, every restart of a finalize
-    # cycle that hits an already-pushed branch fires a misleading
-    # ":git: PR opened" Slack ping even though nothing was opened.
     pre_existing_pr = ops.find_open_pr(canonical_repo, branch, repo_path=repo_path)
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
     logger.info("Created PR: %s", pr_url)
 
-    # Issue #219 + #220: fire ``pr_opened`` Slack ping ONLY when this run
-    # actually created the PR (pre_existing_pr was None).  The batch PR
-    # carries every WU in the single-branch run, so there is no single
-    # ``unit_id`` -- use the most-recent active task as the
-    # representative, falling back to the symbolic "finalize" sentinel
-    # when no WU is in flight.
     if pre_existing_pr is None:
         parser_for_notify = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
         units_for_notify = parser_for_notify.parse_index()
@@ -7091,9 +6796,6 @@ def cmd_watch(watch_interval: int = 0) -> int:
     """
     from devbench.activity import collect_snapshot, render_snapshot
 
-    # Canonical resolver (env -> yaml -> logs/orchestrator.log default) so
-    # `watch`, the orchestrator writer, and `report` all read/write the same
-    # file (previously this hand-rolled the path and ignored yaml log_file).
     log_file = _resolve_log_file_path()
     hook_log = WORKSPACE_ROOT / "hook-logs.jsonl"
 
@@ -7255,9 +6957,6 @@ def cmd_hook_tail(*argv: str) -> int:
             return 2
         orchestrator_session_id = env_session
 
-    # Precedence: CLI --tz > DEVBENCH_DISPLAY_TIMEZONE env > yaml display_timezone
-    # > OS local. DISPLAY_TIMEZONE encodes (env > yaml); resolve_timezone
-    # itself falls back to the OS zone when its argument is None/empty.
     from devbench.config import DISPLAY_TIMEZONE
 
     try:
@@ -7462,7 +7161,6 @@ def _devbench_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-#: Deterministic audit marker emitted by the startup harness-integrity check.
 HARNESS_INTEGRITY_MARKER: str = "[HARNESS_INTEGRITY]"
 
 
@@ -7493,8 +7191,6 @@ def _check_harness_integrity(mode: str) -> int | None:
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        # Not a git checkout / git unavailable: cannot have tracked uncommitted
-        # edits. Degrade gracefully -- never block on our own tooling failure.
         return None
     if result.returncode != 0:
         return None
@@ -7584,8 +7280,6 @@ def _resolve_orchestrator_model() -> str:
     return model.strip()
 
 
-#: Fail-closed error message emitted by ``cmd_start`` when guard hooks are absent.
-#: Verbatim string required by spec AC-H4-1 (E8.F4.S1).
 _GUARD_HOOKS_ABSENT_ERROR: str = (
     "ERROR: devbench guard hooks not loaded; refusing to run"
     " (done-integrity cannot be enforced)."
@@ -7665,71 +7359,30 @@ def _should_auto_restart_after_no_actionable() -> tuple[bool, list[str]]:
     return True, runtime_degraded
 
 
-# ---------------------------------------------------------------------------
-# Drain-enforcement sentinel (spec section 4.3.3, AC-188-4/5/8)
-# ---------------------------------------------------------------------------
-
-#: Audit-log prefix written to the orchestrator log when cmd_start intercepts
-#: a cmd_claim attempt while a drain signal is pending.  Format:
-#: ``[ORCHESTRATOR_DRAIN_ENFORCED] reason=<text-or-none>``.
 _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX: str = "[ORCHESTRATOR_DRAIN_ENFORCED] reason="
 
-#: Audit marker emitted when quota wait begins (AC-236-1, Appendix A QW-7).
-#: Format: ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>``
 _QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
 
-#: Audit marker emitted when quota wait ends in recovery (AC-236-1, Appendix A QW-7).
-#: Format: ``[QUOTA_RESUMED] waited_seconds=<int>``
 _QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
 
-#: Audit marker emitted when the recovery probe is permanently unavailable
-#: (no/invalid API credential) and no provider-supplied reset time is known, so
-#: the orchestrator stops the wait immediately instead of polling a probe that
-#: can never succeed.  Format: ``[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>``
 _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX: str = "[QUOTA_PROBE_UNAVAILABLE]"
 
-#: Audit marker emitted when ``on_exhaustion=fail`` (detection) or
-#: ``on_exhaustion_timeout=fail`` (timeout) aborts the run by re-raising the
-#: quota error for a non-zero exit.  Format: ``[QUOTA_FAIL_FAST] reason=<source>``
 _QUOTA_FAIL_FAST_AUDIT_PREFIX: str = "[QUOTA_FAIL_FAST]"
 
-#: Audit marker emitted when ``on_exhaustion=drain`` (detection) or
-#: ``on_exhaustion_timeout=drain`` (timeout) requests a graceful drain instead
-#: of waiting / instead of failing.
-#: Format: ``[QUOTA_DRAIN_REQUESTED] reason=<source> phase=<detection|timeout>``
 _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX: str = "[QUOTA_DRAIN_REQUESTED]"
 
-#: Audit marker emitted when ``on_exhaustion_timeout=keep_waiting`` elects not
-#: to escalate after the wait cap elapsed (the Makefile restart loop re-enters).
-#: Format: ``[QUOTA_TIMEOUT_KEEP_WAITING] reason=<source>``
 _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX: str = "[QUOTA_TIMEOUT_KEEP_WAITING]"
 
-#: ``_stop_reason`` strings returned by the quota dispatch when a graceful drain
-#: was requested.  ``cmd_start`` checks membership to know it must NOT cancel the
-#: drain signal in its exit ``finally`` blocks (the signal must survive so the
-#: restart loop / a peer session drains).
 _QUOTA_STOP_REASON_DRAIN_DETECTION: str = "quota-drain-requested"
 _QUOTA_STOP_REASON_DRAIN_TIMEOUT: str = "quota-wait-timeout-drain"
 _QUOTA_DRAIN_STOP_REASONS: frozenset[str] = frozenset(
     {_QUOTA_STOP_REASON_DRAIN_DETECTION, _QUOTA_STOP_REASON_DRAIN_TIMEOUT}
 )
 
-#: ``_stop_reason`` string returned by :func:`_dispatch_quota_detection` when a
-#: quota wait recovered.  This value is NOT terminal: ``cmd_start`` treats it as
-#: the signal to re-open a FRESH ``ClaudeSDKClient`` session and resume the
-#: orchestrate skill on the remaining backlog (bounded by
-#: :func:`_resolve_max_quota_resumes`).  Single-sourced so the dispatch, the
-#: cmd_start resume loop, and the notification classifier never drift on the
-#: literal.
 _QUOTA_STOP_REASON_WAIT_RECOVERED: str = "quota-wait-recovered"
 
-#: HTTP timeout in seconds for the ``recovery_probe`` API call issued during
-#: quota wait polling.  A short timeout avoids blocking the orchestrator for
-#: more than one poll cycle on a transient network hang.
 _RECOVERY_PROBE_TIMEOUT_SECONDS: float = 30.0
 
-#: Minimum token count for the ``recovery_probe`` prompt.  A single token is
-#: sufficient to confirm the quota window has cleared without incurring cost.
 _RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
 
 
@@ -7825,7 +7478,6 @@ def _is_claim_tool_use(message: object) -> bool:
     return False
 
 
-#: Captures the unit-id argument of a ``devbench claim <id>`` Bash command.
 _CLAIM_UNIT_ID_RE: re.Pattern[str] = re.compile(r"devbench\s+claim\s+(\S+)")
 
 
@@ -7863,11 +7515,6 @@ def _bash_commands(message: object) -> list[str]:
     return commands
 
 
-#: Bash command fragments that identify a deterministic acceptance / TDD-RED /
-#: live-test re-run -- the observable signal a non-converging claim repeats. A
-#: claim that runs the SAME one of these over and over (same target identifier)
-#: without ever completing is "busy but not converging." Matched as substrings
-#: so the helper is robust to surrounding flags / env prefixes.
 _CLAIM_FAILURE_COMMAND_MARKERS: tuple[str, ...] = (
     "devbench verify-ac",
     "tf-test",
@@ -7877,14 +7524,8 @@ _CLAIM_FAILURE_COMMAND_MARKERS: tuple[str, ...] = (
     "make test",
 )
 
-#: Captures a unit-id-shaped or path-shaped target token so two re-runs of the
-#: same check against the same target collapse to one signature, while a re-run
-#: against a DIFFERENT target (genuine progress) is a distinct signature.
 _FAILURE_TARGET_RE: re.Pattern[str] = re.compile(r"(E\d+-F\d+-S\d+-T\d+|[A-Za-z0-9_.-]*/[A-Za-z0-9_./-]+)")
 
-#: Captures a ``KEY=value`` argument (e.g. ``MODULE_PATH=providers/aws/alb``) so
-#: a parameterised test command keys on its value -- distinguishing two modules
-#: even when the value itself is not path-shaped.
 _FAILURE_KV_ARG_RE: re.Pattern[str] = re.compile(r"\b([A-Z_]+)=(\S+)")
 
 
@@ -7925,18 +7566,8 @@ def _extract_failure_signature(message: object) -> str | None:
     return None
 
 
-#: The AUTHORITATIVE per-unit acceptance gate. A repeated ``devbench verify-ac``
-#: failure ALWAYS counts toward the within-claim convergence bound, regardless of
-#: its target token: it is scoped to the unit by construction, so it can never be
-#: a "whole repo suite" run.
 _VERIFY_AC_MARKER: str = "devbench verify-ac"
 
-#: Test-runner markers whose target is a TEST PATH (a file, node id, directory,
-#: or the whole checkout). Only these can express a "whole repo suite" target,
-#: so only these are subject to the whole-suite exemption. Markers that
-#: parameterise by a ``KEY=value`` module (``tf-test`` / ``terratest``) always
-#: name a SPECIFIC module -- never a whole suite -- so they are excluded here and
-#: always counted toward the bound.
 _PATH_SCOPED_TEST_MARKERS: frozenset[str] = frozenset({"pytest", "make test", "go test"})
 
 
@@ -7978,27 +7609,17 @@ def _is_whole_suite_target(marker: str, target_token: str, repo_roots: tuple[str
     if marker == _VERIFY_AC_MARKER:
         return False
     if marker not in _PATH_SCOPED_TEST_MARKERS:
-        # A ``KEY=value``-parameterised runner (``tf-test`` / ``terratest``)
-        # always names a SPECIFIC module, never a whole suite -- always counts.
         return False
     token = target_token.strip()
     if not token:
-        # A bare runner invocation with no target -> the whole suite.
         return True
     if token.startswith("/"):
-        # An absolute path: whole-suite when it IS a checkout root or a
-        # descendant of one (the whole checkout, not one file inside it).
         normalized = token.rstrip("/")
         for root in repo_roots:
             root_norm = root.rstrip("/")
             if normalized == root_norm or normalized.startswith(root_norm + "/"):
-                # A specific file UNDER the root is still scoped.
                 return not _looks_like_test_file(token)
-        # An absolute path outside every configured checkout root: treat a bare
-        # directory as whole-suite, a specific file as scoped.
         return not _looks_like_test_file(token)
-    # A relative target: a specific test file / node id is scoped; a bare
-    # directory (no file component) is a whole-suite run.
     return not _looks_like_test_file(token)
 
 
@@ -8110,29 +7731,12 @@ class ClaimConvergenceTracker:
     ) -> None:
         self._max_attempts = max_within_claim_attempts
         self._max_wall_clock = max_claim_wall_clock_seconds
-        # Resolved target-repo checkout roots (tracked-issue 004). Used to
-        # classify a raw test-runner failure whose target is a checkout root /
-        # bare directory as a WHOLE-SUITE run that must NOT accrue toward the
-        # within-claim non-converging bound (a leaf unit must never be held
-        # hostage to another unit's tests). The authoritative per-unit
-        # ``verify-ac`` gate is unaffected and always counts.
         self._repo_roots = repo_roots
-        # Inter-claim activity backstop: max seconds the orchestrator may stay
-        # active while NO unit is claimed. <= 0 disables it. Default 0.0 keeps
-        # the bound off unless the caller (production wiring) supplies a value.
         self._max_no_claim_activity = max_no_claim_activity_seconds
         self.current_unit_id: str | None = None
         self._claim_started_at: float | None = None
         self._signature_counts: dict[str, int] = {}
-        # When > 0, the timestamp of the first message observed while no unit is
-        # claimed; reset to None whenever a claim is active or freshly noted.
         self._no_claim_active_since: float | None = None
-        # TDI #016: the signature of the most-recent run whose count was just
-        # incremented, pending its result. A subsequent timed-out result
-        # (``_is_timeout_result``) rolls that increment back because a timeout is
-        # non-deterministic provisioning latency, not a deterministic failure.
-        # Cleared once any result is observed so a timeout can never roll back an
-        # increment it did not cause.
         self._pending_signature: str | None = None
 
     def note_claim(self, unit_id: str, *, now: float) -> None:
@@ -8141,7 +7745,6 @@ class ClaimConvergenceTracker:
         self._claim_started_at = now
         self._signature_counts = {}
         self._pending_signature = None
-        # A fresh claim is forward progress: stop any inter-claim stall timer.
         self._no_claim_active_since = None
 
     def clear_current_claim(self) -> None:
@@ -8160,9 +7763,6 @@ class ClaimConvergenceTracker:
         self._claim_started_at = None
         self._signature_counts = {}
         self._pending_signature = None
-        # Restart the inter-claim window fresh: the orchestrator should claim
-        # the next unit promptly after a block; if it instead keeps emitting
-        # messages without claiming, the backstop below catches that wedge.
         self._no_claim_active_since = None
 
     def observe(self, message: object, *, now: float, in_progress_count: int = 0) -> str | None:
@@ -8191,17 +7791,8 @@ class ClaimConvergenceTracker:
         if self.current_unit_id is None or self._claim_started_at is None:
             return self._no_claim_verdict(now=now, in_progress_count=in_progress_count)
 
-        # An active claim is forward progress for the inter-claim backstop.
         self._no_claim_active_since = None
 
-        # TDI #016: a Bash result KILLED by its timeout is a non-deterministic
-        # provisioning failure (e.g. a cold ``uv`` env syncing dependencies on
-        # the first invocation), NOT the "same deterministic test failure". Roll
-        # back the increment the just-run command (``_pending_signature``)
-        # contributed so repeated timed-out runs never accrue toward the bound.
-        # A timeout result carries no failure signature of its own, so this is
-        # handled before signature extraction. The pending signature is then
-        # cleared either way so a later result cannot double-roll-back it.
         if _is_timeout_result(message):
             if self._pending_signature is not None:
                 rolled_back = self._signature_counts.get(self._pending_signature, 0) - 1
@@ -8214,13 +7805,6 @@ class ClaimConvergenceTracker:
 
         signature = _extract_failure_signature(message)
         if signature is not None and self._is_whole_suite_signature(signature):
-            # Tracked-issue 004: a WHOLE-SUITE / out-of-scope test-runner failure
-            # (the executor ran the full repo suite, or a bare checkout-root
-            # directory) can be tripped by ANOTHER unit's defect even when this
-            # unit's own scoped verify-ac is green. It must NOT accrue toward the
-            # within-claim bound -- the authoritative per-unit verify-ac gate
-            # still does. Skip the increment and clear any pending marker so a
-            # following result cannot roll back an unrelated increment.
             logger.info(
                 "convergence: not counting whole-suite/out-of-scope failure %r toward the "
                 "within-claim bound for %s (scoped verify-ac is the per-unit gate)",
@@ -8231,19 +7815,12 @@ class ClaimConvergenceTracker:
             return self._wall_clock_verdict(now)
 
         if signature is not None:
-            # A NEW test/verify re-run: its result (success / real failure /
-            # timeout) arrives in a LATER message. Remember it as pending so a
-            # following timeout result can roll this increment back (#016).
             count = self._signature_counts.get(signature, 0) + 1
             self._signature_counts[signature] = count
             self._pending_signature = signature
             if count >= self._max_attempts:
                 return signature
         else:
-            # A non-run message that is not a timeout result (an edit, a
-            # non-timeout test result, narrative text): the pending run's verdict
-            # is settled, so its increment stands. Drop the pending marker so a
-            # subsequent timeout result cannot roll back an unrelated increment.
             self._pending_signature = None
 
         return self._wall_clock_verdict(now)
@@ -8329,10 +7906,6 @@ def _count_in_progress_units() -> int:
     return sum(1 for unit in units if unit.status is WorkUnitStatus.IN_PROGRESS)
 
 
-#: Sub-agent (Task tool) activity message class names. Their presence means the
-#: orchestrator is doing real work via a spawned agent (e.g. a long terraform
-#: apply / make validate) even when the top-level session is quiet -- so the
-#: turn-end stall budget must NOT accrue against them.
 _SUBAGENT_ACTIVITY_MESSAGE_TYPES: frozenset[str] = frozenset(
     {"TaskStartedMessage", "TaskProgressMessage", "TaskNotificationMessage"}
 )
@@ -8357,8 +7930,6 @@ def _is_genuine_progress(message: object) -> bool:
     content = getattr(message, "content", None)
     if not isinstance(content, (list, tuple)):
         return False
-    # A tool-use block carries a ``name`` + ``input`` (ToolUseBlock); its presence
-    # means the model is actively calling a tool == real work.
     return any(getattr(block, "name", None) and getattr(block, "input", None) is not None for block in content)
 
 
@@ -8407,13 +7978,8 @@ def _daemonize_to_background(workspace_root: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "orchestrator.log"
 
-    # First fork: parent exits, child continues.
     pid = os.fork()
     if pid > 0:
-        # Original parent: tell the operator the daemon PID + exit cleanly so
-        # the invoking shell returns to the prompt.  We can only print the
-        # FIRST-fork PID here; the grandchild will write the authoritative
-        # PID file once it starts up.
         print(
             f"started devbench orchestrator in daemon mode (parent pid {pid}); "
             f"follow logs with: devbench tail <instance_id> --follow",
@@ -8421,18 +7987,12 @@ def _daemonize_to_background(workspace_root: Path) -> None:
         )
         os._exit(0)
 
-    # Become session leader so we detach from any controlling terminal.
     os.setsid()
 
-    # Second fork: prevent re-acquiring a controlling terminal.
     pid = os.fork()
     if pid > 0:
-        # First-fork child: exit so the grandchild's parent becomes init.
         os._exit(0)
 
-    # Grandchild: redirect std streams to the log file.  Append-mode so the
-    # existing orchestrator.log (read by ``devbench report``, ``devbench tail``)
-    # keeps accumulating across daemon restarts.
     sys.stdout.flush()
     sys.stderr.flush()
     log_fd = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
@@ -8549,24 +8109,14 @@ def _write_session_state_files(
     started_at = datetime.now(UTC)
     started_by = getpass.getuser()
 
-    # pid
     (state_dir / "pid").write_text(str(pid), encoding="utf-8")
 
-    # started_at
     (state_dir / SESSION_STARTED_AT_FILENAME).write_text(started_at.isoformat(), encoding="utf-8")
 
-    # started_by
     (state_dir / SESSION_STARTED_BY_FILENAME).write_text(started_by, encoding="utf-8")
 
-    # NOTE: scope.json is intentionally NOT written here.  It is owned solely by
-    # ScopeFilter.to_file (object schema), which cmd_start invokes only when
-    # --include is supplied.  Writing a bare JSON array here produced the
-    # "scope.json corrupt -- got 'list'" failure on no-include starts.
-
-    # registry.json -- add or update this session
     registry = SessionRegistry(workspace_root)
     sessions = registry.load()
-    # Replace any existing entry with the same name (re-start scenario)
     sessions = [s for s in sessions if s.name != session_name]
     sessions.append(
         Session(
@@ -8619,7 +8169,6 @@ def _check_scope_overlap(
     if not overlapping_ids:
         return None
 
-    # Build a map of conflicting ID -> owning session name for the message.
     id_to_sessions: dict[str, list[str]] = {}
     for session in existing_sessions:
         for wu_id in session.scope:
@@ -8732,39 +8281,16 @@ def detect_fatal_sdk_error(message: object) -> str | None:
     return None
 
 
-#: Issue #218: the three terminal sentinels the orchestrate skill emits
-#: at end-of-run (per ``plugin/devbench-orchestrate/skills/orchestrate/SKILL.md``
-#: lines 8, 32, 35-36).  ``NO_ACTIONABLE_IN_SCOPE`` is caught by the
-#: substring check on ``NO_ACTIONABLE``, so only two distinct tokens
-#: live in the tuple.
 _TERMINAL_ORCHESTRATE_MARKERS: tuple[str, ...] = ("ALL_DONE", "NO_ACTIONABLE")
 
-#: Audit-log prefix written to the orchestrator log when the SDK loop
-#: detects a terminal-marker ResultMessage and breaks early.  Mirrors the
-#: shape of ``_ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX``.  Issue #218.
 _ORCHESTRATOR_TERMINAL_EXIT_AUDIT_PREFIX: str = "[ORCHESTRATOR_TERMINAL_EXIT] reason="
 
-#: Issue #262 (E10-F1-S2): audit prefix emitted when a non-terminal ResultMessage
-#: is detected and the orchestrator issues an in-session continuation query.
 _ORCHESTRATOR_TURN_END_NO_SENTINEL_AUDIT: str = "[ORCHESTRATOR_TURN_END_NO_SENTINEL]"
 
-#: Issue #271 (E14-F1-S1-T1): audit prefix emitted at the point the final
-#: stop reason is determined, so the reason is visible in the orchestrator log
-#: as well as in the Slack notification.  Format:
-#: ``[ORCHESTRATOR_STOP_REASON] reason=<token>``
 _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX: str = "[ORCHESTRATOR_STOP_REASON] reason="
 
-#: Issue #271 (E14-F1-S1-T1): distinct stop-reason token emitted when the
-#: SDK loop returns normally without producing a terminal sentinel.  Never
-#: equals the legacy bare ``"clean"`` token.
 _STOP_REASON_PREMATURE_TURN_END: str = "premature-turn-end"
 
-#: Block-and-continue (TDI): stop-reason prefix emitted when the aggregate
-#: non-converging-claims safety valve trips -- K distinct units each hit the
-#: within-claim convergence bound in ONE session, signalling a systemically
-#: broken run that needs operator attention. A single non-converging claim is
-#: BLOCKED and the session continues; only this aggregate valve halts it. Routed
-#: to STOP_CLASS_CRASH (operator mention) by ``classify_stop_class``.
 _STOP_REASON_TOO_MANY_NON_CONVERGING: str = "too many non-converging claims"
 
 
@@ -8777,12 +8303,6 @@ def _too_many_non_converging_reason(count: int) -> str:
     return f"{_STOP_REASON_TOO_MANY_NON_CONVERGING} ({count})"
 
 
-#: Issue #262 (E10-F1-S2): verbatim continuation prompt sent to the same
-#: ClaudeSDKClient session when a non-terminal ResultMessage is observed.
-#: Must not contain an em-dash (U+2014) per code standards; uses -- (double
-#: hyphen) for any separators.  Instructs the agent that its next action
-#: must be a tool call -- specifically running devbench next and acting on
-#: the dispatch result -- rather than generating a summary.
 ORCHESTRATOR_CONTINUATION_PROMPT: str = (
     "Your previous turn ended without a terminal sentinel (ALL_DONE / NO_ACTIONABLE). "
     "Your next action MUST be a tool call -- run `uv run devbench next` and act on its "
@@ -8937,9 +8457,6 @@ async def _handle_result_message(message: object, client: Any) -> bool:
     """
     if not _is_sdk_result_message(message):
         return False
-    # At this point the message IS a ResultMessage.  The terminal-sentinel
-    # check already ran in the caller (via _log_terminal_exit_if_applicable);
-    # if we arrive here the result is non-terminal: issue the continuation.
     result_text = _extract_sdk_result_text(message)
     logger.info(
         "%s result=%r",
@@ -9367,7 +8884,7 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
             done_count = None
             total_count = None
         notify_orchestrator_stop(reason, in_flight_id, done_count, total_count)
-    except Exception as exc:  # broad guard: notification must never mask real exit
+    except Exception as exc:
         print(
             f"[WARN] orchestrator-stop notification failed: {exc!r}",
             file=sys.stderr,
@@ -9511,9 +9028,6 @@ async def _handle_quota_pause(
             backoff_config=backoff,
         )
     except RecoveryProbeUnavailableError as probe_exc:
-        # The probe cannot confirm recovery (no/invalid credential) and no
-        # provider reset time is known. Stop immediately with an actionable
-        # audit instead of polling for the full ``max_wait_seconds``.
         logger.info(
             "%s reason=%s detail=%s",
             _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX,
@@ -9552,7 +9066,7 @@ def _fire_quota_waiting_notification(reason: str, reset_at: str) -> None:
         from devbench.notifications import notify_quota_waiting
 
         notify_quota_waiting(reason, reset_at)
-    except Exception as exc:  # broad guard: notification must never break/delay the wait
+    except Exception as exc:
         logger.warning("[WARN] notify_quota_waiting failed (ignored): %r", exc)
 
 
@@ -9570,7 +9084,7 @@ def _fire_quota_resumed_notification(waited_seconds: int) -> None:
         from devbench.notifications import notify_quota_resumed
 
         notify_quota_resumed(waited_seconds)
-    except Exception as exc:  # broad guard: notification must never break/delay the resume
+    except Exception as exc:
         logger.warning("[WARN] notify_quota_resumed failed (ignored): %r", exc)
 
 
@@ -9643,7 +9157,6 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
     if not _should_handle_quota(detected.quota_exc, qh_cfg):
         raise detected.quota_exc from detected
 
-    # on_exhaustion is consulted at DETECTION time, before any wait.
     if qh_cfg.on_exhaustion == "fail":
         logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
         raise detected.quota_exc from detected
@@ -9656,7 +9169,6 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
         request_drain(WORKSPACE_ROOT, reason=f"quota-exhaustion:{detected.quota_exc.source}")
         return _QUOTA_STOP_REASON_DRAIN_DETECTION
 
-    # on_exhaustion == "wait" (validated default): pause and poll for recovery.
     recovered = asyncio.run(
         _handle_quota_pause(
             exc=detected.quota_exc,
@@ -9668,8 +9180,6 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
     if recovered:
         return _QUOTA_STOP_REASON_WAIT_RECOVERED
 
-    # Timeout (max_wait elapsed) or an unrecoverable probe: apply
-    # on_exhaustion_timeout (default "drain").
     return _dispatch_quota_timeout(detected, qh_cfg.on_exhaustion_timeout)
 
 
@@ -9706,7 +9216,6 @@ def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
             detected.quota_exc.source,
         )
         return "quota-wait-timeout-keep-waiting"
-    # Remaining validated action: drain.
     logger.info(
         "%s reason=%s phase=timeout",
         _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
@@ -9828,27 +9337,18 @@ def _drive_orchestrate_with_quota_resume(
         try:
             asyncio.run(run())
         except _DrainRequested as exc:
-            # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5,
-            # AC-188-8): consume the marker so the next run starts unscoped.
             drained = consume_drain(WORKSPACE_ROOT)
             reason_text = drained.reason if drained is not None else exc.reason
             logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
             return _OrchestrateLoopResult(0, f"drain enforced: {reason_text}", False)
         except _QuotaDetected as exc:
-            # Issue #236 (AC-236-1): quota wait-and-resume dispatch.
             stop_reason = _dispatch_quota_detection(exc, session_name)
             if stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED:
                 if _should_resume_after_quota_recovery(resumes_used, max_resumes):
                     resumes_used += 1
                     continue
-                # Recovered but the resume cap is exhausted: stop terminally
-                # (the exhausted audit line was emitted by the helper above).
                 return _OrchestrateLoopResult(0, "quota-resume-cap-exhausted", False)
-            # A drain requested by on_exhaustion / on_exhaustion_timeout must
-            # outlive this process; signal the caller to preserve it.
             return _OrchestrateLoopResult(0, stop_reason, stop_reason in _QUOTA_DRAIN_STOP_REASONS)
-        # ``_run`` returned normally (no quota / no drain): the session finished
-        # its work -- fall through to cmd_start's terminal classification.
         return _OrchestrateLoopResult(None, "clean", False)
 
 
@@ -9886,16 +9386,9 @@ def _resolve_scope_ids_or_error(parsed: _CmdStartArgs, session_scope_path: Path)
         except InvalidScopeError as exc:
             print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
             return [], 1
-        # TDI-003c: scope is resolved from the per-session scope.json path (via
-        # session_scope_file_path), not from an env var. The former
-        # DEVBENCH_SCOPE_FILE write was write-only (no reader) and is removed so
-        # the scope flow carries no misleading dead surface.
         scope.to_file(WORKSPACE_ROOT, path=session_scope_path)
         scope_ids = sorted(scope.expanded_ids)
     else:
-        # No --include => UNSCOPED (all WUs eligible).  Absence of scope.json is
-        # the unscoped sentinel; delete any stale object left by a prior
-        # --include run or crash so this run is not silently re-scoped.
         ScopeFilter.clear(WORKSPACE_ROOT, path=session_scope_path)
 
     if scope_ids:
@@ -9975,81 +9468,35 @@ def cmd_start(*argv: str) -> int:
     if isinstance(parsed, int):
         return parsed
 
-    # Issue #209: daemon mode + PID file management.  Daemonisation must
-    # happen BEFORE any heavy work so the parent's exit feels instant; the
-    # PID file is written by the grandchild (or foreground process) and
-    # cleaned up in the try/finally below.
     _orchestrator_pid_workspace = WORKSPACE_ROOT
     _setup_daemon_and_pid_file(parsed)
-    # Issue #215: write the last-restart marker so
-    # ``classify_blocked_task`` can bound the agent-tool-unavailable audit
-    # scan to rows emitted by this fresh orchestrator instance only.
-    # RUNTIME_DEGRADATION audit rows from the previous (now-stopped)
-    # instance MUST not keep the new instance's tasks bucketed there.
     _write_last_restart_marker(WORKSPACE_ROOT)
 
-    # Resolve the per-session scope.json path explicitly (env-free): cmd_start
-    # sets DEVBENCH_SESSION_NAME only later, so the env-routed resolver would
-    # otherwise target the workspace-root path while the SDK-subprocess readers
-    # use the per-session path.  Computing it once here keeps the writer, the
-    # clean-exit clear, and the subprocess readers in agreement (#236 follow-up).
     session_scope_path = session_scope_file_path(WORKSPACE_ROOT, parsed.name)
 
-    # Determine the scope IDs for this session and detect any overlap.
-    # AC-192-4: build + persist the ScopeFilter when --include is supplied, then
-    # consult active sessions for scope overlap.  Both the invalid-token and
-    # overlap-detected error paths are handled inside the helper to keep
-    # cmd_start's return-statement count under ruff PLR0911's ceiling.
     scope_ids, scope_rc = _resolve_scope_ids_or_error(parsed, session_scope_path)
     if scope_rc is not None:
         return scope_rc
 
-    # AC-192-1/2: Create the per-session state directory and register the session.
-    # This must happen before the SDK run so that concurrent sessions can detect
-    # each other via the registry.
     _write_session_state_files(WORKSPACE_ROOT, parsed.name, os.getpid(), scope_ids)
 
     plugin_path = _resolve_plugin_path()
 
-    # Startup gates run immediately after the plugin path is resolved, before
-    # any SDK subprocess is spawned: fail closed when guard hooks are not
-    # loaded (H4), then warn / fail on uncommitted harness-source edits.
     if (gate_rc := _check_orchestrator_startup_gates(plugin_path)) is not None:
         return gate_rc
 
-    # Resolve the orchestrate-session model from devbench.yaml (orchestrate.model)
-    # and fail fast BEFORE spawning the SDK subprocess when it is unset. This is
-    # the single source of truth -- the session is pinned to this model so it can
-    # never inherit the interactive Claude Code (~/.claude/settings.json) model.
-    # No fallback (CLAUDE.md). Scoped to the orchestrator-launch path so other
-    # commands (status / report / validate-backlog) load without requiring it.
     try:
         _orchestrator_model = _resolve_orchestrator_model()
     except _OrchestratorModelUnsetError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # When the resolver returned the shadow path (overrides configured),
-    # record this orchestrator's PID inside the shadow tree. The sentinel
-    # makes clear_shadow_plugin refuse to delete the tree while this
-    # process is alive -- preventing a stray prepare-plugin-shadow
-    # invocation from clearing the shadow out from under the running SDK
-    # subprocess and silently breaking hook telemetry mid-run (ADR-25
-    # sentinel-protected lifecycle).
     if plugin_path == shadow_plugin_path(WORKSPACE_ROOT):
         write_pid_sentinel(WORKSPACE_ROOT, os.getpid())
 
-    # Set DEVBENCH_SESSION_NAME for the duration of the SDK run.  Use a
-    # try/finally to restore the previous value so test isolation is maintained
-    # (the orchestrator process is long-lived in tests).
     _prev_session_name = os.environ.get("DEVBENCH_SESSION_NAME")
     os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
 
-    # AC-192-9: Register a SIGTERM handler so that ``devbench stop --session``
-    # can force the in-flight work unit to ``blocked`` before this process exits.
-    # The handler reads the current backlog, finds the in-progress WU, sets it to
-    # ``blocked``, appends a ``[FORCED_BLOCKED_ON_STOP]`` audit comment, then
-    # exits rc=0.  The previous handler is restored in the finally block.
     _session_name_for_sigterm = parsed.name
 
     def _sigterm_handler(_signum: int, _frame: object) -> None:
@@ -10081,40 +9528,15 @@ def cmd_start(*argv: str) -> int:
 
     _prev_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    # Issue #217: capture the SDK's final ResultMessage `result` text so the
-    # orchestrator_stop Slack ping can carry the actual exit reason
-    # (e.g., ``NO_ACTIONABLE -- 190/212 done, 11 blocked``) instead of the
-    # legacy bare ``"clean"`` that hid whether the backlog was finished.
     _sdk_result_text: str | None = None
 
-    # Issue #262 (E10-F1-S3): set to True by ``_run`` when the per-stall
-    # continuation counter exhausts its budget so the outer handler can
-    # return the distinct exit code without raising an exception.
     _continuation_exhausted: bool = False
 
-    # Set by ``_run`` to the fatal SDK error code (e.g. ``model_not_found``) when a
-    # non-retryable error is detected, so the outer handler returns the distinct
-    # fatal-error exit code instead of looping. ``None`` when no fatal error.
     _fatal_error_code: str | None = None
 
-    # Block-and-continue (TDI): the within-claim convergence bound BLOCKS a
-    # non-converging unit and the orchestrate session CONTINUES to its next
-    # in-queue unit rather than halting -- one bad module no longer abandons the
-    # rest of a session's scope. ``_non_converging_unit_ids`` accumulates the
-    # DISTINCT units that tripped the bound across the WHOLE session (it survives
-    # quota-resume re-invocations of ``_run`` because it lives in this closure).
-    # When its size reaches the aggregate valve threshold K
-    # (:func:`_resolve_max_non_converging_claims`), ``_run`` stops the session and
-    # the outer handler emits the ``too many non-converging claims (K)`` stop
-    # reason for operator attention.
     _non_converging_unit_ids: set[str] = set()
     _max_non_converging_claims = _resolve_max_non_converging_claims()
 
-    # Set by ``_run`` when the aggregate non-converging-claims valve trips (K
-    # distinct units blocked in one session) so the outer handler records the
-    # ``too many non-converging claims (K)`` stop reason. ``False`` when the
-    # session drained its scope without tripping the valve (block-and-continue
-    # ran to a normal NO_ACTIONABLE / ALL_DONE exit).
     _too_many_non_converging: bool = False
 
     async def _run() -> None:
@@ -10162,11 +9584,6 @@ def cmd_start(*argv: str) -> int:
             _QuotaDetected: A quota error is detected in the SDK message stream.
         """
         nonlocal _sdk_result_text, _continuation_exhausted, _fatal_error_code, _too_many_non_converging
-        # Pin the orchestrate session to the devbench.yaml-configured model
-        # (resolved + fail-fast-checked in cmd_start). Passing model= here is
-        # what prevents the session from inheriting the interactive Claude Code
-        # (~/.claude/settings.json) model -- the root cause of the model_not_found
-        # runaway. No fallback (CLAUDE.md).
         options = ClaudeAgentOptions(
             plugins=[{"type": "local", "path": str(plugin_path)}],
             permission_mode="bypassPermissions",
@@ -10175,16 +9592,11 @@ def cmd_start(*argv: str) -> int:
         _orchestrate_prompt = "Run the devbench-orchestrate:orchestrate skill to process the backlog until complete"
         _continuation_budget = _resolve_max_turn_end_continuations()
         _inactivity_timeout = ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS
-        # Within-claim convergence bound (config-gated, default on): block a
-        # claim that repeats the SAME unresolvable failure rather than churning.
         _convergence_enabled = _resolve_within_claim_convergence_check()
         _convergence_tracker = ClaimConvergenceTracker(
             max_within_claim_attempts=_resolve_max_within_claim_attempts(),
             max_claim_wall_clock_seconds=_resolve_max_claim_wall_clock_seconds(),
             max_no_claim_activity_seconds=_resolve_max_no_claim_activity_seconds(),
-            # Tracked-issue 004: the configured target-repo checkout roots, so a
-            # whole-suite test-runner failure against a checkout root / bare dir
-            # is not counted toward the within-claim bound.
             repo_roots=tuple(str(p) for p in REPO_LOCAL_PATHS.values()),
         )
 
@@ -10212,38 +9624,16 @@ def cmd_start(*argv: str) -> int:
             claimed = _claimed_unit_id(msg)
             if claimed is not None:
                 _convergence_tracker.note_claim(claimed, now=now)
-            # Tracked-issue 003: gate the inter-claim no-claim backstop on the
-            # AUTHORITATIVE backlog in-progress count, not just the tracker's
-            # own (divergeable) ``current_unit_id``. When the tracker has a
-            # current claim the count is irrelevant (the within-claim bounds
-            # govern), so only read the backlog -- a cheap parse -- when there
-            # is no tracked claim, the sole case the no-claim backstop inspects.
             in_progress_count = _count_in_progress_units() if _convergence_tracker.current_unit_id is None else 0
             recurring = _convergence_tracker.observe(msg, now=now, in_progress_count=in_progress_count)
             if recurring is None:
                 return False
             if _convergence_tracker.current_unit_id is None:
-                # Inter-claim stall: the orchestrator is active (messages still
-                # arriving, so the per-message inactivity timeout never fires)
-                # but has claimed no unit for too long -- e.g. an executor still
-                # churning AFTER its unit was force-blocked, or a loop stuck
-                # without claiming the next unit (the "0 in-progress but
-                # hook-logs flowing" wedge). End the session cleanly so the
-                # daemon stops instead of hanging (and ignoring SIGTERM); the
-                # operator/supervisor restarts it on the remaining backlog.
                 logger.warning("%s%s", _ORCHESTRATOR_STOP_REASON_AUDIT_PREFIX, recurring)
                 return True
             unit_id = _convergence_tracker.current_unit_id
-            # Positively-attributed teardown: the in-session live-command runner
-            # records the pgid of the external command it launched into this
-            # session's executor.pgid file; read it (None when no live command is
-            # registered) and hand it to the block so the executor's subtree is
-            # reaped rather than orphaned to init (Item B, tracked issue 015).
             _block_non_converging_claim(unit_id, recurring, executor_pgid=_read_attributed_executor_pgid())
             _non_converging_unit_ids.add(unit_id)
-            # Clear the just-blocked claim so its lingering identical-failure
-            # messages cannot re-trip the bound for the SAME unit before the skill
-            # claims the next one (which would double-count it / re-block it).
             _convergence_tracker.clear_current_claim()
             if len(_non_converging_unit_ids) >= _max_non_converging_claims:
                 _too_many_non_converging = True
@@ -10255,7 +9645,6 @@ def cmd_start(*argv: str) -> int:
                     ", ".join(sorted(_non_converging_unit_ids)),
                 )
                 return True
-            # Block-and-continue: keep working the session's remaining units.
             return False
 
         async with ClaudeSDKClient(options=options) as client:
@@ -10268,11 +9657,6 @@ def cmd_start(*argv: str) -> int:
                         client.receive_response(), _inactivity_timeout
                     ):
                         logger.info("sdk message: %s", message)
-                        # Fatal, non-retryable SDK error (e.g. model_not_found): exit
-                        # fast on the FIRST occurrence. Such an error recurs identically
-                        # every turn and must never be fed into the continuation loop
-                        # (the model_not_found runaway). Checked before the continuation
-                        # path; quota errors are NOT matched here -- they route below.
                         if (_fatal := detect_fatal_sdk_error(message)) is not None:
                             logger.info(
                                 "%s%s model=%r detail=%r remediation=%s",
@@ -10285,13 +9669,8 @@ def cmd_start(*argv: str) -> int:
                             _fatal_error_code = _fatal
                             return
                         _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                        # Issue #218: check terminal sentinel on every message that
-                        # carries result text; break immediately to avoid re-invoking.
                         if _log_terminal_exit_if_applicable(_sdk_result_text):
                             return
-                        # Issue #262 (E10-F1-S2 + E10-F1-S3): handle ResultMessage
-                        # turn boundary.  True means a non-terminal continuation was
-                        # issued; increment the stall counter and enforce the budget.
                         if await _handle_result_message(message, client):
                             stall_count += 1
                             if stall_count >= _continuation_budget:
@@ -10299,41 +9678,14 @@ def cmd_start(*argv: str) -> int:
                                 _continuation_exhausted = True
                                 return
                             break
-                        # Reset the stall budget on GENUINE PROGRESS (a claim, a
-                        # tool-use, or sub-agent Task activity), NOT on every
-                        # non-ResultMessage. The prior unconditional reset made the
-                        # budget unreachable (every turn emits a message before its
-                        # ResultMessage), so a no-sentinel-every-turn condition looped
-                        # forever. Resetting ONLY on a claim was too strict -- a
-                        # legitimately long-running unit (a quiet sub-agent doing a
-                        # terraform apply / make validate) accrues inactivity timeouts
-                        # with no new claim and would be killed. Resetting on any real
-                        # activity keeps long runs alive while still bounding a true
-                        # no-progress / empty-turn loop (a fatal error exits earlier).
                         if _is_genuine_progress(message):
                             stall_count = 0
-                        # Within-claim convergence bound (block-and-continue): a
-                        # claim that repeats the SAME unresolvable failure beyond
-                        # the configured cap (or exceeds the wall-clock backstop)
-                        # is force-blocked with [CLAIM_NOT_CONVERGING] and the
-                        # session CONTINUES to its next in-queue unit. Only when
-                        # the aggregate valve trips (K distinct non-converging
-                        # units in one session) does _check_convergence return
-                        # True and the loop exit for operator attention.
                         if _check_convergence(message):
                             return
-                        # Per-message quota detection (#236) + drain-on-claim
-                        # short-circuit (#188/#212), factored into one helper that
-                        # raises _QuotaDetected / _DrainRequested. Keeps _run under
-                        # ruff PLR0912's 12-branch cap.
                         _check_quota_and_drain(message)
                     else:
-                        # receive_response exhausted without a turn-boundary: loop is done.
                         _exhausted = True
                 except TimeoutError:
-                    # Issue #262 (E10-F2-S1): per-message inactivity timeout fired.
-                    # Log the audit prefix and issue an in-session continuation,
-                    # counting against the same stall budget (E10-F1-S3).
                     logger.info(ORCHESTRATOR_INACTIVITY_TIMEOUT_AUDIT_PREFIX)
                     stall_count += 1
                     if stall_count >= _continuation_budget:
@@ -10344,60 +9696,22 @@ def cmd_start(*argv: str) -> int:
                 if _exhausted:
                     return
 
-    # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
-    # finally in an outer try/finally that calls notify_orchestrator_stop
-    # regardless of how the function exits (clean, drain, SystemExit from
-    # the SIGTERM handler, or an uncaught SDK exception).  The notify
-    # helper is best-effort so a failure here cannot mask the original
-    # exit reason.
     _stop_reason: str = "clean"
-    # Issue #236 follow-up: when the quota dispatch requests a graceful drain,
-    # the drain signal MUST survive cmd_start's exit so the restart loop / a
-    # peer session acts on it.  This flag tells the exit finally blocks below to
-    # skip their otherwise-unconditional cancel_drain.
     _quota_drain_requested: bool = False
     try:
         try:
-            # TDI: drive the orchestrate session(s) with in-process quota resume.
-            # The helper re-opens a FRESH ClaudeSDKClient and re-runs ``_run`` on
-            # the remaining backlog after every recovered quota wait (bounded by
-            # DEVBENCH_MAX_QUOTA_RESUMES) so a single quota window cannot
-            # permanently end an unattended ``--daemon`` run that lacks the
-            # external ``make start`` restart wrapper.  All non-recovered exits
-            # (clean return, drain enforced, quota fail/drain/keep-waiting,
-            # resume-cap exhausted) are returned terminally.
             _loop_result = _drive_orchestrate_with_quota_resume(_run, parsed.name)
             _quota_drain_requested = _loop_result.quota_drain_requested
             if _loop_result.terminal_rc is not None:
                 _stop_reason = _loop_result.stop_reason
                 return _loop_result.terminal_rc
         finally:
-            # Issue #212: drop the drain signal on any exit from the SDK run so
-            # the next start does not inherit a stale request.  Run while
-            # DEVBENCH_SESSION_NAME is still set (before the restore below) so
-            # cancel_drain scans both the per-session and workspace-root
-            # candidate paths.  Idempotent on already-clean state.  Preserved when
-            # the quota dispatch deliberately requested a drain (#236 follow-up).
             _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
-            # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
-            # maintained when cmd_start is invoked multiple times in the same process.
             _restore_session_env_name(_prev_session_name)
-            # Restore the previous SIGTERM handler so test isolation is maintained.
             signal.signal(signal.SIGTERM, _prev_sigterm_handler)
 
-        # AC-190-13: delete scope.json on clean SDK exit so the next run starts
-        # without a stale scope.  On crash (SDK raises), the exception propagates
-        # before this line runs, intentionally leaving scope.json in place for
-        # operator inspection.  Use the explicit per-session path: the inner
-        # finally above has already restored DEVBENCH_SESSION_NAME, so the
-        # env-routed default would otherwise target the wrong path (#236 follow-up).
         ScopeFilter.clear(WORKSPACE_ROOT, path=session_scope_path)
 
-        # Issue #262 (E10-F1-S3): fail-fast on continuation-budget exhaustion.
-        # Issue #217: bubble the SDK's final ResultMessage text into the Slack reason.
-        # Issue #271 (E14-F1-S1-T1): distinguish premature turn-end from genuine
-        # completion so the stop reason is never the bare literal "clean".
-        # Extracted into a helper so cmd_start stays under PLR0912's branch cap.
         restart_rc, _stop_reason = _classify_orchestrator_exit(
             fatal_error_code=_fatal_error_code,
             continuation_exhausted=_continuation_exhausted,
@@ -10406,28 +9720,14 @@ def cmd_start(*argv: str) -> int:
         )
         return restart_rc
     except BaseException as exc:
-        # Capture the exit reason for the always-fire notification before
-        # re-raising.  ``BaseException`` covers SystemExit (SIGTERM) and
-        # KeyboardInterrupt in addition to standard exceptions; see
-        # _label_stop_reason for the bucketing rules (#213).
         _stop_reason = _label_stop_reason(exc)
         raise
     finally:
         _fire_orchestrator_stop_notification(_stop_reason)
-        # Issue #209: drop the PID file on clean exit so a fresh start does
-        # not trip the alive-check on a stale entry.  Best-effort: missing /
-        # permission-denied is a no-op.
         import contextlib
 
         with contextlib.suppress(OSError, NameError):
             remove_pid_file(_orchestrator_pid_workspace)
-        # Issue #212: drop the drain signal on any exit so the next start
-        # does not inherit a stale request.  cancel_drain scans both the
-        # per-session and workspace-root candidate paths and is idempotent
-        # on already-clean state.  Best-effort: NameError guards a very
-        # early exit before WORKSPACE_ROOT was set; OSError covers
-        # permission-denied during unlink.  Preserved when the quota dispatch
-        # deliberately requested a drain (#236 follow-up) so it survives exit.
         with contextlib.suppress(OSError, NameError):
             _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
 
@@ -10449,12 +9749,6 @@ def cmd_prepare_plugin_shadow() -> int:
     print(str(plugin_path))
     return 0
 
-
-# ---------------------------------------------------------------------------
-# supervise: interactive `claude` CLI orchestrator under a detached `screen`
-# daemon (devbench-supervise-screen-orchestrator). Phase 1 lands the verb
-# surface + arg parsing + dispatch; the sub-verb bodies land in later phases.
-# ---------------------------------------------------------------------------
 
 _SUPERVISE_SESSION_NAME_RE = re.compile(SUPERVISE_SESSION_NAME_PATTERN)
 
@@ -10515,7 +9809,6 @@ def _validate_supervise_name(name: str) -> None:
         )
 
 
-# Flag tokens that take a value, mapped to the ``_SuperviseArgs`` field they set.
 _SUPERVISE_VALUE_FLAGS: dict[str, str] = {
     "--name": "name",
     "--include": "include",
@@ -10524,7 +9817,6 @@ _SUPERVISE_VALUE_FLAGS: dict[str, str] = {
     "--effort": "effort",
     "--billing-mode": "billing_mode",
 }
-# Boolean flag tokens, mapped to the ``_SuperviseArgs`` field they set ``True``.
 _SUPERVISE_BOOL_FLAGS: dict[str, str] = {
     "--allow-overlap": "allow_overlap",
     "--hard": "hard",
@@ -10578,15 +9870,6 @@ def _parse_supervise_args(args: list[str]) -> _SuperviseArgs:
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase 2 wiring seams. These thin module-level functions isolate the
-# config/credentials/backlog dependencies the supervise bodies need so the tests
-# can inject deterministic values without a live config or a real backlog. They
-# read the SAME single sources of truth the rest of the CLI uses (no duplication).
-# ---------------------------------------------------------------------------
-
-#: The subscription credentials file the AuthVerifier checks (Section 3.6.1). A
-#: module-level alias so tests point it at a fixture without touching config.py.
 SUPERVISE_CREDENTIALS_FILE: Path = CLAUDE_CREDENTIALS_FILE
 
 
@@ -10857,8 +10140,6 @@ def _supervise_wait_for_running(
     start = now()
     while True:
         state = registry.read_state(name)
-        # Only a record written at/after the launch belongs to THIS daemon; a
-        # stale prior record (older started_at) is ignored entirely.
         if state is not None and state.started_at >= launch_began_at:
             if state.state == SUPERVISE_STATE_RUNNING:
                 return state
@@ -10982,8 +10263,6 @@ def _supervise_preflight(parsed: _SuperviseArgs) -> tuple[str, str, str, str, st
     return claude_path, screen_path, model, effort, billing_mode
 
 
-# Registry states that mean a same-named session is no longer occupying the name
-# (a fresh ``start`` may reuse it). Anything else means "already running" (FR-2).
 _SUPERVISE_VACATED_STATES: frozenset[str] = frozenset(
     {SUPERVISE_STATE_STOPPED, SUPERVISE_STATE_COMPLETED_CLEAN, SUPERVISE_STATE_FAULTED}
 )
@@ -11007,7 +10286,6 @@ def _supervise_start_under_flock(
     message is already on stderr).
     """
     with flock_backlog(WORKSPACE_ROOT):
-        # A same-named session still occupying the name is a fail-fast error.
         existing = registry.read_state(parsed.name)
         if existing is not None and registry.is_alive(existing.pid) and existing.state not in _SUPERVISE_VACATED_STATES:
             print(
@@ -11017,7 +10295,6 @@ def _supervise_start_under_flock(
             )
             return 2
 
-        # Expand + persist the scope (Section 5.6, step 4a) BEFORE launch.
         try:
             scope_ids = write_session_scope(
                 workspace_root=WORKSPACE_ROOT,
@@ -11030,13 +10307,9 @@ def _supervise_start_under_flock(
             print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
             return 2
 
-        # Multi-session arbitration against the SDK SessionRegistry (FR-18).
         if (overlap_rc := _check_scope_overlap(WORKSPACE_ROOT, scope_ids, parsed.allow_overlap)) is not None:
             return overlap_rc
 
-        # Build the minimized screen env (Section 3.6.1, 5.6). The interactive
-        # billing model is the --model flag; DEVBENCH_CLAUDE_MODEL is the
-        # import-time model the in-session subprocesses need.
         env = EnvSanitizer(extra_deny_vars=cfg.env.deny_vars, billing_mode=billing_mode).build(
             source_env=dict(os.environ),
             workspace_root=str(WORKSPACE_ROOT),
@@ -11078,11 +10351,6 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
     cfg = _supervise_runtime_config()
 
     registry = SuperviseRegistry(WORKSPACE_ROOT)
-    # Capture the launch instant BEFORE the (asynchronous) screen launch so the
-    # readiness wait can tell the NEW daemon's record (started_at >= this) apart
-    # from any stale prior record. The screen daemon writes its own record only
-    # once it comes up, so reading the registry immediately after launch would
-    # otherwise surface a stopped/faulted leftover from an earlier run.
     launch_began_at = datetime.now(UTC)
     try:
         launch_rc = _supervise_start_under_flock(
@@ -11094,9 +10362,6 @@ def _cmd_supervise_start(parsed: _SuperviseArgs) -> int:
     if launch_rc != 0:
         return launch_rc
 
-    # Wait (event-driven, bounded by the configurable ready-prompt timeout) for
-    # the NEW daemon to reach running (Section 4.1 step 4). Never report the
-    # stale prior record (tracked issue: supervise-start-returns-early).
     outcome = _supervise_wait_for_running(
         name=parsed.name,
         registry=registry,
@@ -11246,10 +10511,6 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     reason are recorded in the registry (FR-13, FR-27).
     """
     cfg = _supervise_runtime_config()
-    # Resolve the progress-watchdog stall window (env > yaml > default) and fold the
-    # result back into cfg so the event loop reads the env-overridden value (design
-    # point 2). A bad env value fails fast -- the watchdog must never be silently
-    # disabled (it is the primary "is real work happening?" gate).
     try:
         resolved_stall = _resolve_supervise_progress_stall_seconds(config_value=cfg.timeouts.progress_stall_seconds)
     except ValueError as exc:
@@ -11263,9 +10524,6 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    # The billing mode was resolved at ``start`` and forwarded via --billing-mode;
-    # re-resolve here (flag > env > config > default) so __run honours the same
-    # precedence even if invoked directly, and fail fast on an invalid value.
     try:
         billing_mode = _resolve_supervise_billing_mode(cli_mode=parsed.billing_mode, config_mode=cfg.billing_mode)
     except ValueError as exc:
@@ -11328,8 +10586,6 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
     state.last_activity = datetime.now(UTC)
     registry.write_state(state)
 
-    # Run the event loop (Section 4.8) until a terminal. Quota/restart are handled
-    # inside the loop; quota NEVER exits non-zero (FR-13).
     quota_waiter = build_quota_waiter(
         patterns=patterns,
         config=cfg,
@@ -11348,10 +10604,6 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         state=state,
     )
     on_quota_wait = _make_supervise_quota_wait_persister(registry=registry, state=state)
-    # Refresh last_activity on observed PTY activity (throttled to the registry
-    # poll cadence) so supervise status distinguishes a busy session from a hung
-    # one without an operator having to stat the pty.log (tracked issue:
-    # supervise-status-last-activity-stale-during-active-work).
     on_activity = _make_supervise_activity_persister(
         registry=registry, state=state, min_interval_seconds=cfg.timeouts.poll_interval_seconds
     )
@@ -11364,11 +10616,6 @@ def _cmd_supervise_run(parsed: _SuperviseArgs) -> int:
         stop_poll=lambda: read_stop_request(WORKSPACE_ROOT, parsed.name),
         on_quota_wait=on_quota_wait,
         on_activity=on_activity,
-        # PROGRESS WATCHDOG (design point 2): the same LogTailDetector that scrapes
-        # the orchestrator log for terminal markers also reports whether that log
-        # GREW (progressed), which is the watchdog's "is real work happening?"
-        # signal. The watched file (_supervise_orchestrator_log_path) is the SAME
-        # file the in-session devbench subprocesses' setup_logging writes to.
         progress_poll=log_tail.progressed,
     )
 
@@ -11431,13 +10678,6 @@ def _cmd_supervise_attach(parsed: _SuperviseArgs) -> int:
         sys.stdout.write(chunk)
         sys.stdout.flush()
 
-    # The follow loop is event-driven and read-only: stdin is never wired to the
-    # child. Between reads it PARKS the process on a bounded ``select`` (the
-    # config-driven poll interval) via ``_block_until_readable`` rather than
-    # spinning -- a true ``tail -F``, not a CPU busy-loop (Section 4.7, CLAUDE.md
-    # Section 7.5). Ctrl-C (KeyboardInterrupt) ends the follow with exit 0; it
-    # interrupts the blocking ``select`` so the operator never waits a full
-    # interval to stop watching.
     poll_interval = _supervise_runtime_config().timeouts.poll_interval_seconds
 
     def _block() -> None:
@@ -11481,8 +10721,6 @@ def _cmd_supervise_stop(parsed: _SuperviseArgs) -> int:
     try:
         live_screens = _supervise_live_screen_names()
     except SuperviseError as exc:
-        # A broken ``screen -ls`` must NOT be mistaken for "the session is gone"
-        # (that would skip the teardown); fail fast (FR-30, CLAUDE.md).
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -11510,8 +10748,6 @@ def _supervise_stop_graceful(
     live_screens: set[str],
 ) -> int:
     """Graceful-stop *name*: signal ``__run``, wait, escalate to hard on timeout (Section 4.2)."""
-    # Stale-screen reconcile: a registry-running session whose screen is gone has
-    # no supervisor to drain; reconcile rather than write a pointless drain signal.
     if state.screen_name not in live_screens:
         state.state = SUPERVISE_STATE_STOPPED
         state.exit_reason = SUPERVISE_EXIT_REASON_STALE_RECONCILED
@@ -11519,8 +10755,6 @@ def _supervise_stop_graceful(
         print(f"[supervise] state=stopped name={name} (stale screen reconciled; no live supervisor).")
         return 0
 
-    # Signal __run: write the per-session drain signal + the stop.request the
-    # __run event loop polls to enter ``draining`` (Section 4.2 step 1-2).
     prev = os.environ.get("DEVBENCH_SESSION_NAME")
     os.environ["DEVBENCH_SESSION_NAME"] = name
     try:
@@ -11529,7 +10763,6 @@ def _supervise_stop_graceful(
         _restore_session_env_name(prev)
     write_stop_request(WORKSPACE_ROOT, name)
 
-    # Delegate the teardown to __run: wait (bounded) for it to reach a terminal.
     cfg = _supervise_runtime_config()
     reached = _supervise_wait_for_terminal(
         name=name, registry=registry, timeout_seconds=cfg.timeouts.graceful_stop_seconds
@@ -11540,7 +10773,6 @@ def _supervise_stop_graceful(
         print(f"[supervise] state={final_state} name={name} mode=graceful (drained by supervisor).")
         return 0
 
-    # Graceful budget expired without __run winding down: escalate to hard.
     print(f"[supervise] graceful stop of {name!r} exceeded budget; escalating to hard stop.", file=sys.stderr)
     return _supervise_stop_hard(name, state, registry)
 
@@ -11662,12 +10894,8 @@ def _dispatch_supervise_subverb(sub: str, args: list[str]) -> int:
         The sub-verb's exit code.
     """
     parsed = _parse_supervise_args(args)
-    # ``status`` is the only body that needs the "explicit --name" distinction
-    # (one session vs list all), so it is handled outside the single-arg table.
     if sub == "status":
         return _cmd_supervise_status(parsed, name_given="--name" in args)
-    # A name->handler table keeps the dispatcher flat (one return) and DRY: a new
-    # single-arg sub-verb is added by extending the table, not the control flow.
     handlers: dict[str, Callable[[_SuperviseArgs], int]] = {
         "start": _cmd_supervise_start,
         SUPERVISE_INTERNAL_RUN_SUBVERB: _cmd_supervise_run,
@@ -11710,7 +10938,6 @@ def cmd_supervise(*argv: str) -> int:
         )
         return 2
 
-    # Validate --name (FR-2) before any body runs so a crafted name fails fast.
     try:
         parsed = _parse_supervise_args(rest)
         _validate_supervise_name(parsed.name)
@@ -11751,7 +10978,6 @@ def cmd_quota_watcher(*argv: str) -> int:
         )
         return 1
 
-    # --once: read the checkpoint and print status.
     checkpoint = load_checkpoint(WORKSPACE_ROOT)
     if checkpoint is None:
         print("No quota pause checkpoint found -- orchestrator is not waiting.", file=sys.stdout)
@@ -11817,7 +11043,6 @@ def _scope_set(include: str, exclude: str, workspace_root: Path) -> int:
     except InvalidScopeError as exc:
         print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
         return 1
-    # Determine the target path honouring DEVBENCH_SESSION_NAME
     try:
         target_path = _session_scope_file_path(workspace_root)
     except ValueError as exc:
@@ -12162,10 +11387,6 @@ def _request_drain_for_session(workspace: Path, session_name: str, reason: str) 
         return 1
 
     signal_path = session_state_dir / SESSION_DRAIN_SIGNAL_FILENAME
-    # Construct and write the drain signal directly to the session path.
-    # request_drain(workspace) cannot be used here because it resolves the path
-    # via DEVBENCH_SESSION_NAME -- we need an explicit path regardless of the
-    # caller's environment (spec 4.4.4, AC-192-7).
     state = DrainState(
         requested_at=datetime.now(tz=UTC),
         requested_by=_current_user(),
@@ -12461,8 +11682,6 @@ def cmd_tail(*argv: str) -> int:
     if follow:
         cmd.append("-F")
     cmd.append(str(log_path))
-    # subprocess.run with shell=False; resolves via PATH.  Returns the
-    # child's exit code so an operator can chain in a pipeline.
     completed = subprocess.run(cmd, check=False)
     return completed.returncode
 
@@ -12583,11 +11802,6 @@ def cmd_drain(*argv: str) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# cmd_sessions helpers (E4-F5-S1-T1, issue #192)
-# ---------------------------------------------------------------------------
-
-
 def _parse_sessions_argv(argv: tuple[str, ...]) -> tuple[str | None, int, str]:
     """Parse ``cmd_sessions`` arguments into ``(mode, error_rc, error_msg)``.
 
@@ -12674,14 +11888,6 @@ def cmd_sessions(*argv: str) -> int:
         removed = registry.cleanup_stale_sessions()
         if removed:
             print(f"Removed {len(removed)} stale session(s): {', '.join(removed)}")
-            # A session that died without a clean SIGTERM stop leaves any unit it
-            # had set to ``in-progress`` stuck there forever (tracked issue:
-            # dead-session-leaves-claimed-unit-stuck-in-progress). cleanup already
-            # knows which sessions are dead; re-queue each orphaned in-progress
-            # unit it claimed, cross-checking pid liveness against the surviving
-            # registry so a unit a LIVE session is actively working is never
-            # touched. ``registry.load()`` now returns only the survivors (cleanup
-            # rewrote the registry).
             recovered = _recover_orphaned_units_from_dead_sessions(
                 dead_session_names=set(removed),
                 surviving_sessions=registry.load(),
@@ -12702,7 +11908,6 @@ def cmd_sessions(*argv: str) -> int:
 
     liveness_map = registry.liveness_of_sessions(sessions)
 
-    # Header row
     header = f"{'NAME':<20} {'PID':>8}  {'LIVENESS':<8}  {'DRAIN':<8}  {'STARTED_AT':<25}  SCOPE"
     print(header)
     print("-" * len(header))
@@ -12752,7 +11957,6 @@ def _recover_orphaned_units_from_dead_sessions(
         logger.warning("dead-session recovery: cannot read backlog index: %s", exc)
         return []
 
-    # Any unit a surviving (live) session holds in scope is off-limits.
     live_scoped: set[str] = set()
     for session in surviving_sessions:
         live_scoped.update(session.scope)
@@ -12763,7 +11967,6 @@ def _recover_orphaned_units_from_dead_sessions(
         if unit.status is not WorkUnitStatus.IN_PROGRESS:
             continue
         if unit.id in live_scoped:
-            # A live session may have re-claimed this unit; never re-queue it.
             continue
         claiming = _extract_session_from_wu(unit)
         if claiming is None or claiming not in dead_session_names:
@@ -12809,8 +12012,6 @@ def _flag_orphaned_staged_wip(unit: WorkUnit, reason: str) -> None:
     try:
         canonical_repo = resolve_repo(unit.repo)
     except ValueError:
-        # Unrecognised repo: nothing to clean up here. Best-effort -- never let a
-        # repo-resolution quirk break the unit's status recovery.
         return
     repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
     if repo_path is None:
@@ -12842,9 +12043,6 @@ def _unstage_interrupted_wip(repo_path: Path, *, unit_id: str, reason: str) -> b
     """
     if not repo_path.is_dir():
         return False
-    # `git diff --cached --quiet` exits 0 when nothing is staged, 1 when the
-    # index differs from HEAD. Any other exit (e.g. not a git repo) is treated
-    # as "nothing to do" so this never raises into the recovery path.
     probe = subprocess.run(
         ["git", "-C", str(repo_path), "diff", "--cached", "--quiet"],
         check=False,
@@ -12907,9 +12105,6 @@ def _dirty_paths(repo_path: Path) -> list[str] | None:
     if probe.returncode != 0:
         return None
     paths: list[str] = []
-    # NUL-delimited records: each is "XY <path>"; a rename ("R") record is
-    # followed by a second NUL-delimited field holding the ORIGINAL path,
-    # which must be consumed but is not a dirty destination path itself.
     fields = [field for field in probe.stdout.split("\0") if field]
     index = 0
     while index < len(fields):
@@ -12919,7 +12114,6 @@ def _dirty_paths(repo_path: Path) -> list[str] | None:
         if path:
             paths.append(path)
         if status_code and status_code[0] in ("R", "C"):
-            # Consume the trailing original-path field for rename/copy records.
             index += 1
         index += 1
     return paths
@@ -12999,7 +12193,6 @@ def _clean_foreign_wip_on_claim(unit: WorkUnit) -> bool:
     own = _own_manifest_paths(unit)
     foreign = [path for path in dirty if path not in own]
     if not foreign:
-        # The only dirty paths belong to the claimed unit itself -- leave them.
         return False
 
     stash_message = f"devbench: orphaned WIP evicted on claim of {unit.id}"
@@ -13028,13 +12221,6 @@ def _clean_foreign_wip_on_claim(unit: WorkUnit) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# cmd_stop helpers (E4-F5-S1-T2, issue #192)
-# ---------------------------------------------------------------------------
-
-#: Audit-log prefix written when cmd_start intercepts SIGTERM and forces the
-#: in-flight work unit to ``blocked``.  Format:
-#: ``[FORCED_BLOCKED_ON_STOP] session=<name>``.
 _FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX: str = "[FORCED_BLOCKED_ON_STOP] session="
 
 
@@ -13063,12 +12249,10 @@ def _parse_stop_argv(argv: tuple[str, ...]) -> tuple[str | None, int, str]:
     """
     args = list(argv)
 
-    # Collect unknown flags
     unknown = [a for a in args if a.startswith("-") and a != "--session"]
     if unknown:
         return None, 2, f"ERROR: unknown flag(s) for stop: {', '.join(unknown)}"
 
-    # Require --session
     if "--session" not in args:
         return None, 2, "ERROR: --session <name> is required for devbench stop"
 
@@ -13144,12 +12328,6 @@ def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
         "orchestrator",
         f"{_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX}{session_name}",
     )
-    # The unit may have been interrupted mid-git-ops -- after the executor ran
-    # ``git add`` but before the commit. Force-blocking its status is not enough:
-    # the staged changes sit in the target checkout's index and a later commit in
-    # the same checkout would sweep them in under the wrong unit/message (tracked
-    # issue: drain-leaves-interrupted-unit-staged-wip-in-index). Unstage them
-    # (edits stay in the working tree, recoverable when the unit is re-claimed).
     _flag_orphaned_staged_wip(wu, f"interrupted on stop session={session_name}")
 
 
@@ -13256,9 +12434,6 @@ def _terminate_process_group(pgid: int) -> bool:
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        # The group already exited between attribution and teardown -- nothing
-        # to reap. A no-op success, not a fault (CLAUDE.md no-silent-failure:
-        # logged, not swallowed silently).
         logger.info(
             "%s executor process group pgid=%d already exited; nothing to tear down", CLAIM_TEARDOWN_MARKER, pgid
         )
@@ -13351,9 +12526,6 @@ def _block_non_converging_claim(unit_id: str, recurring_failure: str, *, executo
     except (OSError, ValueError) as exc:
         logger.warning("%s failed to block unit %s: %s", CLAIM_NOT_CONVERGING_MARKER, unit_id, exc)
     finally:
-        # Reap the executor's spawned subprocess group even if the block raised:
-        # an orphaned billable apply is the worse harm. Single, positively
-        # attributed group only.
         _teardown_non_converging_executor(unit_id, executor_pgid)
 
 
@@ -13438,9 +12610,6 @@ def _kill_sigterm(pid: int, session_name: str) -> str:
     return ""
 
 
-#: Exit code for a daemon-control verb refused by the caller-role gate (TDI-004).
-#: Distinct from the argument-parse error (2) and the runtime-delivery error (1)
-#: so callers and tests can tell an authorisation refusal apart from a bad flag.
 DAEMON_CONTROL_REFUSED_RC: int = 3
 
 
@@ -13477,7 +12646,6 @@ def _is_daemon_control_authorized() -> bool:
     try:
         return bool(sys.stdin.isatty())
     except (OSError, ValueError):
-        # A closed/detached stdin is the non-interactive (automated) case.
         return False
 
 
@@ -13552,7 +12720,6 @@ def cmd_stop(*argv: str) -> int:
         print(error_msg, file=sys.stderr)
         return error_rc
 
-    # At this point session_name is guaranteed non-None by _parse_stop_argv.
     assert session_name is not None
     rc, success_msg, err_msg = _send_sigterm_to_session(session_name)
     if rc != 0:
@@ -13788,11 +12955,6 @@ def cmd_reject_amendment(unit_id: str, rejection_reason: str) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Issue #156: review-judge structured rejection-feedback persistence
-# ---------------------------------------------------------------------------
-
-
 def _validate_rejection_feedback_payload(judge: str, payload: object) -> dict[str, Any]:
     """Layer-1 schema check for the ``log-rejection-feedback`` JSON body.
 
@@ -13924,11 +13086,6 @@ def cmd_log_rejection_feedback(*argv: str) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Issue #156: executor-feedback collector for review-judge rejections
-# ---------------------------------------------------------------------------
-
-
 def _collect_review_judge_feedback(task_id: str) -> list[dict[str, Any]]:
     """Return the executor-injected ``review-judge-fail`` payload list for ``task_id``.
 
@@ -13950,8 +13107,6 @@ def _collect_review_judge_feedback(task_id: str) -> list[dict[str, Any]]:
             continue
         if not isinstance(data, dict):
             continue
-        # Synthesize a v1-shaped record for legacy amender-rejections
-        # entries that pre-date schema_version: 1.
         if "schema_version" not in data and "reason_category" in data:
             data = {
                 "schema_version": 1,
@@ -13983,11 +13138,6 @@ def _collect_review_judge_feedback(task_id: str) -> list[dict[str, Any]]:
         )
     )
     return payloads[:MAX_RETRY_ATTEMPTS]
-
-
-# ---------------------------------------------------------------------------
-# Issue #156: done-gate hook for review-judge rejection resolution
-# ---------------------------------------------------------------------------
 
 
 def _outstanding_rejection_categories(task_id: str, wu_file: Path | None) -> list[tuple[str, str]]:
@@ -14050,16 +13200,10 @@ def cmd_sweep_proposals() -> int:
     proposals = list_proposals(WORKSPACE_ROOT)
     auto_accept = RUNTIME_CONFIG.task_factory.auto_accept_proposals
 
-    # Issue #155: when no proposal JSONs AND auto-accept is off, fast-exit
-    # before parsing the backlog so the legacy "nothing to do" message is
-    # preserved. When auto-accept is on we still need to load the index so
-    # the orphan auto-promote pass below can run.
     if not proposals and not auto_accept:
         print("sweep-proposals: nothing to do (no proposal JSONs on disk)")
         return 0
 
-    # Resolve source-task repo once for the whole sweep -- read index here
-    # rather than per-proposal so the sweep runs with O(1) index parses.
     try:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
         units = parser.parse_index()
@@ -14067,8 +13211,6 @@ def cmd_sweep_proposals() -> int:
         print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
         return 1
     unit_by_id = {u.id: u for u in units}
-    # ADR-11 audit suffix written on every auto-promoted draft's Comments
-    # so a reviewer can tell at a glance that no human pressed the button.
     auto_audit_suffix = "(auto-accepted via task_factory.auto_accept_proposals=true)"
 
     touched = 0
@@ -14080,12 +13222,6 @@ def cmd_sweep_proposals() -> int:
             auto_audit_suffix=auto_audit_suffix,
         )
 
-    # Issue #155: extend the auto-promote pass to also pick up pre-existing
-    # ``proposed`` drafts whose proposal JSON no longer exists (operator
-    # deleted it, or sweep skipped it earlier). The first pass above only
-    # iterates over JSONs on disk; this second pass walks the full backlog
-    # index and promotes any ``proposed`` task whose source carries the
-    # auto-accept toggle.
     if auto_accept:
         orphan_promoted = _auto_promote_orphan_proposed_drafts(units, auto_audit_suffix)
         if orphan_promoted:
@@ -14253,8 +13389,6 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     if gate_rc != 0:
         return gate_rc
 
-    # Resolve the target repo from the source task so every draft row uses
-    # the same repo string that the orchestrator will execute against.
     try:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
         units = parser.parse_index()
@@ -14266,11 +13400,6 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
         print(f"ERROR: source task {source_task_id} not found in backlog", file=sys.stderr)
         return 1
 
-    # Pre-classify each proposed task so the CLI output can distinguish
-    # "skipped because already resolved" from "materialised just now".
-    # materialise_proposal itself logs the same skip rationale at INFO.
-    # Capture the original ids in declaration order so a collision re-home
-    # (suggested_id reassigned by materialise_proposal) is observable here.
     original_ids = [task.suggested_id for task in proposal.proposed_tasks]
     pre_states = {tid: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, tid) for tid in original_ids}
 
@@ -14286,17 +13415,11 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # A collision re-home reassigns proposed_tasks[i].suggested_id to a free id.
-    # Surface every old -> new mapping so the operator can see the fix unit was
-    # created under a new id (never silently dropped on an id collision).
     remapped = {
         old: task.suggested_id
         for old, task in zip(original_ids, proposal.proposed_tasks, strict=True)
         if old != task.suggested_id
     }
-    # A task that was re-homed is NOT skipped -- it was materialised under a new
-    # id. Only report a task as skipped when its pre-state was terminal AND it
-    # was not re-homed.
     skipped = {
         tid: state.value
         for tid, state in pre_states.items()
@@ -14373,15 +13496,6 @@ def cmd_write_proposal(source_task_id: str) -> int:
     """
     try:
         proposal = _read_proposal_from_stdin(source_task_id)
-        # Issue #146: drop proposed-task entries whose files all live in
-        # the backlog repo (not in any configured target repo). The
-        # recovery cascade has no valid endpoint for backlog-repo edits;
-        # they're operator bookkeeping commits, not work-unit deliverables.
-        # NOTE: this filter runs BEFORE the prefix strip below because the
-        # filter classifies paths by their first segment matching a
-        # configured `checkout_directory`; stripping the prefix first
-        # would erase that signal and misclassify target-repo paths as
-        # backlog-repo paths.
         proposal, skipped_entries = _filter_backlog_repo_proposed_tasks(proposal)
         for skipped_id, skipped_files in skipped_entries:
             audit = (
@@ -14392,10 +13506,6 @@ def cmd_write_proposal(source_task_id: str) -> int:
             )
             logger.info("write-proposal: %s", audit)
         if not proposal.proposed_tasks:
-            # Every proposed task was backlog-repo only -- nothing to write.
-            # Source task escalates: operator must commit the backlog-repo
-            # bookkeeping by hand and decide whether the source task can
-            # otherwise proceed.
             print(
                 json.dumps(
                     {
@@ -14407,22 +13517,8 @@ def cmd_write_proposal(source_task_id: str) -> int:
                 )
             )
             return 0
-        # Issue #159: blocker-resolver agents sometimes prefix paths with
-        # the target repo's `checkout_directory` (e.g. `kanon/src/foo.py`
-        # when `kanon` is configured as the checkout directory). Strip
-        # the prefix so the persisted JSON carries repo-relative paths
-        # only, matching the manifest-path convention enforced by
-        # validate-backlog rule 11 + guard-work-unit-write.sh. Paths that
-        # match multiple configured `checkout_directories` are ambiguous
-        # and reject the whole proposal. Strip runs AFTER the backlog-
-        # repo filter so the filter can still classify by first-segment
-        # match with the unstripped paths.
         proposal = _strip_checkout_directory_prefix(proposal)
-        # Compute the dedup signature even when the agent did not stamp it.
         proposal = _stamp_fix_signature(proposal)
-        # Issue #141: scan for an existing recovery task whose fix
-        # signature matches. If found, wire the new source task as an
-        # additional dep edge instead of writing a duplicate proposal.
         match = find_matching_pending_proposal(WORKSPACE_ROOT, proposal.fix_signature)
         if match is not None and match.source_task_id != source_task_id:
             return _wire_recovery_reuse(source_task_id, proposal, match)
@@ -14514,8 +13610,6 @@ def _file_lives_in_a_target_repo(file_path: str, source_task_id: str | None = No
     if not file_path:
         return False
     if not RUNTIME_CONFIG.repos:
-        # No target repos configured -- the filter has no basis for
-        # classification; treat every file as in-scope (conservative).
         return True
     first_segment = file_path.split("/", 1)[0]
     all_checkouts: set[str] = set()
@@ -14530,11 +13624,6 @@ def _file_lives_in_a_target_repo(file_path: str, source_task_id: str | None = No
     if source_task_id:
         target_repo = _resolve_source_repo(source_task_id)
         if target_repo and target_repo in RUNTIME_CONFIG.repos:
-            # The source task targets a known repo and ``file_path``
-            # carries no target-repo prefix -- assume it is a repo-
-            # relative path inside the source's target repo (blocker-
-            # resolver agents that run from inside the checkout emit
-            # paths in this form). Issue #180.
             return True
     return False
 
@@ -14562,8 +13651,6 @@ def _strip_checkout_directory_prefix(proposal: Proposal) -> Proposal:
     if not RUNTIME_CONFIG.repos:
         return proposal
 
-    # Enumerate every configured checkout_directory (deterministic order
-    # so the multi-match error message is reproducible).
     checkout_dirs: list[str] = sorted(
         {
             (
@@ -14591,8 +13678,6 @@ def _strip_checkout_directory_prefix(proposal: Proposal) -> Proposal:
             if len(matches) == 1:
                 prefix = matches[0]
                 if raw == prefix:
-                    # Path IS the checkout directory itself (no file
-                    # selected). Skip; the agent must name a real file.
                     continue
                 new_files.append(raw[len(prefix) + 1 :])
             else:
@@ -14621,19 +13706,15 @@ def _filter_backlog_repo_proposed_tasks(proposal: Proposal) -> tuple[Proposal, l
     source_task_id = proposal.source_task_id
     for task in proposal.proposed_tasks:
         if not task.files_to_own:
-            # Empty files_to_own = research / validation-gate task; not
-            # backlog-only by intent. Preserve as-is.
             kept.append(task)
             continue
         target_repo_files = [f for f in task.files_to_own if _file_lives_in_a_target_repo(f, source_task_id)]
         backlog_files = [f for f in task.files_to_own if not _file_lives_in_a_target_repo(f, source_task_id)]
         if not target_repo_files:
-            # Entirely backlog-repo work -- drop the entry.
             skipped.append((task.suggested_id, backlog_files))
             mutated = True
             continue
         if backlog_files:
-            # Mixed -- prune the backlog files; keep target-repo files.
             kept.append(_replace(task, files_to_own=target_repo_files))
             mutated = True
         else:
@@ -14665,9 +13746,6 @@ def _wire_recovery_reuse(
             reason=audit_msg,
         )
     except (FileNotFoundError, ProposalError) as exc:
-        # Failure to wire dep falls back to the emit path so the
-        # operator is not silently left in a half-state. Surface as
-        # error; caller (the orchestrator) can choose to retry.
         print(f"ERROR: recovery-reuse dep wiring failed: {exc}", file=sys.stderr)
         return 1
     output = {
@@ -14801,10 +13879,6 @@ def cmd_escalate_proposal(source_task_id: str) -> int:
         return 1
 
     out_of_scope = [f.strip() for f in attributed_files if f.strip() and f.strip() not in set(manifest_files)]
-    # The PARENT's own failing executable gate directive, carried onto each fix
-    # unit so its done-gate re-runs the parent gate -- a fix that merely relocates
-    # the failure cannot reach done (tracked issue:
-    # fix-unit-validates-narrow-diagnostic-not-parent-full-gate).
     parent_verify_directive = _parent_failing_verify_directive(wu_file)
     mgr = BacklogManager()
 
@@ -15008,10 +14082,6 @@ def cmd_list_proposals() -> int:
     return 0
 
 
-# Width pre-computed from the longest ProposalTaskState value
-# ("unmaterialised" -> 14 chars + surrounding brackets). Updating the enum
-# triggers the test in ``tests/test_cli.py::TestCmdListProposals`` that pins
-# alignment.
 _PROPOSAL_STATE_LABEL_WIDTH = max(len(s.value) for s in ProposalTaskState) + 2
 
 
@@ -15088,10 +14158,6 @@ def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
         print("ERROR: promote-proposal requires a task id", file=sys.stderr)
         return 1
 
-    # Heuristic: warn (or honor proposal flag) when the new task looks like a
-    # test that validates the source task's output. In that pattern, the
-    # default dep direction (source.depends_on(new)) creates a circular
-    # cycle. See docs/task-factory.md "When to use --no-dep-on-source".
     if dep_on_source:
         proposal_hint = _detect_test_validates_source(task_id)
         if proposal_hint == "flag":
@@ -15254,7 +14320,6 @@ def cmd_add_dep(*argv: str) -> int:
     if rc is not None:
         return rc
 
-    # Warn when blocked is not in `blocked` status (ADR-10 soft guidance).
     try:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
         units = parser.parse_index()
@@ -15307,12 +14372,7 @@ def cmd_add_dep(*argv: str) -> int:
     return 0
 
 
-# A leaf Task id: every hierarchy segment present.
 _DEP_EDGE_TASK_ID_RE: re.Pattern[str] = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
-# A canonical work-unit id of any level: Epic, Feature, Story, or Task. Used as
-# the blocker shape for ``remove-dep`` so an operator can cut a CONTAINER
-# dependency edge (TDI-001). ``add-dep`` keeps the strict Task-only shape so it
-# can never wire a new self-ancestor / container edge in the first place.
 _DEP_EDGE_CANONICAL_ID_RE: re.Pattern[str] = re.compile(r"^E\d+(-F\d+)?(-S\d+)?(-T\d+)?$")
 
 
@@ -15636,7 +14696,6 @@ def cmd_review_token(*argv: str) -> int:
     return 1
 
 
-# Command registry: name -> (handler, min_args, description)
 _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
     "next": (cmd_next, 0, "Print next actionable work unit"),
@@ -15904,7 +14963,6 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         "Send one sample Slack notification for an event (smoke-test setup): notify-test --event <name>",
     ),
-    # Plugin agent bridge commands -- used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
@@ -15993,16 +15051,6 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
 
 _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 
-# Commands that parse their own flag grammar and need the full trailing-arg
-# list instead of the dispatcher's fixed-arity slice. Additions here are
-# deliberate -- the slice is a guardrail against typos for fixed-arity
-# commands, so variadic opt-in should be narrow.
-#
-# add-dep is variadic because its `--reason "<multi token message>"` flag
-# value is dropped by the fixed-arity slice (slice keeps only positional
-# count + 1 trailing arg, so `--reason` survives but the value after it
-# does not). _parse_add_dep_argv handles flags itself; opting into
-# variadic dispatch lets the value through.
 _VARIADIC_COMMANDS: frozenset[str] = frozenset(
     {
         "cost-calibrate",
@@ -16020,43 +15068,24 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "review-token",
         "validate-backlog",
         "log-rejection-feedback",
-        # Tracked issue 014: mark-done owns its --already-satisfied flag parsing.
         "mark-done",
-        # Issue #162 Phase 6: pre-render the report into a snapshot file.
         "write-snapshot",
-        # Issue #162 Phase 2: rebuild per-task window-stats aggregates from the log.
         "rebuild-window-stats",
-        # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
         "archive-session",
-        # Issue #242 E7-F1-S1-T1: --operator-mode bypass flag
         "request-amendment",
-        # Issue #194 E7-F1-S1-T1: --include / --exclude scope selectors for bulk status update
         "set-status",
-        # Issue #189 E1-F4-S1-T2: bulk selectors --epic/--feature/--story
         "promote",
-        # Issue #190 E2-F2-S1-T1: --include / --exclude scope selectors
         "start",
-        # Issue #209: lifecycle CLI -- flag-bearing subcommands need raw argv.
-        # "stop" is already registered above for #192 (--session targeting);
-        # #209's "stop-instance" handles instance-id / PID targeting.
         "instances",
         "stop-instance",
         "tail",
         "restart",
-        # Issue #190 E2-F2-S2-T3: cmd_next respects scope filter
         "next",
-        # Issue #196 E2-F7: scope set / clear / show subcommand
         "scope",
-        # Issue #188 E3-F2: drain --reason / --cancel / --status flags
         "drain",
-        # Issue #192 E4-F5-S1-T1: sessions --cleanup flag
         "sessions",
-        # Issue #192 E4-F5-S1-T2: stop --session <name> flag
         "stop",
-        # Issue #236: quota wait-and-resume -- optional --once/--daemon flag
         "quota-watcher",
-        # devbench-supervise-screen-orchestrator (FR-1): the supervise verb group
-        # owns its sub-verb + flag parsing, so it needs the raw trailing argv.
         "supervise",
     }
 )
@@ -16156,7 +15185,6 @@ def _extract_scope_flags_for_report(
         if arg in ("--include", "--exclude", "--session") and i + 1 < len(raw_args):
             next_val = raw_args[i + 1]
             if next_val.startswith("--"):
-                # Next token is another flag -- do not consume it as a value.
                 filtered.append(arg)
                 i += 1
                 continue
@@ -16227,8 +15255,6 @@ def main() -> int:
     """Parse arguments and dispatch to the appropriate command."""
     setup_logging()
 
-    # Top-level: `devbench`, `devbench --help`, `devbench -h` all print usage and exit 0.
-    # Only a typo'd command (e.g. `devbench foo`) returns 1.
     if len(sys.argv) < 2 or sys.argv[1] in _HELP_FLAGS:
         _print_usage()
         return 0
@@ -16239,8 +15265,6 @@ def main() -> int:
         print(f"Available: {', '.join(sorted(_COMMANDS))}", file=sys.stderr)
         return 1
 
-    # Per-command help: `devbench <cmd> --help` / `-h` prints the registry
-    # description (single source of truth) and exits 0.
     if any(arg in _HELP_FLAGS for arg in sys.argv[2:]):
         _, _, desc = _COMMANDS[command]
         print(desc)
@@ -16253,10 +15277,6 @@ def main() -> int:
     else:
         watch_interval, args = 0, list(sys.argv[2:])
 
-    # Issue #163: ``devbench report`` accepts ``--once`` / ``--no-stream``
-    # to force one-shot snapshot rendering even on a TTY. Strip the flag
-    # before the args reach the command function so the positional
-    # ``since`` slot stays well-defined.
     once = False
     by_role = False
     include = ""
@@ -16264,12 +15284,7 @@ def main() -> int:
     session = ""
     if command == "report":
         once, args = _extract_once_flag(args)
-        # Issue #206: opt-in per-role breakdown.
         by_role, args = _extract_by_role_flag(args)
-        # Issue #190 (AC-190-10, AC-190-11): strip ``--include`` / ``--exclude``
-        # scope-filter flags before the remaining positional ``since`` arg is
-        # resolved. The extracted strings are forwarded to ``cmd_report``.
-        # AC-192-12: also strip ``--session <name>`` for per-session filtering.
         include, exclude, session, args = _extract_scope_flags_for_report(args)
 
     if len(args) < min_args:
@@ -16289,9 +15304,6 @@ def main() -> int:
     if watch_rc is not None:
         return watch_rc
 
-    # Variadic commands receive the full trailing-arg list -- they own their
-    # own flag parsing. Fixed-arity commands get sliced to ``min_args + 1``
-    # so a stray extra positional is reported instead of silently absorbed.
     if command in _VARIADIC_COMMANDS:
         sliced_args: list[str] = list(args)
     else:

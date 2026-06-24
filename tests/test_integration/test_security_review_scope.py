@@ -66,15 +66,10 @@ class TestSecurityReviewerScopeContract:
     @pytest.mark.parametrize(
         "fragment",
         [
-            # Rule 1: capture the in-scope path set first
             "Capture the in-scope path set first",
-            # Rule 2: forbid reading files outside the in-scope set
             "Do NOT read files outside the in-scope set",
-            # Rule 3: forbid raw-git scope computations
             "Do NOT run `git diff origin/main`",
-            # Rule 4: every finding must cite an in-scope path; out-of-scope dropped
             "Every finding's verdict body must cite an in-scope path",
-            # Rule 5: empty in-scope set -> PASS with fixed summary
             "no in-scope changes",
         ],
     )

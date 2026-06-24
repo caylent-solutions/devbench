@@ -46,15 +46,11 @@ class TestSuperviseRunReachesRunning:
     """FR-7/FR-8/FR-13: __run drives ready -> kickoff -> event loop -> clean exit."""
 
     def test_run_records_running_then_clean(self, tmp_path: Path) -> None:
-        # ready -> ack -> (event loop reads working activity) -> ALL_DONE clean EOF.
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="> "),  # ready prompt
-                # orchestrate is a SLASH command: typed (no newline) -> menu render
-                # settles -> single Enter (\r). Gate the ack on the submit \r so the
-                # render-settle quiescence wait does NOT prematurely consume it.
-                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),  # ack
-                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # terminal clean
+                _ScriptStep(emit="> "),
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )
         with _ctx(_patch_run(tmp_path, child)):
@@ -62,12 +58,10 @@ class TestSuperviseRunReachesRunning:
         assert rc == 0
         state = SuperviseRegistry(tmp_path).read_state("nightly")
         assert state is not None
-        # The event loop drove the session to its clean terminal (Section 4.6).
         assert state.state == "completed-clean"
         assert state.exit_reason == "all-done"
         assert state.claude_version == "claude 1.2.3"
         assert state.claude_path == "/usr/bin/claude"
-        # Slash submission: type the literal then submit a single Enter.
         assert child.sent == ["/devbench-orchestrate:orchestrate", "\r"]
 
 
@@ -76,22 +70,15 @@ class TestSuperviseRunRestartThroughRun:
     """FR-12/Section 4.3: __run relaunches on exit-42 then completes clean (end-to-end)."""
 
     def test_run_relaunches_on_exit_42(self, tmp_path: Path) -> None:
-        # One child double drives both the initial run and the post-relaunch run
-        # (pexpect.spawn is patched to return it again on relaunch, so its cursor
-        # walks the whole scripted sequence). exit-42 triggers the _relaunch closure.
         restart_line = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks=1"
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="> "),  # initial ready
-                # orchestrate is a SLASH command (type -> render-settle -> Enter).
-                # Gate each cycle's ack on its OWN submit Enter (\r): the first ack
-                # on the 1st \r, the post-relaunch ack on the 2nd \r, so neither is
-                # prematurely consumed by the render-settle quiescence wait.
-                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),  # ack (cycle 1)
-                _ScriptStep(emit=restart_line, eof=True, exitstatus=42),  # restart signal
-                _ScriptStep(emit="> "),  # ready after relaunch
-                _ScriptStep(emit="esc to interrupt", on_send=r"\r", on_send_count=2),  # ack (cycle 2)
-                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # clean terminal
+                _ScriptStep(emit="> "),
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r"),
+                _ScriptStep(emit=restart_line, eof=True, exitstatus=42),
+                _ScriptStep(emit="> "),
+                _ScriptStep(emit="esc to interrupt", on_send=r"\r", on_send_count=2),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )
         with _ctx(_patch_run(tmp_path, child)):
@@ -101,7 +88,6 @@ class TestSuperviseRunRestartThroughRun:
         assert state is not None
         assert state.state == "completed-clean"
         assert state.restart_count == 1
-        # The relaunch re-injected the kickoff a second time.
         assert child.sent.count("/devbench-orchestrate:orchestrate") == 2
 
 
@@ -110,7 +96,7 @@ class TestSuperviseRunFaultsOnReadyTimeout:
     """FR-7/Section 4.6: a ready-prompt timeout faults the session (non-zero)."""
 
     def test_ready_timeout_faults(self, tmp_path: Path) -> None:
-        child = FakePexpectChild([])  # never becomes ready
+        child = FakePexpectChild([])
         with _ctx(_patch_run(tmp_path, child)):
             rc = cli.cmd_supervise("__run", "--name", "nightly", "--model", "claude-opus-4-8")
         assert rc == 1
@@ -197,7 +183,6 @@ class TestRecordToolVersion:
             assert cli._record_tool_version("/usr/bin/claude") is None
 
     def test_uses_config_command_invocation_timeout(self) -> None:
-        # FR-19 / Section 7.4: the version-probe safety timeout is config-driven.
         from devbench.config_loader import SuperviseConfig, SuperviseTimeoutsConfig
 
         cfg = SuperviseConfig(timeouts=SuperviseTimeoutsConfig(command_invocation_seconds=99))
@@ -238,12 +223,7 @@ class TestStartRunningConfirmation:
     def test_no_registry_record_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         creds = self._creds(tmp_path)
         patches = self._common(tmp_path, creds)
-        # The launch is a no-op (no registry record written): the new daemon never
-        # reaches running, so the bounded readiness wait times out and start fails
-        # fast (tracked issue: supervise-start-returns-early-prints-stale-record).
         patches.append(patch("devbench.cli._supervise_launch_screen", MagicMock(return_value=0)))
-        # Drive the monotonic clock so the bounded wait exhausts immediately and
-        # _block_until_readable is a no-op (no real park / sleep in the test).
         clock = {"t": 0.0}
 
         def _now() -> float:
@@ -262,7 +242,6 @@ class TestStartRunningConfirmation:
         from devbench.supervise import new_session_state
 
         creds = self._creds(tmp_path)
-        # Pre-seed a running session with this name, alive (use the current pid).
         reg = SuperviseRegistry(tmp_path)
         import os as _os
 
@@ -315,8 +294,6 @@ class TestStartRunningConfirmation:
         assert run_argv[run_argv.index("--effort") + 1] == "high"
 
     def test_billing_mode_forwarded_into_run_argv(self, tmp_path: Path) -> None:
-        # The resolved billing mode is forwarded into the in-screen __run argv so
-        # the supervisor's quota/env handling matches the operator's choice.
         creds = self._creds(tmp_path)
         spawned: dict[str, Any] = {}
 
@@ -357,8 +334,6 @@ class TestStartRunningConfirmation:
         assert "invalid scope token" in capsys.readouterr().err
 
     def test_scope_overlap_returns_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        # Pre-seed an SDK session claiming E1-F1-S1-T1; a supervise start on the
-        # same scope without --allow-overlap is rejected (FR-18).
         from datetime import UTC, datetime
 
         from devbench.session import Session, SessionRegistry

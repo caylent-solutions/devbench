@@ -15,11 +15,6 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-# ---------------------------------------------------------------------------
-# Shared workspace builders
-# ---------------------------------------------------------------------------
-
-
 def _write_backlog(tmp_path: Path, rows: list[str]) -> None:
     """Write a minimal BACKLOG.md with the given row lines under the standard header."""
     (tmp_path / "BACKLOG.md").write_text(
@@ -109,11 +104,6 @@ def _build_pure_degradation_workspace(tmp_path: Path, *, degradation_ts: datetim
     return tmp_path
 
 
-# ---------------------------------------------------------------------------
-# Tests for classify_blocked_task_excluding_degradation
-# ---------------------------------------------------------------------------
-
-
 class TestClassifyBlockedTaskExcludingDegradation:
     """classify_blocked_task_excluding_degradation skips the RUNTIME_DEGRADATION rung."""
 
@@ -133,7 +123,6 @@ class TestClassifyBlockedTaskExcludingDegradation:
             marker_target_status="in-queue",
         )
 
-        # Original classifier returns RUNTIME_DEGRADATION (masking the structural blocker).
         state_original = classify_blocked_task(
             workspace / "backlog",
             workspace / "BACKLOG.md",
@@ -143,7 +132,6 @@ class TestClassifyBlockedTaskExcludingDegradation:
         )
         assert state_original is BlockedTaskState.RUNTIME_DEGRADATION
 
-        # New classifier skips degradation and returns the structural bucket.
         state_excl = classify_blocked_task_excluding_degradation(
             workspace / "backlog",
             workspace / "BACKLOG.md",
@@ -164,7 +152,6 @@ class TestClassifyBlockedTaskExcludingDegradation:
         story_dir = _make_story_dir(tmp_path)
         ts_str = now.strftime("%Y-%m-%d %H:%M UTC")
 
-        # T1 carries a degradation signal + a marker pointing at E0-F1-S1-T99 (no backlog row)
         source_content = (
             "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
             "## Description\n\nx\n\n"
@@ -209,7 +196,6 @@ class TestClassifyBlockedTaskExcludingDegradation:
             workspace_root=workspace,
             now=now,
         )
-        # The degradation rung is skipped; no structural blocker present; falls to OPERATOR_ACTION_REQUIRED.
         assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
     def test_new_classifier_never_returns_runtime_degradation(self, tmp_path: Path) -> None:
@@ -318,7 +304,6 @@ class TestClassifyBlockedTaskExcludingDegradation:
             classify_blocked_task_excluding_degradation,
         )
 
-        # BACKLOG.md references a file that does not exist on disk.
         _write_backlog(
             tmp_path,
             [
@@ -362,7 +347,6 @@ class TestClassifyBlockedTaskExcludingDegradation:
             tmp_path / "BACKLOG.md",
             "E0-F1-S1-T1",
         )
-        # All markers terminal with no regular dep or recovery signal -> AUTO_CLEARING_VIA_PROPOSAL.
         assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
     def test_awaiting_dependency_returned_when_regular_dep_unsatisfied(self, tmp_path: Path) -> None:

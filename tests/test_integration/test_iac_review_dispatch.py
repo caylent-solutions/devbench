@@ -34,8 +34,6 @@ SKILL_PATH = PLUGIN_ROOT / "skills" / "orchestrate" / "SKILL.md"
 IAC_AGENT_PATH = PLUGIN_ROOT / "agents" / "iac-deploy-reviewer.md"
 SECURITY_AGENT_PATH = PLUGIN_ROOT / "agents" / "security-reviewer.md"
 
-# A work unit whose ## Verification contract declares a real infra item (a
-# terragrunt-driven terratest target). unit_requires_iac_judge must return True.
 _INFRA_UNIT = (
     "# E0-F1-S1-T1: Provision the data-lake landing bucket\n\n"
     "## Status: in-review\n\n"
@@ -47,7 +45,6 @@ _INFRA_UNIT = (
     "## Comments\n\n"
 )
 
-# A work unit with ONLY a non-infra (pytest command) Verification item.
 _NON_INFRA_UNIT = (
     "# E0-F1-S2-T1: Add a pure-Python parser helper\n\n"
     "## Status: in-review\n\n"

@@ -32,25 +32,15 @@ from enum import Enum
 from devbench.backlog.manifest import ManifestParseError, parse_manifest
 from devbench.backlog.sentinels import is_sentinel_manifest_value
 
-# ---------------------------------------------------------------------------
-# Public constants: verbatim rejection strings (spec AC-257-1)
-# ---------------------------------------------------------------------------
-
 TDD_CYCLE_MISSING_ZERO_EXIT: str = (
     "TDD_CYCLE_MISSING: recorded RED exit code was 0 (test did not fail before the change)"
 )
 
 TDD_CYCLE_MISSING_EMPTY_PROD: str = "TDD_CYCLE_MISSING: behavior-fix changed zero production source files"
 
-# ---------------------------------------------------------------------------
-# Valid Task Type header values (spec Section 4 E6.F2.S1)
-# ---------------------------------------------------------------------------
 
 _VALID_TASK_TYPES: frozenset[str] = frozenset({"test-only", "coverage-only"})
 
-# ---------------------------------------------------------------------------
-# Compiled regexes
-# ---------------------------------------------------------------------------
 
 _RED_ENTRY_RE: re.Pattern[str] = re.compile(
     r"-\s*\[RED\]\s+\S+\s+--\s+(.+)",
@@ -61,11 +51,6 @@ _EXIT_CODE_RE: re.Pattern[str] = re.compile(r"\bExit:\s*(\d+)")
 _DIFF_FILE_RE: re.Pattern[str] = re.compile(r"^diff --git a/.+ b/(.+)$", re.MULTILINE)
 
 _TASK_TYPE_RE: re.Pattern[str] = re.compile(r"^##\s+Task\s+Type:\s+(.+)$", re.MULTILINE)
-
-
-# ---------------------------------------------------------------------------
-# Enums and result types
-# ---------------------------------------------------------------------------
 
 
 class TaskTypeHeader(Enum):
@@ -90,11 +75,6 @@ class TddGateResult:
     passed: bool
     rejection_code: str | None
     message: str
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def extract_red_exit_code(text: str) -> int | None:
@@ -249,12 +229,9 @@ def check_tdd_gate(
         appropriate rejection code and verbatim message when either check
         fails.
     """
-    # Verification-only units author no source: the genuine-RED requirement
-    # does not apply, so waive both rule 1 and rule 2.
     if is_verification_only(wu_content):
         return TddGateResult(passed=True, rejection_code=None, message="")
 
-    # Check 1: exit code must be non-zero.
     exit_code = extract_red_exit_code(wu_content)
     if exit_code is not None and exit_code == 0:
         return TddGateResult(
@@ -263,7 +240,6 @@ def check_tdd_gate(
             message=TDD_CYCLE_MISSING_ZERO_EXIT,
         )
 
-    # Check 2: production files changed (unless exempt).
     task_type = extract_task_type(wu_content)
     is_exempt = task_type in (TaskTypeHeader.TEST_ONLY, TaskTypeHeader.COVERAGE_ONLY)
 

@@ -148,22 +148,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("devbench.supervise")
 
-# Serializes the supervise-registry read-modify-write WITHIN a process. Advisory
-# ``fcntl`` flock locks are per-open-file-description, so they serialize separate
-# PROCESSES but not threads in one process holding independent descriptors; this
-# module-level lock covers the in-process (multi-thread) case, paired with the
-# flock for the cross-process case (see :meth:`SuperviseRegistry._index_lock`).
 _REGISTRY_INDEX_THREAD_LOCK = threading.Lock()
 
-# Per-process counter making each registry temp-file name unique (paired with the
-# pid) so concurrent atomic writes never collide on a shared temp path.
 _REGISTRY_TMP_COUNTER = itertools.count()
-
-# ---------------------------------------------------------------------------
-# System-dependency preflight (FR-23): `screen` is a system/devcontainer
-# dependency, NOT a Python dependency. The supervisor probes for it at launch
-# and fails fast with a clear install hint if it is absent.
-# ---------------------------------------------------------------------------
 
 
 class ScreenUnavailableError(Exception):
@@ -209,11 +196,6 @@ def screen_session_name(name: str, *, prefix: str = SUPERVISE_SCREEN_NAME_PREFIX
         The screen session name (e.g. ``devbench-supervise-nightly``).
     """
     return f"{prefix}{name}"
-
-
-# ---------------------------------------------------------------------------
-# Per-session path helpers
-# ---------------------------------------------------------------------------
 
 
 def _reject_traversal(name: str) -> None:
@@ -313,22 +295,6 @@ def supervise_supervisor_log_path(workspace_root: Path, name: str) -> Path:
     return supervise_state_dir(workspace_root, name) / SUPERVISE_SUPERVISOR_LOG_FILENAME
 
 
-# ---------------------------------------------------------------------------
-# SuperviseSessionState
-# ---------------------------------------------------------------------------
-
-
-# The ``claude`` resume id is the session/transcript identifier passed to
-# ``claude --resume <id>`` (an opaque alphanumeric/hyphen handle), NOT a
-# credential, token, or key -- ``status``/``info`` exist precisely to surface it
-# so an operator can resume a session by id. ``sanitize_resume_id`` is the single
-# normalisation boundary that every persistence/display path routes the id
-# through: it reconstructs the value from the identifier character class
-# (alphanumerics plus ``-._``) only, so the result is a fresh string decoupled
-# from the original field and no control character, whitespace, or injection
-# payload can reach the on-disk ``state.json`` or operator output. Every
-# legitimate resume id is composed solely of these characters, so a real id
-# round-trips unchanged.
 _RESUME_ID_ALLOWED_CHARS = re.compile(r"[A-Za-z0-9_.-]+")
 
 
@@ -494,11 +460,6 @@ class SuperviseSessionState:
         )
 
 
-# ---------------------------------------------------------------------------
-# SuperviseRegistry
-# ---------------------------------------------------------------------------
-
-
 class SuperviseRegistry:
     """Read/write the supervise registry and per-session ``state.json`` files.
 
@@ -520,10 +481,6 @@ class SuperviseRegistry:
     def __init__(self, workspace_root: Path) -> None:
         self._workspace_root = workspace_root
         self._registry_path = workspace_root / SUPERVISE_REGISTRY_PATH
-
-    # ------------------------------------------------------------------
-    # Registry file I/O
-    # ------------------------------------------------------------------
 
     def load(self) -> list[SuperviseSessionState]:
         """Load and deserialise the registry file.
@@ -633,10 +590,6 @@ class SuperviseRegistry:
             finally:
                 fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
 
-    # ------------------------------------------------------------------
-    # Per-session state.json
-    # ------------------------------------------------------------------
-
     def write_state(self, state: SuperviseSessionState) -> None:
         """Write *state* to ``.devbench/supervise/<name>/state.json`` atomically.
 
@@ -684,10 +637,6 @@ class SuperviseRegistry:
         except json.JSONDecodeError as exc:
             raise ValueError(f"supervise state.json for {name!r} contains invalid JSON: {exc}") from exc
         return SuperviseSessionState.from_dict(data)
-
-    # ------------------------------------------------------------------
-    # Liveness + stale reaping (mirrors SessionRegistry)
-    # ------------------------------------------------------------------
 
     def is_alive(self, pid: int) -> bool:
         """Return ``True`` when *pid* refers to a running process.
@@ -793,21 +742,6 @@ def new_session_state(
     )
 
 
-# ===========================================================================
-# Phase 2 -- supervisor core (Section 4.0)
-# ===========================================================================
-#
-# These classes are dependency-injected and free of module-global config: the
-# CLI ``cmd_supervise start`` / ``__run`` bodies wire ``RUNTIME_CONFIG.supervise``
-# + ``WORKSPACE_ROOT`` into them. This keeps the core unit-testable with the
-# ``FakePexpectChild`` double and no real ``claude``/``screen`` (Section 10.0).
-
-
-# ---------------------------------------------------------------------------
-# Fail-fast error taxonomy (FR-30)
-# ---------------------------------------------------------------------------
-
-
 class SuperviseError(Exception):
     """Base class for supervise-specific fail-fast errors (FR-30)."""
 
@@ -862,11 +796,6 @@ class SuperviseTransitionError(SuperviseError):
     """An illegal state-machine transition was requested (FR-27, Section 4.8)."""
 
 
-# ---------------------------------------------------------------------------
-# claude path resolution (FR-25)
-# ---------------------------------------------------------------------------
-
-
 def require_claude(*, which: Callable[[str], str | None] = shutil.which) -> str:
     """Return the resolved ``claude`` executable path or fail fast (FR-25).
 
@@ -884,11 +813,6 @@ def require_claude(*, which: Callable[[str], str | None] = shutil.which) -> str:
     if path is None:
         raise FileNotFoundError("'claude' not found on PATH.")
     return path
-
-
-# ---------------------------------------------------------------------------
-# EnvSanitizer (Section 3.6.1, FR-21)
-# ---------------------------------------------------------------------------
 
 
 class EnvSanitizer:
@@ -924,8 +848,6 @@ class EnvSanitizer:
             valid = ", ".join(sorted(SUPERVISE_VALID_BILLING_MODES))
             raise ValueError(f"supervise billing_mode {billing_mode!r} is not one of [{valid}].")
         self._billing_mode = billing_mode
-        # The mode-resolved deny set is non-removable; the configured extras are
-        # layered on top (FR-21).
         self._deny: frozenset[str] = frozenset(resolve_supervise_deny_vars(billing_mode)) | frozenset(extra_deny_vars)
 
     def build(
@@ -964,23 +886,11 @@ class EnvSanitizer:
         if not import_model:
             raise ValueError("import_model is required to export DEVBENCH_CLAUDE_MODEL")
 
-        # Build the session env by EXCLUDING every deny var: a comprehension that
-        # omits the deny keys cannot, by construction, leave a denied var behind,
-        # so the billing-routing guarantee (Section 0.2, FR-21) holds without a
-        # fallible second pass. The AuthVerifier additionally fails fast at
-        # preflight if a deny var is even present in the operator env.
         env = {k: v for k, v in source_env.items() if k not in self._deny}
         env["DEVBENCH_WORKSPACE_ROOT"] = workspace_root
         env["DEVBENCH_SESSION_NAME"] = session_name
         env["DEVBENCH_CLAUDE_MODEL"] = import_model
 
-        # CLI-hang guards (design point 5): ALWAYS set so the interactive claude
-        # child cannot hang on the CLI auto-updater ("Checking for updates"), the
-        # exact stall that defeated the PTY-silence idle timer (the spinner keeps
-        # emitting PTY bytes). Set unconditionally on the RETURNED env (not relying
-        # on an operator-supplied value) so the initial launch and every relaunch
-        # carry them; they are not billing-routing vars, so the deny comprehension
-        # above never strips them.
         env.update(SUPERVISE_CLI_HANG_GUARD_ENV_VARS)
 
         if self._billing_mode == SUPERVISE_BILLING_MODE_BEDROCK:
@@ -1011,11 +921,6 @@ class EnvSanitizer:
         env[SUPERVISE_BEDROCK_MODEL_VAR] = import_model
 
 
-# ---------------------------------------------------------------------------
-# AuthVerifier (Section 3.6.1, 3.6.2, FR-20, FR-21)
-# ---------------------------------------------------------------------------
-
-
 class AuthVerifier:
     """Preflight that confirms the session will bill via the chosen channel.
 
@@ -1044,8 +949,6 @@ class AuthVerifier:
     """
 
     _REQUIRED_SCOPE = "user:inference"
-    #: The AWS creds (any one of these) a bedrock-mode session needs to sign
-    #: Bedrock requests. A bearer token is the SigV4-free alternative.
     _BEDROCK_CRED_VARS: tuple[str, ...] = (
         "AWS_ACCESS_KEY_ID",
         "AWS_PROFILE",
@@ -1083,8 +986,6 @@ class AuthVerifier:
         self._assert_non_root(euid)
 
     def _assert_no_routing_var(self, source_env: dict[str, str], billing_mode: str) -> None:
-        # The mode-resolved deny set excludes AWS workload creds in both modes, so
-        # a present AWS cred is never flagged here.
         deny = resolve_supervise_deny_vars(billing_mode)
         present = [var for var in deny if source_env.get(var)]
         if present:
@@ -1143,11 +1044,6 @@ class AuthVerifier:
     def _assert_non_root(self, euid: int) -> None:
         if euid == 0:
             raise SuperviseRootError("refusing to launch claude --dangerously-skip-permissions as root.")
-
-
-# ---------------------------------------------------------------------------
-# DetectionPatterns (Section 5.1, 6.3, FR-29)
-# ---------------------------------------------------------------------------
 
 
 class DetectionPatterns:
@@ -1219,11 +1115,6 @@ class DetectionPatterns:
         return self._crash.search(text) is not None
 
 
-# ---------------------------------------------------------------------------
-# PtyLogWriter (Section 3.6.3, FR-24)
-# ---------------------------------------------------------------------------
-
-
 class PtyLogWriter:
     """Redact + append the PTY stream to ``pty.log`` (mode 0600, FR-24).
 
@@ -1251,8 +1142,6 @@ class PtyLogWriter:
         if self._fd is None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            # os.open honours the mode only on creation; enforce it regardless so
-            # a pre-existing file is tightened to 0600 (FR-24).
             self._path.chmod(0o600)
         os.write(self._fd, redacted.encode("utf-8"))
 
@@ -1261,11 +1150,6 @@ class PtyLogWriter:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
-
-
-# ---------------------------------------------------------------------------
-# Launch-argv assembly (FR-5, Section 4.1 step 5)
-# ---------------------------------------------------------------------------
 
 
 def build_claude_launch_argv(
@@ -1317,11 +1201,6 @@ def build_claude_launch_argv(
     return argv
 
 
-# ---------------------------------------------------------------------------
-# PtyDriver (Section 4.0, FR-7)
-# ---------------------------------------------------------------------------
-
-
 class PtyDriver:
     """Thin wrapper over a ``pexpect`` child: ready detection + ``sendline``.
 
@@ -1346,13 +1225,6 @@ class PtyDriver:
         self.child = child
         self._patterns = patterns
         self._log_writer = log_writer
-        # PTY text observed by a non-loop ``expect`` (the command-ack wait) that
-        # the event loop has not yet classified. A FAST child can echo its kickoff
-        # and print its terminal sentinel (or crash) entirely within the ack
-        # window; that text lands in ``child.before`` there and would otherwise be
-        # lost before the loop's first ``read_chunk``. Capturing it into a pending
-        # buffer (and prepending it to the next ``read_chunk``) makes terminal
-        # detection independent of where the PTY chunk boundaries fall.
         self._pending = ""
 
     def wait_for_ready(self, *, timeout_seconds: int) -> None:
@@ -1546,11 +1418,6 @@ class PtyDriver:
         return cls._as_text(getattr(child, "before", "")) + cls._as_text(getattr(child, "after", ""))
 
 
-# ---------------------------------------------------------------------------
-# CommandInjector (Section 5.3, FR-28)
-# ---------------------------------------------------------------------------
-
-
 class CommandInjector:
     """Send a named command from the registry through the PTY (FR-28).
 
@@ -1594,11 +1461,6 @@ class CommandInjector:
         self._ack_timeout = ack_timeout_seconds
         self._submit_quiet = command_submit_quiet_seconds
         self._submit_settle = command_submit_settle_seconds
-        # Whether the most recent :meth:`send` saw a working-prompt ack. A missing
-        # ack is non-fatal for most callers (the hybrid log-tail also confirms
-        # activity, FR-29), but the turn-continuation re-inject (design point 6)
-        # READS this to decide whether the turn actually resumed (ack) or claude
-        # stayed idle (no ack -> escalate to a bounded restart).
         self._last_ack_succeeded = False
 
     @property
@@ -1630,35 +1492,18 @@ class CommandInjector:
         if subst:
             literal = literal.format(**subst)
         if literal.lstrip().startswith("/"):
-            # Slash command: type (no newline), let the autocomplete menu render
-            # settle, then submit a single Enter (a premature sendline newline is
-            # swallowed by the menu and never submits the command).
             self._driver.type_text(literal)
             self._driver.wait_until_quiescent(quiet_seconds=self._submit_quiet, max_seconds=self._submit_settle)
             self._driver.submit()
         else:
-            # Non-slash literal: no autocomplete menu, so the newline submits.
             self._driver.sendline(literal)
-        # Wait for the working-prompt ack; a missing ack is not fatal for most
-        # callers (the supervise loop's hybrid log-tail also confirms activity,
-        # FR-29) but the result is retained so the turn-continuation re-inject can
-        # verify the turn actually resumed (design point 6).
         self._last_ack_succeeded = self._driver.expect_working(timeout_seconds=self._ack_timeout)
         return literal
 
 
-# ---------------------------------------------------------------------------
-# SupervisorStateMachine (Section 4.8, FR-27)
-# ---------------------------------------------------------------------------
-
-
-# The transition table: (current_state, event) -> next_state (Section 4.8). Only
-# the transitions this feature drives are present; an unlisted (state, event)
-# pair is an illegal transition and fails fast. ``working-activity`` is a
-# self-loop on ``running`` (refreshes last-activity without changing state).
 _SUPERVISE_TRANSITIONS: dict[tuple[str, str], str] = {
     (SUPERVISE_STATE_STARTING, "ready"): SUPERVISE_STATE_STARTING,
-    (SUPERVISE_STATE_STARTING, "orchestrate-injected"): SUPERVISE_STATE_RUNNING,  # gated on ready (see below)
+    (SUPERVISE_STATE_STARTING, "orchestrate-injected"): SUPERVISE_STATE_RUNNING,
     (SUPERVISE_STATE_STARTING, "fault"): SUPERVISE_STATE_FAULTED,
     (SUPERVISE_STATE_RUNNING, "working-activity"): SUPERVISE_STATE_RUNNING,
     (SUPERVISE_STATE_RUNNING, "quota-detected"): SUPERVISE_STATE_QUOTA_WAITING,
@@ -1675,18 +1520,12 @@ _SUPERVISE_TRANSITIONS: dict[tuple[str, str], str] = {
     (SUPERVISE_STATE_RESTARTING, "restart-launched"): SUPERVISE_STATE_RUNNING,
     (SUPERVISE_STATE_RESTARTING, "fault"): SUPERVISE_STATE_FAULTED,
     (SUPERVISE_STATE_DRAINING, "terminal-clean"): SUPERVISE_STATE_COMPLETED_CLEAN,
-    # An operator-initiated graceful stop: the in-flight WU finished and ``/exit``
-    # was sent, so the session is brought down as ``stopped`` (operator-initiated
-    # -> exit 0, Section 4.8 note), distinct from a spontaneous ``completed-clean``.
     (SUPERVISE_STATE_DRAINING, "drain-complete"): SUPERVISE_STATE_STOPPED,
     (SUPERVISE_STATE_DRAINING, "stop-hard"): SUPERVISE_STATE_STOPPED,
 }
 
-# All events the machine recognizes (used to distinguish "unknown event" from
-# "illegal transition" so the error message is precise, Section 4.8).
 _SUPERVISE_EVENTS: frozenset[str] = frozenset(event for (_state, event) in _SUPERVISE_TRANSITIONS)
 
-# Terminal states (no outbound transition; map to a final exit, Section 4.8).
 _SUPERVISE_TERMINAL_STATES: frozenset[str] = frozenset(
     {SUPERVISE_STATE_COMPLETED_CLEAN, SUPERVISE_STATE_FAULTED, SUPERVISE_STATE_STOPPED}
 )
@@ -1702,11 +1541,7 @@ class SupervisorStateMachine:
 
     def __init__(self) -> None:
         self.state = SUPERVISE_STATE_STARTING
-        # (from_state, to_state, event) tuples for the supervisor.log line.
         self.history: list[tuple[str, str, str]] = []
-        # The ``starting -> running`` transition requires BOTH ``ready`` and
-        # ``orchestrate-injected`` (Section 4.8, AC-1): a ``ready`` event sets
-        # this gate so injecting before the prompt is ready is illegal.
         self._ready_seen = False
 
     def on_event(self, event: str) -> str:
@@ -1747,11 +1582,6 @@ class SupervisorStateMachine:
     def is_terminal(self) -> bool:
         """Return ``True`` when the machine is in a terminal state."""
         return self.state in _SUPERVISE_TERMINAL_STATES
-
-
-# ---------------------------------------------------------------------------
-# Model + effort + scope resolution (Section 5.4, 5.6, FR-8, FR-19)
-# ---------------------------------------------------------------------------
 
 
 def resolve_supervise_model(
@@ -1842,11 +1672,6 @@ def write_session_scope(
     return sorted(scope.expanded_ids)
 
 
-# ---------------------------------------------------------------------------
-# Kickoff pipeline (Section 4.1 steps 6-8) -- the heart of __run
-# ---------------------------------------------------------------------------
-
-
 def run_supervised_kickoff(
     *,
     driver: PtyDriver,
@@ -1897,20 +1722,6 @@ def run_supervised_kickoff(
     return sm
 
 
-# ===========================================================================
-# Phase 3 -- quota wait-and-resume adapter, log-tail, restart, exit taxonomy
-# ===========================================================================
-
-
-# ---------------------------------------------------------------------------
-# Exit taxonomy (Section 4.6, FR-13)
-# ---------------------------------------------------------------------------
-
-
-# Markers the event loop hands to :func:`classify_supervise_outcome`. These name
-# the DETECTION row of the Section 4.6 table, not a literal CLI string -- the
-# literal-to-marker mapping is the loop's job (PTY-pattern / log-tail match), so
-# the classifier stays a pure, exhaustively-tested function.
 _OUTCOME_MARKER_ALL_DONE = "ALL_DONE"
 _OUTCOME_MARKER_NO_ACTIONABLE = "NO_ACTIONABLE"
 _OUTCOME_MARKER_TERMINAL_EXIT = "[ORCHESTRATOR_TERMINAL_EXIT]"
@@ -1921,24 +1732,9 @@ _OUTCOME_MARKER_PROMPT_TIMEOUT = "prompt_timeout"
 _OUTCOME_MARKER_QUOTA_LIMIT = "quota_limit"
 _OUTCOME_MARKER_RESTART_CAP = "restart_cap_exhausted"
 _OUTCOME_MARKER_QUOTA_CAP = "quota_resume_cap_exhausted"
-# The progress watchdog (design point 2): the orchestrator's own log stopped
-# growing for ``progress_stall_seconds`` with no long-op heartbeat in flight, so
-# the still-alive-but-hung claude child is auto-restarted (bounded by the SAME
-# restart budget as the exit-42 path). The recoverable trip reuses the exit-42
-# restart machinery (restart-signal -> RESTARTING) and needs no classifier marker;
-# only the terminal CAP outcome flows through ``classify_supervise_outcome``, so
-# ``_PROGRESS_STALL_CAP`` is the sole marker (the cap fault, with a reason distinct
-# from the exit-42 ``restart-cap-exhausted`` so a hung session is told apart from a
-# crash-looping one).
 _OUTCOME_MARKER_PROGRESS_STALL_CAP = "progress_stall_restart_cap_exhausted"
-# The turn ended awaiting input (design point 6): claude printed its idle-input
-# prompt with the backlog not done. NOT a terminal -- the loop re-injects the
-# loop_continuation and verifies the working ack; a missing ack is a stall.
 _OUTCOME_MARKER_TURN_ENDED = "turn_ended"
 
-# Markers that mean "clean terminal" (Section 4.6 rows 1-2). A clean marker only
-# yields a clean outcome when the child also exited 0 (defense in depth: a clean
-# sentinel cannot launder a non-zero process exit).
 _CLEAN_MARKERS: frozenset[str] = frozenset(
     {_OUTCOME_MARKER_ALL_DONE, _OUTCOME_MARKER_NO_ACTIONABLE, _OUTCOME_MARKER_TERMINAL_EXIT}
 )
@@ -1981,10 +1777,6 @@ def _outcome_quota() -> SuperviseOutcome:
     return SuperviseOutcome(exit_code=None, exit_reason="quota-waiting", is_clean=False, is_quota=True)
 
 
-# Fault markers whose classified exit-reason is a fixed literal (Section 4.6).
-# The dynamic fault reasons (stop-reason-<token>, prompt-timeout-<phase>,
-# claude-exit-<code>) are computed in-line; this table covers the static ones so
-# the classifier stays a flat lookup rather than a return-per-row cascade.
 _STATIC_FAULT_REASONS: dict[str, str] = {
     _OUTCOME_MARKER_CIRCUIT_BREAKER: "circuit-breaker",
     _OUTCOME_MARKER_HARNESS_BLOCK: "harness-self-edit-block",
@@ -2022,12 +1814,9 @@ def classify_supervise_outcome(
     Returns:
         The classified :class:`SuperviseOutcome`.
     """
-    # Quota is NOT a fault and must be recognized before the child-exit fault
-    # rule (a quota event may also carry a non-zero child exit on path 4.9b).
     if marker == _OUTCOME_MARKER_QUOTA_LIMIT:
         return _outcome_quota()
 
-    # A non-zero child exit is a fault regardless of any clean marker present.
     if child_exitstatus is not None and child_exitstatus != 0:
         return _outcome_fault(f"claude-exit-{child_exitstatus}")
 
@@ -2039,7 +1828,6 @@ def classify_supervise_outcome(
     if fault_reason is not None:
         return _outcome_fault(fault_reason)
 
-    # No marker and a clean (0 / None) child exit: a bare clean process exit.
     return _outcome_clean("all-done")
 
 
@@ -2056,11 +1844,6 @@ def _fault_reason_for_marker(marker: str | None, *, stop_reason: str | None, pha
     if marker == _OUTCOME_MARKER_PROMPT_TIMEOUT:
         return f"prompt-timeout-{phase or 'unknown'}"
     return _STATIC_FAULT_REASONS.get(marker or "")
-
-
-# ---------------------------------------------------------------------------
-# LogTailDetector (Section 1.6, 4.9, FR-14, hybrid detection)
-# ---------------------------------------------------------------------------
 
 
 class LogTailKind(enum.Enum):
@@ -2100,27 +1883,13 @@ class LogTailDetector:
 
     def __init__(self, *, log_path: Path, config: SuperviseLogTailConfig) -> None:
         self._log_path = log_path
-        # Precedence order within a batch: fault, then restart, then quota, then
-        # clean (a fault must never be masked by an earlier benign line).
         self._ordered: tuple[tuple[LogTailKind, tuple[str, ...]], ...] = (
             (LogTailKind.FAULT, config.markers_fault),
             (LogTailKind.RESTART, config.markers_restart),
             (LogTailKind.QUOTA, config.markers_quota),
             (LogTailKind.CLEAN, config.markers_clean),
         )
-        # Tail from the CURRENT END so historical markers from PRIOR runs in a
-        # long-lived orchestrator log (the workspace logs/orchestrator.log persists
-        # across runs and accumulates [ORCHESTRATOR_STOP_REASON] / ALL_DONE / ...
-        # markers) are NEVER re-detected -- only markers appended AFTER this
-        # detector starts. Seeding the byte offset to the file's current size (a
-        # cheap stat, not a full read) gives tail-from-end semantics and avoids
-        # reading the entire (potentially huge) log into memory on every poll.
         self._offset = log_path.stat().st_size if log_path.exists() else 0
-        # A SEPARATE byte offset for the progress watchdog's growth signal
-        # (:meth:`progressed`), independent of the marker-detection offset above:
-        # the watchdog and the marker detector are distinct consumers and must not
-        # consume each other's growth. Seeded to the current size so only bytes
-        # appended AFTER construction count as progress (design point 2).
         self._progress_offset = self._offset
 
     def progressed(self) -> bool:
@@ -2140,8 +1909,6 @@ class LogTailDetector:
         size = self._log_path.stat().st_size
         if size == self._progress_offset:
             return False
-        # Any change (growth OR truncation/rotation) advances the offset and counts
-        # as progress: a freshly rotated log carrying new content is real activity.
         self._progress_offset = size
         return True
 
@@ -2158,8 +1925,6 @@ class LogTailDetector:
             return None
         size = self._log_path.stat().st_size
         if size < self._offset:
-            # The log was truncated/rotated to a shorter size: re-read from its
-            # new start so a rotated log's fresh content is not skipped.
             self._offset = 0
         if size <= self._offset:
             return None
@@ -2177,17 +1942,12 @@ class LogTailDetector:
         return None
 
 
-# ---------------------------------------------------------------------------
-# QuotaWaiter (Section 4.9, FR-14/15/16) -- a THIN ADAPTER over quota.* (DRY)
-# ---------------------------------------------------------------------------
-
-
 class QuotaDecision(enum.Enum):
     """The disposition :meth:`QuotaWaiter.wait_and_decide` returns (Section 4.9)."""
 
-    RESUME = "resume"  # window refreshed + under cap -> relaunch/continue (4.9a/4.9b)
-    WAIT = "wait"  # wait did not recover yet -> keep waiting (still NOT an exit)
-    FAULT = "fault"  # resume cap exhausted -> faulted (the ONLY quota fault path)
+    RESUME = "resume"
+    WAIT = "wait"
+    FAULT = "fault"
 
 
 @dataclass(frozen=True)
@@ -2307,8 +2067,6 @@ class QuotaWaiter:
         meridiem = match.group(3).lower()
         if raw_hour < 1 or raw_hour > 12 or raw_minute < 0 or raw_minute > 59:
             return None
-        # Reuse the SHARED 12h->24h converter (quota._convert_to_24h) so the
-        # interactive path and the SDK path parse reset times identically (DRY).
         hour_24 = _convert_to_24h(raw_hour, meridiem)
         now = datetime.now(UTC)
         candidate = now.replace(hour=hour_24, minute=raw_minute, second=0, microsecond=0)
@@ -2344,12 +2102,6 @@ class QuotaWaiter:
         Returns:
             A :class:`QuotaDecisionResult`.
         """
-        # Bedrock has NO 5-hour subscription windows: the wait is DISABLED. A
-        # subscription usage-limit prompt is anomalous in bedrock mode (Bedrock
-        # throttling is handled by the shared quota.py path in the SDK
-        # orchestrator subprocess, not here), so fault fast with a classified
-        # reason rather than persisting a subscription checkpoint or waiting an
-        # imaginary window (design point 4).
         if self._billing_mode == SUPERVISE_BILLING_MODE_BEDROCK:
             logger.info("%s reason=quota-wait-disabled-bedrock", SUPERVISE_FAULT_AUDIT_PREFIX)
             return QuotaDecisionResult(
@@ -2443,9 +2195,6 @@ def build_quota_waiter(
     max_wait = max_wait if max_wait is not None else qh.max_wait_seconds
 
     def _resolve_cap() -> int:
-        # The supervise override (supervise.quota.max_quota_resumes), when set, is
-        # exported into the env the shared resolver reads so a single resolver
-        # (env > config > default) owns the precedence (no re-derive).
         override = config.quota.max_quota_resumes
         if override is not None:
             os.environ["DEVBENCH_MAX_QUOTA_RESUMES"] = str(override)
@@ -2463,11 +2212,6 @@ def build_quota_waiter(
         session_name=session_name,
         billing_mode=billing_mode,
     )
-
-
-# ---------------------------------------------------------------------------
-# Restart loop (Section 4.3, FR-12)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -2525,11 +2269,6 @@ def build_resume_argv(
     )
 
 
-# ---------------------------------------------------------------------------
-# __run event loop (Section 4.1 step 8, 4.6, 4.8, 4.9)
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class EventLoopResult:
     """The terminal result of :func:`run_supervise_event_loop` (FR-13, FR-27).
@@ -2549,11 +2288,6 @@ class EventLoopResult:
     resumes_used: int = 0
 
 
-# The combined PTY pattern set the loop watches each iteration, ordered so a
-# fault/quota marker is checked before the benign working-activity prompt. Each
-# entry maps a DetectionPatterns predicate to the outcome marker the loop's
-# quota / fault handling consumes. (A crash surfaces as a non-zero child EOF, not
-# as on-screen text, so it is handled by the exit-status path, not here.)
 _PTY_WATCH_ORDER: tuple[tuple[str, str], ...] = (
     ("is_quota_limit", _OUTCOME_MARKER_QUOTA_LIMIT),
     ("is_circuit_breaker", _OUTCOME_MARKER_CIRCUIT_BREAKER),
@@ -2577,8 +2311,6 @@ def _classify_pty_text(patterns: DetectionPatterns, text: str) -> str | None:
         return _OUTCOME_MARKER_ALL_DONE
     if "NO_ACTIONABLE" in text:
         return _OUTCOME_MARKER_NO_ACTIONABLE
-    # The turn ended awaiting input with the backlog not done (design point 6): the
-    # loop re-injects the loop_continuation and verifies the ack (not a terminal).
     if patterns.is_idle_input_prompt(text):
         return _OUTCOME_MARKER_TURN_ENDED
     return None
@@ -2679,43 +2411,20 @@ def run_supervise_event_loop(
     sm = state_machine or _running_state_machine()
     budget = RestartBudget(max_attempts=config.restart.max_attempts)
     idle_timeout = config.timeouts.idle_seconds
-    # Normalise the optional activity callback to a no-op so the call sites need no
-    # ``if`` guard (keeps the loop's branch count down; ruff PLR0912).
     notify_activity: Callable[[], None] = on_activity if on_activity is not None else (lambda: None)
-    # When an operator stop CAN arrive (``stop_poll`` set), each PTY read is bounded
-    # by the (shorter) stop-poll cadence so the loop re-checks the stop request
-    # during a quiet session instead of blocking up to the full idle window: a
-    # supervised session that is silently working must still honour ``supervise
-    # stop`` promptly, and a quiet session must NOT fault on an idle timeout while a
-    # stop is pending (Section 4.2, Section 7.5). The cumulative-silence idle
-    # timeout is preserved across these short reads.
     read_timeout = idle_timeout
     if stop_poll is not None:
         read_timeout = min(idle_timeout, config.timeouts.poll_interval_seconds)
     cumulative_idle = 0
     restarts_used = 0
     resumes_used = 0
-    # PROGRESS WATCHDOG state (design point 2). ``last_progress_at`` is the clock
-    # reading at the last observed orchestrator-log growth; the window elapses when
-    # ``now - last_progress_at >= progress_stall_seconds``. ``progress_poll is None``
-    # disables the watchdog (SDK-style callers). The clock is read ONCE per iteration
-    # so the stall arithmetic is deterministic under an injected fake clock.
     progress_stall_seconds = config.timeouts.progress_stall_seconds
     last_progress_at = clock()
 
     while True:
-        # Operator graceful stop (Section 4.2 step 2): a written stop.request
-        # drives running -> draining -> (drain in-flight WU) -> stopped. Checked
-        # before the PTY read so an operator stop is honoured promptly.
         if stop_poll is not None and sm.state == SUPERVISE_STATE_RUNNING and stop_poll():
             return _handle_graceful_drain(driver, config, sm, idle_timeout, restarts_used, resumes_used)
 
-        # PROGRESS WATCHDOG (design point 2): is REAL orchestrate work happening?
-        # Checked BEFORE the PTY read because the hang class keeps the PTY busy
-        # (spinner bytes), so a PTY-silence check would never see it. The step
-        # helper resets the timer on log growth, classifies a stall after the
-        # window, and (on a recoverable stall) relaunches and asks the loop to
-        # restart its iteration; a terminal result (the cap) returns immediately.
         watchdog = _progress_watchdog_step(
             progress_poll,
             clock,
@@ -2734,23 +2443,16 @@ def run_supervise_event_loop(
         if watchdog.restarted:
             continue
 
-        # Hybrid detection: the deterministic log markers are checked first.
         log_hit = log_poll()
         if log_hit is not None:
             log_result = _handle_log_hit(log_hit, sm, restarts_used, resumes_used)
             if log_result is not None:
                 return log_result
-            # A non-actionable (advisory) log hit falls through to the PTY read. It
-            # is still observed liveness, so refresh last_activity (throttled).
             notify_activity()
 
         try:
             observation = _observe_pty(driver, read_timeout)
         except SupervisePromptTimeoutError:
-            # A single short read elapsed with no PTY activity. Only the CUMULATIVE
-            # silence (re-checked against the full idle window) is a fault, so a
-            # quiet-but-healthy session whose operator is about to stop it is not
-            # mistaken for a hung one; the loop re-checks the stop request first.
             cumulative_idle += read_timeout
             if cumulative_idle < idle_timeout:
                 continue
@@ -2760,12 +2462,6 @@ def run_supervise_event_loop(
             )
             return _terminal(sm, outcome, restarts_used, resumes_used)
         cumulative_idle = 0
-        # TURN CONTINUATION (design point 6): the interactive turn ended awaiting
-        # input with the backlog not done. Deterministically re-drive the loop --
-        # re-inject the continuation AND verify it took (working ack); a missing ack
-        # means claude did not resume, which is escalated to the SAME bounded
-        # restart path as a progress stall (NOT a fire-and-forget injection). On a
-        # successful re-inject the timer is reset (the re-drive is real progress).
         if observation.marker == _OUTCOME_MARKER_TURN_ENDED and not observation.eof:
             cont = _handle_turn_continuation(driver, config, sm, budget, relaunch, restarts_used, resumes_used)
             cont_result, restarts_used, resumes_used = cont
@@ -2813,9 +2509,6 @@ def _handle_graceful_drain(
     sm.on_event("drain-requested")
     logger.info("%s state=%s reason=operator-drain", SUPERVISE_STATE_AUDIT_PREFIX, sm.state)
 
-    # Send /exit so the in-flight turn completes then the child exits cleanly.
-    # ``drain_now`` is the slash literal ``/exit``, so this exercises the same
-    # type -> render-settle -> Enter submission flow as the orchestrate kickoff.
     injector = CommandInjector(
         driver=driver,
         registry=config.injectable_commands,
@@ -2825,9 +2518,6 @@ def _handle_graceful_drain(
     )
     injector.send("drain_now")
 
-    # Read to the child EOF (the in-flight WU finishing + /exit taking effect).
-    # A bounded prompt-timeout while winding down is not a fault here: the
-    # operator-initiated stop completes regardless.
     with contextlib.suppress(SupervisePromptTimeoutError):
         while True:
             _text, eof, _exitstatus = driver.read_chunk(timeout_seconds=idle_timeout)
@@ -2912,13 +2602,9 @@ def _handle_pty_observation(
     on_activity: Callable[[], None] | None = None,
 ) -> tuple[EventLoopResult | None, int, int]:
     """Act on a PTY observation; return (result|None, restarts, resumes)."""
-    # A quota PTY marker (path 4.9a/4.9b): NEVER a non-zero exit.
     if observation.marker == _OUTCOME_MARKER_QUOTA_LIMIT:
         return _handle_quota(driver, sm, quota_waiter, relaunch, restarts_used, resumes_used, on_quota_wait)
 
-    # A child EOF: exit-42 is the restart signal; else classify the exit status,
-    # preferring an exact clean sentinel (ALL_DONE / NO_ACTIONABLE) seen in the
-    # final read when the child exited cleanly so the recorded reason is exact.
     if observation.eof:
         if observation.exitstatus == ORCHESTRATOR_RESTART_EXIT_CODE:
             return _handle_restart(sm, budget, relaunch, restarts_used, resumes_used)
@@ -2927,28 +2613,16 @@ def _handle_pty_observation(
         sm.on_event("terminal-clean" if outcome.is_clean else "fault")
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
 
-    # A fault PTY marker observed mid-session (circuit-breaker / harness-block).
     if observation.marker in (_OUTCOME_MARKER_CIRCUIT_BREAKER, _OUTCOME_MARKER_HARNESS_BLOCK):
         sm.on_event("fault")
         outcome = classify_supervise_outcome(marker=observation.marker, child_exitstatus=None)
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
 
-    # A clean terminal sentinel (ALL_DONE / NO_ACTIONABLE) observed on the PTY is
-    # the authoritative clean-completion signal (Section 4.6 rows 1-2: the marker
-    # in PTY). It frequently arrives in a chunk just BEFORE the child EOF (the CLI
-    # prints the sentinel, then exits), and at that instant the child has not yet
-    # been reaped so its ``exitstatus`` reads ``None`` -- relying on the EOF exit
-    # status alone would lose the ALL_DONE-vs-NO_ACTIONABLE distinction. Classify
-    # on the sentinel itself so the recorded ``exit-reason`` is exact and stable.
     if observation.marker in (_OUTCOME_MARKER_ALL_DONE, _OUTCOME_MARKER_NO_ACTIONABLE):
         sm.on_event("terminal-clean")
         outcome = classify_supervise_outcome(marker=observation.marker, child_exitstatus=0)
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
 
-    # No terminal marker and no EOF: ongoing working activity (refresh state) and
-    # keep reading until the child reaches a terminal. Notify the activity callback
-    # so the registry ``last_activity`` advances (throttled) -- a busy session must
-    # not look stale to ``supervise status``.
     with contextlib.suppress(SuperviseTransitionError):
         sm.on_event("working-activity")
     if on_activity is not None:
@@ -2979,10 +2653,6 @@ def _handle_quota(
     sm.on_event("quota-detected")
     text = driver.last_text()
     reset_at = quota_waiter.parse_reset_at(text)
-    # Persist quota-waiting + expected-resume BEFORE the (possibly long) wait so a
-    # concurrent ``supervise status`` surfaces the holding state and the provider
-    # reset time (FR-10, FR-16). The callback is best-effort observability, never a
-    # control point: a persistence failure must not break the quota wait.
     if on_quota_wait is not None:
         on_quota_wait(reset_at, resumes_used)
     while True:
@@ -2992,15 +2662,11 @@ def _handle_quota(
             outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_QUOTA_CAP, child_exitstatus=None)
             return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
         if decision.action is QuotaDecision.RESUME:
-            # Poll-restart (4.9b): relaunch with resume flags; the same session id
-            # is retained where possible (the in-session-wait path 4.9a is
-            # best-effort until DI-5). quota-waiting -> restarting -> running.
             sm.on_event("session-exited-on-quota")
             relaunch(reason="quota-resume", resume=True)
             sm.on_event("restart-launched")
             logger.info("%s reason=quota-resume resumes=%d", SUPERVISE_RESTART_AUDIT_PREFIX, resumes_used + 1)
             return None, restarts_used, resumes_used + 1
-        # WAIT: the window has not refreshed yet; re-delegate the bounded wait.
         logger.info("%s state=%s reason=quota-keep-waiting", SUPERVISE_STATE_AUDIT_PREFIX, sm.state)
 
 
@@ -3057,8 +2723,6 @@ def _progress_watchdog_step(
     )
     if stall_result is not None:
         return _WatchdogStep(stall_result, False, last_progress_at, restarts_used, resumes_used)
-    # Relaunched: the resumed session starts fresh -> reset the timer so the
-    # just-relaunched child is not instantly re-classified as stalled.
     return _WatchdogStep(None, True, clock(), restarts_used, resumes_used)
 
 
@@ -3111,9 +2775,6 @@ def _handle_progress_stall(
         sm.on_event("fault")
         outcome = classify_supervise_outcome(marker=_OUTCOME_MARKER_PROGRESS_STALL_CAP, child_exitstatus=None)
         return _terminal(sm, outcome, restarts_used, resumes_used), restarts_used, resumes_used
-    # Kill the hung child BEFORE relaunch (it is still alive -- the defining
-    # difference from the exit-42 EOF path). Best-effort: a teardown error must not
-    # block the self-heal (the relaunch rebinds driver.child regardless).
     with contextlib.suppress(Exception):
         driver.child.terminate(force=True)
     sm.on_event("restart-signal")
@@ -3156,13 +2817,10 @@ def _handle_turn_continuation(
     )
     injector.send("loop_continuation")
     if injector.last_ack_succeeded:
-        # The turn resumed: refresh activity and keep the loop running.
         with contextlib.suppress(SuperviseTransitionError):
             sm.on_event("working-activity")
         logger.info("%s reason=turn-continuation-acked", SUPERVISE_STATE_AUDIT_PREFIX)
         return None, restarts_used, resumes_used
-    # No ack: claude did not resume on the re-inject -> treat as a stall and restart
-    # (bounded) rather than leaving the orchestrate loop dead.
     logger.info("%s reason=turn-continuation-no-ack", SUPERVISE_STATE_AUDIT_PREFIX)
     return _handle_progress_stall(driver, sm, budget, relaunch, restarts_used, resumes_used)
 
@@ -3184,22 +2842,6 @@ def _terminal(
         restarts_used=restarts_used,
         resumes_used=resumes_used,
     )
-
-
-# ===========================================================================
-# Phase 4 -- read-only observation helpers (status / info / attach follow)
-# ===========================================================================
-#
-# These are PURE (status-line formatting, screen-ls parsing, info reconcile) or
-# I/O-bounded-by-an-injected-predicate (the PTY-log follow) so they are fully
-# unit-testable without a live screen, and the CLI ``status``/``info``/``attach``
-# verbs only wire them onto the registry. The follow is event-driven (re-read on
-# a readiness predicate), never ``time.sleep`` (CLAUDE.md, Section 7.5).
-
-
-# ---------------------------------------------------------------------------
-# status -- per-session line (Section 4.4, FR-9, FR-10)
-# ---------------------------------------------------------------------------
 
 
 def _format_dt(value: datetime | None) -> str:
@@ -3265,15 +2907,6 @@ def format_status_line(state: SuperviseSessionState, *, max_resumes: int, in_pro
     return "  ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# info -- screen -ls join + reconcile (Section 4.5, FR-11)
-# ---------------------------------------------------------------------------
-
-
-# ``screen -ls`` rows look like ``\t<pid>.<session-name>\t(Detached)``. The
-# session name is the dot-suffix of the first whitespace-delimited token. This
-# regex centralizes that parse so a screen-output format quirk is fixed in one
-# place (mirrors the centralized-detection-patterns principle, Section 6.3).
 _SCREEN_LS_ROW_RE = re.compile(r"^\s*\d+\.(?P<name>\S+)\s")
 
 
@@ -3390,11 +3023,6 @@ def reconcile_info_rows(
     return sorted(rows, key=lambda r: r.name)
 
 
-# ---------------------------------------------------------------------------
-# attach -- read-only PTY-log follow (Section 4.7, FR-26)
-# ---------------------------------------------------------------------------
-
-
 def _block_until_readable(*, poll_interval_seconds: float, input_fd: int | None = None) -> None:
     """Park the process until stdin is readable or *poll_interval_seconds* elapses.
 
@@ -3421,8 +3049,6 @@ def _block_until_readable(*, poll_interval_seconds: float, input_fd: int | None 
     try:
         if fd is not None:
             selector.register(fd, selectors.EVENT_READ)
-        # select() blocks the process (kernel-parked) until the fd is readable or
-        # the timeout elapses; an empty selector still honours the timeout.
         selector.select(timeout=poll_interval_seconds)
     finally:
         selector.close()
@@ -3486,11 +3112,8 @@ def follow_pty_log(
         if log_path.exists():
             data = log_path.read_text(encoding="utf-8", errors="replace")
             if len(data) < offset:
-                # Truncated/rotated: re-follow from the new start.
                 offset = 0
             if len(data) > offset:
                 write(data[offset:])
                 offset = len(data)
-        # Park the process until new bytes may have arrived (or the operator
-        # interacts), rather than spinning on a tight re-read loop.
         block()

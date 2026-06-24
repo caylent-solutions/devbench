@@ -93,12 +93,10 @@ class TestCanonicalAcVendoredCarveOut:
         """The vendored section must explicitly state that carve-outs are NOT bypass
         annotations -- they are scope demarcations at the build-config layer."""
         text = CANONICAL_AC.read_text(encoding="utf-8")
-        # The section must contrast carve-outs with bypass annotations.
         assert "noqa" in text or "nosec" in text, (
             "docs/acceptance-criteria-canonical.md must name '# noqa' or '# nosec' in the "
             "vendored section to make clear that those inline bypasses are prohibited."
         )
-        # It must explain the scope-demarcation vs bypass distinction.
         assert "build-config" in text or "build config" in text or "exclude_dirs" in text, (
             "docs/acceptance-criteria-canonical.md must explain that vendored carve-outs "
             "are implemented at the build-config layer (not via inline suppression comments)."

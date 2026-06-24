@@ -26,9 +26,6 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
 pytestmark = pytest.mark.unit
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 _BLOCKED_MARKER = "[BLOCKED_TARGET_REPO_UNRESOLVED]"
 
@@ -94,11 +91,6 @@ def _make_backlog_index(tmp_path: Path, unit_id: str, status: str = "in-queue") 
         encoding="utf-8",
     )
     return idx
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 class TestCmdClaimUnresolvableRepo:
@@ -208,7 +200,6 @@ class TestCmdClaimUnresolvableRepo:
 
         mock_mgr.force_status.assert_called_once()
         call_args = mock_mgr.force_status.call_args
-        # STATUS_BLOCKED must appear in the force_status call arguments
         assert STATUS_BLOCKED in str(call_args)
 
     def test_unresolvable_repo_stderr_contains_repo_name(
@@ -341,7 +332,6 @@ class TestCmdClaimSerializeBackstop:
             rc = cli.cmd_claim(target.id)
 
         assert rc == CLAIM_DEFERRED_SERIALIZED
-        # Deferral writes NO status: no force_status, no flock entered, file unchanged on disk.
         mock_mgr.force_status.assert_not_called()
         assert not entered, "deferral must not acquire the lock"
         content = wu_file.read_text(encoding="utf-8")
@@ -450,7 +440,6 @@ class TestCmdClaimMarkerWriteEdgeCases:
         """When the WU file has no ## Comments section, the section is created with the marker."""
         unit_id = "E0-F1-S1-T3"
         wu_file = backlog_dir / f"{unit_id}.md"
-        # WU file deliberately missing the ## Comments section
         wu_file.write_text(
             f"# {unit_id}: Test\n\n## Status: in-queue\n\n## Changes Manifest\n\n"
             "| File | Change |\n|------|--------|\n| src/x.py | modify |\n",
@@ -518,11 +507,6 @@ class TestCmdClaimResolvableRepoProceeds:
         mock_mgr.force_status.assert_called_once()
 
 
-# ---------------------------------------------------------------------------
-# TDI-006: on-claim foreign-WIP eviction
-# ---------------------------------------------------------------------------
-
-
 def _git(repo: Path, *args: str) -> str:
     """Run a git command in *repo* and return stripped stdout (fail-fast)."""
     result = subprocess.run(
@@ -572,7 +556,6 @@ class TestCmdClaimEvictsForeignWip:
         the on-claim cleanup operates on the real git checkout.
         """
         unit, _wu_file = _make_unit(backlog_dir, repo="caylent-solutions/git-repo")
-        # Rewrite the manifest row so the unit's own legitimate path is known.
         _wu_file.write_text(
             f"# {unit.id}: Test\n\n## Status: in-queue\n\n## Changes Manifest\n\n"
             "| File | Change |\n|------|--------|\n"
@@ -605,7 +588,6 @@ class TestCmdClaimEvictsForeignWip:
         """Foreign staged WIP in the checkout is unstaged AND removed from the tree on claim."""
         checkout = tmp_path / "checkout"
         _init_checkout(checkout)
-        # Orphaned WIP from a prior interrupted unit: a foreign file, staged.
         foreign = checkout / "src" / "lockfile.py"
         foreign.parent.mkdir(parents=True, exist_ok=True)
         foreign.write_text("orphaned = True\n", encoding="utf-8")
@@ -615,11 +597,8 @@ class TestCmdClaimEvictsForeignWip:
         rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
 
         assert rc == 0
-        # The foreign path must no longer be staged...
         assert "src/lockfile.py" not in _staged_paths(checkout)
-        # ...and must no longer pollute the working tree (evicted, not merely unstaged).
         assert not foreign.exists(), "foreign WIP must be removed from the working tree"
-        # The index must be clean (no staged changes at all).
         assert _staged_paths(checkout) == set()
 
     def test_orphaned_wip_is_recoverable_via_stash(
@@ -638,7 +617,6 @@ class TestCmdClaimEvictsForeignWip:
         rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
 
         assert rc == 0
-        # A stash entry must exist holding the evicted WIP (recoverable backup).
         stash_list = _git(checkout, "stash", "list")
         assert stash_list, "evicted foreign WIP must be parked in a stash for recovery"
 
@@ -650,12 +628,10 @@ class TestCmdClaimEvictsForeignWip:
         """The claimed unit's own in-progress manifest work survives the cleanup."""
         checkout = tmp_path / "checkout"
         _init_checkout(checkout)
-        # The claimed unit's OWN legitimate in-progress work (resumed unit).
         own = checkout / "src" / "x.py"
         own.parent.mkdir(parents=True, exist_ok=True)
         own.write_text("legit = 1\n", encoding="utf-8")
         _git(checkout, "add", "src/x.py")
-        # A foreign orphan from a prior interrupted unit, also staged.
         foreign = checkout / "src" / "lockfile.py"
         foreign.write_text("orphaned = True\n", encoding="utf-8")
         _git(checkout, "add", "src/lockfile.py")
@@ -663,10 +639,8 @@ class TestCmdClaimEvictsForeignWip:
         rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="src/x.py")
 
         assert rc == 0
-        # Foreign orphan evicted...
         assert not foreign.exists()
         assert "src/lockfile.py" not in _staged_paths(checkout)
-        # ...but the unit's own manifest file is untouched in the working tree.
         assert own.exists(), "the claimed unit's own manifest work must NOT be clobbered"
         assert own.read_text(encoding="utf-8") == "legit = 1\n"
 
@@ -699,7 +673,6 @@ class TestCmdClaimEvictsForeignWip:
         rc = self._claim_into_checkout(backlog_dir, checkout, manifest_path="docs/guide.md")
 
         assert rc == 0
-        # The directory and its contents are left intact (no crash, no eviction).
         assert (checkout / "file.txt").exists()
 
 
@@ -721,12 +694,9 @@ class TestDirtyPaths:
         """Staged, untracked, and working-tree-modified paths are all reported."""
         repo = tmp_path / "repo"
         _init_checkout(repo)
-        # Modify the committed baseline (working-tree change).
         (repo / "README.md").write_text("changed\n", encoding="utf-8")
-        # A new staged file.
         (repo / "staged.py").write_text("s = 1\n", encoding="utf-8")
         _git(repo, "add", "staged.py")
-        # An untracked file.
         (repo / "untracked.txt").write_text("u\n", encoding="utf-8")
 
         result = cli._dirty_paths(repo)
@@ -741,7 +711,6 @@ class TestDirtyPaths:
         (repo / "old_name.py").write_text("body\n", encoding="utf-8")
         _git(repo, "add", "old_name.py")
         _git(repo, "commit", "-q", "-m", "add old_name")
-        # Rename via git so status reports an "R" record (two NUL fields).
         _git(repo, "mv", "old_name.py", "new_name.py")
 
         result = cli._dirty_paths(repo)
@@ -749,7 +718,6 @@ class TestDirtyPaths:
         assert result is not None
         assert "new_name.py" in result
         assert "old_name.py" not in result
-        # The destination must appear exactly once (the original field is consumed).
         assert result.count("new_name.py") == 1
 
 
@@ -777,7 +745,6 @@ class TestOwnManifestPaths:
         ``## Changes Manifest`` section is absent; the helper swallows it.
         """
         unit, wu_file = _make_unit(backlog_dir, repo="caylent-solutions/git-repo")
-        # Remove the Changes Manifest section so parse_manifest raises.
         wu_file.write_text(
             f"# {unit.id}: Test\n\n## Status: in-queue\n\n## Comments\n\n",
             encoding="utf-8",
@@ -867,7 +834,6 @@ class TestCleanForeignWipBranches:
         ):
             assert cli._clean_foreign_wip_on_claim(self._unit()) is False
 
-        # The unit's own staged work is untouched and no stash was created.
         assert "src/x.py" in _staged_paths(repo)
         assert _git(repo, "stash", "list") == ""
 

@@ -15,10 +15,6 @@ import pytest
 
 from devbench.config_loader import BacklogConfig, load_runtime_config
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _write_minimal_config(path: Path, extra: str = "") -> None:
     """Write a minimal valid devbench.yaml to *path*."""
@@ -26,11 +22,6 @@ def _write_minimal_config(path: Path, extra: str = "") -> None:
     if extra:
         content += extra
     path.write_text(content, encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# BacklogConfig dataclass defaults
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -46,11 +37,6 @@ class TestBacklogConfigCascadeDefault:
         """BacklogConfig accepts a custom cascade_requeue_max_cycles value."""
         cfg = BacklogConfig(cascade_requeue_max_cycles=5)
         assert cfg.cascade_requeue_max_cycles == 5
-
-
-# ---------------------------------------------------------------------------
-# load_runtime_config: cascade_requeue_max_cycles from YAML
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -77,11 +63,6 @@ class TestLoadRuntimeConfigCascade:
         _write_minimal_config(cfg_file, "backlog:\n  cascade_requeue_max_cycles: 1\n")
         cfg = load_runtime_config(cfg_file, {})
         assert cfg.backlog.cascade_requeue_max_cycles == 1
-
-
-# ---------------------------------------------------------------------------
-# Fail-fast: cascade_requeue_max_cycles below 1 raises ValueError
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

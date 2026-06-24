@@ -100,11 +100,9 @@ class TestParseTailArgs:
 @pytest.mark.unit
 class TestWaitForPidExit:
     def test_returns_true_when_pid_already_gone(self) -> None:
-        # Use a definitely-dead pid.
         assert cli._wait_for_pid_exit(2**31 - 1, 1) is True
 
     def test_returns_false_when_pid_still_alive_at_deadline(self) -> None:
-        # Own pid is alive; deadline 0 means we never poll.
         assert cli._wait_for_pid_exit(os.getpid(), 0) is False
 
 
@@ -318,7 +316,6 @@ class TestCmdRestart:
         ):
             rc = cli.cmd_restart(str(os.getpid()))
         assert rc == 0
-        # Daemon mode preserved.
         assert "--daemon" in captured["cmd"]
         assert captured["cwd"] == str(ws)
 
@@ -357,6 +354,5 @@ class TestSetupDaemonAndPidFile:
 
         monkeypatch.setattr("devbench.instances.write_pid_file", _boom)
         parsed = cli._CmdStartArgs(daemon=False, name="default")
-        # Must not raise.
         cli._setup_daemon_and_pid_file(parsed)
         assert "failed to write orchestrator PID file" in capsys.readouterr().err

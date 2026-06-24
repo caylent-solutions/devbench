@@ -31,41 +31,25 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-# fnmatch-style patterns matched against POSIX-relative repo paths.
-# Patterns are intentionally specific: they cover known build/state
-# artifacts that no production workflow legitimately commits.
 _DEFAULT_ORPHAN_PATTERNS: tuple[str, ...] = (
-    # Terraform state and module cache. ``**/`` prefix matches both
-    # repo-root and nested locations.
     "**/*.tfstate",
     "**/*.tfstate.backup",
     "**/*.tfstate.lock.info",
     "**/.terraform/**",
     "**/.terraform.lock.hcl",
     "**/.terragrunt-cache/**",
-    # Python build / test caches
     "**/__pycache__/**",
     "**/*.pyc",
     "**/*.pyo",
     "**/.pytest_cache/**",
     "**/.mypy_cache/**",
     "**/.ruff_cache/**",
-    # Coverage. ``**/.coverage*`` (no separator) is the catch-all that
-    # covers ``.coverage``, ``.coverage.<ext>``, and the stray
-    # ``.coverage (1)`` form pytest-cov writes when the canonical file
-    # is locked. The narrower variants below stay for documentation but
-    # are subsumed by the catch-all on this line.
     "**/.coverage*",
     "**/htmlcov/**",
-    # Node
     "**/node_modules/**",
-    # macOS
     "**/.DS_Store",
 )
 
-# Canonical ``.gitignore`` lines written under the devbench-managed
-# header. One canonical form per pattern category, so future commits
-# cannot reintroduce the shape regardless of where in the tree it lives.
 _DEFAULT_GITIGNORE_ENTRIES: tuple[str, ...] = (
     "# Terraform state and module cache",
     "*.tfstate",
@@ -143,15 +127,10 @@ def _pattern_to_regex(pattern: str) -> str:
     """
     return (
         re.escape(pattern)
-        # ``**/`` first (escapes to ``\*\*/``) -> any leading segments
         .replace(r"\*\*/", "(?:.*/)?")
-        # ``/**`` (escapes to ``/\*\*``) -> any trailing segments
         .replace(r"/\*\*", "(?:/.*)?")
-        # remaining standalone ``**`` -> any sequence incl slashes
         .replace(r"\*\*", ".*")
-        # ``*`` -> any non-slash sequence within a segment
         .replace(r"\*", "[^/]*")
-        # ``?`` -> a single non-slash char
         .replace(r"\?", "[^/]")
     )
 

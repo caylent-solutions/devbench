@@ -82,8 +82,6 @@ class TestAuthVerifierSubscriptionApiKey:
             )
 
     def test_aws_creds_present_is_not_a_billing_violation(self, tmp_path: Path) -> None:
-        # AWS workload creds do NOT route Claude billing; the supervised
-        # orchestrator runs live AWS terratests. They must not trip the preflight.
         creds = _write_creds(tmp_path, scopes=["user:inference"])
         verifier = AuthVerifier(credentials_file=creds)
         verifier.verify(
@@ -150,8 +148,6 @@ class TestAuthVerifierBedrockMode:
     """Bedrock mode: skip subscription auth; require AWS prereqs; still non-root."""
 
     def test_bedrock_does_not_require_subscription_auth(self, tmp_path: Path) -> None:
-        # No credentials file at all: bedrock mode bills via Bedrock, so the
-        # subscription-auth assertion MUST be skipped.
         verifier = AuthVerifier(credentials_file=tmp_path / "absent.json")
         verifier.verify(
             source_env={"PATH": "/usr/bin", **_BEDROCK_PREREQ_ENV},
@@ -182,8 +178,6 @@ class TestAuthVerifierBedrockMode:
             )
 
     def test_bedrock_direct_anthropic_api_var_fails_fast(self, tmp_path: Path) -> None:
-        # A direct-Anthropic-API var present in bedrock mode would route to the
-        # direct API, not Bedrock; fail fast.
         verifier = AuthVerifier(credentials_file=tmp_path / "absent.json")
         with pytest.raises(SuperviseApiKeyPresentError, match="ANTHROPIC_API_KEY"):
             verifier.verify(

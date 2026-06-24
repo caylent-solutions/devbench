@@ -58,8 +58,6 @@ __all__ = [
     "is_whitelisted",
 ]
 
-# Module-level per-(task_id, signature) apply-attempt counter.
-# Keys are (task_id, signature) tuples; values are cumulative apply counts.
 _apply_counts: dict[tuple[str, str], int] = {}
 
 
@@ -235,20 +233,14 @@ def apply_auto_resolve(
         ValueError: When *remediation* is in ``AUTO_RESOLVE_DESTRUCTIVE_VERBS``,
             regardless of ``config.enabled``.
     """
-    # Hard guard: destructive verbs are rejected unconditionally.
     _guard_destructive(remediation)
 
-    # Disabled path: return advise-only output byte-for-byte unchanged (AC-3).
     if not config.enabled:
         return advise_only_payload
 
-    # Composite-block gate: RUNTIME_DEGRADATION + structural blocker means a
-    # restart will not clear the co-existing structural issue. Auto-apply is
-    # unsafe; route to advise without consuming budget (E11-F1-S2 AC-3).
     if _is_composite_block(primary_blocker_state, structural_blocker_state):
         return advise_only_payload
 
-    # Whitelist gate: unknown non-destructive verb stays advisory.
     if not is_whitelisted(remediation):
         print(
             f"WARNING: auto-resolve: remediation {remediation!r} is not in the whitelist; "
@@ -257,19 +249,12 @@ def apply_auto_resolve(
         )
         return advise_only_payload
 
-    # Novel-signature gate: when the catalog is configured and the signature is either
-    # absent (never seen) or has only been recorded as "novel" (success_count == 0,
-    # meaning no operator-confirmed apply has ever succeeded), this is an unrecognized
-    # pattern.  Record it for operator review and route to advise-only without
-    # consuming budget (E11-F2-S2 AC-1).
     prior_record = _lookup_catalog_entry(catalog_path, classification, signature)
     is_novel = prior_record is None or prior_record.success_count == 0
     if catalog_path is not None and classification is not None and is_novel:
         _record_catalog_outcome(catalog_path, classification, signature, remediation, "novel")
         return advise_only_payload
 
-    # Budget gate: if the per-(task_id, signature) count is at max_attempts,
-    # log escalation and return advise-only (E11-F1-S2 AC-1, AC-2).
     if _budget_exhausted(task_id, signature, config.max_attempts):
         attempt_count = _apply_counts.get((task_id, signature), 0)
         print(
@@ -279,8 +264,6 @@ def apply_auto_resolve(
         _record_catalog_outcome(catalog_path, classification, signature, remediation, "escalated")
         return advise_only_payload
 
-    # Apply path: the signature is either learned (in catalog) or no catalog is configured.
-    # recurring=True when the catalog is configured and the prior record was found.
     recurring = prior_record is not None
 
     _increment_budget(task_id, signature)

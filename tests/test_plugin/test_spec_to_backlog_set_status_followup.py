@@ -36,7 +36,6 @@ def _extract_step8(text: str) -> str:
     idx = text.find("## Step 8")
     if idx == -1:
         return ""
-    # Find the next H2 heading after Step 8 (or end of file).
     next_h2 = text.find("\n## ", idx + len("## Step 8"))
     if next_h2 != -1:
         return text[idx:next_h2]
@@ -85,7 +84,6 @@ class TestSetStatusFollowUpPresent:
     def test_epic_selector_example_in_step8(self) -> None:
         """Step 8 follow-up example must demonstrate per-epic selection (e.g. --include E1)."""
         section = _extract_step8(_read_skill())
-        # The spec prescribes 'devbench set-status --include "E1" in-queue' as the canonical form.
         has_epic_selector = re.search(r'--include\s+["\']?E\d', section) is not None
         assert has_epic_selector, (
             "spec-to-backlog/SKILL.md Step 8 success message must demonstrate "
@@ -157,7 +155,6 @@ class TestSetStatusFollowUpContextual:
         """
         section = _extract_step8(_read_skill())
         lower = section.lower()
-        # Accept any phrasing that conveys releasing for work / autonomous execution.
         has_purpose = any(
             kw in lower
             for kw in (

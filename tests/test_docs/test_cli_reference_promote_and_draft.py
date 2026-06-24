@@ -112,7 +112,6 @@ class TestPromoteSubcommandPresence:
     def test_promote_refuses_non_draft_documented(self) -> None:
         """The doc must state that promote refuses WUs not currently in draft."""
         text = self._text()
-        # The semantics must be described -- refuse / only draft / error / rc=1.
         lower = text.lower()
         assert (
             "not currently" in lower or "refuses" in lower or "only" in lower or "rc=1" in lower or "exit" in lower
@@ -124,7 +123,6 @@ class TestPromoteSubcommandPresence:
     def test_promote_example_present(self) -> None:
         """The promote section must contain at least one worked example."""
         text = self._text()
-        # There must be a code block somewhere after the promote heading.
         promote_idx = text.find("### `promote`")
         assert promote_idx != -1, "### `promote` section must exist"
         section_text = text[promote_idx:]
@@ -147,10 +145,8 @@ class TestStatusSectionDraftRow:
     def test_status_section_mentions_draft(self) -> None:
         """The status section must mention the Draft status row in the summary."""
         text = self._text()
-        # Find the status section.
         status_idx = text.find("### `status`")
         assert status_idx != -1, "### `status` section must exist in cli-reference.md"
-        # Extract the status section text.
         next_section = text.find("\n### ", status_idx + 1)
         section_text = text[status_idx:next_section] if next_section != -1 else text[status_idx:]
         assert "draft" in section_text.lower() or "Draft" in section_text, (
@@ -165,7 +161,6 @@ class TestStatusSectionDraftRow:
         assert status_idx != -1, "### `status` section must exist"
         next_section = text.find("\n### ", status_idx + 1)
         section_text = text[status_idx:next_section] if next_section != -1 else text[status_idx:]
-        # The section must mention draft alongside other status counts.
         lower = section_text.lower()
         assert "draft" in lower, (
             "docs/cli-reference.md 'status' section must include 'draft' in its "
@@ -179,7 +174,6 @@ class TestStatusSectionDraftRow:
         assert status_idx != -1, "### `status` section must exist"
         next_section = text.find("\n### ", status_idx + 1)
         section_text = text[status_idx:next_section] if next_section != -1 else text[status_idx:]
-        # Per spec 4.1.3: Draft N row appears between TOTAL and In Queue lines.
         lower = section_text.lower()
         has_ordering_info = "total" in lower or "in-queue" in lower or "in queue" in lower
         assert has_ordering_info, (
@@ -215,7 +209,6 @@ class TestReportSectionDraftColumn:
         next_section = text.find("\n### ", report_idx + 1)
         section_text = text[report_idx:next_section] if next_section != -1 else text[report_idx:]
         lower = section_text.lower()
-        # Must mention draft in context of a column or count table.
         has_draft_column_context = "draft" in lower and (
             "column" in lower or "status summary" in lower or "per-epic" in lower or "table" in lower
         )

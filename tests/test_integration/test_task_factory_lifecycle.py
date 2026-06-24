@@ -141,10 +141,8 @@ class TestTaskFactoryLifecycleHappyPath:
         backlog_text = (workspace / "BACKLOG.md").read_text()
         assert "E0-F1-S1-T2" in backlog_text
         assert "E0-F1-S1-T3" in backlog_text
-        # list_proposals surfaces the pending proposal.
         assert list_proposals(workspace)
 
-        # Promote every draft from the CLI (--all-from).
         with (
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
             patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
@@ -153,7 +151,6 @@ class TestTaskFactoryLifecycleHappyPath:
             rc = cli.cmd_promote_proposal("--all-from", "E0-F1-S1-T1")
         assert rc == 0
         backlog_text = (workspace / "BACKLOG.md").read_text()
-        # Proposed rows flipped to in-queue.
         assert "| E0-F1-S1-T2 | Fix scenario A | Task | in-queue " in backlog_text
         assert "| E0-F1-S1-T3 | Fix scenario B | Task | in-queue " in backlog_text
 
@@ -187,7 +184,6 @@ class TestTaskFactoryLifecycleHappyPath:
             repo="caylent-solutions/example",
         )
 
-        # Promote both drafts (the default --all-from path).
         with (
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
             patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
@@ -199,16 +195,11 @@ class TestTaskFactoryLifecycleHappyPath:
         source_path = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         source_text = source_path.read_text()
 
-        # (1) Both markers landed on the source.
         assert source_text.count("[BLOCKED_PENDING_PROPOSAL]") == 2
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in source_text
         assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in source_text
-        # Source is still blocked; promotion does not flip its status.
         assert "## Status: blocked" in source_text
 
-        # Simulate the standard lifecycle of the first promoted draft: add
-        # review-pass entries so mark_done satisfies the done-gate, then
-        # mark it done.
         mgr = BacklogManager()
         draft_paths = {
             "E0-F1-S1-T2": workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md",
@@ -221,20 +212,17 @@ class TestTaskFactoryLifecycleHappyPath:
             )
             draft.write_text(draft.read_text() + "\n" + review_block + "\n")
 
-        # (2) Partial: mark first draft done -- source stays blocked.
         _stamp_reviews(draft_paths["E0-F1-S1-T2"])
         mgr.mark_done(draft_paths["E0-F1-S1-T2"], workspace / "BACKLOG.md", "E0-F1-S1-T2")
         after_first = source_path.read_text()
         assert "## Status: blocked" in after_first
         assert "[AUTO_UNBLOCKED]" not in after_first
 
-        # (3) Full: mark second draft done -- source auto-flips to in-queue.
         _stamp_reviews(draft_paths["E0-F1-S1-T3"])
         mgr.mark_done(draft_paths["E0-F1-S1-T3"], workspace / "BACKLOG.md", "E0-F1-S1-T3")
         after_second = source_path.read_text()
         assert "## Status: in-queue" in after_second
         assert "[AUTO_UNBLOCKED]" in after_second
-        # Audit comment names both promoted drafts.
         unblocked_line_idx = after_second.index("[AUTO_UNBLOCKED]")
         tail = after_second[unblocked_line_idx:]
         assert "E0-F1-S1-T2" in tail
@@ -290,25 +278,21 @@ class TestUnmaterialisedRejectLifecycle:
         proposal = _proposal()
         write_proposal(workspace, proposal)
 
-        # Precondition: both proposed tasks classify as UNMATERIALISED.
         for task in proposal.proposed_tasks:
             state = classify_proposed_task(workspace / "backlog", workspace, task.suggested_id)
             assert state is ProposalTaskState.UNMATERIALISED
 
-        # Report panel renders the entries.
         with patch.object(report_mod, "BACKLOG_ROOT", workspace / "backlog"):
             lines = report_mod._unmaterialised_proposals_listing()
         assert any("E0-F1-S1-T2" in line for line in lines)
         assert any("E0-F1-S1-T3" in line for line in lines)
 
-        # CLI count reflects both un-materialised tasks.
         with (
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
             patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
         ):
             assert cli._count_unmaterialised_proposed_tasks() == 2
 
-        # Reject the entire JSON via the new --unmaterialised form.
         archive = reject_proposal(
             workspace_root=workspace,
             backlog_root=workspace / "backlog",
@@ -317,21 +301,17 @@ class TestUnmaterialisedRejectLifecycle:
             reason="redundant with existing in-flight work",
         )
 
-        # Archive was written under rejected-proposals/ with the -unmaterialised- infix.
         assert archive is not None and archive.is_file()
         assert archive.parent == workspace / REJECTED_PROPOSAL_DIR_NAME
         assert "unmaterialised" in archive.name
 
-        # Live JSON is gone.
         assert not (workspace / PROPOSAL_DIR_NAME / "E0-F1-S1-T1.json").exists()
 
-        # Audit comment landed on the source task.
         source_md = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         src_text = source_md.read_text()
         assert "[PROPOSAL_JSON_REJECTED]" in src_text
         assert "redundant with existing in-flight work" in src_text
 
-        # Panel is empty on the next report render.
         with patch.object(report_mod, "BACKLOG_ROOT", workspace / "backlog"):
             assert report_mod._unmaterialised_proposals_listing() == []
         with (
@@ -340,7 +320,6 @@ class TestUnmaterialisedRejectLifecycle:
         ):
             assert cli._count_unmaterialised_proposed_tasks() == 0
 
-        # And no pending proposals remain on disk.
         assert list_proposals(workspace) == []
 
 
@@ -352,7 +331,6 @@ class TestAffectedTaskIdsLifecycle:
         from devbench.backlog.manager import BacklogManager
         from devbench.backlog.proposal import promote_proposal
 
-        # Build a workspace with three blocked tasks (source + 2 peers) sharing a bug.
         (tmp_path / "BACKLOG.md").write_text(
             "# Backlog\n\n"
             "## Status Summary\n\n"
@@ -415,15 +393,10 @@ class TestAffectedTaskIdsLifecycle:
         for tid in result.wired_targets:
             assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in (story / f"{tid}.md").read_text()
 
-        # Transition the fix to done via _set_status (the internal path used by
-        # mark_done and _rollup_parent_status; force_status refuses done per AC-H1-1).
-        # cascade should flip all three blocked peers.
         mgr = BacklogManager()
         t2 = story / "E0-F1-S1-T2.md"
         mgr._set_status(t2, tmp_path / "BACKLOG.md", "E0-F1-S1-T2", "done")
 
-        # The cascade runs inside force_status / _set_status. All three peers
-        # must now be in-queue with [AUTO_UNBLOCKED] audit.
         for tid in ("E0-F1-S1-T1", "E0-F1-S1-T3", "E0-F1-S1-T4"):
             text = (story / f"{tid}.md").read_text()
             assert "## Status: in-queue" in text, f"{tid} did not auto-unblock"
@@ -451,9 +424,6 @@ class TestAutoAcceptProposalsLifecycle:
         proposal = _proposal()
         write_proposal(workspace, proposal)
 
-        # Source-task row is already in BACKLOG.md via _workspace; its file exists.
-        # Build a RUNTIME_CONFIG mock with auto_accept_proposals=True and the
-        # BacklogParser resolving the source unit so the sweep reaches materialise.
         unit = MagicMock()
         unit.id = "E0-F1-S1-T1"
         unit.repo = "caylent-solutions/example"
@@ -473,14 +443,11 @@ class TestAutoAcceptProposalsLifecycle:
             rc = cli.cmd_sweep_proposals()
         assert rc == 0
 
-        # Both drafts were materialised at 'proposed' then auto-promoted to
-        # in-queue by the sweep's auto-accept loop.
         story = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         t2 = (story / "E0-F1-S1-T2.md").read_text()
         t3 = (story / "E0-F1-S1-T3.md").read_text()
         assert "## Status: in-queue" in t2, "T2 must be auto-promoted to in-queue"
         assert "## Status: in-queue" in t3, "T3 must be auto-promoted to in-queue"
-        # Verify that both draft files were created (materialise_proposal ran).
         assert (story / "E0-F1-S1-T2.md").exists()
         assert (story / "E0-F1-S1-T3.md").exists()
 
@@ -496,10 +463,6 @@ class TestTaskFactoryLifecycleSkipWhenUnresolved:
         seed BACKLOG.md directly with a 'proposed' row before calling materialise.
         """
         workspace = _workspace(tmp_path)
-        # Seed BACKLOG.md with a 'proposed' row to simulate a prior unresolved materialise.
-        # This is necessary because materialise_proposal now writes the config-driven default
-        # status (in-queue) rather than 'proposed', so a second materialise call would not
-        # be blocked unless we inject 'proposed' rows directly.
         _append_backlog_row(
             workspace / "BACKLOG.md",
             _render_backlog_row(
@@ -511,7 +474,6 @@ class TestTaskFactoryLifecycleSkipWhenUnresolved:
             ),
         )
 
-        # Second proposal (different IDs) should be skipped because prior proposals are unresolved.
         second = Proposal(
             source_task_id="E0-F1-S1-T1",
             generated_at="2026-04-18T05:00:00Z",

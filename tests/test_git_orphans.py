@@ -17,10 +17,6 @@ from devbench.git_orphans import (
     path_matches_orphan,
 )
 
-# ---------------------------------------------------------------------------
-# path_matches_orphan
-# ---------------------------------------------------------------------------
-
 
 class TestPathMatchesOrphan:
     """Pattern-matcher correctness across globstar and non-orphan paths."""
@@ -28,36 +24,27 @@ class TestPathMatchesOrphan:
     @pytest.mark.parametrize(
         ("path", "expected"),
         [
-            # Terraform state at any depth
             ("foo.tfstate", True),
             ("infra/sandbox/foo.tfstate", True),
             ("a/b/c/d.tfstate.backup", True),
-            # Terragrunt cache at any depth
             ("infra/.terragrunt-cache/abc/main.tf", True),
             ("svc/sub/.terragrunt-cache/x/y.tf", True),
-            # Terraform provider lock at root or nested
             (".terraform.lock.hcl", True),
             ("infra/.terraform.lock.hcl", True),
-            # .terraform internals
             ("infra/.terraform/providers/aws/x", True),
-            # Python pycache + bytecode at any depth
             ("__pycache__/x.cpython-312.pyc", True),
             ("tests/unit/__pycache__/test_foo.cpython-312-pytest-9.0.3.pyc", True),
             ("foo.pyc", True),
             ("a/b/foo.pyo", True),
-            # Coverage variants
             (".coverage", True),
             (".coverage.42", True),
             (".coverage (1)", True),
             ("htmlcov/index.html", True),
             ("subdir/htmlcov/index.html", True),
-            # Node modules at any depth
             ("node_modules/pkg/index.js", True),
             ("packages/svc/node_modules/pkg/index.js", True),
-            # macOS metadata
             (".DS_Store", True),
             ("a/b/.DS_Store", True),
-            # NOT orphans
             ("src/main.py", False),
             ("infra/properties/common.yaml", False),
             ("infra/scripts/merge_properties.py", False),
@@ -94,11 +81,6 @@ class TestConfiguredPatterns:
         assert "**/*.tfstate" in configured_patterns()
 
 
-# ---------------------------------------------------------------------------
-# Real-git fixture for detect_* and cleanup
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def polluted_repo(tmp_path: Path) -> Path:
     """Build a real git repo with both clean files and orphan-pattern files staged + committed."""
@@ -114,7 +96,6 @@ def polluted_repo(tmp_path: Path) -> Path:
     (repo / "infra").mkdir()
     (repo / "infra" / "common.yaml").write_text("region: us-east-1\n")
 
-    # Orphan-pattern files that will be tracked
     (repo / "infra" / "sandbox.tfstate").write_text("{}\n")
     cache_dir = repo / "infra" / ".terragrunt-cache" / "abc"
     cache_dir.mkdir(parents=True)
@@ -141,7 +122,6 @@ class TestDetectTrackedOrphans:
         assert "infra/.terragrunt-cache/abc/module.tf" in detected
         assert "tests/__pycache__/test_foo.cpython-312.pyc" in detected
         assert ".coverage" in detected
-        # Clean files do not appear
         assert "src/main.py" not in detected
         assert "infra/common.yaml" not in detected
 
@@ -158,8 +138,6 @@ class TestDetectTrackedOrphans:
         assert detect_tracked_orphans(repo) == []
 
     def test_custom_pattern_override_via_argument(self, polluted_repo: Path) -> None:
-        # Pass a narrow override that excludes .coverage; the function must
-        # honor the explicit argument over the configured defaults.
         detected = detect_tracked_orphans(polluted_repo, patterns=("**/*.tfstate",))
         assert detected == ["infra/sandbox.tfstate"]
 
@@ -168,7 +146,6 @@ class TestDetectStagedOrphans:
     """``detect_staged_orphans`` filters ``git diff --cached``."""
 
     def test_unstaged_orphans_not_reported(self, polluted_repo: Path) -> None:
-        # Polluted files are committed (HEAD) but nothing is currently staged.
         assert detect_staged_orphans(polluted_repo) == []
 
     def test_newly_staged_orphan_reported(self, polluted_repo: Path) -> None:
@@ -183,11 +160,6 @@ class TestDetectStagedOrphans:
         assert "newcache/x.pyc" in staged
 
 
-# ---------------------------------------------------------------------------
-# cleanup_tracked_orphans
-# ---------------------------------------------------------------------------
-
-
 class TestCleanupTrackedOrphans:
     """End-to-end cleanup: ``git rm --cached`` + ``.gitignore`` write."""
 
@@ -197,9 +169,7 @@ class TestCleanupTrackedOrphans:
         assert len(report.detected) >= 4
         assert report.removed == []
         assert report.gitignore_updated is False
-        # Worktree files preserved on disk
         assert (polluted_repo / "infra" / "sandbox.tfstate").exists()
-        # Files still tracked
         result = subprocess.run(
             ["git", "-C", str(polluted_repo), "ls-files"],
             check=True,
@@ -212,7 +182,6 @@ class TestCleanupTrackedOrphans:
         report = cleanup_tracked_orphans(polluted_repo)
         assert report.dry_run is False
         assert len(report.removed) >= 4
-        # Index no longer tracks the orphans
         ls = subprocess.run(
             ["git", "-C", str(polluted_repo), "ls-files"],
             check=True,
@@ -222,10 +191,8 @@ class TestCleanupTrackedOrphans:
         assert "infra/sandbox.tfstate" not in ls
         assert ".coverage" not in ls
         assert "tests/__pycache__/test_foo.cpython-312.pyc" not in ls
-        # But the working-tree files are still on disk
         assert (polluted_repo / "infra" / "sandbox.tfstate").exists()
         assert (polluted_repo / ".coverage").exists()
-        # .gitignore now contains the devbench-managed block
         gitignore = (polluted_repo / ".gitignore").read_text(encoding="utf-8")
         assert DEVBENCH_GITIGNORE_HEADER in gitignore
         assert "*.tfstate" in gitignore
@@ -239,7 +206,6 @@ class TestCleanupTrackedOrphans:
         assert len(first.removed) >= 4
         assert second.removed == []
         assert second.detected == []
-        # Second run does not re-append the gitignore block
         assert second.gitignore_updated is False
         gitignore = (polluted_repo / ".gitignore").read_text(encoding="utf-8")
         assert gitignore.count(DEVBENCH_GITIGNORE_HEADER) == 1
@@ -249,10 +215,8 @@ class TestCleanupTrackedOrphans:
         (polluted_repo / ".gitignore").write_text(existing, encoding="utf-8")
         cleanup_tracked_orphans(polluted_repo)
         new_content = (polluted_repo / ".gitignore").read_text(encoding="utf-8")
-        # User's content preserved
         assert "# Project-specific" in new_content
         assert "build/" in new_content
-        # devbench block appended
         assert DEVBENCH_GITIGNORE_HEADER in new_content
 
     def test_non_repo_raises(self, tmp_path: Path) -> None:

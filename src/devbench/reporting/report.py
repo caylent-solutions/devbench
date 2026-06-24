@@ -96,8 +96,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger("devbench.reporting.report")
 
-# Match a log line of the form "YYYY-MM-DDTHH:MM:SSZ [logger.name] LEVEL ...",
-# capturing the ISO-8601 timestamp (group 1) and the logger name (group 2).
 _LOG_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z \[([^\]]+)\]", re.MULTILINE)
 _DONE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to 'done'", re.MULTILINE)
 _PROGRESS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to 'in-progress'", re.MULTILINE)
@@ -116,7 +114,7 @@ class HookLogTotals:
     """
 
     total_duration_ms: int = 0
-    input_tokens: int = 0  # uncached input
+    input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_5m_tokens: int = 0
@@ -124,19 +122,11 @@ class HookLogTotals:
     entries_with_usage: int = 0
     entries_us_geo: int = 0
     entries_fast_mode: int = 0
-    # Token volumes from entries flagged with ``inference_geo`` (data-residency
-    # premium, issue #124). Tracked separately so ``_compute_cost`` can apply
-    # ``report.data_residency_multiplier`` (default 1.10 from
-    # DEFAULT_DATA_RESIDENCY_MULTIPLIER) only to the residency-restricted
-    # subset of the token volume, not the full aggregate.
     us_only_input_tokens: int = 0
     us_only_output_tokens: int = 0
     us_only_cache_read_tokens: int = 0
     us_only_cache_write_5m_tokens: int = 0
     us_only_cache_write_1h_tokens: int = 0
-    # Token volumes from entries with ``usage.speed == 'fast'`` (fast-mode
-    # premium, issue #124). Same per-subset accounting; multiplied by
-    # ``report.fast_mode_multiplier`` (default 6.0).
     fast_input_tokens: int = 0
     fast_output_tokens: int = 0
     fast_cache_read_tokens: int = 0
@@ -167,39 +157,17 @@ class WindowStats:
     est_hours: float
     totals: HookLogTotals
     cost: CostBreakdown
-    cache_hit_rate: float | None  # None when no input/cache_read tokens
+    cache_hit_rate: float | None
     tokens_per_task: float
     est_total_cost: float
     api_hours: float
-    api_efficiency: float | None  # None when window_hours == 0
-    # Number of completed-task duration samples that produced ``avg_minutes``.
-    # When < MIN_PACE_SAMPLES the display marks the pace as fragile so a single
-    # sample (e.g. a freshly-restarted Session window with one completion)
-    # cannot drive a multi-task projection.
+    api_efficiency: float | None
     pace_sample_count: int = 0
-    # Average minutes per task across the most-recently-completed N tasks
-    # (N = RECENT_PACE_TASKS), regardless of window. None when fewer than N
-    # task completions exist log-wide. Used in preference to ``avg_minutes``
-    # for projections so the rate metric reflects current orchestrator pace
-    # rather than being anchored by historical completions.
     recent_pace_minutes: float | None = None
-    # Wall-clock completion moment = now() + est_hours. None when est_hours is
-    # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
-    # to the resolved display timezone.
     est_completion_at: datetime | None = None
-    # Issue #157: ETA breakdown so the renderer can print
-    # ``~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)``.
-    # Issue #214: the renderer caps column widths and wraps long
-    # breakdowns at " + " boundaries so this value never blows out the
-    # table layout, even when all four buckets contribute.
     eta_active: int = 0
     eta_blocked_recovery: int = 0
     eta_blocked_auto: int = 0
-    # Issue #183 follow-up: RUNTIME_DEGRADATION tasks auto-recover when
-    # the orchestrator restarts (cmd_start exit-42 + Makefile while-loop).
-    # They belong in the ETA denominator alongside the other auto-recover
-    # buckets so the projection reflects work that WILL get done without
-    # operator intervention.
     eta_blocked_runtime_degradation: int = 0
 
     @property
@@ -233,9 +201,9 @@ class WindowStats:
 class WindowSpec:
     """One window to render in the multi-column window-stats table."""
 
-    label: str  # short column header, e.g. "All-time"
+    label: str
     start: datetime
-    is_log_started: bool  # True if this window's start equals log_started (controls title)
+    is_log_started: bool
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -364,7 +332,6 @@ def _extract_usage_totals(usage: object, totals_acc: dict[str, int]) -> bool:
         write_5m_t = int(cc.get("ephemeral_5m_input_tokens") or 0)
         write_1h_t = int(cc.get("ephemeral_1h_input_tokens") or 0)
     else:
-        # Older format / fallback: all cache writes counted as 5-min.
         write_5m_t = int(usage.get("cache_creation_input_tokens") or 0)
         write_1h_t = 0
 
@@ -374,9 +341,6 @@ def _extract_usage_totals(usage: object, totals_acc: dict[str, int]) -> bool:
     totals_acc["cache_write_5m_tokens"] += write_5m_t
     totals_acc["cache_write_1h_tokens"] += write_1h_t
 
-    # Per-subset token tallies for the data-residency and fast-mode premium
-    # multipliers (issue #124). Tracked per-call so the multipliers apply
-    # only to the affected token volume, not the full aggregate.
     is_us_only = bool(usage.get("inference_geo"))
     is_fast = usage.get("speed") == "fast"
     if is_us_only:
@@ -520,8 +484,6 @@ def _role_for_entry(entry: dict) -> str:
     raw = entry.get("attributionAgent")
     if not isinstance(raw, str) or not raw:
         return _ROLE_ORCHESTRATOR
-    # Strip plugin prefix (``devbench:``) and normalise dashes to underscores.
-    # ``code-reviewer`` -> ``code_review`` (matches REVIEW_JUDGE_NAMES).
     base = raw.split(":", 1)[1] if ":" in raw else raw
     return base.replace("-reviewer", "_review").replace("-", "_")
 
@@ -697,9 +659,6 @@ def _compute_cost(
         totals.cache_write_1h_tokens,
     )
 
-    # Residency premium: residency-flagged tokens cost (multiplier - 1) MORE
-    # than the base. Adding to the per-bucket cost preserves the bucket-sum
-    # invariant.
     if data_residency_multiplier != 1.0:
         boost = data_residency_multiplier - 1.0
         ri_c, ro_c, rr_c, rw5_c, rw1_c = _bucket_cost(
@@ -907,10 +866,6 @@ def _recent_per_task_cost(
             event_index.aggregate_transcript_window_by_model, transcript_dir_indexed, earliest_progress
         )
     else:
-        # Non-indexed fallback: parser path doesn't yet bucket by model, so
-        # every entry collapses to the ``"<unknown>"`` bucket priced against
-        # ``REPORT_DEFAULT_MODEL_RATES``.  The indexed path (the normal
-        # case for any real workspace) preserves per-model attribution.
         totals_hook = _parse_hook_log_metrics(log_path, earliest_progress)
         transcript_dir = _discover_transcript_dir(hook_log_path)
         totals_transcript = _parse_transcript_metrics(transcript_dir, earliest_progress)
@@ -1021,13 +976,6 @@ def _compute_window_stats(
     eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto + tasks_blocked_runtime_degradation
     est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
-    # Combine usage from two sources, both filtered by window_start:
-    #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
-    #   2. Claude Code transcripts: per-turn outer-session reasoning -- captures what the orchestrate
-    #      skill itself spends between Agent calls. Without these, cost can be off by 10-20x.
-    # Issue #162: when ``event_index`` is supplied the totals come from
-    # indexed SQL range-scans of the persistent cache (~ms cost). When
-    # ``event_index`` is None the legacy full-file parsers run.
     hook_log_path = _hook_log_path(log_path)
     if event_index is not None:
         transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
@@ -1038,29 +986,19 @@ def _compute_window_stats(
             event_index.aggregate_transcript_window_by_model, transcript_dir_indexed, window_start
         )
     else:
-        # Non-indexed fallback: see ``_recent_per_task_cost`` for the
-        # equivalent ``"<unknown>"`` collapse rationale.
         totals_hook = _parse_hook_log_metrics(log_path, window_start)
         transcript_dir = _discover_transcript_dir(hook_log_path)
         totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
         totals_hook_by_model = {"<unknown>": totals_hook}
         totals_transcript_by_model = {"<unknown>": totals_transcript}
     totals_by_model = _merge_totals_by_model(totals_hook_by_model, totals_transcript_by_model)
-    # Aggregate totals across every model id for downstream renderers that
-    # still need a single ``HookLogTotals``-shaped view of the window.
     totals = _combine_many(totals_by_model.values())
-    # Per-model cost: each model id is priced against its own rates; the
-    # per-model contract correction factor (issue #223) composes inside the
-    # helper.  The premium multipliers (residency / fast-mode) apply
-    # inside each per-model call so they multiply the correct base rate.
     cost = _compute_cost_by_model(
         totals_by_model,
         data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
         fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
 
-    # Cache hit rate: cache reads / (cache reads + uncached input). Output and
-    # cache writes are not "input" in the hit-rate sense.
     input_total = totals.cache_read_tokens + totals.input_tokens
     cache_hit_rate = (totals.cache_read_tokens / input_total * PERCENT_MULTIPLIER) if input_total > 0 else None
 
@@ -1072,31 +1010,6 @@ def _compute_window_stats(
         + totals.cache_write_1h_tokens
     )
     tokens_per_task = total_tokens_window / tasks_in_window if tasks_in_window else 0.0
-    # Issue #164: cost projection now uses a GLOBAL recent-pace per-task
-    # rate (computed once log-wide by ``_recent_per_task_cost`` and passed
-    # in by the caller) instead of the window-specific ``tasks_in_window``
-    # denominator. The window-specific denominator was producing wildly
-    # different "Estimated total cost at completion" numbers per column
-    # (e.g. $13k all-time vs $42k session vs $8 this-run) for the same
-    # physical workspace; completion is one global event, not three.
-    # Fallback chain: recent-pace global rate (most accurate) ->
-    # window's own per-task average (legacy behaviour, matches the
-    # per-pace-minutes fallback path) -> zero (no data).
-    #
-    # Spanning-row follow-up: the multiplier above is global, but the
-    # ADDITIVE base ``cost.total_cost`` is window-scoped, so per-column
-    # est_total_cost values still diverged by exactly the cost-so-far
-    # delta between windows (All-time spend > Session spend > This-run
-    # spend). The render-side ``_merge_spanning_values`` collapse only
-    # fires when every column produces an identical string, so the row
-    # never collapsed in practice. Threading ``lifetime_total_cost``
-    # (the All-time cost.total_cost, computed once by ``generate_report``
-    # before any narrower window) gives every column the same additive
-    # base; the projection becomes a single global number, the spanning
-    # collapse fires, and the report expresses the underlying truth:
-    # one global completion, one cost. ``lifetime_total_cost=None``
-    # preserves the legacy formula for direct test callers that exercise
-    # ``_compute_window_stats`` in isolation.
     if recent_per_task_cost is not None:
         per_task_cost = recent_per_task_cost
     elif tasks_in_window:
@@ -1109,9 +1022,6 @@ def _compute_window_stats(
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
 
-    # Wall-clock completion moment. None when est_hours is zero/unknown
-    # (no pace data yet, or no remaining active tasks). Stored in UTC;
-    # the renderer converts to the resolved display timezone.
     est_completion_at = datetime.now(UTC) + timedelta(hours=est_hours) if est_hours > 0 else None
 
     return WindowStats(
@@ -1137,11 +1047,6 @@ def _compute_window_stats(
     )
 
 
-# --------------------------------------------------------------------------
-# Display helpers
-# --------------------------------------------------------------------------
-
-
 def _resolve_display_timezone(tz_name: str | None) -> tzinfo | None:
     """Return a tzinfo for the configured display timezone, or None for system local."""
     if tz_name is None:
@@ -1162,17 +1067,12 @@ def _format_local_timestamp(dt: datetime, display_tz: tzinfo | None = None) -> s
     return converted.strftime("%Y-%m-%d %H:%M %Z")
 
 
-# ANSI color codes. Applied AFTER alignment so escape bytes never count
-# toward the visible-width math the table renderers do via len().
 _COLOR_GREEN = "\033[32m"
 _COLOR_RED_LIGHT = "\033[91m"
 _COLOR_YELLOW = "\033[33m"
 _COLOR_MAGENTA = "\033[35m"
 _COLOR_RESET = "\033[0m"
 
-# Map metric labels to ANSI color codes. The renderers wrap the entire
-# row line (borders included) so the colour visually pops while the
-# alignment stays exact.
 _ROW_COLORS: dict[str, str] = {
     "Tasks completed": _COLOR_GREEN,
     "Tasks completed in window": _COLOR_GREEN,
@@ -1309,7 +1209,6 @@ def _orchestrator_liveness_banner(
     current = now if now is not None else datetime.now(UTC)
     suffix = f" -- session {session_id}" if session_id else ""
 
-    # Determine whether a live orchestrator process exists.
     live_pid = False
     if pid_file is not None:
         inst = read_pid_file(pid_file)
@@ -1319,24 +1218,18 @@ def _orchestrator_liveness_banner(
     last_ts = _read_last_log_timestamp(log_path)
 
     if not live_pid:
-        # No live PID -- always STOPPED, regardless of log recency.
         if last_ts is not None:
             delta = max(0.0, (current - last_ts).total_seconds())
             seen = _format_local_timestamp(last_ts, display_tz)
             body = f"[ORCHESTRATOR STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
         else:
-            # No parseable log line; use the configured quiet window as a
-            # lower-bound estimate of how long the orchestrator has been idle.
             min_quiet = _format_duration(threshold_seconds)
             body = f"[ORCHESTRATOR STOPPED] no activity recorded; quiet for at least {min_quiet}"
         color = _COLOR_RED_LIGHT
     elif last_ts is None:
-        # Live PID but no parseable log line yet (empty file, missing file,
-        # or untimestamped traceback tail) -- STARTING.
         body = "[ORCHESTRATOR STARTING] log file empty; no activity recorded yet"
         color = _COLOR_YELLOW
     else:
-        # Live PID and parseable log line -- ALIVE.
         delta = max(0.0, (current - last_ts).total_seconds())
         body = f"[ORCHESTRATOR ALIVE] last activity {_format_duration(delta)} ago"
         color = _COLOR_GREEN
@@ -1432,8 +1325,6 @@ def _render_one_session_banner(
             body = f"[SESSION {name} STOPPED] no activity recorded; quiet for at least {min_quiet}"
         color = _COLOR_RED_LIGHT
     elif last_ts is None:
-        # Live PID but no parseable log line yet -- STARTING.  A pending drain
-        # is still surfaced so the operator sees it even before first activity.
         body = f"[SESSION {name} STARTING] log file empty; no activity recorded yet"
         if drain_pending:
             body += " -- drain=pending"
@@ -1441,8 +1332,6 @@ def _render_one_session_banner(
     else:
         delta = max(0.0, (now - last_ts).total_seconds())
         if drain_pending:
-            # Live + draining: DRAINING state with an explicit marker so the
-            # banner agrees with ``devbench sessions`` (DRAIN=pending).
             body = f"[SESSION {name} DRAINING] last activity {_format_duration(delta)} ago -- drain=pending"
             color = _COLOR_YELLOW
         else:
@@ -1579,11 +1468,6 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
     return lines
 
 
-#: Issue #214: cap any value column at this width.  Cells longer than the
-#: cap wrap onto multiple physical lines (see :func:`_wrap_cell_value`).
-#: 50 chars accommodates the longest natural ETA breakdown segment
-#: (``blocked-runtime-degradation NN``) with room for the prefix / suffix
-#: without exceeding a comfortable terminal column width.
 MAX_VALUE_COL_WIDTH: int = 50
 
 
@@ -1742,9 +1626,6 @@ def _render_multi_column_table(
     metric_w = max((len(metric) for metric, _ in rows), default=0)
     metric_w = max(metric_w, len(title))
 
-    # Issue #214: per-column widths so one wide cell does NOT inflate every
-    # column.  Each column's natural width is max(default, label, own cells).
-    # Spanning rows are handled afterwards by widening columns uniformly.
     value_widths = _compute_value_widths(column_labels, rows, default_min=value_w)
     max_spanning = max(
         (len(vals) for _, vals in rows if isinstance(vals, str)),
@@ -1752,8 +1633,6 @@ def _render_multi_column_table(
     )
     value_widths = _widen_for_spanning(value_widths, max_spanning)
 
-    # Width a spanning cell occupies (covers all n_cols value columns plus the
-    # n_cols-1 internal "│" separators that would otherwise split them).
     spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
@@ -1775,14 +1654,12 @@ def _render_multi_column_table(
         if i > 0:
             lines.append(border_mid)
         if isinstance(values, str):
-            # Spanning row: wrap to spanning_w; metric shows on line 0 only.
             wrapped = _wrap_cell_value(values, spanning_w)
             for k, wl in enumerate(wrapped):
                 metric_text = metric if k == 0 else ""
                 row_line = f"\u2502 {metric_text:<{metric_w}} \u2502 {wl:>{spanning_w}} \u2502"
                 lines.append(_colorize_row(row_line, metric))
         else:
-            # Per-column wrap; row height = max wrapped lines across columns.
             wrapped_cells = [_wrap_cell_value(v, value_widths[j]) for j, v in enumerate(values)]
             height = max((len(c) for c in wrapped_cells), default=1)
             for c in wrapped_cells:
@@ -1823,8 +1700,6 @@ def _render_grouped_progress_table(
     metric_w = max((len(metric) for metric, _ in all_rows), default=0)
     metric_w = max(metric_w, len(title), max((len(name) for name, _ in sections), default=0))
 
-    # Issue #214: per-column widths so one wide cell does NOT inflate every
-    # column.  Spanning rows are handled afterwards by widening uniformly.
     value_widths = _compute_value_widths(column_labels, all_rows, default_min=value_w)
     max_spanning = max(
         (len(vals) for _, section_rows in sections for _, vals in section_rows if isinstance(vals, str)),
@@ -1832,13 +1707,7 @@ def _render_grouped_progress_table(
     )
     value_widths = _widen_for_spanning(value_widths, max_spanning)
 
-    # Width a spanning cell occupies across all n_cols value columns (plus
-    # the n_cols-1 internal separators). Used for both the section-header row
-    # and any individual metric whose value was merged into a str.
     spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
-    # Width of the ENTIRE merged cell for a section-header row: metric column
-    # + all value columns + every separator between them - leading/trailing
-    # padding (2 spaces).
     section_w = metric_w + 2 + 1 + (sum(w + 2 for w in value_widths) + (n_cols - 1)) - 2
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
@@ -1860,10 +1729,6 @@ def _render_grouped_progress_table(
     for section_label, rows in sections:
         if not rows:
             continue
-        # One mid-border divides the previous section (or the column-header
-        # row) from this section. The section-label row flows directly into
-        # the first metric row with no additional border between them, so
-        # the sections read as compact visual blocks like the plan's mockup.
         lines.append(border_mid)
         lines.append(f"\u2502 {section_label.upper():<{section_w}} \u2502")
         for metric, values in rows:
@@ -1943,13 +1808,6 @@ def _format_est_hours_display(stats: WindowStats) -> str:
     from the window's avg_minutes; falls back to ``n/a`` otherwise.
     """
     if stats.est_hours and stats.recent_pace_minutes is not None:
-        # Only surface non-zero blocked-bucket terms so a typical report --
-        # where every blocked counter sits at zero -- keeps the breakdown
-        # short. The "active" term always shows.  Issue #214 caps the
-        # rendered cell width by wrapping long breakdowns at " + "
-        # boundaries inside the table renderer; this builder keeps the
-        # full classification names so the table reads naturally on a
-        # wide terminal.
         parts: list[str] = [f"active {stats.eta_active}"]
         if stats.eta_blocked_recovery:
             parts.append(f"blocked-recovery {stats.eta_blocked_recovery}")
@@ -1970,11 +1828,6 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     ``display_tz`` is used to render the estimated-completion datetime in the
     operator's configured timezone. When ``None``, the OS local zone applies.
     """
-    # API utilization > 100% means API time exceeds wall time -- concurrent
-    # subagent calls (legitimate parallelism) or two orchestrators writing to
-    # the same hook log. The raw percentage reads as broken; surface the
-    # condition explicitly. The underlying WindowStats.api_efficiency stays
-    # untouched for programmatic callers.
     if stats.api_efficiency is None:
         api_eff = "n/a"
     elif stats.api_efficiency > PERCENT_MULTIPLIER:
@@ -1984,22 +1837,14 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     cache_hit = f"{stats.cache_hit_rate:.2f}%" if stats.cache_hit_rate is not None else "n/a"
     tokens_per_task = f"{stats.tokens_per_task:,.0f}" if stats.tokens_per_task else "n/a"
     est_total = f"~${stats.est_total_cost:.2f}" if stats.est_total_cost else "n/a"
-    # Per-task averages are meaningful only when ≥ MIN_PACE_SAMPLES tasks
-    # completed in the window. Below that, _compute_window_stats sets avg=0
-    # and we display "n/a" with the actual sample count so the reader knows
-    # whether the metric is genuinely empty (N=0) or fragile (1 ≤ N < min).
     if stats.avg_minutes:
         avg_min_display = f"{stats.avg_minutes:.1f} min"
     elif stats.pace_sample_count > 0:
         avg_min_display = f"n/a (N={stats.pace_sample_count} sample{'s' if stats.pace_sample_count != 1 else ''})"
     else:
         avg_min_display = "n/a"
-    # Recent pace is log-wide; same value across all window columns. None
-    # when fewer than RECENT_PACE_TASKS completions exist.
     recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
     est_hours_display = _format_est_hours_display(stats)
-    # Wall-clock completion datetime rendered in the resolved display TZ.
-    # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
     if stats.est_completion_at is None:
         est_completion_display = "n/a"
     else:
@@ -2036,7 +1881,6 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     ]
 
 
-# Order MUST match _stats_to_value_list above.
 _METRIC_LABELS: list[str] = [
     "Time span",
     "Tasks completed in window",
@@ -2059,21 +1903,11 @@ _METRIC_LABELS: list[str] = [
     "Estimated total cost at completion",
 ]
 
-# Rows whose value is window-agnostic (identical across every window column).
-# These render as a single cell spanning all value columns instead of repeating
-# the same number per column. Recent pace is log-wide by construction; Est. time
-# to complete remaining = tasks_active * log-wide pace / 60 when recent pace is
-# available (the usual case after RECENT_PACE_TASKS completions).
 _SPANNING_METRIC_LABELS: frozenset[str] = frozenset(
     {
         f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
         "Est. time to complete remaining",
         "Est. completion date/time",
-        # Issue #164: total-cost-at-completion is a global measure (one
-        # finishing point for the backlog). The narrower-window numbers
-        # were rendered as different per-column projections that couldn't
-        # all be right at once. Spanning the row makes the report express
-        # the underlying truth: one global completion, one cost projection.
         "Estimated total cost at completion",
     }
 )
@@ -2167,24 +2001,23 @@ class _BacklogTotals:
     stories_done: int
     features_done: int
     epics_done: int
-    tasks_remaining: int  # all non-Done tasks (active + blocked); kept for backward-compat
-    tasks_blocked: int  # non-Done tasks with status == BLOCKED or HOLD
-    tasks_active: int  # tasks_remaining - tasks_blocked (in-queue / in-progress / in-review)
-    tasks_in_progress: int  # non-Done tasks with status == IN_PROGRESS (subset of tasks_active)
-    tasks_in_queue: int  # non-Done tasks with status == IN_QUEUE (subset of tasks_active)
-    tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
-    tasks_proposed: int  # task-factory-generated drafts awaiting human review
-    tasks_declined: int  # explicitly declined work (won't ever be done)
-    tasks_draft: int = 0  # pre-queue gate; not yet promoted to in-queue
-    # E2-F2-S1: per-state blocked counts (one per BlockedTaskState).
-    tasks_blocked_auto_clearing: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
-    tasks_blocked_amendment_recovery: int = 0  # AWAITING_AMENDMENT_RECOVERY
-    tasks_blocked_dependency: int = 0  # AWAITING_DEPENDENCY
-    tasks_blocked_held: int = 0  # HELD (task's own status is hold)
-    tasks_blocked_on_held: int = 0  # BLOCKED_ON_HELD
-    tasks_blocked_runtime_degradation: int = 0  # RUNTIME_DEGRADATION (auto-recovers on orchestrator restart)
-    tasks_blocked_interrupted_on_stop: int = 0  # INTERRUPTED_ON_STOP (auto-requeued on next sweep, TDI-002)
-    tasks_blocked_operator: int = 0  # OPERATOR_ACTION_REQUIRED
+    tasks_remaining: int
+    tasks_blocked: int
+    tasks_active: int
+    tasks_in_progress: int
+    tasks_in_queue: int
+    tasks_in_review: int
+    tasks_proposed: int
+    tasks_declined: int
+    tasks_draft: int = 0
+    tasks_blocked_auto_clearing: int = 0
+    tasks_blocked_amendment_recovery: int = 0
+    tasks_blocked_dependency: int = 0
+    tasks_blocked_held: int = 0
+    tasks_blocked_on_held: int = 0
+    tasks_blocked_runtime_degradation: int = 0
+    tasks_blocked_interrupted_on_stop: int = 0
+    tasks_blocked_operator: int = 0
 
     @property
     def tasks_blocked_recovery(self) -> int:
@@ -2238,8 +2071,6 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     features = [u for u in units if u.unit_type == WorkUnitType.FEATURE]
     epics = [u for u in units if u.unit_type == WorkUnitType.EPIC]
     tasks_done = [t for t in tasks if t.status == WorkUnitStatus.DONE]
-    # Both BLOCKED and HOLD tasks are classified by the 6-state classifier
-    # and counted in tasks_blocked so the six per-state fields sum to that total.
     tasks_blocked_status = [t for t in tasks if t.status == WorkUnitStatus.BLOCKED]
     tasks_hold_status = [t for t in tasks if t.status == WorkUnitStatus.HOLD]
     tasks_blocked_and_hold = tasks_blocked_status + tasks_hold_status
@@ -2252,9 +2083,6 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined) - len(tasks_draft)
     n_blocked_total = len(tasks_blocked_and_hold)
 
-    # E2-F2-S1: classify each blocked/hold task into one of the per-state
-    # BlockedTaskState buckets so the ETA projection and the panel report can
-    # operate from pre-computed per-state counts.
     from devbench.backlog.proposal import BlockedTaskState
 
     counts = _count_blocked_states(tasks_blocked_and_hold)
@@ -2296,7 +2124,7 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
     and have been removed. The argument is ignored; the rows returned here
     carry only instantaneous state that does not belong in a windowed view.
     """
-    _ = lifetime  # retained for API compatibility; no longer emits Lifetime rows.
+    _ = lifetime
     task_pct = round(PERCENT_MULTIPLIER * b.tasks_done / b.tasks_total) if b.tasks_total else 0
     total_pct = round(PERCENT_MULTIPLIER * b.units_done / b.units_total) if b.units_total else 0
     return [
@@ -2317,14 +2145,6 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
         ),
     ]
 
-
-# ---------------------------------------------------------------------------
-# Per-section metric grouping for the consolidated progress table
-# ---------------------------------------------------------------------------
-# The Window stats rows are split into four logical sections: THROUGHPUT,
-# API USAGE, TOKENS, COST. Order within each section is preserved from
-# ``_METRIC_LABELS``; the ordering in ``_METRIC_LABELS`` is therefore the
-# single source of truth for how rows appear in the output.
 
 _SECTION_THROUGHPUT: frozenset[str] = frozenset(
     {
@@ -2350,12 +2170,6 @@ _SECTION_COST: frozenset[str] = frozenset(
         "Estimated total cost at completion",
     }
 )
-
-# Every row in ``_METRIC_LABELS`` that is not in THROUGHPUT, API USAGE, or
-# COST falls into TOKENS by elimination. That includes the token-breakdown
-# rows, Input/output share, Cache hit rate, and Avg tokens per task -- the
-# plan's TOKENS section ends with "Avg tokens per task" immediately before
-# the COST section begins.
 
 
 def _section_for_metric(metric: str) -> str:
@@ -2455,8 +2269,6 @@ def _classify_blocked_unit_into_buckets(
     elif state is BlockedTaskState.BLOCKED_ON_HELD:
         on_held_rows.append(u)
     elif state is BlockedTaskState.RUNTIME_DEGRADATION:
-        # Issue #248a: check for a co-existing structural blocker so the
-        # operator sees that a restart alone will not clear the task.
         structural_state = classify_blocked_task_excluding_degradation(
             BACKLOG_ROOT,
             BACKLOG_INDEX,
@@ -2650,7 +2462,6 @@ def _blocked_listing(units: list) -> list[str]:
        nothing.
     7. ``operator action required`` -- no automation path; operator must act.
     """
-    # Admit BOTH BLOCKED and HOLD task units.
     eligible = [
         u
         for u in units
@@ -2659,13 +2470,12 @@ def _blocked_listing(units: list) -> list[str]:
     if not eligible:
         return []
 
-    # Per-state row buckets in canonical display order.
-    auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
-    amendment_recovery_rows: list[tuple] = []  # (unit, signal-source string)
+    auto_rows: list[tuple] = []
+    amendment_recovery_rows: list[tuple] = []
     dependency_rows: list = []
     held_rows: list = []
     on_held_rows: list = []
-    runtime_degradation_rows: list[tuple] = []  # (unit, structural_state: BlockedTaskState)
+    runtime_degradation_rows: list[tuple] = []
     interrupted_rows: list = []
     operator_rows: list = []
 
@@ -2910,12 +2720,6 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
     total_cost = 0.0
     rows: list[tuple[str, int, int, int, int, int, float]] = []
     for role, totals in sorted(by_role.items()):
-        # Per-role buckets do not carry per-call model attribution
-        # individually -- the role aggregator collapses across models.
-        # Pricing against the "<unknown>" bucket (-> REPORT_DEFAULT_MODEL_RATES)
-        # produces the same total an operator would compute by hand from the
-        # canonical Opus 4.7 list rates.  Issue #223's per-model panel
-        # remains the more accurate axis for cost; #206 is per-role view.
         cost = _compute_cost_by_model({"<unknown>": totals})
         cache_write = totals.cache_write_5m_tokens + totals.cache_write_1h_tokens
         rows.append(
@@ -2935,9 +2739,6 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
         total_cw += cache_write
         total_msgs += totals.entries_with_usage
         total_cost += cost.total_cost
-    # Sort by est_cost descending so the most expensive role surfaces
-    # first; operators triaging cost want to see the biggest contributor
-    # at the top without scrolling.
     rows.sort(key=lambda r: r[6], reverse=True)
     for role, in_t, out_t, cr, cw, msgs, est in rows:
         rendered.append(f"{role:<20}  {in_t:>12,}  {out_t:>13,}  {cr:>10,}  {cw:>11,}  {msgs:>4}   ${est:>7,.4f}")
@@ -2948,8 +2749,6 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
     return rendered
 
 
-#: How many in-flight unit ids to name inline before eliding the rest, so the
-#: headline stays a single readable line when many units are active.
 _MAX_NAMED_INFLIGHT_IDS: int = 5
 
 
@@ -3049,48 +2848,15 @@ def generate_report(
             structurally invalid tokens (reversed ranges, etc.).
         OSError: If a WU backing file cannot be read during session filtering.
     """
-    # Operator-alive banner (issue #161). Prepended to every render so
-    # ``devbench report --watch N`` shows liveness state on every tick.
-    # Threshold reuses ``stop_hook.window_seconds`` -- the same quiet
-    # window the circuit-breaker tolerates -- so the banner stays aligned
-    # with the operator's already-tuned cadence.
-    #
-    # The banner is computed BEFORE the snapshot short-circuit (issue
-    # #162 Phase 6) because the banner uses ``datetime.now()`` to
-    # express "last activity Ns ago" -- if we cached it inside the
-    # snapshot the elapsed-since string would freeze and a stalled
-    # orchestrator would still appear ALIVE on every watch tick.
     banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
     banner_lines = _resolve_banner_lines(log_path, banner_display_tz)
 
-    # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
-    # A snapshot keyed on log mtime + size is fast but unsafe:
-    # cost-rate config (``REPORT_MODEL_RATES``, the cache + residency +
-    # fast-mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
-    # can change between invocations without the log advancing, and a
-    # snapshot keyed only on the log would silently return numbers
-    # computed against the old config. Per CLAUDE.md fail-fast: better
-    # to recompute and stay correct than cache and risk wrong cost
-    # output. Phases 1+4 alone already serve the report from indexed
-    # range scans, which is the dominant cost on the live workspace
-    # (196 MB hook log + 200+ MB transcripts) -- the marginal saving
-    # from Phase 6 over Phases 1+4 is small. The schema row
-    # ``report_snapshot`` is left in place for a future invocation-
-    # safe snapshot design (one that hashes the full config + BACKLOG
-    # mtime tree into the cache key).
     event_index = EventIndex.open(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     try:
         units = parser.parse_index()
     except FileNotFoundError as exc:
-        # FileNotFoundError can name either BACKLOG.md itself or a WU md
-        # referenced by it. Surface the actual path so the diagnostic
-        # stops blaming the index when the real culprit is a transient
-        # writer-window race on a single WU md (SDK-driven Write/Edit
-        # tools outside BacklogManager can leave a WU md momentarily
-        # unreadable; the parser already does one retry, this prefix
-        # tells the operator what to re-run if even the retry lost).
         missing = getattr(exc, "filename", None) or str(exc)
         sys.stderr.write(
             f"devbench report: cannot read '{missing}' "
@@ -3101,40 +2867,18 @@ def generate_report(
         )
         sys.exit(1)
     except ValueError as exc:
-        # Issue #174: a malformed or non-canonical BACKLOG.md surfaces here
-        # as a parser-level exception. Fail fast with an actionable
-        # diagnostic naming the file + the parse failure so the operator
-        # can fix the index directly instead of seeing a raw stack trace.
         sys.stderr.write(
             f"devbench report: cannot parse '{BACKLOG_INDEX}': {exc}\n"
             "  Run `devbench validate-backlog` for a full list of issues with the index.\n"
         )
         sys.exit(1)
 
-    # AC-192-12 / AC-192-13: apply session filter first when provided, then scope.
-    # Session filter restricts to WUs claimed by the named session; without it,
-    # all sessions are aggregated (AC-192-13).
     units = _filter_units_by_session(units, session_name)
 
-    # Issue #190 (AC-190-10, AC-190-11): apply scope filter when provided.
     units = _filter_units_by_scope(units, scope_filter)
 
     backlog = _backlog_totals_from_units(units)
 
-    # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index
-    # against the orchestrator log + hook log + transcripts (each call
-    # is a mtime+size check + delta-only re-parse on append, full
-    # re-parse on rotation/truncation), then read aggregated views via
-    # indexed queries instead of full-file regex scans. The legacy
-    # text-parser path below is preserved as a fallback for callers
-    # that pass ``event_index=None`` to ``_compute_window_stats``
-    # directly (mostly the existing test suite, which tests the parser
-    # building blocks individually).
-    # Issue #168: route the orch-log refresh + queries through the
-    # workspace-aware variants so events from sharded shards (post
-    # Phase-3 migration) merge with the live flat log. When the
-    # workspace has no sharded layout, the workspace-aware path
-    # behaves identically to the legacy single-file path.
     event_index.refresh_orch_log_sources(WORKSPACE_ROOT, log_path)
     hook_log_path = _hook_log_path(log_path)
     event_index.refresh_hook_log(hook_log_path)
@@ -3148,18 +2892,8 @@ def generate_report(
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
-    # Precedence: report-specific (env DEVBENCH_REPORT_TIMEZONE > yaml
-    # report.display_timezone) > top-level (env DEVBENCH_DISPLAY_TIMEZONE >
-    # yaml display_timezone) > OS local. REPORT_DISPLAY_TIMEZONE already
-    # encodes the first pair; DISPLAY_TIMEZONE the second.
     display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
 
-    # Issue #164: compute the global recent-pace per-task cost ONCE (it's
-    # log-wide, not window-specific) and reuse across every window's
-    # ``_compute_window_stats`` call. This is what makes the
-    # "Estimated total cost at completion" number consistent across the
-    # All-time / Session / This-run columns -- one global rate produces
-    # one global completion cost regardless of window.
     recent_per_task_cost = _recent_per_task_cost(
         log_path,
         done_times,
@@ -3168,9 +2902,6 @@ def generate_report(
         event_index=event_index,
     )
 
-    # Compute lifetime (since-log-started) stats once. Used to enrich the top
-    # box with cost / token / cache-hit summary so the most relevant numbers
-    # are visible at a glance without scanning across the wider window-stats table.
     lifetime_stats: WindowStats | None = (
         _compute_window_stats(
             log_path,
@@ -3191,17 +2922,9 @@ def generate_report(
 
     lines: list[str] = [*banner_lines, ""]
 
-    # Spanning-row follow-up: thread the All-time cost (already paid in
-    # lifetime_stats above) as the additive base for every narrower
-    # window's est_total_cost. When lifetime_stats is None (no log
-    # started yet), fall through with None and the legacy per-window
-    # additive base applies -- there is nothing to collapse against.
     lifetime_total_cost = lifetime_stats.cost.total_cost if lifetime_stats is not None else None
 
     if since is not None:
-        # Single-window mode (legacy API for callers passing --since explicitly).
-        # Kept stacked -- the single window block stays beneath the Backlog state
-        # box the way older callers / tests expect it.
         backlog_state_block = _render_table("Backlog state", _backlog_state_rows(backlog))
         single_stats = _compute_window_stats(
             log_path,
@@ -3225,15 +2948,9 @@ def generate_report(
                 _stats_to_rows_single(single_stats, display_tz),
             )
         )
-        # Backward-compat label so callers grepping for "Tasks in this session" still find it.
         lines.append(f"\nTasks in this session: {single_stats.tasks_in_window}")
         summary_stats = single_stats
     else:
-        # Default: ONE unified grouped table with sections (BACKLOG STATE,
-        # THROUGHPUT, API USAGE, TOKENS, COST). The reader scans top-down;
-        # the Backlog state rows have only the All-time column populated
-        # (Session and This run cells render as blank); the windowed rows
-        # populate every column.
         windows: list[WindowSpec] = [
             WindowSpec(label="All-time", start=log_start_for_window, is_log_started=True),
         ]
@@ -3267,9 +2984,6 @@ def generate_report(
         column_labels = [_short_window_label(w.label, w.start, display_tz) for w in windows]
         n_cols = len(column_labels)
         value_columns = [_stats_to_value_list(s, display_tz) for s in all_window_stats]
-        # Transpose per-window stats into (metric, values) rows and group by
-        # section label. Spanning metrics (Recent pace / Est. time) still
-        # collapse into a single cell when every column agrees.
         windowed_rows: list[tuple[str, list[str] | str]] = [
             (metric, _merge_spanning_values(metric, [col[i] for col in value_columns]))
             for i, metric in enumerate(_METRIC_LABELS)
@@ -3292,18 +3006,6 @@ def generate_report(
             ("Cost", sections_by_label["Cost"]),
         ]
         lines.extend(_render_grouped_progress_table("Metric", column_labels, sections))
-        # Divergence warning: the BACKLOG STATE row "Tasks completed"
-        # counts ``Status: done`` rows in BACKLOG.md while the THROUGHPUT
-        # row "Tasks completed in window" counts ``Set <id> to 'done'``
-        # log lines parsed from ``log_path``. The two MUST agree for a
-        # healthy backlog. When backlog state shows completions but the
-        # All-time throughput window (which spans the entire log) shows
-        # zero, the operator is reading a different log than the one
-        # the orchestrator writes to -- typically because
-        # ``DEVBENCH_LOG_FILE`` was unset in the shell that ran
-        # ``devbench report`` and the default fell back to the devbench
-        # source-tree log. Surface the discrepancy as a one-line
-        # warning so the user does not silently misread the table.
         all_time_stats = all_window_stats[0]
         if backlog.tasks_done > 0 and all_time_stats.tasks_in_window == 0:
             lines.append("")
@@ -3311,20 +3013,9 @@ def generate_report(
                 f"WARNING: BACKLOG.md shows {backlog.tasks_done} done but log {log_path} shows 0 "
                 "-- check DEVBENCH_LOG_FILE points at the orchestrator's log."
             )
-        # Use the All-time stats for the trailing prose projection -- they're the
-        # most stable sample. Narrower windows can have zero completed tasks
-        # (e.g. just after a restart) which would project meaningless numbers.
         summary_stats = all_window_stats[0]
 
     if by_role:
-        # Issue #206: opt-in per-role token/cost breakdown.  The data path
-        # was landed in PR #202 (issue #123) via
-        # ``_parse_transcript_metrics_by_role``; this section wires it
-        # into the rendered output.  Pricing reuses the per-model
-        # dispatcher (issue #223) -- per-role tokens are priced against
-        # whatever model that role actually ran on, so a role that
-        # spans multiple models (executor on opus + sonnet) gets a
-        # correct blended cost.
         lines.extend(
             _render_by_role_panel(
                 log_path=log_path,
@@ -3335,21 +3026,10 @@ def generate_report(
     lines.append("")
     lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))
 
-    # AC-251-1: emit the no-actionable line when candidates are empty and not
-    # all done. This mirrors the verbatim format from cmd_status so both
-    # surfaces are always consistent. The line is appended in both the default
-    # and --once (since=<ts>) render paths.
     _no_act = _no_actionable_line(parser, units)
     lines.extend([_no_act] if _no_act is not None else [])
 
     if since is None:
-        # B9: per-unit listings at the very end so the user can act on each.
-        # Order surfaces the most operationally-actionable panels first
-        # (In Progress, then Blocked) and pushes long-tail / decision-only
-        # state (Proposed, Unmaterialised Proposals, Declined) to the edges.
-        # Declined renders LAST since it represents tasks already taken off
-        # the table -- useful as historical reference but not actionable.
-        # Each panel is omitted when its respective status has zero tasks.
         lines.extend(_proposed_listing(units))
         lines.extend(_unmaterialised_proposals_listing())
         lines.extend(_in_progress_listing(units, log_path))

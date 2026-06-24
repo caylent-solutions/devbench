@@ -14,15 +14,10 @@ from devbench import config
 from devbench.config import ALLOWED_REPOS, validate_repo
 from devbench.config_loader import RepoConfig, RuntimeConfig
 
-# ---------------------------------------------------------------------------
-# Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
-# so that test data is not embedded as inline deployment-configuration literals.
-# The fixture defines repos under "caylent-solutions"; these constants mirror that.
-# ---------------------------------------------------------------------------
 _FIXTURE_ORG = "caylent-solutions"
 _ALLOWED_REPO_IN_FIXTURE = f"{_FIXTURE_ORG}/git-repo"
-_UNKNOWN_REPO = "test-sentinel-org/unknown-repo"  # deliberately absent from fixture
-_WRONG_ORG_REPO = "wrong-org/git-repo"  # org not matching _FIXTURE_ORG
+_UNKNOWN_REPO = "test-sentinel-org/unknown-repo"
+_WRONG_ORG_REPO = "wrong-org/git-repo"
 
 
 @pytest.mark.unit
@@ -48,13 +43,11 @@ class TestAllowedRepos:
 
     def test_judge_allowed_repos_env_var_has_no_effect(self) -> None:
         """DEVBENCH_ALLOWED_REPOS env var is ignored -- repos come from YAML only."""
-        # Capture the baseline ALLOWED_REPOS before patching.
         baseline = frozenset(config.ALLOWED_REPOS)
         assert len(baseline) > 0, "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
 
         with patch.dict(os.environ, {"DEVBENCH_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
-            # The env var must not alter ALLOWED_REPOS -- it must remain the same as baseline.
             assert baseline == config.ALLOWED_REPOS, (
                 f"ALLOWED_REPOS changed after setting DEVBENCH_ALLOWED_REPOS -- "
                 f"it must only come from YAML. Before: {baseline}, After: {config.ALLOWED_REPOS}"
@@ -102,7 +95,6 @@ class TestResolveRepo:
 
     def test_resolves_short_name_to_full_name(self) -> None:
         """Lines 77-79: resolves a short repo name to its fully-qualified form."""
-        # The fixture has "caylent-solutions/git-repo", so "git-repo" should resolve
         result = config.resolve_repo("git-repo")
         assert result == _ALLOWED_REPO_IN_FIXTURE
 
@@ -260,7 +252,6 @@ class TestResolveMergeStrategy:
         return RuntimeConfig(repos={"org/repo": repo}, merge_strategy=top)
 
     def test_env_override_wins_over_yaml(self) -> None:
-        # env set -> returns the (validated, import-time) MERGE_STRATEGY regardless of YAML.
         with (
             patch.object(config, "_read_env", return_value="merge"),
             patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.MERGE),
@@ -381,8 +372,6 @@ class TestResolveHelpers:
             result = config._resolve_float("TEST_FLOAT_ABSENT", None, 3.0)
         assert result == 3.0
 
-    # ---- _resolve_str -----------------------------------------------------
-
     def test_resolve_str_env_var_wins(self) -> None:
         with patch.dict(os.environ, {"TEST_STR_X": "from-env"}, clear=False):
             assert config._resolve_str("TEST_STR_X", "yaml", "default") == "from-env"
@@ -397,8 +386,6 @@ class TestResolveHelpers:
         with patch.dict(os.environ, env_copy, clear=True):
             assert config._resolve_str("TEST_STR_X", None, "default-val") == "default-val"
 
-    # ---- _resolve_optional_str -------------------------------------------
-
     def test_resolve_optional_str_env_var_wins(self) -> None:
         with patch.dict(os.environ, {"TEST_OPT": "envv"}, clear=False):
             assert config._resolve_optional_str("TEST_OPT", "yaml") == "envv"
@@ -412,8 +399,6 @@ class TestResolveHelpers:
         env_copy = {k: v for k, v in os.environ.items() if k != "TEST_OPT"}
         with patch.dict(os.environ, env_copy, clear=True):
             assert config._resolve_optional_str("TEST_OPT", None) is None
-
-    # ---- _resolve_bool ----------------------------------------------------
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -443,8 +428,6 @@ class TestResolveHelpers:
         env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_X"}
         with patch.dict(os.environ, env_copy, clear=True):
             assert config._resolve_bool("TEST_BOOL_X", True, False) is True
-
-    # ---- _resolve_str_tuple ----------------------------------------------
 
     def test_resolve_str_tuple_env_overrides_default(self) -> None:
         with patch.dict(os.environ, {"TEST_TUPLE": "a, b ,c"}, clear=False):
@@ -483,12 +466,8 @@ class TestRequireEnv:
                 config._require_env("REQ_TEST_VAR", "set-it-properly")
         assert excinfo.value.code == 2
         captured = capsys.readouterr()
-        # Actionable message on stderr; stdout stays empty so log scrapers
-        # don't false-positive on a missing-env-var line.
         assert captured.out == ""
         assert "REQ_TEST_VAR environment variable is not set. set-it-properly" in captured.err
-        # The "devbench:" prefix marks the line as coming from devbench's
-        # fail-fast layer, not from an unrelated upstream component.
         assert captured.err.startswith("devbench: ")
 
     def test_exits_when_env_var_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -506,13 +485,10 @@ class TestAgentModelEnvOverrideTypeError:
     """
 
     def test_typeerror_for_non_string_agent_model_value(self) -> None:
-        # Build a namespace that mirrors every (var, attr_path) entry in
-        # _AGENT_MODEL_ENV_VARS.  Every leaf is None except the one we are
-        # exercising, which is a non-string sentinel.
         from types import SimpleNamespace
 
         review_team = SimpleNamespace(
-            code_reviewer=12345,  # the non-string we want the loop to trip on
+            code_reviewer=12345,
             test_reviewer=None,
             doc_reviewer=None,
             changes_manifest=None,
@@ -611,7 +587,6 @@ class TestMaxRetriesYamlFirst:
         env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_MAX_RETRIES"}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
-            # Value should come from YAML or default -- it should be an int > 0
             assert isinstance(config.MAX_RETRY_ATTEMPTS, int)
             assert config.MAX_RETRY_ATTEMPTS > 0
         importlib.reload(config)
@@ -659,7 +634,6 @@ class TestAgentModelEnvOverrides:
         """Empty string env var must not override (treated as unset)."""
         with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": ""}, clear=False):
             importlib.reload(config)
-            # Fixture has no agents block, so executor stays None.
             assert config.AGENT_MODELS.executor is None
         importlib.reload(config)
 
@@ -719,7 +693,6 @@ class TestNotificationsSlackEnvOverride:
                 "https://hooks.slack.com/services/TEST/HOOK/URL"
             )
         importlib.reload(config)
-        # The pre-test value is restored after reload-without-env.
         assert config.RUNTIME_CONFIG.notifications.slack.webhook_url == original
 
 
@@ -853,11 +826,6 @@ class TestAutoResolveMaxAttemptsConfig:
         assert result == 7
 
 
-# ---------------------------------------------------------------------------
-# Skills workflow config resolution -- E12-F1-S1-T1
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestSkillsUseWorkflowConfig:
     """E12-F1-S1-T1: SKILLS_USE_WORKFLOW resolved via _resolve_bool with env precedence."""
@@ -950,11 +918,6 @@ class TestSkillsAdversarialReviewThresholdConfig:
         assert result == DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD
 
 
-# ---------------------------------------------------------------------------
-# E14-F2-S1-T1: Configurable stop-class to mention-level mapping
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestOrchestratorStopMentionMapConfig:
     """ORCHESTRATOR_STOP_MENTION_MAP resolved via env vars, unset-safe with a noise-reducing default."""
@@ -1007,7 +970,6 @@ class TestOrchestratorStopMentionMapConfig:
                 {notifications.STOP_CLASS_COMPLETION: notifications.MENTION_LEVEL_HERE}
             )
         assert m[notifications.STOP_CLASS_COMPLETION] == notifications.MENTION_LEVEL_HERE
-        # Other classes still default.
         assert m[notifications.STOP_CLASS_DRAIN] == notifications.MENTION_LEVEL_NONE
 
     def test_env_wins_over_yaml(self) -> None:
@@ -1064,7 +1026,6 @@ class TestOptionalJudgeAndDoneGateEnvOverrides:
         with patch.dict(os.environ, {self._IAC_ENV: "true"}, clear=False):
             importlib.reload(config)
             assert config.OPTIONAL_JUDGES["iac_review"] is True
-            # The done-gate reads RUNTIME_CONFIG directly; the override must land there.
             assert config.RUNTIME_CONFIG.optional_judges["iac_review"] is True
         importlib.reload(config)
 

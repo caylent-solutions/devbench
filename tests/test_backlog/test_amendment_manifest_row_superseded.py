@@ -37,15 +37,9 @@ from devbench.backlog.amendment import (
 from devbench.backlog.manifest import parse_manifest
 from devbench.config_loader import AmendmentConfig
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 TASK_ID = "EX-F1-S1-T1"
 DONE_ID = "EX-F1-S1-T0"
-# The stale row: a file the DONE sibling renamed away. Absent on disk.
 STALE_ROW = "terragrunt/terragrunt.hcl"
-# The surviving row: still present on disk.
 SURVIVING_ROW = "terragrunt/root.hcl"
 
 WORK_UNIT_TEMPLATE = """\
@@ -128,7 +122,6 @@ Landed work that renamed terragrunt/terragrunt.hcl to terragrunt/root.hcl.
 - [ ] All AC checked
 """
 
-# An optional second in-queue (NOT done) sibling, for the "cited unit not done" test.
 NOT_DONE_INDEX = BACKLOG_INDEX_TEMPLATE.replace(
     "| EX-F1-S1-T0 | Done Sibling | Task | done |",
     "| EX-F1-S1-T0 | Done Sibling | Task | in-queue |",
@@ -148,7 +141,6 @@ def workspace(tmp_path: Path) -> Path:
     backlog_dir.mkdir()
     (backlog_dir / f"{TASK_ID}.md").write_text(WORK_UNIT_TEMPLATE.format(task_id=TASK_ID))
     (backlog_dir / f"{DONE_ID}.md").write_text(DONE_UNIT)
-    # Target repo working tree: SURVIVING_ROW present, STALE_ROW absent.
     repo = tmp_path / "repo"
     (repo / "terragrunt").mkdir(parents=True)
     (repo / SURVIVING_ROW).write_text("// root.hcl\n", encoding="utf-8")
@@ -201,11 +193,6 @@ def _apply(workspace: Path, staged: frozenset[str] | None = frozenset()) -> None
     )
 
 
-# ---------------------------------------------------------------------------
-# Dataclass + serialisation
-# ---------------------------------------------------------------------------
-
-
 class TestManifestRowSupersededParsing:
     def test_reason_constant_registered(self) -> None:
         assert REASON_MANIFEST_ROW_SUPERSEDED == "manifest_row_superseded"
@@ -237,7 +224,6 @@ class TestManifestRowSupersededParsing:
             ManifestRowSupersededClaim(**kwargs)
 
     def test_empty_cited_units_rejected(self) -> None:
-        # A superseded claim must cite at least one DONE unit explaining the absence.
         with pytest.raises(ValueError):
             ManifestRowSupersededClaim(row_path=STALE_ROW, cited_done_units=[], evidence="e")
 
@@ -246,11 +232,6 @@ class TestManifestRowSupersededParsing:
         data["manifest_row_superseded_claims"] = {"row_path": "x"}
         with pytest.raises(ValueError):
             AmendmentRequest.from_dict(data)
-
-
-# ---------------------------------------------------------------------------
-# Layer-1 pre-filter gating
-# ---------------------------------------------------------------------------
 
 
 class TestPreFilterGating:
@@ -287,7 +268,6 @@ class TestCheckCitedUnitsDone:
     """Direct coverage of the shared cited-units guard's error branches."""
 
     def test_empty_cited_is_noop(self, tmp_path: Path) -> None:
-        # No citations -> no index read, returns cleanly.
         _check_cited_units_done(set(), tmp_path / "MISSING.md", context="x")
 
     def test_missing_index_raises(self, tmp_path: Path) -> None:
@@ -299,18 +279,10 @@ class TestCheckCitedUnitsDone:
             _check_cited_units_done({"E9-F9-S9-T9"}, workspace / "BACKLOG.md", context="Manifest-row-superseded claim")
 
 
-# ---------------------------------------------------------------------------
-# apply_amendment: deterministic guards + removal
-# ---------------------------------------------------------------------------
-
-
 class TestApplyManifestRowSupersededDirect:
     """Direct coverage of ``_apply_manifest_row_superseded`` error branches."""
 
     def test_malformed_manifest_raises(self, workspace: Path) -> None:
-        # All deterministic guards pass (row absent on disk, cited unit done, not
-        # staged), but the content has no parseable Changes Manifest -> remove_rows
-        # raises ManifestParseError, surfaced as AmendmentError.
         req = _request()
         content_without_manifest = "# EX-F1-S1-T1\n\n## Description\n\nno manifest here\n"
         with pytest.raises(AmendmentError, match="manifest_row_superseded"):
@@ -330,17 +302,14 @@ class TestApplyManifestRowSuperseded:
         _apply(workspace)
         rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
         assert [r.file for r in rows] == [SURVIVING_ROW]
-        # Audit trail names the removed row.
         updated = wu_file.read_text(encoding="utf-8")
         assert MANIFEST_ROW_REMOVED_ACTION in updated
         assert STALE_ROW in updated
-        # Request consumed on success.
         assert not request_path(workspace, TASK_ID).exists()
 
     def test_rejected_when_file_still_exists(self, workspace: Path) -> None:
         wu_file = workspace / "backlog" / f"{TASK_ID}.md"
         before = wu_file.read_text(encoding="utf-8")
-        # The surviving-row file IS present -> claiming it is superseded must fail.
         write_request(workspace, _request(claims=[_claim(row_path=SURVIVING_ROW)]))
         with pytest.raises(AmendmentError, match="still exists"):
             _apply(workspace)
@@ -378,8 +347,6 @@ class TestApplyManifestRowSuperseded:
         assert wu_file.read_text(encoding="utf-8") == before
 
     def test_post_check_rollback_on_integrity_violation(self, workspace: Path) -> None:
-        # AC-3: Layer-3 post-check failure rolls the work-unit file back. Damage
-        # the backlog index so validate-backlog fails after the (valid) removal.
         wu_file = workspace / "backlog" / f"{TASK_ID}.md"
         before = wu_file.read_text(encoding="utf-8")
         write_request(workspace, _request())
@@ -391,15 +358,12 @@ class TestApplyManifestRowSuperseded:
         backlog_md.write_text(damaged, encoding="utf-8")
         with pytest.raises(AmendmentError, match="Post-check"):
             _apply(workspace)
-        # Rolled back to the pre-amendment content.
         assert wu_file.read_text(encoding="utf-8") == before
 
     def test_row_not_in_manifest_raises(self, workspace: Path) -> None:
-        # A claimed row that is absent on disk AND not in the manifest at all:
-        # remove_rows raises ManifestRowNotFoundError, surfaced as AmendmentError.
         wu_file = workspace / "backlog" / f"{TASK_ID}.md"
         before = wu_file.read_text(encoding="utf-8")
-        ghost = "terragrunt/ghost.hcl"  # absent on disk, absent from the manifest
+        ghost = "terragrunt/ghost.hcl"
         write_request(workspace, _request(claims=[_claim(row_path=ghost)]))
         with pytest.raises(AmendmentError, match=r"ghost\.hcl"):
             _apply(workspace)
@@ -418,11 +382,6 @@ class TestApplyManifestRowSuperseded:
             )
 
 
-# ---------------------------------------------------------------------------
-# CLI dispatch: cmd_apply_amendment resolves repo context for this reason only
-# ---------------------------------------------------------------------------
-
-
 class TestCmdApplyAmendmentManifestRowSuperseded:
     """``cmd_apply_amendment`` threads repo context for manifest_row_superseded."""
 
@@ -432,8 +391,6 @@ class TestCmdApplyAmendmentManifestRowSuperseded:
         write_request(workspace, _request())
         repo = _repo_path(workspace)
 
-        # Resolve repo context to the fake repo; report an empty staged set so
-        # the staged-diff guard passes.
         monkeypatch.setattr(cli, "WORKSPACE_ROOT", workspace)
         monkeypatch.setattr(cli, "BACKLOG_INDEX", workspace / "BACKLOG.md")
         monkeypatch.setattr(cli, "_resolve_amendment_repo_context", lambda _uid: (repo, frozenset()))
@@ -457,7 +414,6 @@ class TestCmdApplyAmendmentManifestRowSuperseded:
     ) -> None:
         from devbench import cli
 
-        # A tdd request: no repo context needed.
         (tmp_path / "BACKLOG.md").write_text(BACKLOG_INDEX_TEMPLATE)
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()
@@ -504,8 +460,6 @@ class TestCmdApplyAmendmentManifestRowSuperseded:
         def _raise(_repo: Path) -> list[str]:
             raise RuntimeError("not a git repo")
 
-        # ``list_staged_files`` is imported inside the function from the manifest
-        # module; patch it there so the RuntimeError branch is deterministic.
         monkeypatch.setattr(manifest_mod, "list_staged_files", _raise)
         resolved_repo, staged = cli._resolve_amendment_repo_context(TASK_ID)
         assert resolved_repo == repo

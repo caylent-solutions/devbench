@@ -30,18 +30,7 @@ from typing import Any
 
 from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME, SESSION_SESSIONS_BASE_DIR
 
-# ---------------------------------------------------------------------------
-# Module-level constant
-# ---------------------------------------------------------------------------
-
-#: Relative path (from workspace root) of the drain signal file.
-#: Spec section 4.3.1.
 DRAIN_SIGNAL_NAME: str = ".devbench/drain.signal"
-
-
-# ---------------------------------------------------------------------------
-# DrainState dataclass
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -105,7 +94,6 @@ class DrainState:
         except ValueError:
             raise ValueError(f"requested_at '{raw_at}' is not a valid ISO 8601 datetime") from None
 
-        # Ensure the datetime is timezone-aware and normalised to UTC.
         requested_at = requested_at.replace(tzinfo=UTC) if requested_at.tzinfo is None else requested_at.astimezone(UTC)
 
         return cls(
@@ -113,11 +101,6 @@ class DrainState:
             requested_by=data["requested_by"],
             reason=data.get("reason", ""),
         )
-
-
-# ---------------------------------------------------------------------------
-# Public path resolver
-# ---------------------------------------------------------------------------
 
 
 def resolve_drain_signal_path(workspace: Path) -> Path:
@@ -142,11 +125,6 @@ def resolve_drain_signal_path(workspace: Path) -> Path:
     if not session_name:
         return workspace / DRAIN_SIGNAL_NAME
     return workspace / SESSION_SESSIONS_BASE_DIR / session_name / SESSION_DRAIN_SIGNAL_FILENAME
-
-
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
 
 
 def _signal_path(workspace: Path) -> Path:
@@ -216,11 +194,6 @@ def _parse_drain_signal(signal: Path) -> DrainState:
 def _current_user() -> str:
     """Return the current OS user name, or ``"unknown"`` when undetectable."""
     return os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def request_drain(workspace: Path, *, reason: str = "") -> Path:
@@ -356,9 +329,6 @@ def consume_drain(workspace: Path) -> DrainState | None:
     for signal in _both_signal_paths(workspace):
         if signal.exists():
             state = _parse_drain_signal(signal)
-            # If the file vanishes between read and unlink (concurrent cancel
-            # or second consumer), the drain was still observed; suppress the
-            # missing-file error.
             with contextlib.suppress(FileNotFoundError):
                 signal.unlink()
             return state

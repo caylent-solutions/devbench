@@ -33,7 +33,6 @@ def fake_runner():
 
     def runner(cmd, *, cwd=None, check=True):
         calls.append(list(cmd))
-        # Emulate `screen -ls` for cmd_list / cmd_attach / cmd_stop.
         if cmd[:2] == ["screen", "-ls"]:
             return _Result(stdout="\tdevbench-1\t(Detached)\n\tdevbench-3\t(Detached)\n")
         return _Result()
@@ -94,10 +93,8 @@ class TestCmdStart:
             2, repo_url="git@x:repo.git", branch="main", mode="orchestrate", home=fake_home, runner=runner
         )
         assert rc == 0
-        # Should fetch + checkout + pull, not clone.
         assert not any(c[0:2] == ["git", "clone"] for c in calls)
         assert any("fetch" in c for c in calls if c[0] == "git")
-        # orchestrate mode should set the screen command appropriately.
         screen_cmd = next(c for c in calls if c[0] == "screen")
         assert any("uv run devbench start" in part for part in screen_cmd)
 

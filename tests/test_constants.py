@@ -173,7 +173,6 @@ class TestStatusSummaryTableHeader:
         assert len(lines) == 2
         assert lines[0].startswith("|")
         assert lines[1].startswith("|")
-        # Separator row contains only dashes and pipes
         assert all(c in "-| " for c in lines[1])
 
     def test_status_summary_table_header_draft_column_position(self) -> None:
@@ -524,7 +523,7 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
 
 
 class TestDefaultModelRatesOpus48:
-    """AC-254-2: DEFAULT_MODEL_RATES contains claude-opus-4-8 entry and mirror comment is updated."""
+    """AC-254-2: DEFAULT_MODEL_RATES contains the claude-opus-4-8 entry."""
 
     @pytest.mark.unit
     def test_opus_48_in_default_model_rates(self) -> None:
@@ -539,21 +538,6 @@ class TestDefaultModelRatesOpus48:
         )
 
     @pytest.mark.unit
-    def test_mirror_comment_reads_opus_48(self) -> None:
-        """The fallback mirror comment in constants.py reads 'mirrors Opus 4.8 list'."""
-        import inspect
-
-        import devbench.constants as _c
-
-        source = inspect.getsource(_c)
-        assert "mirrors Opus 4.8 list" in source, (
-            "The fallback comment must read 'mirrors Opus 4.8 list' after the update (AC-254-2)"
-        )
-        assert "mirrors Opus 4.7 list" not in source, (
-            "The stale 'mirrors Opus 4.7 list' comment must be replaced with 'mirrors Opus 4.8 list'"
-        )
-
-    @pytest.mark.unit
     def test_existing_opus_entries_retained(self) -> None:
         """AC-254a-1: 4.7/4.6/4.5 rate entries are retained unchanged."""
         from devbench.constants import DEFAULT_MODEL_RATES, ModelRates
@@ -564,13 +548,13 @@ class TestDefaultModelRatesOpus48:
 
     @pytest.mark.unit
     def test_issue_223_clause_preserved(self) -> None:
-        """AC-254a-1: The #223 clause is preserved verbatim in the fallback comment."""
+        """AC-254a-1: the #223 issue reference stays documented in the constants module."""
         import inspect
 
         import devbench.constants as _c
 
         source = inspect.getsource(_c)
-        assert "#223" in source, "The #223 clause must be preserved in the fallback comment (AC-254a-1)"
+        assert "#223" in source, "The #223 issue reference must remain documented in constants.py (AC-254a-1)"
 
 
 class TestSkillIterateUntilPerfectConstants:
@@ -856,11 +840,6 @@ class TestAutoResolveConstants:
         )
 
 
-# ---------------------------------------------------------------------------
-# Skills workflow constants -- E12-F1-S1-T1
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestSkillsWorkflowConstants:
     """E12-F1-S1-T1: env var names and unset-safe defaults for Workflow fan-out."""
@@ -904,17 +883,10 @@ class TestSkillsWorkflowConstants:
         assert DEFAULT_SKILLS_ADVERSARIAL_REVIEW_THRESHOLD >= 1
 
 
-# ---------------------------------------------------------------------------
-# CANONICAL_VERDICT_RE constant -- E8-F2-S1-T2
-# ---------------------------------------------------------------------------
-
-# Timestamp used in all regex fixture lines (matches the canonical format).
 _CVR_TS = "2026-06-07 17:43 UTC"
 
-# The five required judge names mirror ALL_REQUIRED_JUDGE_NAMES values.
 _CVR_JUDGES = ["code_review", "test_review", "doc_review", "changes_manifest", "security_review"]
 
-# Verdict action tokens to test positive matches.
 _CVR_ACTIONS = ["REVIEW_PASS", "REVIEW_FAIL", "REVIEW_REJECTED"]
 
 
@@ -932,10 +904,6 @@ class TestCanonicalVerdictRe:
     AC-CVR-3: negative-matches agent lines, orchestrator lines, mid-line occurrences,
                and lines missing the timestamp bracket.
     """
-
-    # ------------------------------------------------------------------
-    # AC-CVR-1: exported type check
-    # ------------------------------------------------------------------
 
     def test_canonical_verdict_re_is_importable(self) -> None:
         """CANONICAL_VERDICT_RE is importable from devbench.constants without error."""
@@ -959,13 +927,8 @@ class TestCanonicalVerdictRe:
         """CANONICAL_VERDICT_RE is a Pattern[str], not Pattern[bytes] (AC-CVR-1)."""
         from devbench.constants import CANONICAL_VERDICT_RE
 
-        # A compiled str-pattern has no bytes flag; matching a str succeeds.
         m = CANONICAL_VERDICT_RE.match(_cvr_line("code_review", "REVIEW_PASS"))
         assert m is not None, "CANONICAL_VERDICT_RE must be a str pattern (AC-CVR-1)"
-
-    # ------------------------------------------------------------------
-    # AC-CVR-2: positive matches -- all five judges x three verdict tokens
-    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize("judge", _CVR_JUDGES)
     @pytest.mark.parametrize("action", _CVR_ACTIONS)
@@ -1003,10 +966,6 @@ class TestCanonicalVerdictRe:
         assert m.group("action") == action, (
             f"Expected 'action' group to equal {action!r}; got {m.group('action')!r} (AC-CVR-2)"
         )
-
-    # ------------------------------------------------------------------
-    # AC-CVR-3: negative matches
-    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
         ("label", "non_matching_line"),

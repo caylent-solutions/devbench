@@ -16,10 +16,6 @@ import pytest
 import devbench.config_loader as _config_loader_mod
 from devbench.config_loader import QuotaHandlingConfig, load_runtime_config
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _write_minimal_config(path: Path, extra: str = "") -> None:
     """Write a minimal valid devbench.yaml to *path*."""
@@ -27,11 +23,6 @@ def _write_minimal_config(path: Path, extra: str = "") -> None:
     if extra:
         content += extra
     path.write_text(content, encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# QuotaHandlingConfig dataclass defaults
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -74,11 +65,6 @@ class TestQuotaHandlingConfigDefaults:
     def test_log_structured_events_default(self) -> None:
         cfg = QuotaHandlingConfig()
         assert cfg.log_structured_events is True
-
-
-# ---------------------------------------------------------------------------
-# AC-236-3: config loading via load_runtime_config
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -148,11 +134,6 @@ class TestQuotaHandlingConfigLoading:
         assert qh.log_structured_events is False
 
 
-# ---------------------------------------------------------------------------
-# Enum fail-fast validation
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestQuotaHandlingEnumValidation:
     """Parser-level enum fail-fast for quota_handling fields (Appendix A QW-6)."""
@@ -177,11 +158,6 @@ class TestQuotaHandlingEnumValidation:
             load_runtime_config(cfg_path, os.environ)
 
 
-# ---------------------------------------------------------------------------
-# Range fail-fast validation
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestQuotaHandlingRangeValidation:
     """Parser-level range fail-fast for quota_handling fields (Appendix A QW-6)."""
@@ -204,15 +180,6 @@ class TestQuotaHandlingRangeValidation:
 
         with pytest.raises((ValueError, Exception), match=match):
             load_runtime_config(cfg_path, os.environ)
-
-
-# ---------------------------------------------------------------------------
-# Direct tests for _parse_quota_handling_config (defense-in-depth coverage)
-# ---------------------------------------------------------------------------
-# The JSON schema catches invalid values before load_runtime_config reaches
-# _parse_quota_handling_config, so these tests call the private function
-# directly to cover its Python-level fail-fast branches (AC-FINAL-014).
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

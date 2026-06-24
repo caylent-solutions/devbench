@@ -127,15 +127,10 @@ class TestCompositeBlockedRender:
 
         unit = _mk_unit("E0-F1-S1-T3", "Pure degradation", WorkUnitStatus.BLOCKED)
 
-        # Both classifiers return the same result -- no structural divergence.
-        # The excluding classifier returns OPERATOR_ACTION_REQUIRED (the structural
-        # fallback bucket when no structural blocker exists), indicating no marker or
-        # dep blocker beyond the degradation itself.
         def fake_classify(backlog_root, backlog_index, task_id, **kwargs):
             return BlockedTaskState.RUNTIME_DEGRADATION
 
         def fake_classify_excluding_degradation_operator(backlog_root, backlog_index, task_id, **kwargs):
-            # Returns OPERATOR_ACTION_REQUIRED meaning no distinct structural blocker.
             return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
         monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
@@ -146,9 +141,7 @@ class TestCompositeBlockedRender:
 
         lines = report_mod._blocked_listing([unit])
 
-        # The task should still appear in the runtime-degradation panel.
         assert any("E0-F1-S1-T3" in line for line in lines), f"Task row absent: {lines}"
-        # The composite pattern must NOT appear for a pure-degradation task.
         assert not any("RUNTIME_DEGRADATION + structural blocker" in line for line in lines), (
             f"Unexpected composite line in pure-degradation output: {lines}"
         )

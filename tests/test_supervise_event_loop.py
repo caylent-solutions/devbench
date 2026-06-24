@@ -165,8 +165,8 @@ class TestEventLoopCleanExit:
     def test_all_done_clean_exit_zero(self) -> None:
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="esc to interrupt"),  # working activity
-                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # terminal clean
+                _ScriptStep(emit="esc to interrupt"),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )
         result = run_supervise_event_loop(
@@ -210,12 +210,10 @@ class TestEventLoopQuotaWaitThenResume:
     """A quota prompt -> quota-waiting -> resume (NOT a non-zero exit) (AC-9/AC-15 shape)."""
 
     def test_quota_prompt_waits_then_resumes_then_clean(self) -> None:
-        # The child emits a quota-limit line, then (after the resume) becomes ready
-        # again and finishes clean. The loop must NOT exit non-zero on the quota.
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="You've hit your limit; resets 8:00am (UTC)"),  # quota
-                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # post-resume clean
+                _ScriptStep(emit="You've hit your limit; resets 8:00am (UTC)"),
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )
         waiter = _StubQuotaWaiter(recovered=True)
@@ -227,7 +225,6 @@ class TestEventLoopQuotaWaitThenResume:
             log_poll=lambda: None,
             relaunch=lambda **k: relaunches.append(k),
         )
-        # Quota was handled (waiter consulted) and the run still ended cleanly 0.
         assert waiter.calls == 1
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
@@ -260,7 +257,7 @@ class TestEventLoopRestartSignal:
         child = FakePexpectChild(
             [
                 _ScriptStep(emit=restart_line, eof=True, exitstatus=42),
-                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # after relaunch
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )
         relaunches: list = []
@@ -276,8 +273,6 @@ class TestEventLoopRestartSignal:
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_restart_cap_exhausted_faults(self) -> None:
-        # Every relaunch immediately re-signals exit-42; bounded by max_attempts=2
-        # the loop faults with restart-cap-exhausted rather than looping forever.
         steps = [_ScriptStep(emit="[ORCHESTRATOR_AUTO_RESTART] tasks=1", eof=True, exitstatus=42) for _ in range(5)]
         child = FakePexpectChild(steps)
         cfg = SuperviseConfig()
@@ -297,7 +292,6 @@ class TestEventLoopRestartSignal:
         assert result.exit_code != 0
         assert result.final_state == SUPERVISE_STATE_FAULTED
         assert result.exit_reason == "restart-cap-exhausted"
-        # Exactly max_attempts relaunches were attempted before giving up.
         assert len(relaunches) == 2
 
 
@@ -308,8 +302,6 @@ class TestEventLoopLogTailDetection:
     def test_clean_via_log_tail(self) -> None:
         from devbench.supervise import LogTailHit, LogTailKind
 
-        # The PTY shows only working activity then EOF with status 0; the clean
-        # signal arrives via the orchestrator log-tail.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="esc to interrupt"),
@@ -330,8 +322,6 @@ class TestEventLoopLogTailDetection:
     def test_fault_via_log_tail(self) -> None:
         from devbench.supervise import LogTailHit, LogTailKind
 
-        # A FAULT log marker terminates the loop with a classified non-zero exit
-        # even though the PTY only shows working activity.
         child = FakePexpectChild([_ScriptStep(emit="esc to interrupt")])
         hits = iter([LogTailHit(kind=LogTailKind.FAULT, line="[ORCHESTRATOR_STOP_REASON] reason=premature-turn-end")])
         result = run_supervise_event_loop(
@@ -348,8 +338,6 @@ class TestEventLoopLogTailDetection:
     def test_advisory_log_hit_falls_through_to_pty(self) -> None:
         from devbench.supervise import LogTailHit, LogTailKind
 
-        # A QUOTA/RESTART log marker is advisory: the loop falls through to the
-        # PTY (authoritative), which here finishes clean.
         child = FakePexpectChild([_ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0)])
         hits = iter([LogTailHit(kind=LogTailKind.RESTART, line="[ORCHESTRATOR_AUTO_RESTART] tasks=1")])
         result = run_supervise_event_loop(
@@ -368,7 +356,6 @@ class TestEventLoopMidSessionFaultAndTimeout:
     """Mid-session fault PTY markers and a prompt timeout both fault (Section 4.6)."""
 
     def test_circuit_breaker_pty_marker_faults(self) -> None:
-        # A circuit-breaker line on the PTY (no EOF) faults immediately.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="[CIRCUIT_BREAKER] cascade depth exceeded"),
@@ -386,14 +373,10 @@ class TestEventLoopMidSessionFaultAndTimeout:
         assert result.exit_reason == "circuit-breaker"
 
     def test_terminal_marker_in_pty_text_before_eof(self) -> None:
-        # The child prints "ALL_DONE" as on-screen text (no EOF yet) -- the loop
-        # records it as working activity and keeps reading until the real EOF, so
-        # the clean classification comes from the child's exit-0 (defense: a text
-        # match alone is not a terminal). Exercises the ALL_DONE text branch.
         child = FakePexpectChild(
             [
-                _ScriptStep(emit="ALL_DONE printed mid-stream"),  # text, not EOF
-                _ScriptStep(emit="", eof=True, exitstatus=0),  # real terminal
+                _ScriptStep(emit="ALL_DONE printed mid-stream"),
+                _ScriptStep(emit="", eof=True, exitstatus=0),
             ]
         )
         result = run_supervise_event_loop(
@@ -407,7 +390,6 @@ class TestEventLoopMidSessionFaultAndTimeout:
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_no_actionable_text_in_pty_before_eof(self) -> None:
-        # Same as above for the NO_ACTIONABLE text branch.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="NO_ACTIONABLE in scope right now"),
@@ -425,7 +407,6 @@ class TestEventLoopMidSessionFaultAndTimeout:
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_prompt_timeout_faults(self) -> None:
-        # No scripted steps: the first read_chunk TIMEOUTs -> prompt-timeout fault.
         child = FakePexpectChild([])
         result = run_supervise_event_loop(
             driver=_driver(child),
@@ -439,13 +420,10 @@ class TestEventLoopMidSessionFaultAndTimeout:
         assert result.exit_reason == "prompt-timeout-idle"
 
     def test_quota_wait_keeps_waiting_then_resumes_then_clean(self) -> None:
-        # The waiter returns WAIT first (window not refreshed), then RESUME on the
-        # re-wait. The supervisor stays in quota-waiting across the WAIT (NEVER an
-        # exit), then resumes -> relaunch -> the post-resume PTY is a clean terminal.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="You've hit your limit; resets 8:00am (UTC)"),
-                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),  # after resume relaunch
+                _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0),
             ]
         )
         waiter = _StubQuotaWaiter(decisions=[QuotaDecision.WAIT, QuotaDecision.RESUME])
@@ -457,7 +435,6 @@ class TestEventLoopMidSessionFaultAndTimeout:
             log_poll=lambda: None,
             relaunch=lambda **k: relaunches.append(k),
         )
-        # The wait was re-delegated once (WAIT) before recovering (RESUME).
         assert waiter.calls == 2
         assert len(relaunches) == 1
         assert result.exit_code == 0
@@ -469,18 +446,8 @@ class TestEventLoopGracefulStop:
     """An operator ``stop.request`` drives running -> draining -> stopped (Section 4.2)."""
 
     def test_stop_request_drains_inflight_then_stops_exit_zero(self) -> None:
-        # The stop_poll fires True on the first iteration: the loop enters
-        # ``draining``, lets the in-flight turn finish (sends /exit), reads to the
-        # child EOF, and reaches ``stopped`` (operator-initiated -> exit 0). The
-        # /exit (drain_now) literal must have been injected into the child.
         child = FakePexpectChild(
             [
-                # /exit is a SLASH command: it is typed (no newline), the menu
-                # render settles, then a single Enter (\r) submits it. Gate the
-                # post-submit output on that \r so wait_until_quiescent's
-                # expect([r".+"]) settles (sees no available step -> TIMEOUT)
-                # BEFORE the Enter, and the in-flight wind-down + clean EOF only
-                # become visible after submission.
                 _ScriptStep(emit="wrapping up current work unit", on_send=r"\r"),
                 _ScriptStep(emit="", eof=True, exitstatus=0, on_send=r"\r"),
             ]
@@ -502,12 +469,9 @@ class TestEventLoopGracefulStop:
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_STOPPED
         assert result.exit_reason == SUPERVISE_EXIT_REASON_GRACEFUL_STOP
-        # The graceful drain injected the configured /exit (drain_now) command.
         assert SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["drain_now"] in child.sent
 
     def test_stop_poll_default_none_does_not_drain(self) -> None:
-        # With no stop_poll supplied (the default), a clean ALL_DONE still wins:
-        # the absence of an operator stop must not perturb the normal terminal.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="esc to interrupt"),
@@ -525,8 +489,6 @@ class TestEventLoopGracefulStop:
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_draining_state_is_observable_via_state_machine(self) -> None:
-        # The loop must drive the machine through ``draining`` (FR-27) on the way
-        # to ``stopped``; the recorded history is asserted so the edge is real.
         from devbench.supervise import SupervisorStateMachine
 
         sm = SupervisorStateMachine()
@@ -534,9 +496,6 @@ class TestEventLoopGracefulStop:
         sm.on_event("orchestrate-injected")
         child = FakePexpectChild(
             [
-                # Gate on the submit Enter (\r): /exit is typed then submitted, so
-                # the wind-down output only appears after the single Enter (the
-                # quiescence wait settles on the unmet gate before submission).
                 _ScriptStep(emit="finishing", on_send=r"\r"),
                 _ScriptStep(emit="", eof=True, exitstatus=0, on_send=r"\r"),
             ]
@@ -551,7 +510,6 @@ class TestEventLoopGracefulStop:
             state_machine=sm,
         )
         assert result.final_state == SUPERVISE_STATE_STOPPED
-        # The (running -> draining) edge fired before reaching stopped.
         assert (SUPERVISE_STATE_DRAINING, SUPERVISE_STATE_STOPPED, "drain-complete") in sm.history
         assert any(to == SUPERVISE_STATE_DRAINING for (_f, to, _e) in sm.history)
 
@@ -569,7 +527,6 @@ class TestEventLoopProgressWatchdog:
 
     @staticmethod
     def _short_stall_config(**extra: int):
-        # A tight stall window keeps the deterministic fake-clock arithmetic small.
         from dataclasses import replace
 
         from devbench.config_loader import SuperviseConfig
@@ -579,16 +536,12 @@ class TestEventLoopProgressWatchdog:
         return replace(base, timeouts=timeouts)
 
     def test_stall_trips_when_log_quiet_and_pty_spins(self) -> None:
-        # The orchestrator log never grows (progress_poll always False) while the
-        # PTY spins forever. The idle timer can NEVER fire (every read is working
-        # activity). The progress watchdog must trip and auto-restart; the relaunch
-        # releases the child to a clean terminal so a single stall+recover is seen.
         child = _SpinnerChild()
         relaunches: list = []
 
         def _relaunch(**k):
             relaunches.append(k)
-            child.release = True  # the resumed session makes progress -> clean exit
+            child.release = True
 
         result = run_supervise_event_loop(
             driver=_driver(child),
@@ -596,38 +549,26 @@ class TestEventLoopProgressWatchdog:
             quota_waiter=_StubQuotaWaiter(),
             log_poll=lambda: None,
             relaunch=_relaunch,
-            progress_poll=lambda: False,  # the orchestrator log NEVER grows
+            progress_poll=lambda: False,
             clock=_FakeClock(step=100),
         )
-        # The watchdog tripped exactly once and auto-restarted with resume context.
         assert len(relaunches) == 1
         assert relaunches[0].get("reason") == "progress-stall"
         assert relaunches[0].get("resume") is True
-        # The hung child was terminated before the relaunch (unlike exit-42 EOF).
         assert child.terminated is True
         assert child.terminate_force is True
-        # The restart was counted (persisted to registry.restart_count by the CLI).
         assert result.restarts_used == 1
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_no_stall_when_long_op_heartbeats_the_log(self) -> None:
-        # The orchestrator log is quiet ONLY because a genuine long op is running --
-        # but the long-op heartbeat keeps GROWING the log (progress_poll True), so
-        # the watchdog must NOT trip. The op then finishes clean. This is the
-        # no-false-stall-on-long-op proof (design point 4): same spinner PTY, same
-        # fake clock, but BECAUSE the log grows the watchdog never fires.
         child = _SpinnerChild()
         relaunches: list = []
-        # The heartbeat arrives for many iterations (well past the stall window),
-        # then the op completes and the child is released to a clean terminal.
         heartbeats = iter([True] * 50)
 
         def _progress_poll() -> bool:
             grew = next(heartbeats, False)
             if not grew:
-                # The long op finished: release the child so the loop can terminate
-                # cleanly (the test asserts the watchdog never tripped meanwhile).
                 child.release = True
             return grew
 
@@ -640,17 +581,12 @@ class TestEventLoopProgressWatchdog:
             progress_poll=_progress_poll,
             clock=_FakeClock(step=100),
         )
-        # The watchdog NEVER tripped: the heartbeat-driven log growth kept resetting
-        # the progress timer for the full (simulated) long op.
         assert relaunches == []
         assert child.terminated is False
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_stall_restart_cap_exhausted_faults(self) -> None:
-        # Every relaunch re-stalls (the resumed session immediately hangs again).
-        # Bounded by max_attempts=2 the watchdog faults with
-        # progress-stall-restart-cap-exhausted rather than restarting forever.
         from devbench.config_loader import SuperviseRestartConfig
 
         cfg = self._short_stall_config()
@@ -664,20 +600,17 @@ class TestEventLoopProgressWatchdog:
             config=cfg,
             quota_waiter=_StubQuotaWaiter(),
             log_poll=lambda: None,
-            relaunch=lambda **k: relaunches.append(k),  # never releases -> keeps stalling
+            relaunch=lambda **k: relaunches.append(k),
             progress_poll=lambda: False,
             clock=_FakeClock(step=100),
         )
         assert result.exit_code != 0
         assert result.final_state == SUPERVISE_STATE_FAULTED
         assert result.exit_reason == "progress-stall-restart-cap-exhausted"
-        # Exactly max_attempts relaunches were attempted before giving up.
         assert len(relaunches) == 2
         assert result.restarts_used == 2
 
     def test_watchdog_disabled_when_progress_poll_is_none(self) -> None:
-        # The SDK-style callers do not supply progress_poll; the watchdog must then
-        # be inert (no behaviour change). A normal clean ALL_DONE still wins.
         child = FakePexpectChild(
             [
                 _ScriptStep(emit="esc to interrupt"),
@@ -690,20 +623,14 @@ class TestEventLoopProgressWatchdog:
             quota_waiter=_StubQuotaWaiter(),
             log_poll=lambda: None,
             relaunch=lambda **_k: None,
-            clock=_FakeClock(step=100000),  # would trip instantly IF the watchdog ran
+            clock=_FakeClock(step=100000),
         )
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_log_growth_resets_progress_timer_before_stall(self) -> None:
-        # A single late heartbeat (log growth) just before the stall window elapses
-        # resets the timer, so the watchdog does NOT trip on that window. Proves the
-        # reset-on-growth branch (not merely the never-grows case).
         child = _SpinnerChild()
         relaunches: list = []
-        # Grow on iterations 1-5, then go quiet; with step=100 and a 600 window the
-        # reset on iter 5 pushes the next possible trip out, and the child is
-        # released shortly after so no stall is reached.
         growth = iter([True, True, True, True, True])
         polls = {"n": 0}
 
@@ -746,11 +673,7 @@ class TestEventLoopTurnContinuation:
         loop_cont = SUPERVISE_INJECTABLE_COMMANDS_DEFAULT["loop_continuation"]
         child = FakePexpectChild(
             [
-                # Turn ended awaiting input: the supervisor must re-inject.
                 _ScriptStep(emit="How would you like to proceed?"),
-                # After the continuation is SUBMITTED (\r), claude resumes working
-                # then finishes clean. Gate on \r so the type->settle->Enter ack flow
-                # works exactly like the orchestrate kickoff.
                 _ScriptStep(emit="esc to interrupt", on_send=r"\r"),
                 _ScriptStep(emit="ALL_DONE", eof=True, exitstatus=0, on_send=r"\r"),
             ]
@@ -762,20 +685,13 @@ class TestEventLoopTurnContinuation:
             log_poll=lambda: None,
             relaunch=lambda **_k: None,
         )
-        # The continuation literal was injected to re-drive the loop across the turn.
         assert loop_cont in child.sent
         assert result.exit_code == 0
         assert result.final_state == SUPERVISE_STATE_COMPLETED_CLEAN
 
     def test_turn_end_no_ack_is_stall_and_restarts(self) -> None:
-        # The continuation is injected but NO working ack comes back (claude stays
-        # idle): a fire-and-forget would hang forever. The supervisor must treat the
-        # missing ack as a progress stall and restart (bounded). The relaunch
-        # releases a fresh child to a clean terminal so the recover is asserted.
         child = FakePexpectChild(
             [
-                # Turn ended awaiting input; after the submit \r NO ack arrives (no
-                # further step matches the working pattern) -> expect_working False.
                 _ScriptStep(emit="How would you like to proceed?"),
             ]
         )
@@ -791,14 +707,10 @@ class TestEventLoopTurnContinuation:
             log_poll=lambda: None,
             relaunch=_relaunch,
         )
-        # A no-ack continuation was escalated to a restart (not left hanging).
         assert len(relaunches) >= 1
         assert relaunches[0].get("reason") == "progress-stall"
 
     def test_turn_end_no_ack_at_restart_cap_faults(self) -> None:
-        # With the restart budget already exhausted (max_attempts=0), a no-ack
-        # continuation cannot restart -> it faults terminally with the
-        # progress-stall cap reason (the cont_result-is-not-None branch).
         from dataclasses import replace
 
         from devbench.config_loader import SuperviseRestartConfig
@@ -813,7 +725,7 @@ class TestEventLoopTurnContinuation:
             log_poll=lambda: None,
             relaunch=lambda **k: relaunches.append(k),
         )
-        assert relaunches == []  # the cap was already reached: no relaunch attempted
+        assert relaunches == []
         assert result.exit_code != 0
         assert result.final_state == SUPERVISE_STATE_FAULTED
         assert result.exit_reason == "progress-stall-restart-cap-exhausted"

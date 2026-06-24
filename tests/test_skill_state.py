@@ -163,11 +163,6 @@ class TestEmitAudit:
             emit_audit("create-spec", "[SKILL_MAX_ITERATIONS_REACHED]", {"": "x"}, tmp_path)
 
 
-# ---------------------------------------------------------------------------
-# Per-task checkpoint API (issue #221 A3)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestPerTaskCheckpoint:
     """``write_per_task_checkpoint`` + ``read_per_task_checkpoint`` round-trip

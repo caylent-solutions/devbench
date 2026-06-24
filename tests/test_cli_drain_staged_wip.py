@@ -49,7 +49,6 @@ def _init_repo_with_staged_wip(repo: Path) -> None:
     (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
     _git(repo, "add", "seed.txt")
     _git(repo, "commit", "-q", "-m", "initial")
-    # Now simulate the mid-git-ops state: a manifest file staged but not committed.
     (repo / "manifest_file.txt").write_text("interrupted unit WIP\n", encoding="utf-8")
     _git(repo, "add", "manifest_file.txt")
 
@@ -88,7 +87,6 @@ class TestUnstageInterruptedWip:
 
         assert unstaged is True
         assert _staged_paths(repo) == [], "the staged WIP must be unstaged"
-        # The edit is NOT lost -- it remains in the working tree (recoverable).
         assert (repo / "manifest_file.txt").read_text(encoding="utf-8") == "interrupted unit WIP\n"
 
     def test_clean_index_is_noop(self, tmp_path: Path) -> None:
@@ -107,7 +105,6 @@ class TestUnstageInterruptedWip:
     def test_non_git_dir_is_noop(self, tmp_path: Path) -> None:
         plain = tmp_path / "plain"
         plain.mkdir()
-        # Must not raise, returns False.
         assert cli._unstage_interrupted_wip(plain, unit_id="E1-F1-S1-T1", reason="drain") is False
 
 
@@ -134,9 +131,6 @@ class TestForceBlockUnstagesWip:
         ):
             cli._force_block_in_flight_wu(wu, session_name="serial")
 
-        # The unit is force-blocked AND its staged WIP is unstaged so the next
-        # commit in this checkout cannot sweep it in.
         assert _staged_paths(repo) == [], "force-block must unstage the interrupted unit's WIP"
-        # The edit survives in the working tree (recoverable when re-claimed).
         assert (repo / "manifest_file.txt").read_text(encoding="utf-8") == "interrupted unit WIP\n"
         assert "## Status: blocked" in wu.file_path.read_text(encoding="utf-8")

@@ -41,9 +41,8 @@ class TestStubRestartResumesContext:
     """AC-20: relaunch uses --continue/--resume and reaches running (real pexpect)."""
 
     def test_relaunch_uses_continue_by_default(self, tmp_path: Path) -> None:
-        config = functional_supervise_config()  # resume_mode defaults to "continue"
+        config = functional_supervise_config()
         state_file = tmp_path / "stub-seq.state"
-        # Launch 1 exits 42 (restart signal); the relaunch (launch 2) completes clean.
         stub_env = stub_sequence_env(sequence="restart,clean", state_file=state_file)
         launches: list[list[str]] = []
         with (
@@ -57,17 +56,13 @@ class TestStubRestartResumesContext:
         assert state is not None
         assert state.state == "completed-clean"
         assert state.restart_count == 1
-        # Two launches: the initial launch (no resume flag) and the relaunch.
         assert len(launches) == 2
         initial, relaunch = launches
         assert "--continue" not in initial and "--resume" not in initial
-        # The context-preserving relaunch carried --continue (resume_mode=continue).
         assert "--continue" in relaunch
         assert "--resume" not in relaunch
 
     def test_relaunch_uses_resume_id_when_configured(self, tmp_path: Path) -> None:
-        # resume_mode=resume with a captured session id relaunches via --resume <id>
-        # (the exact-transcript resume the `supervise restart` verb performs).
         timeouts = SuperviseTimeoutsConfig(
             ready_prompt_seconds=15, idle_seconds=15, command_ack_seconds=2, poll_interval_seconds=1
         )
@@ -76,8 +71,6 @@ class TestStubRestartResumesContext:
         stub_env = stub_sequence_env(sequence="restart,clean", state_file=state_file)
         launches: list[list[str]] = []
 
-        # Capture a session id onto the run state the moment it is first written so the
-        # relaunch (which reads state.claude_session_id) resumes that exact transcript.
         captured_id = "018f-abc-resume"
         real_write_state = SuperviseRegistry.write_state
 

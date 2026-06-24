@@ -48,14 +48,11 @@ def test_disjoint_cycles_each_reported_once() -> None:
 
 
 def test_edge_to_unknown_node_ignored() -> None:
-    # A dependency on a node not in the graph is not a cycle.
     graph = {"a": ["missing"], "b": ["a"]}
     assert find_cycles(graph) == []
 
 
 def test_cycle_normalised_to_smallest_member_and_deduped() -> None:
-    # Entering the same 3-cycle from any root reports it once, rotated to the
-    # lexicographically smallest member.
     graph = {"b": ["c"], "c": ["a"], "a": ["b"]}
     cycles = find_cycles(graph)
     assert cycles == [("a", "b", "c")]

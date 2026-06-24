@@ -42,10 +42,6 @@ from devbench.constants import (
     SESSION_REGISTRY_TMP_SUFFIX,
 )
 
-# ---------------------------------------------------------------------------
-# ClaimRaceError
-# ---------------------------------------------------------------------------
-
 
 class ClaimRaceError(Exception):
     """Raised when a work unit's status changed underneath the BACKLOG.lock.
@@ -69,11 +65,6 @@ class ClaimRaceError(Exception):
             f"Claim race on {unit_id!r}: expected status {expected_status!r} "
             f"but found {actual_status!r} under lock -- another session won the race."
         )
-
-
-# ---------------------------------------------------------------------------
-# Session dataclass
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -134,7 +125,6 @@ class Session:
         except ValueError:
             raise ValueError(f"started_at {raw_at!r} is not a valid ISO 8601 datetime") from None
 
-        # Normalise naive datetime to UTC-aware.
         started_at = started_at.replace(tzinfo=UTC) if started_at.tzinfo is None else started_at.astimezone(UTC)
 
         return cls(
@@ -145,11 +135,6 @@ class Session:
             started_by=data["started_by"],
             state_dir=Path(data["state_dir"]),
         )
-
-
-# ---------------------------------------------------------------------------
-# SessionRegistry
-# ---------------------------------------------------------------------------
 
 
 class SessionRegistry:
@@ -172,10 +157,6 @@ class SessionRegistry:
     def __init__(self, workspace_root: Path) -> None:
         self._workspace_root = workspace_root
         self._registry_path = workspace_root / SESSION_REGISTRY_PATH
-
-    # ------------------------------------------------------------------
-    # Registry file I/O
-    # ------------------------------------------------------------------
 
     def load(self) -> list[Session]:
         """Load and deserialise the registry file.
@@ -223,10 +204,6 @@ class SessionRegistry:
                 tmp.unlink(missing_ok=True)
             raise
         tmp.replace(self._registry_path)
-
-    # ------------------------------------------------------------------
-    # PID-file helpers
-    # ------------------------------------------------------------------
 
     def write_pid(self, state_dir: Path, pid: int) -> None:
         """Write *pid* to ``<state_dir>/pid``.
@@ -277,10 +254,6 @@ class SessionRegistry:
         except ValueError:
             raise ValueError(f"PID file {pid_path} contains non-integer content: {raw!r}") from None
 
-    # ------------------------------------------------------------------
-    # Liveness
-    # ------------------------------------------------------------------
-
     def is_alive(self, pid: int) -> bool:
         """Return ``True`` when *pid* refers to a running process.
 
@@ -308,7 +281,6 @@ class SessionRegistry:
         except ProcessLookupError:
             return False
         except PermissionError:
-            # EPERM: process exists, but we lack permission to signal it.
             return True
         return True
 
@@ -362,11 +334,6 @@ class SessionRegistry:
             self.save(surviving)
 
         return sorted(removed_names)
-
-
-# ---------------------------------------------------------------------------
-# flock_backlog
-# ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
@@ -427,11 +394,6 @@ def flock_backlog(
             yield None
         finally:
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-
-
-# ---------------------------------------------------------------------------
-# detect_scope_overlap
-# ---------------------------------------------------------------------------
 
 
 def detect_scope_overlap(existing_sessions: list[Session], new_scope: list[str]) -> list[str]:

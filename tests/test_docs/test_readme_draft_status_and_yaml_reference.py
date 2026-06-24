@@ -40,7 +40,6 @@ class TestReadmeDraftStatusMention:
         """README feature overview must describe 'draft' in the context of work unit lifecycle."""
         text = self._text()
         lower = text.lower()
-        # draft must appear alongside lifecycle-related terms
         has_lifecycle_context = "draft" in lower and (
             "in-queue" in lower or "lifecycle" in lower or "status" in lower or "promote" in lower
         )

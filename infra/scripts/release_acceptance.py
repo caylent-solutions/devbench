@@ -36,10 +36,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-# ---------------------------------------------------------------------------
-# Data carrier
-# ---------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
 class ConditionResult:
@@ -48,11 +44,6 @@ class ConditionResult:
     passed: bool
     label: str
     message: str = field(default="")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _run(
@@ -92,11 +83,6 @@ def _has_workspace_config(repo_root: Path) -> bool:
 def _workspace_env(repo_root: Path) -> dict[str, str]:
     """Environment overlay so the devbench CLI resolves the workspace root."""
     return {"DEVBENCH_WORKSPACE_ROOT": str(repo_root)}
-
-
-# ---------------------------------------------------------------------------
-# Condition checkers
-# ---------------------------------------------------------------------------
 
 
 def check_make_validate(repo_root: Path) -> ConditionResult:
@@ -234,12 +220,10 @@ def _load_guard_script_known_judges(repo_root: Path) -> frozenset[str]:
             f"ERROR: guard-verdict-format.sh not found at {guard_path}. Ensure the repo root is correct."
         )
     content = guard_path.read_text(encoding="utf-8")
-    # Find the KNOWN_JUDGES=( ... ) block
     match = re.search(r"KNOWN_JUDGES=\((.*?)\)", content, re.DOTALL)
     if not match:
         raise ValueError(f"ERROR: KNOWN_JUDGES array not found in {guard_path}. The script format may have changed.")
     block = match.group(1)
-    # Extract all quoted strings from the block
     entries = re.findall(r'"([^"]+)"', block)
     return frozenset(entries)
 
@@ -308,7 +292,6 @@ def check_mirrored_lists(repo_root: Path) -> ConditionResult:
     """
     failures: list[str] = []
 
-    # Pair 1: judge lists
     constants_judges = _load_constants_known_judges(repo_root)
     guard_judges = _load_guard_script_known_judges(repo_root)
     if constants_judges != guard_judges:
@@ -318,7 +301,6 @@ def check_mirrored_lists(repo_root: Path) -> ConditionResult:
             f"Judge list mismatch -- only in constants.py: {only_constants}, only in guard script: {only_guard}"
         )
 
-    # Pair 2: marketplace plugin versions
     versions_in_sync = _check_marketplace_plugin_versions_in_sync(repo_root)
     if not versions_in_sync:
         failures.append("Marketplace plugin version mismatch -- see stderr for per-plugin details")
@@ -397,11 +379,6 @@ def check_ac_traceability(repo_root: Path) -> ConditionResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# Gate runner
-# ---------------------------------------------------------------------------
-
-
 def run_gate(repo_root: Path) -> int:
     """Evaluate all eight conditions and return an exit code.
 
@@ -439,11 +416,6 @@ def run_gate(repo_root: Path) -> int:
         flush=True,
     )
     return 1
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

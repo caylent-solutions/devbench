@@ -32,7 +32,7 @@ def _extract_section(text: str, heading: str) -> str:
     if idx == -1:
         return ""
     section_text = text[idx:]
-    level = len(heading.split(" ", maxsplit=1)[0])  # count leading '#'
+    level = len(heading.split(" ", maxsplit=1)[0])
     marker = "\n" + "#" * level + " "
     next_idx = section_text.find(marker, 1)
     if next_idx != -1:

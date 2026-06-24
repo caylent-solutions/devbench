@@ -28,21 +28,12 @@ from devbench.config_loader import (
     load_runtime_config,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _write_yaml(tmp_path: Path, content: str) -> Path:
     """Write *content* to a temp devbench.yaml and return the path."""
     cfg = tmp_path / "devbench.yaml"
     cfg.write_text(textwrap.dedent(content), encoding="utf-8")
     return cfg
-
-
-# ---------------------------------------------------------------------------
-# AC-244-1: repos key pattern validation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -100,11 +91,6 @@ class TestReposKeyPattern:
             load_runtime_config(cfg, {})
 
 
-# ---------------------------------------------------------------------------
-# AC-244-1: RepoConfig.local_only parsing
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestRepoConfigLocalOnly:
     """RepoConfig.local_only default and parsing from YAML."""
@@ -159,11 +145,6 @@ class TestRepoConfigLocalOnly:
         assert result.repos["caylent/devbench"].local_only is False
 
 
-# ---------------------------------------------------------------------------
-# AC-244a-1: effective_local_only precedence
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestEffectiveLocalOnly:
     """effective_local_only is per-repo if set, else top-level git_ops.local_only."""
@@ -185,7 +166,6 @@ class TestEffectiveLocalOnly:
         )
         result = load_runtime_config(cfg, {})
         repo = result.repos["workspace-local"]
-        # Per-repo local_only is true; effective_local_only must be true.
         assert repo.local_only is True
 
     def test_per_repo_false_overrides_top_level_true(self, tmp_path: Path) -> None:
@@ -207,8 +187,6 @@ class TestEffectiveLocalOnly:
               local_only: true
             """,
         )
-        # Two local_only repos would raise; this tests that per-repo false
-        # opts a repo OUT of the local_only pool, leaving only one local_only.
         result = load_runtime_config(cfg, {})
         assert result.repos["workspace-local"].local_only is True
         assert result.repos["remote-repo"].local_only is False
@@ -228,14 +206,7 @@ class TestEffectiveLocalOnly:
             """,
         )
         result = load_runtime_config(cfg, {})
-        # Top-level local_only is true; repo has no per-repo override.
-        # The repo's local_only field reflects the effective value.
         assert result.repos["workspace-local"].local_only is True
-
-
-# ---------------------------------------------------------------------------
-# AC-244-1: at-most-one local_only rule
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -339,11 +310,6 @@ class TestAtMostOneLocalOnly:
             load_runtime_config(cfg, {})
 
 
-# ---------------------------------------------------------------------------
-# AC-244a-1: ensure-branch skips git fetch origin for local_only repo
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestEnsureBranchLocalOnly:
     """ensure_branch must not call git fetch origin for a local_only repo."""
@@ -370,8 +336,6 @@ class TestEnsureBranchLocalOnly:
                 return 1, "", ""
             return 0, "main\n", ""
 
-        # Per-repo local_only=True with top-level git_ops.local_only=False
-        # proves that _effective_local_only uses per-repo value first.
         mock_repo_cfg = MagicMock()
         mock_repo_cfg.local_only = True
 
@@ -390,18 +354,11 @@ class TestEnsureBranchLocalOnly:
             monkeypatch.setattr(ops, "_git", git_mock)
             monkeypatch.setattr(ops, "_get_default_branch", MagicMock(return_value="main"))
 
-            # Should complete without raising the AssertionError above.
             ops.ensure_branch("workspace-local", repo_path, "feat/work")
 
-        # After ensure_branch: _git was called but not with git fetch origin.
         for call in git_mock.call_args_list:
             args = call[0][0] if call[0] else []
             assert args[:2] != ["fetch", "origin"], f"Unexpected fetch origin call: {call}"
-
-
-# ---------------------------------------------------------------------------
-# AC-244a-1: git-ops-finalize is a no-op for local_only repo
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit

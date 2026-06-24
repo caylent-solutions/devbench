@@ -60,36 +60,6 @@ from pathlib import Path
 _log = logging.getLogger("devbench.reporting.event_index")
 
 
-# Schema version. Bumped whenever the on-disk schema changes in a way
-# that requires a rebuild (column added, index changed, etc.). On open
-# the cache reads ``PRAGMA user_version`` and rebuilds from scratch
-# when the value differs from ``_SCHEMA_VERSION``.
-#
-# Version 2: ``ts_epoch_us`` on ``hook_entries`` + ``transcript_entries``
-# is now nullable. NULL means "timestamp present in the source but
-# unparseable" -- the legacy ``_entry_in_window`` includes these in
-# every window aggregate (fail-soft so a malformed entry doesn't drop
-# the cost data attached to it). The query ``WHERE ts_epoch_us IS NULL
-# OR ts_epoch_us >= ?`` mirrors that semantic.
-#
-# Version 3 (issue #169): ``transcript_entries`` gains a ``message_id``
-# column with a partial UNIQUE index (``WHERE message_id IS NOT NULL``).
-# Resumed Claude Code sessions copy prior assistant messages forward
-# into new transcript files, so the same logical message can appear in
-# multiple ``*.jsonl`` files. The unique index lets ``INSERT OR IGNORE``
-# discard the duplicate at ingest time so the aggregate ``SUM`` stays
-# correct without a query-side ``DISTINCT``. Entries without a stable
-# ``message.id`` continue to insert -- the partial predicate excludes
-# NULLs from the uniqueness check.
-#
-# Version 4 (issue #223): ``hook_entries`` + ``transcript_entries`` both
-# gain a ``model TEXT`` column carrying the Claude model id (the literal
-# ``message.model`` from the transcript envelope, e.g.
-# ``claude-opus-4-7``).  NULL means "no model attribution available"
-# and aggregates under the ``"<unknown>"`` bucket priced against
-# ``REPORT_DEFAULT_MODEL_RATES``.  Pre-v4 caches are dropped + rebuilt by
-# the open-time version-mismatch handler (rebuild is lossless because
-# every row is a deterministic transformation of the source files).
 _SCHEMA_VERSION = 4
 
 
@@ -98,15 +68,7 @@ _KIND_HOOK_LOG = "hook_log"
 _KIND_TRANSCRIPT = "transcript"
 
 
-# Match a log line of the form "YYYY-MM-DDTHH:MM:SSZ [logger.name] LEVEL ...",
-# capturing the ISO-8601 timestamp (group 1) and the logger name (group 2).
-# Same regex shape as the existing one in report.py; kept private here so
-# the index can advance one line at a time during incremental reads.
 _LOG_LINE_RE = re.compile(rb"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z \[([^\]]+)\]")
-# Mirrors the existing ``_DONE_RE`` / ``_PROGRESS_RE`` regexes in report.py:
-# task IDs must start with ``E`` (the backlog work-unit-ID convention) to be
-# counted as transition events. This keeps any future ``Set foo to 'bar'``
-# log line from leaking into the task aggregates.
 _TASK_TRANSITION_RE = re.compile(rb"Set (E\S+) to '([^']+)'")
 
 
@@ -203,11 +165,6 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
 """
 
 
-# In-memory lock to serialise writers within a single Python process.
-# SQLite itself serialises across processes via its own locking; this
-# extra lock guards against concurrent ``refresh_*`` calls in the same
-# interpreter (e.g. from a future watch-mode parallel renderer) racing
-# on the parsed_offset bookkeeping.
 _INDEX_LOCKS: dict[Path, threading.Lock] = {}
 _REGISTRY_LOCK = threading.Lock()
 
@@ -227,9 +184,6 @@ def _open_connection(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.execute("PRAGMA foreign_keys = ON")
-    # WAL gives concurrent readers + a single writer with low overhead;
-    # ideal for ``devbench report --watch N`` running alongside an
-    # active orchestrator that may someday want to feed the same index.
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
@@ -277,11 +231,8 @@ class EventIndex:
                 conn.executescript(_INIT_SQL)
                 conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             else:
-                # Run init defensively in case a partial init left tables missing.
                 conn.executescript(_INIT_SQL)
         except sqlite3.DatabaseError:
-            # Corrupt SQLite file. Wipe and rebuild: every row is
-            # derived from source files, so the rebuild is lossless.
             if conn is not None:
                 with contextlib.suppress(sqlite3.Error):
                     conn.close()
@@ -294,10 +245,6 @@ class EventIndex:
     def close(self) -> None:
         with contextlib.suppress(sqlite3.Error):
             self._conn.close()
-
-    # ------------------------------------------------------------------
-    # Source-file bookkeeping
-    # ------------------------------------------------------------------
 
     def _get_or_create_file_row(self, path: Path, kind: str) -> tuple[int, int, int, int]:
         """Return ``(file_id, mtime_ns, size_bytes, parsed_offset)`` for ``path``.
@@ -371,14 +318,8 @@ class EventIndex:
                     yield (current_offset, line)
                     current_offset += nl + 1
                     buf = buf[nl + 1 :]
-            # Anything remaining in ``buf`` is a partial unterminated
-            # line; explicitly do NOT yield it.
         finally:
             f.close()
-
-    # ------------------------------------------------------------------
-    # Orchestrator log
-    # ------------------------------------------------------------------
 
     def refresh_orchestrator_log(self, log_path: Path) -> None:
         """Bring the orchestrator-log cache into sync with ``log_path``.
@@ -424,16 +365,14 @@ class EventIndex:
         size_bytes = stat.st_size
         file_id, cached_mtime, cached_size, parsed_offset = self._get_or_create_file_row(log_path, _KIND_ORCH_LOG)
         if cached_mtime == mtime_ns and cached_size == size_bytes:
-            return  # perfect hit
+            return
         if size_bytes < cached_size or mtime_ns < cached_mtime:
-            # Rotation / truncation / hand-edit -- invalidate.
             self._invalidate_orch_log_events_for_file(file_id)
             parsed_offset = 0
-        # Append-only path: parse from parsed_offset to size_bytes.
         rows: list[tuple[int, int, int, str, str | None, str | None]] = []
         new_parsed_offset = parsed_offset
         for offset, raw_line in self._scan_lines_with_offsets(log_path, parsed_offset):
-            new_parsed_offset = offset + len(raw_line) + 1  # +1 for the consumed newline
+            new_parsed_offset = offset + len(raw_line) + 1
             m = _LOG_LINE_RE.match(raw_line)
             if not m:
                 continue
@@ -454,10 +393,6 @@ class EventIndex:
                 rows,
             )
         self._update_file_row(file_id, mtime_ns, size_bytes, new_parsed_offset)
-
-    # ------------------------------------------------------------------
-    # Hook log
-    # ------------------------------------------------------------------
 
     def refresh_hook_log(self, hook_log_path: Path) -> None:
         """Bring the hook-log cache into sync with ``hook_log_path``."""
@@ -491,21 +426,11 @@ class EventIndex:
                 continue
             ts_str = entry.get("timestamp")
             if not isinstance(ts_str, str) or not ts_str:
-                # Match legacy ``_entry_in_window``: a missing
-                # ``timestamp`` field means the entry is dropped
-                # (return value defaults True only when the field is
-                # ``""`` -- but legacy uses ``entry.get("timestamp", "")``
-                # which produces ``""`` for missing too, so the entry
-                # was effectively included as "always in window"). Mark
-                # ts as NULL so the aggregate query picks it up.
                 ts_epoch_us: int | None = None
             else:
                 try:
                     ts_epoch_us = _iso_to_epoch_us(ts_str)
                 except ValueError:
-                    # Unparseable timestamp -- legacy behaviour
-                    # includes the entry in every window (the cost
-                    # data attached to it would otherwise vanish).
                     ts_epoch_us = None
             tool_resp = (entry.get("input") or {}).get("tool_response") or {}
             if not isinstance(tool_resp, dict):
@@ -516,11 +441,6 @@ class EventIndex:
             tokens = _tokens_from_usage(usage)
             transcript_path = (entry.get("input") or {}).get("transcript_path")
             transcript_path_str = transcript_path if isinstance(transcript_path, str) else None
-            # Issue #223: hook log entries typically carry the model id
-            # inside ``tool_response.model`` (Claude Code's PostToolUse
-            # envelope).  Some entries fall back to ``entry.model``.
-            # When neither is present the row is stored with model=NULL
-            # and aggregates under the ``"<unknown>"`` bucket downstream.
             raw_model = tool_resp.get("model") or entry.get("model")
             model_str = raw_model if isinstance(raw_model, str) and raw_model else None
             rows.append(
@@ -551,10 +471,6 @@ class EventIndex:
                 rows,
             )
         self._update_file_row(file_id, mtime_ns, size_bytes, new_parsed_offset)
-
-    # ------------------------------------------------------------------
-    # Transcripts
-    # ------------------------------------------------------------------
 
     def refresh_transcripts(self, transcript_dir: Path | None) -> None:
         """Bring every transcript file under ``transcript_dir`` into sync.
@@ -610,16 +526,8 @@ class EventIndex:
             if not tokens.has_usage:
                 continue
             role = _role_from_attribution(entry.get("attributionAgent"))
-            # Issue #169: capture message.id so the partial unique index
-            # can dedup carried-forward messages across resumed-session
-            # transcript files. Non-string ids fall through as NULL,
-            # which the partial predicate excludes from uniqueness.
             raw_id = message.get("id")
             message_id = raw_id if isinstance(raw_id, str) and raw_id else None
-            # Issue #223: capture the model id Claude Code records on
-            # every ``assistant`` message envelope.  NULL when the field
-            # is missing or non-string; the aggregator buckets such rows
-            # under ``"<unknown>"`` priced against ``REPORT_DEFAULT_MODEL_RATES``.
             raw_model = message.get("model")
             model_str = raw_model if isinstance(raw_model, str) and raw_model else None
             rows.append(
@@ -641,11 +549,6 @@ class EventIndex:
                 )
             )
         if rows:
-            # OR IGNORE (was OR REPLACE) so a duplicate ``message_id``
-            # from a resumed session leaves the original row in place
-            # rather than swapping in the carried-forward copy. The
-            # carried copy carries identical usage data, so first-write
-            # wins is deterministic.
             self._conn.executemany(
                 "INSERT OR IGNORE INTO transcript_entries "
                 "(file_id, line_offset, ts_epoch_us, role, input_tokens, output_tokens, "
@@ -655,16 +558,6 @@ class EventIndex:
                 rows,
             )
         self._update_file_row(file_id, mtime_ns, size_bytes, new_parsed_offset)
-
-    # ------------------------------------------------------------------
-    # Query API (consumed by report.py)
-    # ------------------------------------------------------------------
-    #
-    # Every query is scoped to a specific source-file path so the same
-    # cache DB can hold events from many log files (multi-session
-    # workspaces, side-by-side renamed logs, the cache db being shared
-    # by every test in a pytest run) without one source's data leaking
-    # into another's aggregates.
 
     def _file_id_for(self, path: Path) -> int | None:
         row = self._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(path),)).fetchone()
@@ -722,11 +615,6 @@ class EventIndex:
         if not file_ids:
             return {}
         placeholders = ",".join("?" for _ in file_ids)
-        # SQL composed via list-join rather than an f-string so the static
-        # analyser does not misclassify the variable-arity ``IN`` clause
-        # as user-controlled input. ``placeholders`` is a comma-joined
-        # string of literal ``?`` characters; values bind through the
-        # parameter tuple below.
         sql = "".join(
             [
                 "SELECT task_id, MAX(ts_epoch_us) FROM orch_log_events ",
@@ -871,9 +759,6 @@ class EventIndex:
             "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_read_tokens ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_write_5m_tokens ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_write_1h_tokens ELSE 0 END), 0) "
-            # NULL ts means the source entry's timestamp was unparseable;
-            # mirror legacy ``_entry_in_window`` by including those rows
-            # in every window so cost data is not silently dropped.
             "FROM hook_entries WHERE file_id = ? AND (ts_epoch_us IS NULL OR ts_epoch_us >= ?)",
             (file_id, boundary),
         ).fetchone()
@@ -898,7 +783,7 @@ class EventIndex:
         boundary = _datetime_to_epoch_us(window_start)
         row = self._conn.execute(
             "SELECT "
-            "0, "  # transcripts contribute no duration_ms
+            "0, "
             "COALESCE(SUM(input_tokens), 0), "
             "COALESCE(SUM(output_tokens), 0), "
             "COALESCE(SUM(cache_read_tokens), 0), "
@@ -1021,10 +906,6 @@ class EventIndex:
         file_id = self._file_id_for(hook_log_path)
         if file_id is None:
             return None
-        # NULLS LAST so a malformed-timestamp entry (ts NULL) doesn't
-        # outrank a real one. Within ts_epoch_us ASC the earliest valid
-        # timestamp wins -- same first-hit semantic as the legacy
-        # ``_discover_transcript_dir`` walk.
         row = self._conn.execute(
             "SELECT transcript_path FROM hook_entries "
             "WHERE file_id = ? AND transcript_path IS NOT NULL "
@@ -1032,10 +913,6 @@ class EventIndex:
             (file_id,),
         ).fetchone()
         return row[0] if row else None
-
-    # ------------------------------------------------------------------
-    # Phase 6: render-output snapshot
-    # ------------------------------------------------------------------
 
     def write_snapshot(self, log_path: Path, payload: dict) -> None:
         """Persist a JSON-serialisable rendered-state payload keyed on log mtime+size.
@@ -1074,13 +951,6 @@ class EventIndex:
         except _json.JSONDecodeError:
             return None
         return payload if isinstance(payload, dict) else None
-
-
-# ----------------------------------------------------------------------
-# Free-function helpers (shared with the parser path in report.py via
-# a thin re-export layer; keeping them module-private here keeps the
-# cache schema definition in one file).
-# ----------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -1167,7 +1037,6 @@ def _iso_to_epoch_us(raw: str) -> int:
 def _datetime_to_epoch_us(dt: datetime) -> int:
     """Convert a tz-aware (or naive=UTC) datetime to integer microseconds since epoch."""
     aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
-    # ``datetime.timestamp()`` returns a float; round to microseconds.
     return int(aware.timestamp() * 1_000_000)
 
 

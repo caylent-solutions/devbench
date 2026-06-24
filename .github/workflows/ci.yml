@@ -46,6 +46,28 @@ jobs:
       - run: make lint-no-duplicates
         shell: bash
 
+  lint-comments:
+    name: Lint (comments)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make lint-comments
+        shell: bash
+
+  lint-markdown:
+    name: Lint (markdown)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make lint-markdown
+        shell: bash
+
   format-check:
     name: Format check
     runs-on: ubuntu-24.04

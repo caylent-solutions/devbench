@@ -3,7 +3,15 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+# Python comment linter scope (first-party source; fixtures are sample data).
+COMMENT_LINT_PATHS := src tests tools infra/scripts
+COMMENT_LINT_EXCLUDE := --exclude 'tests/fixtures/**'
+# Markdown linter: human-authored docs only. Claude plugin/marketplace,
+# fixture, and example-backlog markdown are excluded so the linter can never
+# rewrite or break frontmatter-driven plugin files.
+MARKDOWN_GLOBS := --exclude '.venv/**' --exclude 'CLAUDE.md' --exclude 'plugin/**' --exclude 'plugin-authoring/**' --exclude '.claude/**' --exclude 'tests/**' --exclude 'examples/**' '**/*.md'
+
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates lint-comments fix-comments lint-markdown format-markdown format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -65,8 +73,24 @@ lint-no-duplicates:
 	  exit 1; \
 	fi
 
-## lint: Run all linters (ruff + bandit + no-duplicates guard)
-lint: lint-ruff lint-bandit lint-no-duplicates
+## lint-comments: Fail if disallowed (explanatory) Python comments exist
+lint-comments:
+	uv run python tools/comment_lint.py --check $(COMMENT_LINT_PATHS) $(COMMENT_LINT_EXCLUDE)
+
+## fix-comments: Remove disallowed Python comments in place (maintenance only)
+fix-comments:
+	uv run python tools/comment_lint.py --fix $(COMMENT_LINT_PATHS) $(COMMENT_LINT_EXCLUDE)
+
+## lint-markdown: Run the Markdown linter (pymarkdown) over human-authored docs
+lint-markdown:
+	uv run pymarkdown --config .pymarkdown.yml scan $(MARKDOWN_GLOBS)
+
+## format-markdown: Auto-fix Markdown formatting (maintenance only)
+format-markdown:
+	uv run pymarkdown --config .pymarkdown.yml fix $(MARKDOWN_GLOBS)
+
+## lint: Run all linters (ruff + bandit + no-duplicates + comments + markdown)
+lint: lint-ruff lint-bandit lint-no-duplicates lint-comments lint-markdown
 
 ## format: Auto-format code with ruff
 format:
@@ -101,11 +125,11 @@ test-coverage:
 test: test-unit
 
 ## validate: Full validation (all checks -- identical to CI and pre-push)
-validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage
+validate: lint-ruff lint-bandit lint-no-duplicates lint-comments lint-markdown format-check typecheck test-coverage
 	@echo "All validations passed"
 
 ## pre-commit-check: Checks that run on every commit (fast)
-pre-commit-check: lint-ruff format-check
+pre-commit-check: lint-ruff format-check lint-comments lint-markdown
 	@echo "Pre-commit checks passed"
 
 ## pre-push-check: Checks that run before push (full -- identical to CI)

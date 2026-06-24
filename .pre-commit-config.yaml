@@ -15,6 +15,20 @@ repos:
         types: [python]
         pass_filenames: false
 
+      - id: comment-lint
+        name: python comment check
+        entry: make lint-comments
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: markdown-lint
+        name: markdown lint
+        entry: make lint-markdown
+        language: system
+        types: [markdown]
+        pass_filenames: false
+
   - repo: local
     hooks:
       - id: pre-push-validate

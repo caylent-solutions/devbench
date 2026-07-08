@@ -503,7 +503,7 @@ STOP_HOOK_STALE_TASK_MINUTES: int = _resolve_int(
 )
 USE_BEDROCK: bool = _resolve_bool(
     "DEVBENCH_USE_BEDROCK",
-    None,
+    RUNTIME_CONFIG.use_bedrock,
     False,
 )
 BEDROCK_REGION: str = _resolve_str(

@@ -628,12 +628,7 @@ class TestUseBedrockYamlFirst:
 
     def test_use_bedrock_true_from_yaml_when_env_absent(self, tmp_path: Path) -> None:
         config_path = tmp_path / "devbench.yaml"
-        config_path.write_text(
-            "repos:\n"
-            "  caylent-solutions/git-repo:\n"
-            "    default_branch: main\n"
-            "use_bedrock: true\n"
-        )
+        config_path.write_text("repos:\n  caylent-solutions/git-repo:\n    default_branch: main\nuse_bedrock: true\n")
         env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_USE_BEDROCK"}
         env_copy["DEVBENCH_CONFIG_PATH"] = str(config_path)
         with patch.dict(os.environ, env_copy, clear=True):
@@ -643,13 +638,8 @@ class TestUseBedrockYamlFirst:
 
     def test_env_var_overrides_yaml_false(self, tmp_path: Path) -> None:
         config_path = tmp_path / "devbench.yaml"
-        config_path.write_text(
-            "repos:\n"
-            "  caylent-solutions/git-repo:\n"
-            "    default_branch: main\n"
-            "use_bedrock: false\n"
-        )
-        env_copy = {k: v for k, v in os.environ.items()}
+        config_path.write_text("repos:\n  caylent-solutions/git-repo:\n    default_branch: main\nuse_bedrock: false\n")
+        env_copy = dict(os.environ)
         env_copy["DEVBENCH_CONFIG_PATH"] = str(config_path)
         env_copy["DEVBENCH_USE_BEDROCK"] = "true"
         with patch.dict(os.environ, env_copy, clear=True):
@@ -678,9 +668,7 @@ class TestUseBedrockYamlFirst:
             "  executor: us.anthropic.claude-opus-4-7-v1\n"
         )
         env_copy = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in ("DEVBENCH_USE_BEDROCK", "DEVBENCH_AGENT_MODEL_EXECUTOR")
+            k: v for k, v in os.environ.items() if k not in ("DEVBENCH_USE_BEDROCK", "DEVBENCH_AGENT_MODEL_EXECUTOR")
         }
         env_copy["DEVBENCH_CONFIG_PATH"] = str(config_path)
         with patch.dict(os.environ, env_copy, clear=True):

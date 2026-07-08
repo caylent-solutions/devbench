@@ -263,6 +263,35 @@ class TestParseWorkUnitFileBranch:
 
         assert wu.branch == "backlog/e0-f1-s1-t1"
 
+    def test_branch_template_namespaced_by_configured_branch_prefix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When git_ops.branch_prefix is configured for the unit's repo, the
+        derived branch is namespaced -- preventing collisions when multiple
+        devbench workspaces push same-numbered tasks to a shared repo."""
+        from devbench.backlog import parser as parser_module
+        from devbench.config_loader import GitOpsConfig, RepoConfig, RuntimeConfig
+
+        monkeypatch.setattr(
+            parser_module,
+            "RUNTIME_CONFIG",
+            RuntimeConfig(
+                repos={"caylent-solutions/git-repo": RepoConfig(branch_prefix="wg_004")},
+                git_ops=GitOpsConfig(),
+            ),
+        )
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: My Task\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/git-repo`\n"
+        )
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        wu = parser.parse_work_unit_file(wu_file)
+
+        assert wu.branch == "backlog/wg_004/e0-f1-s1-t1"
+
     def test_parses_branch_with_backlog_prefix(self, tmp_path: Path) -> None:
         wu_file = tmp_path / "E0-F1-S1-T2.md"
         wu_file.write_text(

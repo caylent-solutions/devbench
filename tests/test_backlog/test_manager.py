@@ -3948,6 +3948,36 @@ class TestValidateBranchUniqueness:
             errors = BacklogManager().validate(idx, tmp_path)
         assert not any("Branch collision" in e for e in errors)
 
+    def test_configured_branch_prefix_used_for_canonical_derivation(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Canonical (non-explicit-Branch:) tasks derive the namespaced branch
+        name when git_ops.branch_prefix is configured -- matching what
+        cmd_git_ops/BacklogParser actually push to, so this check can't pass
+        while a real push would still collide across two devbench workspaces."""
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            _ValidateRuleHarness.make_task(
+                backlog_dir,
+                unit_id,
+                "ex/foo",
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        from unittest.mock import patch as _patch
+
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        assert (
+            BacklogManager._derive_branch_for_row("EX-F1-S1-T1", "", tmp_path, "wg_004") == "backlog/wg_004/ex-f1-s1-t1"
+        )
+
+        runtime = RuntimeConfig(git_ops=GitOpsConfig(branch_prefix="wg_004"))
+        with _patch("devbench.config.RUNTIME_CONFIG", runtime):
+            errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("Branch collision" in e for e in errors)
+
 
 class TestRequiredSectionsRowDefensiveSkips:
     """Cover the empty-file-path-string defensive skip in `_check_required_sections`.

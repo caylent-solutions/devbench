@@ -2894,6 +2894,68 @@ class TestCmdEnsureBranch:
 
         assert result == 1
 
+    def test_cmd_ensure_branch_namespaces_with_configured_branch_prefix(self, tmp_path: Path) -> None:
+        """issue #283 AC-1/AC-2: when git_ops.branch_prefix is configured for the
+        unit's repo, the branch ensure_branch is called with is namespaced --
+        preventing collisions when multiple devbench workspaces share one repo."""
+        from devbench.config_loader import GitOpsConfig, RepoConfig, RuntimeConfig
+
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        repo_path = tmp_path / "devbench"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={"caylent-solutions/devbench": RepoConfig(branch_prefix="wg_004")},
+            git_ops=GitOpsConfig(),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+        ):
+            result = cli.cmd_ensure_branch("E202-F1-S1-T1")
+
+        assert result == 0
+        mock_ops.ensure_branch.assert_called_once_with(
+            "caylent-solutions/devbench",
+            repo_path,
+            "backlog/wg_004/e202-f1-s1-t1",
+        )
+
+    def test_cmd_ensure_branch_namespaces_single_branch_with_configured_branch_prefix(self, tmp_path: Path) -> None:
+        """issue #283 AC-5: branch_prefix also namespaces git_ops.single_branch
+        (accumulator mode), not just per-unit branches."""
+        from devbench.config_loader import GitOpsConfig, RepoConfig, RuntimeConfig
+
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        repo_path = tmp_path / "devbench"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={"caylent-solutions/devbench": RepoConfig(branch_prefix="wg_004")},
+            git_ops=GitOpsConfig(single_branch="feat/batch"),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.config.SINGLE_BRANCH", "feat/batch"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+        ):
+            result = cli.cmd_ensure_branch("E202-F1-S1-T1")
+
+        assert result == 0
+        mock_ops.ensure_branch.assert_called_once_with(
+            "caylent-solutions/devbench",
+            repo_path,
+            "wg_004/feat/batch",
+        )
+
 
 @pytest.mark.unit
 class TestCmdGitOpsPostMergeCheckout:
@@ -5141,6 +5203,33 @@ class TestCmdGitOpsFinalizeHappyPath:
         mock_ops.create_pr.assert_called_once()
         mock_ops.wait_for_checks_and_classify.assert_called_once()
         mock_handler.assert_called_once()
+
+    def test_finalize_namespaces_single_branch_with_configured_branch_prefix(self, tmp_path: Path) -> None:
+        """issue #283 AC-5: git-ops-finalize namespaces single_branch by the
+        configured branch_prefix too, same as the per-unit git-ops path."""
+        from devbench.config_loader import GitOpsConfig, RepoConfig, RuntimeConfig
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_runtime_cfg = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(branch_prefix="wg_004")},
+            git_ops=GitOpsConfig(single_branch="feature/combined"),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        pushed_branch = mock_ops.commit_and_push.call_args.args[2]
+        assert pushed_branch == "wg_004/feature/combined"
 
     def test_finalize_returns_1_when_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Lines 837-838: no local path configured for repo."""

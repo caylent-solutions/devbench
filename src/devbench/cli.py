@@ -152,7 +152,13 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import RepoConfig, get_configured_default_branch
+from devbench.config_loader import (
+    RepoConfig,
+    format_branch_name,
+    format_single_branch_name,
+    get_configured_default_branch,
+    get_effective_branch_prefix,
+)
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
@@ -3748,7 +3754,12 @@ def cmd_ensure_branch(unit_id: str) -> int:
 
     from devbench.config import SINGLE_BRANCH
 
-    branch = SINGLE_BRANCH if SINGLE_BRANCH else f"backlog/{unit_id.lower()}"
+    branch_prefix = get_effective_branch_prefix(canonical_repo, RUNTIME_CONFIG)
+    branch = (
+        format_single_branch_name(SINGLE_BRANCH, branch_prefix)
+        if SINGLE_BRANCH
+        else format_branch_name(unit_id, branch_prefix)
+    )
     ops = GitOpsService()
     ops.ensure_branch(canonical_repo, repo_path, branch)
     logger.info("Branch ready: %s on %s", branch, canonical_repo)
@@ -4701,7 +4712,12 @@ def cmd_git_ops(unit_id: str) -> int:
 
     from devbench.config import DEFER_PR, SINGLE_BRANCH
 
-    branch = SINGLE_BRANCH if SINGLE_BRANCH else f"backlog/{unit_id.lower()}"
+    branch_prefix = get_effective_branch_prefix(canonical_repo, RUNTIME_CONFIG)
+    branch = (
+        format_single_branch_name(SINGLE_BRANCH, branch_prefix)
+        if SINGLE_BRANCH
+        else format_branch_name(unit_id, branch_prefix)
+    )
 
     if DEFER_PR:
         return _git_ops_deferred(unit_id, unit, canonical_repo, repo_path, branch)
@@ -4968,7 +4984,7 @@ def cmd_check_merge(unit_id: str) -> int:
     mgr = BacklogManager()
     ops = GitOpsService()
 
-    branch = unit.branch or f"backlog/{unit_id.lower()}"
+    branch = unit.branch or format_branch_name(unit_id, get_effective_branch_prefix(canonical_repo, RUNTIME_CONFIG))
     fetch_rc, pr_records = _check_merge_fetch_pr_state(ops, canonical_repo, unit_id, branch)
     if fetch_rc != 0:
         return fetch_rc
@@ -5318,7 +5334,7 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    branch = SINGLE_BRANCH
+    branch = format_single_branch_name(SINGLE_BRANCH, get_effective_branch_prefix(canonical_repo, RUNTIME_CONFIG))
     pr_title = FINALIZE_PR_TITLE_TEMPLATE.format(branch=branch)
     pr_body = (
         f"Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{canonical_repo}`"

@@ -2460,13 +2460,14 @@ class BacklogManager:
         single_branch = getattr(RUNTIME_CONFIG.git_ops, "single_branch", None)
         if single_branch:
             return
+        branch_prefix = getattr(RUNTIME_CONFIG.git_ops, "branch_prefix", None)
         branches: dict[str, list[str]] = {}
         for row_id, _, file_path_str in rows:
             if not row_id or row_id.startswith("-"):
                 continue
             if not self._is_task_id(row_id):
                 continue
-            branch = self._derive_branch_for_row(row_id, file_path_str, workspace_root)
+            branch = self._derive_branch_for_row(row_id, file_path_str, workspace_root, branch_prefix)
             branches.setdefault(branch, []).append(row_id)
         for branch, ids in sorted(branches.items()):
             if len(ids) > 1:
@@ -2762,14 +2763,19 @@ class BacklogManager:
                 )
 
     @staticmethod
-    def _derive_branch_for_row(unit_id: str, file_path_str: str, workspace_root: Path) -> str:
+    def _derive_branch_for_row(
+        unit_id: str, file_path_str: str, workspace_root: Path, branch_prefix: str | None = None
+    ) -> str:
         """Resolve the branch name a Task row would push to.
 
         Mirrors ``BacklogParser._parse_branch``: prefer an explicit
         ``- **Branch:** \\`<name>\\``` line in the work-unit file; fall
-        back to the canonical lowercase-ID template when the explicit
-        line is absent or unreadable.
+        back to the canonical lowercase-ID template (namespaced by
+        *branch_prefix* when set) when the explicit line is absent or
+        unreadable.
         """
+        from devbench.config_loader import format_branch_name
+
         if file_path_str:
             wu_path = workspace_root / file_path_str
             if wu_path.is_file():
@@ -2777,7 +2783,7 @@ class BacklogManager:
                 explicit = re.search(r"-\s+\*?\*?Branch:?\*?\*?\s*`([^`]+)`", content)
                 if explicit:
                     return explicit.group(1).strip()
-        return f"backlog/{unit_id.lower()}"
+        return format_branch_name(unit_id, branch_prefix)
 
     @classmethod
     def _iter_dep_ids(cls, content: str) -> list[str]:

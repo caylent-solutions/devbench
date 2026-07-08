@@ -5,7 +5,7 @@
 ## Target Repository
 
 - **Repo:** `{{REPO}}`
-- **Branch:** `backlog/{{ID_LOWER}}`
+- **Branch:** `backlog/{{ID_LOWER}}` <!-- or `backlog/{{BRANCH_PREFIX}}/{{ID_LOWER}}` when git_ops.branch_prefix (or a per-repo override) is configured in backlog/config/devbench.yaml -- see spec-to-backlog SKILL.md "Branch naming" -->
 
 ## Description
 

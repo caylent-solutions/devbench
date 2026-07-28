@@ -89,6 +89,22 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`git_ops.branch_prefix` / per-repo `branch_prefix` task-branch
+  namespacing** (issue #283). Task branches were always named
+  `backlog/<unit-id-lower>` with no workspace identifier. When two
+  independent devbench workspaces (each numbering its own backlog from
+  `E1-F1-S1-T1`) target the same downstream repo, their task branches
+  collide by name -- a run hit this live: workspace A's already-merged
+  `backlog/e1-f1-s1-t1` PR blocked workspace B's unrelated `E1-F1-S1-T1`
+  push with a non-fast-forward rejection, since it was a different task
+  that happened to share an ID, not a real merge conflict. Setting
+  `git_ops.branch_prefix` (optionally overridden per-repo via
+  `repos.<org/repo>.branch_prefix`) namespaces per-unit branches as
+  `backlog/<prefix>/<unit-id-lower>` and `single_branch` as
+  `<prefix>/<single_branch>`, eliminating the collision in both modes.
+  Unset by default -- existing single-workspace setups are unaffected.
+  See `docs/devbench-yaml-reference.md`.
+
 - **`spec-to-backlog` append-mode `BACKLOG.md` regeneration**
   (issue #225). Materialising a new spec on top of an existing
   populated backlog (E17+ on top of E1-E16) previously required the

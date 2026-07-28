@@ -16,6 +16,8 @@ repos:
     checkout_directory: devbench
     # Per-repo merge_strategy override; falls back to the top-level merge_strategy.
     # merge_strategy: squash
+    # Per-repo branch_prefix override; falls back to the top-level git_ops.branch_prefix.
+    # branch_prefix: wg_004
 
 # ---------------------------------------------------------------------------
 # Top-level identity / runtime knobs
@@ -104,6 +106,14 @@ git_ops:
   # Single-branch mode: every work unit commits to this branch (see defer_pr
   # below). Unset = standard multi-PR mode (one branch per work unit).
   # single_branch: feat/my-batch-branch
+  # Namespaces per-unit task branches as backlog/<prefix>/<id-lower> instead
+  # of backlog/<id-lower> (and single_branch as <prefix>/<single_branch>
+  # when both are set). Set this when multiple devbench workspaces (each
+  # independently numbering tasks from E1-F1-S1-T1) push to the same shared
+  # repo, to prevent branch-name collisions across workspaces. Overridden
+  # per-repo by repos.<org/repo>.branch_prefix above. Unset = no prefix
+  # (original behaviour).
+  # branch_prefix: wg_004
   # Defer-PR mode: commits stay local until `devbench git-ops-finalize` runs.
   # Requires single_branch to be set.
   defer_pr: false

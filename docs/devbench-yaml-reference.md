@@ -46,6 +46,7 @@ repos:
     default_branch: main          # optional -- omit to fall back to origin/HEAD
     checkout_directory: devbench  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
     merge_strategy: squash        # optional -- overrides top-level merge_strategy
+    branch_prefix: wg_004         # optional -- overrides top-level git_ops.branch_prefix
 ```
 
 ---
@@ -155,6 +156,7 @@ limits:
 git_ops:
   update_submodule: false       # set true only for git-submodule repos
   # single_branch: feat/batch  # one branch for all WUs (single-PR mode)
+  # branch_prefix: wg_004      # namespaces per-unit branches: backlog/<prefix>/<id-lower>
   defer_pr: false               # requires single_branch; commits stay local until git-ops-finalize
   pause_before_merge: false     # push + wait for CI, then transition to in-review
   inline_orphan_cleanup: true   # chore commit before task commit when orphans detected

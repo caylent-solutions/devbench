@@ -1240,7 +1240,7 @@ DRAFT_TEMPLATE: str = """\
 ## Target Repository
 
 - **Repo:** `{repo}`
-- **Branch:** `backlog/{task_id_lower}`
+- **Branch:** `{branch}`
 
 ## Description
 
@@ -1291,6 +1291,10 @@ def generate_draft_md(
     status: str = STATUS_PROPOSED,
 ) -> str:
     """Render the markdown content for one proposed task file."""
+    from devbench.config import RUNTIME_CONFIG
+    from devbench.config_loader import format_branch_name, get_effective_branch_prefix
+
+    branch = format_branch_name(proposed.suggested_id, get_effective_branch_prefix(repo, RUNTIME_CONFIG))
     scenarios = ", ".join(proposed.linked_scenarios) if proposed.linked_scenarios else "(none documented)"
     ac_lines = (
         "\n".join(f"- [ ] {line}" for line in proposed.suggested_acs)
@@ -1304,9 +1308,9 @@ def generate_draft_md(
     )
     return DRAFT_TEMPLATE.format(
         task_id=proposed.suggested_id,
-        task_id_lower=proposed.suggested_id.lower(),
         title=proposed.title,
         repo=repo,
+        branch=branch,
         status=status,
         generated_at=generated_at,
         source_task_id=source_task_id,

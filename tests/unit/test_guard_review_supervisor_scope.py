@@ -6,10 +6,11 @@ agent. It blocks two classes of escalation:
 1. **Bash mutations** -- destructive shell commands (rm, git commit, sed -i,
    `>` redirection, etc.) executed via the Bash tool. Existing rule, sanity-
    tested here for regression coverage.
-2. **Agent-tool subagent spawn** (issue #118) -- Agent-tool invocations
-   whose ``subagent_type`` is not in the canonical review_team allowlist
-   (``devbench-orchestrate:code_review`` / ``devbench-orchestrate:test_review`` /
-   ``devbench-orchestrate:doc_review`` / ``devbench-orchestrate:changes_manifest``). New branch.
+2. **Agent-tool subagent spawn** (issue #118, tightened by ADR-33) -- every
+   Agent-tool invocation, whatever its ``subagent_type``. Issue #118 allow-listed
+   the four review_team subagents because the supervisor fanned out to them
+   itself; ADR-33 moved that fan-out to the orchestrate skill as a first-level
+   dispatch, so the supervisor dispatches nothing and the allowlist was removed.
 
 Both paths share the operator override env var
 ``DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1``.
@@ -83,27 +84,28 @@ class TestNonSupervisorAgentTypeIsNoOp:
         assert rc == 0
 
 
-class TestAgentToolAllowlist:
-    """Issue #118: review-supervisor may only spawn the four review_team subagents."""
+class TestAgentToolAlwaysBlocked:
+    """Post-ADR-33: review-supervisor dispatches nothing, so every Agent call is blocked.
+
+    Issue #118 originally allow-listed the four ``review_team`` subagents because
+    the supervisor fanned out to them itself. The flatten moved that fan-out to
+    the orchestrate skill as a first-level dispatch, so the allowlist described a
+    contract that no longer exists. The former allowlist entries are kept in the
+    parametrisation below precisely so a regression that reinstates them fails.
+    """
 
     @pytest.mark.parametrize(
         "subagent_type",
         [
+            # Former allowlist entries -- must now be blocked like any other.
             "devbench-orchestrate:code_review",
             "devbench-orchestrate:test_review",
             "devbench-orchestrate:doc_review",
             "devbench-orchestrate:changes_manifest",
-        ],
-    )
-    def test_review_team_subagents_allowed(self, subagent_type: str) -> None:
-        result = _run_hook(_agent_payload(subagent_type))
-        assert result.returncode == 0, (
-            f"expected supervisor->{subagent_type} to be allowed; got stderr: {result.stderr}"
-        )
-
-    @pytest.mark.parametrize(
-        "subagent_type",
-        [
+            # Namespaced review_team form used by the flattened skill.
+            "devbench-orchestrate:review_team:code-reviewer",
+            "devbench-orchestrate:review_team:changes-manifest",
+            # Never-allowed agents.
             "devbench-orchestrate:executor",
             "devbench-orchestrate:blocker_resolver",
             "devbench-orchestrate:task_factory",
@@ -114,9 +116,11 @@ class TestAgentToolAllowlist:
             "",
         ],
     )
-    def test_non_review_team_subagents_blocked(self, subagent_type: str) -> None:
+    def test_every_subagent_spawn_is_blocked(self, subagent_type: str) -> None:
         result = _run_hook(_agent_payload(subagent_type))
-        assert result.returncode == 2
+        assert result.returncode == 2, (
+            f"expected supervisor->{subagent_type!r} to be blocked; got rc={result.returncode} stderr: {result.stderr}"
+        )
         assert "review-supervisor attempted to spawn subagent_type" in result.stderr
         assert subagent_type in result.stderr
 

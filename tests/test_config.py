@@ -617,6 +617,67 @@ class TestMaxRetriesYamlFirst:
 
 
 @pytest.mark.unit
+class TestUseBedrockYamlFirst:
+    """USE_BEDROCK must read YAML when DEVBENCH_USE_BEDROCK is absent.
+
+    Regression test: USE_BEDROCK previously hardcoded the YAML argument to
+    ``None`` instead of ``RUNTIME_CONFIG.use_bedrock``, so a ``use_bedrock:
+    true`` in devbench.yaml (documented in docs/devbench-yaml-reference.md)
+    was silently ignored unless DEVBENCH_USE_BEDROCK was also exported.
+    """
+
+    def test_use_bedrock_true_from_yaml_when_env_absent(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "devbench.yaml"
+        config_path.write_text("repos:\n  caylent-solutions/git-repo:\n    default_branch: main\nuse_bedrock: true\n")
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_USE_BEDROCK"}
+        env_copy["DEVBENCH_CONFIG_PATH"] = str(config_path)
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.USE_BEDROCK is True
+        importlib.reload(config)
+
+    def test_env_var_overrides_yaml_false(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "devbench.yaml"
+        config_path.write_text("repos:\n  caylent-solutions/git-repo:\n    default_branch: main\nuse_bedrock: false\n")
+        env_copy = dict(os.environ)
+        env_copy["DEVBENCH_CONFIG_PATH"] = str(config_path)
+        env_copy["DEVBENCH_USE_BEDROCK"] = "true"
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.USE_BEDROCK is True
+        importlib.reload(config)
+
+    def test_bedrock_agent_override_no_longer_falsely_rejected(self, tmp_path: Path) -> None:
+        """The agent_models re-validation (config.py lines ~557-579) checks
+        each YAML agent_models value against the *resolved* USE_BEDROCK.
+
+        Before the fix, USE_BEDROCK always resolved False when
+        DEVBENCH_USE_BEDROCK was unset -- even with `use_bedrock: true` in
+        YAML -- so a YAML-declared Bedrock ARN for `agents.executor` failed
+        this re-validation with a spurious "not a valid Anthropic API model
+        id" error. Post-fix, USE_BEDROCK correctly resolves True from YAML
+        and the same config loads without error.
+        """
+        config_path = tmp_path / "devbench.yaml"
+        config_path.write_text(
+            "repos:\n"
+            "  caylent-solutions/git-repo:\n"
+            "    default_branch: main\n"
+            "use_bedrock: true\n"
+            "agents:\n"
+            "  executor: us.anthropic.claude-opus-4-7-v1\n"
+        )
+        env_copy = {
+            k: v for k, v in os.environ.items() if k not in ("DEVBENCH_USE_BEDROCK", "DEVBENCH_AGENT_MODEL_EXECUTOR")
+        }
+        env_copy["DEVBENCH_CONFIG_PATH"] = str(config_path)
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.AGENT_MODELS.executor == "us.anthropic.claude-opus-4-7-v1"
+        importlib.reload(config)
+
+
+@pytest.mark.unit
 class TestAgentModelEnvOverrides:
     """ADR-25: DEVBENCH_AGENT_MODEL_<NAME> env vars override YAML at config-load time."""
 

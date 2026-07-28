@@ -129,7 +129,7 @@ The executor **must not**:
 
 The orchestrate skill is responsible for:
 
-- Invoking `devbench:review-supervisor` (which runs all four judge agents in parallel)
+- Dispatching the four `review_team` judges directly as first-level sub-agents, in parallel
 - Injecting review feedback into retry attempts
 - Invoking `devbench:security-reviewer` after the four judges pass
 - Delegating git operations to the executor agent (`devbench git-ops`)
@@ -156,7 +156,7 @@ uv run devbench start
             ├── invokes devbench:executor agent to implement each work unit
             │
             ├── dispatches the 4 review_team judges directly (first-level)
-            │       └── review-supervisor runs all 4 judge agents in parallel
+            │       └── code-reviewer, test-reviewer, doc-reviewer, changes-manifest (parallel)
             │
             ├── invokes devbench:security-reviewer agent
             │
@@ -177,7 +177,7 @@ Claude Code session (with devbench plugin active)
     ├── Claude invokes devbench:executor agent for implementation
     │
     ├── Claude dispatches the 4 review_team judges directly for judge review
-    │       └── review-supervisor runs all 4 judge agents in parallel
+    │       └── code-reviewer, test-reviewer, doc-reviewer, changes-manifest (parallel)
     │
     ├── Claude invokes devbench:security-reviewer for security gate
     │

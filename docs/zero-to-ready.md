@@ -301,7 +301,8 @@ agents:                              # ADR-25: per-agent model overrides
   #   - blocker-resolver, manifest-amender, task-factory (workflow /
   #     recovery): opus -- judgment-heavy and fire only on unhappy
   #     paths, so cost is bounded.
-  #   - review-supervisor: sonnet -- fan-out coordinator (Agent-tool reliability).
+  #   - review-supervisor: sonnet -- post-flatten (ADR-33) it only
+  #     aggregates already-persisted verdicts, it does not spawn.
   # Writing the same value as the frontmatter default is a no-op; flip an
   # individual field when your per-model quota is uneven (e.g. sonnet left,
   # opus exhausted). Omit the agents: block entirely (or set a field to

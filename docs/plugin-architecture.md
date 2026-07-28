@@ -28,12 +28,12 @@ plugin/devbench-orchestrate/
 │   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
 │   ├── executor.md              ← dev agent: implements work units via TDD
-│   ├── review-supervisor.md     ← discovers and invokes all review_team agents in parallel
+│   ├── review-supervisor.md     ← non-spawning aggregator: reads the 4 judges' persisted verdicts
 │   ├── security-reviewer.md     ← security review gate agent
 │   ├── blocker-resolver.md      ← dependency blocker assessment agent + proposal emission after amendment reject
 │   ├── manifest-amender.md      ← conditional judge for TDD GREEN manifest amendments
 │   ├── task-factory.md          ← materialises blocker-resolver proposals into draft `proposed` work units
-│   └── review_team/             ← review team agents invoked by review-supervisor
+│   └── review_team/             ← review team agents, invoked directly by SKILL.md as first-level sub-agents (ADR-33)
 │       ├── code-reviewer.md     ← SOLID, DRY, fail-fast, 12-factor review
 │       ├── test-reviewer.md     ← TDD discipline, test quality, assertions
 │       ├── doc-reviewer.md      ← accuracy, completeness, sync with code
@@ -52,12 +52,12 @@ plugin/devbench-orchestrate/
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
     ├── guard-destructive-git.sh ← blocks direct destructive git operations from non-git-ops agents
     ├── guard-review-supervisor-scope.sh
-    │                            ← enforces read-only scope on the review-supervisor agent.
+    │                            ← enforces read-only, non-spawning scope on the review-supervisor agent.
     │                              Blocks Bash mutations (git commit/push, rm, sed -i, > redirection, etc.)
-    │                              AND blocks Agent-tool spawn of any subagent_type outside the
-    │                              review_team allowlist (devbench:code_review, test_review, doc_review,
-    │                              changes_manifest). Issue #118 -- closes the loophole where the
-    │                              supervisor escalated to repo-mutation rights via subagent spawn.
+    │                              AND blocks every Agent-tool invocation unconditionally -- no allowlist
+    │                              (ADR-33: review-supervisor never spawns the judges itself). Issue #118
+    │                              -- closes the loophole where the supervisor escalated to repo-mutation
+    │                              rights via subagent spawn.
     └── assert-tests-pass.sh     ← enforces test suite passes after Bash
 ```
 

@@ -31,15 +31,57 @@ SPEC_TO_BACKLOG_SKILL_PATH = (
 
 @pytest.mark.unit
 class TestOrchestrateSkillReviewSupervisor:
-    """AC-1: Step 5 invokes review-supervisor, not 4 individual review agents."""
+    """AC-E4-F1-S1-T2-2/6/8 (post-flatten, ADR-33): the four review_team
+    judges are first-level sub-agents invoked directly by the skill;
+    review-supervisor is invoked separately, for read-only aggregation of
+    the judges' already-persisted verdicts, and never spawns them itself.
+    """
 
-    def test_skill_references_review_supervisor(self) -> None:
-        """AC-1: SKILL.md must reference review-supervisor."""
+    def test_skill_invokes_all_four_review_team_judges_directly(self) -> None:
+        """AC-64: SKILL.md must invoke each of the four review_team judges
+        directly as first-level sub-agents, using the namespaced
+        ``devbench-orchestrate:review_team:<judge>`` subagent_type form that
+        ADR-33's own recorded reproduction uses (docs/adr/33 lines 196-205),
+        not the retired bare ``devbench:<judge>`` prefix (which was never a
+        valid plugin namespace -- ``plugin.json`` declares the plugin name
+        as ``devbench-orchestrate``, so a bare ``devbench:`` prefix could
+        never resolve to anything real).
+        """
         content = SKILL_PATH.read_text()
-        assert "review-supervisor" in content, "SKILL.md must invoke review-supervisor in step 5"
+        required = [
+            "devbench-orchestrate:review_team:code-reviewer",
+            "devbench-orchestrate:review_team:test-reviewer",
+            "devbench-orchestrate:review_team:doc-reviewer",
+            "devbench-orchestrate:review_team:changes-manifest",
+        ]
+        for agent in required:
+            assert agent in content, (
+                f"SKILL.md must invoke '{agent}' directly as a first-level sub-agent (AC-64); "
+                "post-flatten, review-supervisor has no Agent-tool spawn capability and cannot "
+                "invoke the judges on the skill's behalf."
+            )
 
-    def test_skill_no_individual_reviewer_invocations(self) -> None:
-        """AC-8: SKILL.md must not reference individual review agents."""
+    def test_skill_references_review_supervisor_for_aggregation(self) -> None:
+        """AC-E4-F1-S1-T2-6: SKILL.md must still invoke review-supervisor,
+        but only for aggregating the four judges' already-persisted
+        verdicts, not for spawning them.
+        """
+        content = SKILL_PATH.read_text()
+        assert "review-supervisor" in content, (
+            "SKILL.md must invoke review-supervisor to aggregate the four judges' verdicts"
+        )
+        assert "aggregat" in content.lower(), (
+            "SKILL.md must describe review-supervisor's role as aggregation of "
+            "already-persisted verdicts, not spawning the judges"
+        )
+
+    def test_skill_no_retired_bare_devbench_namespace(self) -> None:
+        """The retired bare ``devbench:`` prefix (never a valid plugin
+        namespace) must not reappear -- a regression test that stops being
+        vacuous by asserting against the real, currently-used namespace
+        form (``devbench-orchestrate:``) rather than a form that never
+        existed in this file.
+        """
         content = SKILL_PATH.read_text()
         forbidden = [
             "devbench:code-reviewer",
@@ -49,7 +91,8 @@ class TestOrchestrateSkillReviewSupervisor:
         ]
         for agent in forbidden:
             assert agent not in content, (
-                f"SKILL.md must not reference individual reviewer '{agent}' -- use review-supervisor instead"
+                f"SKILL.md must not reference the retired bare-prefix form '{agent}'; "
+                "the real plugin namespace is 'devbench-orchestrate:review_team:<judge>'"
             )
 
 
@@ -1384,6 +1427,24 @@ class TestConfigureDevbenchSkillModelSection:
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
         assert "executor_model" in content or "executor" in content, (
             "configure-devbench/SKILL.md must walk operator through the executor_model setting"
+        )
+
+    def test_review_supervisor_is_not_described_as_fan_out_coordinator(self) -> None:
+        """Post-flatten (ADR-33), review-supervisor is a non-spawning aggregator.
+
+        review-supervisor no longer declares an Agent tool and cannot spawn the
+        four review_team judges, so describing it as a 'fan-out coordinator'
+        in the operator-facing agents: prompt is stale and misleading.
+        """
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "Fan-out coordinator" not in content, (
+            "configure-devbench/SKILL.md must not describe review_supervisor as a "
+            "'Fan-out coordinator' -- post-flatten (ADR-33) it is a non-spawning "
+            "aggregator with no Agent tool."
+        )
+        assert "review_supervisor" in content and "aggregat" in content.lower(), (
+            "configure-devbench/SKILL.md must describe review_supervisor's "
+            "post-flatten role as aggregation of already-persisted verdicts."
         )
 
 

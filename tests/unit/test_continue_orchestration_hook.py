@@ -118,7 +118,13 @@ class TestContinueOrchestrationHook:
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
         reason = output["reason"]
-        assert "review-supervisor" in reason
+        # Post-flatten (ADR-33): the four review_team judges are invoked
+        # directly as first-level sub-agents; review-supervisor only
+        # aggregates their already-persisted verdicts.
+        assert "review_team" in reason
+        assert "code-reviewer" in reason
+        assert "first-level" in reason.lower()
+        assert "aggregate" in reason.lower()
 
     def test_block_reason_next_step_after_review_pass(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"
@@ -189,6 +195,11 @@ class TestContinueOrchestrationHook:
         output = json.loads(result.stdout)
         reason = output["reason"]
         assert "executor" in reason.lower()
+        # Post-flatten (ADR-33): the retry loop re-invokes the four
+        # review_team judges directly as first-level sub-agents, then
+        # re-aggregates via review-supervisor.
+        assert "review_team" in reason
+        assert "first-level" in reason.lower()
 
 
 class TestCircuitBreaker:

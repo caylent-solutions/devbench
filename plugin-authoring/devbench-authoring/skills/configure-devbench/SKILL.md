@@ -180,7 +180,7 @@ Ask the operator:
 >   manifest_amender   -- Reviews amendment requests [frontmatter default: opus]
 >   security_reviewer  -- Security audit [frontmatter default: opus]
 >   task_factory       -- Materialises proposed tasks [frontmatter default: opus]
->   review_supervisor  -- Fan-out coordinator for review team [frontmatter default: sonnet]
+>   review_supervisor  -- Aggregates already-persisted review_team verdicts (post-flatten, ADR-33; does not spawn) [frontmatter default: sonnet]
 >
 > Per-judge model overrides (review_team):
 >   review_team.code_reviewer   [frontmatter default: opus]

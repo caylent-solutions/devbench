@@ -71,7 +71,7 @@ Process the backlog using the steps below, repeating until all work units are do
        - On `reject`: the agent first reverts every file listed in the pending request from the target repo (unstages, restores the tracked baseline, and cleans untracked additions) so stale staged edits do not leak into subsequent tasks. It then invokes `uv run devbench reject-amendment <id> "<reason>"`, which writes an audit comment, transitions the task to `blocked`, and archives the pending request to `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json` for blocker-resolver input. The git-cleanup recipe (restore --staged, checkout --, clean -f) appears in `plugin/devbench-orchestrate/agents/manifest-amender.md` and runs BEFORE the CLI invocation.
        - Either way the agent finishes by running `uv run devbench log-verdict manifest_amender <id> <pass|fail> "<summary>"`.
     d. After `manifest-amender` returns:
-       - If the verdict was `pass` (amendment applied and post-check passed): proceed to step 5. The review-supervisor judges now see the updated Changes Manifest.
+       - If the verdict was `pass` (amendment applied and post-check passed): proceed to step 5. The four review_team judges now see the updated Changes Manifest.
        - If the verdict was `fail` (rejected, or post-check rolled back): the task is already marked `blocked` with an audit comment. If `task_factory.enabled: true` in `backlog/config/devbench.yaml`, proceed to step 4c (blocker-resolver + task-factory). Otherwise, log a blocker comment and return to step 2.
 
 4c. Task-factory loop (runs only when `task_factory.enabled: true` and the amender just rejected):
@@ -80,15 +80,24 @@ Process the backlog using the steps below, repeating until all work units are do
     c. If the proposal JSON exists: invoke `devbench-orchestrate:task-factory` with the same source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
     d. After task-factory returns: log a blocker comment on the source task summarising the N proposed tasks created, then return to step 2. The source task remains `blocked` until the operator reviews and promotes the proposed tasks (via `uv run devbench promote-proposal <id>`) and they complete; promotion automatically wires the source task's dependencies so the orchestrator picks the source task back up only after the fixes land.
 
-5. Invoke `review-supervisor` with the unit ID.
-   - If result is REVIEW_FAIL: go to step 6.
-   - If result is REVIEW_PASS: go to step 7.
+5. **Invoke the four review_team judges directly, as first-level sub-agents, per ADR-33's flatten.** In a single response, invoke all four with the unit ID:
+   - `devbench-orchestrate:review_team:code-reviewer`
+   - `devbench-orchestrate:review_team:test-reviewer`
+   - `devbench-orchestrate:review_team:doc-reviewer`
+   - `devbench-orchestrate:review_team:changes-manifest`
 
-6. On REVIEW_FAIL:
-   a. **Immediately** invoke the `devbench-orchestrate:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
-   b. When executor returns, Return to step 5 -- immediately re-invoke `review-supervisor`. Do NOT invoke security-reviewer here.
+   Each judge independently self-logs its own verdict via `log-verdict` before returning. The implementation MUST NOT rely on any second-level Agent-tool spawn (a sub-agent spawning further sub-agents) in any form -- these four calls are first-level, made directly from this skill's own turn.
+
+5a. Invoke `devbench-orchestrate:review-supervisor` with the unit ID to aggregate. review-supervisor does not invoke or spawn the judges (it has no Agent-tool spawn capability); it reads the four judges' already-persisted verdicts from the work unit's Comments section and reports a consolidated result.
+   - **Missing-verdict hard failure (AC-65)**: if any of the four required judges (code_review, test_review, doc_review, changes_manifest) has no verdict logged in the current round, review-supervisor treats that as a hard failure naming the absent judge -- never an implicit pass. A judge that never logged is indistinguishable from a judge that never ran.
+   - If the result is fail (including a missing-verdict hard failure): go to step 6.
+   - If the result is pass: go to step 7.
+
+6. On review-team failure (explicit fail from any judge, or a missing-verdict hard failure):
+   a. **Immediately** invoke the `devbench-orchestrate:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the failure result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
+   b. When executor returns: Return to step 5 -- immediately re-invoke all four review_team judges directly (first-level, as in step 5), then step 5a to re-aggregate. Re-invoking all four gives an absent judge (the missing-verdict case) another chance to run and self-log; it is not treated differently from an explicit fail. Do NOT invoke security-reviewer here.
    c. After `max_executor_retries` consecutive failures, the next tool calls (in this order, same turn) are mandatory and explicit: (1) `uv run devbench log-comment agent/orchestrator <id> "[BLOCKED] ..."` naming the failing checks, (2) `uv run devbench next`. The `devbench next` call is the only authorised loop-continuation signal -- treat its output exactly like step 2 (ALL_DONE / NO_ACTIONABLE / JSON).
-   d. **Per-judge retry budgets (issue #122)**: when `max_executor_retries_per_judge` is set in `backlog/config/devbench.yaml`, the budget for the cycle is the value for the failing judge if listed (e.g., `max_executor_retries_per_judge.test_review`); otherwise fall back to the global `max_executor_retries`. Different judges can fail in different cycles -- count failures **per judge** in the per-task counter and trip the BLOCKED transition the moment ANY single judge's per-judge budget is exhausted. Read both fields once at the start of the work-unit cycle: `uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge` returns the resolved values. Schema validation rejects unknown judge names; an unknown name is a config bug not a runtime concern.
+   d. **Per-judge retry budgets (issue #122)**: when `max_executor_retries_per_judge` is set in `backlog/config/devbench.yaml`, the budget for the cycle is the value for the failing judge if listed (e.g., `max_executor_retries_per_judge.test_review`); otherwise fall back to the global `max_executor_retries`. Different judges can fail in different cycles -- count failures **per judge** in the per-task counter and trip the BLOCKED transition the moment ANY single judge's per-judge budget is exhausted. A missing-verdict hard failure charges the per-judge counter for the absent judge exactly like an explicit fail would -- there is no separate counter for the missing-verdict case. Read both fields once at the start of the work-unit cycle: `uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge` returns the resolved values. Schema validation rejects unknown judge names; an unknown name is a config bug not a runtime concern.
 
 7. On review team REVIEW_PASS:
    - **CRITICAL (issue #128)**: REVIEW_PASS is a terminal signal. After ALL judges return REVIEW_PASS, branch SOLELY on pass-vs-fail -- do NOT inspect verdict bodies, summary text, findings, or comments looking for improvement opportunities. Informational content in PASS verdicts (MEDIUM severity notes, refactor suggestions, "consider also..." remarks) MUST NOT trigger additional executor work cycles. The executor is invoked only when a judge returns REVIEW_FAIL (step 6). Surfacing informational PASS-verdict content in the PR description or a comment is fine; re-running the executor against PASS-verdict content is a violation of this rule and will be regression-tested in `tests/test_integration/test_executor_review_pass_terminality.py`.
@@ -131,9 +140,10 @@ Process the backlog using the steps below, repeating until all work units are do
 ## Standards
 
 - Never modify files under `backlog/` directly -- use `uv run devbench log-verdict` and `mark-done`.
-- Never bypass the done-gate -- review-supervisor must pass before git-ops.
-- Security review runs exactly once per work unit -- after review-supervisor passes. If security passes, go directly to step 8.
-- The retry loop (step 6) re-runs only review-supervisor, never security-reviewer.
+- Never bypass the done-gate -- all four review_team judges (invoked directly, first-level, at step 5) plus review-supervisor's aggregation (step 5a) must pass before git-ops. A missing verdict from any required judge is a hard failure, never an implicit pass (AC-65).
+- Security review runs exactly once per work unit -- after the review-team judges and review-supervisor's aggregation pass. If security passes, go directly to step 8.
+- The retry loop (step 6) re-runs the four review_team judges directly and then review-supervisor's aggregation, never security-reviewer.
+- The review leg (steps 5/5a) does not rely on second-level Agent-tool spawning in any form (ADR-33): the four judges are invoked directly from this skill, and review-supervisor never invokes them itself.
 - Log all significant actions and decisions to the work unit Comments via `log-verdict`.
 
 ## Halt discipline

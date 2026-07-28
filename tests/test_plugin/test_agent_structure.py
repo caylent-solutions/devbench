@@ -52,7 +52,10 @@ class TestReviewSupervisorFrontmatter:
         assert self._SUPERVISOR_PATH.exists(), f"review-supervisor.md not found at {self._SUPERVISOR_PATH}"
 
     def test_review_supervisor_frontmatter_valid(self) -> None:
-        """AC-2: Frontmatter must contain name: review-supervisor and tools: Bash, Agent(...)."""
+        """AC-E4-F1-S1-T2-6: Frontmatter must contain name: review-supervisor
+        and tools: Bash only -- post-flatten (ADR-33) review-supervisor is a
+        non-spawning aggregator and must declare NO Agent(...) spawn capability.
+        """
         content = self._SUPERVISOR_PATH.read_text()
 
         # Extract frontmatter block between --- delimiters
@@ -72,37 +75,87 @@ class TestReviewSupervisorFrontmatter:
         )
         assert "tools:" in frontmatter, f"Frontmatter must contain a tools: field. Got:\n{frontmatter}"
         assert "Bash" in frontmatter, f"Frontmatter tools must include Bash. Got:\n{frontmatter}"
-        assert "Agent" in frontmatter, f"Frontmatter tools must include Agent(...). Got:\n{frontmatter}"
+        assert "Agent(" not in frontmatter, (
+            f"Frontmatter tools must NOT declare Agent(...) -- review-supervisor is a "
+            f"non-spawning aggregator post-flatten (ADR-33). Got:\n{frontmatter}"
+        )
 
 
 @pytest.mark.unit
-class TestReviewSupervisorStep0SelfCheck:
-    """Issue #183(a): review-supervisor.md must instruct the agent to
-    self-check Agent-tool availability before dispatching reviewers,
-    and to emit a structured ``agent-tool-unavailable`` audit comment
-    on failure so ``classify_blocked_task`` priority-0 can bucket the
-    task as ``RUNTIME_DEGRADATION``.
+class TestReviewSupervisorNonSpawningAggregation:
+    """AC-E4-F1-S1-T2-6: review-supervisor.md is reduced to a non-spawning
+    aggregation role per ADR-33. Post-flatten it never had Agent-tool spawn
+    capability in the first place, so the pre-flatten Step 0 self-check
+    (which existed to detect that capability silently dropping out of the
+    session) is dead prose and must be removed. Instead the agent reads the
+    four review_team judges' independently-persisted verdicts and treats
+    any absent required verdict as a hard failure naming the absent judge.
     """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    def test_supervisor_contains_step_0_self_check(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "Step 0:" in content, "review-supervisor.md must declare a Step 0 self-check"
-        assert "Agent tool" in content, "Step 0 must describe how to detect missing Agent tool access"
-
-    def test_supervisor_emits_structured_runtime_degradation_payload(self) -> None:
-        """The audit-comment phrasing must match the regex in
-        ``classify_blocked_task`` (``agent-tool-unavailable`` keyword) so
-        the priority-0 check actually fires when the agent emits it.
+    def test_supervisor_no_step_0_self_check_payload(self) -> None:
+        """The pre-flatten 'agent-tool-unavailable' self-check payload must
+        not survive -- it described detecting a capability review-supervisor
+        no longer ever has, so a healthy run must never emit it again (AC-67).
         """
         content = self._SUPERVISOR_PATH.read_text()
-        assert "agent-tool-unavailable" in content, (
-            "review-supervisor.md must emit the canonical 'agent-tool-unavailable' "
-            "payload so classify_blocked_task can detect the degraded runtime"
+        assert "agent-tool-unavailable" not in content, (
+            "review-supervisor.md must not retain the pre-flatten Step 0 "
+            "'agent-tool-unavailable' self-check payload; post-flatten the "
+            "agent never has Agent-tool spawn capability to lose."
         )
-        assert "log-comment review-supervisor" in content, (
-            "review-supervisor.md must instruct logging the failure via log-comment"
+
+    def test_supervisor_reads_persisted_verdicts_not_invoking_judges(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "persisted" in content, (
+            "review-supervisor.md must describe reading the judges' already-persisted "
+            "verdicts rather than invoking the judges itself."
+        )
+
+    def test_supervisor_treats_missing_verdict_as_hard_failure(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "missing" in content and "hard failure" in content, (
+            "review-supervisor.md must state that a missing verdict from any required "
+            "judge is a hard failure, never an implicit pass (AC-65)."
+        )
+
+    def test_supervisor_names_the_absent_judge(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "naming every absent judge" in content or "naming the absent judge" in content, (
+            "review-supervisor.md must instruct naming the absent judge(s) by canonical "
+            "name, not reporting a generic unattributed failure."
+        )
+
+    def test_supervisor_boundary_scan_does_not_claim_discarding(self) -> None:
+        """The Step 1 boundary description must not claim the scan discards
+        everything already collected the moment it hits ``[REVIEW_REJECTED]``.
+
+        ``BacklogManager._last_round_all_passed`` walks reversed(lines) and
+        KEEPS everything collected below the boundary (the current round);
+        it only stops collecting further, it does not discard what it
+        already gathered. A prompt that instructs "discarding everything
+        already collected" would make the aggregator report all four judges
+        absent on every work unit that has any prior [REVIEW_REJECTED]
+        boundary -- the common retry case -- producing a false hard failure.
+        """
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "discarding everything already collected" not in content, (
+            "review-supervisor.md Step 1 must not claim the scan discards everything "
+            "already collected when it hits [REVIEW_REJECTED]; the manager keeps "
+            "everything collected below that boundary (the current round)."
+        )
+
+    def test_supervisor_boundary_scan_states_correct_keep_semantics(self) -> None:
+        """The corrected Step 1 wording must state that verdicts collected
+        below the [REVIEW_REJECTED] boundary (the current round) count, and
+        that only entries above it (a prior round) are excluded.
+        """
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "belong" in content and "prior round" in content, (
+            "review-supervisor.md Step 1 must state that entries above the "
+            "[REVIEW_REJECTED] boundary belong to a prior round and are never collected, "
+            "while entries below it (the current round) count."
         )
 
 
@@ -783,4 +836,67 @@ class TestNoAgentFrontmatterPinsHaiku:
             "any agent pinned to haiku will cause config-load failure when the "
             "operator's YAML explicitly selects it, and risks SDK Agent-tool "
             "drops under load. Change to 'sonnet' or 'opus'."
+        )
+
+
+@pytest.mark.unit
+class TestNoSubAgentDeclaresSpawningCapability:
+    """AC-E4-F1-S1-T2-1 / spec AC-63: no sub-agent definition under
+    plugin/devbench-orchestrate/agents/ may declare 'Agent(' anywhere in
+    its content. This is the systematic, file-by-file regression pin for
+    the grep proof the work unit's Definition of Done requires:
+    ``grep -rn "Agent(" plugin/devbench-orchestrate/agents/`` must return
+    zero hits.
+    """
+
+    @pytest.mark.parametrize(
+        "agent_path",
+        _ALL_AGENT_MD_FILES,
+        ids=lambda p: str(p.relative_to(AGENTS_DIR)),
+    )
+    def test_agent_md_has_no_agent_tool_spawn_declaration(self, agent_path: Path) -> None:
+        content = agent_path.read_text(encoding="utf-8")
+        assert "Agent(" not in content, (
+            f"{agent_path.relative_to(AGENTS_DIR)} must not contain the literal 'Agent(' "
+            "substring anywhere -- no sub-agent may declare second-level Agent-tool spawn "
+            "capability post-flatten (AC-63)."
+        )
+
+
+@pytest.mark.unit
+class TestSkillInvokesReviewJudgesDirectly:
+    """AC-E4-F1-S1-T2-2: the orchestrate skill invokes the four review_team
+    judges directly as first-level sub-agents (ADR-33's flatten design),
+    and states the missing-verdict hard-failure rule explicitly.
+    """
+
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
+
+    @pytest.mark.parametrize(
+        "judge_slug",
+        ["code-reviewer", "test-reviewer", "doc-reviewer", "changes-manifest"],
+    )
+    def test_skill_invokes_judge_directly(self, judge_slug: str) -> None:
+        content = self._SKILL_PATH.read_text()
+        invocation = f"devbench-orchestrate:review_team:{judge_slug}"
+        assert invocation in content, (
+            f"SKILL.md must invoke {invocation!r} directly as a first-level sub-agent "
+            "(ADR-33 flatten); the orchestrate skill must not rely on review-supervisor "
+            "spawning the judges as second-level sub-agents."
+        )
+
+    def test_skill_states_missing_verdict_is_hard_failure(self) -> None:
+        content = self._SKILL_PATH.read_text().lower()
+        assert "missing verdict" in content and "hard failure" in content, (
+            "SKILL.md must state that a missing verdict from any required judge is a "
+            "hard failure (AC-65), never an implicit pass."
+        )
+
+    def test_skill_describes_judges_as_first_level_subagents(self) -> None:
+        content = self._SKILL_PATH.read_text().lower()
+        assert "first-level" in content, (
+            "SKILL.md must describe the review_team judges as first-level sub-agents "
+            "invoked directly by the skill, not second-level spawns from review-supervisor."
         )

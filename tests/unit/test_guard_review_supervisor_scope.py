@@ -83,27 +83,27 @@ class TestNonSupervisorAgentTypeIsNoOp:
         assert rc == 0
 
 
-class TestAgentToolAllowlist:
-    """Issue #118: review-supervisor may only spawn the four review_team subagents."""
+class TestAgentToolAlwaysBlocked:
+    """ADR-33 flatten (AC-E4-F1-S1-T2-9): review-supervisor is a
+    non-spawning aggregator with no Agent-tool spawn capability at all.
+    Every subagent_type -- including the four review_team judges the
+    pre-flatten hook used to allowlist -- must now be blocked
+    unconditionally. Spawning the judges directly is now the orchestrate
+    skill's own first-level responsibility (SKILL.md step 5), never
+    review-supervisor's.
+    """
 
     @pytest.mark.parametrize(
         "subagent_type",
         [
+            "devbench-orchestrate:review_team:code-reviewer",
+            "devbench-orchestrate:review_team:test-reviewer",
+            "devbench-orchestrate:review_team:doc-reviewer",
+            "devbench-orchestrate:review_team:changes-manifest",
             "devbench-orchestrate:code_review",
             "devbench-orchestrate:test_review",
             "devbench-orchestrate:doc_review",
             "devbench-orchestrate:changes_manifest",
-        ],
-    )
-    def test_review_team_subagents_allowed(self, subagent_type: str) -> None:
-        result = _run_hook(_agent_payload(subagent_type))
-        assert result.returncode == 0, (
-            f"expected supervisor->{subagent_type} to be allowed; got stderr: {result.stderr}"
-        )
-
-    @pytest.mark.parametrize(
-        "subagent_type",
-        [
             "devbench-orchestrate:executor",
             "devbench-orchestrate:blocker_resolver",
             "devbench-orchestrate:task_factory",
@@ -114,9 +114,13 @@ class TestAgentToolAllowlist:
             "",
         ],
     )
-    def test_non_review_team_subagents_blocked(self, subagent_type: str) -> None:
+    def test_every_subagent_type_blocked(self, subagent_type: str) -> None:
         result = _run_hook(_agent_payload(subagent_type))
-        assert result.returncode == 2
+        assert result.returncode == 2, (
+            f"expected supervisor->{subagent_type} to be blocked (review-supervisor has no "
+            f"Agent-tool spawn capability post-flatten); got returncode={result.returncode}, "
+            f"stderr: {result.stderr}"
+        )
         assert "review-supervisor attempted to spawn subagent_type" in result.stderr
         assert subagent_type in result.stderr
 

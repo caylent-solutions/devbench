@@ -87,6 +87,68 @@ since the last release. PR #119 carries every change.
   format, or the orchestrate plugin's self-containedness fails
   these tests locally before push.
 
+### Changed
+
+- **Flattened the review leg: the four review-team judges are now
+  invoked directly by the orchestrate skill as first-level
+  sub-agents; `review-supervisor` is reduced to a non-spawning
+  aggregator** (ADR-33). A live reproduction (session
+  `32862e10-7ede-4265-8892-e0637684bb3e`, `claude-agent-sdk 0.2.128`,
+  recorded in `docs/adr/33-flatten-review-topology.md`) showed a
+  second-level Agent-tool spawn from a sub-agent succeeding
+  completely and reliably under that configuration -- it did **not**
+  reproduce a hard SDK restriction on sub-agent-spawns-sub-agent. The
+  flatten is adopted anyway, per spec S0 B-9a, as defense-in-depth
+  against model-tier-dependent Agent-tool spawn reliability -- the
+  same class of risk ADR-25's haiku-rejection guard already
+  mitigates by pinning.
+  - `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` step 5
+    now invokes `devbench-orchestrate:review_team:code-reviewer`,
+    `test-reviewer`, `doc-reviewer`, and `changes-manifest` directly,
+    in a single response, as first-level sub-agents. Each judge
+    self-logs its own verdict before returning.
+  - `plugin/devbench-orchestrate/agents/review-supervisor.md` no
+    longer declares Agent-tool spawn capability in its frontmatter
+    `tools:` field. It reads the four judges' already-persisted
+    verdicts from the work unit's Comments section and reports a
+    consolidated result.
+  - **Missing-verdict hard failure**: SKILL.md step 5a documents
+    that if any of the four required judges has no verdict logged in
+    the current round, that is a hard failure naming the absent
+    judge -- never an implicit pass. A judge that never logged is
+    indistinguishable from a judge that never ran. (The underlying
+    enforcement in `BacklogManager._last_round_all_passed` already
+    treated a missing verdict as a hard failure; this change aligns
+    the prompts with that existing contract.)
+  - `plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`
+    now blocks every Agent-tool invocation from review-supervisor
+    unconditionally -- the prior review_team allowlist branch is
+    removed, since review-supervisor never spawns any subagent
+    post-flatten.
+  - `src/devbench/backlog/proposal.py`'s `_RUNTIME_DEGRADATION_BODY_RE`
+    comment and `_has_runtime_degradation_signal` docstring now
+    describe a match as a topology **regression** signal (a match
+    should never occur in a healthy post-flatten run), not a
+    transient degradation an operator restart routinely clears. The
+    regex pattern itself is unchanged.
+  - `docs/architecture.md`, `docs/plugin-architecture.md`,
+    `docs/execution-modes.md`, `docs/faq.md`, `docs/cli-reference.md`,
+    and `README.md` updated to describe the four judges as
+    first-level sub-agents invoked directly by the orchestrate skill,
+    with review-supervisor as a non-spawning aggregator.
+  - Remaining consumers of the superseded second-level-spawn contract
+    updated to match: `continue-orchestration.sh`'s Stop-hook
+    `NEXT_STEP` guidance now names the four `review_team` judges as
+    first-level invocations before review-supervisor aggregates;
+    `docs/zero-to-ready.md`, `docs/llm-authentication.md`, and
+    `plugin-authoring/devbench-authoring/skills/configure-devbench/
+    SKILL.md` no longer call review-supervisor a "fan-out
+    coordinator"; and `docs/watch-activity.md`'s troubleshooting
+    table row and omitted-content bullet now describe
+    `review-supervisor running` as meaning the four judges have
+    already finished and self-logged, not that they are concurrently
+    running.
+
 ### Added
 
 - **`git_ops.branch_prefix` / per-repo `branch_prefix` task-branch

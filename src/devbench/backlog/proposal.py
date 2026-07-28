@@ -1144,11 +1144,49 @@ def _id_allocation_lock(workspace_root: Path) -> Iterator[None]:
 
 
 def _story_dir(backlog_root: Path, story_id: str) -> Path:
-    """Return the filesystem path that holds the given story's task files."""
+    """Return the filesystem path that holds the given story's task files.
+
+    Backlogs authored by the ``spec-to-backlog`` skill name every level
+    ``<id>-<slug>`` (``backlog/E4-tdd-red-gate/E4-F1-spawn-topology/
+    E4-F1-S1-topology``), so deriving the path from bare IDs alone writes
+    materialised tasks into a parallel orphan tree that has no Epic /
+    Feature / Story work-unit files. That in turn hides existing siblings
+    from :func:`scan_story_for_task_ids`, which makes
+    :func:`allocate_next_ids` hand out an ID that already exists.
+
+    An existing directory therefore always wins. When several candidates
+    match, the one holding the Story's own ``<story_id>.md`` work-unit file
+    is canonical. The bare-ID form remains the fallback for a story whose
+    directory has not been created yet.
+    """
     if not _STORY_ID_RE.match(story_id):
         raise ProposalError(f"story_id {story_id!r} is not a valid Story ID (expected ``E<N>-F<N>-S<N>``)")
+    candidates = _existing_story_dirs(backlog_root, story_id)
+    for candidate in candidates:
+        if (candidate / f"{story_id}.md").is_file():
+            return candidate
+    if candidates:
+        return candidates[0]
     parts = story_id.split("-")
     return backlog_root / parts[0] / "-".join(parts[:2]) / story_id
+
+
+def _existing_story_dirs(backlog_root: Path, story_id: str) -> list[Path]:
+    """Return every existing ``<story_id>`` / ``<story_id>-<slug>`` directory, sorted.
+
+    Matching on the ``<story_id>-`` prefix (rather than ``<story_id>``) keeps
+    ``E0-F1-S10-<slug>`` from satisfying a lookup for ``E0-F1-S1``. The scan
+    is depth-3 (epic/feature/story), which is the only layout the backlog
+    contract allows.
+    """
+    if not backlog_root.is_dir():
+        return []
+    prefix = f"{story_id}-"
+    return sorted(
+        path
+        for path in backlog_root.glob("*/*/*")
+        if path.is_dir() and (path.name == story_id or path.name.startswith(prefix))
+    )
 
 
 def scan_story_for_task_ids(backlog_root: Path, story_id: str) -> set[str]:
@@ -1728,6 +1766,39 @@ def promote_proposal(
     return PromoteResult(draft_path=draft, wired_targets=wired_targets)
 
 
+def delete_proposal_if_consumed(workspace_root: Path, backlog_root: Path, proposal: Proposal | None) -> None:
+    """Drop the proposal JSON once no task in it is still awaiting resolution.
+
+    ``_has_pending_proposal_json`` is pure file-presence, so a JSON left on
+    disk after its last draft is resolved pins the source task to
+    ``AWAITING_AMENDMENT_RECOVERY`` forever: the classifier keeps promising a
+    task-factory sweep that will never run again, ``write_proposal`` refuses
+    to emit a replacement, and because the task is bucketed as auto-clearing
+    it never surfaces as ``OPERATOR_ACTION_REQUIRED`` either. The task can
+    then neither recover nor be re-proposed.
+
+    "Consumed" means no ``proposed_tasks[].suggested_id`` is still
+    ``UNMATERIALISED`` or ``PROPOSED``. Call this only from a caller that has
+    finished promoting every task in the proposal -- never from inside
+    ``promote_proposal`` itself. Under
+    ``default_status_for_new_work_units: in-queue`` every draft is born
+    ``PROMOTED``, so a per-task check would report "consumed" on the first
+    promotion and delete the JSON that the remaining promotions still need
+    for their dependency wiring.
+    """
+    if proposal is None:
+        return
+    pending = {ProposalTaskState.UNMATERIALISED, ProposalTaskState.PROPOSED}
+    for entry in proposal.proposed_tasks:
+        if classify_proposed_task(backlog_root, workspace_root, entry.suggested_id) in pending:
+            return
+    delete_proposal(workspace_root, proposal.source_task_id)
+    logger.info(
+        "Proposal for %s fully consumed (every proposed task resolved); removed the JSON",
+        proposal.source_task_id,
+    )
+
+
 def _append_promote_comment(
     source_file: Path,
     source_task_id: str,
@@ -1928,6 +1999,7 @@ def promote_all_from_source(
             dep_on_source=dep_on_source,
         )
         promoted.append(result.draft_path)
+    delete_proposal_if_consumed(workspace_root, backlog_root, proposal)
     return promoted
 
 

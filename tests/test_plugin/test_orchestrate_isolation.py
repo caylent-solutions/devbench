@@ -68,11 +68,15 @@ class TestOrchestratePluginSelfContained:
         """
         skill_text = (ORCHESTRATE_PLUGIN_ROOT / "skills" / "orchestrate" / "SKILL.md").read_text(encoding="utf-8")
         # Match every Skill("devbench-orchestrate:<agent>", ...) invocation.
-        invocations = set(re.findall(r"devbench-orchestrate:([a-z][a-z_-]+)", skill_text))
+        invocations = set(re.findall(r"devbench-orchestrate:([a-z][a-z_:-]+)", skill_text))
         # Map review-team underscored shortnames to their actual file
         # locations (review_team subdir + hyphenated filename).
         review_team_map = {
             "code_review": "review_team/code-reviewer.md",
+            "review_team:code-reviewer": "review_team/code-reviewer.md",
+            "review_team:test-reviewer": "review_team/test-reviewer.md",
+            "review_team:doc-reviewer": "review_team/doc-reviewer.md",
+            "review_team:changes-manifest": "review_team/changes-manifest.md",
             "test_review": "review_team/test-reviewer.md",
             "doc_review": "review_team/doc-reviewer.md",
             "changes_manifest": "review_team/changes-manifest.md",

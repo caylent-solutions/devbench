@@ -118,6 +118,7 @@ from devbench.backlog.proposal import (
     add_dep,
     classify_blocked_task,
     classify_proposed_task,
+    delete_proposal_if_consumed,
     detect_placeholder_descriptions,
     enforce_cascade_depth,
     find_matching_pending_proposal,
@@ -8849,10 +8850,20 @@ def _maybe_auto_cascade_proposal(source_task_id: str, proposal: Proposal) -> dic
         )
         return {"auto_cascade": "failed", "error": str(exc)}
 
+    # Drafts materialised by THIS call must always be wired, whatever status
+    # they were born with. Under `backlog.default_status_for_new_work_units:
+    # in-queue` a fresh draft classifies as PROMOTED rather than PROPOSED, so
+    # a PROPOSED-only guard skips promote_proposal entirely -- and with it the
+    # dependency row and the `[BLOCKED_PENDING_PROPOSAL]` marker that the
+    # ADR-07 cascade needs to auto-unblock the source once the recovery task
+    # completes. The source would stay blocked forever with no marker naming
+    # what it is waiting for. The status check still guards drafts left over
+    # from earlier runs, which must not be re-promoted.
+    just_materialised = {path.stem for path in materialised}
     promoted: list[str] = []
     for task in proposal.proposed_tasks:
         state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
-        if state is not ProposalTaskState.PROPOSED:
+        if state is not ProposalTaskState.PROPOSED and task.suggested_id not in just_materialised:
             continue
         try:
             promote_proposal(
@@ -8869,6 +8880,7 @@ def _maybe_auto_cascade_proposal(source_task_id: str, proposal: Proposal) -> dic
                 task.suggested_id,
                 exc,
             )
+    delete_proposal_if_consumed(WORKSPACE_ROOT, BACKLOG_ROOT, proposal)
 
     logger.info(
         "write-proposal auto-cascade applied for %s: materialised=%d promoted=%d",

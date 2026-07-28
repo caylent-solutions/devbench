@@ -244,6 +244,44 @@ class TestPathHelpers:
         path = _story_dir(tmp_path, "E0-F1-S1")
         assert path == tmp_path / "E0" / "E0-F1" / "E0-F1-S1"
 
+    def test_story_dir_resolves_existing_slug_directories(self, tmp_path: Path) -> None:
+        """spec-to-backlog names dirs ``<id>-<slug>``; materialise must reuse them."""
+        slug = tmp_path / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        slug.mkdir(parents=True)
+        assert _story_dir(tmp_path, "E0-F1-S1") == slug
+
+    def test_story_dir_prefers_directory_holding_the_story_file(self, tmp_path: Path) -> None:
+        """When a bare orphan tree and the canonical slug tree both exist, pick the canonical one."""
+        orphan = tmp_path / "E0" / "E0-F1" / "E0-F1-S1"
+        orphan.mkdir(parents=True)
+        canonical = tmp_path / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        canonical.mkdir(parents=True)
+        (canonical / "E0-F1-S1.md").write_text("# E0-F1-S1: Story\n")
+        assert _story_dir(tmp_path, "E0-F1-S1") == canonical
+
+    def test_story_dir_does_not_match_a_longer_story_number(self, tmp_path: Path) -> None:
+        """``E0-F1-S10-*`` must not satisfy a lookup for ``E0-F1-S1``."""
+        (tmp_path / "E0-epic" / "E0-F1-feat" / "E0-F1-S10-story").mkdir(parents=True)
+        assert _story_dir(tmp_path, "E0-F1-S1") == tmp_path / "E0" / "E0-F1" / "E0-F1-S1"
+
+    def test_scan_story_sees_tasks_inside_slug_directory(self, tmp_path: Path) -> None:
+        slug = tmp_path / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        slug.mkdir(parents=True)
+        for tid in ("E0-F1-S1-T1", "E0-F1-S1-T2"):
+            (slug / f"{tid}.md").write_text(f"# {tid}\n")
+        assert scan_story_for_task_ids(tmp_path, "E0-F1-S1") == {"E0-F1-S1-T1", "E0-F1-S1-T2"}
+
+    def test_allocate_next_ids_does_not_collide_with_slug_directory_tasks(self, tmp_path: Path) -> None:
+        """Allocating blind to the slug dir would return T1 and overwrite an existing task."""
+        slug = tmp_path / "backlog" / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        slug.mkdir(parents=True)
+        for tid in ("E0-F1-S1-T1", "E0-F1-S1-T2"):
+            (slug / f"{tid}.md").write_text(f"# {tid}\n")
+        assert allocate_next_ids(tmp_path, tmp_path / "backlog", "E0-F1-S1", 2) == [
+            "E0-F1-S1-T3",
+            "E0-F1-S1-T4",
+        ]
+
     def test_constants_present(self) -> None:
         assert LOCK_FILE_NAME
         assert PROPOSAL_DIR_NAME
@@ -562,6 +600,77 @@ class TestMaterialiseProposal:
         backlog = (workspace / "BACKLOG.md").read_text()
         assert "E0-F1-S1-T2" in backlog
         assert "E0-F1-S1-T3" in backlog
+
+    def test_promote_all_deletes_the_proposal_json_once_consumed(self, tmp_path: Path) -> None:
+        """A consumed proposal must not linger as a permanent AWAITING_AMENDMENT_RECOVERY signal.
+
+        Left on disk it classifies its source task as auto-recovering forever
+        -- the classifier keeps promising a task-factory sweep that will never
+        run again -- and ``write_proposal`` then refuses to emit a replacement,
+        so the task can neither recover nor be re-proposed.
+        """
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal()
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        assert proposal_path(workspace, "E0-F1-S1-T1").is_file()
+
+        promote_all_from_source(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            source_task_id="E0-F1-S1-T1",
+        )
+
+        assert not proposal_path(workspace, "E0-F1-S1-T1").exists()
+        # And the blocker-resolver can now emit a replacement -- this would
+        # raise ProposalError("Proposal already exists ...") otherwise.
+        write_proposal(workspace, _sample_proposal(task_ids=["E0-F1-S1-T4"]))
+
+    def test_promote_all_wires_every_task_before_deleting(self, tmp_path: Path) -> None:
+        """Deleting mid-loop would strip the JSON that later promotions read for wiring."""
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal()
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        promote_all_from_source(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            source_task_id="E0-F1-S1-T1",
+        )
+
+        source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert source_text.count("[BLOCKED_PENDING_PROPOSAL]") == 2
+
+    def test_consumed_check_is_a_noop_without_a_proposal(self, tmp_path: Path) -> None:
+        """A draft with no originating proposal must not trip the consumed check."""
+        workspace = _build_workspace(tmp_path)
+        proposal_mod.delete_proposal_if_consumed(workspace, workspace / "backlog", None)
+
+    def test_consumed_check_deletes_once_the_last_draft_is_declined(self, tmp_path: Path) -> None:
+        workspace = _build_workspace(tmp_path)
+        backlog_root = workspace / "backlog"
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2", "E0-F1-S1-T3"])
+        write_proposal(workspace, proposal)
+        _seed_draft(backlog_root, "E0-F1-S1-T2", "in-queue")
+        _seed_draft(backlog_root, "E0-F1-S1-T3", "declined")
+
+        proposal_mod.delete_proposal_if_consumed(workspace, backlog_root, proposal)
+
+        assert not proposal_path(workspace, "E0-F1-S1-T1").exists()
 
     def test_refuses_when_unresolved_proposed_rows_exist(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)

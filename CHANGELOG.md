@@ -1316,6 +1316,26 @@ since the last release. PR #119 carries every change.
 
 ### Changed
 
+- **`claude-agent-sdk` lock advanced 0.1.48 -> 0.2.128** (issue #231; epic
+  driver #255). `pyproject.toml:18` already declared
+  `claude-agent-sdk>=0.1.48` with no upper bound -- `uv.lock` was simply
+  pinned to a stale 0.1.48 resolution. `uv lock --upgrade-package
+  claude-agent-sdk` resolved cleanly to 0.2.128 with no `pyproject.toml`
+  edit required. The nine sites in `tests/test_cli.py` that construct real
+  `claude_agent_sdk.types` objects (`AssistantMessage`, `ToolUseBlock`,
+  `ResultMessage`) pass unchanged against the upgraded SDK -- no
+  constructor signature change was observed. A live probe (`query()`
+  against a minimal prompt, run outside the orchestrator's own SDK
+  session via `env -u CLAUDECODE`) shows the 0.2.x iterator now
+  **terminates naturally** after a single `ResultMessage`
+  (`ITERATOR TERMINATED NATURALLY` printed within ~4s total), in contrast
+  to the 0.1.x behaviour documented above (#218) where the iterator never
+  terminated on its own and re-emitted paid `ResultMessage` turns every
+  ~5s. This is a cadence improvement, not a regression -- the
+  `_TERMINAL_ORCHESTRATE_MARKERS` early-break workaround remains in place
+  pending its own removal task. `make validate` passes unchanged after the
+  advance (98.01% coverage, 5084 passed, 8 skipped -- identical to the
+  pre-upgrade baseline).
 - **Cost-rate calibration guidance** added to `sample-config.yaml`
   `report:` block + new "Calibrating cost rates against actual billing"
   section in `docs/model-pricing.md`. Operators with non-default model /

@@ -28,6 +28,10 @@
               "type": "string",
               "enum": ["merge", "squash", "rebase"],
               "description": "Per-repo PR merge strategy override."
+            },
+            "branch_prefix": {
+              "type": "string",
+              "description": "Per-repo task-branch prefix override. When set, task branches are named backlog/<prefix>/<unit-id-lower> instead of backlog/<unit-id-lower>. Overrides the top-level git_ops.branch_prefix for this repo. Must not be empty, have leading/trailing '/', or contain '..'."
             }
           }
         }
@@ -133,6 +137,10 @@
         "single_branch": {
           "type": "string",
           "description": "When set, all work units use this branch name instead of per-unit backlog/<id> branches. Enables accumulating multiple commits on one branch for a single PR."
+        },
+        "branch_prefix": {
+          "type": "string",
+          "description": "Top-level task-branch prefix, overridden per-repo by repos.<org/repo>.branch_prefix. When set, task branches are named backlog/<prefix>/<unit-id-lower> instead of backlog/<unit-id-lower>; also namespaces single_branch as <prefix>/<single_branch> when both are set. Namespaces branches by workspace so multiple devbench work groups sharing one downstream repo never collide on branch names. Default: unset (no prefix). Must not be empty, have leading/trailing '/', or contain '..'."
         },
         "defer_pr": {
           "type": "boolean",

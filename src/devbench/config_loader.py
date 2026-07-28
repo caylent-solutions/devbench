@@ -78,6 +78,7 @@ from devbench.constants import (
     ALLOWED_AGENT_MODEL_SHORT_NAMES,
     ANTHROPIC_AGENT_MODEL_PATTERN,
     BEDROCK_AGENT_MODEL_PATTERN,
+    BRANCH_NAME_TEMPLATE,
     DEFAULT_FALLBACK_MODEL_RATES,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
@@ -283,6 +284,15 @@ class GitOpsConfig:
             ``[AUTO_MERGE_SKIPPED] no_ci_watcher`` and skips. A marker
             file at ``<workspace>/.devbench/auto-merge-fired-<repo>.marker``
             prevents duplicate invocations. Defaults to ``False``.
+        branch_prefix: Top-level task-branch prefix, overridden per-repo by
+            ``RepoConfig.branch_prefix``.  When set, task branches are named
+            ``backlog/<prefix>/<unit-id-lower>`` instead of
+            ``backlog/<unit-id-lower>``.  Also namespaces ``single_branch``
+            as ``<prefix>/<single_branch>`` when both are set.  Namespaces
+            branches by workspace so multiple devbench work groups sharing
+            one downstream repo (each independently numbering tasks from
+            ``E1-F1-S1-T1``) never collide on branch names.  Defaults to
+            ``None`` (no prefix, original behaviour).
     """
 
     update_submodule: bool = False
@@ -296,6 +306,7 @@ class GitOpsConfig:
     local_only: bool = False
     auto_finalize: bool = False
     auto_merge: bool = False
+    branch_prefix: str | None = None
 
 
 @dataclass
@@ -916,6 +927,12 @@ class RepoConfig:
             the ``/`` in ``org/repo``).
         merge_strategy: Per-repo PR merge strategy override.  When ``None``,
             the top-level ``RuntimeConfig.merge_strategy`` is used.
+        branch_prefix: Per-repo task-branch prefix override.  When ``None``,
+            the top-level ``GitOpsConfig.branch_prefix`` is used.  Inserted
+            between ``backlog/`` and the lowercased unit ID (e.g. prefix
+            ``wg_004`` yields ``backlog/wg_004/e1-f1-s1-t1``).  Use this to
+            avoid task-branch collisions when multiple devbench workspaces
+            push to the same shared repo.
         resolved_checkout_path: Absolute filesystem path to the repo
             checkout, populated by ``load_runtime_config``. Equal to
             ``<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
@@ -930,6 +947,7 @@ class RepoConfig:
     default_branch: str | None = None
     checkout_directory: str | None = None
     merge_strategy: str | None = None
+    branch_prefix: str | None = None
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
 
@@ -1202,6 +1220,43 @@ def resolve_config_path(
     return workspace_root / DEFAULT_CONFIG_SUBPATH
 
 
+def _validate_branch_prefix(path: Path, key: str, value: str) -> None:
+    """Validate a ``branch_prefix`` value shared by repo- and top-level config.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key the value came from (used in error messages).
+        value: Raw prefix string to validate.
+
+    Raises:
+        ValueError: If *value* is empty, has leading/trailing ``/``, or
+            contains a parent-traversal (``..``) segment.
+    """
+    if not value.strip("/"):
+        raise ValueError(f"Config file '{path}': {key} must not be empty when set, got '{value}'.")
+    if value != value.strip("/"):
+        raise ValueError(f"Config file '{path}': {key} must not have leading or trailing '/', got '{value}'.")
+    if ".." in Path(value).parts:
+        raise ValueError(f"Config file '{path}': {key} must not contain parent traversal ('..'), got '{value}'.")
+
+
+def _parse_branch_prefix(path: Path, key: str, raw_value: str | None) -> str | None:
+    """Parse and validate an optional ``branch_prefix`` YAML value.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key the value came from (used in error messages).
+        raw_value: Raw value from YAML (``None``/falsy means unset).
+
+    Returns:
+        The validated prefix string, or ``None`` when unset.
+    """
+    branch_prefix: str | None = raw_value or None
+    if branch_prefix is not None:
+        _validate_branch_prefix(path, key, branch_prefix)
+    return branch_prefix
+
+
 def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoConfig:
     """Parse and validate a single repo entry from raw YAML.
 
@@ -1214,7 +1269,9 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         ``RepoConfig`` populated from *repo_data*.
 
     Raises:
-        ValueError: If *checkout_directory* is absolute or contains ``..``.
+        ValueError: If *checkout_directory* is absolute or contains ``..``,
+            or if *branch_prefix* is empty or has leading/trailing ``/``
+            or a parent-traversal segment.
     """
     if not isinstance(repo_data, dict):
         return RepoConfig()
@@ -1222,11 +1279,14 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     default_branch: str | None = repo_data.get("default_branch")
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
 
+    repo_branch_prefix = _parse_branch_prefix(path, f"repos.{repo_name}.branch_prefix", repo_data.get("branch_prefix"))
+
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
         return RepoConfig(
             default_branch=default_branch,
             merge_strategy=repo_merge_strategy,
+            branch_prefix=repo_branch_prefix,
         )
 
     if Path(raw_checkout).is_absolute():
@@ -1243,6 +1303,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         default_branch=default_branch,
         checkout_directory=raw_checkout,
         merge_strategy=repo_merge_strategy,
+        branch_prefix=repo_branch_prefix,
     )
 
 
@@ -1467,6 +1528,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     auto_finalize = bool(git_ops_raw.get("auto_finalize", False))
     auto_merge = bool(git_ops_raw.get("auto_merge", False))
     _validate_auto_finalize_auto_merge(path, defer_pr, local_only, auto_finalize, auto_merge)
+    branch_prefix_raw = _parse_branch_prefix(path, "git_ops.branch_prefix", git_ops_raw.get("branch_prefix"))
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
@@ -1479,6 +1541,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         local_only=local_only,
         auto_finalize=auto_finalize,
         auto_merge=auto_merge,
+        branch_prefix=branch_prefix_raw,
     )
     if local_only:
         missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]
@@ -1746,3 +1809,71 @@ def get_effective_merge_strategy(repo: str, runtime_config: RuntimeConfig) -> st
     if runtime_config.merge_strategy:
         return runtime_config.merge_strategy
     return None
+
+
+def get_effective_branch_prefix(repo: str, runtime_config: RuntimeConfig) -> str | None:
+    """Return the effective task-branch prefix for *repo*.
+
+    Resolution: per-repo ``repos.<org/repo>.branch_prefix`` override, else the
+    top-level ``git_ops.branch_prefix``, else ``None`` (no prefix, original
+    ``backlog/<unit-id>`` naming).  Pure function -- no env reads, no I/O.
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        The configured branch-prefix string, or ``None`` when neither
+        per-repo nor top-level sets one.
+    """
+    repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.branch_prefix:
+        return repo_config.branch_prefix
+    if runtime_config.git_ops.branch_prefix:
+        return runtime_config.git_ops.branch_prefix
+    return None
+
+
+def format_branch_name(unit_id: str, branch_prefix: str | None = None) -> str:
+    """Build the canonical task-branch name for *unit_id*.
+
+    Produces ``backlog/<unit-id-lower>`` when *branch_prefix* is unset
+    (original behaviour, unchanged), or ``backlog/<prefix>/<unit-id-lower>``
+    when set -- namespacing the branch so multiple devbench workspaces
+    sharing one downstream repo cannot collide on task-branch names.
+
+    Args:
+        unit_id: Work-unit ID (e.g. ``'E1-F1-S1-T1'``); case-folded to lower.
+        branch_prefix: Effective prefix from :func:`get_effective_branch_prefix`,
+            or ``None``.
+
+    Returns:
+        The branch name to create/push/match against.
+    """
+    unit_slug = unit_id.lower()
+    if branch_prefix:
+        return BRANCH_NAME_TEMPLATE.format(unit_id=f"{branch_prefix}/{unit_slug}")
+    return BRANCH_NAME_TEMPLATE.format(unit_id=unit_slug)
+
+
+def format_single_branch_name(single_branch: str, branch_prefix: str | None = None) -> str:
+    """Namespace ``git_ops.single_branch`` by *branch_prefix*, same rationale as :func:`format_branch_name`.
+
+    Single-branch (accumulator) mode shares one branch across every work
+    unit instead of one per unit, but the collision risk is identical: two
+    devbench workspaces sharing a downstream repo could configure the same
+    ``single_branch`` name. Prefixing it the same way per-unit branches are
+    prefixed closes that gap.
+
+    Args:
+        single_branch: The configured ``git_ops.single_branch`` value.
+        branch_prefix: Effective prefix from :func:`get_effective_branch_prefix`,
+            or ``None``.
+
+    Returns:
+        ``single_branch`` unchanged when *branch_prefix* is unset (original
+        behaviour), or ``<prefix>/<single_branch>`` when set.
+    """
+    if branch_prefix:
+        return f"{branch_prefix}/{single_branch}"
+    return single_branch

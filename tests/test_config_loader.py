@@ -15,12 +15,16 @@ import pytest
 from devbench.config_loader import (
     DEFAULT_CONFIG_SUBPATH,
     BacklogConfig,
+    GitOpsConfig,
     LimitConfig,
     RepoConfig,
     RuntimeConfig,
     SkillsConfig,
     TimeoutConfig,
+    format_branch_name,
+    format_single_branch_name,
     get_configured_default_branch,
+    get_effective_branch_prefix,
     get_effective_merge_strategy,
     get_repo_local_path,
     load_runtime_config,
@@ -288,6 +292,74 @@ class TestGetEffectiveMergeStrategy:
     def test_none_when_neither_set(self) -> None:
         config = RuntimeConfig(repos={"org/repo": RepoConfig(merge_strategy=None)}, merge_strategy=None)
         assert get_effective_merge_strategy("org/repo", config) is None
+
+
+class TestGetEffectiveBranchPrefix:
+    """Per-repo branch_prefix overrides the top-level git_ops.branch_prefix; None when neither set.
+
+    Mirrors TestGetEffectiveMergeStrategy -- same three-tier precedence
+    (per-repo -> top-level -> None), added to prevent task-branch
+    collisions when multiple devbench workspaces share one downstream repo.
+    """
+
+    def test_per_repo_override_wins(self) -> None:
+        config = RuntimeConfig(
+            repos={"org/repo": RepoConfig(branch_prefix="wg_004")},
+            git_ops=GitOpsConfig(branch_prefix="wg_global"),
+        )
+        assert get_effective_branch_prefix("org/repo", config) == "wg_004"
+
+    def test_top_level_fallback_when_no_per_repo(self) -> None:
+        config = RuntimeConfig(
+            repos={"org/repo": RepoConfig(branch_prefix=None)},
+            git_ops=GitOpsConfig(branch_prefix="wg_global"),
+        )
+        assert get_effective_branch_prefix("org/repo", config) == "wg_global"
+
+    def test_top_level_applies_to_unknown_repo(self) -> None:
+        config = RuntimeConfig(repos={}, git_ops=GitOpsConfig(branch_prefix="wg_global"))
+        assert get_effective_branch_prefix("org/unknown", config) == "wg_global"
+
+    def test_none_when_neither_set(self) -> None:
+        config = RuntimeConfig(repos={"org/repo": RepoConfig(branch_prefix=None)}, git_ops=GitOpsConfig())
+        assert get_effective_branch_prefix("org/repo", config) is None
+
+
+class TestFormatBranchName:
+    """format_branch_name: backlog/<id> unchanged when unset; namespaced when a prefix is given."""
+
+    def test_no_prefix_matches_original_template(self) -> None:
+        assert format_branch_name("E1-F1-S1-T1") == "backlog/e1-f1-s1-t1"
+
+    def test_no_prefix_explicit_none_matches_original_template(self) -> None:
+        assert format_branch_name("E1-F1-S1-T1", None) == "backlog/e1-f1-s1-t1"
+
+    def test_prefix_inserted_between_backlog_and_unit_id(self) -> None:
+        assert format_branch_name("E1-F1-S1-T1", "wg_004") == "backlog/wg_004/e1-f1-s1-t1"
+
+    def test_empty_string_prefix_treated_as_unset(self) -> None:
+        assert format_branch_name("E1-F1-S1-T1", "") == "backlog/e1-f1-s1-t1"
+
+
+class TestFormatSingleBranchName:
+    """format_single_branch_name: single_branch unchanged when unset; namespaced when a prefix is given.
+
+    Single-branch (accumulator) mode has the same cross-workspace collision
+    risk as per-unit branches -- two devbench workspaces could configure the
+    same single_branch name against the same shared repo (issue #283 AC-5).
+    """
+
+    def test_no_prefix_matches_configured_single_branch(self) -> None:
+        assert format_single_branch_name("feat/batch") == "feat/batch"
+
+    def test_no_prefix_explicit_none_matches_configured_single_branch(self) -> None:
+        assert format_single_branch_name("feat/batch", None) == "feat/batch"
+
+    def test_prefix_prepended_to_single_branch(self) -> None:
+        assert format_single_branch_name("feat/batch", "wg_004") == "wg_004/feat/batch"
+
+    def test_empty_string_prefix_treated_as_unset(self) -> None:
+        assert format_single_branch_name("feat/batch", "") == "feat/batch"
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1342,114 @@ class TestGitOpsConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.stop_hook.stale_task_minutes == 30
+
+
+@pytest.mark.unit
+class TestBranchPrefixConfig:
+    """git_ops.branch_prefix and repos.<org/repo>.branch_prefix: parsing and validation.
+
+    Namespaces task branches (backlog/<prefix>/<id>) so multiple devbench
+    workspaces sharing one downstream repo cannot collide on branch names.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_branch_prefix_defaults_to_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.branch_prefix is None
+        assert result.repos["caylent-solutions/devbench"].branch_prefix is None
+
+    def test_top_level_branch_prefix_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              branch_prefix: wg_004
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.branch_prefix == "wg_004"
+
+    def test_per_repo_branch_prefix_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+                branch_prefix: wg_004
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.repos["caylent-solutions/devbench"].branch_prefix == "wg_004"
+
+    def test_rejects_empty_branch_prefix(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              branch_prefix: ""
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.branch_prefix is None
+
+    def test_rejects_leading_slash_branch_prefix(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              branch_prefix: /wg_004
+            """,
+        )
+        with pytest.raises(ValueError, match="leading or trailing"):
+            load_runtime_config(cfg, {})
+
+    def test_rejects_trailing_slash_repo_branch_prefix(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+                branch_prefix: wg_004/
+            """,
+        )
+        with pytest.raises(ValueError, match="leading or trailing"):
+            load_runtime_config(cfg, {})
+
+    def test_rejects_parent_traversal_branch_prefix(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              branch_prefix: "../escape"
+            """,
+        )
+        with pytest.raises(ValueError, match="parent traversal"):
+            load_runtime_config(cfg, {})
 
 
 class TestManifestAmendmentConfig:

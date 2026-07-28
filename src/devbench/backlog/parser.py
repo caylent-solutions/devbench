@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT
+from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT, RUNTIME_CONFIG
+from devbench.config_loader import format_branch_name, get_effective_branch_prefix
 from devbench.constants import (
     BACKLOG_AC_RE,
     BACKLOG_BRANCH_RE,
@@ -21,7 +22,6 @@ from devbench.constants import (
     BACKLOG_INDEX_TABLE_ROW_RE,
     BACKLOG_REPO_RE,
     BACKLOG_STATUS_RE,
-    BRANCH_NAME_TEMPLATE,
     EPIC_PLACEHOLDER_ID,
     STATUS_BLOCKED,
     STATUS_DECLINED,
@@ -274,7 +274,7 @@ class BacklogParser:
         if branch_match is not None:
             branch = branch_match.group(1).strip()
         else:
-            branch = BRANCH_NAME_TEMPLATE.format(unit_id=unit_id.lower())
+            branch = format_branch_name(unit_id, get_effective_branch_prefix(repo, RUNTIME_CONFIG))
 
         # --- Description ---
         description = _extract_section(content, "Description")

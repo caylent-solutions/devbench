@@ -209,6 +209,12 @@ The output starts with `### Code Standards` and ends after the `#### Error Handl
 - Key absent or set to `draft`: write `## Status: draft` as the second line of the task file.
 - Key set to `in-queue` (legacy workspace override): write `## Status: in-queue` as the second line of the task file.
 
+**Branch naming (multi-workspace safety)**: Before writing each task's `## Target Repository` block, read `git_ops.branch_prefix` from `backlog/config/devbench.yaml`, or the per-repo override at `repos.<org/repo>.branch_prefix` when the task's repo has one:
+- A prefix is configured: write `- **Branch:** \`backlog/<prefix>/<task-id-lower>\``.
+- No prefix configured (key absent at both levels): write `- **Branch:** \`backlog/<task-id-lower>\`` (unchanged legacy convention).
+
+This MUST match devbench's own `format_branch_name` resolution (`src/devbench/config_loader.py`) exactly, because every work group numbers its own backlog independently starting at `E1-F1-S1-T1` while multiple work groups typically push to the SAME downstream repo. Hardcoding the unprefixed form here silently reintroduces cross-workspace branch-name collisions (two unrelated tasks in different work groups landing on the identical `backlog/<id>` branch) even when the operator has correctly set `branch_prefix` in their config.
+
 ### 5b -- Self-critique at per-Task granularity
 
 Score each item PASS or FAIL:

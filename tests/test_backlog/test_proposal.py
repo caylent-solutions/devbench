@@ -423,6 +423,44 @@ class TestGenerateDraftMd:
         assert "`TODO` | TODO -- describe change" in md
         assert "(none documented)" in md
 
+    def test_branch_line_uses_canonical_template_by_default(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="My Task",
+            files_to_own=[],
+            linked_scenarios=[],
+            suggested_acs=[],
+            suggested_approach="",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "- **Branch:** `backlog/e0-f1-s1-t9`" in md
+
+    def test_branch_line_namespaced_by_configured_branch_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The generated draft's Branch: line must match the branch devbench
+        will actually push to -- so it stays namespaced when git_ops.branch_prefix
+        (or a per-repo override) is configured, same as BacklogParser's fallback."""
+        import devbench.config as config_module
+        from devbench.config_loader import GitOpsConfig, RepoConfig, RuntimeConfig
+
+        monkeypatch.setattr(
+            config_module,
+            "RUNTIME_CONFIG",
+            RuntimeConfig(
+                repos={"acme/example": RepoConfig(branch_prefix="wg_004")},
+                git_ops=GitOpsConfig(),
+            ),
+        )
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="My Task",
+            files_to_own=[],
+            linked_scenarios=[],
+            suggested_acs=[],
+            suggested_approach="",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "- **Branch:** `backlog/wg_004/e0-f1-s1-t9`" in md
+
 
 # ---------------------------------------------------------------------------
 # BACKLOG.md manipulation

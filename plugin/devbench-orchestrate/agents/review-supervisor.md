@@ -20,14 +20,14 @@ from spawning its own sub-agents: a nested `Agent(...)` call silently no-ops, so
 the fan-out never ran and the task stalled as a runtime degradation that no
 restart could clear.
 
-Reproduced live in this workspace on 2026-07-28: work unit `E1-F1-S1-T1`
-completed its implementation, then this supervisor's agent-tool self-check found none
-available on two consecutive attempts (18:56 and 18:57 UTC). The orchestrator
-classified the task `RUNTIME_DEGRADATION` and exited with
-`ORCHESTRATOR_RESTART_EXIT_CODE` (42). The guidance previously in this file --
-"operator restart of `make start` required" -- was wrong: the fault is
-structural, and restarting reproduces it identically. See ADR-28 for the
-original root-cause analysis.
+The observable signature was: the executor completed its implementation, this
+supervisor's agent-tool self-check then found no reviewer agents available on
+consecutive attempts, and the orchestrator classified the work unit
+`RUNTIME_DEGRADATION` and exited with `ORCHESTRATOR_RESTART_EXIT_CODE` (42).
+The guidance previously in this file -- "operator restart of `make start`
+required" -- was wrong: the fault is structural, so a restart reproduces it
+identically and no work unit can ever reach `done`. See ADR-28 for the original
+root-cause analysis and ADR-33 for the flatten that replaced it.
 
 ## What replaced it
 

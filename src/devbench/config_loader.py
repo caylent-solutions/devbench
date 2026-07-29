@@ -97,6 +97,16 @@ _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
 _SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
 _SKILLS_DEFAULT_MAX_ITERATIONS: int = 5
 
+# Quota wait-and-resume configuration (issue #236, spec S5.2, FR-2.9).
+_QUOTA_HANDLING_VALID_ON_EXHAUSTION: frozenset[str] = frozenset({"wait", "fail", "drain"})
+_QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT: frozenset[str] = frozenset({"drain", "fail", "keep_waiting"})
+_QUOTA_HANDLING_VALID_RESUME_STRATEGY: frozenset[str] = frozenset(
+    {"continue_current_wu", "restart_wu", "drain_and_resume"}
+)
+_QUOTA_HANDLING_POLL_INTERVAL_MIN: int = 30
+_QUOTA_HANDLING_POLL_INTERVAL_MAX: int = 3600
+_QUOTA_HANDLING_MAX_WAIT_MIN: int = 1
+
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
 # Pinned here so SKILL.md prose and tests reference the same literals.
@@ -580,6 +590,52 @@ class SkillsConfig:
     max_iterations: int = _SKILLS_DEFAULT_MAX_ITERATIONS
 
 
+@dataclass
+class QuotaHandlingConfig:
+    """Quota wait-and-resume configuration (issue #236, spec S5.2).
+
+    Loaded from the ``quota_handling:`` YAML section. Default is ON per
+    spec S5.2. Operators opt out via ``quota_handling: {enabled: false}``
+    to restore the legacy non-zero exit behaviour (#193 AC-4, spec AC-24).
+    The quota core (detection, wait, probe, checkpoint, resume strategies)
+    is delivered separately; this dataclass is the config surface the
+    dispatcher reads to decide what that core does on each quota signal.
+
+    Attributes:
+        enabled: Master toggle. ``True`` (the default) enables
+            wait-and-resume. ``False`` restores the legacy non-zero exit.
+        on_exhaustion: What to do when a quota signal is detected. One of
+            ``"wait"`` (default), ``"fail"`` (non-zero exit), ``"drain"``
+            (request a drain and return).
+        poll_interval_seconds: Polling cadence between recovery probes.
+            Must be in ``[30, 3600]``. Default 60.
+        max_wait_seconds: Maximum total wait in seconds. Must be >= 1.
+            Default 18000 (5 hours).
+        on_exhaustion_timeout: Action when ``max_wait_seconds`` elapses
+            without recovery. One of ``"drain"`` (default), ``"fail"``,
+            ``"keep_waiting"``.
+        resume_strategy: How to resume after recovery. One of
+            ``"continue_current_wu"`` (default), ``"restart_wu"``,
+            ``"drain_and_resume"``.
+        audit_comment_on_wait: When ``True`` (default), appends a
+            ``[QUOTA_WAITING]`` comment to the in-progress work unit.
+        audit_comment_on_resume: When ``True`` (default), appends a
+            ``[QUOTA_RESUMED]`` comment after recovery.
+        log_structured_events: When ``True`` (default), emits structured
+            log events on quota transitions.
+    """
+
+    enabled: bool = True
+    on_exhaustion: str = "wait"
+    poll_interval_seconds: int = 60
+    max_wait_seconds: int = 18000
+    on_exhaustion_timeout: str = "drain"
+    resume_strategy: str = "continue_current_wu"
+    audit_comment_on_wait: bool = True
+    audit_comment_on_resume: bool = True
+    log_structured_events: bool = True
+
+
 def _parse_model_rates(model_id: str, raw: object, source: str) -> ModelRates:
     """Parse one ``report.models.<id>`` entry into a ``ModelRates``.
 
@@ -686,6 +742,75 @@ def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
         exemplar_spec_path=str(exemplar_spec) if exemplar_spec else None,
         fan_out_threshold=fan_out,
         max_iterations=max_iter,
+    )
+
+
+def _parse_quota_handling_config(path: Path, raw: dict) -> QuotaHandlingConfig:
+    """Parse and validate the ``quota_handling:`` YAML section.
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw ``quota_handling`` dict from YAML (already schema-validated
+            for unknown keys and enum membership). May be an empty dict when
+            the section is absent -- an absent block yields the full S5.2
+            default set, never a partial or ``None`` object.
+
+    Returns:
+        ``QuotaHandlingConfig`` populated from *raw*.
+
+    Raises:
+        ValueError: When an enum field has an invalid value or a range
+            field is out of bounds. Rejection happens here, at config-load
+            time, never deferred to dispatch time (FR-2.9).
+    """
+    defaults = QuotaHandlingConfig()
+
+    on_exhaustion = raw.get("on_exhaustion", defaults.on_exhaustion)
+    if on_exhaustion not in _QUOTA_HANDLING_VALID_ON_EXHAUSTION:
+        valid = ", ".join(sorted(_QUOTA_HANDLING_VALID_ON_EXHAUSTION))
+        raise ValueError(
+            f"Config file '{path}': quota_handling.on_exhaustion {on_exhaustion!r} is not one of [{valid}]."
+        )
+
+    on_exhaustion_timeout = raw.get("on_exhaustion_timeout", defaults.on_exhaustion_timeout)
+    if on_exhaustion_timeout not in _QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT:
+        valid = ", ".join(sorted(_QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT))
+        raise ValueError(
+            f"Config file '{path}': quota_handling.on_exhaustion_timeout {on_exhaustion_timeout!r} "
+            f"is not one of [{valid}]."
+        )
+
+    resume_strategy = raw.get("resume_strategy", defaults.resume_strategy)
+    if resume_strategy not in _QUOTA_HANDLING_VALID_RESUME_STRATEGY:
+        valid = ", ".join(sorted(_QUOTA_HANDLING_VALID_RESUME_STRATEGY))
+        raise ValueError(
+            f"Config file '{path}': quota_handling.resume_strategy {resume_strategy!r} is not one of [{valid}]."
+        )
+
+    poll_interval_seconds = int(raw.get("poll_interval_seconds", defaults.poll_interval_seconds))
+    if not (_QUOTA_HANDLING_POLL_INTERVAL_MIN <= poll_interval_seconds <= _QUOTA_HANDLING_POLL_INTERVAL_MAX):
+        raise ValueError(
+            f"Config file '{path}': quota_handling.poll_interval_seconds {poll_interval_seconds!r} "
+            f"must be in [{_QUOTA_HANDLING_POLL_INTERVAL_MIN}, {_QUOTA_HANDLING_POLL_INTERVAL_MAX}]."
+        )
+
+    max_wait_seconds = int(raw.get("max_wait_seconds", defaults.max_wait_seconds))
+    if max_wait_seconds < _QUOTA_HANDLING_MAX_WAIT_MIN:
+        raise ValueError(
+            f"Config file '{path}': quota_handling.max_wait_seconds {max_wait_seconds!r} "
+            f"must be >= {_QUOTA_HANDLING_MAX_WAIT_MIN}."
+        )
+
+    return QuotaHandlingConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        on_exhaustion=on_exhaustion,
+        poll_interval_seconds=poll_interval_seconds,
+        max_wait_seconds=max_wait_seconds,
+        on_exhaustion_timeout=on_exhaustion_timeout,
+        resume_strategy=resume_strategy,
+        audit_comment_on_wait=bool(raw.get("audit_comment_on_wait", defaults.audit_comment_on_wait)),
+        audit_comment_on_resume=bool(raw.get("audit_comment_on_resume", defaults.audit_comment_on_resume)),
+        log_structured_events=bool(raw.get("log_structured_events", defaults.log_structured_events)),
     )
 
 
@@ -1146,6 +1271,8 @@ class RuntimeConfig:
         report: Report and cost estimation settings.
         stop_hook: Stop hook circuit breaker settings.
         backlog: Backlog lifecycle settings (default status for new WUs).
+        quota_handling: Quota wait-and-resume configuration (issue #236,
+            spec S5.2). Absent YAML block yields the full default set.
         allowed_orgs: List of permitted GitHub organisations.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
@@ -1178,6 +1305,7 @@ class RuntimeConfig:
     hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
     orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
     backlog: BacklogConfig = field(default_factory=BacklogConfig)
+    quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
@@ -1701,6 +1829,14 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     backlog_raw = raw.get("backlog") or {}
     backlog = _parse_backlog_config(path, backlog_raw)
 
+    # Populate QuotaHandlingConfig from YAML quota_handling block (issue
+    # #236, spec S5.2). Schema enforces enum membership, range bounds, and
+    # additionalProperties: false; _parse_quota_handling_config re-validates
+    # at runtime so a bypassed schema layer still fails fast with a message
+    # naming the field. An absent block yields the full default set.
+    quota_handling_raw = raw.get("quota_handling") or {}
+    quota_handling = _parse_quota_handling_config(path, quota_handling_raw)
+
     # Populate SkillsConfig from YAML skills block (issue #221 E1-E10).
     # JSON Schema validates types + minimums; _parse_skills_config
     # re-validates at runtime to emit clearer messages naming the field.
@@ -1723,6 +1859,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         hook_tail=hook_tail,
         orchestrate=orchestrate,
         backlog=backlog,
+        quota_handling=quota_handling,
         skills=skills,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,

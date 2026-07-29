@@ -413,6 +413,62 @@ skills:
 #     changes_manifest: opus
 
 # ---------------------------------------------------------------------------
+# Quota wait-and-resume (issue #236, spec S5.2).
+#
+# STATUS: this block is parsed and validated at config-load time today
+# (schema enum/range checks, additionalProperties:false), but nothing in
+# the orchestrator consumes it yet -- the quota dispatcher that reads
+# on_exhaustion / on_exhaustion_timeout / resume_strategy lands in a
+# follow-up work unit (E2-F4). Until that wiring lands, a quota-exhaustion
+# signal still produces the pre-existing non-zero exit no matter what this
+# block says, and enabled:true (the default) has no runtime effect yet.
+#
+# Once wired, this block will govern what the orchestrator does when the
+# Claude CLI reports a quota-exhaustion signal (HTTP 429 / CLI "You've hit
+# your limit" message).
+#
+# enabled: true (default) -- once wired, the orchestrator will pause and
+#   wait for the quota window to reset rather than exiting with a non-zero
+#   code. Set to false to restore the pre-#236 behaviour (propagate the
+#   error, non-zero exit; #193 AC-4, spec AC-24) once the dispatcher acts
+#   on this flag.
+# on_exhaustion: what to do when a quota signal is detected (once wired).
+#   "wait"  -- pause and poll until reset_at (default).
+#   "fail"  -- re-raise immediately (non-zero exit, same as enabled:false).
+#   "drain" -- trigger a graceful drain then exit.
+# poll_interval_seconds: base cadence for the recovery probe loop (30-3600).
+# max_wait_seconds: cap on total wait time in seconds; on_exhaustion_timeout
+#   fires if exceeded.
+# on_exhaustion_timeout: what to do when max_wait_seconds is exceeded.
+#   "drain"        -- trigger a graceful drain (default).
+#   "fail"         -- re-raise the quota error.
+#   "keep_waiting" -- ignore the cap and keep polling.
+# resume_strategy: how to re-enter the orchestrate loop after recovery.
+#   "continue_current_wu" -- resume where we left off (default).
+#   "restart_wu"          -- force the current WU back to in-queue.
+#   "drain_and_resume"    -- remove the quota checkpoint and request a
+#     graceful drain; the run stops and must be restarted manually, since
+#     the Makefile auto-restart loop (Makefile:117-123) fires only on exit
+#     code 42, which a graceful drain does not produce.
+# audit_comment_on_wait: write a [QUOTA_WAITING] audit comment to the active
+#   work unit when pausing. Defaults to true.
+# audit_comment_on_resume: write a [QUOTA_RESUMED] audit comment when the
+#   wait ends. Defaults to true.
+# log_structured_events: emit JSON-structured events alongside the text
+#   markers. Defaults to true.
+# ---------------------------------------------------------------------------
+# quota_handling:
+#   enabled: true
+#   on_exhaustion: wait
+#   poll_interval_seconds: 60
+#   max_wait_seconds: 18000
+#   on_exhaustion_timeout: drain
+#   resume_strategy: continue_current_wu
+#   audit_comment_on_wait: true
+#   audit_comment_on_resume: true
+#   log_structured_events: true
+
+# ---------------------------------------------------------------------------
 # Operator-facing notifications (PR #202).
 # ---------------------------------------------------------------------------
 # Per-event toggles for lifecycle pings.  Each notification endpoint
@@ -448,6 +504,8 @@ skills:
 #     ci_failure: false                    # CI run on a WU PR failed
 #     orchestrator_stop: false             # orchestrator loop exited (clean / drain / SIGTERM / crash)
 #     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
+#     quota_waiting: false                 # orchestrator hit a quota and started waiting (inert until E2-F3-S1-T1 wires the dispatcher)
+#     quota_resumed: false                 # quota recovered and the run resumed (inert until E2-F3-S1-T1 wires the dispatcher)
 #   slack:
 #     enabled: false                       # endpoint-level toggle; flip to true to enable Slack POSTs
 #     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)

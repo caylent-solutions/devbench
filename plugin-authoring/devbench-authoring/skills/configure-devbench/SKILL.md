@@ -169,7 +169,7 @@ Validate each provided value is a positive integer.
 
 ## Step 6 -- agents section: judge_model and executor_model overrides
 
-The `agents:` section (mapped to `agent_models` in `RuntimeConfig`) lets operators pin each devbench agent to a specific model. When `use_bedrock: true`, values must be Bedrock ARNs; otherwise use short names (`opus`, `sonnet`, `haiku`) or full Anthropic API IDs (e.g. `claude-opus-4-7`).
+The `agents:` section (mapped to `agent_models` in `RuntimeConfig`) lets operators pin each devbench agent to a specific model. When `use_bedrock: true`, values must be Bedrock model ids of the form `us.anthropic.claude-<name>-<ver>-v<N>`; otherwise use short names (`opus`, `sonnet`, `fable`) or full Anthropic API IDs (e.g. `claude-opus-5`).
 
 Ask the operator:
 
@@ -188,9 +188,9 @@ Ask the operator:
 >   review_team.doc_reviewer    [frontmatter default: opus]
 >   review_team.changes_manifest [frontmatter default: opus]"
 
-After collecting values, validate the executor_model and judge_model choices against the resolved `use_bedrock` flag. If `use_bedrock: true`, Bedrock ARN format is required (`arn:aws:bedrock:...`). Reject mismatches with:
+After collecting values, validate the executor_model and judge_model choices against the resolved `use_bedrock` flag. If `use_bedrock: true`, the Bedrock model id format `us.anthropic.claude-<name>-<ver>-v<N>` is required (e.g. `us.anthropic.claude-opus-4-7-v1`). Reject mismatches with:
 
-> "[INVALID] When use_bedrock is true, model values must be Bedrock ARNs (arn:aws:bedrock:...). Re-enter."
+> "[INVALID] When use_bedrock is true, model values must be Bedrock model ids of the form us.anthropic.claude-<name>-<ver>-v<N> (e.g. us.anthropic.claude-opus-4-7-v1). Re-enter."
 
 ---
 

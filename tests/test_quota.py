@@ -1,8 +1,10 @@
-"""Tests for src/devbench/quota.py -- detection tier.
+"""Tests for src/devbench/quota.py -- detection tier and wait tier.
 
-Coverage requirement: 100% line + branch on the detection-tier symbols added
-in this task (the wait/checkpoint/probe symbols belong to E2-F1-S2-T1 and are
-not covered here).
+Coverage requirement: 100% line + branch on the detection-tier symbols (FR-2.1
+/ FR-2.2 / FR-2.3) and the wait-tier symbols (FR-2.4) added across
+E2-F1-S1-T1 and E2-F1-S2-T1. The checkpoint and recovery-probe symbols
+belong to downstream tasks E2-F1-S2-T2 and E2-F1-S2-T3 and are not covered
+here.
 
 Covers:
 - QuotaExhaustedError and its four LSP subclasses (SubscriptionRateLimitError,
@@ -18,24 +20,48 @@ Covers:
 - The four #234 signal surfaces (spec AC-10).
 - Marker-integrity: the first _QUOTA_MARKERS entry is the curly-apostrophe
   escape sequence byte-for-byte, in both value and source spelling.
+- BackoffConfig: field defaults and the __post_init__ validation of its
+  documented invariants (initial_seconds > 0, max_seconds >= initial_seconds,
+  multiplier >= 1.0, jitter in [0, 1]) (FR-2.4).
+- _wait_toward_reset: stepped sleeps in poll_interval_seconds increments
+  toward a known future reset_at (never one blind long sleep), the
+  [QUOTA_POLLING] heartbeat emitted before each step, and the local-
+  accumulator elapsed bookkeeping that terminates deterministically under a
+  mocked clock (FR-2.4, spec AC-14).
+- wait_for_reset: the TDI-003a elapsed-reset short-circuit (zero probe
+  calls), the cadence guard and the poll_interval_seconds fail-fast guard
+  (both ValueError before any I/O), the max_wait_seconds == 0 fast path, the
+  full poll-loop call order (timeout -> elapsed-reset short-circuit ->
+  jittered delay -> heartbeat -> probe -> sleep -> delay growth), jittered
+  backoff bounds and growth/clamp, heartbeat coverage (per-poll, on the
+  reset_at path, reaching the root logging handler, and swallowed emitter
+  failures), and RecoveryProbeUnavailableError / other probe_fn exception
+  propagation (FR-2.4, spec AC-15 through AC-17, S10.1).
+- Every wait test mocks the clock at devbench.quota._get_current_utc and
+  patches asyncio.sleep with a simulated clock that accumulates the fake
+  sleep durations -- no test performs a real sleep (spec S10.1).
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
+Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
 AC-234-1, AC-234a-1.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from devbench.quota import (
     _QUOTA_MARKERS,
     ApiBillingError,
+    BackoffConfig,
     BedrockThrottleError,
     QuotaExhaustedError,
     RecoveryProbeUnavailableError,
@@ -44,10 +70,63 @@ from devbench.quota import (
     _has_quota_marker,
     _has_verbatim_quota_marker,
     _parse_reset_at_from_text,
+    _wait_toward_reset,
     detect_quota_error,
+    wait_for_reset,
 )
 
 _NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+
+class _FakeClock:
+    """A mutable clock box read by a mocked ``_get_current_utc``.
+
+    ``self.now`` only ever advances when ``advance()`` is called -- by a
+    fake ``asyncio.sleep`` (see :func:`_make_fake_sleep`) -- never on its
+    own. This keeps the wait engine's clock reads and its internal
+    "elapsed" bookkeeping deterministic under test without ever blocking on
+    a real timer (spec S10.1: the simulated clock accumulates the fake
+    sleep durations).
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def get(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+def _make_fake_sleep(clock: _FakeClock, recorder: list[tuple[str, float]] | None = None) -> AsyncMock:
+    """Build an ``AsyncMock`` standing in for ``asyncio.sleep`` that advances ``clock``.
+
+    Never performs a real sleep (spec AC-E2-F1-S2-T1-7): the mock's
+    ``side_effect`` advances the fake clock by the requested duration
+    instead of blocking.
+    """
+
+    async def _sleep(seconds: float) -> None:
+        if recorder is not None:
+            recorder.append(("sleep", seconds))
+        clock.advance(seconds)
+
+    return AsyncMock(side_effect=_sleep)
+
+
+class _FixedRng:
+    """Stand-in for ``secrets.SystemRandom`` with a fixed ``uniform()`` result.
+
+    Makes the jittered-backoff delay in ``wait_for_reset`` deterministic for
+    testing, instead of depending on the real cryptographic RNG.
+    """
+
+    def __init__(self, value: float) -> None:
+        self._value = value
+
+    def uniform(self, _a: float, _b: float) -> float:
+        return self._value
 
 
 def _make_exc(
@@ -1051,3 +1130,591 @@ class TestInternalHelperBranchCoverage:
         assert isinstance(result, SubscriptionRateLimitError)
         assert result.reset_at is not None
         assert result.reset_at.hour == 16
+
+
+# ---------------------------------------------------------------------------
+# Wait engine (FR-2.4). Every test below mocks the clock at
+# ``devbench.quota._get_current_utc`` and patches ``asyncio.sleep`` -- never
+# a real sleep -- per spec S10.1 / AC-E2-F1-S2-T1-7.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBackoffConfigValidation:
+    """BackoffConfig.__post_init__ enforces its documented invariants
+    (fail-fast: no silent normalisation of an out-of-contract config)."""
+
+    def test_default_construction_does_not_raise(self) -> None:
+        BackoffConfig()
+
+    @pytest.mark.parametrize("initial_seconds", [0, -1, -30])
+    def test_non_positive_initial_seconds_raises(self, initial_seconds: int) -> None:
+        with pytest.raises(ValueError, match="initial_seconds"):
+            BackoffConfig(initial_seconds=initial_seconds, max_seconds=600)
+
+    def test_max_seconds_less_than_initial_seconds_raises(self) -> None:
+        with pytest.raises(ValueError, match="max_seconds"):
+            BackoffConfig(initial_seconds=60, max_seconds=30)
+
+    def test_max_seconds_equal_to_initial_seconds_does_not_raise(self) -> None:
+        BackoffConfig(initial_seconds=60, max_seconds=60)
+
+    @pytest.mark.parametrize("multiplier", [0.0, 0.5, 0.999])
+    def test_multiplier_below_one_raises(self, multiplier: float) -> None:
+        with pytest.raises(ValueError, match="multiplier"):
+            BackoffConfig(multiplier=multiplier)
+
+    def test_multiplier_equal_to_one_does_not_raise(self) -> None:
+        BackoffConfig(multiplier=1.0)
+
+    @pytest.mark.parametrize("jitter", [-0.1, -1.0, 1.1, 2.0])
+    def test_jitter_outside_unit_interval_raises(self, jitter: float) -> None:
+        with pytest.raises(ValueError, match="jitter"):
+            BackoffConfig(jitter=jitter)
+
+    @pytest.mark.parametrize("jitter", [0.0, 1.0])
+    def test_jitter_at_unit_interval_bounds_does_not_raise(self, jitter: float) -> None:
+        BackoffConfig(jitter=jitter)
+
+
+@pytest.mark.unit
+class TestWaitTowardReset:
+    """_wait_toward_reset sleeps in poll_interval_seconds steps (spec AC-14)."""
+
+    def test_steps_toward_future_reset_never_one_blind_sleep(self, caplog: pytest.LogCaptureFixture) -> None:
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            caplog.at_level(logging.INFO, logger="devbench.quota"),
+        ):
+            asyncio.run(
+                _wait_toward_reset(
+                    reset_at=_NOW + timedelta(seconds=130),
+                    poll_interval_seconds=50,
+                    max_wait_seconds=1000,
+                )
+            )
+        sleep_durations = [call.args[0] for call in fake_sleep.await_args_list]
+        # Never one blind long sleep of 130s: three bounded steps instead.
+        assert sleep_durations == [50, 50, 30]
+        assert len(sleep_durations) > 1
+        heartbeat_lines = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert heartbeat_lines == [
+            "[QUOTA_POLLING] elapsed=0s probe=0 next_in=50s",
+            "[QUOTA_POLLING] elapsed=50s probe=0 next_in=50s",
+            "[QUOTA_POLLING] elapsed=100s probe=0 next_in=30s",
+        ]
+
+    def test_elapsed_is_local_accumulator_not_clock_reads(self) -> None:
+        """``elapsed`` is a local accumulator of the sleep durations already
+        performed, not derived from re-reading the clock, so the step count
+        is pre-computed from a single ``now`` snapshot and the wait
+        terminates deterministically under the mocked clock."""
+        clock = _FakeClock(_NOW)
+        recorder: list[tuple[str, float]] = []
+        fake_sleep = _make_fake_sleep(clock, recorder)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            asyncio.run(
+                _wait_toward_reset(
+                    reset_at=_NOW + timedelta(seconds=95),
+                    poll_interval_seconds=40,
+                    max_wait_seconds=1000,
+                )
+            )
+        durations = [d for _, d in recorder]
+        assert durations == [40, 40, 15]
+        assert sum(durations) == 95
+
+    def test_reset_at_none_returns_without_sleeping(self) -> None:
+        fake_sleep = AsyncMock()
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            asyncio.run(_wait_toward_reset(reset_at=None, poll_interval_seconds=30, max_wait_seconds=100))
+        fake_sleep.assert_not_awaited()
+
+    def test_reset_at_already_past_returns_without_sleeping(self) -> None:
+        fake_sleep = AsyncMock()
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            asyncio.run(
+                _wait_toward_reset(
+                    reset_at=_NOW - timedelta(seconds=1),
+                    poll_interval_seconds=30,
+                    max_wait_seconds=100,
+                )
+            )
+        fake_sleep.assert_not_awaited()
+
+    def test_window_bounded_by_max_wait_seconds(self) -> None:
+        """When max_wait_seconds is shorter than the gap to reset_at, the
+        step window is capped by max_wait_seconds, not the full gap."""
+        clock = _FakeClock(_NOW)
+        recorder: list[tuple[str, float]] = []
+        fake_sleep = _make_fake_sleep(clock, recorder)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            asyncio.run(
+                _wait_toward_reset(
+                    reset_at=_NOW + timedelta(seconds=500),
+                    poll_interval_seconds=20,
+                    max_wait_seconds=45,
+                )
+            )
+        assert sum(d for _, d in recorder) == 45
+
+
+@pytest.mark.unit
+class TestWaitForResetTDI003a:
+    """An elapsed known reset_at short-circuits to True without probing (TDI-003a, spec AC-15)."""
+
+    def test_elapsed_reset_returns_true_without_probe(self) -> None:
+        probe_fn = MagicMock(return_value=False)
+        fake_sleep = AsyncMock()
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=_NOW - timedelta(seconds=1),
+                    poll_interval_seconds=30,
+                    max_wait_seconds=300,
+                    probe_fn=probe_fn,
+                )
+            )
+        assert result is True
+        probe_fn.assert_not_called()
+        fake_sleep.assert_not_awaited()
+
+    def test_reset_at_exactly_now_counts_as_elapsed(self) -> None:
+        """``now >= reset_at`` -- a reset_at equal to now counts as elapsed."""
+        probe_fn = MagicMock(return_value=False)
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=_NOW,
+                    poll_interval_seconds=30,
+                    max_wait_seconds=300,
+                    probe_fn=probe_fn,
+                )
+            )
+        assert result is True
+        probe_fn.assert_not_called()
+
+
+@pytest.mark.unit
+class TestWaitForResetCadenceGuard:
+    """backoff_config.initial_seconds != poll_interval_seconds raises before I/O (spec AC-16)."""
+
+    def test_mismatch_raises_value_error_before_any_io(self) -> None:
+        probe_fn = MagicMock(return_value=True)
+        mismatched = BackoffConfig(initial_seconds=45)
+        with (
+            patch("devbench.quota._get_current_utc") as fake_clock,
+            patch("asyncio.sleep", AsyncMock()) as fake_sleep,
+            pytest.raises(ValueError, match="must equal poll_interval_seconds"),
+        ):
+            asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=30,
+                    max_wait_seconds=300,
+                    probe_fn=probe_fn,
+                    backoff_config=mismatched,
+                )
+            )
+        probe_fn.assert_not_called()
+        fake_sleep.assert_not_awaited()
+        fake_clock.assert_not_called()
+
+    def test_matching_cadence_does_not_raise(self) -> None:
+        probe_fn = MagicMock(return_value=True)
+        matching = BackoffConfig(initial_seconds=30)
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", AsyncMock()),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=30,
+                    max_wait_seconds=300,
+                    probe_fn=probe_fn,
+                    backoff_config=matching,
+                )
+            )
+        assert result is True
+
+
+@pytest.mark.unit
+class TestWaitForResetPollIntervalGuard:
+    """poll_interval_seconds <= 0 raises ValueError before any I/O, so an
+    invalid cadence fails loudly instead of busy-spinning (fail-fast fix
+    alongside the cadence guard)."""
+
+    @pytest.mark.parametrize("poll_interval_seconds", [0, -1, -30])
+    def test_non_positive_poll_interval_raises_before_any_io(self, poll_interval_seconds: int) -> None:
+        probe_fn = MagicMock(return_value=True)
+        with (
+            patch("devbench.quota._get_current_utc") as fake_clock,
+            patch("asyncio.sleep", AsyncMock()) as fake_sleep,
+            pytest.raises(ValueError, match="poll_interval_seconds"),
+        ):
+            asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=poll_interval_seconds,
+                    max_wait_seconds=300,
+                    probe_fn=probe_fn,
+                )
+            )
+        probe_fn.assert_not_called()
+        fake_sleep.assert_not_awaited()
+        fake_clock.assert_not_called()
+
+
+@pytest.mark.unit
+class TestWaitForResetMaxWaitZero:
+    """max_wait_seconds == 0 returns False immediately, no probe, no sleep, no I/O."""
+
+    def test_zero_max_wait_returns_false_immediately(self) -> None:
+        probe_fn = MagicMock(return_value=True)
+        with (
+            patch("devbench.quota._get_current_utc") as fake_clock,
+            patch("asyncio.sleep", AsyncMock()) as fake_sleep,
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=_NOW + timedelta(seconds=10),
+                    poll_interval_seconds=30,
+                    max_wait_seconds=0,
+                    probe_fn=probe_fn,
+                )
+            )
+        assert result is False
+        probe_fn.assert_not_called()
+        fake_sleep.assert_not_awaited()
+        fake_clock.assert_not_called()
+
+
+@pytest.mark.unit
+class TestWaitForResetLoopOrder:
+    """Full-loop call order per FR-2.4: timeout check, elapsed-reset
+    short-circuit, jittered delay computation, heartbeat, probe, sleep,
+    delay growth (spec AC-E2-F1-S2-T1-5).
+
+    The elapsed-reset short-circuit and probe are mutually exclusive per
+    call to ``reset_at`` being known or not (TestWaitForResetTDI003a already
+    proves the short-circuit pre-empts the probe when reset_at is known).
+    This class proves the remaining order -- heartbeat before probe before
+    sleep, repeated per iteration, with the delay growing between
+    iterations -- on the probe-only path (``reset_at=None``).
+    """
+
+    def test_heartbeat_probe_sleep_order_repeats_per_iteration(self) -> None:
+        clock = _FakeClock(_NOW)
+        recorder: list[str] = []
+
+        def _fake_heartbeat(*, elapsed: float, probe: int, next_in: float) -> None:
+            recorder.append("heartbeat")
+
+        probe_results = [False, False, True]
+
+        def _fake_probe() -> bool:
+            recorder.append("probe")
+            return probe_results.pop(0)
+
+        async def _fake_sleep(seconds: float) -> None:
+            recorder.append("sleep")
+            clock.advance(seconds)
+
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("devbench.quota._emit_polling_heartbeat", side_effect=_fake_heartbeat),
+            patch("asyncio.sleep", side_effect=_fake_sleep),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=_fake_probe,
+                )
+            )
+        assert result is True
+        # Two full cycles (probe still exhausted -> sleep), then a third
+        # iteration whose probe recovers and returns immediately (no sleep).
+        assert recorder == [
+            "heartbeat",
+            "probe",
+            "sleep",
+            "heartbeat",
+            "probe",
+            "sleep",
+            "heartbeat",
+            "probe",
+        ]
+
+
+@pytest.mark.unit
+class TestWaitForResetBackoffBounds:
+    """Jittered delay stays within the configured bounds and grows per the
+    growth factor, clamped at ``max_seconds`` (spec AC-E2-F1-S2-T1-8 approach bullet)."""
+
+    def test_delay_grows_by_multiplier_and_clamps_at_max_seconds(self) -> None:
+        clock = _FakeClock(_NOW)
+        recorder: list[tuple[str, float]] = []
+        fake_sleep = _make_fake_sleep(clock, recorder)
+        probe_results = [False, False, False, False, True]
+        backoff = BackoffConfig(initial_seconds=10, max_seconds=100, multiplier=3.0, jitter=0.5)
+
+        def _fake_probe() -> bool:
+            return probe_results.pop(0)
+
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            # Zero jitter (fixed rng.uniform == 0.0) isolates the growth
+            # factor from the jitter contribution for this assertion.
+            patch("devbench.quota.secrets.SystemRandom", return_value=_FixedRng(0.0)),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=10000,
+                    probe_fn=_fake_probe,
+                    backoff_config=backoff,
+                )
+            )
+        assert result is True
+        delays = [d for _, d in recorder]
+        # raw_delay: 10 -> 30 -> 90 -> clamp(270, 100)=100 -> clamp(300,100)=100
+        assert delays == [10, 30, 90, 100]
+
+    @pytest.mark.parametrize(
+        ("jitter_uniform_value", "expected_delay"),
+        [
+            (0.3, 13.0),
+            (-0.3, 7.0),
+        ],
+    )
+    def test_delay_applies_jitter_within_configured_bounds(
+        self, jitter_uniform_value: float, expected_delay: float
+    ) -> None:
+        clock = _FakeClock(_NOW)
+        recorder: list[tuple[str, float]] = []
+        fake_sleep = _make_fake_sleep(clock, recorder)
+        # multiplier=1.0 keeps raw_delay constant so only the jitter term
+        # varies the observed delay.
+        backoff = BackoffConfig(initial_seconds=10, max_seconds=1000, multiplier=1.0, jitter=0.3)
+        probe_results = [False, True]
+
+        def _fake_probe() -> bool:
+            return probe_results.pop(0)
+
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            patch("devbench.quota.secrets.SystemRandom", return_value=_FixedRng(jitter_uniform_value)),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=10000,
+                    probe_fn=_fake_probe,
+                    backoff_config=backoff,
+                )
+            )
+        assert result is True
+        assert recorder == [("sleep", expected_delay)]
+
+
+@pytest.mark.unit
+class TestWaitForResetHeartbeat:
+    """Heartbeat coverage per spec S10.1: per poll, on the reset_at path,
+    reaching the root logging handler, and failure tolerance."""
+
+    def test_heartbeat_emitted_once_per_poll(self, caplog: pytest.LogCaptureFixture) -> None:
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        probe_results = [False, True]
+
+        def _fake_probe() -> bool:
+            return probe_results.pop(0)
+
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            patch("devbench.quota.secrets.SystemRandom", return_value=_FixedRng(0.0)),
+            caplog.at_level(logging.INFO, logger="devbench.quota"),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=_fake_probe,
+                )
+            )
+        assert result is True
+        polling_lines = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        # Default BackoffConfig multiplier is 2.0: raw_delay grows 10 -> 20
+        # between the first and second poll (jitter is pinned to 0 above).
+        assert polling_lines == [
+            "[QUOTA_POLLING] elapsed=0s probe=1 next_in=10s",
+            "[QUOTA_POLLING] elapsed=10s probe=2 next_in=20s",
+        ]
+
+    def test_heartbeat_on_reset_at_path_via_wait_for_reset(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The reset_at (probe=0) heartbeat fires through the full
+        ``wait_for_reset`` call, not just the internal stepper directly."""
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        probe_fn = MagicMock(return_value=False)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            caplog.at_level(logging.INFO, logger="devbench.quota"),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=_NOW + timedelta(seconds=20),
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=probe_fn,
+                )
+            )
+        assert result is True
+        probe_fn.assert_not_called()
+        polling_lines = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert polling_lines == [
+            "[QUOTA_POLLING] elapsed=0s probe=0 next_in=10s",
+            "[QUOTA_POLLING] elapsed=10s probe=0 next_in=10s",
+        ]
+
+    def test_heartbeat_reaches_root_logging_handler(self, caplog: pytest.LogCaptureFixture) -> None:
+        """caplog captures the heartbeat at the ROOT logger (no explicit
+        ``logger=`` scope), proving the record propagates all the way up
+        from ``devbench.quota`` rather than being swallowed en route.
+
+        ``reset_at=None`` so the probe path (which always emits a heartbeat
+        before consulting the probe) runs instead of the TDI-003a
+        short-circuit, which resolves before any heartbeat would be emitted.
+        """
+        probe_fn = MagicMock(return_value=True)
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", AsyncMock()),
+            caplog.at_level(logging.INFO),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=probe_fn,
+                )
+            )
+        assert result is True
+        assert any("[QUOTA_POLLING]" in r.getMessage() for r in caplog.records)
+
+    def test_heartbeat_failure_is_swallowed(self) -> None:
+        """A raising log handler/emitter never aborts the wait (sanctioned
+        swallow, spec S7.1) -- the wait still resolves normally."""
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        probe_results = [False, True]
+
+        def _fake_probe() -> bool:
+            return probe_results.pop(0)
+
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            patch("devbench.quota.logger.info", side_effect=RuntimeError("handler exploded")),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=_fake_probe,
+                )
+            )
+        assert result is True
+
+
+@pytest.mark.unit
+class TestWaitForResetTimeoutAndExceptions:
+    """Timeout returns False fast; probe exceptions propagate out of the loop."""
+
+    def test_max_wait_timeout_returns_false(self) -> None:
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        probe_fn = MagicMock(return_value=False)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=25,
+                    probe_fn=probe_fn,
+                )
+            )
+        assert result is False
+        assert probe_fn.called
+
+    def test_recovery_probe_unavailable_error_propagates(self) -> None:
+        def _raising_probe() -> bool:
+            raise RecoveryProbeUnavailableError("no credentials configured")
+
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", AsyncMock()),
+            pytest.raises(RecoveryProbeUnavailableError),
+        ):
+            asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=_raising_probe,
+                )
+            )
+
+    def test_other_probe_exception_propagates(self) -> None:
+        def _raising_probe() -> bool:
+            raise RuntimeError("upstream network error")
+
+        with (
+            patch("devbench.quota._get_current_utc", return_value=_NOW),
+            patch("asyncio.sleep", AsyncMock()),
+            pytest.raises(RuntimeError, match="upstream network error"),
+        ):
+            asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=_raising_probe,
+                )
+            )

@@ -1,24 +1,43 @@
-"""Quota detection module for devbench.
+"""Quota detection and wait-and-resume module for devbench.
 
 Provides the ``QuotaExhaustedError`` exception hierarchy (base + four LSP
 subclasses), the ``detect_quota_error`` dispatcher (ten ordered rules, never
 raises), the two-matcher CLI-text scanners (``_has_quota_marker`` and
-``_has_verbatim_quota_marker``), and the ``_parse_reset_at_from_text``
-reset-time parser.
+``_has_verbatim_quota_marker``), the ``_parse_reset_at_from_text``
+reset-time parser, and the async wait engine (``BackoffConfig``,
+``_emit_polling_heartbeat``, ``_wait_toward_reset``, ``wait_for_reset``) that
+polls for quota recovery with jittered exponential backoff, stepping toward
+a known provider ``reset_at`` in bounded, heartbeat-emitting sleeps rather
+than one blind long sleep. No cancellation-shielding primitive is used
+anywhere in this module (D-9): a SIGTERM during a long wait must propagate
+naturally so ``devbench stop`` stays responsive; durability comes from the
+checkpoint (downstream task E2-F1-S2-T3), not from shielding.
 
-This module is the detection tier only (FR-2.1, FR-2.2, FR-2.3). The
-wait-and-resume poller, checkpoint persistence, and recovery probe belong to
-a downstream task (E2-F1-S2-T1) and are not part of this module's surface.
+This module covers the detection tier (FR-2.1, FR-2.2, FR-2.3) and the wait
+tier (FR-2.4). Checkpoint persistence and the recovery probe belong to
+downstream tasks (E2-F1-S2-T2, E2-F1-S2-T3) and are not part of this
+module's surface yet.
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
+Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
 AC-234-1, AC-234a-1.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import re
+import secrets
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+logger = logging.getLogger("devbench.quota")
+
+_QUOTA_POLLING_AUDIT_PREFIX: str = "[QUOTA_POLLING]"
 
 # ---------------------------------------------------------------------------
 # Exception hierarchy
@@ -422,3 +441,269 @@ def detect_quota_error(obj: object) -> QuotaExhaustedError | None:
         return _detect_quota_error_inner(obj)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Wait engine (FR-2.4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BackoffConfig:
+    """Jittered exponential backoff configuration for ``wait_for_reset``.
+
+    Every invariant documented below is enforced by ``__post_init__`` --
+    fail-fast (Code Standards rule 3): an out-of-contract value raises
+    ``ValueError`` at construction time instead of being silently
+    normalised or clamped later, deep inside the poll loop.
+
+    Attributes:
+        initial_seconds: Starting backoff delay (must equal ``poll_interval_seconds``
+            passed to ``wait_for_reset`` to avoid a conflict guard error).
+            Must be > 0.
+        max_seconds: Upper bound for any single backoff delay after jitter.
+            Must be >= ``initial_seconds``.
+        multiplier: Factor by which the raw delay grows each iteration.
+            Must be >= 1.0.
+        jitter: Fractional jitter range applied as ``+/- (delay * jitter)``
+            via a cryptographically secure RNG. Must be in [0, 1].
+
+    Raises:
+        ValueError: When ``initial_seconds <= 0``, ``max_seconds <
+            initial_seconds``, ``multiplier < 1.0``, or ``jitter`` is
+            outside the closed interval ``[0, 1]``.
+    """
+
+    initial_seconds: int = 30
+    max_seconds: int = 600
+    multiplier: float = 2.0
+    jitter: float = 0.2
+
+    def __post_init__(self) -> None:
+        if self.initial_seconds <= 0:
+            raise ValueError(f"BackoffConfig.initial_seconds must be > 0, got {self.initial_seconds}.")
+        if self.max_seconds < self.initial_seconds:
+            raise ValueError(
+                f"BackoffConfig.max_seconds ({self.max_seconds}) must be >= initial_seconds ({self.initial_seconds})."
+            )
+        if self.multiplier < 1.0:
+            raise ValueError(f"BackoffConfig.multiplier must be >= 1.0, got {self.multiplier}.")
+        if not 0.0 <= self.jitter <= 1.0:
+            raise ValueError(f"BackoffConfig.jitter must be in [0, 1], got {self.jitter}.")
+
+
+_DEFAULT_BACKOFF: BackoffConfig = BackoffConfig()
+
+
+def _emit_polling_heartbeat(*, elapsed: float, probe: int, next_in: float) -> None:
+    """Emit one ``[QUOTA_POLLING]`` heartbeat line -- strictly best-effort.
+
+    A visible heartbeat lets an operator SEE the orchestrator is actively
+    waiting during a long quota pause, rather than the log looking dead
+    between ``[QUOTA_WAITING]`` and ``[QUOTA_RESUMED]``. It is emitted at the
+    poll interval on EVERY waiting path, including a pure provider-stated
+    ``reset_at`` wait where no recovery probe runs (``probe`` is then ``0``).
+
+    Any logging failure is swallowed here (sanctioned swallow, spec S7.1): a
+    heartbeat or its log handler must NEVER break or delay the wait or the
+    resume -- the wait's correctness does not depend on the line being
+    written. This is the one place in the wait engine that deliberately
+    suppresses an error, and only for the cosmetic liveness line.
+    """
+    with contextlib.suppress(Exception):
+        logger.info(
+            "%s elapsed=%ds probe=%d next_in=%ds",
+            _QUOTA_POLLING_AUDIT_PREFIX,
+            int(elapsed),
+            probe,
+            int(next_in),
+        )
+
+
+async def _wait_toward_reset(
+    *,
+    reset_at: datetime | None,
+    poll_interval_seconds: int,
+    max_wait_seconds: int,
+) -> None:
+    """Sleep toward a provider-stated ``reset_at`` in poll-interval-bounded steps.
+
+    Used only on the production path where ``reset_at`` is known and still
+    in the future. Sleeps in ``poll_interval_seconds`` increments -- never
+    one blind long sleep -- emitting a ``[QUOTA_POLLING]`` heartbeat
+    (``probe=0``, no probe run) before each interval so a long wait is
+    visibly alive in the log between ``[QUOTA_WAITING]`` and
+    ``[QUOTA_RESUMED]``. The recovery probe is NOT consulted here: an
+    elapsed provider reset is the authoritative readiness signal (TDI-003a)
+    and the probe tests a different auth channel that can never confirm the
+    subscription quota.
+
+    This is a pure side-effecting stepper: it returns ``None`` and never
+    decides the outcome. After it returns, ``wait_for_reset``'s probe loop
+    is the single source of truth -- it short-circuits to recovery on the
+    now-elapsed reset, returns ``False`` on the max-wait timeout, or
+    consults the probe. The wait window is bounded by whichever comes
+    first, the reset or ``max_wait_seconds``, and ``elapsed`` is a local
+    accumulator of the sleep durations already performed -- never a clock
+    read -- so the step count is pre-computed from a single ``now`` snapshot
+    and the loop terminates deterministically regardless of whether the
+    (mockable) clock advances during the sleeps.
+
+    Args:
+        reset_at: Expected UTC reset time, or ``None`` (no reset-wait performed).
+        poll_interval_seconds: Heartbeat/sleep cadence in seconds. Must be
+            > 0 -- ``wait_for_reset`` validates this before calling here, so
+            this stepper never has to normalise or clamp an invalid cadence.
+        max_wait_seconds: Maximum total wait in seconds.
+    """
+    now = _get_current_utc()
+    if reset_at is None or now >= reset_at:
+        return
+    poll_step = float(poll_interval_seconds)
+    gap_to_reset = (reset_at - now).total_seconds()
+    window = min(gap_to_reset, float(max_wait_seconds))
+    elapsed = 0.0
+    while elapsed < window:
+        sleep_for = min(poll_step, window - elapsed)
+        _emit_polling_heartbeat(elapsed=elapsed, probe=0, next_in=sleep_for)
+        await asyncio.sleep(sleep_for)
+        elapsed += sleep_for
+
+
+async def wait_for_reset(
+    *,
+    reset_at: datetime | None,
+    poll_interval_seconds: int,
+    max_wait_seconds: int,
+    probe_fn: Callable[[], bool],
+    backoff_config: BackoffConfig | None = None,
+) -> bool:
+    """Async poller that waits until the quota resets and a probe confirms recovery.
+
+    Algorithm, in this exact order (FR-2.4; not negotiable -- this is the
+    piece that survived real production quota exhaustion, spec S1.6):
+
+    1. Cadence validation: ``poll_interval_seconds <= 0`` raises
+       ``ValueError`` before any I/O -- an invalid cadence must fail loudly
+       rather than being silently clamped and busy-spinning the poll loop.
+    2. Default ``backoff_config`` from ``poll_interval_seconds`` when not
+       supplied.
+    3. Cadence guard: ``backoff_config.initial_seconds != poll_interval_seconds``
+       raises ``ValueError`` before any I/O.
+    4. ``max_wait_seconds == 0`` returns ``False`` immediately.
+    5. ``_wait_toward_reset`` performs stepped sleeps toward a known future
+       ``reset_at`` (no-op when ``reset_at`` is ``None`` or already past).
+    6. Poll loop: timeout check -> elapsed-reset short-circuit (TDI-003a,
+       no probe) -> jittered delay computation -> heartbeat -> probe ->
+       sleep -> delay growth.
+
+    No cancellation-shielding primitive is used anywhere in this wait (D-9):
+    a SIGTERM must propagate naturally so ``devbench stop`` stays responsive
+    while a wait is in progress; durability comes from the checkpoint
+    (downstream task E2-F1-S2-T3), not from shielding.
+
+    Args:
+        reset_at: Expected UTC reset time (or ``None`` when unknown).
+        poll_interval_seconds: Base polling cadence in seconds. Must be > 0
+            (validated before any I/O) and must equal
+            ``backoff_config.initial_seconds`` when a custom ``backoff_config``
+            is supplied.
+        max_wait_seconds: Maximum total wait in seconds. 0 means no wait.
+        probe_fn: Callable returning ``True`` when the quota has recovered,
+            ``False`` when still exhausted. Non-quota exceptions propagate.
+        backoff_config: Optional backoff configuration. When ``None`` the
+            function uses a default aligned with ``poll_interval_seconds``.
+
+    Returns:
+        ``True`` when a known ``reset_at`` has elapsed (the provider-stated
+        reset time is the authoritative readiness signal -- no probe needed;
+        TDI-003a), OR when the probe confirmed recovery before
+        ``max_wait_seconds`` elapsed; ``False`` when the timeout was hit. The
+        probe is best-effort and only consulted while ``reset_at`` is
+        unknown or not yet reached.
+
+    Raises:
+        ValueError: When ``poll_interval_seconds <= 0``, or when
+            ``backoff_config.initial_seconds != poll_interval_seconds``.
+        RecoveryProbeUnavailableError: When the probe is permanently
+            unavailable (no/invalid credential) AND no usable ``reset_at``
+            is known (unknown, or not yet reached) -- the caller must fail
+            fast rather than poll a probe that can never succeed.
+        Any other exception raised by ``probe_fn``.
+    """
+    if poll_interval_seconds <= 0:
+        raise ValueError(f"wait_for_reset: poll_interval_seconds must be > 0, got {poll_interval_seconds}.")
+
+    if backoff_config is None:
+        backoff_config = BackoffConfig(
+            initial_seconds=poll_interval_seconds,
+            max_seconds=_DEFAULT_BACKOFF.max_seconds,
+            multiplier=_DEFAULT_BACKOFF.multiplier,
+            jitter=_DEFAULT_BACKOFF.jitter,
+        )
+    if backoff_config.initial_seconds != poll_interval_seconds:
+        raise ValueError(
+            f"wait_for_reset: backoff_config.initial_seconds ({backoff_config.initial_seconds}) "
+            f"must equal poll_interval_seconds ({poll_interval_seconds}) to avoid ambiguous cadence."
+        )
+
+    if max_wait_seconds == 0:
+        return False
+
+    start_time = _get_current_utc()
+
+    # Provider-stated-reset_at wait (the common production path): step
+    # toward the reset time in poll-interval-bounded sleeps, emitting a
+    # [QUOTA_POLLING] heartbeat each interval so a long wait is visibly
+    # alive in the log. This is a pure stepper -- the probe loop below
+    # remains the single source of truth for the outcome (short-circuits to
+    # True on the now-elapsed reset per TDI-003a, returns False on the
+    # max-wait timeout, or consults the probe).
+    await _wait_toward_reset(
+        reset_at=reset_at,
+        poll_interval_seconds=poll_interval_seconds,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+    raw_delay = float(backoff_config.initial_seconds)
+    rng = secrets.SystemRandom()
+    probe_count = 0
+
+    while True:
+        now = _get_current_utc()
+        elapsed = (now - start_time).total_seconds()
+        if elapsed >= max_wait_seconds:
+            return False
+
+        # TDI-003a: a known, elapsed reset time is the authoritative
+        # readiness signal -- resume without probing. The recovery probe
+        # tests the raw Anthropic API channel, not the CLI/SDK subscription
+        # channel the orchestrator runs on, so once the provider-stated
+        # reset has passed the probe adds nothing (and on subscription auth
+        # can never succeed). The probe is best-effort and only consulted
+        # when reset_at is unknown or not yet reached.
+        if reset_at is not None and now >= reset_at:
+            return True
+
+        probe_count += 1
+        # Jittered delay: raw_delay * (1 +/- jitter), clamped to max_seconds.
+        jitter_factor = 1.0 + rng.uniform(-backoff_config.jitter, backoff_config.jitter)
+        delay = min(raw_delay * jitter_factor, float(backoff_config.max_seconds))
+
+        # Visible heartbeat: exactly one line per poll so an operator can
+        # SEE the orchestrator is actively polling during a long wait,
+        # rather than the log looking dead between [QUOTA_WAITING] and
+        # [QUOTA_RESUMED]. Best-effort: a logging failure must never break
+        # the probe (same guarantee as the reset_at path).
+        _emit_polling_heartbeat(elapsed=elapsed, probe=probe_count, next_in=delay)
+
+        # RecoveryProbeUnavailableError (probe permanently unavailable, no
+        # usable reset_at known) and any other probe_fn exception propagate
+        # unhandled here -- fail fast rather than poll a probe that can
+        # never succeed. A known, elapsed reset time is handled by the
+        # short-circuit above, before the probe is ever consulted.
+        if probe_fn():
+            return True
+
+        await asyncio.sleep(delay)
+        raw_delay = min(raw_delay * backoff_config.multiplier, float(backoff_config.max_seconds))

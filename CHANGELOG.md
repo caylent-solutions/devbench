@@ -151,6 +151,34 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Quota wait-and-resume** (ADR-24, issue #236). `devbench start`
+  detects Anthropic subscription rate-limit exhaustion mid-session
+  (HTTP 429, the CLI's verbatim "You've hit your limit" text, or an
+  `AssistantMessage.error == "rate_limit"` field) and pauses the
+  orchestrate loop instead of exiting non-zero: it checkpoints the
+  pause to `.devbench/quota_pause.json`, waits for the provider's
+  `reset_at` (or polls a recovery probe when `reset_at` is unknown),
+  then opens a fresh in-process SDK session and continues the backlog
+  automatically once quota recovers. Configurable via the new
+  `quota_handling` block in `backlog/config/devbench.yaml`
+  (`enabled`, `on_exhaustion`, `poll_interval_seconds`,
+  `max_wait_seconds`, `on_exhaustion_timeout`, `resume_strategy`,
+  `audit_comment_on_wait`, `audit_comment_on_resume`,
+  `log_structured_events`) -- default-on, waits on exhaustion, drains
+  on timeout. The wait never uses `asyncio.shield`, so
+  `devbench stop --session <name>` (or a direct SIGTERM) still
+  interrupts a paused session promptly, force-blocking the in-flight
+  work unit rather than leaving it in an ambiguous state. The new
+  `devbench quota-watcher` command reports the current pause state
+  (`reason`, `reset_at`) from the on-disk checkpoint without
+  disturbing the running orchestrator; `devbench status` continues to
+  show the paused work unit under "Active work units:" for the
+  duration of the wait. In-process resumes are bounded by
+  `DEVBENCH_MAX_QUOTA_RESUMES` (default 1000) so an unattended
+  overnight run can survive multiple quota windows without exceeding
+  a fail-safe cap. See `docs/quota-handling.md` and
+  `docs/adr/24-quota-wait-and-resume.md`.
+
 - **`git_ops.branch_prefix` / per-repo `branch_prefix` task-branch
   namespacing** (issue #283). Task branches were always named
   `backlog/<unit-id-lower>` with no workspace identifier. When two

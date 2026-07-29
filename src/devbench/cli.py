@@ -200,6 +200,7 @@ from devbench.plugin_shadow import (
     shadow_plugin_path,
     write_pid_sentinel,
 )
+from devbench.quota import QuotaExhaustedError, detect_quota_error
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
 # resolve unchanged after the function moved to report.py for the issue #161
@@ -5829,6 +5830,31 @@ class _DrainRequested(BaseException):
         self.reason = reason
 
 
+class _QuotaDetected(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when a quota error is detected per-message.
+
+    Raised as a :class:`BaseException` subclass (not :class:`Exception`) so that
+    ``asyncio.run`` propagates it through the event loop without it being caught
+    by broad ``except Exception`` handlers between the message loop and
+    ``asyncio.run`` (spec AC-20, decision D-4). This lets the SDK session tear
+    down BEFORE any quota wait begins, running the wait in a fresh event loop
+    rather than shielding a task inside the SDK's own loop -- sidestepping the
+    anyio cancel-scope defect (issue #235) architecturally instead of guarding
+    against it.
+
+    Args:
+        quota_exc: The :class:`~devbench.quota.QuotaExhaustedError` produced by
+            :func:`~devbench.quota.detect_quota_error`.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, quota_exc: QuotaExhaustedError) -> None:
+        super().__init__(str(quota_exc))
+        self.quota_exc = quota_exc
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -5869,6 +5895,37 @@ def _is_claim_tool_use(message: object) -> bool:
         if isinstance(command, str) and "devbench claim" in command:
             return True
     return False
+
+
+def _check_quota_and_drain(message: object) -> None:
+    """Per-message quota + drain-on-claim short-circuit for the ``_run`` message loop.
+
+    Raises :class:`_QuotaDetected` when *message* carries a quota / rate-limit
+    signal recognized by :func:`~devbench.quota.detect_quota_error` (issue
+    #236), or raises :class:`_DrainRequested` when *message* is a claim
+    tool-use observed while a drain signal is pending (issues #188/#212).
+    Returns ``None`` (no-op) in every other case.
+
+    Extracted out of ``_run`` so the per-message branching lives in exactly
+    one place (DRY) and ``_run`` itself stays under ruff's PLR0912 12-branch
+    cap. :func:`~devbench.quota.detect_quota_error` guarantees it never
+    raises, so a malformed or unrelated *message* falls through both checks
+    and this function raises nothing (spec Section 7.1 sanctioned swallow 1).
+
+    Args:
+        message: Any object emitted by the :func:`claude_agent_sdk.query`
+            async generator.
+
+    Raises:
+        _QuotaDetected: *message* carries a quota / rate-limit signal.
+        _DrainRequested: *message* is a claim tool-use and a drain signal is
+            currently pending for this session.
+    """
+    quota_exc = detect_quota_error(message)
+    if quota_exc is not None:
+        raise _QuotaDetected(quota_exc)
+    if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
+        raise _DrainRequested(drain_state.reason)
 
 
 @dataclass(frozen=True)
@@ -6366,11 +6423,23 @@ def cmd_start(*argv: str) -> int:
     ``DEVBENCH_MAX_AUTO_RESTARTS`` cap. Any other exit returns 0.
 
     **Drain enforcement (spec section 4.3.3, AC-188-4/5/8):** Between SDK
-    messages, the inner ``_run`` coroutine checks whether a ``devbench claim``
-    Bash tool-use is being requested.  When one is detected AND the drain
-    signal file is present, ``_run`` raises :class:`_DrainRequested`.
-    ``cmd_start`` catches this sentinel, consumes the drain marker, logs a
+    messages, the inner ``_run`` coroutine calls :func:`_check_quota_and_drain`
+    once per message, which checks whether a ``devbench claim`` Bash tool-use
+    is being requested.  When one is detected AND the drain signal file is
+    present, it raises :class:`_DrainRequested`. ``cmd_start`` catches this
+    sentinel, consumes the drain marker, logs a
     ``[ORCHESTRATOR_DRAIN_ENFORCED]`` audit entry, and returns 0.
+
+    **Quota detection (spec AC-20, FR-2.7, decision D-4, issue #236):** The
+    same per-message call also raises :class:`_QuotaDetected` -- a
+    :class:`BaseException` subclass, not :class:`Exception` -- the moment a
+    quota / rate-limit signal is recognized in the SDK message stream. This
+    task wires detection only: ``cmd_start`` does not handle or dispatch on
+    ``_QuotaDetected``; the outer ``except BaseException`` labels the stop
+    reason (via ``_label_stop_reason``) and re-raises, so the sentinel still
+    propagates out of ``asyncio.run`` and out of this function, tearing the
+    SDK session down first. Pause handling and the resume loop are wired in
+    a follow-up task (E2-F4-S2-T1).
 
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
@@ -6385,9 +6454,11 @@ def cmd_start(*argv: str) -> int:
         :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42) when auto-restart is triggered.
 
     Raises:
-        Nothing from this function's own scope -- all SDK exceptions propagate
-        as-is through the asyncio boundary; :class:`_DrainRequested` is
-        caught here and handled as a clean exit.
+        _QuotaDetected: Propagates uncaught from the SDK loop when a quota /
+            rate-limit signal is detected (detection wiring only; see above).
+        Nothing else from this function's own scope -- all other SDK
+        exceptions propagate as-is through the asyncio boundary;
+        :class:`_DrainRequested` is caught here and handled as a clean exit.
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -6501,14 +6572,22 @@ def cmd_start(*argv: str) -> int:
     _sdk_result_text: str | None = None
 
     async def _run() -> None:
-        """Iterate SDK messages with drain enforcement.
+        """Iterate SDK messages with quota detection and drain enforcement.
 
-        Processes SDK messages and raises :class:`_DrainRequested` when a
-        ``devbench claim`` tool-use is detected while a drain is pending.
+        Processes SDK messages and calls :func:`_check_quota_and_drain` once
+        per message, which raises :class:`_QuotaDetected` when a quota /
+        rate-limit signal is observed (issue #236) or :class:`_DrainRequested`
+        when a ``devbench claim`` tool-use is detected while a drain is
+        pending (issues #188/#212). Both sentinels are :class:`BaseException`
+        subclasses (spec AC-20, decision D-4) so they propagate through
+        ``asyncio.run`` without being caught by any broad ``except Exception``
+        handler in between.
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
         Raises:
+            _QuotaDetected: A quota / rate-limit signal is observed in an SDK
+                message.
             _DrainRequested: A drain signal is present when a ``cmd_claim``
                 tool-use is observed.
         """
@@ -6524,12 +6603,7 @@ def cmd_start(*argv: str) -> int:
             _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
             if _log_terminal_exit_if_applicable(_sdk_result_text):
                 return
-            # Issue #188 + #212: drain-on-claim short-circuit. Combined
-            # condition (rather than nested ifs) keeps ``_run`` under
-            # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
-            # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
-            if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
-                raise _DrainRequested(drain_state.reason)
+            _check_quota_and_drain(message)
         # Clean exit from the SDK loop -- done.
         return
 

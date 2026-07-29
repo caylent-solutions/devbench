@@ -1361,6 +1361,25 @@ since the last release. PR #119 carries every change.
 
 ### Removed
 
+- **`sdk_teardown_filter` workaround module removed** (issues #232, #231).
+  The 185-line `src/devbench/sdk_teardown_filter.py` asyncio exception
+  handler that downgraded the known `claude-agent-sdk` `Query.close()`
+  cancel-scope `RuntimeError` teardown race to a `WARNING` is deleted,
+  along with its 347-line test file `tests/test_sdk_teardown_filter.py`.
+  `cmd_start`'s `_run` coroutine in `src/devbench/cli.py` no longer wraps
+  the SDK `query()` loop in `async with _sdk_teardown_guard():`; the
+  `async for` loop body is unchanged, only unindented one level. The
+  operator-facing paragraph describing the workaround was removed from
+  `docs/cli-reference.md`. The workaround is no longer needed now that
+  `uv.lock` resolves `claude-agent-sdk` to `0.2.128`, above the `>=0.2.87`
+  floor at which the cancel-scope teardown race is resolved upstream
+  (verified in E1-F1-S1-T1); `pyproject.toml`'s declared floor remains
+  unchanged at `>=0.1.48`, so a fresh resolve against the manifest alone
+  is not guaranteed to select a fixed version -- the lock file is the
+  operative evidence, not the manifest floor. Issue #232 (this workaround)
+  and issue #231 (the upstream lock-advance tracking issue) are both
+  closed as a result.
+
 - **Dead `judge_model` / `executor_model` YAML fields** removed from
   `config-schema.json`, `RuntimeConfig`, `load_runtime_config`, the test
   fixtures, the parser tests, `sample-config.yaml`, and the example backlog

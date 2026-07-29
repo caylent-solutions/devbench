@@ -460,8 +460,11 @@ class TestQuotaHandlingFullBlockRoundTrip:
 class TestNotificationsEventsQuotaKeys:
     """quota_waiting/quota_resumed schema keys land here (single ownership of config-schema.json).
 
-    These keys are inert until E2-F3-S1-T1 wires the dispatcher fields;
-    this test only proves the schema accepts them without raising.
+    These keys are live: E2-F3-S1-T1 wired ``is_event_enabled`` to observe them, and
+    E2-F4-S3-T1 wired ``_handle_quota_pause`` (``src/devbench/cli.py``) to fire
+    ``_fire_quota_waiting_notification`` / ``_fire_quota_resumed_notification`` off of
+    them on every quota pause/recovery. This test proves the schema accepts them
+    without raising.
     """
 
     def test_quota_waiting_key_accepted(self, tmp_path: Path) -> None:
@@ -624,13 +627,15 @@ class TestNotificationsEventsQuotaFieldWiring:
 
 @pytest.mark.unit
 class TestIsEventEnabledQuotaRoundTrip:
-    """AC-E2-F3-S1-T2-5: is_event_enabled observes the quota toggles once wired.
+    """AC-E2-F3-S1-T2-5: is_event_enabled observes the quota toggles; the dispatcher is live.
 
     Before this task, ``NotificationsEventsConfig`` had no ``quota_waiting``
     / ``quota_resumed`` attribute, so ``is_event_enabled``'s
     ``getattr(cfg.events, event_kind, False)`` fell through to the
     missing-attribute default and the schema keys were unobservable by the
-    dispatcher regardless of what the operator configured.
+    dispatcher regardless of what the operator configured. E2-F4-S3-T1 wired
+    ``_handle_quota_pause`` (``src/devbench/cli.py``) into ``cmd_start``'s dispatch
+    loop, so these toggles are now consumed by a real quota pause/recovery.
     """
 
     def test_is_event_enabled_true_for_quota_waiting_when_toggled_on(self) -> None:

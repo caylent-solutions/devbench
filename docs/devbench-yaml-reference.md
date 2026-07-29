@@ -281,18 +281,20 @@ All fields default to `null` (agent's `.md` frontmatter default). See
 
 ## `quota_handling:` -- quota wait-and-resume configuration (issue #236, spec S5.2)
 
-**Status: parsed and validated today, not yet consumed.** This block is parsed, schema-checked
-and range-checked at config-load time as of this change, and `RuntimeConfig.quota_handling` is
-populated exactly as documented below. No orchestrator code path reads that field yet -- the
-quota dispatcher that would act on `on_exhaustion` / `on_exhaustion_timeout` / `resume_strategy`
-lands in a follow-up work unit (E2-F4). Until that dispatcher wiring lands, a quota-exhaustion
-signal still produces the pre-existing non-zero exit regardless of what this block says; setting
-`enabled: true` (the default) has no runtime effect today.
+**Status: parsed, validated, and live.** This block is parsed, schema-checked and
+range-checked at config-load time, `RuntimeConfig.quota_handling` is populated exactly as
+documented below, and `cmd_start` reads `enabled` / `on_exhaustion` / `on_exhaustion_timeout` /
+`resume_strategy` / `audit_comment_on_wait` / `audit_comment_on_resume` at runtime via
+`_drive_orchestrate_with_quota_resume` -> `_dispatch_quota_detection` -> `_handle_quota_pause`
+(`src/devbench/cli.py`; landed by E2-F4-S3-T1) -- see the per-field table below for exactly
+when each is read. `log_structured_events` is the one exception: it is parsed and validated
+like every other field, but has no runtime consumer today (see its table row). `enabled: true`
+(the default) makes the orchestrator pause and poll for reset instead of exiting non-zero;
+`enabled: false` restores the legacy non-zero exit.
 
-Once wired, this block will govern what the orchestrator does when the Claude CLI reports a
-quota-exhaustion signal (HTTP 429 / CLI "You've hit your limit" message). The whole block is
-optional; omitting it entirely yields the full default set below -- never a partial or `None`
-config object.
+This block governs what the orchestrator does when the Claude CLI reports a quota-exhaustion
+signal (HTTP 429 / CLI "You've hit your limit" message). The whole block is optional; omitting
+it entirely yields the full default set below -- never a partial or `None` config object.
 
 ```yaml
 quota_handling:
@@ -314,10 +316,10 @@ quota_handling:
 | `poll_interval_seconds` | integer | `[30, 3600]` | `60` | Cadence in seconds between recovery probes while waiting. |
 | `max_wait_seconds` | integer | `>= 1` | `18000` (5 hours) | Cap on total wait time in seconds before `on_exhaustion_timeout` fires. |
 | `on_exhaustion_timeout` | string (enum) | `drain`, `fail`, `keep_waiting` | `drain` | Action taken when `max_wait_seconds` elapses without recovery. `drain` triggers a graceful drain; `fail` re-raises the quota error; `keep_waiting` is terminal -- it logs `[QUOTA_TIMEOUT_KEEP_WAITING]` and ends the run (no drain request, no re-raise; see `_dispatch_quota_timeout` in `src/devbench/cli.py`). |
-| `resume_strategy` | string (enum) | `continue_current_wu`, `restart_wu`, `drain_and_resume` | `continue_current_wu` | How the orchestrator re-enters the loop after recovery (once the dispatcher wiring lands). `continue_current_wu` resumes where it left off; `restart_wu` forces the current work unit back to `in-queue`; `drain_and_resume` removes the quota checkpoint and requests a graceful drain -- the run stops and must be restarted manually, since the Makefile auto-restart loop (`Makefile:117-123`) only fires on exit code 42, which a graceful drain does not produce. |
+| `resume_strategy` | string (enum) | `continue_current_wu`, `restart_wu`, `drain_and_resume` | `continue_current_wu` | How the orchestrator re-enters the loop after recovery. `continue_current_wu` resumes where it left off; `restart_wu` forces the current work unit back to `in-queue`; `drain_and_resume` removes the quota checkpoint and requests a graceful drain -- the run stops and must be restarted manually, since the Makefile auto-restart loop (`Makefile:117-123`) only fires on exit code 42, which a graceful drain does not produce. |
 | `audit_comment_on_wait` | boolean | `true`, `false` | `true` | Append a `[QUOTA_WAITING]` audit comment to the in-progress work unit when pausing. |
 | `audit_comment_on_resume` | boolean | `true`, `false` | `true` | Append a `[QUOTA_RESUMED]` audit comment after recovery. |
-| `log_structured_events` | boolean | `true`, `false` | `true` | Emit structured log events on quota transitions, alongside the text markers. |
+| `log_structured_events` | boolean | `true`, `false` | `true` | Parsed and validated; has no runtime consumer today -- quota transitions currently emit only the plain text markers (`[QUOTA_WAITING]`/`[QUOTA_RESUMED]`) via `logger.info`, not a JSON-structured event. |
 
 **Enum and range enforcement happens at config-load time, never at dispatch time** (spec FR-2.9):
 an invalid `on_exhaustion` / `on_exhaustion_timeout` / `resume_strategy` value, or a
@@ -325,18 +327,17 @@ an invalid `on_exhaustion` / `on_exhaustion_timeout` / `resume_strategy` value, 
 `ValueError` naming the config file path and the offending field before the orchestrator starts.
 Unknown keys inside the block are rejected the same way (`additionalProperties: false`).
 
-**What `enabled: false` will restore, once the dispatcher lands.** The quota core (E2-F1) and
-this config surface exist today, but the orchestrator does not yet act on either -- every quota
-signal currently produces the existing non-zero exit no matter how this block is set. When the
-E2-F4 dispatcher is wired, `quota_handling.enabled: false` will be the config-level equivalent of
-that current behaviour: the orchestrator will propagate the quota error and exit non-zero instead
-of pausing and polling. Until then, `enabled: true` (the default) does not change behaviour.
+**What `enabled: false` restores.** The quota core (E2-F1), this config surface, and the
+E2-F4 dispatcher that acts on it are all live: `quota_handling.enabled: false` is the
+config-level equivalent of the pre-#236 behaviour -- the orchestrator propagates the quota
+error and exits non-zero instead of pausing and polling. `enabled: true` (the default) makes
+the orchestrator pause and poll for reset instead.
 
-**Two `notifications.events` keys are inert until wired.** This task also adds `quota_waiting`
-and `quota_resumed` to the `notifications.events` schema block below (single ownership of
-`config-schema.json` avoids two tasks writing the same file). The dispatcher fields and firing
-logic for those two events land in a follow-up task; until then the keys parse but have no
-runtime effect.
+**The `notifications.events` keys `quota_waiting` and `quota_resumed` are live.** They are
+declared in the `notifications.events` schema block below (single ownership of
+`config-schema.json` avoids two tasks writing the same file) and are read on every
+quota-exhaustion pause/recovery by `_handle_quota_pause` (`src/devbench/cli.py`); see
+[`docs/slack-notifications.md`](slack-notifications.md) for the payload shape.
 
 ---
 
@@ -374,9 +375,7 @@ notifications:
     orchestrator_stop: false
     orchestrator_auto_restart: false
     quota_waiting: false                 # orchestrator hit a quota and started waiting; see `quota_handling:` above.
-                                          # Schema key only -- dispatcher wiring lands in a follow-up task.
     quota_resumed: false                 # quota recovered and the run resumed; see `quota_handling:` above.
-                                          # Schema key only -- dispatcher wiring lands in a follow-up task.
 ```
 
 ---

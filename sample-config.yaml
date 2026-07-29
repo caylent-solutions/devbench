@@ -415,24 +415,25 @@ skills:
 # ---------------------------------------------------------------------------
 # Quota wait-and-resume (issue #236, spec S5.2).
 #
-# STATUS: this block is parsed and validated at config-load time today
-# (schema enum/range checks, additionalProperties:false), but nothing in
-# the orchestrator consumes it yet -- the quota dispatcher that reads
-# on_exhaustion / on_exhaustion_timeout / resume_strategy lands in a
-# follow-up work unit (E2-F4). Until that wiring lands, a quota-exhaustion
-# signal still produces the pre-existing non-zero exit no matter what this
-# block says, and enabled:true (the default) has no runtime effect yet.
+# STATUS: this block is parsed and validated at config-load time (schema
+# enum/range checks, additionalProperties:false). Most fields are consumed at
+# runtime by the quota dispatcher (`cmd_start` via
+# `_drive_orchestrate_with_quota_resume` / `_dispatch_quota_detection` /
+# `_handle_quota_pause` in `src/devbench/cli.py`, landed by E2-F4-S3-T1):
+# enabled / on_exhaustion are read on every quota-exhaustion signal,
+# on_exhaustion_timeout is read only when the wait cap elapses, and
+# resume_strategy only after a confirmed recovery. log_structured_events is
+# the one field that is parsed and validated but never read at runtime today
+# (see its own comment below).
 #
-# Once wired, this block will govern what the orchestrator does when the
-# Claude CLI reports a quota-exhaustion signal (HTTP 429 / CLI "You've hit
-# your limit" message).
+# This block governs what the orchestrator does when the Claude CLI reports
+# a quota-exhaustion signal (HTTP 429 / CLI "You've hit your limit" message).
 #
-# enabled: true (default) -- once wired, the orchestrator will pause and
-#   wait for the quota window to reset rather than exiting with a non-zero
-#   code. Set to false to restore the pre-#236 behaviour (propagate the
-#   error, non-zero exit; #193 AC-4, spec AC-24) once the dispatcher acts
-#   on this flag.
-# on_exhaustion: what to do when a quota signal is detected (once wired).
+# enabled: true (default) -- the orchestrator pauses and waits for the
+#   quota window to reset rather than exiting with a non-zero code. Set to
+#   false to restore the pre-#236 behaviour (propagate the error, non-zero
+#   exit; #193 AC-4, spec AC-24).
+# on_exhaustion: what to do when a quota signal is detected.
 #   "wait"  -- pause and poll until reset_at (default).
 #   "fail"  -- re-raise immediately (non-zero exit, same as enabled:false).
 #   "drain" -- trigger a graceful drain then exit.
@@ -455,8 +456,10 @@ skills:
 #   work unit when pausing. Defaults to true.
 # audit_comment_on_resume: write a [QUOTA_RESUMED] audit comment when the
 #   wait ends. Defaults to true.
-# log_structured_events: emit JSON-structured events alongside the text
-#   markers. Defaults to true.
+# log_structured_events: has no runtime consumer today. Parsed and
+#   validated like every other field, but quota transitions currently emit
+#   only the plain text markers ([QUOTA_WAITING]/[QUOTA_RESUMED]) via
+#   logger.info, not a JSON-structured event. Defaults to true.
 # ---------------------------------------------------------------------------
 # quota_handling:
 #   enabled: true
@@ -505,8 +508,8 @@ skills:
 #     ci_failure: false                    # CI run on a WU PR failed
 #     orchestrator_stop: false             # orchestrator loop exited (clean / drain / SIGTERM / crash)
 #     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
-#     quota_waiting: false                 # orchestrator hit a quota and started waiting (inert until E2-F3-S1-T1 wires the dispatcher)
-#     quota_resumed: false                 # quota recovered and the run resumed (inert until E2-F3-S1-T1 wires the dispatcher)
+#     quota_waiting: false                 # orchestrator hit a quota and started waiting (see quota_handling: above)
+#     quota_resumed: false                 # quota recovered and the run resumed (see quota_handling: above)
 #   slack:
 #     enabled: false                       # endpoint-level toggle; flip to true to enable Slack POSTs
 #     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)

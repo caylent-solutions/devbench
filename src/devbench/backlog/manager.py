@@ -2410,10 +2410,14 @@ class BacklogManager:
         """
         from devbench.backlog.manifest import ManifestParseError, parse_manifest
 
-        for row_id, _, file_path_str in rows:
+        for row_id, row_status, file_path_str in rows:
             if not row_id or row_id.startswith("-") or row_id.lower() == "id":
                 continue
             if not file_path_str or not self._is_task_id(row_id):
+                continue
+            # Skip terminal tasks: they predate the taxonomy and cannot be
+            # retroactively failed for a missing ## Task Type: section.
+            if row_status in _TERMINAL_CHILD_STATUSES:
                 continue
             wu_path = workspace_root / file_path_str
             if not wu_path.exists():

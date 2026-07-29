@@ -87,6 +87,59 @@ since the last release. PR #119 carries every change.
   format, or the orchestrate plugin's self-containedness fails
   these tests locally before push.
 
+### Changed (model defaults)
+
+- **Shipped model rate table refreshed to the current lineup; default
+  fallback model moves to Opus 5** (issue #233). `DEFAULT_MODEL_RATES`
+  (`src/devbench/constants.py`) gains four entries, all LIST rates
+  verified against the official Anthropic pricing page
+  (https://platform.claude.com/docs/en/about-claude/pricing), captured
+  2026-07-28:
+  - `claude-fable-5`: $10 / $50 per million input / output tokens.
+  - `claude-opus-5`: $5 / $25 -- the new shipped default (see
+    `DEFAULT_FALLBACK_MODEL_RATES`).
+  - `claude-opus-4-8`: $5 / $25 -- selectable, no longer the default.
+  - `claude-sonnet-5`: $3 / $15 LIST rate (spec S5.3). An introductory rate
+    of $2 / $10 runs through 2026-08-31; that promotional rate is **not**
+    shipped as the default -- workspaces wanting invoice-accurate
+    introductory pricing during the promo window override locally via
+    `report.models`.
+
+  Every pre-existing entry is retained, including the three Haiku pricing
+  rows (Haiku remains priced for reporting even though it is banned for
+  work agents, issue #198).
+
+  **`DEFAULT_FALLBACK_MODEL_RATES`** moves from an Opus-4.7-list-rates
+  label to an Opus-5-list-rates label (value unchanged at $5/$25 since
+  Opus 5 and Opus 4.7 share the same list rate); no hard-coded Opus 4.7
+  default reference remains in `constants.py`, `config_loader.py`,
+  `config.py`, or `config-schema.json`.
+
+  **`DEFAULT_FAST_MODE_MULTIPLIER`** corrects from `6.0` (stale Opus
+  4.6-era value) to `2.0`: fast mode today runs $10/$50 on a $5/$25 base
+  for Opus 5 and Opus 4.8, verified against the same pricing-page capture.
+
+  **`fable` short name added.** `ALLOWED_AGENT_MODEL_SHORT_NAMES` now
+  includes `fable` alongside `opus` and `sonnet`, aliasing `claude-fable-5`
+  for `agents.*` YAML overrides when `use_bedrock: false`. `haiku` remains
+  absent (issue #198); the `config-schema.json` `agents` description no
+  longer advertises `haiku` as an accepted short name.
+
+  **Issue #254 superseded.** #254 asked for Opus 4.8 as the new default;
+  Opus 5 shipped after #254 was filed, so per Decision D-2 this work moves
+  the default to Opus 5 instead and keeps Opus 4.8 as a selectable,
+  non-default model. #254 closes with this note recording the honest
+  supersede rather than the literal request.
+
+  Mirrored comments updated in the same commit:
+  `src/devbench/config_loader.py` (`ReportConfig.fast_mode_multiplier`
+  docstring, `_parse_default_model_rates` docstring),
+  `src/devbench/config.py` (`REPORT_DEFAULT_MODEL_RATES` comment), and
+  `src/devbench/config-schema.json` (`default_model`,
+  `fast_mode_multiplier`, `agents` descriptions). The `docs/model-pricing.md`
+  and `sample-config.yaml` mirrors are updated by the follow-up task
+  E3-F2-S1-T1.
+
 ### Changed
 
 - **Flattened the review leg: the four review-team judges are now

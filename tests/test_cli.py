@@ -19735,13 +19735,23 @@ class TestCostCalibrate:
         """When the operator calibrates a model not yet listed in
         ``report.models``, the helper seeds ``input``/``output`` from the
         canonical defaults so the resulting yaml is schema-valid.
+
+        AC-E3-F1-S1-T1-10 (spec FR-3.2 error handling, designed tripwire):
+        exercises the current default ``claude-opus-5`` (issue #233)
+        alongside the retained ``claude-opus-4-7`` row so the same test
+        that hard-pinned the Opus 4.7-era table catches any future
+        regression on either id.
         """
+        from devbench.constants import DEFAULT_MODEL_RATES
+
         config_yaml = tmp_path / "devbench.yaml"
         config_yaml.write_text(
             "repos:\n  org/repo:\n    default_branch: main\nreport:\n  models: {}\n",
             encoding="utf-8",
         )
-        cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], correction_factor=0.95)
+        cli.write_per_model_correction_factors(
+            config_yaml, ["claude-opus-4-7", "claude-opus-5"], correction_factor=0.95
+        )
         import yaml as _yaml
 
         round_tripped = _yaml.safe_load(config_yaml.read_text(encoding="utf-8"))
@@ -19749,6 +19759,19 @@ class TestCostCalibrate:
         # Seeded from DEFAULT_MODEL_RATES["claude-opus-4-7"]: $5/$25.
         assert opus["input"] == 5.0
         assert opus["output"] == 25.0
+
+        # claude-opus-5 is the current default lineup entry (issue #233).
+        # Assert it is an explicit DEFAULT_MODEL_RATES entry (not merely a
+        # value that happens to match the "<unknown>" fallback rate) so this
+        # tripwire actually catches the entry being dropped from the table.
+        assert "claude-opus-5" in DEFAULT_MODEL_RATES, (
+            "claude-opus-5 must be an explicit DEFAULT_MODEL_RATES entry, not just "
+            "coincidentally matching the fallback rate (issue #233)."
+        )
+        opus5 = round_tripped["report"]["models"]["claude-opus-5"]
+        # Seeded from DEFAULT_MODEL_RATES["claude-opus-5"]: $5/$25 list.
+        assert opus5["input"] == 5.0
+        assert opus5["output"] == 25.0
         assert opus["correction_factor"] == 0.95
 
     def test_write_per_model_correction_factors_rejects_non_mapping_yaml(self, tmp_path: Path) -> None:

@@ -330,10 +330,13 @@ class TestSessionDrainSignalFilenameConstant:
 
 
 class TestAllowedAgentModelShortNamesHaikuRemoval:
-    """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({'opus', 'sonnet'}).
+    """AC-198-1 / AC-E3-F1-S1-T1-5: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal
+    frozenset({'opus', 'sonnet', 'fable'}).
 
     Haiku must not be present -- any value containing 'haiku' in the
     per-agent YAML block is rejected at config-load time (caylent-solutions/devbench#198).
+    'fable' was added by caylent-solutions/devbench#233 (E3 model refresh) to
+    alias the newly-priced ``claude-fable-5`` model.
     """
 
     @pytest.mark.unit
@@ -347,14 +350,15 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
         )
 
     @pytest.mark.unit
-    def test_allowed_short_names_equals_opus_sonnet(self) -> None:
-        """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal exactly {'opus', 'sonnet'}."""
+    def test_allowed_short_names_equals_opus_sonnet_fable(self) -> None:
+        """AC-E3-F1-S1-T1-5: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal exactly
+        {'opus', 'sonnet', 'fable'}."""
         from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
 
-        expected = frozenset({"opus", "sonnet"})
+        expected = frozenset({"opus", "sonnet", "fable"})
         assert expected == ALLOWED_AGENT_MODEL_SHORT_NAMES, (
-            f"ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({{'opus', 'sonnet'}}); "
-            f"got {ALLOWED_AGENT_MODEL_SHORT_NAMES!r} (caylent-solutions/devbench#198)."
+            f"ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({{'opus', 'sonnet', 'fable'}}); "
+            f"got {ALLOWED_AGENT_MODEL_SHORT_NAMES!r} (caylent-solutions/devbench#198, #233)."
         )
 
     @pytest.mark.unit
@@ -370,6 +374,107 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
         from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
 
         assert "sonnet" in ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+    @pytest.mark.unit
+    def test_fable_in_allowed_short_names(self) -> None:
+        """AC-E3-F1-S1-T1-5: 'fable' must be in ALLOWED_AGENT_MODEL_SHORT_NAMES
+        (spec AC-36, issue #233)."""
+        from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+        assert "fable" in ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+
+class TestDefaultModelRatesLineup:
+    """AC-E3-F1-S1-T1-1/2/3/8/9: DEFAULT_MODEL_RATES gains the current-lineup
+    entries (Fable 5, Opus 5, Opus 4.8, Sonnet 5), every pre-existing entry
+    (including the three Haiku rows) is retained, DEFAULT_FALLBACK_MODEL_RATES
+    moves to Opus 5 list rates, and DEFAULT_FAST_MODE_MULTIPLIER corrects to
+    2.0 (issue #233, spec FR-3.1/FR-3.2/FR-3.9a, section 5.3).
+
+    Rates re-verified against the official Anthropic pricing page
+    (https://platform.claude.com/docs/en/about-claude/pricing), captured
+    2026-07-28, per spec Section 1.0 rule 2 and this task's Definition of
+    Ready.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("model_id", "expected_input", "expected_output"),
+        [
+            ("claude-fable-5", 10.0, 50.0),
+            ("claude-opus-5", 5.0, 25.0),
+            ("claude-opus-4-8", 5.0, 25.0),
+            ("claude-sonnet-5", 3.0, 15.0),
+        ],
+    )
+    def test_new_lineup_entries_present_with_verified_rates(
+        self, model_id: str, expected_input: float, expected_output: float
+    ) -> None:
+        """AC-E3-F1-S1-T1-1: each new-lineup model id is present with its
+        re-verified list rate."""
+        from devbench.constants import DEFAULT_MODEL_RATES
+
+        assert model_id in DEFAULT_MODEL_RATES, f"{model_id} missing from DEFAULT_MODEL_RATES (issue #233)."
+        rates = DEFAULT_MODEL_RATES[model_id]
+        assert rates.input == expected_input, f"{model_id} input rate: expected {expected_input}, got {rates.input}"
+        assert rates.output == expected_output, (
+            f"{model_id} output rate: expected {expected_output}, got {rates.output}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("model_id", "expected_input", "expected_output"),
+        [
+            ("claude-opus-4-7", 5.0, 25.0),
+            ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-opus-4-5", 5.0, 25.0),
+            ("claude-opus-4-1", 15.0, 75.0),
+            ("claude-opus-4", 15.0, 75.0),
+            ("claude-sonnet-4-6", 3.0, 15.0),
+            ("claude-sonnet-4-5", 3.0, 15.0),
+            ("claude-sonnet-4", 3.0, 15.0),
+            ("claude-haiku-4-5", 1.0, 5.0),
+            ("claude-haiku-3-5", 0.80, 4.0),
+            ("claude-haiku-3", 0.25, 1.25),
+        ],
+    )
+    def test_preexisting_entries_retained(self, model_id: str, expected_input: float, expected_output: float) -> None:
+        """AC-E3-F1-S1-T1-8: every pre-existing DEFAULT_MODEL_RATES entry,
+        including the three Haiku pricing rows, is retained byte-for-byte."""
+        from devbench.constants import DEFAULT_MODEL_RATES
+
+        assert model_id in DEFAULT_MODEL_RATES, f"{model_id} must remain in DEFAULT_MODEL_RATES."
+        rates = DEFAULT_MODEL_RATES[model_id]
+        assert rates.input == expected_input
+        assert rates.output == expected_output
+
+    @pytest.mark.unit
+    def test_default_model_rates_entry_count(self) -> None:
+        """AC-E3-F1-S1-T1-1/8: the table has exactly the 11 pre-existing rows
+        plus the 4 new-lineup rows -- no accidental drops, no duplicates."""
+        from devbench.constants import DEFAULT_MODEL_RATES
+
+        assert len(DEFAULT_MODEL_RATES) == 15, (
+            f"Expected 15 DEFAULT_MODEL_RATES entries (11 retained + 4 new); got {len(DEFAULT_MODEL_RATES)}: "
+            f"{sorted(DEFAULT_MODEL_RATES)}"
+        )
+
+    @pytest.mark.unit
+    def test_default_fallback_model_rates_is_opus_5_list(self) -> None:
+        """AC-E3-F1-S1-T1-3: DEFAULT_FALLBACK_MODEL_RATES equals Opus 5 list
+        rates ($5/$25); no hard-coded Opus 4.7 value remains."""
+        from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES
+
+        assert DEFAULT_FALLBACK_MODEL_RATES.input == 5.0
+        assert DEFAULT_FALLBACK_MODEL_RATES.output == 25.0
+
+    @pytest.mark.unit
+    def test_default_fast_mode_multiplier_is_2_0(self) -> None:
+        """AC-E3-F1-S1-T1-9: DEFAULT_FAST_MODE_MULTIPLIER is 2.0 (Opus 5 /
+        Opus 4.8 fast-mode premium), not the stale Opus 4.6-era 6.0."""
+        from devbench.constants import DEFAULT_FAST_MODE_MULTIPLIER
+
+        assert DEFAULT_FAST_MODE_MULTIPLIER == 2.0
 
 
 class TestSkillIterateUntilPerfectConstants:

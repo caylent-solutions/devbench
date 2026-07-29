@@ -126,8 +126,9 @@ class HookLogTotals:
     us_only_cache_write_5m_tokens: int = 0
     us_only_cache_write_1h_tokens: int = 0
     # Token volumes from entries with ``usage.speed == 'fast'`` (fast-mode
-    # premium, issue #124). Same per-subset accounting; multiplied by
-    # ``report.fast_mode_multiplier`` (default 6.0).
+    # premium, issue #124). Same per-subset accounting; the fast-token
+    # subset is multiplied by ``report.fast_mode_multiplier``, whose
+    # default is DEFAULT_FAST_MODE_MULTIPLIER in src/devbench/constants.py.
     fast_input_tokens: int = 0
     fast_output_tokens: int = 0
     fast_cache_read_tokens: int = 0
@@ -2631,7 +2632,7 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
         # individually -- the role aggregator collapses across models.
         # Pricing against the "<unknown>" bucket (-> REPORT_DEFAULT_MODEL_RATES)
         # produces the same total an operator would compute by hand from the
-        # canonical Opus 4.7 list rates.  Issue #223's per-model panel
+        # canonical Opus 5 list rates (issue #233).  Issue #223's per-model panel
         # remains the more accurate axis for cost; #206 is per-role view.
         cost = _compute_cost_by_model({"<unknown>": totals})
         cache_write = totals.cache_write_5m_tokens + totals.cache_write_1h_tokens

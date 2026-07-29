@@ -377,7 +377,8 @@ class ReportConfig:
         data_residency_multiplier: Cost multiplier when usage.inference_geo
             is set (US-only inference). Applied per-call (issue #124).
         fast_mode_multiplier: Cost multiplier when usage.speed == 'fast'
-            (Opus 4.6 fast-mode premium). Applied per-call (issue #124).
+            (Opus 5 / Opus 4.8 fast-mode premium, issue #233). Applied
+            per-call (issue #124).
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
@@ -702,8 +703,8 @@ def _parse_default_model_rates(raw: object, source: str) -> ModelRates:
 
     Falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` when absent.  Operators
     on standard Anthropic pricing typically leave this unset; the default
-    matches Opus 4.7 list pricing so an unknown-model bucket errs toward
-    over-reporting cost rather than under-reporting.
+    matches Opus 5 list pricing (issue #233) so an unknown-model bucket errs
+    toward over-reporting cost rather than under-reporting.
     """
     if raw is None:
         return DEFAULT_FALLBACK_MODEL_RATES

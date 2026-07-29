@@ -4057,11 +4057,19 @@ class TestPerModelHelpersCoverage:
         """Known model id pulls from REPORT_MODEL_RATES with the cache
         multipliers falling back to the top-level defaults when the
         per-model entry leaves them unset.
+
+        AC-E3-F1-S1-T1-10 (spec FR-3.2 error handling, designed tripwire):
+        this test previously pinned only the retained ``claude-opus-4-7``
+        row. It now also exercises the current default ``claude-opus-5``
+        ($5/$25 list, issue #233) alongside the retained row so the same
+        test that hard-pinned the Opus 4.7-era table catches any future
+        regression on either id.
         """
         from devbench.reporting.report import (
             REPORT_CACHE_READ_MULTIPLIER,
             REPORT_CACHE_WRITE_1HR_MULTIPLIER,
             REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+            REPORT_MODEL_RATES,
             _resolve_rates_for_model,
         )
 
@@ -4072,6 +4080,23 @@ class TestPerModelHelpersCoverage:
         assert c_5m == REPORT_CACHE_WRITE_5MIN_MULTIPLIER
         assert c_1h == REPORT_CACHE_WRITE_1HR_MULTIPLIER
         assert corr == 1.0
+
+        # Opus 5 is the current default lineup entry (issue #233); same
+        # list rate ($5/$25) as the retained Opus 4.7 row above. Assert it
+        # is an explicit REPORT_MODEL_RATES entry (not merely a value that
+        # happens to match the "<unknown>" fallback rate) so this tripwire
+        # actually catches the entry being dropped from the table.
+        assert "claude-opus-5" in REPORT_MODEL_RATES, (
+            "claude-opus-5 must be an explicit REPORT_MODEL_RATES entry, not just "
+            "coincidentally matching the fallback rate (issue #233)."
+        )
+        in_r5, out_r5, c_read5, c_5m5, c_1h5, corr5 = _resolve_rates_for_model("claude-opus-5")
+        assert in_r5 == 5.0
+        assert out_r5 == 25.0
+        assert c_read5 == REPORT_CACHE_READ_MULTIPLIER
+        assert c_5m5 == REPORT_CACHE_WRITE_5MIN_MULTIPLIER
+        assert c_1h5 == REPORT_CACHE_WRITE_1HR_MULTIPLIER
+        assert corr5 == 1.0
 
     def test_resolve_rates_for_model_per_model_cache_overrides_win(self) -> None:
         from devbench.constants import ModelRates

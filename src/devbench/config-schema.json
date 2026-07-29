@@ -356,7 +356,7 @@
         },
         "default_model": {
           "type": "object",
-          "description": "Rates applied to the `<unknown>` bucket: any transcript message whose `model` field is missing OR a model id not present in `report.models`. When absent, falls back to the Opus 4.7 list rates so unknown models err toward over-reporting cost.",
+          "description": "Rates applied to the `<unknown>` bucket: any transcript message whose `model` field is missing OR a model id not present in `report.models`. When absent, falls back to the Opus 5 list rates (issue #233) so unknown models err toward over-reporting cost.",
           "additionalProperties": false,
           "required": ["input", "output"],
           "properties": {
@@ -390,7 +390,7 @@
         },
         "fast_mode_multiplier": {
           "type": "number",
-          "description": "Cost multiplier applied per-call to usage.speed=='fast' tokens (issue #124). Defaults to 6.0 (Opus 4.6 fast-mode premium). Composes with cache + base-rate multipliers and applies before token_cost_discount."
+          "description": "Cost multiplier applied per-call to usage.speed=='fast' tokens (issue #124). Defaults to 2.0 (Opus 5 / Opus 4.8 fast-mode premium, captured 2026-07-28, issue #233). Composes with cache + base-rate multipliers and applies before token_cost_discount."
         },
         "recent_pace_tasks": {
           "type": "integer",
@@ -565,7 +565,7 @@
     },
     "agents": {
       "type": "object",
-      "description": "Per-agent model overrides (ADR-25). Each field defaults to null; the agent then runs on the model declared in its .md frontmatter. Set a field to override for this workspace -- devbench materialises a workspace-local shadow plugin tree under <workspace>/.devbench/plugin-shadow/devbench/ and rewrites the matching frontmatter line. JUDGE_AGENT_MODEL_<NAME> env vars override these YAML values. Use short names (opus|sonnet|haiku) or full Anthropic model ids (claude-opus-4-7) when use_bedrock: false; use the matching Bedrock id (us.anthropic.claude-opus-4-7-v1) when use_bedrock: true.",
+      "description": "Per-agent model overrides (ADR-25). Each field defaults to null; the agent then runs on the model declared in its .md frontmatter. Set a field to override for this workspace -- devbench materialises a workspace-local shadow plugin tree under <workspace>/.devbench/plugin-shadow/devbench/ and rewrites the matching frontmatter line. JUDGE_AGENT_MODEL_<NAME> env vars override these YAML values. Use short names (opus|sonnet|fable) or full Anthropic model ids (claude-opus-5) when use_bedrock: false; use the matching Bedrock id (us.anthropic.claude-opus-5-v1) when use_bedrock: true. Note: 'haiku' is not an accepted short name -- haiku is rejected for every work agent at config-load time (caylent-solutions/devbench#198).",
       "additionalProperties": false,
       "properties": {
         "executor": {

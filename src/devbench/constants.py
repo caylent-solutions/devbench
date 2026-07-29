@@ -496,6 +496,13 @@ class ModelRates:
 # Keys match the literal ``model`` strings emitted by Claude Code in the
 # transcript ``message.model`` field (e.g. ``claude-opus-4-7``, NOT
 # ``us.anthropic.claude-opus-4-7-v1``).
+#
+# Current-lineup entries (issue #233, spec FR-3.1, section 5.3) added below
+# the legacy rows. Source: https://platform.claude.com/docs/en/about-claude/pricing,
+# captured 2026-07-28. All four are LIST rates per spec S5.3 -- workspaces
+# wanting invoice-accurate introductory pricing override locally via
+# ``report.models`` rather than getting a promotional rate baked into the
+# shipped default.
 DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
     "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
     "claude-opus-4-6": ModelRates(input=5.0, output=25.0),
@@ -508,13 +515,33 @@ DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
     "claude-haiku-4-5": ModelRates(input=1.0, output=5.0),
     "claude-haiku-3-5": ModelRates(input=0.80, output=4.0),
     "claude-haiku-3": ModelRates(input=0.25, output=1.25),
+    # Fable 5 list rate. Source: https://platform.claude.com/docs/en/about-claude/pricing,
+    # captured 2026-07-28.
+    "claude-fable-5": ModelRates(input=10.0, output=50.0),
+    # Opus 5 list rate; current shipped default (issue #233 supersedes the
+    # literal #254 request for Opus 4.8, per Decision D-2 -- Opus 5 shipped
+    # after #254 was filed). Source:
+    # https://platform.claude.com/docs/en/about-claude/pricing, captured 2026-07-28.
+    "claude-opus-5": ModelRates(input=5.0, output=25.0),
+    # Opus 4.8 list rate; selectable but no longer the default (see
+    # claude-opus-5 above). Source:
+    # https://platform.claude.com/docs/en/about-claude/pricing, captured 2026-07-28.
+    "claude-opus-4-8": ModelRates(input=5.0, output=25.0),
+    # Sonnet 5 LIST rate per spec S5.3 ($3/$15). NOTE: an introductory rate
+    # of $2/$10 runs through 2026-08-31; that promotional rate is NOT the
+    # shipped default -- workspaces wanting invoice-accurate introductory
+    # pricing during the promo window override locally via `report.models`.
+    # Source: https://platform.claude.com/docs/en/about-claude/pricing,
+    # captured 2026-07-28.
+    "claude-sonnet-5": ModelRates(input=3.0, output=15.0),
 }
 
 # Rates applied to the ``"<unknown>"`` aggregation bucket: any transcript
 # message whose ``model`` field is missing, or any model id that does not
-# appear in the loaded ``report.models`` table. Default mirrors Opus 4.7 list
-# so devbench errs on the conservative (over-report) side -- under-reporting
-# is the operator-pain failure mode #223 is filed against.
+# appear in the loaded ``report.models`` table. Default mirrors Opus 5 list
+# (issue #233; supersedes the prior Opus 4.7-list default) so devbench errs
+# on the conservative (over-report) side -- under-reporting is the
+# operator-pain failure mode #223 is filed against.
 DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)
 
 # Em-dash (U+2014). Prohibited in work-unit markdown files by the
@@ -675,9 +702,13 @@ DEFAULT_CACHE_WRITE_1HR_MULTIPLIER: float = 2.0
 # Data-residency premium when usage.inference_geo is set (US-only inference;
 # applies to Opus 4.7, Opus 4.6, Sonnet 4.6+).
 DEFAULT_DATA_RESIDENCY_MULTIPLIER: float = 1.10
-# Fast-mode premium when usage.speed == "fast" (Opus 4.6 only at the time of
-# this snapshot). Counted but not applied per-call in v1.
-DEFAULT_FAST_MODE_MULTIPLIER: float = 6.0
+# Fast-mode premium when usage.speed == "fast" (Opus 5 and Opus 4.8 only at
+# the time of this snapshot, issue #233). Source:
+# https://platform.claude.com/docs/en/about-claude/pricing, captured 2026-07-28:
+# fast mode runs $10/$50 on a $5/$25 base, i.e. a 2.0x multiplier. Applied
+# per-call to the fast_* token subset (issue #124); see
+# reporting.report._compute_cost_by_model.
+DEFAULT_FAST_MODE_MULTIPLIER: float = 2.0
 
 # ---------------------------------------------------------------------------
 # Report table render widths (characters)
@@ -725,13 +756,16 @@ SHADOW_PID_SENTINEL_FILENAME: str = ".pid"
 
 # Short-name model aliases accepted in ``agents.*`` YAML values when
 # ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic
-# SDK accepts.
-ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet"})
+# SDK accepts. ``fable`` added by issue #233 (E3 model refresh) to alias
+# ``claude-fable-5``.
+ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet", "fable"})
 
-# Full Anthropic model id pattern (``claude-opus-4-7``, ``claude-sonnet-4-6``,
-# ``claude-sonnet-4-6-20250514``). Accepted when ``use_bedrock: false``.
-# Note: ids containing ``haiku`` are rejected by ``validate_agent_model_value()``
-# even though they would otherwise match this pattern.
+# Full Anthropic model id pattern (``claude-opus-5``, ``claude-sonnet-5``,
+# ``claude-fable-5``, ``claude-sonnet-4-6-20250514``). Accepted when
+# ``use_bedrock: false``. Note: ids containing ``haiku`` are rejected by
+# ``validate_agent_model_value()`` even though they would otherwise match
+# this pattern. Verified (spec S1.7) to already match every current-lineup
+# id added by issue #233 with zero pattern changes.
 ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(-[a-z0-9]+)+$")
 
 # AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted

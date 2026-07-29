@@ -410,7 +410,7 @@ REPORT_MODEL_RATES: dict[str, ModelRates] = {
 # Rates applied to the ``"<unknown>"`` aggregation bucket (transcript
 # messages with no ``model`` field, or model ids not present in
 # REPORT_MODEL_RATES).  Operator override via ``report.default_model``;
-# falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` (Opus 4.7 list rates).
+# falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` (Opus 5 list rates, issue #233).
 REPORT_DEFAULT_MODEL_RATES: ModelRates = RUNTIME_CONFIG.report.default_model
 # IANA timezone name for displaying timestamps in `devbench report`.
 # None means "use the host's system local timezone." Resolution: env > YAML > None.

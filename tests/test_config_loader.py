@@ -3174,6 +3174,85 @@ class TestAgentModelsConfig:
 
 
 # ---------------------------------------------------------------------------
+# New-lineup model ids -- AC-E3-F1-S1-T1-6/7 (issue #233, spec AC-37, S1.7)
+# ---------------------------------------------------------------------------
+
+_NEW_LINEUP_MODEL_IDS = (
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+)
+
+
+@pytest.mark.unit
+class TestNewLineupModelIdsAccepted:
+    """AC-E3-F1-S1-T1-6: validate_agent_model_value accepts every new-lineup
+    model id, both as an Anthropic API id (use_bedrock=False) and as its
+    Bedrock ARN form (use_bedrock=True), with zero regex changes (spec S1.7:
+    the existing ANTHROPIC_AGENT_MODEL_PATTERN / BEDROCK_AGENT_MODEL_PATTERN
+    already match these ids).
+    """
+
+    @pytest.mark.parametrize("model_id", _NEW_LINEUP_MODEL_IDS)
+    def test_anthropic_id_accepted_when_use_bedrock_false(self, model_id: str) -> None:
+        from devbench.config_loader import validate_agent_model_value
+
+        validate_agent_model_value("yaml", "executor", model_id, False)
+
+    @pytest.mark.parametrize("model_id", _NEW_LINEUP_MODEL_IDS)
+    def test_bedrock_id_accepted_when_use_bedrock_true(self, model_id: str) -> None:
+        from devbench.config_loader import validate_agent_model_value
+
+        bedrock_id = f"us.anthropic.{model_id}-v1"
+        validate_agent_model_value("yaml", "executor", bedrock_id, True)
+
+    def test_fable_short_name_accepted_when_use_bedrock_false(self) -> None:
+        """AC-E3-F1-S1-T1-6: the 'fable' short name is accepted exactly like
+        'opus'/'sonnet' when use_bedrock is False."""
+        from devbench.config_loader import validate_agent_model_value
+
+        validate_agent_model_value("yaml", "executor", "fable", False)
+
+    def test_fable_short_name_rejected_when_use_bedrock_true(self) -> None:
+        """AC-E3-F1-S1-T1-7: 'fable' alone is rejected under use_bedrock=True
+        exactly as 'opus'/'sonnet' short names are today (FR-3.3 error
+        handling)."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="not a valid Bedrock model id"):
+            validate_agent_model_value("yaml", "executor", "fable", True)
+
+    def test_new_lineup_ids_round_trip_via_yaml(self, tmp_path: Path) -> None:
+        """AC-E3-F1-S1-T1-6: a full config-load round trip accepts the new
+        default model id via the top-level `agents.executor` field."""
+        cfg = tmp_path / "cfg.yaml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(
+            textwrap.dedent(
+                """\
+                repos:
+                  org/repo:
+                    default_branch: main
+                agents:
+                  executor: claude-opus-5
+                """
+            ),
+            encoding="utf-8",
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.agent_models.executor == "claude-opus-5"
+
+    def test_haiku_still_rejected_after_fable_addition(self) -> None:
+        """AC-E3-F1-S1-T1-8: the haiku rejection (with its #198 citation) is
+        untouched by the fable short-name addition."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="caylent-solutions/devbench#198"):
+            validate_agent_model_value("yaml", "executor", "haiku", False)
+
+
+# ---------------------------------------------------------------------------
 # Haiku rejection -- AC-198-2, AC-198-3
 # ---------------------------------------------------------------------------
 

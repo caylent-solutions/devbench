@@ -236,13 +236,20 @@ Validate incompatible combinations:
 
 Ask the operator:
 
-> "Section: task_factory
+> "Section: task_factory (on by default, ADR-32)
 >
 >   enabled               -- Run the blocker-resolver + task-factory loop after amendment rejects.
->                            Requires manifest_amendment.enabled: true. [true/false, default: false]
->   auto_accept_proposals -- Auto-promote task-factory drafts to in-queue without operator review.
->                            [true/false, default: true]; set false for the 'proposed' draft review step.
->                            Only takes effect when enabled: true."
+>                            Requires manifest_amendment.enabled: true. [true/false, default: true]
+>   auto_accept_proposals -- Two auto-promote paths. (1) write-proposal: synchronously
+>                            materialises (and promotes any legacy 'proposed'-status draft)
+>                            in the same call, instead of waiting for the next sweep-proposals
+>                            tick. (2) sweep-proposals: also auto-promotes any orphaned draft
+>                            explicitly left at status 'proposed' (legacy/hand-edited drafts
+>                            only -- freshly materialised drafts always use
+>                            backlog.default_status_for_new_work_units, default 'in-queue',
+>                            regardless of this flag). [true/false, default: false]; false
+>                            defers both to an explicit promote-proposal/reject-proposal
+>                            decision. Only takes effect when enabled: true."
 
 ---
 

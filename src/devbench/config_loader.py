@@ -422,23 +422,46 @@ class TaskFactoryConfig:
     """Per-backlog task-factory configuration.
 
     Controls whether the orchestrator invokes blocker-resolver + task-factory
-    after an amendment reject to generate `proposed` work units for the
-    out-of-scope production fixes the amender surfaced.
+    after an amendment reject to materialise draft work-unit files for the
+    out-of-scope production fixes the amender surfaced. A materialised
+    draft's initial ``## Status:`` is always governed by
+    ``BacklogConfig.default_status_for_new_work_units`` (default
+    ``in-queue``), independent of both fields below.
 
     Attributes:
-        enabled: Whether the task-factory loop runs. Defaults to ``False``
-            so existing backlogs see no behavior change. Requires
+        enabled: Whether the task-factory loop runs. Defaults to ``True``
+            (D-11, ADR-32, superseding the PR #202 shipped auto-promote-by-
+            default posture, not ADR-11): the loop is on for every backlog
+            unless explicitly disabled. Requires
             ``manifest_amendment.enabled: true`` (task-factory runs from
-            the amendment-reject path).
-        auto_accept_proposals: When ``True``, ``devbench sweep-proposals``
-            auto-promotes every task-factory-produced draft to ``in-queue``
-            immediately, skipping the human review step. Default ``True``
-            (set ``false`` to make drafts land at ``proposed`` and wait for
-            the operator). Only takes effect when ``enabled`` is true. See ADR-11.
+            the amendment-reject path); see ``load_runtime_config`` for the
+            defaults-versus-amendment interaction contract when
+            ``manifest_amendment.enabled`` is explicitly ``false``.
+        auto_accept_proposals: Governs two independent auto-promote paths.
+            (1) ``devbench write-proposal`` itself: when ``True``, it
+            synchronously also calls ``materialise-proposal`` (and
+            ``promote-proposal`` for any of the just-written ids that
+            happen to already sit at legacy status ``proposed``) inside the
+            same invocation, so drafts land immediately instead of waiting
+            for the next ``sweep-proposals`` tick; when ``False`` (the
+            default), ``write-proposal`` only persists the JSON and
+            materialisation happens later via ``sweep-proposals`` or a
+            manual ``materialise-proposal`` call. (2) ``devbench
+            sweep-proposals``: when ``True``, it also auto-promotes any
+            draft explicitly sitting at status ``proposed`` (a
+            legacy/hand-edited-draft case -- the normal materialise path
+            has not written that status since AC-189-8 shipped); when
+            ``False``, such orphaned ``proposed`` drafts wait for an
+            explicit ``promote-proposal``/``reject-proposal`` decision.
+            Neither path affects the initial ``## Status:`` value written
+            into a freshly materialised draft -- that is always
+            ``BacklogConfig.default_status_for_new_work_units``. Default
+            ``False`` (D-11, ADR-32). Only takes effect when ``enabled`` is
+            true.
     """
 
-    enabled: bool = False
-    auto_accept_proposals: bool = True
+    enabled: bool = True
+    auto_accept_proposals: bool = False
 
 
 @dataclass(frozen=True)
@@ -812,6 +835,54 @@ def _parse_quota_handling_config(path: Path, raw: dict) -> QuotaHandlingConfig:
         audit_comment_on_wait=bool(raw.get("audit_comment_on_wait", defaults.audit_comment_on_wait)),
         audit_comment_on_resume=bool(raw.get("audit_comment_on_resume", defaults.audit_comment_on_resume)),
         log_structured_events=bool(raw.get("log_structured_events", defaults.log_structured_events)),
+    )
+
+
+def _parse_task_factory_config(
+    path: Path, task_factory_raw: dict, manifest_amendment: AmendmentConfig
+) -> TaskFactoryConfig:
+    """Parse and validate the ``task_factory:`` YAML section (ADR-32, D-11).
+
+    Args:
+        path: Config file path (used in error messages).
+        task_factory_raw: Raw ``task_factory`` dict from YAML (already
+            schema-validated for unknown keys and value types). May be an
+            empty dict when the section is absent -- an absent block yields
+            the on-by-default ``TaskFactoryConfig()`` defaults.
+        manifest_amendment: The already-resolved ``AmendmentConfig`` for this
+            load, needed for the cross-field interaction check below.
+
+    Returns:
+        ``TaskFactoryConfig`` populated from *task_factory_raw*.
+
+    Raises:
+        ValueError: When ``task_factory.enabled`` is EXPLICITLY ``true`` in
+            the YAML while ``manifest_amendment.enabled`` resolves ``false``.
+            Task-factory runs from the amendment-reject path, so this is a
+            real contradiction the operator must fix.
+
+    Interaction contract (ADR-32): a DEFAULTED-on ``enabled`` (the key was
+    omitted from *task_factory_raw*) against an explicitly disabled
+    ``manifest_amendment.enabled: false`` is NOT a contradiction -- it is the
+    spec Section 0 B-8 migration case, an existing backlog that predates the
+    D-11 defaults flip and never mentions ``task_factory``. That combination
+    downgrades ``enabled`` to ``False`` silently instead of bricking
+    config-load; the loop has nothing to do without the amendment workflow it
+    runs from either way.
+    """
+    defaults = TaskFactoryConfig()
+    enabled_explicit = "enabled" in task_factory_raw
+    enabled = bool(task_factory_raw.get("enabled", defaults.enabled))
+    if enabled and not manifest_amendment.enabled:
+        if enabled_explicit:
+            raise ValueError(
+                f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
+                "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
+            )
+        enabled = False
+    return TaskFactoryConfig(
+        enabled=enabled,
+        auto_accept_proposals=bool(task_factory_raw.get("auto_accept_proposals", defaults.auto_accept_proposals)),
     )
 
 
@@ -1758,23 +1829,10 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate TaskFactory config from YAML task_factory block. Requires
-    # manifest_amendment.enabled when task_factory.enabled is true -- the
-    # loop runs after an amendment reject, so it has nothing to do when the
-    # amendment workflow itself is off.
-    task_factory_raw = raw.get("task_factory") or {}
-    default_task_factory = TaskFactoryConfig()
-    task_factory = TaskFactoryConfig(
-        enabled=bool(task_factory_raw.get("enabled", default_task_factory.enabled)),
-        auto_accept_proposals=bool(
-            task_factory_raw.get("auto_accept_proposals", default_task_factory.auto_accept_proposals)
-        ),
-    )
-    if task_factory.enabled and not manifest_amendment.enabled:
-        raise ValueError(
-            f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
-            "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
-        )
+    # Populate TaskFactory config from YAML task_factory block (ADR-32, D-11).
+    # See _parse_task_factory_config for the defaults-versus-amendment
+    # interaction contract.
+    task_factory = _parse_task_factory_config(path, raw.get("task_factory") or {}, manifest_amendment)
 
     # Populate AgentModelsConfig from YAML agents block (ADR-25). Cross-
     # validates each non-None value against the top-level use_bedrock flag so

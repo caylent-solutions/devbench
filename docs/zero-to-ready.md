@@ -286,7 +286,7 @@ manifest_amendment:
   enabled: true    # default; set false to stop executors requesting Manifest changes mid-task
 
 task_factory:
-  enabled: false   # set true to let the orchestrator auto-generate follow-up tasks
+  enabled: true    # default (ADR-32); set false to stop the orchestrator auto-generating follow-up tasks
 
 validate:
   check_orphan_path_tokens: true    # Rule 20 (default on); set false to opt out of the AC / DoD path-coherence check
@@ -970,7 +970,14 @@ default; set `false` to opt out.
 ### task_factory.enabled (Step 7)
 
 When enabled, the orchestrator can auto-generate new backlog tasks from proposals emitted
-by blocked executors. Requires `manifest_amendment.enabled: true`. Disabled by default.
+by blocked executors. Requires `manifest_amendment.enabled: true`. Enabled by default
+(ADR-32); set `false` to opt out. A draft's initial status is always
+`backlog.default_status_for_new_work_units` (default `in-queue`), unaffected by
+`task_factory.auto_accept_proposals` -- that flag (default `false`) instead governs two
+auto-promote paths: `write-proposal` synchronously materialises (and promotes any legacy
+`proposed`-status draft) in the same call rather than waiting for the next
+`sweep-proposals` tick, and `sweep-proposals` separately auto-promotes any orphaned draft
+explicitly left at `## Status: proposed`.
 
 ### Manual blockers vs regular deps (Step 8)
 

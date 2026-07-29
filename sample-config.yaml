@@ -308,14 +308,23 @@ manifest_amendment:
   max_requests_per_execution: 1
 
 # ---------------------------------------------------------------------------
-# Task factory loop (requires manifest_amendment.enabled: true)
+# Task factory loop (on by default, ADR-32; requires manifest_amendment.enabled:
+# true). Set enabled: false to opt out of the loop entirely.
 # ---------------------------------------------------------------------------
 task_factory:
-  enabled: false
-  # When true (the default), sweep-proposals auto-promotes every produced
-  # draft at the next loop tick. Set false to make a human review every
-  # proposal. Only takes effect when task_factory.enabled is true.
-  auto_accept_proposals: true
+  enabled: true
+  # Two independent auto-promote paths. (1) write-proposal: true makes
+  # write-proposal itself synchronously materialise (and, for legacy
+  # `proposed`-status ids, promote) drafts in the same call instead of
+  # waiting for the next sweep-proposals tick; false (the default) means
+  # write-proposal only persists the JSON. (2) sweep-proposals: true makes
+  # it also auto-promote any orphaned draft explicitly left at status
+  # `proposed` (a legacy/hand-edited-draft case); false leaves such drafts
+  # for an explicit `promote-proposal`/`reject-proposal` decision. Neither
+  # path changes a freshly materialised draft's initial status, which is
+  # always backlog.default_status_for_new_work_units (default `in-queue`).
+  # Only takes effect when task_factory.enabled is true.
+  auto_accept_proposals: false
 
 # ---------------------------------------------------------------------------
 # Backlog lifecycle settings (issue #189)

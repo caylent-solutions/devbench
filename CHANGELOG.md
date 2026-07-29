@@ -19,8 +19,29 @@ since the last release. PR #119 carries every change.
   - `validate.check_orphan_path_tokens` now defaults **true** (was `false`) --
     `validate-backlog` runs Rule 20 (AC/DoD path-coherence) by default. Set `false`
     to opt out if a pre-existing backlog is not yet compatible.
-  - `task_factory.auto_accept_proposals` now defaults **true** (was `false`); only
-    takes effect when `task_factory.enabled` is `true`.
+  - `task_factory.enabled` now defaults **true** (was `false`) and
+    `task_factory.auto_accept_proposals` now defaults **false** (was `true`
+    as shipped in released tag `0.1.0` via PR #202) -- both flipped together
+    in the same commit per D-11 (issue #259, ADR-32) so the on-by-default
+    loop never grants an unreviewed orphan-auto-promote path. Relative to
+    `0.1.0` the user-visible change is that the loop now runs for every
+    backlog by default; a freshly materialised draft's initial status was,
+    and remains, `backlog.default_status_for_new_work_units` (default
+    `in-queue`, AC-189-8) regardless of `auto_accept_proposals` -- that flag
+    instead governs two auto-promote paths: `write-proposal` itself no
+    longer synchronously materialises-and-promotes the proposal it just
+    wrote inside the same invocation by default (that cascade only fires
+    when `auto_accept_proposals` is explicitly `true`), so a freshly
+    written proposal now waits for the next `sweep-proposals` tick to
+    become actionable; and `sweep-proposals` no longer auto-promotes a
+    draft explicitly left at `## Status: proposed` (a legacy/hand-edited-
+    draft case, not something the normal materialise path produces) unless
+    the flag is set. Existing backlogs that explicitly disabled
+    `manifest_amendment` and never mentioned `task_factory` are unaffected:
+    the defaulted-on `task_factory.enabled` downgrades to disabled rather
+    than failing config-load in that combination (see ADR-32's interaction
+    contract). See the migration note below for the exact keys to restore
+    each pre-flip behavior.
   - `merge_strategy` default is now explicitly `squash` at the config layer.
   - `timeouts.executor` and `timeouts.executor_max_turns` were **removed** -- they
     were parsed but never consumed (dead config); removing them changes no behaviour.
@@ -1866,6 +1887,39 @@ Operators upgrading from before this release:
    (`git_ops.pause_before_merge`) in this release; the runtime
    implementation ships in a follow-up commit on this branch (or in
    the next release if the follow-up is deferred).
+6. **Issue #259 (task-factory on by default, ADR-32)**: if your backlog
+   omits `task_factory` from `backlog/config/devbench.yaml`, the loop now
+   runs and materialises draft work-unit `.md` files after amendment
+   rejects, where before it produced none. A freshly materialised
+   draft's initial status is, and has always been, governed by
+   `backlog.default_status_for_new_work_units` (default `in-queue`,
+   AC-189-8) -- unaffected by this change -- so drafts remain immediately
+   actionable unless you also set that key to `draft` for an explicit
+   human-review gate. Relative to released tag `0.1.0`, TWO defaults
+   changed: `task_factory.enabled` flipped `false` -> `true`, and
+   `task_factory.auto_accept_proposals` flipped `true` -> `false`. To
+   restore the pre-flip `enabled` behavior (loop off unless explicitly
+   turned on), add `task_factory.enabled: false`. `auto_accept_proposals`
+   going `true` -> `false` has two concrete effects an upgrading operator
+   will notice: (a) `write-proposal` no longer synchronously
+   materialises-and-promotes the proposal it just wrote inside the same
+   invocation (`auto_cascade` in its output JSON now reads `"disabled"`),
+   so a freshly written proposal now waits for the next `sweep-proposals`
+   tick instead of being actionable immediately; and (b)
+   `sweep-proposals` no longer auto-promotes a draft explicitly left at
+   `## Status: proposed` (a legacy/hand-edited-draft case, not something
+   the normal materialise path produces). To restore the
+   `0.1.0`-released `auto_accept_proposals: true` behavior (both effects
+   together), add `task_factory.auto_accept_proposals: true` (alongside
+   `enabled: true`, its default) -- **warning:** this reintroduces the
+   orphan-auto-promote path that `0.1.0` shipped and that D-11
+   deliberately turns off by default; it was never a general
+   auto-promote-everything behavior even at `0.1.0`, since freshly
+   materialised drafts have always bypassed `proposed` status entirely.
+   Only set it if you have already confirmed that skipping review of
+   orphaned `proposed` drafts is acceptable. See
+   `docs/adr/32-task-factory-default-on.md` for the full decision record
+   and the `manifest_amendment`-interaction contract.
 
 ### Known follow-ups (this branch / next release)
 

@@ -245,12 +245,12 @@ manifest_amendment:
 
 ---
 
-## `task_factory:` -- opt-in task-factory loop
+## `task_factory:` -- task-factory loop (on by default, ADR-32)
 
 ```yaml
 task_factory:
-  enabled: false                   # opt-in; requires manifest_amendment.enabled: true
-  auto_accept_proposals: true      # default; only applies when enabled: true
+  enabled: true                    # default; set false to opt out; requires manifest_amendment.enabled: true
+  auto_accept_proposals: false     # default; governs two auto-promote paths (write-proposal's synchronous materialise+promote cascade, and sweep-proposals' orphan-`proposed`-draft promote); new drafts always use backlog.default_status_for_new_work_units regardless; only applies when enabled: true
 ```
 
 ---

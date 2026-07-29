@@ -458,16 +458,16 @@
     },
     "task_factory": {
       "type": "object",
-      "description": "Opt-in configuration for the task-factory loop. When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to generate new `proposed` work units for the out-of-scope production fixes the amender surfaced. Requires manifest_amendment.enabled: true.",
+      "description": "Configuration for the task-factory loop, on by default (ADR-32, superseding the PR #202 shipped auto-promote-by-default posture, not ADR-11). When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to materialise new draft work-unit files for the out-of-scope production fixes the amender surfaced; a draft's initial status is governed by backlog.default_status_for_new_work_units (default in-queue), unrelated to auto_accept_proposals. Requires manifest_amendment.enabled: true (a config that omits this block while explicitly disabling manifest_amendment.enabled downgrades silently to disabled rather than failing config-load; an explicit enabled: true against a disabled amendment workflow still fails fast).",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Whether the task-factory loop runs after amendment rejects. Default false (opt-in). Requires manifest_amendment.enabled: true."
+          "description": "Whether the task-factory loop runs after amendment rejects. Default true (on by default, ADR-32). Requires manifest_amendment.enabled: true. Set false to opt out."
         },
         "auto_accept_proposals": {
           "type": "boolean",
-          "description": "When true (the default), devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Set false to require operator review. Only takes effect when task_factory.enabled is true. ADR-11."
+          "description": "Governs two auto-promote paths. (1) write-proposal: when true, write-proposal synchronously also calls materialise-proposal (and promote-proposal for any just-written id already sitting at legacy status `proposed`) in the same invocation, so drafts land immediately instead of waiting for the next sweep-proposals tick; when false (the default), write-proposal only persists the JSON and materialisation happens later via sweep-proposals or a manual materialise-proposal call. (2) sweep-proposals: when true, it also auto-promotes any draft explicitly sitting at status `proposed` (a legacy/hand-edited-draft case; the normal materialise path never writes that status -- it always uses backlog.default_status_for_new_work_units). Neither path changes the initial status of a freshly materialised draft. Default false (ADR-32). Only takes effect when task_factory.enabled is true."
         }
       }
     },

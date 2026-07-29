@@ -6,11 +6,15 @@ configured branch lookup, and PR base-branch wiring.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import re
 import textwrap
 from pathlib import Path
 
 import jsonschema
 import pytest
+import yaml
 
 from devbench.config_loader import (
     DEFAULT_CONFIG_SUBPATH,
@@ -20,6 +24,7 @@ from devbench.config_loader import (
     RepoConfig,
     RuntimeConfig,
     SkillsConfig,
+    TaskFactoryConfig,
     TimeoutConfig,
     format_branch_name,
     format_single_branch_name,
@@ -1555,7 +1560,9 @@ class TestManifestAmendmentConfig:
 
 
 class TestTaskFactoryConfig:
-    """ADR-11: YAML loader correctly parses the opt-in task_factory section including auto_accept_proposals."""
+    """ADR-32: YAML loader correctly parses the task_factory section (on-by-default
+    per D-11, superseding the PR #202 shipped auto-promote-by-default posture, not
+    ADR-11) including auto_accept_proposals."""
 
     @staticmethod
     def _write(path: Path, content: str) -> Path:
@@ -1565,6 +1572,8 @@ class TestTaskFactoryConfig:
         return path
 
     def test_defaults_when_section_absent(self, tmp_path: Path) -> None:
+        """D-11: a config omitting task_factory entirely resolves enabled=True,
+        auto_accept_proposals=False (spec AC-41)."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1574,15 +1583,13 @@ class TestTaskFactoryConfig:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.task_factory.enabled is False
-        assert result.task_factory.auto_accept_proposals is True
+        assert result.task_factory.enabled is True
+        assert result.task_factory.auto_accept_proposals is False
 
     def test_task_factory_enabled_without_manifest_amendment_raises(self, tmp_path: Path) -> None:
-        """task_factory.enabled=true requires manifest_amendment.enabled=true.
-
-        manifest_amendment now defaults on, so the YAML must explicitly disable it
-        to exercise the cross-field validation.
-        """
+        """An EXPLICIT task_factory.enabled=true still requires an explicit or
+        defaulted manifest_amendment.enabled=true; the contradiction fails fast
+        with the existing ValueError (ADR-32 interaction contract, AC-5)."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1598,8 +1605,65 @@ class TestTaskFactoryConfig:
         with pytest.raises(ValueError, match=r"task_factory\.enabled: true requires manifest_amendment\.enabled: true"):
             load_runtime_config(cfg, {})
 
-    def test_auto_accept_defaults_true_when_key_omitted(self, tmp_path: Path) -> None:
-        """Key omitted inside an enabled task_factory block -> default True."""
+    @pytest.mark.parametrize(
+        "task_factory_block",
+        [
+            pytest.param("", id="task_factory_block_absent"),
+            pytest.param(
+                "task_factory:\n              auto_accept_proposals: false\n",
+                id="task_factory_block_present_without_enabled_key",
+            ),
+        ],
+    )
+    def test_defaulted_enabled_downgrades_when_manifest_amendment_disabled(
+        self, tmp_path: Path, task_factory_block: str
+    ) -> None:
+        """ADR-32 interaction contract: a config where task_factory.enabled
+        resolves via the on-by-default value -- because the key was never
+        explicitly set to `true` -- but manifest_amendment is explicitly
+        disabled, must NOT brick at config-load (spec Section 0 B-8 migration
+        requirement). The defaulted-on task_factory downgrades to disabled
+        instead of raising, since the loop has nothing to do without the
+        amendment workflow it runs from.
+
+        Parametrized over two shapes that must both downgrade rather than
+        raise: (1) the task_factory block is absent entirely, and (2) the
+        block is present but only sets an unrelated key
+        (auto_accept_proposals), omitting `enabled`. Shape (2) pins that the
+        "was `enabled` explicitly set" check inspects the `enabled` KEY
+        specifically -- not merely whether the `task_factory` mapping is
+        non-empty/truthy. A mutant that computed explicitness from
+        truthiness of the whole block (e.g. `bool(task_factory_raw)`) would
+        pass shape (1) but incorrectly treat shape (2) as an explicit
+        `enabled: true`, wrongly raising ValueError instead of downgrading.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: false
+            {task_factory_block}""",
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.enabled is False, (
+            "ADR-32 B-8 migration contract: a task_factory.enabled that resolves via "
+            "the on-by-default value (not an explicit `enabled: true` key) against an "
+            "explicitly disabled manifest_amendment must downgrade enabled to False "
+            "rather than raising, so a pre-existing backlog is never bricked by the "
+            "on-by-default flip"
+        )
+        assert result.task_factory.auto_accept_proposals is False, (
+            "ADR-32 B-8 migration contract: the downgraded, defaulted-off task_factory "
+            "must also resolve auto_accept_proposals to its unreviewed-promotion-safe "
+            "False default -- an unreviewed auto-promote path must never be granted by "
+            "a defaults-only resolution the operator never explicitly requested"
+        )
+
+    def test_auto_accept_defaults_false_when_key_omitted(self, tmp_path: Path) -> None:
+        """Key omitted inside an explicitly-enabled task_factory block -> default False (D-11)."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1614,7 +1678,7 @@ class TestTaskFactoryConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.task_factory.enabled is True
-        assert result.task_factory.auto_accept_proposals is True
+        assert result.task_factory.auto_accept_proposals is False
 
     def test_auto_accept_accepts_explicit_false(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -1685,6 +1749,199 @@ class TestTaskFactoryConfig:
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
+
+
+_TASK_FACTORY_DRIFT_FIELDS = [field.name for field in dataclasses.fields(TaskFactoryConfig)]
+
+
+@pytest.mark.unit
+class TestTaskFactoryDefaultsDriftGuard:
+    """Parameterized guard against the task_factory defaults (D-11, ADR-32:
+    ``enabled`` True, ``auto_accept_proposals`` False) silently drifting
+    across ``TaskFactoryConfig``, ``sample-config.yaml``,
+    ``src/devbench/config-schema.json``, the configure-devbench
+    ``SKILL.md`` Step 8 prompt, and the ``docs/block-types.md`` config-knobs
+    table.
+
+    Modeled on
+    ``tests/test_plugin/test_skill_structure.py::TestConfigureDevbenchSkillReportStepDriftGuard``
+    (test_review REVIEW_FAIL, round 3: 'the two task_factory defaults are
+    hand-restated in sample-config.yaml, SKILL.md Step 8, config-schema.json
+    and docs/block-types.md with no drift guard tying them to
+    TaskFactoryConfig, and the task's own round-3 log proves nine surfaces
+    already drifted under the manual-grep control'). Every comparison below
+    treats the ``TaskFactoryConfig`` dataclass default as the single source
+    of truth so a future default change is caught the moment any restated
+    surface goes stale, instead of relying on a one-time manual grep.
+
+    ``_TASK_FACTORY_DRIFT_FIELDS`` above is derived from
+    ``dataclasses.fields(TaskFactoryConfig)`` rather than hand-maintained,
+    so a future third ``TaskFactoryConfig`` field is automatically covered
+    by every parametrized check in this class instead of silently escaping
+    them (test_review REVIEW_FAIL, round 6).
+
+    ``docs/block-types.md``'s config-knobs table only restates
+    ``task_factory.enabled`` (it has no ``auto_accept_proposals`` row), so
+    that surface is guarded by a single, non-parametrized test rather than
+    being folded into the parametrized checks above. The table's adjacent
+    ``manifest_amendment.enabled`` row is guarded by ``AmendmentConfig``,
+    not ``TaskFactoryConfig``, and is out of scope for this drift guard
+    (test_review round-6 remediation item 2 is deliberately not
+    implemented here; it belongs to whichever unit owns
+    ``AmendmentConfig`` defaults).
+    """
+
+    @staticmethod
+    def _dataclass_defaults() -> dict[str, bool]:
+        defaults: dict[str, bool] = {}
+        for field in dataclasses.fields(TaskFactoryConfig):
+            assert isinstance(field.default, bool), (
+                f"TaskFactoryConfig.{field.name} must declare a bool default for this "
+                "drift guard to compare against; got "
+                f"{type(field.default).__name__}"
+            )
+            defaults[field.name] = field.default
+        return defaults
+
+    @staticmethod
+    def _sample_config_task_factory_section() -> dict[str, object]:
+        sample_path = Path(__file__).parent.parent / "sample-config.yaml"
+        loaded = yaml.safe_load(sample_path.read_text(encoding="utf-8"))
+        section = loaded.get("task_factory") if isinstance(loaded, dict) else None
+        assert isinstance(section, dict), (
+            f"sample-config.yaml ({sample_path}) must have a top-level 'task_factory:' mapping"
+        )
+        return section
+
+    @staticmethod
+    def _config_schema_task_factory_properties() -> dict[str, dict[str, object]]:
+        schema_path = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+        with schema_path.open(encoding="utf-8") as fh:
+            schema = json.load(fh)
+        properties = schema.get("properties", {}).get("task_factory", {}).get("properties", {})
+        assert isinstance(properties, dict) and properties, (
+            f"config-schema.json ({schema_path}) must define properties.task_factory.properties"
+        )
+        return properties
+
+    @staticmethod
+    def _skill_step_8_text() -> str:
+        skill_path = (
+            Path(__file__).parent.parent
+            / "plugin-authoring"
+            / "devbench-authoring"
+            / "skills"
+            / "configure-devbench"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text(encoding="utf-8")
+        match = re.search(
+            r"^## Step \d+ -- task_factory section\n(.*?)(?=^## Step \d+ --)",
+            content,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, (
+            f"configure-devbench/SKILL.md ({skill_path}) must contain a "
+            "'## Step N -- task_factory section' walkthrough step"
+        )
+        return match.group(1)
+
+    @staticmethod
+    def _block_types_task_factory_enabled_default() -> bool:
+        block_types_path = Path(__file__).parent.parent / "docs" / "block-types.md"
+        content = block_types_path.read_text(encoding="utf-8")
+        match = re.search(
+            r"^\|\s*`task_factory\.enabled`\s*\|\s*`?(true|false)`?[^|]*\|",
+            content,
+            re.MULTILINE,
+        )
+        assert match is not None, (
+            f"docs/block-types.md ({block_types_path}) must have a config-knobs table "
+            "row for '`task_factory.enabled`' with the default in the Default column, "
+            "e.g. '| `task_factory.enabled` | `true` (ADR-32) | ... |'"
+        )
+        return match.group(1) == "true"
+
+    @pytest.mark.parametrize("field_name", _TASK_FACTORY_DRIFT_FIELDS)
+    def test_sample_config_matches_dataclass_default(self, field_name: str) -> None:
+        dataclass_default = self._dataclass_defaults()[field_name]
+        section = self._sample_config_task_factory_section()
+        assert field_name in section, (
+            f"sample-config.yaml's task_factory block must set '{field_name}' explicitly "
+            "so the shipped example never silently relies on an unstated default"
+        )
+        assert section[field_name] is dataclass_default, (
+            f"sample-config.yaml's task_factory.{field_name} is '{section[field_name]}' but "
+            f"TaskFactoryConfig.{field_name} defaults to '{dataclass_default}' in "
+            "src/devbench/config_loader.py. Update sample-config.yaml to match the "
+            "dataclass default (D-11, ADR-32)."
+        )
+
+    @pytest.mark.parametrize("field_name", _TASK_FACTORY_DRIFT_FIELDS)
+    def test_schema_description_matches_dataclass_default(self, field_name: str) -> None:
+        dataclass_default = self._dataclass_defaults()[field_name]
+        properties = self._config_schema_task_factory_properties()
+        assert field_name in properties, (
+            f"src/devbench/config-schema.json must define properties.task_factory.properties.{field_name}"
+        )
+        description = properties[field_name]["description"]
+        assert isinstance(description, str), (
+            f"src/devbench/config-schema.json's task_factory.{field_name} description must "
+            f"be a string; got {type(description).__name__}"
+        )
+        match = re.search(r"Default (true|false)", description)
+        assert match is not None, (
+            f"src/devbench/config-schema.json's task_factory.{field_name} description must "
+            "state 'Default true' or 'Default false' so this drift guard can verify it"
+        )
+        stated_default = match.group(1) == "true"
+        assert stated_default == dataclass_default, (
+            f"src/devbench/config-schema.json states task_factory.{field_name}'s default as "
+            f"'{match.group(1)}' but TaskFactoryConfig.{field_name} defaults to "
+            f"'{dataclass_default}' in src/devbench/config_loader.py. Update the schema "
+            "description to match the dataclass default (D-11, ADR-32)."
+        )
+
+    @pytest.mark.parametrize("field_name", _TASK_FACTORY_DRIFT_FIELDS)
+    def test_skill_step_matches_dataclass_default(self, field_name: str) -> None:
+        dataclass_default = self._dataclass_defaults()[field_name]
+        step_text = self._skill_step_8_text()
+        match = re.search(
+            rf"{re.escape(field_name)}\s.*?\[true/false,\s*default:\s*(true|false)\]",
+            step_text,
+            re.DOTALL,
+        )
+        assert match is not None, (
+            f"configure-devbench/SKILL.md Step 8 must state '{field_name}' followed by a "
+            "'[true/false, default: <bool>]' annotation on its own bullet"
+        )
+        stated_default = match.group(1) == "true"
+        assert stated_default == dataclass_default, (
+            f"configure-devbench/SKILL.md Step 8 states task_factory.{field_name}'s default "
+            f"as '{match.group(1)}' but TaskFactoryConfig.{field_name} defaults to "
+            f"'{dataclass_default}' in src/devbench/config_loader.py. Update the SKILL.md "
+            "prompt to match the dataclass default (D-11, ADR-32)."
+        )
+
+    def test_block_types_config_knobs_matches_dataclass_default(self) -> None:
+        """docs/block-types.md's config-knobs table restates
+        task_factory.enabled's Default column (test_review REVIEW_FAIL,
+        round 6: this was the fourth restated surface the round-3 finding
+        named that the drift guard added in round 4 left unguarded). This
+        checks only 'enabled': the table has no 'auto_accept_proposals'
+        row, so there is nothing to guard there. The adjacent
+        'manifest_amendment.enabled' row is out of scope (AmendmentConfig,
+        not TaskFactoryConfig) and is deliberately left unguarded and
+        unmodified here.
+        """
+        dataclass_default = self._dataclass_defaults()["enabled"]
+        stated_default = self._block_types_task_factory_enabled_default()
+        assert stated_default == dataclass_default, (
+            f"docs/block-types.md's config-knobs table states task_factory.enabled's "
+            f"default as '{stated_default}' but TaskFactoryConfig.enabled defaults to "
+            f"'{dataclass_default}' in src/devbench/config_loader.py. Update the "
+            "Default column to match the dataclass default (D-11, ADR-32)."
+        )
 
 
 @pytest.mark.unit

@@ -2,7 +2,7 @@
 
 The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files. Each draft's initial status is determined by `backlog.default_status_for_new_work_units` in `backlog/config/devbench.yaml` (`in-queue` by default; `draft` when opted in via AC-189-8). The human reviews, edits, and promotes each draft; the orchestrator continues on other actionable tasks until promotion.
 
-See [ADR-03: Task factory](adr/03-task-factory.md) for the design rationale and alternatives considered.
+See [ADR-03: Task factory](adr/03-task-factory.md) for the design rationale and alternatives considered, and [ADR-32: task-factory on by default](adr/32-task-factory-default-on.md) for the current defaults.
 
 ## When task-factory runs
 
@@ -20,17 +20,17 @@ Two independent triggers fire task-factory. Both land a proposal JSON at `<works
 | No amendment request + executor emits proposal JSON + `task_factory.enabled: false` | No factory run; audit comment notes the pending proposal for operator review. |
 | No amendment request + executor emits proposal JSON + `task_factory.enabled: true` | Task-factory materialises drafts directly; source task's own reviews continue (it is NOT auto-blocked -- validation gates can still pass their own ACs even when they surface out-of-scope bugs). |
 
-The feature is opt-in per backlog via `backlog/config/devbench.yaml`:
+The feature is **on by default** per backlog (ADR-32); set `task_factory.enabled: false` in `backlog/config/devbench.yaml` to opt out:
 
 ```yaml
 manifest_amendment:
-  enabled: true           # prerequisite
+  enabled: true           # prerequisite; also on by default
 
 task_factory:
-  enabled: true           # runs after amender rejects
+  enabled: false          # opt out; omit this key (or set true) to keep the loop running
 ```
 
-`task_factory.enabled: true` requires `manifest_amendment.enabled: true`. Config validation fails loud otherwise.
+`task_factory.enabled: true` (the default) requires `manifest_amendment.enabled: true` (also the default). Config validation fails loud on the explicit contradiction. A freshly materialised draft's initial status is unaffected by `task_factory.auto_accept_proposals` -- it is always `backlog.default_status_for_new_work_units` as described above. `auto_accept_proposals` (default `false`) governs two auto-promote paths instead: `write-proposal` synchronously materialises (and promotes any legacy `proposed`-status draft) in the same call rather than waiting for the next `sweep-proposals` tick, and `sweep-proposals` separately auto-promotes any orphaned draft explicitly left at `## Status: proposed` (a legacy/hand-edited-draft case); see [Auto-accepting proposals](#auto-accepting-proposals-adr-11) below for the full behavior.
 
 **Trigger is file-based, not verdict-word-based.** The orchestrate skill branches on `test -f $DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` to decide whether to invoke task-factory. Agent verdict words (`proposed` / `resolved` / `escalated` from blocker-resolver; `NEEDS_ESCALATION` from the executor) are audit-only. This is deliberate: the file existing proves a proposal was emitted; verdict words are summaries that cannot override disk state. If no proposal file exists after the executor or blocker-resolver runs, task-factory does NOT fire -- by design. Both triggers use the same file, so only one can fire per source task per run.
 
@@ -210,10 +210,13 @@ task_factory:
 
 When the flag is `true`, `devbench sweep-proposals` calls `promote-proposal` automatically for every draft currently at `## Status: proposed`. When `backlog.default_status_for_new_work_units` is `in-queue` (the default), new drafts materialise directly at `in-queue` and the promote loop skips them (they are already in the actionable queue). When the value is `draft`, drafts materialise at `draft` status and the auto-accept sweep promotes them to `in-queue`. Auto-promote runs on the standard SKILL step 0 tick, so no separate command or cron job is required. The flag is workspace-wide -- every proposal produced in this workspace gets auto-accepted, not individual proposals.
 
+Independently, `devbench write-proposal` also honours the flag: when `true`, it synchronously calls `materialise-proposal` (and `promote-proposal` for any of the just-written ids that already sit at legacy status `proposed`) inside the same invocation, so the proposal is fully actionable the moment its JSON lands on disk rather than waiting for the next `sweep-proposals` tick. This closes a timing window in which a resolver-written proposal could otherwise sit for up to one full orchestrator iteration before its drafts existed. The write-proposal cascade is best-effort: any error is logged and reported in the output JSON's `auto_cascade`/`error` fields but does not fail the call outright, and the next `sweep-proposals` tick retries. When the flag is `false` (the default), `write-proposal` only persists the JSON; materialisation happens later via `sweep-proposals` or a manual `materialise-proposal` call.
+
 Behavioural details:
 
-- **Default is `false`.** Omitting the key, or setting it explicitly to `false`, preserves the "human reviews every proposal" posture.
-- **Idempotent.** A draft already past `PROPOSED` (promoted, done, declined, rejected) is skipped on the next sweep tick; no duplicate markers are written.
+- **Default is `false`.** Omitting the key, or setting it explicitly to `false`, preserves the "human reviews every proposal" posture: `write-proposal` only writes the JSON and `sweep-proposals` never auto-promotes.
+- **Applies at write-proposal time too.** `write-proposal` performs the same materialise-(+promote-where-applicable) cascade synchronously when the flag is `true`, so proposals from `blocker-resolver` or an executor's validation-gate escalation are immediately actionable instead of waiting for the next `sweep-proposals` tick.
+- **Idempotent.** A draft already past `PROPOSED` (promoted, done, declined, rejected) is skipped on the next sweep tick or write-proposal cascade; no duplicate markers are written.
 - **Legacy drafts get picked up too.** Flipping the flag on with PROPOSED drafts already waiting causes the next sweep tick to promote them. No extra operator action.
 - **Audit signal.** Every auto-promoted draft's `[PROPOSAL_PROMOTED]` comment on the source task gains the suffix `(auto-accepted via task_factory.auto_accept_proposals=true)` between the description and the `[BLOCKED_PENDING_PROPOSAL]` marker. Reviewers of the work-unit file see at a glance that the tool, not a human, pressed the button.
 - **Rejection still works.** An auto-promoted draft the operator later decides is wrong is rejected via the standard `reject-proposal <id> --reason "..."` flow; the ADR-07 marker-strip + cascade handle it exactly like any other reject.

@@ -1,9 +1,9 @@
-"""Tests for src/devbench/quota.py -- detection tier and wait tier.
+"""Tests for src/devbench/quota.py -- detection tier, wait tier, and probe.
 
 Coverage requirement: 100% line + branch on the detection-tier symbols (FR-2.1
-/ FR-2.2 / FR-2.3) and the wait-tier symbols (FR-2.4) added across
-E2-F1-S1-T1 and E2-F1-S2-T1. The checkpoint and recovery-probe symbols
-belong to downstream tasks E2-F1-S2-T2 and E2-F1-S2-T3 and are not covered
+/ FR-2.2 / FR-2.3), the wait-tier symbols (FR-2.4), and the recovery-probe
+symbols (FR-2.5) added across E2-F1-S1-T1, E2-F1-S2-T1, and E2-F1-S2-T2. The
+checkpoint symbols belong to downstream task E2-F1-S2-T3 and are not covered
 here.
 
 Covers:
@@ -40,6 +40,15 @@ Covers:
 - Every wait test mocks the clock at devbench.quota._get_current_utc and
   patches asyncio.sleep with a simulated clock that accumulates the fake
   sleep durations -- no test performs a real sleep (spec S10.1).
+- recovery_probe / _probe_api_call (FR-2.5): the five-arm exception ladder
+  ordering (QuotaExhaustedError -> AuthenticationError/PermissionDeniedError
+  -> APIError -> bare AnthropicError -> any other), the two ValueError guards
+  before any I/O, and the success path issuing exactly one 1-token
+  messages.create against RECOVERY_PROBE_MODEL. All probe tests install a
+  fake anthropic exception hierarchy via unittest.mock.patch.multiple that
+  mirrors the real subclass graph (AuthenticationError and
+  PermissionDeniedError subclass APIError; APIError subclasses
+  AnthropicError) -- no network access, no credentials (spec S10.1).
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
 Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
@@ -70,8 +79,10 @@ from devbench.quota import (
     _has_quota_marker,
     _has_verbatim_quota_marker,
     _parse_reset_at_from_text,
+    _probe_api_call,
     _wait_toward_reset,
     detect_quota_error,
+    recovery_probe,
     wait_for_reset,
 )
 
@@ -191,6 +202,97 @@ def _make_assistant_message_rate_limit(reset_text: str | None = None) -> SimpleN
 def _make_result_message_error(result_text: str) -> SimpleNamespace:
     """Build a ResultMessage-shaped object with is_error=True."""
     return SimpleNamespace(is_error=True, result=result_text)
+
+
+# ---------------------------------------------------------------------------
+# Fake anthropic exception hierarchy (FR-2.5, spec S10.1)
+#
+# Reproduces the REAL anthropic SDK's subclass graph -- AuthenticationError
+# and PermissionDeniedError subclass APIError; APIError subclasses
+# AnthropicError -- so the ordering tests below exercise the genuine MRO
+# hazard the load-bearing except-clause ordering in recovery_probe guards
+# against, rather than a flattened stand-in that would pass even if the
+# APIError arm were moved above the auth arms.
+#
+# Reusable: downstream E2-F4 loop tests that also need to simulate the probe
+# channel without depending on the real anthropic SDK can import
+# ``fake_anthropic_hierarchy`` and ``patch_anthropic`` from this module.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAnthropicError(Exception):
+    """Fake stand-in for anthropic.AnthropicError -- root of the SDK hierarchy."""
+
+
+class _FakeAPIError(_FakeAnthropicError):
+    """Fake stand-in for anthropic.APIError -- subclasses AnthropicError."""
+
+
+class _FakeAuthenticationError(_FakeAPIError):
+    """Fake stand-in for anthropic.AuthenticationError -- subclasses APIError."""
+
+
+class _FakePermissionDeniedError(_FakeAPIError):
+    """Fake stand-in for anthropic.PermissionDeniedError -- subclasses APIError."""
+
+
+@pytest.fixture
+def fake_anthropic_hierarchy() -> dict[str, type[Exception]]:
+    """The four fake anthropic exception classes, keyed by their real SDK names.
+
+    Installed on the real (already-imported) ``anthropic`` module via
+    ``unittest.mock.patch.multiple`` in every probe test -- see
+    :func:`patch_anthropic`.
+    """
+    return {
+        "AnthropicError": _FakeAnthropicError,
+        "APIError": _FakeAPIError,
+        "AuthenticationError": _FakeAuthenticationError,
+        "PermissionDeniedError": _FakePermissionDeniedError,
+    }
+
+
+def _make_fake_anthropic_client(
+    *, side_effect: BaseException | None = None, response: object = "probe-ok"
+) -> MagicMock:
+    """Build a fake ``anthropic.Anthropic()`` client instance.
+
+    ``client.messages.create(...)`` either raises ``side_effect`` or returns
+    ``response`` -- no real HTTP call is ever made.
+    """
+    client = MagicMock(name="fake_anthropic_client")
+    if side_effect is not None:
+        client.messages.create.side_effect = side_effect
+    else:
+        client.messages.create.return_value = response
+    return client
+
+
+def patch_anthropic(
+    hierarchy: dict[str, type[Exception]],
+    *,
+    anthropic_ctor: MagicMock | None = None,
+) -> Any:
+    """Return a ``patch.multiple`` context manager over the real ``anthropic`` module.
+
+    Temporarily replaces ``AnthropicError``, ``APIError``,
+    ``AuthenticationError``, ``PermissionDeniedError``, and ``Anthropic`` on
+    the already-installed ``anthropic`` package for the duration of the
+    context -- no ``sys.modules`` substitution, no network access, no
+    credentials. ``anthropic_ctor`` defaults to a ``MagicMock`` that
+    constructs no client (tests that expect a ``ValueError`` before any I/O
+    assert this default mock was never called).
+    """
+    if anthropic_ctor is None:
+        anthropic_ctor = MagicMock(name="fake_anthropic_ctor")
+    return patch.multiple(
+        "anthropic",
+        Anthropic=anthropic_ctor,
+        AnthropicError=hierarchy["AnthropicError"],
+        APIError=hierarchy["APIError"],
+        AuthenticationError=hierarchy["AuthenticationError"],
+        PermissionDeniedError=hierarchy["PermissionDeniedError"],
+    )
 
 
 @pytest.mark.unit
@@ -1718,3 +1820,174 @@ class TestWaitForResetTimeoutAndExceptions:
                     probe_fn=_raising_probe,
                 )
             )
+
+
+@pytest.mark.unit
+class TestProbeApiCall:
+    """_probe_api_call issues one 1-token messages.create against RECOVERY_PROBE_MODEL."""
+
+    def test_success_issues_one_token_call_against_recovery_probe_model(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        fake_client = _make_fake_anthropic_client(response="probe-ok")
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor):
+            result = _probe_api_call(5.0, 1)
+
+        anthropic_ctor.assert_called_once_with(timeout=5.0)
+        fake_client.messages.create.assert_called_once_with(
+            model=RECOVERY_PROBE_MODEL,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "x"}],
+        )
+        assert result == "probe-ok"
+
+    def test_prompt_size_scales_with_request_size_tokens(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        fake_client = _make_fake_anthropic_client(response="probe-ok")
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor):
+            _probe_api_call(5.0, 7)
+
+        call_kwargs = fake_client.messages.create.call_args.kwargs
+        assert call_kwargs["messages"] == [{"role": "user", "content": "x" * 7}]
+        assert call_kwargs["max_tokens"] == 1
+
+
+@pytest.mark.unit
+class TestRecoveryProbeGuards:
+    """AC-E2-F1-S2-T2-3: guard ValueErrors fire before any I/O."""
+
+    @pytest.mark.parametrize("timeout_seconds", [0, -1, -0.5])
+    def test_timeout_seconds_not_positive_raises_before_io(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]], timeout_seconds: float
+    ) -> None:
+        anthropic_ctor = MagicMock()
+        with (
+            patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor),
+            pytest.raises(ValueError, match="timeout_seconds"),
+        ):
+            recovery_probe(timeout_seconds=timeout_seconds, request_size_tokens=1)
+        anthropic_ctor.assert_not_called()
+
+    @pytest.mark.parametrize("request_size_tokens", [0, -1, -5])
+    def test_request_size_tokens_below_one_raises_before_io(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]], request_size_tokens: int
+    ) -> None:
+        anthropic_ctor = MagicMock()
+        with (
+            patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor),
+            pytest.raises(ValueError, match="request_size_tokens"),
+        ):
+            recovery_probe(timeout_seconds=5.0, request_size_tokens=request_size_tokens)
+        anthropic_ctor.assert_not_called()
+
+
+@pytest.mark.unit
+class TestRecoveryProbeExceptionOrdering:
+    """AC-E2-F1-S2-T2-1/2 (spec FR-2.5, AC-18): the five-arm exception ladder,
+    in the exact order load-bearing per the docstring in recovery_probe.
+
+    QuotaExhaustedError -> False
+    AuthenticationError / PermissionDeniedError (subclass APIError) -> RecoveryProbeUnavailableError
+    APIError (not an auth subclass) -> False
+    bare AnthropicError -> RecoveryProbeUnavailableError
+    any other exception -> False
+    """
+
+    def test_quota_exhausted_error_returns_false(self, fake_anthropic_hierarchy: dict[str, type[Exception]]) -> None:
+        quota_exc = SubscriptionRateLimitError(reset_at=None, raw_error="raw", source="anthropic-api")
+        fake_client = _make_fake_anthropic_client(side_effect=quota_exc)
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor):
+            result = recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
+        assert result is False
+
+    def test_authentication_error_raises_recovery_probe_unavailable(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        """PROVES the AuthenticationError arm is not swallowed by APIError:
+        AuthenticationError subclasses APIError, so if the APIError arm were
+        listed first this would return False instead of raising."""
+        auth_exc = fake_anthropic_hierarchy["AuthenticationError"]("invalid api key")
+        assert isinstance(auth_exc, fake_anthropic_hierarchy["APIError"])
+        fake_client = _make_fake_anthropic_client(side_effect=auth_exc)
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with (
+            patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor),
+            pytest.raises(RecoveryProbeUnavailableError, match="AuthenticationError"),
+        ):
+            recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
+
+    def test_permission_denied_error_raises_recovery_probe_unavailable(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        """PROVES the PermissionDeniedError arm is not swallowed by APIError:
+        PermissionDeniedError subclasses APIError, so if the APIError arm
+        were listed first this would return False instead of raising."""
+        perm_exc = fake_anthropic_hierarchy["PermissionDeniedError"]("access denied")
+        assert isinstance(perm_exc, fake_anthropic_hierarchy["APIError"])
+        fake_client = _make_fake_anthropic_client(side_effect=perm_exc)
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with (
+            patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor),
+            pytest.raises(RecoveryProbeUnavailableError, match="PermissionDeniedError"),
+        ):
+            recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
+
+    def test_api_error_not_auth_subclass_returns_false(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        api_exc = fake_anthropic_hierarchy["APIError"]("connection reset")
+        fake_client = _make_fake_anthropic_client(side_effect=api_exc)
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor):
+            result = recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
+        assert result is False
+
+    def test_bare_anthropic_error_raises_recovery_probe_unavailable(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        """A bare AnthropicError (not an APIError) means no credential is
+        configured at all -- e.g. client construction failed."""
+        bare_exc = fake_anthropic_hierarchy["AnthropicError"]("no credential configured")
+        assert not isinstance(bare_exc, fake_anthropic_hierarchy["APIError"])
+        fake_client = _make_fake_anthropic_client(side_effect=bare_exc)
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with (
+            patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor),
+            pytest.raises(RecoveryProbeUnavailableError, match="no usable Anthropic API credential"),
+        ):
+            recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
+
+    def test_any_other_exception_returns_false(self, fake_anthropic_hierarchy: dict[str, type[Exception]]) -> None:
+        fake_client = _make_fake_anthropic_client(side_effect=RuntimeError("unexpected"))
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor):
+            result = recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
+        assert result is False
+
+
+@pytest.mark.unit
+class TestRecoveryProbeSuccessPath:
+    """A success returns True and issues exactly one 1-token probe call."""
+
+    def test_success_returns_true_and_issues_single_probe_call(
+        self, fake_anthropic_hierarchy: dict[str, type[Exception]]
+    ) -> None:
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        fake_client = _make_fake_anthropic_client(response="probe-ok")
+        anthropic_ctor = MagicMock(return_value=fake_client)
+        with patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor):
+            result = recovery_probe(timeout_seconds=5.0, request_size_tokens=3)
+
+        assert result is True
+        fake_client.messages.create.assert_called_once_with(
+            model=RECOVERY_PROBE_MODEL,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "xxx"}],
+        )

@@ -409,3 +409,39 @@ class TestSkillIterateUntilPerfectConstants:
             assert isinstance(tag, str)
             assert tag.startswith("[SKILL_"), f"audit tag must start with '[SKILL_' (got {tag!r})"
             assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"
+
+
+class TestRecoveryProbeModelConstant:
+    """AC-E2-F1-S2-T2-4: RECOVERY_PROBE_MODEL lands as claude-opus-5, deliberately
+    diverging from the source branch's claude-opus-4-8 per spec decision D-2."""
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_is_opus_5(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert RECOVERY_PROBE_MODEL == "claude-opus-5"
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_is_str(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert isinstance(RECOVERY_PROBE_MODEL, str)
+
+    @pytest.mark.unit
+    def test_source_comment_records_d2_divergence_from_branch_value(self) -> None:
+        """The constant's comment must name the superseded branch value
+        claude-opus-4-8 so the D-2 divergence is not lost to a future editor."""
+        from pathlib import Path
+
+        module_path = Path(__file__).resolve().parent.parent / "src" / "devbench" / "constants.py"
+        source_text = module_path.read_text(encoding="utf-8")
+        marker_index = source_text.index('RECOVERY_PROBE_MODEL: str = "claude-opus-5"')
+        preceding_comment = source_text[max(0, marker_index - 800) : marker_index]
+        assert "claude-opus-4-8" in preceding_comment, (
+            "RECOVERY_PROBE_MODEL's comment must name the superseded branch value "
+            "'claude-opus-4-8' to record the deliberate D-2 divergence."
+        )
+        assert "D-2" in preceding_comment, (
+            "RECOVERY_PROBE_MODEL's comment must cite spec decision D-2, which "
+            "moved the default model lineup to Opus 5."
+        )

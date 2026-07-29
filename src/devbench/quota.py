@@ -1,22 +1,25 @@
-"""Quota detection and wait-and-resume module for devbench.
+"""Quota detection, wait-and-resume, and recovery-probe module for devbench.
 
 Provides the ``QuotaExhaustedError`` exception hierarchy (base + four LSP
 subclasses), the ``detect_quota_error`` dispatcher (ten ordered rules, never
 raises), the two-matcher CLI-text scanners (``_has_quota_marker`` and
 ``_has_verbatim_quota_marker``), the ``_parse_reset_at_from_text``
-reset-time parser, and the async wait engine (``BackoffConfig``,
+reset-time parser, the async wait engine (``BackoffConfig``,
 ``_emit_polling_heartbeat``, ``_wait_toward_reset``, ``wait_for_reset``) that
 polls for quota recovery with jittered exponential backoff, stepping toward
 a known provider ``reset_at`` in bounded, heartbeat-emitting sleeps rather
-than one blind long sleep. No cancellation-shielding primitive is used
-anywhere in this module (D-9): a SIGTERM during a long wait must propagate
-naturally so ``devbench stop`` stays responsive; durability comes from the
-checkpoint (downstream task E2-F1-S2-T3), not from shielding.
+than one blind long sleep, and the recovery probe (``_probe_api_call``,
+``recovery_probe``) that issues a 1-token ``messages.create`` request against
+``RECOVERY_PROBE_MODEL`` to test whether quota has recovered -- consulted by
+``wait_for_reset`` as its ``probe_fn``. No cancellation-shielding primitive is
+used anywhere in this module (D-9): a SIGTERM during a long wait must
+propagate naturally so ``devbench stop`` stays responsive; durability comes
+from the checkpoint (downstream task E2-F1-S2-T3), not from shielding.
 
-This module covers the detection tier (FR-2.1, FR-2.2, FR-2.3) and the wait
-tier (FR-2.4). Checkpoint persistence and the recovery probe belong to
-downstream tasks (E2-F1-S2-T2, E2-F1-S2-T3) and are not part of this
-module's surface yet.
+This module covers the detection tier (FR-2.1, FR-2.2, FR-2.3), the wait
+tier (FR-2.4), and the recovery probe (FR-2.5). Checkpoint persistence
+belongs to downstream task E2-F1-S2-T3 and is not part of this module's
+surface yet.
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
 Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
@@ -707,3 +710,120 @@ async def wait_for_reset(
 
         await asyncio.sleep(delay)
         raw_delay = min(raw_delay * backoff_config.multiplier, float(backoff_config.max_seconds))
+
+
+# ---------------------------------------------------------------------------
+# Recovery probe (FR-2.5)
+# ---------------------------------------------------------------------------
+
+
+def _probe_api_call(timeout_seconds: float, request_size_tokens: int) -> object:
+    """Issue a minimal Anthropic ``messages.create`` call for quota probing.
+
+    This thin shim is isolated so tests can patch ``anthropic.Anthropic`` (via
+    ``unittest.mock.patch.multiple`` on the already-imported ``anthropic``
+    module) without needing the full SDK imported at test-collection time --
+    the import happens here, inside the call, not at module load.
+
+    Args:
+        timeout_seconds: HTTP timeout for the probe call.
+        request_size_tokens: Approximate input token count (affects prompt size).
+
+    Returns:
+        The API response object (opaque; callers check for success by the
+        absence of a raised exception).
+    """
+    import anthropic
+
+    from devbench.constants import RECOVERY_PROBE_MODEL
+
+    client = anthropic.Anthropic(timeout=timeout_seconds)
+    prompt = "x" * max(1, request_size_tokens)
+    return client.messages.create(
+        model=RECOVERY_PROBE_MODEL,
+        max_tokens=1,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+    """Issue a minimal probe API call to check whether the quota has recovered.
+
+    The except-clause ORDER below is load-bearing and MUST NOT be reordered
+    (spec FR-2.5, AC-18). ``anthropic.AuthenticationError`` and
+    ``anthropic.PermissionDeniedError`` both subclass ``anthropic.APIError``,
+    which itself subclasses ``anthropic.AnthropicError``. Python's ``except``
+    matches the FIRST arm whose type the raised exception is an instance of,
+    so the two narrower auth subclasses MUST be caught before the broader
+    ``APIError`` arm, and both API arms MUST be caught before the broadest
+    ``AnthropicError`` arm. If ``APIError`` were listed above the auth arms,
+    an auth failure would be silently swallowed as "still exhausted"
+    (``False``) instead of raising ``RecoveryProbeUnavailableError`` -- the
+    wait loop would then spin on a probe channel that can never succeed until
+    ``max_wait_seconds`` finally times it out. This ordering (and its
+    rationale) restores what commit ``6188aab`` stripped from the tip of
+    ``origin/feat/flatten-review-pipeline``; see the pre-strip commits
+    ``162f932`` (introduces ``recovery_probe``) and ``f2b4644`` (introduces
+    ``RecoveryProbeUnavailableError`` and the bare-``AnthropicError`` arm)
+    (D-16).
+
+    Arm order:
+
+    1. ``QuotaExhaustedError`` -- still exhausted; return ``False``.
+    2. ``anthropic.AuthenticationError`` / ``anthropic.PermissionDeniedError``
+       -- rejected credential; raise ``RecoveryProbeUnavailableError``.
+    3. ``anthropic.APIError`` -- other API/network error; return ``False``.
+    4. ``anthropic.AnthropicError`` -- no credential configured; raise
+       ``RecoveryProbeUnavailableError``.
+    5. Any other exception -- return ``False``.
+
+    Args:
+        timeout_seconds: HTTP timeout in seconds. Must be > 0.
+        request_size_tokens: Input token count for the probe prompt. Must be >= 1.
+
+    Returns:
+        ``True`` when the probe call succeeded (quota has cleared).
+        ``False`` when the probe hit a quota error, a non-auth API error, or
+        any other exception (quota may still be exhausted, or the network is
+        temporarily down); treated as "not yet recovered" without crashing
+        the wait loop.
+
+    Raises:
+        ValueError: When ``timeout_seconds <= 0`` or ``request_size_tokens < 1``
+            (fail-fast, checked before any I/O).
+        RecoveryProbeUnavailableError: When the probe channel itself is
+            permanently unavailable -- the credential is rejected
+            (``AuthenticationError`` / ``PermissionDeniedError``) or absent
+            (a bare ``AnthropicError``). Waiting longer cannot clear either
+            condition, so the caller must stop polling and surface an
+            actionable diagnostic instead of spinning until
+            ``max_wait_seconds`` elapses.
+    """
+    if timeout_seconds <= 0:
+        raise ValueError(f"recovery_probe: timeout_seconds must be > 0; got {timeout_seconds!r}.")
+    if request_size_tokens < 1:
+        raise ValueError(f"recovery_probe: request_size_tokens must be >= 1; got {request_size_tokens!r}.")
+
+    import anthropic
+
+    try:
+        _probe_api_call(timeout_seconds, request_size_tokens)
+        return True
+    except QuotaExhaustedError:
+        return False
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+        raise RecoveryProbeUnavailableError(
+            f"recovery probe could not authenticate to the Anthropic API ({type(exc).__name__}). "
+            "Configure a valid API credential so quota recovery can be confirmed, "
+            "or rely on the provider-supplied reset time."
+        ) from exc
+    except anthropic.APIError:
+        return False
+    except anthropic.AnthropicError as exc:
+        raise RecoveryProbeUnavailableError(
+            "recovery probe has no usable Anthropic API credential configured. "
+            "Quota recovery cannot be probed; configure a credential or rely on "
+            "the provider-supplied reset time."
+        ) from exc
+    except Exception:
+        return False

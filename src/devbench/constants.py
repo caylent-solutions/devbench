@@ -718,6 +718,19 @@ ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(
 BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$")
 
 # ---------------------------------------------------------------------------
+# Quota recovery probe (FR-2.5, issue #236, E2-F1-S2-T2)
+# ---------------------------------------------------------------------------
+# Model id targeted by ``devbench.quota.recovery_probe``'s 1-token
+# ``messages.create`` call used to confirm whether an exhausted quota has
+# cleared. DELIBERATE DIVERGENCE from the source branch
+# (``origin/feat/flatten-review-pipeline:constants.py:711``), which pinned
+# ``"claude-opus-4-8"``: spec decision D-2 moves the default model lineup to
+# Opus 5, so this constant lands as ``"claude-opus-5"`` instead of copying
+# the branch value. Do not "fix" this back to ``claude-opus-4-8`` -- that
+# would silently un-do D-2.
+RECOVERY_PROBE_MODEL: str = "claude-opus-5"
+
+# ---------------------------------------------------------------------------
 # Session-management constants (spec 4.4.1 named sessions, issue #192)
 # Consumed exclusively by ``src/devbench/session.py``; defined here so no
 # literal values appear inline in that module.

@@ -630,6 +630,31 @@ uv run devbench start --name beta --include "E4-E6"
 
 To pre-arm scope.json without immediately launching the orchestrator, use `devbench scope set` instead.
 
+### `quota-watcher`
+
+```
+uv run devbench quota-watcher
+```
+
+Print the current quota-pause checkpoint, if any (spec FR-2.11, AC-28). No flags -- the plain invocation is the entire command surface. There is deliberately no `--daemon` background-monitor mode; that design was removed upstream in commit `9883d13`.
+
+Reads `<workspace>/.devbench/quota_pause.json`, the checkpoint [`devbench start`](#start) writes when it enters a quota wait, and prints the pause details. The watcher is advisory: when a running orchestrator owns the session, its in-loop wait is authoritative -- this command only surfaces the same on-disk checkpoint for operator visibility (journey J-3: quota fires, operator runs `quota-watcher`, then `devbench status`).
+
+**Exit codes:**
+
+- **0** -- a checkpoint exists (the orchestrator is paused); details printed.
+- **1** -- no checkpoint (not paused).
+
+**Output when paused:**
+
+```
+[QUOTA_WAITING] reason=claude-code-cli reset_at=2026-05-23T16:10:00+00:00
+```
+
+`reset_at` prints `unknown` when the provider did not supply a reset time.
+
+**Error handling:** a corrupt checkpoint (invalid JSON, a missing required field, or an unparseable timestamp) prints `load_checkpoint`'s `ValueError` message -- which names the checkpoint path -- to stderr and returns 1, never a Python traceback. An unreadable workspace path is checked before any read attempt and also exits 1 with the path named.
+
 ### `prepare-plugin-shadow`
 
 ```

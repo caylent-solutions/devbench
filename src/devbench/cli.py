@@ -214,6 +214,7 @@ from devbench.quota import (
     RecoveryProbeUnavailableError,
     _apply_resume_strategy,
     detect_quota_error,
+    load_checkpoint,
     recovery_probe,
     save_checkpoint,
     wait_for_reset,
@@ -6063,6 +6064,24 @@ def _append_quota_audit_comment(message: str) -> None:
     _run_quota_side_effect_best_effort("quota audit comment append", _append)
 
 
+def _format_checkpoint_reset_at(reset_at: datetime | None) -> str:
+    """Format a checkpoint's ``reset_at`` as ISO 8601, or the literal ``"unknown"`` when absent.
+
+    Shared by :func:`_handle_quota_pause` (the ``[QUOTA_WAITING]`` marker
+    emitted at pause time) and :func:`cmd_quota_watcher` (the same marker
+    read back from the on-disk checkpoint) so the ISO-or-unknown format
+    exists in exactly one place (DRY).
+
+    Args:
+        reset_at: The checkpoint's expected reset time, or ``None`` when
+            the provider did not supply one.
+
+    Returns:
+        ``reset_at.isoformat()`` when set, otherwise ``"unknown"``.
+    """
+    return reset_at.isoformat() if reset_at is not None else "unknown"
+
+
 async def _handle_quota_pause(
     *,
     exc: QuotaExhaustedError,
@@ -6111,7 +6130,7 @@ async def _handle_quota_pause(
     )
     save_checkpoint(checkpoint, workspace_root)
 
-    reset_at_str = exc.reset_at.isoformat() if exc.reset_at is not None else "unknown"
+    reset_at_str = _format_checkpoint_reset_at(exc.reset_at)
     logger.info(
         "%s reason=%s reset_at=%s",
         _QUOTA_WAITING_AUDIT_PREFIX,
@@ -6160,6 +6179,62 @@ async def _handle_quota_pause(
         _append_quota_audit_comment(f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}")
     _apply_resume_strategy(qh_cfg.resume_strategy, workspace_root)
     return True
+
+
+def cmd_quota_watcher() -> int:
+    """Inspect the quota pause checkpoint (FR-2.11, spec AC-28, Section 14).
+
+    Usage::
+
+        devbench quota-watcher
+
+    No flags -- the plain invocation is the entire command surface. The
+    ``--daemon`` background-monitor mode from earlier design drafts was
+    removed in commit ``9883d13``; this is a fresh port, not a copy of the
+    source branch's leftover ``--once``-required guard.
+
+    Reads ``<workspace>/.devbench/quota_pause.json`` via
+    :func:`devbench.quota.load_checkpoint` and prints
+    ``[QUOTA_WAITING] reason=<source> reset_at=<ISO|unknown>`` to stdout
+    when a checkpoint is present. The watcher is advisory: when a running
+    orchestrator owns the session, its in-loop wait (:func:`_handle_quota_pause`)
+    is authoritative -- this command only surfaces the same on-disk
+    checkpoint for operator visibility (S10.4 journey J-3).
+
+    Error handling is fail-fast without leaking a traceback: an unreadable
+    workspace path (verified via :func:`os.access` before any read attempt)
+    and a checkpoint file that raises ``OSError`` mid-read both print a
+    one-line ``ERROR:`` message naming the path and return 1; a corrupt
+    checkpoint surfaces ``load_checkpoint``'s ``ValueError`` message
+    (which already names the path) and returns 1.
+
+    Returns:
+        0 when a checkpoint exists (the orchestrator is paused); the pause
+        details are printed to stdout.
+        1 when no checkpoint exists (not paused), when the checkpoint is
+        corrupt, when reading it fails with an ``OSError``, or when the
+        workspace path itself is not readable.
+    """
+    workspace_root = WORKSPACE_ROOT
+    if not os.access(workspace_root, os.R_OK | os.X_OK):
+        print(f"ERROR: workspace path is not readable: {workspace_root}", file=sys.stderr)
+        return 1
+
+    try:
+        checkpoint = load_checkpoint(workspace_root)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: cannot read quota checkpoint: {exc}", file=sys.stderr)
+        return 1
+
+    if checkpoint is None:
+        return 1
+
+    reset_at_str = _format_checkpoint_reset_at(checkpoint.reset_at)
+    print(f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={checkpoint.reason} reset_at={reset_at_str}")
+    return 0
 
 
 def _cancel_drain_unless_requested(workspace_root: Path, quota_drain_requested: bool) -> None:
@@ -10158,6 +10233,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_start,
         0,
         "Run orchestrate skill via Agent SDK (non-interactive). Flag: --daemon detaches to background (#209).",
+    ),
+    "quota-watcher": (
+        cmd_quota_watcher,
+        0,
+        "Print the current quota-pause checkpoint, if any: quota-watcher (spec FR-2.11, Section 14; no flags)",
     ),
     "instances": (cmd_instances, 0, "List every live devbench orchestrator on this host (#209). Flag: --json"),
     "stop-instance": (

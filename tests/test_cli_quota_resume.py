@@ -15,7 +15,7 @@ import asyncio
 import functools
 import logging
 import types
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +29,13 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config_loader import QuotaHandlingConfig
 from devbench.constants import SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
 from devbench.drain import read_drain_state
-from devbench.quota import QuotaExhaustedError, RecoveryProbeUnavailableError, SubscriptionRateLimitError
+from devbench.quota import (
+    QuotaCheckpoint,
+    QuotaExhaustedError,
+    RecoveryProbeUnavailableError,
+    SubscriptionRateLimitError,
+    save_checkpoint,
+)
 
 
 def _make_sdk_exc(status_code: int) -> MagicMock:
@@ -756,3 +762,127 @@ class TestNoAsyncioShieldInPausePath:
 
         source = inspect.getsource(cli)
         assert "asyncio.shield" not in source
+
+
+class TestCmdQuotaWatcher:
+    """``devbench quota-watcher`` reads the pause checkpoint (FR-2.11, spec AC-28, Section 14).
+
+    Section 14's CLI reference defines the shipped surface as the plain
+    ``devbench quota-watcher`` invocation with no flags -- the source
+    branch's ``--once``-required guard is a remnant of the ``--daemon``
+    mode removed in ``9883d13`` and is NOT ported.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("reset_at", "expected_reset_at_str"),
+        [
+            (datetime(2026, 5, 23, 16, 10, 0, tzinfo=UTC), "2026-05-23T16:10:00+00:00"),
+            (None, "unknown"),
+        ],
+        ids=["with-reset-at", "without-reset-at"],
+    )
+    def test_quota_watcher_paused_prints_marker_and_exits_zero(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        reset_at: datetime | None,
+        expected_reset_at_str: str,
+    ) -> None:
+        """AC-E2-F4-S4-T1-1: with a checkpoint present, prints the marker and returns rc 0 (spec AC-28)."""
+        checkpoint = QuotaCheckpoint(
+            reason="anthropic-api",
+            reset_at=reset_at,
+            saved_at=datetime.now(tz=UTC),
+            session_name="default",
+        )
+        save_checkpoint(checkpoint, tmp_path)
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"[QUOTA_WAITING] reason=anthropic-api reset_at={expected_reset_at_str}" in out
+
+    @pytest.mark.unit
+    def test_quota_watcher_absent_exits_one(self, tmp_path: Path) -> None:
+        """AC-E2-F4-S4-T1-2: with no checkpoint present, returns rc 1 (spec AC-28)."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher()
+        assert rc == 1
+
+    @pytest.mark.unit
+    def test_quota_watcher_corrupt_checkpoint_surfaces_valueerror_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-E2-F4-S4-T1-4: malformed checkpoint JSON surfaces load_checkpoint's ValueError, rc 1, no traceback."""
+        checkpoint_path = tmp_path / ".devbench" / "quota_pause.json"
+        checkpoint_path.parent.mkdir(parents=True)
+        checkpoint_path.write_text("{not valid json", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher()
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert str(checkpoint_path) in captured.err
+        assert "invalid JSON" in captured.err
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+
+    @pytest.mark.unit
+    def test_quota_watcher_unreadable_workspace_exits_one_naming_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-E2-F4-S4-T1-4: an unreadable workspace path exits 1 with the path named, never a traceback."""
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        original_mode = workspace_root.stat().st_mode
+        try:
+            workspace_root.chmod(0o000)
+            with patch("devbench.cli.WORKSPACE_ROOT", workspace_root):
+                rc = cli.cmd_quota_watcher()
+        finally:
+            workspace_root.chmod(original_mode)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert str(workspace_root) in captured.err
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+
+    @pytest.mark.unit
+    def test_quota_watcher_unreadable_checkpoint_file_exits_one_naming_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-E2-F4-S4-T1-4: an unreadable checkpoint FILE (workspace root itself stays readable) also exits 1
+
+        naming the path, never a traceback -- distinct from the workspace-root-level unreadable path above:
+        this exercises the ``OSError`` branch raised by ``load_checkpoint``'s ``read_text`` call, not the
+        pre-flight ``os.access`` guard on ``WORKSPACE_ROOT`` itself.
+        """
+        checkpoint_path = tmp_path / ".devbench" / "quota_pause.json"
+        checkpoint_path.parent.mkdir(parents=True)
+        checkpoint_path.write_text("{}", encoding="utf-8")
+        original_mode = checkpoint_path.stat().st_mode
+        try:
+            checkpoint_path.chmod(0o000)
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                rc = cli.cmd_quota_watcher()
+        finally:
+            checkpoint_path.chmod(original_mode)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert str(checkpoint_path) in captured.err
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+
+    @pytest.mark.unit
+    def test_quota_watcher_registered_without_daemon_flag(self) -> None:
+        """AC-E2-F4-S4-T1-3/5: the registry exposes quota-watcher with the plain-invocation surface; no --daemon."""
+        assert "quota-watcher" in cli._COMMANDS
+        func, min_args, description = cli._COMMANDS["quota-watcher"]
+        assert func is cli.cmd_quota_watcher
+        assert min_args == 0
+        assert "--daemon" not in description
+        assert "--once" not in description
+        # The plain invocation is the whole surface: no argv required or accepted.
+        with patch("devbench.cli.WORKSPACE_ROOT", Path("/nonexistent-for-registry-check")):
+            rc = cli.cmd_quota_watcher()
+        assert rc == 1

@@ -2,7 +2,7 @@
 
 Per-model token pricing for the Claude models supported by devbench, with the YAML snippet to drop into your `devbench.yaml` for accurate cost estimates in `devbench report`.
 
-> **Pricing snapshot:** captured from <https://platform.claude.com/docs/en/about-claude/pricing> on **2026-04-16**. Rates and regional / platform-specific premiums change over time. Always verify against the canonical source before relying on these numbers for billing or budgeting decisions. This file is a captured reference, not a live feed.
+> **Pricing snapshot:** captured from <https://platform.claude.com/docs/en/about-claude/pricing> on **2026-07-29**. Rates and regional / platform-specific premiums change over time. Always verify against the canonical source before relying on these numbers for billing or budgeting decisions. This file is a captured reference, not a live feed.
 
 ---
 
@@ -24,8 +24,10 @@ Per-model token pricing for the Claude models supported by devbench, with the YA
 
 ```yaml
 report:
-  token_cost_per_million_input: <your model's input rate>
-  token_cost_per_million_output: <your model's output rate>
+  models:
+    <your-model-id>:
+      input: <your model's input rate>
+      output: <your model's output rate>
 ```
 
 If these don't match the model your orchestrator is actually running (set by `DEVBENCH_CLAUDE_MODEL`), the cost numbers will be off by the ratio of real-vs-configured rates. Pick the row in the table below that matches your model, then drop the snippet from [Picking your defaults](#picking-your-defaults) into your config.
@@ -62,13 +64,13 @@ uv run devbench cost-calibrate <actual-usd> [--window <ISO-8601>]
 
 The command sums devbench's reported cost across every model observed in the window, derives `correction_factor = actual_usd / reported_total`, and writes the factor back to `report.models.<id>.correction_factor` in `backlog/config/devbench.yaml` for every model that contributed to the window. The next `devbench report` reflects the corrected total without further operator action.
 
-**Worked example.** A live workspace running Opus 4.7 with 1M-context observed actual API spend of `$83.66` against `devbench report` reading `$39.57` for the same window:
+**Worked example.** A live workspace running Opus 5 (the current shipped default; see [Standard pricing](#standard-pricing-per-1m-tokens-usd) below) with 1M-context observed actual API spend of `$83.66` against `devbench report` reading `$39.57` for the same window:
 
 ```bash
 uv run devbench cost-calibrate 83.66 --window 2026-05-01T00:00:00Z
 ```
 
-The command writes `correction_factor = 83.66 / 39.57 = 2.114` to `report.models.claude-opus-4-7.correction_factor` (and any other model that contributed). Re-run `devbench report` on the same window and the new value matches the invoice within rounding.
+The command writes `correction_factor = 83.66 / 39.57 = 2.114` to `report.models.claude-opus-5.correction_factor` (and any other model that contributed, e.g. `claude-sonnet-5`, `claude-opus-4-8`, `claude-fable-5`). Re-run `devbench report` on the same window and the new value matches the invoice within rounding.
 
 **When to recalibrate.** Re-run `devbench cost-calibrate` whenever any of these change: model routing in `agents:`, the workspace's context-tier (200k vs 1M), Anthropic's published list pricing, or your contract terms. Successive calibrations replace (not multiply) the prior `correction_factor` so re-running is idempotent against a fixed actual-spend figure.
 
@@ -81,13 +83,25 @@ The command writes `correction_factor = 83.66 / 39.57 = 2.114` to `report.models
 ```yaml
 report:
   models:
+    claude-opus-5:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-8:
+      input: 5.0
+      output: 25.0
+    claude-fable-5:
+      input: 10.0
+      output: 50.0
+    claude-sonnet-5:    # LIST rate; $2/$10 intro rate runs through 2026-08-31 -- override locally, never the shipped default
+      input: 3.0
+      output: 15.0
     claude-opus-4-7:
       input: 5.0
       output: 25.0
     claude-sonnet-4-6:
       input: 3.0
       output: 15.0
-  default_model:    # applied to any model id NOT listed above
+  default_model:    # applied to any model id NOT listed above -- Opus 5 list rates
     input: 5.0
     output: 25.0
 ```
@@ -124,11 +138,15 @@ The legacy fields `report.token_cost_per_million_input`, `report.token_cost_per_
 
 | Model            | Input | Output | Cache read | 5-min cache write | 1-hr cache write |
 | ---------------- | ----- | ------ | ---------- | ----------------- | ---------------- |
+| Claude Fable 5   | $10   | $50    | $1         | $12.50            | $20              |
+| Claude Opus 5    | $5    | $25    | $0.50      | $6.25             | $10              |
+| Claude Opus 4.8  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.7  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.6  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.5  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.1  | $15   | $75    | $1.50      | $18.75            | $30              |
 | Claude Opus 4    | $15   | $75    | $1.50      | $18.75            | $30              |
+| Claude Sonnet 5 [^sonnet-5-intro] | $3 | $15 | $0.30 | $3.75 | $6 |
 | Claude Sonnet 4.6 | $3   | $15    | $0.30      | $3.75             | $6               |
 | Claude Sonnet 4.5 | $3   | $15    | $0.30      | $3.75             | $6               |
 | Claude Sonnet 4   | $3   | $15    | $0.30      | $3.75             | $6               |
@@ -136,6 +154,10 @@ The legacy fields `report.token_cost_per_million_input`, `report.token_cost_per_
 | Claude Haiku 3.5  | $0.80 | $4    | $0.08      | $1                | $1.60            |
 | Claude Haiku 3    | $0.25 | $1.25 | $0.03      | $0.30             | $0.50            |
 
+[^sonnet-5-intro]: **List rate is the shipped default.** An introductory rate of $2/$10 (cache read $0.20, 5-min write $2.50, 1-hr write $4) runs through 2026-08-31; devbench never bakes a promotional rate into a shipped default (spec S5.3) -- workspaces wanting invoice-accurate cost during the promo window override `report.models.claude-sonnet-5` locally in `devbench.yaml`. Source: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29.
+
+> Source and capture date for the Fable 5, Opus 5, Opus 4.8, and Sonnet 5 rows: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29. Cache-read / cache-write columns for these rows are derived from the input rate via the standard Anthropic multipliers (0.10x / 1.25x / 2.0x), confirmed against the same source and capture date.
+>
 > Opus 4.7 introduced a new tokenizer that may use significantly more tokens for the same fixed text compared to earlier models -- factor this into cost projections when migrating between Opus generations.
 
 The cache columns are derived from the input rate via the standard Anthropic multipliers (0.10x for reads, 1.25x for 5-min writes, 2.0x for 1-hr writes) and are applied automatically by `devbench report` -- you do not need to set them unless your deployment platform uses different multipliers.
@@ -145,6 +167,64 @@ The cache columns are derived from the input rate via the standard Anthropic mul
 ## Picking your defaults
 
 Drop the matching block into the `report:` section of `backlog/config/devbench.yaml`. Input and output rates are mandatory; cache multipliers default to Anthropic's published values and only need overriding on non-Anthropic platforms.
+
+### Fable 5
+
+Source: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29.
+
+```yaml
+report:
+  models:
+    claude-fable-5:
+      input: 10.0
+      output: 50.0
+```
+
+### Opus 5 (current shipped default)
+
+Source: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29.
+
+```yaml
+report:
+  models:
+    claude-opus-5:
+      input: 5.0
+      output: 25.0
+```
+
+### Opus 4.8
+
+Selectable, but no longer the default (see Opus 5 above -- issue #233 supersedes the literal #254 request for Opus 4.8 per Decision D-2). Source: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29.
+
+```yaml
+report:
+  models:
+    claude-opus-4-8:
+      input: 5.0
+      output: 25.0
+```
+
+### Sonnet 5
+
+**LIST rate is the shipped default.** devbench ships `$3/$15`; workspaces wanting invoice-accurate cost before the introductory-window closes on 2026-08-31 (Anthropic publishes `$2/$10` through that date) override `report.models.claude-sonnet-5` locally rather than getting the promotional rate baked into the shipped default (spec S5.3). Source: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29.
+
+```yaml
+report:
+  models:
+    claude-sonnet-5:
+      input: 3.0
+      output: 15.0
+```
+
+Local override for the 2026-08-31-and-earlier introductory rate (do not commit this as the workspace default):
+
+```yaml
+report:
+  models:
+    claude-sonnet-5:
+      input: 2.0
+      output: 10.0
+```
 
 ### Opus 4.7 / 4.6 / 4.5
 
@@ -245,15 +325,16 @@ Resolution order is env var > YAML value > constant default.
 `src/devbench/constants.py` defines:
 
 ```python
-DEFAULT_MODEL_RATES: dict[str, ModelRates] = { ... }  # per-model table; see Standard pricing above
-DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)  # "<unknown>" bucket
+DEFAULT_MODEL_RATES: dict[str, ModelRates] = { ... }  # extended per-model table; see Standard pricing above (includes Fable 5, Opus 5, Opus 4.8, Sonnet 5)
+DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)  # "<unknown>" bucket -- mirrors Opus 5 list rates, the shipped fallback default
 DEFAULT_CACHE_READ_MULTIPLIER: float = 0.10
 DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER: float = 1.25
 DEFAULT_CACHE_WRITE_1HR_MULTIPLIER: float = 2.0
 DEFAULT_DATA_RESIDENCY_MULTIPLIER: float = 1.10
+DEFAULT_FAST_MODE_MULTIPLIER: float = 2.0
 ```
 
-The per-model table is lifted verbatim from the Standard pricing block above. Operators do not need to override anything when running on standard Anthropic pricing; the `report.models` block is the place to override when running on Bedrock, a contract rate, or a newly released model that devbench does not yet know about.
+The per-model table is lifted verbatim from the Standard pricing block above. `DEFAULT_FALLBACK_MODEL_RATES` -- applied to any transcript message whose `model` field is missing or unrecognized -- mirrors the Opus 5 list rate (issue #233; supersedes the prior Opus 4.7-list fallback) so devbench errs on the conservative, over-report side. Operators do not need to override anything when running on standard Anthropic pricing; the `report.models` block is the place to override when running on Bedrock, a contract rate, or a newly released model that devbench does not yet know about.
 
 ### Other settings under `report:`
 
@@ -274,27 +355,19 @@ When unset (or set to a name that isn't a valid IANA zone), the report falls bac
 
 ## Discount / correction factor off list pricing
 
-If your organisation negotiated a flat contract reduction on token pricing (AWS EDP, Azure EA, Anthropic enterprise, etc.), set `report.token_cost_discount` to the **fraction reduced from list price**. Every per-call calculated cost and every ETA-projected total-cost value in `devbench report` is reduced by that fraction before display, so the dollar figures match what finance reconciles.
+If your organisation negotiated a flat contract reduction on token pricing (AWS EDP, Azure EA, Anthropic enterprise, etc.), express it as a per-model `report.models.<id>.correction_factor` (see [Per-model pricing config](#per-model-pricing-config-issue-223) above) rather than a single global discount field. `correction_factor` multiplies the fully-computed cost -- base rate, cache multipliers, and any premium multipliers already applied -- so a known discount fraction converts directly: `correction_factor = 1 - discount`. `correction_factor` must be greater than 0 (`config-schema.json` declares `exclusiveMinimum: 0`, and `config_loader.py` fail-fasts on load if it is not); a 100% discount cannot be expressed as a correction factor.
 
-The value is a discount (reduction), sometimes also called a correction factor. Semantics: `final_cost = raw_list_cost x (1 - token_cost_discount)`. Specify the **discount itself**, not the pay-rate. If you only know the fraction you pay, convert first: `discount = 1 - pay_rate`.
+Set the factor either by hand-editing `report.models.<id>.correction_factor`, or by running `devbench cost-calibrate <actual-usd>` once against a recent Anthropic invoice, which derives and writes the correct factor automatically for every model that contributed to the calibration window (see [Calibrating against an Anthropic invoice](#calibrating-against-an-anthropic-invoice-devbench-cost-calibrate) above).
 
-| Discount                    | Fraction paid     | Percent off list       |
-|-----------------------------|-------------------|------------------------|
-| `0.0` (default)             | `1.0`             | 0% (pay full list)     |
-| `0.25`                      | `0.75`            | 25%                    |
-| `0.40363636364`             | `0.59636363636`   | 40.3636364%            |
-| `0.5`                       | `0.5`             | 50%                    |
-| `1.0`                       | `0.0`             | 100% (free, rare)      |
+| Discount                    | correction_factor (= fraction paid) | Percent off list       |
+|-----------------------------|--------------------------------------|------------------------|
+| `0.0` (no discount)         | `1.0`                                 | 0% (pay full list)     |
+| `0.25`                      | `0.75`                                | 25%                    |
+| `0.40363636364`             | `0.59636363636`                       | 40.3636364%            |
+| `0.5`                       | `0.5`                                 | 50%                    |
+| `0.99`                      | `0.01`                                | 99% (near-maximum)     |
 
-```yaml
-report:
-  # 40.3636364% off list  (equivalently: pay 59.6363636% of list)
-  token_cost_discount: 0.40363636364
-```
-
-Override via env: `DEVBENCH_REPORT_TOKEN_COST_DISCOUNT=0.40363636364`. Default: `0.0`.
-
-Applies uniformly to input, output, cache reads, and cache writes (5-min and 1-hr). Cache multipliers stay as pure ratios; the discount is applied at the base input/output rate before cache multipliers evaluate.
+`correction_factor` applies per-model, as the last multiplier evaluated: input/output base rate, then cache-read and cache-write (5-min and 1-hr) multipliers, then `correction_factor`.
 
 ---
 
@@ -318,7 +391,7 @@ Resolution order (per command): CLI flag or command-specific override > `DEVBENC
 
 ## Long context and batch pricing
 
-Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** at the same per-token rate as smaller requests -- there is no long-context premium for these models on the Claude API.
+Claude 4.6-and-later models -- Opus 4.6, 4.7, 4.8, 5; Sonnet 4.6, 5; and Fable 5 -- support a **1M-token context window** at the same per-token rate as smaller requests -- there is no long-context premium for these models on the Claude API. Source: <https://platform.claude.com/docs/en/about-claude/pricing>, captured 2026-07-29.
 
 The **Batch API** offers 50% off input and output for asynchronous workloads (devbench does not currently use the Batch API; the orchestrator runs interactive sessions).
 

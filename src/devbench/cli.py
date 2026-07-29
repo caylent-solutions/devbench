@@ -57,6 +57,7 @@ for easy parsing by Claude Code or other automation.
 
 import asyncio
 import contextlib
+import functools
 import getpass
 import json
 import logging
@@ -153,6 +154,7 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import (
+    QuotaHandlingConfig,
     RepoConfig,
     format_branch_name,
     format_single_branch_name,
@@ -177,6 +179,8 @@ from devbench.constants import (
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+    RECOVERY_PROBE_TIMEOUT_SECONDS,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -200,7 +204,17 @@ from devbench.plugin_shadow import (
     shadow_plugin_path,
     write_pid_sentinel,
 )
-from devbench.quota import QuotaExhaustedError, detect_quota_error
+from devbench.quota import (
+    BackoffConfig,
+    QuotaCheckpoint,
+    QuotaExhaustedError,
+    RecoveryProbeUnavailableError,
+    _apply_resume_strategy,
+    detect_quota_error,
+    recovery_probe,
+    save_checkpoint,
+    wait_for_reset,
+)
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
 # resolve unchanged after the function moved to report.py for the issue #161
@@ -5926,6 +5940,340 @@ def _check_quota_and_drain(message: object) -> None:
         raise _QuotaDetected(quota_exc)
     if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
         raise _DrainRequested(drain_state.reason)
+
+
+_QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
+_QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
+_QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX: str = "[QUOTA_PROBE_UNAVAILABLE]"
+_QUOTA_FAIL_FAST_AUDIT_PREFIX: str = "[QUOTA_FAIL_FAST]"
+_QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX: str = "[QUOTA_DRAIN_REQUESTED]"
+_QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX: str = "[QUOTA_TIMEOUT_KEEP_WAITING]"
+
+_QUOTA_STOP_REASON_DRAIN_DETECTION: str = "quota-drain-requested"
+_QUOTA_STOP_REASON_DRAIN_TIMEOUT: str = "quota-wait-timeout-drain"
+_QUOTA_STOP_REASON_WAIT_RECOVERED: str = "quota-wait-recovered"
+_QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING: str = "quota-wait-timeout-keep-waiting"
+
+#: Allowed ``on_exhaustion_timeout`` values (FR-2.9). Single source of truth
+#: for both the ``_dispatch_quota_timeout`` membership guard and its
+#: ``ValueError`` message, mirroring the ``_RESUME_STRATEGIES`` idiom in
+#: ``devbench.quota``.
+_QUOTA_TIMEOUT_ACTIONS: frozenset[str] = frozenset({"drain", "fail", "keep_waiting"})
+
+
+def _run_quota_side_effect_best_effort(operation: str, fn: Callable[[], None]) -> None:
+    """Run a best-effort quota side effect and never let it break or delay a wait.
+
+    Section 7.1 sanctioned swallows 2 and 3: a Slack notification failure and
+    a work-unit audit-comment append failure must NEVER break or delay a
+    quota wait. Catches ``Exception`` (not ``BaseException``, so a genuine
+    interrupt such as ``KeyboardInterrupt`` still propagates), logs a single
+    WARNING naming the failed *operation* and the exception, and returns.
+    Shared by both notification wrappers and the audit-comment appender so
+    the catch-log-continue shape exists in exactly one place (DRY).
+
+    Args:
+        operation: Short human-readable operation name used in the WARNING.
+        fn: Zero-argument callable performing the side effect.
+    """
+    try:
+        fn()
+    except Exception as exc:
+        logger.warning("[WARN] %s failed (ignored): %r", operation, exc)
+
+
+def _fire_quota_waiting_notification(reason: str, reset_at: str) -> None:
+    """Best-effort ``quota_waiting`` Slack ping at the start of a quota wait.
+
+    Wraps :func:`devbench.notifications.notify_quota_waiting` via
+    :func:`_run_quota_side_effect_best_effort` so a notify/IO failure can
+    NEVER break or delay the quota wait (spec AC-27, Section 7.1 sanctioned
+    swallow 3).
+
+    Args:
+        reason: The quota source/reason (``QuotaExhaustedError.source``).
+        reset_at: The provider-stated reset time as ISO 8601, or ``"unknown"``.
+    """
+
+    def _notify() -> None:
+        from devbench.notifications import notify_quota_waiting
+
+        notify_quota_waiting(reason, reset_at)
+
+    _run_quota_side_effect_best_effort("notify_quota_waiting", _notify)
+
+
+def _fire_quota_resumed_notification(waited_seconds: int) -> None:
+    """Best-effort ``quota_resumed`` Slack ping on the quota-recovered path.
+
+    Wraps :func:`devbench.notifications.notify_quota_resumed` via
+    :func:`_run_quota_side_effect_best_effort` so a notify/IO failure can
+    NEVER break or delay the resume (spec AC-27, Section 7.1 sanctioned
+    swallow 3).
+
+    Args:
+        waited_seconds: Total seconds spent waiting before recovery.
+    """
+
+    def _notify() -> None:
+        from devbench.notifications import notify_quota_resumed
+
+        notify_quota_resumed(waited_seconds)
+
+    _run_quota_side_effect_best_effort("notify_quota_resumed", _notify)
+
+
+def _append_quota_audit_comment(message: str) -> None:
+    """Best-effort append of *message* to the in-flight work unit's Comments section.
+
+    FR-2.12 / decision D-10: ``audit_comment_on_wait`` and
+    ``audit_comment_on_resume`` are parsed-but-DEAD on the source branch;
+    this function is the fresh implementation this task ships. Resolves the
+    single in-progress work unit via :func:`_find_in_flight_wu` and appends
+    *message* through :meth:`~devbench.backlog.manager.BacklogManager._append_agent_comment`.
+    A no-op (nothing appended, nothing logged) when no work unit is
+    in-progress. Wrapped via :func:`_run_quota_side_effect_best_effort` so a
+    comment-append failure logs a WARNING and never breaks the wait (spec
+    AC-29, Section 7.1 sanctioned swallow 3).
+
+    Args:
+        message: The full audit-comment text to append (e.g.
+            ``"[QUOTA_WAITING] reason=anthropic-api reset_at=unknown"``).
+    """
+
+    def _append() -> None:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+        wu = _find_in_flight_wu(units)
+        if wu is None:
+            return
+        BacklogManager()._append_agent_comment(wu.file_path, "orchestrator", message)
+
+    _run_quota_side_effect_best_effort("quota audit comment append", _append)
+
+
+async def _handle_quota_pause(
+    *,
+    exc: QuotaExhaustedError,
+    qh_cfg: QuotaHandlingConfig,
+    workspace_root: Path,
+    session_name: str,
+) -> bool:
+    """Handle a quota exhaustion signal with wait-and-resume (FR-2.9/FR-2.10, spec AC-26).
+
+    Fixed sequence:
+
+    1. Saves a checkpoint so SIGTERM does not lose pause state.
+    2. Emits ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>``, fires the
+       wrapped Slack notification, then (when ``audit_comment_on_wait`` is
+       true) appends the same marker to the in-flight work unit's Comments
+       section (FR-2.12, D-10).
+    3. Awaits ``wait_for_reset`` with no cancellation-shielding primitive
+       (D-9): a SIGTERM must propagate naturally so ``devbench stop`` stays
+       responsive.
+    4. On recovery: emits ``[QUOTA_RESUMED] waited_seconds=<N>``, fires the
+       resumed notification, appends the audit comment when
+       ``audit_comment_on_resume`` is true, applies the configured resume
+       strategy, and returns ``True``.
+    5. On timeout: returns ``False`` (caller applies ``on_exhaustion_timeout``
+       via :func:`_dispatch_quota_timeout`).
+    6. When the recovery probe is permanently unavailable: emits
+       ``[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>`` and returns
+       ``False`` immediately instead of polling out the full window.
+
+    Args:
+        exc: The detected ``QuotaExhaustedError``.
+        qh_cfg: Quota handling configuration.
+        workspace_root: Workspace root for checkpoint storage.
+        session_name: Current session name (stored in checkpoint).
+
+    Returns:
+        ``True`` when recovery was confirmed; ``False`` when timed out or the
+        recovery probe was permanently unavailable.
+    """
+    now = datetime.now(tz=UTC)
+    checkpoint = QuotaCheckpoint(
+        reason=exc.source,
+        reset_at=exc.reset_at,
+        saved_at=now,
+        session_name=session_name,
+    )
+    save_checkpoint(checkpoint, workspace_root)
+
+    reset_at_str = exc.reset_at.isoformat() if exc.reset_at is not None else "unknown"
+    logger.info(
+        "%s reason=%s reset_at=%s",
+        _QUOTA_WAITING_AUDIT_PREFIX,
+        exc.source,
+        reset_at_str,
+    )
+    _fire_quota_waiting_notification(exc.source, reset_at_str)
+    if qh_cfg.audit_comment_on_wait:
+        _append_quota_audit_comment(f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={exc.source} reset_at={reset_at_str}")
+
+    wait_start = datetime.now(tz=UTC)
+    backoff = BackoffConfig(initial_seconds=qh_cfg.poll_interval_seconds)
+
+    try:
+        recovered = await wait_for_reset(
+            reset_at=exc.reset_at,
+            poll_interval_seconds=qh_cfg.poll_interval_seconds,
+            max_wait_seconds=qh_cfg.max_wait_seconds,
+            probe_fn=functools.partial(
+                recovery_probe,
+                timeout_seconds=RECOVERY_PROBE_TIMEOUT_SECONDS,
+                request_size_tokens=RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+            ),
+            backoff_config=backoff,
+        )
+    except RecoveryProbeUnavailableError as probe_exc:
+        logger.info(
+            "%s reason=%s detail=%s",
+            _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX,
+            exc.source,
+            probe_exc,
+        )
+        return False
+
+    if not recovered:
+        return False
+
+    waited_seconds = int((datetime.now(tz=UTC) - wait_start).total_seconds())
+    logger.info(
+        "%s waited_seconds=%d",
+        _QUOTA_RESUMED_AUDIT_PREFIX,
+        waited_seconds,
+    )
+    _fire_quota_resumed_notification(waited_seconds)
+    if qh_cfg.audit_comment_on_resume:
+        _append_quota_audit_comment(f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}")
+    _apply_resume_strategy(qh_cfg.resume_strategy, workspace_root)
+    return True
+
+
+def _cancel_drain_unless_requested(workspace_root: Path, quota_drain_requested: bool) -> None:
+    """Best-effort cancel of a pending drain signal on ``cmd_start`` exit (spec AC-25).
+
+    Skips the cancel when the quota dispatch deliberately requested a drain
+    (``on_exhaustion``/``on_exhaustion_timeout`` == ``"drain"``): that signal
+    MUST survive process exit so the Makefile restart loop / a peer session
+    acts on it. Otherwise cancels any stale drain so the next start does not
+    inherit it. Idempotent; suppresses filesystem errors the same way the
+    existing unconditional ``cancel_drain`` call sites in ``cmd_start`` do.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        quota_drain_requested: ``True`` when the quota dispatch requested a
+            drain.
+    """
+    if quota_drain_requested:
+        return
+    with contextlib.suppress(OSError):
+        cancel_drain(workspace_root)
+
+
+def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> str:
+    """Handle a detected quota signal from ``cmd_start``'s ``_run`` loop (FR-2.9, spec AC-24/AC-25).
+
+    Applies the configured ``quota_handling`` policy:
+
+    - ``enabled: false`` -- re-raise the wrapped
+      :class:`~devbench.quota.QuotaExhaustedError` so the legacy non-zero
+      exit of issue #193 AC-4 is reproduced byte-for-byte (spec AC-24).
+    - ``on_exhaustion`` (detection-time): ``"fail"`` logs
+      ``[QUOTA_FAIL_FAST]`` and re-raises immediately; ``"drain"`` logs
+      ``[QUOTA_DRAIN_REQUESTED] phase=detection``, requests a drain, and
+      stops without waiting; ``"wait"`` (default) enters
+      :func:`_handle_quota_pause`.
+    - On a wait timeout (or an unrecoverable probe), ``on_exhaustion_timeout``
+      is applied via :func:`_dispatch_quota_timeout`.
+
+    Extracted from ``cmd_start`` to keep that function under ruff's PLR0912
+    12-branch limit.
+
+    Args:
+        detected: The :class:`_QuotaDetected` sentinel raised by ``_run``.
+        session_name: Current session name (passed to
+            :func:`_handle_quota_pause`).
+
+    Returns:
+        A descriptive stop-reason string for the ``cmd_start`` audit trail.
+
+    Raises:
+        ~devbench.quota.QuotaExhaustedError: When ``enabled`` is false, or
+            when ``on_exhaustion``/``on_exhaustion_timeout`` is ``"fail"``.
+    """
+    qh_cfg = RUNTIME_CONFIG.quota_handling
+    if not qh_cfg.enabled:
+        raise detected.quota_exc from detected
+
+    if qh_cfg.on_exhaustion == "fail":
+        logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        raise detected.quota_exc from detected
+    if qh_cfg.on_exhaustion == "drain":
+        logger.info(
+            "%s reason=%s phase=detection",
+            _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+            detected.quota_exc.source,
+        )
+        request_drain(WORKSPACE_ROOT, reason=f"quota-exhaustion:{detected.quota_exc.source}")
+        return _QUOTA_STOP_REASON_DRAIN_DETECTION
+
+    recovered = asyncio.run(
+        _handle_quota_pause(
+            exc=detected.quota_exc,
+            qh_cfg=qh_cfg,
+            workspace_root=WORKSPACE_ROOT,
+            session_name=session_name,
+        )
+    )
+    if recovered:
+        return _QUOTA_STOP_REASON_WAIT_RECOVERED
+
+    return _dispatch_quota_timeout(detected, qh_cfg.on_exhaustion_timeout)
+
+
+def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
+    """Apply ``on_exhaustion_timeout`` after the wait cap elapses or the probe is unavailable.
+
+    Args:
+        detected: The original quota sentinel (holds ``quota_exc`` for
+            re-raise).
+        action: ``on_exhaustion_timeout`` value -- one of
+            :data:`_QUOTA_TIMEOUT_ACTIONS` (``"drain"`` default, ``"fail"``,
+            ``"keep_waiting"``).
+
+    Returns:
+        A descriptive stop-reason string for ``"drain"`` / ``"keep_waiting"``.
+
+    Raises:
+        ValueError: When *action* is not a member of
+            :data:`_QUOTA_TIMEOUT_ACTIONS` (defense in depth against
+            config-schema drift; the loader already validates the enum).
+        ~devbench.quota.QuotaExhaustedError: When ``action == "fail"``
+            (legacy non-zero exit).
+    """
+    if action not in _QUOTA_TIMEOUT_ACTIONS:
+        raise ValueError(
+            f"unknown on_exhaustion_timeout action {action!r}. Allowed values: {sorted(_QUOTA_TIMEOUT_ACTIONS)}."
+        )
+    if action == "fail":
+        logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        raise detected.quota_exc from detected
+    if action == "keep_waiting":
+        logger.info(
+            "%s reason=%s",
+            _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX,
+            detected.quota_exc.source,
+        )
+        return _QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING
+    logger.info(
+        "%s reason=%s phase=timeout",
+        _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+        detected.quota_exc.source,
+    )
+    request_drain(WORKSPACE_ROOT, reason=f"quota-timeout:{detected.quota_exc.source}")
+    return _QUOTA_STOP_REASON_DRAIN_TIMEOUT
 
 
 @dataclass(frozen=True)

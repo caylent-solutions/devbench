@@ -480,3 +480,48 @@ class TestRecoveryProbeTimeoutAndRequestSizeConstants:
 
         assert RECOVERY_PROBE_TIMEOUT_SECONDS > 0
         assert RECOVERY_PROBE_REQUEST_SIZE_TOKENS >= 1
+
+
+class TestOrchestratorQuotaResumeConstants:
+    """AC-E2-F4-S3-T1-3/4: the in-process quota-resume cap and its two audit
+    markers live in constants.py, not inlined at cli.py call sites (spec
+    AC-21, AC-22; Section 7.3 configuration precedence)."""
+
+    @pytest.mark.unit
+    def test_default_max_quota_resumes_value_and_type(self) -> None:
+        from devbench.constants import DEFAULT_MAX_QUOTA_RESUMES
+
+        assert DEFAULT_MAX_QUOTA_RESUMES == 1000
+        assert isinstance(DEFAULT_MAX_QUOTA_RESUMES, int)
+
+    @pytest.mark.unit
+    def test_default_max_quota_resumes_is_positive(self) -> None:
+        """The built-in cap must itself be a usable positive bound (fail-safe target)."""
+        from devbench.constants import DEFAULT_MAX_QUOTA_RESUMES
+
+        assert DEFAULT_MAX_QUOTA_RESUMES > 0
+
+    @pytest.mark.unit
+    def test_orchestrator_quota_resume_audit_prefix(self) -> None:
+        from devbench.constants import ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX
+
+        assert ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX == "[ORCHESTRATOR_QUOTA_RESUME]"
+
+    @pytest.mark.unit
+    def test_orchestrator_quota_resumes_exhausted_audit_prefix(self) -> None:
+        from devbench.constants import ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX
+
+        assert ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX == "[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]"
+
+    @pytest.mark.unit
+    def test_prefixes_are_distinct_bracketed_tags(self) -> None:
+        """Both markers follow the ``[TAG]`` grammar shared by every other orchestrator audit prefix."""
+        from devbench.constants import (
+            ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+            ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
+        )
+
+        for tag in (ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX, ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX):
+            assert tag.startswith("[ORCHESTRATOR_"), f"audit tag must start with '[ORCHESTRATOR_' (got {tag!r})"
+            assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"
+        assert ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX != ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX

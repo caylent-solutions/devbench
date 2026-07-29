@@ -606,6 +606,27 @@ ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
 # reason=runtime_degradation tasks=<id1,id2,...>``.
 ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
 
+# Bound on the number of consecutive in-process quota-recovery resumes
+# ``_drive_orchestrate_with_quota_resume`` performs before stopping the
+# orchestrator (spec FR-2.8, AC-22). Overridable via
+# ``DEVBENCH_MAX_QUOTA_RESUMES``; resolved through
+# ``_resolve_max_quota_resumes``'s fail-safe parse (non-integer or <= 0
+# falls back to this default rather than raising or disabling resume, so a
+# typo can never silently turn a single quota window into a run-ending
+# event). Configuration precedence: env > yaml > built-in default
+# (Section 7.3).
+DEFAULT_MAX_QUOTA_RESUMES: int = 1000
+
+# Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
+# permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]
+# resume=<n> max=<cap>`` (spec FR-2.10).
+ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX: str = "[ORCHESTRATOR_QUOTA_RESUME]"
+
+# Audit marker emitted by ``_should_resume_after_quota_recovery`` when the
+# in-process quota-resume cap above is reached:
+# ``[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>`` (spec FR-2.10).
+ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]"
+
 # ---------------------------------------------------------------------------
 # Token arithmetic
 # ---------------------------------------------------------------------------

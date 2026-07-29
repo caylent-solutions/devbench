@@ -267,11 +267,22 @@ class TestRunCallsCheckQuotaAndDrainPerMessage:
         assert [call.args[0] for call in mock_check.call_args_list] == messages
 
     @pytest.mark.unit
-    def test_cmd_start_propagates_quota_detected_out_of_the_sdk_loop(self, tmp_path: Path) -> None:
-        """A quota-shaped SDK message causes _QuotaDetected to escape cmd_start (D-4: no dispatch wired here)."""
+    def test_cmd_start_dispatches_quota_detected_via_resume_loop(self, tmp_path: Path) -> None:
+        """E2-F4-S3-T1: cmd_start no longer lets the raw _QuotaDetected sentinel escape.
+
+        ``_drive_orchestrate_with_quota_resume`` now catches ``_QuotaDetected`` and
+        delegates to ``_dispatch_quota_detection``, which applies the configured
+        ``on_exhaustion`` policy. Under an explicit ``fail`` policy, only the
+        *wrapped* ``QuotaExhaustedError`` propagates out of ``cmd_start`` --
+        proving the sentinel itself is intercepted and dispatched, not left to
+        escape undispatched as it did before the resume loop was wired.
+        """
         rate_limit_message = _make_rate_limit_message()
-        with pytest.raises(cli._QuotaDetected):
-            self._drive_cmd_start_with_messages(tmp_path, [rate_limit_message])
+        fail_cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(enabled=True, on_exhaustion="fail"))
+        with patch("devbench.cli.RUNTIME_CONFIG", fail_cfg):
+            with pytest.raises(QuotaExhaustedError) as excinfo:
+                self._drive_cmd_start_with_messages(tmp_path, [rate_limit_message])
+        assert not isinstance(excinfo.value, cli._QuotaDetected)
 
     @pytest.mark.unit
     def test_cmd_start_no_duplicate_drain_check_still_enforces_drain(self, tmp_path: Path) -> None:

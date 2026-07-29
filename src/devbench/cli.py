@@ -67,11 +67,11 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NamedTuple
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -171,6 +171,7 @@ from devbench.constants import (
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
@@ -178,6 +179,8 @@ from devbench.constants import (
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+    ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
     RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_TIMEOUT_SECONDS,
@@ -5951,6 +5954,14 @@ _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX: str = "[QUOTA_TIMEOUT_KEEP_WAITING]"
 
 _QUOTA_STOP_REASON_DRAIN_DETECTION: str = "quota-drain-requested"
 _QUOTA_STOP_REASON_DRAIN_TIMEOUT: str = "quota-wait-timeout-drain"
+#: Non-recovering quota stop reasons whose disposition is a drain request
+#: (as opposed to a fail-fast re-raise or a keep-waiting terminal stop).
+#: :func:`_drive_orchestrate_with_quota_resume` consults this set to decide
+#: whether the returned :class:`_OrchestrateLoopResult.quota_drain_requested`
+#: must survive ``cmd_start``'s exit-path drain cleanup (spec AC-25).
+_QUOTA_DRAIN_STOP_REASONS: frozenset[str] = frozenset(
+    {_QUOTA_STOP_REASON_DRAIN_DETECTION, _QUOTA_STOP_REASON_DRAIN_TIMEOUT}
+)
 _QUOTA_STOP_REASON_WAIT_RECOVERED: str = "quota-wait-recovered"
 _QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING: str = "quota-wait-timeout-keep-waiting"
 
@@ -6274,6 +6285,168 @@ def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
     )
     request_drain(WORKSPACE_ROOT, reason=f"quota-timeout:{detected.quota_exc.source}")
     return _QUOTA_STOP_REASON_DRAIN_TIMEOUT
+
+
+def _resolve_max_quota_resumes() -> int:
+    """Return the effective in-process quota-resume cap (env > default).
+
+    Reads ``DEVBENCH_MAX_QUOTA_RESUMES`` from the process environment. When the
+    variable is absent, empty, or not a parseable positive integer, the constant
+    :data:`~devbench.constants.DEFAULT_MAX_QUOTA_RESUMES` is returned so the
+    caller is never left without a bound (unset-safe).
+
+    A value <= 0 is treated as invalid and falls back to the default rather than
+    disabling the resume loop, so a typo can never silently turn a single quota
+    window back into a run-ending event (fail-safe, not fail-open; spec AC-22).
+
+    Returns:
+        The maximum number of consecutive in-process quota resumes ``cmd_start``
+        will perform before stopping with
+        :data:`~devbench.constants.ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX`.
+    """
+    raw = os.environ.get("DEVBENCH_MAX_QUOTA_RESUMES", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return DEFAULT_MAX_QUOTA_RESUMES
+        if parsed > 0:
+            return parsed
+    return DEFAULT_MAX_QUOTA_RESUMES
+
+
+def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> bool:
+    """Decide whether ``cmd_start`` may resume the orchestrate skill in-process.
+
+    Called after :func:`_dispatch_quota_detection` reports a recovered quota
+    wait (``_stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED``). A recovered
+    wait is NOT terminal: the orchestrator opens a FRESH SDK session and
+    re-runs ``_run`` on the remaining backlog so a single quota window cannot
+    permanently end an unattended ``--daemon`` run (which has no external
+    ``make start`` restart wrapper).
+
+    Bounds the resume count by *max_resumes* so a pathological quota loop can
+    never spin forever:
+
+    - When *resumes_used* (resumes already performed, BEFORE this one) is below
+      *max_resumes*, emits ``[ORCHESTRATOR_QUOTA_RESUME] resume=<n> max=<cap>``
+      and returns ``True`` (caller re-runs ``_run``).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>`` and returns ``False``
+      so the caller falls through to the normal terminal classification.
+
+    Args:
+        resumes_used: Number of in-process resumes already performed during this
+            ``cmd_start`` invocation (0 on the first recovery).
+        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+
+    Returns:
+        ``True`` when another in-process resume is permitted; ``False`` when the
+        cap is exhausted and the run must stop.
+    """
+    if resumes_used >= max_resumes:
+        logger.info("%s max=%d", ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+        return False
+    logger.info(
+        "%s resume=%d max=%d",
+        ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+        resumes_used + 1,
+        max_resumes,
+    )
+    return True
+
+
+class _OrchestrateLoopResult(NamedTuple):
+    """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
+
+    Attributes:
+        terminal_rc: The exit code when the loop ended via an early-return
+            terminal path (drain enforced, a non-recovering quota disposition,
+            or the resume cap exhausted) -- always ``0`` for those paths.
+            ``None`` means ``_run`` returned normally and ``cmd_start`` must run
+            its usual post-loop terminal classification (continuation-exhausted /
+            normal-exit) instead of returning ``terminal_rc``.
+        stop_reason: The audit/Slack stop-reason label for the always-fire
+            notification. Meaningful only when ``terminal_rc`` is not ``None``;
+            on the fall-through path ``cmd_start`` overwrites it.
+        quota_drain_requested: ``True`` when the quota disposition requested a
+            graceful drain that MUST survive process exit, so ``cmd_start``'s
+            exit-path drain cleanups skip their otherwise-unconditional
+            ``cancel_drain`` call (spec AC-25).
+    """
+
+    terminal_rc: int | None
+    stop_reason: str
+    quota_drain_requested: bool
+
+
+def _drive_orchestrate_with_quota_resume(
+    run: Callable[[], Coroutine[Any, Any, None]],
+    session_name: str,
+) -> _OrchestrateLoopResult:
+    """Drive the orchestrate session loop with in-process quota resume.
+
+    Each iteration runs ONE SDK session via ``asyncio.run(run())`` (*run* opens
+    a fresh session on every call -- decision D-6: the SDK conversation is
+    never resumed; context is preserved entirely through the backlog on disk).
+    The loop re-enters ONLY when a quota wait recovered: the orchestrator
+    resumes the orchestrate skill on the remaining backlog with a brand-new
+    session rather than exiting, so a single quota window cannot permanently
+    end an unattended ``--daemon`` run that has no external ``make start``
+    restart wrapper. The number of consecutive resumes is bounded by
+    :func:`_resolve_max_quota_resumes`.
+
+    Terminal dispositions (each leaves the loop and is returned to ``cmd_start``):
+
+    - ``run`` returns normally -> ``terminal_rc=None`` (caller runs its normal
+      continuation-exhausted / clean-exit classification).
+    - :class:`_DrainRequested` -> consume the marker, audit, ``terminal_rc=0``.
+    - :class:`_QuotaDetected` with a non-recovering disposition (fail re-raises;
+      drain/keep-waiting return a terminal stop reason) -> ``terminal_rc=0``.
+    - A recovered wait whose resume cap is exhausted -> ``terminal_rc=0`` with the
+      ``"quota-resume-cap-exhausted"`` stop reason (the exhausted audit line was
+      emitted by :func:`_should_resume_after_quota_recovery`).
+
+    Extracted from ``cmd_start`` so the added resume loop does not push that
+    function over ruff PLR0912's 12-branch ceiling.
+
+    Args:
+        run: The ``cmd_start._run`` closure; a no-arg coroutine factory awaited
+            fresh on every iteration. No conversation handle, transcript, or
+            other session state is threaded between iterations (D-6).
+        session_name: Current session name, forwarded to
+            :func:`_dispatch_quota_detection` for the quota checkpoint.
+
+    Returns:
+        An :class:`_OrchestrateLoopResult` describing how the loop ended.
+
+    Raises:
+        :class:`~devbench.quota.QuotaExhaustedError`: Propagated from
+            :func:`_dispatch_quota_detection` when ``quota_handling`` is disabled
+            or the configured disposition is ``fail`` (legacy non-zero exit).
+        ValueError: Propagated from :func:`~devbench.quota._apply_resume_strategy`
+            (via :func:`_handle_quota_pause`) when a recovered wait's configured
+            ``resume_strategy`` is not one of the three recognised values.
+    """
+    resumes_used = 0
+    max_resumes = _resolve_max_quota_resumes()
+    while True:
+        try:
+            asyncio.run(run())
+        except _DrainRequested as exc:
+            drained = consume_drain(WORKSPACE_ROOT)
+            reason_text = drained.reason if drained is not None else exc.reason
+            logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
+            return _OrchestrateLoopResult(0, f"drain enforced: {reason_text}", False)
+        except _QuotaDetected as exc:
+            stop_reason = _dispatch_quota_detection(exc, session_name)
+            if stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED:
+                if _should_resume_after_quota_recovery(resumes_used, max_resumes):
+                    resumes_used += 1
+                    continue
+                return _OrchestrateLoopResult(0, "quota-resume-cap-exhausted", False)
+            return _OrchestrateLoopResult(0, stop_reason, stop_reason in _QUOTA_DRAIN_STOP_REASONS)
+        return _OrchestrateLoopResult(None, "clean", False)
 
 
 @dataclass(frozen=True)
@@ -6778,16 +6951,25 @@ def cmd_start(*argv: str) -> int:
     sentinel, consumes the drain marker, logs a
     ``[ORCHESTRATOR_DRAIN_ENFORCED]`` audit entry, and returns 0.
 
-    **Quota detection (spec AC-20, FR-2.7, decision D-4, issue #236):** The
-    same per-message call also raises :class:`_QuotaDetected` -- a
-    :class:`BaseException` subclass, not :class:`Exception` -- the moment a
-    quota / rate-limit signal is recognized in the SDK message stream. This
-    task wires detection only: ``cmd_start`` does not handle or dispatch on
-    ``_QuotaDetected``; the outer ``except BaseException`` labels the stop
-    reason (via ``_label_stop_reason``) and re-raises, so the sentinel still
-    propagates out of ``asyncio.run`` and out of this function, tearing the
-    SDK session down first. Pause handling and the resume loop are wired in
-    a follow-up task (E2-F4-S2-T1).
+    **Quota detection and in-process resume (spec AC-20, AC-21, AC-22,
+    FR-2.7-2.10, decisions D-4/D-6, issue #236):** The same per-message call
+    also raises :class:`_QuotaDetected` -- a :class:`BaseException`
+    subclass, not :class:`Exception` -- the moment a quota / rate-limit
+    signal is recognized in the SDK message stream. ``cmd_start`` drives the
+    whole SDK run through :func:`_drive_orchestrate_with_quota_resume`,
+    which wraps ``asyncio.run(_run())`` in a loop: on ``_QuotaDetected`` it
+    dispatches via :func:`_dispatch_quota_detection`, runs
+    :func:`_handle_quota_pause` while waiting, and -- when the quota window
+    recovers before ``on_exhaustion_timeout`` -- re-enters a **fresh** SDK
+    session (decision D-6: no stateful-client conversation resume; context
+    flows only through the on-disk backlog, never through SDK session
+    state) up to ``DEVBENCH_MAX_QUOTA_RESUMES`` (default
+    :data:`DEFAULT_MAX_QUOTA_RESUMES`) consecutive resumes before stopping.
+    Non-recovering dispositions (timeout, drain-requested) and drain
+    enforcement (:class:`_DrainRequested`) both terminate the loop; when the
+    disposition requested a drain, that intent survives this function's
+    exit-path cleanup via :func:`_cancel_drain_unless_requested` so the next
+    ``devbench start`` invocation still honours it.
 
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
@@ -6797,16 +6979,27 @@ def cmd_start(*argv: str) -> int:
             ``--allow-overlap``).
 
     Returns:
-        0 on success (including drain-enforced stop), 1 on argument-parse
-        error, invalid scope token, or scope overlap without ``--allow-overlap``,
-        :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42) when auto-restart is triggered.
+        0 on success (including drain-enforced stop and quota-driven stops),
+        1 on argument-parse error, invalid scope token, or scope overlap
+        without ``--allow-overlap``, :data:`ORCHESTRATOR_RESTART_EXIT_CODE`
+        (42) when auto-restart is triggered.
 
     Raises:
-        _QuotaDetected: Propagates uncaught from the SDK loop when a quota /
-            rate-limit signal is detected (detection wiring only; see above).
-        Nothing else from this function's own scope -- all other SDK
-        exceptions propagate as-is through the asyncio boundary;
-        :class:`_DrainRequested` is caught here and handled as a clean exit.
+        :class:`~devbench.quota.QuotaExhaustedError`: Propagates from
+            :func:`_drive_orchestrate_with_quota_resume` (via
+            :func:`_dispatch_quota_detection`) when ``quota_handling`` is
+            disabled or the configured ``on_exhaustion`` /
+            ``on_exhaustion_timeout`` disposition is ``fail`` -- the
+            documented operator escape hatch back to the legacy non-zero
+            exit.
+        ValueError: Propagates from :func:`_drive_orchestrate_with_quota_resume`
+            (via :func:`~devbench.quota._apply_resume_strategy`) when a
+            recovered wait's configured ``resume_strategy`` is not one of the
+            three recognised values.
+        Nothing else from this function's own scope for quota / drain
+        signals -- both dispositions are otherwise fully handled by
+        :func:`_drive_orchestrate_with_quota_resume`. Any other SDK
+        exception propagates as-is through the asyncio boundary.
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -6962,28 +7155,27 @@ def cmd_start(*argv: str) -> int:
     # helper is best-effort so a failure here cannot mask the original
     # exit reason.
     _stop_reason: str = "clean"
+    _quota_drain_requested: bool = False
     try:
         try:
-            try:
-                asyncio.run(_run())
-            except _DrainRequested as exc:
-                # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
-                # consume the marker so the next run starts unscoped, then record the audit.
-                drained = consume_drain(WORKSPACE_ROOT)
-                reason_text = drained.reason if drained is not None else exc.reason
-                logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
-                _stop_reason = f"drain enforced: {reason_text}"
-                return 0
+            _loop_result = _drive_orchestrate_with_quota_resume(_run, parsed.name)
+            _quota_drain_requested = _loop_result.quota_drain_requested
+            if _loop_result.terminal_rc is not None:
+                _stop_reason = _loop_result.stop_reason
+                return _loop_result.terminal_rc
         finally:
             # Issue #212: drop the drain signal on any exit from the SDK run so
             # the next start does not inherit a stale request.  Run while
             # DEVBENCH_SESSION_NAME is still set (before the restore below) so
             # cancel_drain scans both the per-session and workspace-root
-            # candidate paths.  Idempotent on already-clean state.
+            # candidate paths.  Idempotent on already-clean state.  When the
+            # loop's disposition asked for a drain (spec AC-25), the request
+            # must survive so the next ``devbench start`` still honours it --
+            # see :func:`_cancel_drain_unless_requested`.
             import contextlib as _contextlib
 
             with _contextlib.suppress(OSError):
-                cancel_drain(WORKSPACE_ROOT)
+                _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
             # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
             # maintained when cmd_start is invoked multiple times in the same process.
             if _prev_session_name is None:
@@ -7027,13 +7219,16 @@ def cmd_start(*argv: str) -> int:
         with contextlib.suppress(OSError, NameError):
             remove_pid_file(_orchestrator_pid_workspace)
         # Issue #212: drop the drain signal on any exit so the next start
-        # does not inherit a stale request.  cancel_drain scans both the
-        # per-session and workspace-root candidate paths and is idempotent
-        # on already-clean state.  Best-effort: NameError guards a very
-        # early exit before WORKSPACE_ROOT was set; OSError covers
-        # permission-denied during unlink.
+        # does not inherit a stale request -- unless the quota-resume loop's
+        # disposition asked for a drain (spec AC-25), in which case that
+        # request must survive so the next ``devbench start`` still honours
+        # it.  cancel_drain scans both the per-session and workspace-root
+        # candidate paths and is idempotent on already-clean state.
+        # Best-effort: NameError guards a very early exit before
+        # WORKSPACE_ROOT (or ``_quota_drain_requested``) was set; OSError
+        # covers permission-denied during unlink.
         with contextlib.suppress(OSError, NameError):
-            cancel_drain(WORKSPACE_ROOT)
+            _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
 
 
 def cmd_prepare_plugin_shadow() -> int:

@@ -38,7 +38,7 @@ The guard and the amendment workflow together preserve `AC-FINAL-015` (the manif
 
 ### What judges run on every task?
 
-Four review-team judges run in parallel via `review-supervisor` after the executor stages its files: `code_review`, `test_review`, `doc_review`, and `changes_manifest`. If they all pass, `security_review` runs sequentially. The `manifest-amender` judge runs conditionally before `review-supervisor` when an amendment request file is pending; if the backlog has not opted in, it is never invoked. The done-gate (`mark-done`) requires the four review judges plus security to have all passed in the most recent round.
+Four review-team judges are dispatched directly by the orchestrate skill as first-level sub-agents, in parallel, after the executor stages its files: `code_review`, `test_review`, `doc_review`, and `changes_manifest`. If they all pass, `security_review` runs sequentially. The `manifest-amender` judge runs conditionally before `review-supervisor` when an amendment request file is pending; if the backlog has not opted in, it is never invoked. The done-gate (`mark-done`) requires the four review judges plus security to have all passed in the most recent round.
 
 ### Why does my task keep failing with the same judge finding?
 

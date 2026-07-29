@@ -10,6 +10,43 @@ configuration refactor, the EC2 remote-dev provisioning stack, and the
 work-unit lifecycle / authoring CLI improvements that have accumulated
 since the last release. PR #119 carries every change.
 
+### Fixed
+
+- **The review leg could never dispatch (ADR-33).** The orchestrate skill invoked
+  `review-supervisor` as a first-level sub-agent, which then declared
+  `Agent(code-reviewer, test-reviewer, doc-reviewer, changes-manifest)` to fan out
+  to the four judges. The Claude Agent SDK forbids a sub-agent from spawning
+  sub-agents, so that declaration silently no-opped: the fan-out never ran, the
+  work unit stalled as `RUNTIME_DEGRADATION`, and no restart could clear it. The
+  skill now dispatches all four `review_team` judges directly as first-level
+  sub-agents and determines pass/fail solely from their canonical verdict lines,
+  fail-closed -- a missing verdict is a `REVIEW_FAIL`, never an implicit pass.
+  `review-supervisor` is now a non-dispatching deprecation stub, retained only so
+  existing `agents:` config, plugin-shadow, and activity references keep
+  resolving. The `continue-orchestration.sh` Stop hook no longer tells the
+  orchestrator to invoke it.
+- **Recovery tasks were materialised but never wired.** The `write-proposal`
+  auto-cascade skipped `promote_proposal` for any draft not in `proposed` state.
+  Under `backlog.default_status_for_new_work_units: in-queue` every fresh draft is
+  born promoted, so the guard skipped it -- and with it the dependency row and the
+  `[BLOCKED_PENDING_PROPOSAL]` marker the auto-unblock cascade reads. The source
+  task stayed blocked indefinitely with nothing naming what it waited for. Drafts
+  materialised by the current call are now always wired.
+- **Consumed proposals were never deleted.** `delete_proposal` existed but had no
+  caller. Because the recovery classifier tests for the proposal file's presence
+  alone, a spent proposal pinned its source task to `AWAITING_AMENDMENT_RECOVERY`
+  permanently -- reported as self-healing, so never surfaced as
+  `OPERATOR_ACTION_REQUIRED` -- while `write_proposal` refused to emit a
+  replacement. The proposal is now dropped once every proposed task has been
+  resolved.
+- **Materialised tasks landed in an orphan directory tree.** The story-directory
+  helper derived its path from bare IDs (`backlog/E4/E4-F1/E4-F1-S1`), but
+  `spec-to-backlog` names every level `<id>-<slug>`, so recovery tasks were written
+  into a parallel tree with no Epic / Feature / Story work-unit files. That hid
+  existing siblings from the story scan and could make ID allocation return an ID
+  that already existed, overwriting a live task. An existing directory now always
+  wins, preferring the one that holds the Story's own work-unit file.
+
 ### Changed (BREAKING)
 
 - **devbench.yaml default changes.** Several built-in defaults changed; workspaces

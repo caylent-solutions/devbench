@@ -54,11 +54,11 @@ What devbench does today, grouped by theme:
 - Recursive work-unit hierarchy (Epic → Feature → Story → Task) with automatic status rollup of parents when children complete.
 
 ### Multi-judge review
-- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`. The supervisor is **read-only**: a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
+- Four review judges (code, test, doc, changes-manifest) are dispatched directly by the orchestrate skill as first-level sub-agents, in parallel (ADR-33). `review-supervisor` is a deprecated non-dispatching stub and MUST NOT be invoked; a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) enforces that it is read-only: a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
 - A separate security judge runs sequentially after the review tier passes.
 - Done-gate enforces all four review judges must REVIEW_PASS before a unit can be marked done.
 - Review failures inject prior feedback into the next executor attempt to prevent loops.
-- A fifth, conditional judge (`manifest-amender`) runs before `review-supervisor` when an executor-emitted amendment request file is pending. On approval the amender invokes `apply-amendment`, which atomically updates the Changes Manifest and runs a deterministic Layer 3 post-check (em-dash scan plus `validate-backlog`) with rollback on any failure. Opt-in via `manifest_amendment.enabled: true` in `backlog/config/devbench.yaml`; see [authoring-manifests.md](authoring-manifests.md) and [manifest-amendments.md](manifest-amendments.md).
+- A fifth, conditional judge (`manifest-amender`) runs before the review fan-out when an executor-emitted amendment request file is pending. On approval the amender invokes `apply-amendment`, which atomically updates the Changes Manifest and runs a deterministic Layer 3 post-check (em-dash scan plus `validate-backlog`) with rollback on any failure. Opt-in via `manifest_amendment.enabled: true` in `backlog/config/devbench.yaml`; see [authoring-manifests.md](authoring-manifests.md) and [manifest-amendments.md](manifest-amendments.md).
 - **`devbench get-diff` is the AUTHORITATIVE scope source for every review judge** and is mode-aware per [ADR-12](adr/12-mode-aware-get-diff.md). In per-task-branch mode it emits staged + unstaged + branch-vs-default + untracked; in `git_ops.defer_pr: true` mode it emits staged + unstaged + untracked only, substituting `git show HEAD` when the working tree is empty post-commit. Judges must never compute scope via raw `git diff origin/main`; that view includes every prior completed task in single-branch + defer_pr mode and produces false-positive "files staged outside manifest" findings.
 
 ### Reliability
@@ -386,7 +386,7 @@ Four judges in `plugin/devbench-orchestrate/agents/review_team/`:
 - `doc-reviewer.md` -- documentation accuracy, sync with code, no stale docs
 - `changes-manifest.md` -- declared changes match staged changes, no out-of-scope edits
 
-`review-supervisor.md` invokes all four in parallel (single response with multiple `Agent` tool calls), aggregates verdicts, and emits a single REVIEW_PASS or REVIEW_FAIL.
+The orchestrate skill invokes all four directly as first-level sub-agents (single response with multiple `Agent` tool calls). Each judge self-logs its own canonical verdict, and the skill determines pass/fail solely from those verdict lines, fail-closed: a missing verdict is a REVIEW_FAIL, never an implicit pass.
 
 ### Tier 2 -- Security gate (sequential, separate)
 
@@ -421,7 +421,7 @@ Walkthrough adding a hypothetical `api-contract` judge that verifies API changes
 5. Run `make validate` to confirm tests still pass.
 6. Test end-to-end on a sample work unit.
 
-`review-supervisor` discovers judges by listing `plugin/devbench-orchestrate/agents/review_team/*.md` at runtime, so no change to `review-supervisor.md` is required -- it picks up the new agent automatically.
+The orchestrate skill names each judge explicitly by its registered agent type (`devbench-orchestrate:review_team:<name>`), so adding a judge also requires adding it to the skill's review step and to the required-verdict set.
 
 ### Removing a judge
 

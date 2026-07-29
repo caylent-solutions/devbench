@@ -2,13 +2,19 @@
 
 import json
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 HOOK_SCRIPT = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "continue-orchestration.sh"
 )
-STATE_FILE = Path("/tmp/devbench-stop-hook-state.json")
+# Isolated per-run state directory. The hook defaults to /tmp, which is shared
+# machine-wide: a live orchestrator writing its own stop-hook state would
+# otherwise race the assertions below that a given state file is absent.
+# DEVBENCH_STOP_HOOK_STATE_DIR is the seam the hook exposes for exactly this.
+STATE_DIR = Path(tempfile.mkdtemp(prefix="devbench-hook-state-"))
+STATE_FILE = STATE_DIR / "devbench-stop-hook-state.json"
 
 
 def _run_hook(
@@ -25,7 +31,11 @@ def _run_hook(
             the Stop event payload from Claude Code).  When ``None``, no
             stdin is provided (maintains backward compat with existing tests).
     """
-    env = {"DEVBENCH_WORKSPACE_ROOT": workspace_root, "PATH": "/usr/bin:/bin"}
+    env = {
+        "DEVBENCH_WORKSPACE_ROOT": workspace_root,
+        "PATH": "/usr/bin:/bin",
+        "DEVBENCH_STOP_HOOK_STATE_DIR": str(STATE_DIR),
+    }
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -485,6 +495,47 @@ class TestActiveTaskSelection:
         assert active_idx >= 0 and active_idx < stale_idx
 
 
+class TestStateDirIsConfigurable:
+    """The stop-hook state directory must be overridable, not a hardcoded /tmp path.
+
+    The default lives in the shared, world-writable ``/tmp``, so the suite and any
+    live orchestrator on the same machine contend for the identical file: a test
+    asserting the shared state file does NOT exist fails whenever a real hook run
+    writes it. CLAUDE.md bars hardcoded paths and requires test fixtures to be
+    configurable; ``DEVBENCH_STOP_HOOK_STATE_DIR`` is that seam.
+    """
+
+    def test_state_dir_env_var_redirects_the_shared_state_file(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "hookstate"
+        state_dir.mkdir()
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_HOOK_STATE_DIR": str(state_dir)})
+
+        assert result.returncode == 0
+        assert (state_dir / "devbench-stop-hook-state.json").exists(), (
+            "shared state file must be created under DEVBENCH_STOP_HOOK_STATE_DIR"
+        )
+        assert not STATE_FILE.exists(), "the hardcoded /tmp path must not be touched when the env var is set"
+
+    def test_state_dir_env_var_redirects_the_session_scoped_file(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "hookstate"
+        state_dir.mkdir()
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+
+        result = _run_hook(
+            str(tmp_path),
+            extra_env={"DEVBENCH_STOP_HOOK_STATE_DIR": str(state_dir), "DEVBENCH_SESSION_NAME": "isolated"},
+        )
+
+        assert result.returncode == 0
+        assert (state_dir / "devbench-stop-hook-state-isolated.json").exists(), (
+            "session-scoped state file must be created under DEVBENCH_STOP_HOOK_STATE_DIR"
+        )
+
+
 class TestPerSessionStateFile:
     """AC-192-15: Stop hook circuit breaker is per-session when DEVBENCH_SESSION_NAME is set.
 
@@ -497,8 +548,8 @@ class TestPerSessionStateFile:
 
     SESSION_A = "my-session"
     SESSION_B = "other-session"
-    STATE_FILE_A = Path(f"/tmp/devbench-stop-hook-state-{SESSION_A}.json")
-    STATE_FILE_B = Path(f"/tmp/devbench-stop-hook-state-{SESSION_B}.json")
+    STATE_FILE_A = STATE_DIR / f"devbench-stop-hook-state-{SESSION_A}.json"
+    STATE_FILE_B = STATE_DIR / f"devbench-stop-hook-state-{SESSION_B}.json"
 
     def setup_method(self) -> None:
         STATE_FILE.unlink(missing_ok=True)

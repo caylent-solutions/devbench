@@ -43,7 +43,7 @@ class TestReviewTeamDirectory:
 
 @pytest.mark.unit
 class TestReviewSupervisorFrontmatter:
-    """AC-2: review-supervisor.md exists with correct frontmatter."""
+    """AC-2 / ADR-28: review-supervisor.md exists, tools: Bash, NO Agent tool."""
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
@@ -52,57 +52,69 @@ class TestReviewSupervisorFrontmatter:
         assert self._SUPERVISOR_PATH.exists(), f"review-supervisor.md not found at {self._SUPERVISOR_PATH}"
 
     def test_review_supervisor_frontmatter_valid(self) -> None:
-        """AC-2: Frontmatter must contain name: review-supervisor and tools: Bash, Agent(...)."""
-        content = self._SUPERVISOR_PATH.read_text()
+        """ADR-28: frontmatter names review-supervisor with tools: Bash and NO Agent tool.
 
-        # Extract frontmatter block between --- delimiters
-        lines = content.splitlines()
-        assert lines[0].strip() == "---", "review-supervisor.md must start with --- frontmatter delimiter"
-
-        end_idx = next(
-            (i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
-            None,
+        The review pipeline was flattened: the orchestrate skill dispatches the
+        four review_team reviewers directly (first-level). A sub-agent cannot
+        spawn sub-agents -- a nested ``Agent(...)`` declaration silently no-ops,
+        which stalled every task as an unclearable runtime degradation.
+        """
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        frontmatter = content.split("---")[1]
+        assert "name: review-supervisor" in frontmatter
+        assert re.search(r"^tools:\s*Bash\s*$", frontmatter, re.MULTILINE), (
+            f"review-supervisor tools must be exactly 'Bash'. Got:\n{frontmatter}"
         )
-        assert end_idx is not None, "review-supervisor.md frontmatter closing --- not found"
-
-        frontmatter = "\n".join(lines[1:end_idx])
-
-        assert "name: review-supervisor" in frontmatter, (
-            f"Frontmatter must contain 'name: review-supervisor'. Got:\n{frontmatter}"
+        assert "Agent(" not in frontmatter, (
+            "review-supervisor MUST NOT declare the Agent tool: a sub-agent cannot spawn sub-agents (ADR-28)."
         )
-        assert "tools:" in frontmatter, f"Frontmatter must contain a tools: field. Got:\n{frontmatter}"
-        assert "Bash" in frontmatter, f"Frontmatter tools must include Bash. Got:\n{frontmatter}"
-        assert "Agent" in frontmatter, f"Frontmatter tools must include Agent(...). Got:\n{frontmatter}"
 
 
 @pytest.mark.unit
-class TestReviewSupervisorStep0SelfCheck:
-    """Issue #183(a): review-supervisor.md must instruct the agent to
-    self-check Agent-tool availability before dispatching reviewers,
-    and to emit a structured ``agent-tool-unavailable`` audit comment
-    on failure so ``classify_blocked_task`` priority-0 can bucket the
-    task as ``RUNTIME_DEGRADATION``.
+class TestReviewSupervisorHasNoPipelineRole:
+    """ADR-33: review-supervisor.md carries no pipeline role and is never invoked.
+
+    The Step-0 Agent-tool self-check (issue #183) and the entire dispatch /
+    aggregation body are removed: the orchestrate skill dispatches the four
+    review_team reviewers directly and aggregates their verdicts itself, so the
+    supervisor no longer spawns anything, self-checks anything, or logs
+    verdicts. The file survives only because ``plugin_shadow`` maps the
+    ``agents.review_supervisor`` config key to this path and fails fast when it
+    is absent, so deleting it would break every workspace that pins a model for
+    this agent.
     """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    def test_supervisor_contains_step_0_self_check(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "Step 0:" in content, "review-supervisor.md must declare a Step 0 self-check"
-        assert "Agent tool" in content, "Step 0 must describe how to detect missing Agent tool access"
+    def test_supervisor_states_it_has_no_pipeline_role(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "NOT INVOKED" in content, "review-supervisor.md must declare it is not invoked (ADR-33)"
 
-    def test_supervisor_emits_structured_runtime_degradation_payload(self) -> None:
-        """The audit-comment phrasing must match the regex in
-        ``classify_blocked_task`` (``agent-tool-unavailable`` keyword) so
-        the priority-0 check actually fires when the agent emits it.
-        """
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "agent-tool-unavailable" in content, (
-            "review-supervisor.md must emit the canonical 'agent-tool-unavailable' "
-            "payload so classify_blocked_task can detect the degraded runtime"
-        )
-        assert "log-comment review-supervisor" in content, (
-            "review-supervisor.md must instruct logging the failure via log-comment"
+    def test_supervisor_states_it_must_not_be_invoked(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "MUST NOT be invoked" in content or "do not invoke" in content.lower()
+
+    def test_supervisor_no_longer_dispatches_reviewers(self) -> None:
+        """The stub must not carry dispatch instructions for the review team."""
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "Step 0" not in content, "the Step-0 self-check must be removed (ADR-33)"
+        assert "invoke them in parallel" not in content
+
+    def test_supervisor_references_the_governing_adrs(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "ADR-33" in content, "the flatten decision (ADR-33) must be cited"
+        assert "ADR-28" in content, "the original root-cause analysis (ADR-28) must remain cited"
+
+    def test_supervisor_explains_why_the_file_is_retained(self) -> None:
+        """A reader must learn why an unused file is still here, not guess."""
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "plugin_shadow" in content, "the file must name the config coupling that keeps it alive"
+
+    def test_supervisor_retains_the_model_frontmatter_line(self) -> None:
+        """plugin_shadow._rewrite_agent_model raises when this line is missing."""
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert re.search(r"^model:[ \t]+\S", content, re.MULTILINE), (
+            "per-agent model overrides rewrite this line; without it the override is a hard error"
         )
 
 
@@ -178,41 +190,21 @@ class TestReviewTeamModelDefault:
 
 @pytest.mark.unit
 class TestReviewSupervisorVerdictFormat:
-    """AC-4, AC-5: review-supervisor must use lowercase pass/fail in log-verdict calls."""
+    """ADR-28: the deprecated supervisor emits no verdicts at all."""
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
     def test_supervisor_no_review_fail_token(self) -> None:
-        """AC-4: review-supervisor must not use REVIEW_FAIL as a verdict token."""
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "REVIEW_FAIL" not in content, (
-            "review-supervisor.md must not use 'REVIEW_FAIL' as a verdict token. "
-            "Use lowercase 'fail' in log-verdict calls."
-        )
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "REVIEW_FAIL" not in content
 
     def test_supervisor_no_review_pass_token(self) -> None:
-        """AC-5: review-supervisor must not use REVIEW_PASS as a verdict token."""
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "REVIEW_PASS" not in content, (
-            "review-supervisor.md must not use 'REVIEW_PASS' as a verdict token. "
-            "Use lowercase 'pass' in log-verdict calls."
-        )
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "REVIEW_PASS" not in content
 
-    def test_supervisor_fail_branch_uses_lowercase_fail(self) -> None:
-        """AC-4: log-verdict calls in review-supervisor must use lowercase 'fail'."""
-        content = self._SUPERVISOR_PATH.read_text()
-        # Should have at least one log-verdict call with lowercase 'fail'
-        assert re.search(r"log-verdict\s+\S+\s+\S+\s+fail\b", content), (
-            "review-supervisor.md must contain log-verdict calls using lowercase 'fail'."
-        )
-
-    def test_supervisor_pass_branch_uses_lowercase_pass(self) -> None:
-        """AC-5: log-verdict calls in review-supervisor must use lowercase 'pass'."""
-        content = self._SUPERVISOR_PATH.read_text()
-        # Should have at least one log-verdict call with lowercase 'pass'
-        assert re.search(r"log-verdict\s+\S+\s+\S+\s+pass\b", content), (
-            "review-supervisor.md must contain log-verdict calls using lowercase 'pass'."
-        )
+    def test_supervisor_logs_no_verdicts(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "log-verdict" not in content
 
 
 @pytest.mark.unit
@@ -266,42 +258,6 @@ class TestReviewerJsonEnvelope:
             content,
             re.IGNORECASE,
         ), f"{agent_filename} must instruct the agent that the JSON envelope is the last thing output in the response."
-
-
-@pytest.mark.unit
-class TestReviewSupervisorUsesJsonEnvelope:
-    """AC-6, AC-9: review-supervisor must use reviewer JSON envelope data, not hardcoded strings."""
-
-    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
-
-    def test_supervisor_no_hardcoded_passed_strings(self) -> None:
-        """AC-9: Supervisor must not hardcode 'X passed' strings in log-verdict calls."""
-        content = self._SUPERVISOR_PATH.read_text()
-        hardcoded_patterns = [
-            "code-reviewer passed",
-            "test-reviewer passed",
-            "doc-reviewer passed",
-            "changes-manifest passed",
-        ]
-        for pattern in hardcoded_patterns:
-            assert pattern not in content, (
-                f"review-supervisor.md must not hardcode '{pattern}' in log-verdict calls. "
-                "Use the actual reviewer JSON summary from the envelope."
-            )
-
-    def test_supervisor_references_json_envelope(self) -> None:
-        """AC-6, AC-9: Supervisor must instruct parsing of reviewer JSON envelope."""
-        content = self._SUPERVISOR_PATH.read_text()
-        assert re.search(r"\bjson\b", content, re.IGNORECASE), (
-            "review-supervisor.md must instruct parsing the reviewer JSON envelope to extract verdicts and summaries."
-        )
-
-    def test_supervisor_fail_branch_logs_findings_as_comments(self) -> None:
-        """AC-6: Supervisor FAIL branch must relay individual findings via log-comment."""
-        content = self._SUPERVISOR_PATH.read_text()
-        assert "log-comment" in content, (
-            "review-supervisor.md must use log-comment to relay reviewer findings in the FAIL branch."
-        )
 
 
 @pytest.mark.unit
@@ -493,52 +449,19 @@ class TestExecutorCommentLanguageDiscipline:
 
 
 @pytest.mark.unit
-class TestReviewSupervisorCanonicalJudgeNames:
-    """ADR-08 slice G: supervisor must use underscored canonical judge names in log-verdict."""
+class TestReviewSupervisorEmitsNoJudgeNames:
+    """ADR-28: the deprecated stub emits no verdicts, so it carries no judge names.
+
+    Canonical judge-name coverage now lives with the reviewers themselves and
+    with the orchestrate skill, which owns the fan-out and the fail-closed
+    verdict check.
+    """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    _CANONICAL_JUDGE_NAMES = (
-        "code_review",
-        "test_review",
-        "doc_review",
-        "changes_manifest",
-        "security_review",
-    )
-
-    _HYPHENATED_REVIEWER_NAMES = (
-        "code-reviewer",
-        "test-reviewer",
-        "doc-reviewer",
-    )
-
-    def test_supervisor_contains_all_canonical_judge_names(self) -> None:
-        """Each underscored name must appear in the supervisor's log-verdict examples."""
-        content = self._SUPERVISOR_PATH.read_text()
-        for name in self._CANONICAL_JUDGE_NAMES:
-            assert name in content, (
-                f"review-supervisor.md must reference canonical judge name '{name}' "
-                "so the supervisor emits the exact string the done-gate parser looks for."
-            )
-
-    def test_supervisor_has_no_hyphenated_log_verdict_calls(self) -> None:
-        """Regression pin: no ``log-verdict <hyphenated-name>`` examples in supervisor."""
-        content = self._SUPERVISOR_PATH.read_text()
-        for name in self._HYPHENATED_REVIEWER_NAMES:
-            bad = f"log-verdict {name}"
-            assert bad not in content, (
-                f"review-supervisor.md must not contain '{bad}'. "
-                "Hyphenated reviewer frontmatter names do not match the done-gate parser's "
-                "canonical underscored set. Use e.g. 'log-verdict code_review' instead."
-            )
-
-    def test_supervisor_has_mapping_or_warning(self) -> None:
-        """Prompt must explicitly warn against deriving the judge name from frontmatter."""
-        content = self._SUPERVISOR_PATH.read_text().lower()
-        assert "frontmatter" in content or "canonical" in content, (
-            "review-supervisor.md must contain a caution or mapping that steers the agent "
-            "away from the reviewer's frontmatter name toward the canonical underscored form."
-        )
+    def test_supervisor_declares_no_log_verdict_calls(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "devbench log-verdict" not in content
 
 
 @pytest.mark.unit

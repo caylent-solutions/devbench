@@ -196,7 +196,7 @@ fi
 # --- Scope: executor must not write canonical reviewer verdicts ---
 # The executor is an authoring agent, not a reviewer. Review-team
 # verdicts (code_review, test_review, doc_review, changes_manifest,
-# security_review) are written by review-supervisor and
+# security_review) are self-logged by each review_team judge and by
 # security-reviewer; the executor self-attesting them confuses the
 # audit trail and risks racing the actual reviewers' verdicts in the
 # done-gate's "most recent round" bookkeeping. The audit-only
@@ -208,7 +208,7 @@ if [[ "$AGENT_TYPE" == "devbench-orchestrate:executor" ]]; then
     if [[ "$JUDGE" == "$canonical" ]]; then
       echo "guard-verdict-format: BLOCKED -- the executor agent must not write canonical reviewer verdicts." >&2
       echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
-      echo "Reason: review-team verdicts belong to review-supervisor / security-reviewer." >&2
+      echo "Reason: review-team verdicts belong to the review_team judges / security-reviewer." >&2
       echo "Fix: write a 'log-comment' for narrative status, or a 'log-verdict executor <id> <pass|fail> <feedback>' for audit-only progress (the 'executor' judge is on the allowlist but does NOT satisfy the done-gate)." >&2
       exit 2
     fi

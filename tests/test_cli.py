@@ -11183,15 +11183,24 @@ class TestCmdWriteProposalAutoCascade:
         promoted = result["promoted"]
         assert isinstance(promoted, list)
         # With default_status='in-queue', materialise_proposal writes 'in-queue'
-        # directly into the draft. The auto-cascade promote loop only promotes
-        # tasks in 'proposed' state; tasks already at 'in-queue' are classified
-        # as PROMOTED and need no explicit promotion step.
-        assert promoted == [], "no explicit promotion needed when draft was materialised directly to in-queue"
+        # directly into the draft, so the draft classifies as PROMOTED rather
+        # than PROPOSED. Promotion is still required: it is the step that wires
+        # the dependency row and writes the `[BLOCKED_PENDING_PROPOSAL]` marker
+        # the ADR-07 cascade reads to auto-unblock the source. Skipping it on a
+        # status technicality leaves the source blocked forever with nothing
+        # naming what it waits for.
+        assert promoted == ["E0-F1-S1-T9"], "a freshly materialised draft must still be wired to its source"
         # The materialised task's file exists with the configured status.
         materialised_file = story_dir / "E0-F1-S1-T9.md"
         assert materialised_file.exists()
         materialised_content = materialised_file.read_text(encoding="utf-8")
         assert "## Status: in-queue" in materialised_content
+        # The source carries the auto-unblock marker naming the recovery task.
+        source_content = (story_dir / "E0-F1-S1-T1.md").read_text(encoding="utf-8")
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9" in source_content
+        # And the fully consumed proposal JSON is gone, so the source does not
+        # stay pinned to AWAITING_AMENDMENT_RECOVERY by a stale file-presence signal.
+        assert not (proposals_dir / "E0-F1-S1-T1.json").exists()
 
 
 # ---------------------------------------------------------------------------

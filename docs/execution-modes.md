@@ -64,7 +64,7 @@ Both modes execute the same logical steps in the same order.
    ├── test-reviewer    -- TDD discipline, test quality, coverage
    ├── doc-reviewer     -- accuracy, completeness, sync with code
    └── changes-manifest -- actual changes vs. declared manifest
-   (review-supervisor invokes all four judge agents in parallel)
+   (the orchestrate skill dispatches all four judge agents directly, in parallel)
 
 6. If any judge FAILs → inject feedback, return to step 4 (max max_executor_retries)
 
@@ -129,7 +129,7 @@ The executor **must not**:
 
 The orchestrate skill is responsible for:
 
-- Invoking `devbench:review-supervisor` (which runs all four judge agents in parallel)
+- Dispatching the four `review_team` judges directly as first-level sub-agents, in parallel
 - Injecting review feedback into retry attempts
 - Invoking `devbench:security-reviewer` after the four judges pass
 - Delegating git operations to the executor agent (`devbench git-ops`)
@@ -155,8 +155,8 @@ uv run devbench start
             │
             ├── invokes devbench:executor agent to implement each work unit
             │
-            ├── invokes devbench:review-supervisor agent to run judge review
-            │       └── review-supervisor runs all 4 judge agents in parallel
+            ├── dispatches the 4 review_team judges directly (first-level)
+            │       └── code-reviewer, test-reviewer, doc-reviewer, changes-manifest (parallel)
             │
             ├── invokes devbench:security-reviewer agent
             │
@@ -176,8 +176,8 @@ Claude Code session (with devbench plugin active)
     │
     ├── Claude invokes devbench:executor agent for implementation
     │
-    ├── Claude invokes devbench:review-supervisor for judge review
-    │       └── review-supervisor runs all 4 judge agents in parallel
+    ├── Claude dispatches the 4 review_team judges directly for judge review
+    │       └── code-reviewer, test-reviewer, doc-reviewer, changes-manifest (parallel)
     │
     ├── Claude invokes devbench:security-reviewer for security gate
     │

@@ -85,7 +85,7 @@ Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
   |     |-- Optional: manifest-amender judges a `tdd_green_production_fix`
   |     |   amendment when the executor needs to expand the Manifest mid-cycle
   |-- Run repo's task runners (make test, make validate)
-  |-- Stage files, submit to judge review  [review-supervisor agent]
+  |-- Stage files, dispatch the 4 judges directly as first-level sub-agents
   |     |-- code-reviewer       -- SOLID, DRY, fail-fast, security, 12-factor
   |     |-- test-reviewer       -- TDD discipline, test quality, real assertions
   |     |-- doc-reviewer        -- accuracy, completeness, sync with code

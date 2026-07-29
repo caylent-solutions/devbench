@@ -510,8 +510,13 @@ git_ops:
 
 # Cost reporting (see docs/model-pricing.md)
 report:
-  token_cost_per_million_input: 5.0    # Opus 4.7 default
-  token_cost_per_million_output: 25.0
+  models:
+    claude-opus-5:                     # Opus 5 default (issue #233)
+      input: 5.0
+      output: 25.0
+  default_model:                       # rates for any model id not listed above
+    input: 5.0
+    output: 25.0
   display_timezone: America/Denver     # IANA name; defaults to system local TZ
   # Cache multipliers -- override only on non-Anthropic platforms.
   # cache_read_multiplier: 0.10

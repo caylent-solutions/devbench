@@ -210,9 +210,13 @@ orchestrate:
 
 ```yaml
 report:
-  token_cost_per_million_input: 5.0
-  token_cost_per_million_output: 25.0
-  token_cost_discount: 0.0
+  models:
+    claude-opus-5:
+      input: 5.0
+      output: 25.0
+  default_model:
+    input: 5.0
+    output: 25.0
   cache_read_multiplier: 0.10
   cache_write_5min_multiplier: 1.25
   cache_write_1hr_multiplier: 2.0
@@ -222,7 +226,10 @@ report:
   # display_timezone: America/New_York
 ```
 
-See [docs/model-pricing.md](model-pricing.md) for per-model pricing blocks and the cost formula.
+The legacy scalar fields `token_cost_per_million_input`, `token_cost_per_million_output`, and
+`token_cost_discount` were retired in issue #223; workspaces that still set them fail-fast at
+config-load time. See [docs/model-pricing.md](model-pricing.md) for the full per-model pricing
+table, the cost formula, and migration guidance.
 
 ---
 

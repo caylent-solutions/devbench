@@ -72,9 +72,9 @@ agent content:
 ---
 name: code-reviewer
 description: Reviews staged code changes against SOLID, DRY, fail-fast, and 12-factor standards
-model: haiku
-tools: Read, Bash, Glob, Grep
-disallowedTools: Write, Edit
+model: opus
+tools: Bash
+disallowedTools: Write, Edit, Read, Glob, Grep
 ---
 
 ## Evidence
@@ -94,7 +94,7 @@ explicitly (since it cannot rely on cwd auto-loading):
 ---
 name: executor
 description: Implements a work unit following TDD, SOLID, and all project standards
-model: opus
+model: sonnet
 tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
@@ -110,13 +110,28 @@ standards before starting. Use `repo_path` as your working root for all file ope
 
 ## Model Per Role
 
-Each agent specifies its own model in the frontmatter:
+Each agent specifies its own model in the frontmatter. Current shipped defaults
+(`plugin/devbench-orchestrate/agents/**/*.md` frontmatter, ADR-25):
 
 | Agent | Model | Reason |
 |-------|-------|--------|
-| `executor.md` | opus | Complex implementation work requiring full capability |
-| `code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, `changes-manifest.md` | haiku | Structured evidence evaluation with constrained output |
-| `security-reviewer.md` | sonnet | Security reasoning requires more capability than haiku |
+| `executor.md` | sonnet | Complex implementation work; sonnet balances capability and cost for the highest-volume agent |
+| `code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, `changes-manifest.md` | opus | Judgment-heavy structured evidence evaluation; wrong verdicts cascade into rework, so accuracy outweighs the inference-cost savings of a smaller model |
+| `security-reviewer.md` | opus | Security reasoning for a highly regulated environment requires full capability |
+| `review-supervisor.md` | sonnet | Non-spawning aggregator (ADR-33): reads the four judges' already-persisted verdicts and reports a consolidated result; no spawning and no independent judgment call |
+| `manifest-amender.md`, `blocker-resolver.md`, `task-factory.md` | opus | Judgment-heavy, fire only on unhappy paths; a wrong amendment/proposal decision costs more than the inference savings of a smaller model |
+
+**Haiku is rejected at config-load time for every work agent
+(`caylent-solutions/devbench#198`).** The Claude Agent SDK was repeatedly
+observed silently dropping the `Agent` tool from Haiku's tool list mid-session,
+breaking parallel sub-agent dispatch and forcing the orchestrator to classify
+the work unit as `RUNTIME_DEGRADATION`. `validate_agent_model_value()` in
+`src/devbench/config_loader.py` hard-rejects any `agents:` override value
+containing `haiku` -- short name, full Anthropic API id, or Bedrock ARN --
+at config-load, with no operator-facing override path. This ban is
+unconditional and is not softened by cost-optimization goals; see
+[ADR-25](adr/25-per-agent-model-overrides.md) for the full rationale and
+reproduction evidence.
 
 ---
 

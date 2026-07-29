@@ -105,7 +105,7 @@ Each agent file declares its model in YAML frontmatter:
 ```markdown
 ---
 name: code-reviewer
-model: sonnet
+model: opus
 tools: Bash
 ---
 ```
@@ -113,6 +113,20 @@ tools: Bash
 Claude Code reads the `model:` field when invoking the agent and routes the inference call to that model. There is no per-role wiring in the Python code -- the routing is data-driven by the agent file itself.
 
 This was not possible when a single global `DEVBENCH_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) -- all configured independently and changeable without code changes.
+
+> **Update (ADR-25, issue #198):** the per-role assignment above described the
+> design's intent at acceptance time; it does not reflect the shipped
+> defaults. Haiku was tried for `review-supervisor` and dropped -- the Claude
+> Agent SDK repeatedly dropped the `Agent` tool from Haiku's tool list mid-
+> session, breaking parallel sub-agent dispatch -- so Haiku is now hard-
+> rejected at config-load for every work agent
+> (`caylent-solutions/devbench#198`; this ban is unconditional and not
+> softened by cost-optimization goals). Current shipped frontmatter: the
+> executor runs on `sonnet`, the four review judges and the security
+> reviewer all run on `opus`, and `review-supervisor` runs on `sonnet`. See
+> [ADR-25](25-per-agent-model-overrides.md) and
+> [docs/plugin-architecture.md](../plugin-architecture.md#model-per-role) for
+> the current, authoritative per-agent table.
 
 Agent files live at `plugin/devbench/agents/` (top-level agents: executor, review-supervisor, security-reviewer, blocker-resolver, manifest-amender, task-factory) and `plugin/devbench/agents/review_team/` (the four parallel review judges).
 

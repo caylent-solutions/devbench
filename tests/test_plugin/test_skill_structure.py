@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
+import yaml
+
+from devbench.constants import (
+    DEFAULT_CACHE_READ_MULTIPLIER,
+    DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
+    DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
+    DEFAULT_DATA_RESIDENCY_MULTIPLIER,
+    DEFAULT_FALLBACK_MODEL_RATES,
+    DEFAULT_FAST_MODE_MULTIPLIER,
+    DEFAULT_RECENT_PACE_TASKS,
+)
 
 SKILL_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
@@ -1302,6 +1314,8 @@ CONFIGURE_DEVBENCH_SKILL_PATH = (
     / "SKILL.md"
 )
 
+SAMPLE_CONFIG_PATH = Path(__file__).parent.parent.parent / "sample-config.yaml"
+
 
 @pytest.mark.unit
 class TestConfigureDevbenchSkillFrontmatter:
@@ -1606,6 +1620,513 @@ class TestConfigureDevbenchSkillRoundTripValidation:
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
         assert "devbench.yaml" in content, (
             "configure-devbench/SKILL.md must write backlog/config/devbench.yaml as its output"
+        )
+
+
+# ---------------------------------------------------------------------------
+# configure-devbench/SKILL.md: report step + full-default emission
+# (E3-F3-S1-T2, issue #260, spec FR-3.6, AC-40, AC-44)
+# ---------------------------------------------------------------------------
+
+_FR_3_6_EMISSION_SECTIONS = [
+    "timeouts",
+    "limits",
+    "stop_hook",
+    "hook_tail",
+    "orchestrate",
+    "report",
+    "backlog",
+    "validate",
+    "skills",
+    "max_executor_retries",
+    "max_executor_retries_per_judge",
+    "log_file",
+]
+
+_REPORT_MULTIPLIER_FIELDS = [
+    "cache_read_multiplier",
+    "cache_write_5min_multiplier",
+    "cache_write_1hr_multiplier",
+    "data_residency_multiplier",
+    "fast_mode_multiplier",
+    "recent_pace_tasks",
+]
+
+
+def _step_numbers(content: str) -> list[int]:
+    """Return every '## Step N -- ...' heading number, in document order."""
+    return [int(n) for n in re.findall(r"^## Step (\d+) --", content, re.MULTILINE)]
+
+
+def _final_write_step_text(content: str) -> str:
+    """Return the body text of the 'Final validation and write' step.
+
+    The step is matched by name (not a hardcoded number) so the extraction
+    survives renumbering when a new step is inserted ahead of it.
+    """
+    match = re.search(
+        r"^## Step \d+ -- Final validation and write\n(.*?)(?=^## Self-critique loop)",
+        content,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, (
+        "configure-devbench/SKILL.md must contain a '## Step N -- Final validation "
+        "and write' heading followed by content, terminated by the "
+        "'## Self-critique loop' section"
+    )
+    return match.group(1)
+
+
+def _emission_instruction_text(content: str) -> str:
+    """Return only the emission-instruction paragraph within the final-write step.
+
+    Deliberately narrower than `_final_write_step_text`: the round-trip
+    validation block later in the same step restates every FR-3.6 section
+    name inside the `_MODULE_CONSTANTS` Python comment (as inline documentation
+    for the resolved-constants dump). A section-name assertion scoped to the
+    whole final-write step would therefore still pass even if the
+    operator-facing emission instruction itself were deleted, since the
+    section names remain visible in that unrelated comment. Scoping the
+    match to the sentence that begins "the assembled YAML must also emit
+    every remaining FR-3.6 tuning section" and ends right before "Source
+    every emitted default value" isolates the actual instruction from that
+    later restatement.
+    """
+    final_write_text = _final_write_step_text(content)
+    match = re.search(
+        r"the assembled YAML must also emit every remaining FR-3\.6 tuning section"
+        r".*?(?=Source every emitted default value)",
+        final_write_text,
+        re.DOTALL,
+    )
+    assert match is not None, (
+        "configure-devbench/SKILL.md final-write step must contain the emission "
+        "instruction paragraph beginning 'the assembled YAML must also emit every "
+        "remaining FR-3.6 tuning section' and ending before 'Source every emitted "
+        "default value', naming every FR-3.6 tuning section"
+    )
+    return match.group(0)
+
+
+def _report_step_text(content: str) -> str:
+    """Return the body text of the dedicated 'report section' step."""
+    match = re.search(
+        r"^## Step \d+ -- report section\n(.*?)(?=^## Step \d+ --)",
+        content,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, (
+        "configure-devbench/SKILL.md must contain a dedicated "
+        "'## Step N -- report section' walkthrough step (issue #260, spec FR-3.6)"
+    )
+    return match.group(1)
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillReportStep:
+    """AC-E3-F3-S1-T2-1: dedicated report: walkthrough step (issue #260, spec FR-3.6, AC-40)."""
+
+    def test_skill_has_dedicated_report_step(self) -> None:
+        """A '## Step N -- report section' heading must exist."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert re.search(r"^## Step \d+ -- report section", content, re.MULTILINE), (
+            "configure-devbench/SKILL.md must contain a dedicated '## Step N -- report "
+            "section' walkthrough step covering report.models, default_model, and the "
+            "cost multipliers (issue #260, spec FR-3.6, AC-40)"
+        )
+
+    def test_report_step_covers_models_table(self) -> None:
+        """The report step must walk the operator through the report.models pricing table."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        assert "models" in report_text, (
+            "configure-devbench/SKILL.md report step must walk the operator through the "
+            "report.models per-model pricing table"
+        )
+
+    def test_report_step_covers_default_model(self) -> None:
+        """The report step must walk the operator through default_model."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        assert "default_model" in report_text, (
+            "configure-devbench/SKILL.md report step must walk the operator through "
+            "default_model (fallback rate for unknown/missing model ids)"
+        )
+
+    @pytest.mark.parametrize("multiplier_field", _REPORT_MULTIPLIER_FIELDS)
+    def test_report_step_covers_multiplier_field(self, multiplier_field: str) -> None:
+        """The report step must walk the operator through every cost multiplier field."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        assert multiplier_field in report_text, (
+            f"configure-devbench/SKILL.md report step must walk the operator through '{multiplier_field}'"
+        )
+
+    def test_report_step_default_model_uses_opus_5_list_rate(self) -> None:
+        """default_model must show the Opus 5 list rate ($5/$25), never a guessed value.
+
+        Parses the input/output rates positionally out of the default_model
+        bullet and compares each one independently to
+        ``devbench.constants.DEFAULT_FALLBACK_MODEL_RATES`` (the built-in
+        default the ``report.default_model`` YAML key resolves to). A plain
+        ``"5.0" in report_text`` substring check is tautological because
+        "5.0" is also a substring of "25.0"; this positional match fails if
+        either rate drifts independently (mutation-proven fix for the
+        test_review REVIEW_FAIL on this test).
+        """
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        match = re.search(
+            r"default_model\s*--.*?input:\s*([\d.]+),\s*output:\s*([\d.]+)\]",
+            report_text,
+            re.DOTALL,
+        )
+        assert match is not None, (
+            "configure-devbench/SKILL.md report step must state default_model's rate as "
+            "'input: <n>, output: <n>' immediately following the default_model bullet"
+        )
+        stated_input, stated_output = float(match.group(1)), float(match.group(2))
+        assert stated_input == DEFAULT_FALLBACK_MODEL_RATES.input, (
+            f"configure-devbench/SKILL.md report step states default_model input as "
+            f"'{match.group(1)}' but src/devbench/constants.py "
+            f"DEFAULT_FALLBACK_MODEL_RATES.input is '{DEFAULT_FALLBACK_MODEL_RATES.input}'"
+        )
+        assert stated_output == DEFAULT_FALLBACK_MODEL_RATES.output, (
+            f"configure-devbench/SKILL.md report step states default_model output as "
+            f"'{match.group(2)}' but src/devbench/constants.py "
+            f"DEFAULT_FALLBACK_MODEL_RATES.output is '{DEFAULT_FALLBACK_MODEL_RATES.output}'"
+        )
+
+    def test_report_step_fast_mode_multiplier_is_2_0(self) -> None:
+        """fast_mode_multiplier must show the shipped default of 2.0.
+
+        Requires the '[default: <value>]' annotation to appear on the SAME
+        line as the 'fast_mode_multiplier' key text, then compares the
+        parsed value to ``devbench.constants.DEFAULT_FAST_MODE_MULTIPLIER``.
+        A plain ``"2.0" in report_text`` substring check is tautological
+        because the neighbouring cache_write_1hr_multiplier bullet also
+        states '[default: 2.0]' on its own line; anchoring to the same line
+        as the key fails independently if either value drifts
+        (mutation-proven fix for the test_review REVIEW_FAIL on this test).
+        """
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        match = re.search(
+            r"^.*fast_mode_multiplier.*\[default:\s*([\d.]+)\].*$",
+            report_text,
+            re.MULTILINE,
+        )
+        assert match is not None, (
+            "configure-devbench/SKILL.md report step must state fast_mode_multiplier "
+            "followed by a '[default: <value>]' annotation on the SAME line as the key"
+        )
+        stated_value = float(match.group(1))
+        assert stated_value == DEFAULT_FAST_MODE_MULTIPLIER, (
+            f"configure-devbench/SKILL.md report step states fast_mode_multiplier's default "
+            f"as '{match.group(1)}' but src/devbench/constants.py "
+            f"DEFAULT_FAST_MODE_MULTIPLIER is '{DEFAULT_FAST_MODE_MULTIPLIER}'"
+        )
+
+    def test_skill_never_offers_haiku(self) -> None:
+        """No 'haiku' offer anywhere in the skill, including the new report step (issue #198)."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "haiku" not in content.lower(), (
+            "configure-devbench/SKILL.md must never offer a haiku model anywhere "
+            "in the skill, including the new report step (issue #198 haiku ban)"
+        )
+
+
+# Fields the report step's prompt text hand-restates from the shipped
+# sample-config.yaml, each rendered as "<field> ... [default: <value>]"
+# somewhere in the multiplier block (test_review REVIEW_FAIL, retry #1:
+# "no test compares any of these against sample-config.yaml ... nothing
+# prevents silent drift when the upstream rate table is refreshed again").
+_REPORT_STEP_DRIFT_MULTIPLIER_FIELDS = [
+    ("cache_read_multiplier", DEFAULT_CACHE_READ_MULTIPLIER),
+    ("cache_write_5min_multiplier", DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER),
+    ("cache_write_1hr_multiplier", DEFAULT_CACHE_WRITE_1HR_MULTIPLIER),
+    ("data_residency_multiplier", DEFAULT_DATA_RESIDENCY_MULTIPLIER),
+    ("fast_mode_multiplier", DEFAULT_FAST_MODE_MULTIPLIER),
+    ("recent_pace_tasks", DEFAULT_RECENT_PACE_TASKS),
+]
+
+
+def _sample_config_report_section() -> dict[str, object]:
+    """Parse sample-config.yaml's top-level report: section.
+
+    This is the shipped, citation-carrying source of truth the report
+    step's prompt text is required to copy verbatim (spec FR-3.6). Used by
+    the drift-guard tests below to catch a hand-restated default going
+    stale the next time the upstream rate table is refreshed.
+    """
+    loaded = yaml.safe_load(SAMPLE_CONFIG_PATH.read_text())
+    report_section = loaded.get("report") if isinstance(loaded, dict) else None
+    assert isinstance(report_section, dict), (
+        f"sample-config.yaml ({SAMPLE_CONFIG_PATH}) must have a top-level 'report:' mapping"
+    )
+    return report_section
+
+
+def _extract_report_step_field_default(report_text: str, field_name: str) -> str:
+    """Extract the '[default: <value>]' bracket immediately following field_name.
+
+    Non-greedy + DOTALL: scoped to the nearest '[default: ...]' after the
+    field name, which is that field's own annotation since no other
+    field's description intervenes before it in the multiplier block.
+    """
+    match = re.search(
+        rf"{re.escape(field_name)}\s*--.*?\[default:\s*([^\]]+)\]",
+        report_text,
+        re.DOTALL,
+    )
+    assert match is not None, (
+        f"configure-devbench/SKILL.md report step must state '{field_name}' followed by a "
+        f"'[default: <value>]' annotation"
+    )
+    return match.group(1).strip()
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillReportStepDriftGuard:
+    """Parameterized guard against the report step's hand-restated defaults
+    silently drifting from sample-config.yaml (test_review REVIEW_FAIL,
+    retry #1, required fix #3: 'add a parameterized drift test that
+    compares each hand-restated default in the report step against the
+    shipped sample-config.yaml ... so future upstream rate refreshes are
+    caught')."""
+
+    @pytest.mark.parametrize("field_name,expected_default", _REPORT_STEP_DRIFT_MULTIPLIER_FIELDS)
+    def test_report_step_multiplier_field_matches_sample_config(self, field_name: str, expected_default: float) -> None:
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        report_section = _sample_config_report_section()
+        shipped_value = report_section[field_name]
+        assert isinstance(shipped_value, (int, float)), (
+            f"sample-config.yaml's report.{field_name} must be a number, got {type(shipped_value).__name__}"
+        )
+        stated_value = _extract_report_step_field_default(report_text, field_name)
+        assert float(stated_value) == float(shipped_value), (
+            f"configure-devbench/SKILL.md report step states '{field_name}' default as "
+            f"'{stated_value}' but sample-config.yaml's report.{field_name} is "
+            f"'{shipped_value}'. Update the hand-restated value to match the shipped source "
+            "of truth."
+        )
+        assert float(stated_value) == float(expected_default), (
+            f"configure-devbench/SKILL.md report step states '{field_name}' default as "
+            f"'{stated_value}' but src/devbench/constants.py's built-in default is "
+            f"'{expected_default}'. Update the hand-restated value to match the shipped "
+            "source of truth."
+        )
+
+    def test_report_step_default_model_input_matches_sample_config(self) -> None:
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        report_text = _report_step_text(content)
+        report_section = _sample_config_report_section()
+        default_model_section = report_section["default_model"]
+        assert isinstance(default_model_section, dict), (
+            "sample-config.yaml's report.default_model must be a mapping with 'input' and 'output' keys"
+        )
+        expected_input = default_model_section["input"]
+        expected_output = default_model_section["output"]
+        match = re.search(
+            r"default_model\s*--.*?input:\s*([\d.]+),\s*output:\s*([\d.]+)\]",
+            report_text,
+            re.DOTALL,
+        )
+        assert match is not None, (
+            "configure-devbench/SKILL.md report step must state default_model's rate as "
+            "'input: <n>, output: <n>' immediately following the default_model bullet"
+        )
+        stated_input, stated_output = float(match.group(1)), float(match.group(2))
+        assert stated_input == float(expected_input), (
+            f"configure-devbench/SKILL.md report step states default_model input as "
+            f"'{match.group(1)}' but sample-config.yaml's report.default_model.input is "
+            f"'{expected_input}'"
+        )
+        assert stated_output == float(expected_output), (
+            f"configure-devbench/SKILL.md report step states default_model output as "
+            f"'{match.group(2)}' but sample-config.yaml's report.default_model.output is "
+            f"'{expected_output}'"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillFullDefaultEmission:
+    """AC-E3-F3-S1-T2-2: final-write step emits every FR-3.6 section at its resolved default."""
+
+    @pytest.mark.parametrize("section_name", _FR_3_6_EMISSION_SECTIONS)
+    def test_final_write_step_names_emission_section(self, section_name: str) -> None:
+        """Every FR-3.6 section must be named in the final-write step's emission instructions.
+
+        Scoped to `_emission_instruction_text` (not the whole final-write step) so
+        this assertion cannot pass on the strength of the unrelated `_MODULE_CONSTANTS`
+        comment in the round-trip validation block further down the same step, which
+        also happens to enumerate every section name as inline documentation.
+        """
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        emission_instruction_text = _emission_instruction_text(content)
+        assert section_name in emission_instruction_text, (
+            f"configure-devbench/SKILL.md final-write step must name '{section_name}' in its "
+            "emission instruction paragraph (the sentence beginning 'the assembled YAML must "
+            "also emit every remaining FR-3.6 tuning section') so the written config contains "
+            "every FR-3.6 tuning section at its resolved default"
+        )
+
+    def test_final_write_step_states_defaults_equal_built_in_defaults(self) -> None:
+        """The round-trip requirement (written == built-in defaults) must be stated.
+
+        Anchored to the actual directive phrasing rather than mere token
+        presence: 'built-in default' also appears in the semantic inverse of
+        this requirement ("Written values need not equal built-in
+        defaults"), so a substring check alone stays green under inversion
+        (test_review REVIEW_FAIL, mutation-proven).
+        """
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert re.search(r"[Ww]ritten values must equal built-in defaults exactly", final_write_text), (
+            "configure-devbench/SKILL.md final-write step must state, verbatim, that "
+            "written values must equal built-in defaults exactly (FR-3.6)"
+        )
+
+    def test_final_write_step_sources_defaults_from_sample_config(self) -> None:
+        """Emission instructions must direct sourcing defaults from sample-config.yaml.
+
+        Anchored to the actual sourcing directive rather than mere token
+        presence: 'sample-config.yaml' also appears in the semantic inverse
+        of this requirement ("Source ... from your own memory rather than
+        sample-config.yaml"), so a substring check alone stays green under
+        inversion (test_review REVIEW_FAIL, mutation-proven).
+        """
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert re.search(
+            r"Source every emitted default value and its comment from .sample-config\.yaml",
+            final_write_text,
+        ), (
+            "configure-devbench/SKILL.md final-write step must direct the skill, verbatim, "
+            "to source each default and its annotated comment from sample-config.yaml rather "
+            "than restating numbers by hand"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillEmissionTrimRules:
+    """AC-E3-F3-S1-T2-3: inert blocks are still trimmed from the full-default emission.
+
+    Each assertion below is anchored to the trim-rule bullet LINE (key plus
+    directive on the same line via `re.MULTILINE`), not to token presence
+    across the whole final-write step. Presence-only substring checks stay
+    green even when the named rule is semantically inverted, because the
+    same tokens ('use_bedrock', 'trim', 'frontmatter default', 'disabled
+    sub-block') recur elsewhere in the step -- e.g. 'trim' appears 6 times
+    and 'use_bedrock' also appears in the CONFIGURE_DEVBENCH_DONE summary
+    inside the same step (test_review REVIEW_FAIL, mutation-proven: three
+    independent bullet inversions all left the prior substring-only
+    assertions green).
+    """
+
+    def test_trims_bedrock_region_when_use_bedrock_false(self) -> None:
+        """bedrock_region must be trimmed when use_bedrock is false."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert re.search(
+            r"^- .bedrock_region.*\btrim\b.*use_bedrock.*false",
+            final_write_text,
+            re.MULTILINE,
+        ), (
+            "configure-devbench/SKILL.md final-write step must state, on the "
+            "`bedrock_region` bullet line itself, that bedrock_region is trimmed "
+            "when use_bedrock is false"
+        )
+
+    def test_trims_agents_entries_equal_to_frontmatter_defaults(self) -> None:
+        """agents: entries equal to frontmatter defaults must be trimmed."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert re.search(
+            r"^- .agents:. entries.*trim any entry whose value equals",
+            final_write_text,
+            re.MULTILINE,
+        ), (
+            "configure-devbench/SKILL.md final-write step must state, on the `agents:` "
+            "entries bullet line itself, that any entry whose value equals its agent's "
+            "frontmatter default is trimmed"
+        )
+
+    def test_trims_disabled_sub_blocks(self) -> None:
+        """Disabled sub-blocks must be trimmed from the emitted config."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert re.search(
+            r"^- Disabled sub-block trim:.*trim any sub-block",
+            final_write_text,
+            re.MULTILINE,
+        ), (
+            "configure-devbench/SKILL.md final-write step must state, on the disabled "
+            "sub-block bullet line itself, that any sub-block whose enabled toggle "
+            "resolves to false is trimmed"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillRoundTripEquivalence:
+    """AC-E3-F3-S1-T2-4: emitted full-default config behaves identically to a minimal config."""
+
+    def test_final_write_step_checks_load_runtime_config_equivalence(self) -> None:
+        """The equivalence check must load both configs through load_runtime_config."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert "load_runtime_config" in final_write_text, (
+            "configure-devbench/SKILL.md final-write step must load both the full-default "
+            "and a minimal config through load_runtime_config for the equivalence check"
+        )
+        assert "minimal config" in final_write_text.lower(), (
+            "configure-devbench/SKILL.md final-write step must compare against a minimal config"
+        )
+
+    def test_final_write_step_names_differing_field_on_mismatch(self) -> None:
+        """A resolved-value mismatch must fail loudly and name the differing field."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        final_write_text = _final_write_step_text(content)
+        assert "differing field" in final_write_text.lower(), (
+            "configure-devbench/SKILL.md final-write step must fail loudly and name the "
+            "differing field when the full-default and minimal configs resolve to different "
+            "RuntimeConfig values (FR-3.6 error handling)"
+        )
+
+    def test_configure_devbench_done_summary_includes_report(self) -> None:
+        """The closing [CONFIGURE_DEVBENCH_DONE] summary must mention the report section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        marker = "[CONFIGURE_DEVBENCH_DONE]"
+        assert marker in content, "configure-devbench/SKILL.md must emit [CONFIGURE_DEVBENCH_DONE]"
+        summary_text = content[content.index(marker) : content.index(marker) + 2000]
+        assert "report:" in summary_text, (
+            "configure-devbench/SKILL.md [CONFIGURE_DEVBENCH_DONE] summary must include the report section (issue #260)"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillStepRenumbering:
+    """AC-E3-F3-S1-T2-7: step numbers must remain sequential after the new step is inserted."""
+
+    def test_step_numbers_are_sequential_with_no_gaps_or_duplicates(self) -> None:
+        """'## Step N -- ...' headings must number 1..N in document order, no gaps/dupes."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        numbers = _step_numbers(content)
+        expected = list(range(1, len(numbers) + 1))
+        assert numbers == expected, (
+            f"configure-devbench/SKILL.md '## Step N --' headings must be sequential "
+            f"starting at 1 with no gaps or duplicates; got {numbers}, expected {expected}"
+        )
+
+    def test_final_write_step_is_the_last_numbered_step(self) -> None:
+        """The 'Final validation and write' step must remain the last numbered step."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        headings = re.findall(r"^## Step \d+ -- (.+)$", content, re.MULTILINE)
+        assert headings, "configure-devbench/SKILL.md must contain at least one '## Step N --' heading"
+        assert headings[-1] == "Final validation and write", (
+            "configure-devbench/SKILL.md 'Final validation and write' must remain the last "
+            f"numbered step after renumbering; last step found was {headings[-1]!r}"
         )
 
 

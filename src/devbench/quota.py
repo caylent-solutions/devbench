@@ -1,4 +1,4 @@
-"""Quota detection, wait-and-resume, and recovery-probe module for devbench.
+"""Quota detection, wait-and-resume, checkpoint, and recovery-probe module for devbench.
 
 Provides the ``QuotaExhaustedError`` exception hierarchy (base + four LSP
 subclasses), the ``detect_quota_error`` dispatcher (ten ordered rules, never
@@ -8,35 +8,44 @@ reset-time parser, the async wait engine (``BackoffConfig``,
 ``_emit_polling_heartbeat``, ``_wait_toward_reset``, ``wait_for_reset``) that
 polls for quota recovery with jittered exponential backoff, stepping toward
 a known provider ``reset_at`` in bounded, heartbeat-emitting sleeps rather
-than one blind long sleep, and the recovery probe (``_probe_api_call``,
+than one blind long sleep, the recovery probe (``_probe_api_call``,
 ``recovery_probe``) that issues a 1-token ``messages.create`` request against
 ``RECOVERY_PROBE_MODEL`` to test whether quota has recovered -- consulted by
-``wait_for_reset`` as its ``probe_fn``. No cancellation-shielding primitive is
-used anywhere in this module (D-9): a SIGTERM during a long wait must
-propagate naturally so ``devbench stop`` stays responsive; durability comes
-from the checkpoint (downstream task E2-F1-S2-T3), not from shielding.
+``wait_for_reset`` as its ``probe_fn`` -- and the checkpoint / resume-strategy
+tier (``QuotaCheckpoint``, ``save_checkpoint``, ``load_checkpoint``,
+``remove_checkpoint``, ``_apply_resume_strategy``) that persists pause state
+to survive a SIGTERM. No cancellation-shielding primitive is used anywhere
+in this module (D-9): a SIGTERM during a long wait must propagate naturally
+so ``devbench stop`` stays responsive; durability comes from the checkpoint,
+not from shielding.
 
 This module covers the detection tier (FR-2.1, FR-2.2, FR-2.3), the wait
-tier (FR-2.4), and the recovery probe (FR-2.5). Checkpoint persistence
-belongs to downstream task E2-F1-S2-T3 and is not part of this module's
-surface yet.
+tier (FR-2.4), the recovery probe (FR-2.5), and the checkpoint / resume-
+strategy tier (FR-2.6, FR-2.8; strategies only -- the resume loop itself
+that consults these strategies after a recovered wait belongs to E2-F4).
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
 Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
-AC-234-1, AC-234a-1.
+AC-234-1, AC-234a-1, AC-236-1.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
 import re
 import secrets
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+from devbench.drain import request_drain
 
 logger = logging.getLogger("devbench.quota")
 
@@ -603,7 +612,8 @@ async def wait_for_reset(
     No cancellation-shielding primitive is used anywhere in this wait (D-9):
     a SIGTERM must propagate naturally so ``devbench stop`` stays responsive
     while a wait is in progress; durability comes from the checkpoint
-    (downstream task E2-F1-S2-T3), not from shielding.
+    (:func:`save_checkpoint` / :func:`load_checkpoint`, FR-2.6), not from
+    shielding.
 
     Args:
         reset_at: Expected UTC reset time (or ``None`` when unknown).
@@ -710,6 +720,192 @@ async def wait_for_reset(
 
         await asyncio.sleep(delay)
         raw_delay = min(raw_delay * backoff_config.multiplier, float(backoff_config.max_seconds))
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint persistence (FR-2.6, spec S5.1)
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_DIR: str = ".devbench"
+_CHECKPOINT_FILENAME: str = "quota_pause.json"
+
+
+@dataclass
+class QuotaCheckpoint:
+    """Persisted state for a quota pause.
+
+    Written atomically to ``<workspace_root>/.devbench/quota_pause.json`` by
+    :func:`save_checkpoint`. This is the durability mechanism that replaced
+    an ``asyncio.shield``-based approach considered during design (D-9): a
+    SIGTERM arriving during a long :func:`wait_for_reset` call is allowed to
+    kill the process outright -- spec FR-2.4 / decision D-9 / ADR-24:134-140
+    require SIGTERM to propagate naturally so ``devbench stop`` stays
+    responsive even mid-wait -- so the pause state must survive the process
+    death on disk instead, letting a restarted orchestrator pick the wait
+    back up rather than losing track of it.
+
+    Attributes:
+        reason: Short string identifying why the pause was entered (the
+            ``QuotaExhaustedError.source`` field, e.g. ``"anthropic-api"``).
+            Must be a non-empty string (validated by ``save_checkpoint``).
+        reset_at: Expected UTC reset time, or ``None`` when the provider did
+            not supply one. Must be timezone-aware when set (validated by
+            ``save_checkpoint``).
+        saved_at: UTC datetime when the checkpoint was written. Must be
+            timezone-aware -- ``save_checkpoint`` is the timezone gate for
+            this field (FR-2.1): a naive datetime raises ``ValueError`` at
+            write time rather than being silently accepted and producing an
+            ambiguous on-disk timestamp.
+        session_name: Name of the devbench session that wrote the checkpoint.
+    """
+
+    reason: str
+    reset_at: datetime | None
+    saved_at: datetime
+    session_name: str
+
+
+def _checkpoint_path(workspace_root: Path) -> Path:
+    """Return the absolute path to the quota checkpoint file for *workspace_root*."""
+    return workspace_root / _CHECKPOINT_DIR / _CHECKPOINT_FILENAME
+
+
+def save_checkpoint(checkpoint: QuotaCheckpoint, workspace_root: Path) -> None:
+    """Atomically persist *checkpoint* to ``<workspace_root>/.devbench/quota_pause.json``.
+
+    Validation runs BEFORE any filesystem I/O (fail-fast, Code Standards
+    rule 3): an empty ``reason`` or a naive (tz-unaware) ``saved_at`` /
+    ``reset_at`` raises ``ValueError`` immediately, so a malformed
+    checkpoint is never written to disk.
+
+    The write itself goes through ``tempfile.mkstemp`` -- a uniquely-named
+    sibling temp file created in the same directory as the destination, so
+    the eventual rename never crosses filesystems -- followed by
+    ``Path.replace``. ``Path.replace`` is atomic on POSIX: the directory
+    entry only flips once the temp file is fully written and closed, so
+    neither a concurrent reader nor a process crash mid-write ever observes
+    a partially-written file; the previous checkpoint (if any) stays intact
+    and visible right up until the instant the new one is atomically swapped
+    in. Nothing in this function opens ``dest`` directly for writing.
+
+    Args:
+        checkpoint: The checkpoint to persist.
+        workspace_root: Workspace root directory. The checkpoint directory
+            (``<workspace_root>/.devbench``) is created if it does not
+            already exist.
+
+    Raises:
+        ValueError: When ``checkpoint.reason`` is empty, or when
+            ``checkpoint.saved_at`` or ``checkpoint.reset_at`` (when set) is
+            a naive (tz-unaware) datetime.
+        OSError: On filesystem write errors (disk full, permission denied,
+            etc.), or when the caller's crash simulation interrupts the
+            write -- propagated unchanged for fail-fast diagnostics. The
+            temp file is removed before re-raising.
+    """
+    if not checkpoint.reason:
+        raise ValueError("QuotaCheckpoint.reason must be a non-empty string.")
+    if checkpoint.saved_at.tzinfo is None:
+        raise ValueError(
+            f"QuotaCheckpoint.saved_at must be timezone-aware; got a naive datetime: {checkpoint.saved_at!r}. "
+            "Use datetime.now(tz=UTC) or an equivalent timezone-aware value."
+        )
+    if checkpoint.reset_at is not None and checkpoint.reset_at.tzinfo is None:
+        raise ValueError(
+            f"QuotaCheckpoint.reset_at must be timezone-aware when set; got a naive datetime: "
+            f"{checkpoint.reset_at!r}. Use a UTC-aware datetime or None."
+        )
+
+    dest = _checkpoint_path(workspace_root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    data: dict[str, Any] = {
+        "reason": checkpoint.reason,
+        "reset_at": checkpoint.reset_at.isoformat() if checkpoint.reset_at is not None else None,
+        "saved_at": checkpoint.saved_at.isoformat(),
+        "session_name": checkpoint.session_name,
+    }
+
+    tmp_fd, tmp_path_str = tempfile.mkstemp(dir=str(dest.parent), suffix=".tmp")
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+        tmp_path.replace(dest)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def load_checkpoint(workspace_root: Path) -> QuotaCheckpoint | None:
+    """Load the quota pause checkpoint, or return ``None`` when absent.
+
+    Args:
+        workspace_root: Workspace root directory.
+
+    Returns:
+        The persisted ``QuotaCheckpoint`` when the checkpoint file exists
+        and is well-formed. ``None`` when the file does not exist -- this is
+        the normal "no active pause" state, not an error.
+
+    Raises:
+        ValueError: When the file exists but is malformed -- invalid JSON, a
+            missing required field, or an unparseable ``saved_at`` /
+            ``reset_at`` datetime. The message names the checkpoint path so
+            an operator can locate and inspect the corrupt file directly
+            (this is the exact message ``quota-watcher``, FR-2.11, surfaces
+            to the operator).
+    """
+    path = _checkpoint_path(workspace_root)
+    if not path.exists():
+        return None
+    path_str = str(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"quota_pause.json at '{path_str}' contains invalid JSON: {exc}.") from exc
+
+    required = {"reason", "reset_at", "saved_at", "session_name"}
+    missing = required - set(data.keys())
+    if missing:
+        raise ValueError(f"quota_pause.json at '{path_str}' is missing required fields: {sorted(missing)}.")
+
+    try:
+        saved_at = datetime.fromisoformat(data["saved_at"])
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"quota_pause.json at '{path_str}': saved_at value {data['saved_at']!r} "
+            f"is not a valid ISO 8601 datetime: {exc}."
+        ) from exc
+
+    reset_at: datetime | None = None
+    if data["reset_at"] is not None:
+        try:
+            reset_at = datetime.fromisoformat(data["reset_at"])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"quota_pause.json at '{path_str}': reset_at value {data['reset_at']!r} "
+                f"is not a valid ISO 8601 datetime: {exc}."
+            ) from exc
+
+    return QuotaCheckpoint(
+        reason=str(data["reason"]),
+        reset_at=reset_at,
+        saved_at=saved_at,
+        session_name=str(data["session_name"]),
+    )
+
+
+def remove_checkpoint(workspace_root: Path) -> None:
+    """Remove the quota pause checkpoint file if present. Idempotent.
+
+    Safe to call when no checkpoint exists, and safe to call repeatedly --
+    ``Path.unlink(missing_ok=True)`` means neither case raises.
+
+    Args:
+        workspace_root: Workspace root directory.
+    """
+    _checkpoint_path(workspace_root).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -827,3 +1023,76 @@ def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
         ) from exc
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Resume-strategy dispatcher (FR-2.8, spec AC-23)
+#
+# Strategies only -- the resume loop that consults these after a recovered
+# wait belongs to downstream task E2-F4.
+# ---------------------------------------------------------------------------
+
+_RESUME_STRATEGIES: frozenset[str] = frozenset({"continue_current_wu", "restart_wu", "drain_and_resume"})
+
+
+def _force_status_in_queue(workspace_root: Path) -> None:
+    """Force every ``in-progress`` work unit under *workspace_root* back to ``in-queue``.
+
+    Delegates entirely to the existing ``BacklogParser`` / ``BacklogManager``
+    primitives (spec Section 3: reuse, do not reinvent) -- this function
+    introduces no bespoke backlog-file parsing or status-writing logic; it
+    only decides WHICH units to force and calls the existing
+    ``BacklogManager.force_status`` for each one.
+
+    Args:
+        workspace_root: Workspace root directory. The backlog index
+            (``<workspace_root>/BACKLOG.md``) and backlog directory
+            (``<workspace_root>/backlog``) are derived from this parameter
+            so the function always operates on the same workspace the
+            checkpoint itself was written to, rather than a process-global
+            default.
+    """
+    from devbench.backlog.manager import BacklogManager
+    from devbench.backlog.parser import BacklogParser
+    from devbench.backlog.work_unit import WorkUnitStatus
+    from devbench.constants import BACKLOG_SUBDIR, STATUS_IN_QUEUE
+
+    backlog_index = workspace_root / "BACKLOG.md"
+    backlog_root = workspace_root / BACKLOG_SUBDIR
+    parser = BacklogParser(backlog_root=backlog_root, backlog_index=backlog_index)
+    units = parser.parse_index()
+    manager = BacklogManager()
+    for unit in units:
+        if unit.status is WorkUnitStatus.IN_PROGRESS:
+            manager.force_status(unit.file_path, backlog_index, unit.id, STATUS_IN_QUEUE)
+
+
+def _apply_resume_strategy(strategy: str, workspace_root: Path) -> None:
+    """Dispatch the post-wait resume action for *strategy* (FR-2.8, spec AC-23).
+
+    Args:
+        strategy: One of ``"continue_current_wu"`` (the default -- simply
+            resumes the claimed work unit in place), ``"restart_wu"`` (every
+            ``in-progress`` unit is forced back to ``in-queue`` so the next
+            orchestrator pass re-claims it from a clean state), or
+            ``"drain_and_resume"`` (requests a graceful drain instead of
+            resuming automatically).
+        workspace_root: Workspace root directory, used by both the
+            checkpoint removal and (for ``drain_and_resume``) the
+            ``request_drain`` primitive.
+
+    Raises:
+        ValueError: When *strategy* is not one of the three recognised
+            values; the message names the allowed set.
+    """
+    if strategy not in _RESUME_STRATEGIES:
+        raise ValueError(f"unknown resume strategy {strategy!r}. Allowed values: {sorted(_RESUME_STRATEGIES)}.")
+
+    if strategy == "continue_current_wu":
+        remove_checkpoint(workspace_root)
+    elif strategy == "restart_wu":
+        _force_status_in_queue(workspace_root)
+        remove_checkpoint(workspace_root)
+    else:
+        remove_checkpoint(workspace_root)
+        request_drain(workspace_root)

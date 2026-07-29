@@ -1,10 +1,9 @@
-"""Tests for src/devbench/quota.py -- detection tier, wait tier, and probe.
+"""Tests for src/devbench/quota.py -- detection tier, wait tier, probe, and checkpoint.
 
 Coverage requirement: 100% line + branch on the detection-tier symbols (FR-2.1
-/ FR-2.2 / FR-2.3), the wait-tier symbols (FR-2.4), and the recovery-probe
-symbols (FR-2.5) added across E2-F1-S1-T1, E2-F1-S2-T1, and E2-F1-S2-T2. The
-checkpoint symbols belong to downstream task E2-F1-S2-T3 and are not covered
-here.
+/ FR-2.2 / FR-2.3), the wait-tier symbols (FR-2.4), the recovery-probe
+symbols (FR-2.5), and the checkpoint / resume-strategy symbols (FR-2.6,
+FR-2.8) added across E2-F1-S1-T1, E2-F1-S2-T1, E2-F1-S2-T2, and E2-F1-S2-T3.
 
 Covers:
 - QuotaExhaustedError and its four LSP subclasses (SubscriptionRateLimitError,
@@ -49,6 +48,20 @@ Covers:
   mirrors the real subclass graph (AuthenticationError and
   PermissionDeniedError subclass APIError; APIError subclasses
   AnthropicError) -- no network access, no credentials (spec S10.1).
+- QuotaCheckpoint / save_checkpoint / load_checkpoint / remove_checkpoint
+  (FR-2.6, spec S5.1, AC-19): the mkstemp + Path.replace atomic write (a
+  simulated mid-write crash leaves the previous checkpoint intact), the
+  empty-reason and naive-datetime ValueError guards, a None reset_at round
+  -tripping to None, the four-field round trip, load_checkpoint's path-
+  naming ValueError on malformed JSON / missing keys / unparseable
+  datetimes, and remove_checkpoint's idempotency. All checkpoint tests run
+  against real tmp_path workspaces -- no mocked filesystem.
+- _apply_resume_strategy / _force_status_in_queue (FR-2.8, spec AC-23): the
+  three resume strategies (continue_current_wu, restart_wu,
+  drain_and_resume) exercised against real BACKLOG.md + work-unit files
+  under tmp_path via the real BacklogManager.force_status and
+  devbench.drain.request_drain primitives, plus the ValueError on an
+  unknown strategy naming the allowed set.
 
 Issue #234 (Appendix A QW-1 / QW-2 / QW-10).
 Issue #236 (Appendix A QW-3 / QW-4 / QW-5).
@@ -58,6 +71,7 @@ AC-234-1, AC-234a-1.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -72,17 +86,23 @@ from devbench.quota import (
     ApiBillingError,
     BackoffConfig,
     BedrockThrottleError,
+    QuotaCheckpoint,
     QuotaExhaustedError,
     RecoveryProbeUnavailableError,
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
+    _apply_resume_strategy,
+    _checkpoint_path,
     _has_quota_marker,
     _has_verbatim_quota_marker,
     _parse_reset_at_from_text,
     _probe_api_call,
     _wait_toward_reset,
     detect_quota_error,
+    load_checkpoint,
     recovery_probe,
+    remove_checkpoint,
+    save_checkpoint,
     wait_for_reset,
 )
 
@@ -1991,3 +2011,349 @@ class TestRecoveryProbeSuccessPath:
             max_tokens=1,
             messages=[{"role": "user", "content": "xxx"}],
         )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / resume-strategy fixtures (FR-2.6, FR-2.8, spec S5.1, AC-23)
+# ---------------------------------------------------------------------------
+
+_SAVED_AT = datetime(2026, 3, 1, 8, 0, 0, tzinfo=UTC)
+_RESET_AT = datetime(2026, 3, 1, 10, 30, 0, tzinfo=UTC)
+
+
+def _make_checkpoint(
+    *,
+    reason: str = "anthropic-api",
+    reset_at: datetime | None = _RESET_AT,
+    saved_at: datetime = _SAVED_AT,
+    session_name: str = "default",
+) -> QuotaCheckpoint:
+    return QuotaCheckpoint(reason=reason, reset_at=reset_at, saved_at=saved_at, session_name=session_name)
+
+
+def _write_backlog_workspace(tmp_path: Path, units: list[tuple[str, str]]) -> Path:
+    """Write a real BACKLOG.md plus one work-unit .md file per entry in *units*.
+
+    Args:
+        tmp_path: Workspace root.
+        units: List of ``(unit_id, status)`` pairs; ``status`` is the exact
+            lowercase CLI-form status string (e.g. ``"in-progress"``).
+
+    Returns:
+        The workspace root (``tmp_path``), the same value passed in --
+        returned for call-site symmetry with the other checkpoint helpers.
+    """
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir(exist_ok=True)
+    header = (
+        "# Backlog\n\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|-----------|\n"
+    )
+    rows = []
+    for unit_id, status in units:
+        row = f"| {unit_id} | Test Task {unit_id} | Task | {status} | None | git-repo | `backlog/{unit_id}.md` |\n"
+        rows.append(row)
+        wu_content = f"# {unit_id}: Test Task {unit_id}\n\n## Status: {status}\n\n## Comments\n"
+        (backlog_dir / f"{unit_id}.md").write_text(wu_content)
+    (tmp_path / "BACKLOG.md").write_text(header + "".join(rows))
+    return tmp_path
+
+
+def _read_status_line(tmp_path: Path, unit_id: str) -> str:
+    content = (tmp_path / "backlog" / f"{unit_id}.md").read_text()
+    for line in content.splitlines():
+        if line.startswith("## Status:"):
+            return line.removeprefix("## Status:").strip()
+    raise AssertionError(f"No '## Status:' line found for {unit_id}")
+
+
+@pytest.mark.unit
+class TestCheckpointPath:
+    """_checkpoint_path targets <workspace_root>/.devbench/quota_pause.json (spec S5.1)."""
+
+    def test_checkpoint_path_targets_devbench_quota_pause_json(self, tmp_path: Path) -> None:
+        path = _checkpoint_path(tmp_path)
+        assert path == tmp_path / ".devbench" / "quota_pause.json"
+
+
+@pytest.mark.unit
+class TestSaveCheckpointValidation:
+    """AC-E2-F1-S2-T3-2: save_checkpoint raises ValueError before any write on bad input."""
+
+    def test_empty_reason_raises_value_error(self, tmp_path: Path) -> None:
+        checkpoint = _make_checkpoint(reason="")
+        with pytest.raises(ValueError, match="reason"):
+            save_checkpoint(checkpoint, tmp_path)
+        assert not _checkpoint_path(tmp_path).exists()
+
+    def test_naive_saved_at_raises_value_error(self, tmp_path: Path) -> None:
+        checkpoint = _make_checkpoint(saved_at=_SAVED_AT.replace(tzinfo=None))
+        with pytest.raises(ValueError, match="saved_at"):
+            save_checkpoint(checkpoint, tmp_path)
+        assert not _checkpoint_path(tmp_path).exists()
+
+    def test_naive_reset_at_raises_value_error(self, tmp_path: Path) -> None:
+        checkpoint = _make_checkpoint(reset_at=_RESET_AT.replace(tzinfo=None))
+        with pytest.raises(ValueError, match="reset_at"):
+            save_checkpoint(checkpoint, tmp_path)
+        assert not _checkpoint_path(tmp_path).exists()
+
+    def test_none_reset_at_is_accepted(self, tmp_path: Path) -> None:
+        checkpoint = _make_checkpoint(reset_at=None)
+        save_checkpoint(checkpoint, tmp_path)
+        loaded = load_checkpoint(tmp_path)
+        assert loaded is not None
+        assert loaded.reset_at is None
+
+
+@pytest.mark.unit
+class TestSaveCheckpointAtomicity:
+    """AC-E2-F1-S2-T3-1 (spec AC-19): mkstemp + Path.replace, never a direct open of the final path."""
+
+    def test_write_goes_through_mkstemp(self, tmp_path: Path) -> None:
+        import tempfile as tempfile_module
+
+        real_mkstemp = tempfile_module.mkstemp
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def _spy_mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
+            calls.append((args, kwargs))
+            return real_mkstemp(*args, **kwargs)
+
+        with patch("devbench.quota.tempfile.mkstemp", side_effect=_spy_mkstemp) as mock_mkstemp:
+            save_checkpoint(_make_checkpoint(), tmp_path)
+
+        mock_mkstemp.assert_called_once()
+        assert calls[0][1].get("dir") == str(_checkpoint_path(tmp_path).parent)
+
+    def test_mid_write_crash_leaves_previous_checkpoint_intact(self, tmp_path: Path) -> None:
+        original = _make_checkpoint(reason="anthropic-api")
+        save_checkpoint(original, tmp_path)
+        original_bytes = _checkpoint_path(tmp_path).read_bytes()
+
+        replacement = _make_checkpoint(reason="bedrock")
+        with (
+            patch("devbench.quota.Path.replace", side_effect=OSError("simulated crash mid-write")),
+            pytest.raises(OSError, match="simulated crash mid-write"),
+        ):
+            save_checkpoint(replacement, tmp_path)
+
+        assert _checkpoint_path(tmp_path).read_bytes() == original_bytes
+        loaded = load_checkpoint(tmp_path)
+        assert loaded is not None
+        assert loaded.reason == "anthropic-api"
+
+    def test_no_leftover_temp_file_after_mid_write_crash(self, tmp_path: Path) -> None:
+        with (
+            patch("devbench.quota.Path.replace", side_effect=OSError("simulated crash mid-write")),
+            pytest.raises(OSError),
+        ):
+            save_checkpoint(_make_checkpoint(), tmp_path)
+
+        leftovers = list((tmp_path / ".devbench").glob("*.tmp"))
+        assert leftovers == []
+
+
+@pytest.mark.unit
+class TestCheckpointRoundTrip:
+    """AC-E2-F1-S2-T3-4: save then load reproduces all four S5.1 fields exactly."""
+
+    def test_round_trip_reproduces_all_fields(self, tmp_path: Path) -> None:
+        checkpoint = _make_checkpoint(
+            reason="anthropic-api",
+            reset_at=_RESET_AT,
+            saved_at=_SAVED_AT,
+            session_name="my-session",
+        )
+        save_checkpoint(checkpoint, tmp_path)
+        loaded = load_checkpoint(tmp_path)
+
+        assert loaded is not None
+        assert loaded.reason == "anthropic-api"
+        assert loaded.reset_at == _RESET_AT
+        assert loaded.saved_at == _SAVED_AT
+        assert loaded.session_name == "my-session"
+
+    def test_load_returns_none_when_no_checkpoint_exists(self, tmp_path: Path) -> None:
+        assert load_checkpoint(tmp_path) is None
+
+
+@pytest.mark.unit
+class TestLoadCheckpointErrors:
+    """AC-E2-F1-S2-T3-4: load_checkpoint raises ValueError naming the checkpoint path."""
+
+    def test_malformed_json_raises_value_error_naming_path(self, tmp_path: Path) -> None:
+        path = _checkpoint_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text("{not valid json")
+
+        with pytest.raises(ValueError, match=r"not valid|invalid JSON") as exc_info:
+            load_checkpoint(tmp_path)
+        assert str(path) in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "missing_key",
+        ["reason", "reset_at", "saved_at", "session_name"],
+    )
+    def test_missing_required_key_raises_value_error_naming_path(self, tmp_path: Path, missing_key: str) -> None:
+        path = _checkpoint_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        data = {
+            "reason": "anthropic-api",
+            "reset_at": None,
+            "saved_at": _SAVED_AT.isoformat(),
+            "session_name": "default",
+        }
+        del data[missing_key]
+        path.write_text(json.dumps(data))
+
+        with pytest.raises(ValueError, match=missing_key) as exc_info:
+            load_checkpoint(tmp_path)
+        assert str(path) in str(exc_info.value)
+
+    def test_unparseable_saved_at_raises_value_error_naming_path(self, tmp_path: Path) -> None:
+        path = _checkpoint_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        data = {
+            "reason": "anthropic-api",
+            "reset_at": None,
+            "saved_at": "not-a-datetime",
+            "session_name": "default",
+        }
+        path.write_text(json.dumps(data))
+
+        with pytest.raises(ValueError, match="saved_at") as exc_info:
+            load_checkpoint(tmp_path)
+        assert str(path) in str(exc_info.value)
+
+    def test_unparseable_reset_at_raises_value_error_naming_path(self, tmp_path: Path) -> None:
+        path = _checkpoint_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        data = {
+            "reason": "anthropic-api",
+            "reset_at": "not-a-datetime",
+            "saved_at": _SAVED_AT.isoformat(),
+            "session_name": "default",
+        }
+        path.write_text(json.dumps(data))
+
+        with pytest.raises(ValueError, match="reset_at") as exc_info:
+            load_checkpoint(tmp_path)
+        assert str(path) in str(exc_info.value)
+
+
+@pytest.mark.unit
+class TestRemoveCheckpointIdempotent:
+    """AC-E2-F1-S2-T3-3: remove_checkpoint never raises, present or absent, once or twice."""
+
+    def test_remove_existing_checkpoint(self, tmp_path: Path) -> None:
+        save_checkpoint(_make_checkpoint(), tmp_path)
+        assert _checkpoint_path(tmp_path).exists()
+        remove_checkpoint(tmp_path)
+        assert not _checkpoint_path(tmp_path).exists()
+
+    def test_remove_when_no_checkpoint_exists_raises_nothing(self, tmp_path: Path) -> None:
+        remove_checkpoint(tmp_path)  # must not raise
+        assert not _checkpoint_path(tmp_path).exists()
+
+    def test_remove_twice_raises_nothing(self, tmp_path: Path) -> None:
+        save_checkpoint(_make_checkpoint(), tmp_path)
+        remove_checkpoint(tmp_path)
+        remove_checkpoint(tmp_path)  # second call must not raise
+        assert not _checkpoint_path(tmp_path).exists()
+
+
+@pytest.mark.unit
+class TestApplyResumeStrategyContinueCurrentWu:
+    """AC-E2-F1-S2-T3-5: continue_current_wu removes the checkpoint and touches nothing else."""
+
+    def test_removes_checkpoint_only(self, tmp_path: Path) -> None:
+        _write_backlog_workspace(tmp_path, [("E2-F1-S1-T1", "in-progress")])
+        save_checkpoint(_make_checkpoint(), tmp_path)
+
+        _apply_resume_strategy("continue_current_wu", tmp_path)
+
+        assert not _checkpoint_path(tmp_path).exists()
+        assert _read_status_line(tmp_path, "E2-F1-S1-T1") == "in-progress"
+
+    def test_no_checkpoint_present_raises_nothing(self, tmp_path: Path) -> None:
+        _write_backlog_workspace(tmp_path, [("E2-F1-S1-T1", "in-progress")])
+        _apply_resume_strategy("continue_current_wu", tmp_path)  # must not raise
+        assert _read_status_line(tmp_path, "E2-F1-S1-T1") == "in-progress"
+
+
+@pytest.mark.unit
+class TestApplyResumeStrategyRestartWu:
+    """AC-E2-F1-S2-T3-5: restart_wu forces every in-progress unit to in-queue, then removes the checkpoint."""
+
+    def test_all_in_progress_units_become_in_queue(self, tmp_path: Path) -> None:
+        _write_backlog_workspace(
+            tmp_path,
+            [
+                ("E2-F1-S1-T1", "in-progress"),
+                ("E2-F1-S1-T2", "in-progress"),
+                ("E2-F1-S1-T3", "in-queue"),
+                ("E2-F1-S1-T4", "done"),
+            ],
+        )
+        save_checkpoint(_make_checkpoint(), tmp_path)
+
+        _apply_resume_strategy("restart_wu", tmp_path)
+
+        assert _read_status_line(tmp_path, "E2-F1-S1-T1") == "in-queue"
+        assert _read_status_line(tmp_path, "E2-F1-S1-T2") == "in-queue"
+        # Units that were never in-progress are left exactly as they were.
+        assert _read_status_line(tmp_path, "E2-F1-S1-T3") == "in-queue"
+        assert _read_status_line(tmp_path, "E2-F1-S1-T4") == "done"
+        assert not _checkpoint_path(tmp_path).exists()
+
+    def test_no_in_progress_units_is_a_no_op_on_statuses(self, tmp_path: Path) -> None:
+        _write_backlog_workspace(tmp_path, [("E2-F1-S1-T1", "in-queue")])
+        save_checkpoint(_make_checkpoint(), tmp_path)
+
+        _apply_resume_strategy("restart_wu", tmp_path)
+
+        assert _read_status_line(tmp_path, "E2-F1-S1-T1") == "in-queue"
+        assert not _checkpoint_path(tmp_path).exists()
+
+
+@pytest.mark.unit
+class TestApplyResumeStrategyDrainAndResume:
+    """AC-E2-F1-S2-T3-5: drain_and_resume removes the checkpoint and calls request_drain."""
+
+    def test_removes_checkpoint_and_writes_real_drain_signal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from devbench.drain import resolve_drain_signal_path
+
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        _write_backlog_workspace(tmp_path, [("E2-F1-S1-T1", "in-progress")])
+        save_checkpoint(_make_checkpoint(), tmp_path)
+
+        _apply_resume_strategy("drain_and_resume", tmp_path)
+
+        assert not _checkpoint_path(tmp_path).exists()
+        signal_path = resolve_drain_signal_path(tmp_path)
+        assert signal_path.exists()
+        # request_drain was not reinvented -- the real signal file it writes
+        # is present and well-formed JSON with the expected fields.
+        payload = json.loads(signal_path.read_text())
+        assert "requested_at" in payload
+        assert "requested_by" in payload
+        # restart_wu behaviour must NOT have fired: the in-progress unit is untouched.
+        assert _read_status_line(tmp_path, "E2-F1-S1-T1") == "in-progress"
+
+
+@pytest.mark.unit
+class TestApplyResumeStrategyUnknown:
+    """AC-E2-F1-S2-T3-6: an unknown strategy raises ValueError naming the allowed set."""
+
+    def test_unknown_strategy_raises_value_error_naming_allowed_set(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError) as exc_info:
+            _apply_resume_strategy("not_a_real_strategy", tmp_path)
+        message = str(exc_info.value)
+        assert "continue_current_wu" in message
+        assert "restart_wu" in message
+        assert "drain_and_resume" in message

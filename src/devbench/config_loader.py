@@ -922,6 +922,11 @@ class NotificationsEventsConfig:
     ci_pass: bool = False
     orchestrator_stop: bool = False
     orchestrator_auto_restart: bool = False
+    # Quota wait-and-resume lifecycle (spec FR-2.10, ADR-24).  Schema keys
+    # landed in E2-F2-S1-T1; these fields close the gap so the dispatcher
+    # can actually observe them via NotificationsConfig.events.
+    quota_waiting: bool = False
+    quota_resumed: bool = False
 
 
 @dataclass
@@ -1029,6 +1034,8 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
         orchestrator_auto_restart=bool(
             events_raw.get("orchestrator_auto_restart", defaults.events.orchestrator_auto_restart)
         ),
+        quota_waiting=bool(events_raw.get("quota_waiting", defaults.events.quota_waiting)),
+        quota_resumed=bool(events_raw.get("quota_resumed", defaults.events.quota_resumed)),
     )
 
     return NotificationsConfig(

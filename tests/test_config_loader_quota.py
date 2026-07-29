@@ -13,10 +13,14 @@ from __future__ import annotations
 import dataclasses
 import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from devbench import notifications
 from devbench.config_loader import (
+    NotificationsConfig,
+    NotificationsEventsConfig,
     QuotaHandlingConfig,
     RuntimeConfig,
     _parse_quota_handling_config,
@@ -499,3 +503,166 @@ class TestNotificationsEventsQuotaKeys:
             """,
         )
         load_runtime_config(cfg, {})
+
+
+# ---------------------------------------------------------------------------
+# notifications.events quota field wiring -- AC-E2-F3-S1-T2-1..6
+# ---------------------------------------------------------------------------
+#
+# E2-F2-S1-T1 landed the quota_waiting/quota_resumed schema keys tested
+# above but never wired the matching NotificationsEventsConfig dataclass
+# fields or _parse_notifications_config lines, so a value that passed
+# schema validation was silently dropped before reaching the dispatcher.
+# This block proves the full parse -> dataclass -> is_event_enabled round
+# trip now works, matching every sibling event toggle.
+
+
+@pytest.mark.unit
+class TestNotificationsEventsQuotaFieldWiring:
+    """quota_waiting/quota_resumed resolve onto the parsed config object."""
+
+    @pytest.mark.parametrize(
+        "quota_waiting,quota_resumed",
+        [
+            (True, False),
+            (False, True),
+            (True, True),
+        ],
+    )
+    def test_quota_keys_resolve_to_set_value_on_parsed_config(
+        self, tmp_path: Path, quota_waiting: bool, quota_resumed: bool
+    ) -> None:
+        """AC-E2-F3-S1-T2-3: each key resolves independently and together."""
+        cfg = _write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo: {{}}
+            notifications:
+              events:
+                quota_waiting: {str(quota_waiting).lower()}
+                quota_resumed: {str(quota_resumed).lower()}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.notifications.events.quota_waiting is quota_waiting
+        assert rt.notifications.events.quota_resumed is quota_resumed
+
+    def test_absent_events_block_defaults_both_quota_keys_false(self, tmp_path: Path) -> None:
+        """AC-E2-F3-S1-T2-4: no ``notifications:`` block at all -> both False."""
+        cfg = _write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.notifications.events.quota_waiting is False
+        assert rt.notifications.events.quota_resumed is False
+
+    def test_absent_quota_waiting_key_defaults_false(self, tmp_path: Path) -> None:
+        """AC-E2-F3-S1-T2-4: omitting quota_waiting alone still resolves False."""
+        cfg = _write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            notifications:
+              events:
+                quota_resumed: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.notifications.events.quota_waiting is False
+        assert rt.notifications.events.quota_resumed is True
+
+    def test_absent_quota_resumed_key_defaults_false(self, tmp_path: Path) -> None:
+        """AC-E2-F3-S1-T2-4: omitting quota_resumed alone still resolves False."""
+        cfg = _write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            notifications:
+              events:
+                quota_waiting: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.notifications.events.quota_waiting is True
+        assert rt.notifications.events.quota_resumed is False
+
+    def test_dataclass_field_order_follows_orchestrator_auto_restart(self) -> None:
+        """AC-E2-F3-S1-T2-1: fields land immediately after orchestrator_auto_restart."""
+        names = [f.name for f in dataclasses.fields(NotificationsEventsConfig)]
+        idx = names.index("orchestrator_auto_restart")
+        assert names[idx + 1 : idx + 3] == ["quota_waiting", "quota_resumed"]
+
+    def test_quota_fields_default_off_on_bare_dataclass(self) -> None:
+        """AC-E2-F3-S1-T2-2: default is read from the dataclass, not a parser literal."""
+        events = NotificationsEventsConfig()
+        assert events.quota_waiting is False
+        assert events.quota_resumed is False
+
+    def test_unknown_events_key_still_rejected(self, tmp_path: Path) -> None:
+        """AC-E2-F3-S1-T2-6: additionalProperties: false still guards notifications.events."""
+        cfg = _write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            notifications:
+              events:
+                quota_waiting: true
+                not_a_real_event: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*not_a_real_event"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestIsEventEnabledQuotaRoundTrip:
+    """AC-E2-F3-S1-T2-5: is_event_enabled observes the quota toggles once wired.
+
+    Before this task, ``NotificationsEventsConfig`` had no ``quota_waiting``
+    / ``quota_resumed`` attribute, so ``is_event_enabled``'s
+    ``getattr(cfg.events, event_kind, False)`` fell through to the
+    missing-attribute default and the schema keys were unobservable by the
+    dispatcher regardless of what the operator configured.
+    """
+
+    def test_is_event_enabled_true_for_quota_waiting_when_toggled_on(self) -> None:
+        cfg = NotificationsConfig(
+            enabled=True,
+            events=NotificationsEventsConfig(quota_waiting=True),
+        )
+        with patch.object(notifications, "_load_notifications_config", return_value=cfg):
+            assert notifications.is_event_enabled("quota_waiting") is True
+
+    def test_is_event_enabled_true_for_quota_resumed_when_toggled_on(self) -> None:
+        cfg = NotificationsConfig(
+            enabled=True,
+            events=NotificationsEventsConfig(quota_resumed=True),
+        )
+        with patch.object(notifications, "_load_notifications_config", return_value=cfg):
+            assert notifications.is_event_enabled("quota_resumed") is True
+
+    def test_is_event_enabled_false_for_quota_events_when_toggled_off(self) -> None:
+        cfg = NotificationsConfig(
+            enabled=True,
+            events=NotificationsEventsConfig(quota_waiting=False, quota_resumed=False),
+        )
+        with patch.object(notifications, "_load_notifications_config", return_value=cfg):
+            assert notifications.is_event_enabled("quota_waiting") is False
+            assert notifications.is_event_enabled("quota_resumed") is False
+
+    def test_is_event_enabled_false_when_master_switch_off(self) -> None:
+        cfg = NotificationsConfig(
+            enabled=False,
+            events=NotificationsEventsConfig(quota_waiting=True, quota_resumed=True),
+        )
+        with patch.object(notifications, "_load_notifications_config", return_value=cfg):
+            assert notifications.is_event_enabled("quota_waiting") is False
+            assert notifications.is_event_enabled("quota_resumed") is False

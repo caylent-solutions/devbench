@@ -876,3 +876,288 @@ class TestHttpPostInternals:
             )
 
         conn.close.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Quota wait-and-resume Slack events (E2-F3-S1-T1, spec FR-2.10, ADR-24).
+#
+# Ported from the pre-strip commit 58048b3 (D-16: quote pre-strip commits so
+# the design rationale survives the port) plus the quota-exhausted stop-class
+# member added later on the branch.  ``quota_waiting`` / ``quota_resumed`` are
+# opt-in event toggles, same as every other event in this module; the stop-
+# class taxonomy and mention-map are new declarative infrastructure this task
+# introduces so a future task can extend it with the remaining orchestrator
+# stop classes without renaming anything here.
+# ---------------------------------------------------------------------------
+
+
+class TestQuotaEventConstants:
+    """AC-E2-F3-S1-T1-2: event constants + ALL_EVENTS registration."""
+
+    def test_event_quota_waiting_value(self) -> None:
+        assert notifications.EVENT_QUOTA_WAITING == "quota_waiting"
+
+    def test_event_quota_resumed_value(self) -> None:
+        assert notifications.EVENT_QUOTA_RESUMED == "quota_resumed"
+
+    def test_quota_waiting_registered_in_all_events(self) -> None:
+        assert notifications.EVENT_QUOTA_WAITING in notifications.ALL_EVENTS
+
+    def test_quota_resumed_registered_in_all_events(self) -> None:
+        assert notifications.EVENT_QUOTA_RESUMED in notifications.ALL_EVENTS
+
+
+class TestStopClassTaxonomy:
+    """AC-E2-F3-S1-T1-3: quota-exhausted stop-class + here-mention default."""
+
+    def test_stop_class_quota_exhausted_value(self) -> None:
+        assert notifications.STOP_CLASS_QUOTA_EXHAUSTED == "quota-exhausted"
+
+    def test_stop_class_quota_exhausted_is_member_of_all_stop_classes(self) -> None:
+        assert notifications.STOP_CLASS_QUOTA_EXHAUSTED in notifications.ALL_STOP_CLASSES
+
+    def test_stop_class_crash_is_member_of_all_stop_classes(self) -> None:
+        assert notifications.STOP_CLASS_CRASH in notifications.ALL_STOP_CLASSES
+
+    def test_quota_exhausted_maps_to_here_mention_in_default_map(self) -> None:
+        mapping = notifications.DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP
+        assert mapping[notifications.STOP_CLASS_QUOTA_EXHAUSTED] == notifications.MENTION_LEVEL_HERE
+
+
+class TestValidateStopMentionMap:
+    """Task-specific error path: unknown stop-class key raises ValueError naming the allowed set."""
+
+    def test_accepts_known_stop_class_keys(self) -> None:
+        # Must not raise.
+        notifications.validate_stop_mention_map(
+            {
+                notifications.STOP_CLASS_CRASH: notifications.MENTION_LEVEL_HERE,
+                notifications.STOP_CLASS_QUOTA_EXHAUSTED: notifications.MENTION_LEVEL_HERE,
+            }
+        )
+
+    def test_accepts_empty_map(self) -> None:
+        notifications.validate_stop_mention_map({})
+
+    def test_rejects_unknown_stop_class_key(self) -> None:
+        with pytest.raises(ValueError, match="unknown stop-class key"):
+            notifications.validate_stop_mention_map({"not-a-real-class": notifications.MENTION_LEVEL_HERE})
+
+    def test_rejection_names_allowed_set(self) -> None:
+        with pytest.raises(ValueError) as exc_info:
+            notifications.validate_stop_mention_map({"bogus": "here"})
+        message = str(exc_info.value)
+        assert notifications.STOP_CLASS_CRASH in message
+        assert notifications.STOP_CLASS_QUOTA_EXHAUSTED in message
+
+
+class TestClassifyStopClass:
+    """AC-E2-F3-S1-T1-4: quota-prefixed reasons classify quota-exhausted; everything
+    else falls through to the fail-visible crash bucket."""
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "quota-exhausted",
+            "quota exceeded: anthropic-api",
+            "quota_exhausted_bedrock_after_max_resumes",
+            "quota",
+        ],
+    )
+    def test_quota_prefixed_reasons_classify_quota_exhausted(self, reason: str) -> None:
+        assert notifications.classify_stop_class(reason) == notifications.STOP_CLASS_QUOTA_EXHAUSTED
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "clean exit: ALL_DONE",
+            "crash: unexpected SIGKILL",
+            "interrupted by operator",
+            "",
+            "totally-unrecognised-reason",
+        ],
+    )
+    def test_unrecognized_reasons_fall_through_to_crash(self, reason: str) -> None:
+        """Fail-visible fallback: an unrecognised reason must never be silently
+        dropped -- it always resolves to a concrete, alertable stop-class."""
+        assert notifications.classify_stop_class(reason) == notifications.STOP_CLASS_CRASH
+
+
+class TestNotifyQuotaWaiting:
+    """notify_quota_waiting(reason, reset_at) -- payload shape + gating."""
+
+    def test_no_post_when_event_toggle_off(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_waiting": False})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+        posted.assert_not_called()
+
+    def test_slack_post_fires_when_toggle_on(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_waiting": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+        posted.assert_called_once()
+        args, _ = posted.call_args
+        _url, payload, _timeout = args
+        assert "Quota hit" in payload["text"]
+        field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "anthropic-api" in field_blob
+        assert "2026-01-01T16:10:00+00:00" in field_blob
+
+    def test_never_breaks_or_delays_the_wait_on_dispatch_failure(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec AC-27: a raising ``_dispatch`` must not propagate, retry, or sleep."""
+
+        def sleep_forbidden(*_a: Any, **_kw: Any) -> None:
+            raise AssertionError("notify_quota_waiting must never sleep or retry on dispatch failure")
+
+        monkeypatch.setattr("time.sleep", sleep_forbidden)
+        with patch.object(notifications, "_dispatch", side_effect=RuntimeError("dispatch exploded")):
+            # Must not raise.
+            notifications.notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+        err = capsys.readouterr().err
+        assert "[WARN]" in err
+        assert "quota_waiting" in err
+
+
+class TestNotifyQuotaResumed:
+    """notify_quota_resumed(waited_seconds) -- payload shape + gating."""
+
+    def test_no_post_when_event_toggle_off(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_resumed": False})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_resumed(1234)
+        posted.assert_not_called()
+
+    def test_slack_post_fires_when_toggle_on(self) -> None:
+        cfg = _make_config(enabled=True, events={"quota_resumed": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.notify_quota_resumed(1234)
+        posted.assert_called_once()
+        args, _ = posted.call_args
+        _url, payload, _timeout = args
+        assert "Quota recovered" in payload["text"]
+        field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "1234" in field_blob
+
+    def test_never_breaks_or_delays_the_wait_on_dispatch_failure(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec AC-27: a raising ``_dispatch`` must not propagate, retry, or sleep."""
+
+        def sleep_forbidden(*_a: Any, **_kw: Any) -> None:
+            raise AssertionError("notify_quota_resumed must never sleep or retry on dispatch failure")
+
+        monkeypatch.setattr("time.sleep", sleep_forbidden)
+        with patch.object(notifications, "_dispatch", side_effect=RuntimeError("dispatch exploded")):
+            # Must not raise.
+            notifications.notify_quota_resumed(1234)
+        err = capsys.readouterr().err
+        assert "[WARN]" in err
+        assert "quota_resumed" in err
+
+
+class TestQuotaEventsHaveSamples:
+    """``_fire_sample`` must grow a branch for both new events so the existing
+    ``test_every_event_has_a_sample`` parametrization (which iterates
+    ``ALL_EVENTS``) keeps passing once the quota events are registered."""
+
+    def test_quota_waiting_sample_dispatches(self) -> None:
+        cfg = _make_config(enabled=True)
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.send_test_notification("quota_waiting")
+        posted.assert_called_once()
+
+    def test_quota_resumed_sample_dispatches(self) -> None:
+        cfg = _make_config(enabled=True)
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.notifications.post_webhook") as posted,
+        ):
+            notifications.send_test_notification("quota_resumed")
+        posted.assert_called_once()
+
+
+class TestQuotaEventsConfigParsing:
+    """The ``notifications.events.quota_waiting`` / ``quota_resumed`` schema keys
+    (landed by E2-F2-S1-T1) must actually reach ``NotificationsEventsConfig``,
+    not merely validate -- otherwise the toggle can never be turned on by an
+    operator.  Mirrors the ``TestNotificationsConfigParser`` pattern above."""
+
+    def _load(self, yaml_text: str) -> Any:
+        import textwrap
+        from pathlib import Path
+
+        from devbench.config_loader import load_runtime_config
+
+        tmp = Path("/tmp") / "notif-quota-test.yaml"
+        tmp.write_text(textwrap.dedent(yaml_text), encoding="utf-8")
+        return load_runtime_config(tmp, {})
+
+    def test_quota_waiting_defaults_false(self) -> None:
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+            """
+        )
+        assert rt.notifications.events.quota_waiting is False
+
+    def test_quota_resumed_defaults_false(self) -> None:
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+            """
+        )
+        assert rt.notifications.events.quota_resumed is False
+
+    def test_quota_waiting_true_parses_through(self) -> None:
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+              events:
+                quota_waiting: true
+            """
+        )
+        assert rt.notifications.events.quota_waiting is True
+
+    def test_quota_resumed_true_parses_through(self) -> None:
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+              events:
+                quota_resumed: true
+            """
+        )
+        assert rt.notifications.events.quota_resumed is True

@@ -442,7 +442,8 @@ skills:
 # on_exhaustion_timeout: what to do when max_wait_seconds is exceeded.
 #   "drain"        -- trigger a graceful drain (default).
 #   "fail"         -- re-raise the quota error.
-#   "keep_waiting" -- ignore the cap and keep polling.
+#   "keep_waiting" -- terminal: logs [QUOTA_TIMEOUT_KEEP_WAITING] and ends
+#     the run (no drain, no re-raise).
 # resume_strategy: how to re-enter the orchestrate loop after recovery.
 #   "continue_current_wu" -- resume where we left off (default).
 #   "restart_wu"          -- force the current WU back to in-queue.

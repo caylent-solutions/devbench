@@ -177,6 +177,8 @@ Every event toggle, when it fires, and what's in the payload:
 | `ci_pass` | CI on the auto-finalize batch PR turned GREEN — explicit signal that the PR is ready for manual merge under `auto_merge: false` (#219). **Default off** so existing workspaces stay silent on upgrade. | Task id (most-recent active task or symbolic `finalize`), repo, PR URL. |
 | `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, terminal-marker (#218), or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason (post-#217 includes the SDK's `ResultMessage.result` text; post-#218 fires within seconds of the terminal marker via the `[ORCHESTRATOR_TERMINAL_EXIT]` audit), in-flight WU id (when one was active). |
 | `orchestrator_auto_restart` | The orchestrator exited with code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop is restarting. | List of blocked task ids (truncated at 5). |
+| `quota_waiting` | The orchestrator detected a quota limit and began waiting for it to reset. The dispatcher is wired (`notify_quota_waiting`); the orchestrator call site that invokes it lands in E2-F4-S1-T1. | `reason`, `reset_at`. |
+| `quota_resumed` | The quota recovered and the run resumed. The dispatcher is wired (`notify_quota_resumed`); the orchestrator call site that invokes it lands in E2-F4-S1-T1. | `waited_seconds`. |
 
 ## Authentication & secret hygiene
 

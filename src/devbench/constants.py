@@ -730,6 +730,21 @@ BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.clau
 # would silently un-do D-2.
 RECOVERY_PROBE_MODEL: str = "claude-opus-5"
 
+# HTTP timeout, in seconds, for ``devbench.quota.recovery_probe``'s
+# ``messages.create`` call (FR-2.5, issue #236). Consumed by the
+# ``functools.partial(recovery_probe, ...)`` call built in
+# ``_handle_quota_pause`` (``src/devbench/cli.py``) so the probe's timeout
+# is not a hardcoded literal at the call site. Must be > 0 -- enforced by
+# ``recovery_probe``'s own argument guard.
+RECOVERY_PROBE_TIMEOUT_SECONDS: float = 30.0
+
+# Input token count for the 1-token probe prompt sent by
+# ``devbench.quota.recovery_probe`` (FR-2.5, issue #236). Consumed by the
+# same ``functools.partial(recovery_probe, ...)`` call in
+# ``_handle_quota_pause`` (``src/devbench/cli.py``). Must be >= 1 --
+# enforced by ``recovery_probe``'s own argument guard.
+RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
+
 # ---------------------------------------------------------------------------
 # Session-management constants (spec 4.4.1 named sessions, issue #192)
 # Consumed exclusively by ``src/devbench/session.py``; defined here so no

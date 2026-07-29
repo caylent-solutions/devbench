@@ -445,3 +445,38 @@ class TestRecoveryProbeModelConstant:
             "RECOVERY_PROBE_MODEL's comment must cite spec decision D-2, which "
             "moved the default model lineup to Opus 5."
         )
+
+
+class TestRecoveryProbeTimeoutAndRequestSizeConstants:
+    """AC-E2-F4-S2-T2-1, AC-E2-F4-S2-T2-2, AC-E2-F4-S2-T2-4: recovery probe
+    timeout and request-size constants exist, carry the correct type, and
+    satisfy the argument guards devbench.quota.recovery_probe enforces
+    (timeout_seconds > 0, request_size_tokens >= 1)."""
+
+    @pytest.mark.unit
+    def test_recovery_probe_timeout_seconds_value_and_type(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_TIMEOUT_SECONDS
+
+        assert RECOVERY_PROBE_TIMEOUT_SECONDS == 30.0
+        assert isinstance(RECOVERY_PROBE_TIMEOUT_SECONDS, float)
+
+    @pytest.mark.unit
+    def test_recovery_probe_request_size_tokens_value_and_type(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_REQUEST_SIZE_TOKENS
+
+        assert RECOVERY_PROBE_REQUEST_SIZE_TOKENS == 1
+        assert isinstance(RECOVERY_PROBE_REQUEST_SIZE_TOKENS, int)
+
+    @pytest.mark.unit
+    def test_constants_satisfy_recovery_probe_argument_guards(self) -> None:
+        """devbench.quota.recovery_probe raises ValueError when
+        timeout_seconds <= 0 or request_size_tokens < 1 (quota.py lines
+        999-1001). The exported constants must actually satisfy those
+        guards, not merely restate the literals."""
+        from devbench.constants import (
+            RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+            RECOVERY_PROBE_TIMEOUT_SECONDS,
+        )
+
+        assert RECOVERY_PROBE_TIMEOUT_SECONDS > 0
+        assert RECOVERY_PROBE_REQUEST_SIZE_TOKENS >= 1

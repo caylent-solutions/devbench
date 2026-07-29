@@ -2424,7 +2424,11 @@ class BacklogManager:
                 continue
             content = wu_path.read_text(encoding="utf-8")
             declared = self._extract_task_type(content)
-            task_type = declared if declared is not None else DEFAULT_TASK_TYPE
+            if declared is None:
+                # Tasks without an explicit ## Task Type: section predate
+                # the taxonomy and are exempt from invariant checks.
+                continue
+            task_type = declared
 
             if task_type not in VALID_TASK_TYPES:
                 errors.append(

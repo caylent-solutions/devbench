@@ -161,9 +161,9 @@ def validate_stop_mention_map(candidate: dict[str, str]) -> None:
     """Validate a stop-class -> mention-level mapping.
 
     Raises ``ValueError`` when any key is not a recognised stop-class.
-    Called at config-load time (by a future task that exposes this mapping
-    as operator config) and directly in tests so an invalid mapping surfaces
-    immediately rather than at first dispatch.
+    Intended to be called at config-load time once a future task exposes
+    this mapping as operator config; today only tests call it, so an
+    invalid mapping is still caught before any dispatch path relies on it.
 
     Args:
         candidate: Mapping from stop-class token to mention-level token to

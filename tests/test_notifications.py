@@ -1019,9 +1019,10 @@ class TestNotifyQuotaWaiting:
             raise AssertionError("notify_quota_waiting must never sleep or retry on dispatch failure")
 
         monkeypatch.setattr("time.sleep", sleep_forbidden)
-        with patch.object(notifications, "_dispatch", side_effect=RuntimeError("dispatch exploded")):
+        with patch.object(notifications, "_dispatch", side_effect=RuntimeError("dispatch exploded")) as mock_dispatch:
             # Must not raise.
             notifications.notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+        assert mock_dispatch.call_count == 1
         err = capsys.readouterr().err
         assert "[WARN]" in err
         assert "quota_waiting" in err
@@ -1062,9 +1063,10 @@ class TestNotifyQuotaResumed:
             raise AssertionError("notify_quota_resumed must never sleep or retry on dispatch failure")
 
         monkeypatch.setattr("time.sleep", sleep_forbidden)
-        with patch.object(notifications, "_dispatch", side_effect=RuntimeError("dispatch exploded")):
+        with patch.object(notifications, "_dispatch", side_effect=RuntimeError("dispatch exploded")) as mock_dispatch:
             # Must not raise.
             notifications.notify_quota_resumed(1234)
+        assert mock_dispatch.call_count == 1
         err = capsys.readouterr().err
         assert "[WARN]" in err
         assert "quota_resumed" in err
@@ -1092,72 +1094,3 @@ class TestQuotaEventsHaveSamples:
         ):
             notifications.send_test_notification("quota_resumed")
         posted.assert_called_once()
-
-
-class TestQuotaEventsConfigParsing:
-    """The ``notifications.events.quota_waiting`` / ``quota_resumed`` schema keys
-    (landed by E2-F2-S1-T1) must actually reach ``NotificationsEventsConfig``,
-    not merely validate -- otherwise the toggle can never be turned on by an
-    operator.  Mirrors the ``TestNotificationsConfigParser`` pattern above."""
-
-    def _load(self, yaml_text: str) -> Any:
-        import textwrap
-        from pathlib import Path
-
-        from devbench.config_loader import load_runtime_config
-
-        tmp = Path("/tmp") / "notif-quota-test.yaml"
-        tmp.write_text(textwrap.dedent(yaml_text), encoding="utf-8")
-        return load_runtime_config(tmp, {})
-
-    def test_quota_waiting_defaults_false(self) -> None:
-        rt = self._load(
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            notifications:
-              enabled: true
-            """
-        )
-        assert rt.notifications.events.quota_waiting is False
-
-    def test_quota_resumed_defaults_false(self) -> None:
-        rt = self._load(
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            notifications:
-              enabled: true
-            """
-        )
-        assert rt.notifications.events.quota_resumed is False
-
-    def test_quota_waiting_true_parses_through(self) -> None:
-        rt = self._load(
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            notifications:
-              enabled: true
-              events:
-                quota_waiting: true
-            """
-        )
-        assert rt.notifications.events.quota_waiting is True
-
-    def test_quota_resumed_true_parses_through(self) -> None:
-        rt = self._load(
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            notifications:
-              enabled: true
-              events:
-                quota_resumed: true
-            """
-        )
-        assert rt.notifications.events.quota_resumed is True

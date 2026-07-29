@@ -3,7 +3,7 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] -- v-next
+## [0.2.0] -- 2026-07-29
 
 This release bundles the orchestrator self-healing work, the canonical
 configuration refactor, the EC2 remote-dev provisioning stack, and the
@@ -1721,6 +1721,26 @@ Operators upgrading from before this release:
    (`git_ops.pause_before_merge`) in this release; the runtime
    implementation ships in a follow-up commit on this branch (or in
    the next release if the follow-up is deferred).
+
+6. **Review topology changed (ADR-33).** The orchestrate skill now
+   dispatches the four `review_team` judges directly as first-level
+   sub-agents; `review-supervisor` no longer dispatches anything and is
+   never invoked. No action is required for standard workspaces -- the
+   `agents.review_supervisor` config key still parses and still accepts a
+   model, it simply has no effect. If you maintain a **custom orchestrate
+   skill or a forked plugin** that invokes `review-supervisor` to run the
+   review fan-out, that path is now blocked by
+   `guard-review-supervisor-scope.sh` (exit 2) and must be updated to
+   dispatch the judges directly. A missing verdict from any required judge
+   is now a hard review failure rather than an implicit pass, so a work
+   unit that previously slipped through on a partial round will now fail
+   review until every judge reports.
+7. **Optional: isolate stop-hook state.** The Stop hook's state file
+   defaults to `/tmp`, which is shared machine-wide. If you run the test
+   suite on a host that also runs a live orchestrator, set
+   `DEVBENCH_STOP_HOOK_STATE_DIR` to a private directory in the test
+   environment. Leaving it unset preserves the previous `/tmp` paths
+   exactly.
 
 ### Known follow-ups (this branch / next release)
 

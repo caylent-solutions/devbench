@@ -168,3 +168,29 @@ class TestGuardVerdictFormatHook:
         assert result.returncode == 2
         stderr_lower = result.stderr.lower()
         assert "feedback" in stderr_lower or "message" in stderr_lower or "required" in stderr_lower
+
+    # ------------------------------------------------------------------ AC-E4-F1-S1-T4: post-flatten attribution
+
+    def test_scope_comment_does_not_attribute_review_team_verdicts_to_review_supervisor(self) -> None:
+        """AC-E4-F1-S1-T4-1: The scope comment must not claim review-supervisor writes review-team verdicts.
+
+        Post-ADR-33 flatten, review-supervisor dispatches nothing and writes no
+        verdicts; each review_team judge self-logs its own canonical verdict.
+        """
+        script_text = SCRIPT_PATH.read_text()
+        assert "written by review-supervisor" not in script_text, (
+            "the scope comment still attributes review-team verdict authorship to "
+            "review-supervisor, which is stale post-ADR-33 (review-supervisor no "
+            "longer dispatches or writes verdicts)"
+        )
+
+    def test_executor_rejection_stderr_does_not_name_review_supervisor_as_verdict_owner(self) -> None:
+        """AC-E4-F1-S1-T4-2: The executor-rejection stderr must not name review-supervisor as verdict owner."""
+        payload = _make_payload("uv run devbench log-verdict code_review E201-F1-S2-T1 pass")
+        payload["agent_type"] = "devbench-orchestrate:executor"
+        result = _run_hook(payload)
+        assert result.returncode == 2
+        assert "review-supervisor" not in result.stderr, (
+            f"executor-rejection stderr still names review-supervisor as the "
+            f"verdict owner; stderr was: {result.stderr!r}"
+        )

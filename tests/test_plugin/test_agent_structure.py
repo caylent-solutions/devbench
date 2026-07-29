@@ -71,21 +71,24 @@ class TestReviewSupervisorFrontmatter:
 
 
 @pytest.mark.unit
-class TestReviewSupervisorDeprecated:
-    """ADR-28: review-supervisor.md is a demoted, inert deprecation stub.
+class TestReviewSupervisorHasNoPipelineRole:
+    """ADR-33: review-supervisor.md carries no pipeline role and is never invoked.
 
     The Step-0 Agent-tool self-check (issue #183) and the entire dispatch /
-    aggregation body are removed: the orchestrate skill now dispatches the four
-    review_team reviewers directly, so the supervisor no longer spawns anything,
-    self-checks anything, or logs verdicts. The file is kept only so config /
-    plugin-shadow / activity references continue to resolve.
+    aggregation body are removed: the orchestrate skill dispatches the four
+    review_team reviewers directly and aggregates their verdicts itself, so the
+    supervisor no longer spawns anything, self-checks anything, or logs
+    verdicts. The file survives only because ``plugin_shadow`` maps the
+    ``agents.review_supervisor`` config key to this path and fails fast when it
+    is absent, so deleting it would break every workspace that pins a model for
+    this agent.
     """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    def test_supervisor_marked_deprecated(self) -> None:
+    def test_supervisor_states_it_has_no_pipeline_role(self) -> None:
         content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "DEPRECATED" in content, "review-supervisor.md must be marked DEPRECATED (ADR-28)"
+        assert "NOT INVOKED" in content, "review-supervisor.md must declare it is not invoked (ADR-33)"
 
     def test_supervisor_states_it_must_not_be_invoked(self) -> None:
         content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
@@ -94,12 +97,25 @@ class TestReviewSupervisorDeprecated:
     def test_supervisor_no_longer_dispatches_reviewers(self) -> None:
         """The stub must not carry dispatch instructions for the review team."""
         content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "Step 0" not in content, "the Step-0 self-check must be removed (ADR-28)"
+        assert "Step 0" not in content, "the Step-0 self-check must be removed (ADR-33)"
         assert "invoke them in parallel" not in content
 
-    def test_supervisor_references_adr_28(self) -> None:
+    def test_supervisor_references_the_governing_adrs(self) -> None:
         content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "ADR-28" in content
+        assert "ADR-33" in content, "the flatten decision (ADR-33) must be cited"
+        assert "ADR-28" in content, "the original root-cause analysis (ADR-28) must remain cited"
+
+    def test_supervisor_explains_why_the_file_is_retained(self) -> None:
+        """A reader must learn why an unused file is still here, not guess."""
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "plugin_shadow" in content, "the file must name the config coupling that keeps it alive"
+
+    def test_supervisor_retains_the_model_frontmatter_line(self) -> None:
+        """plugin_shadow._rewrite_agent_model raises when this line is missing."""
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert re.search(r"^model:[ \t]+\S", content, re.MULTILINE), (
+            "per-agent model overrides rewrite this line; without it the override is a hard error"
+        )
 
 
 @pytest.mark.unit

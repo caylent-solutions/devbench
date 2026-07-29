@@ -6,12 +6,13 @@
 #   { "tool_name": "Bash", "tool_input": { "command": "..." },
 #     "agent_type": "devbench-orchestrate:review-supervisor", ... }
 #
-# A reviewer's job is to AUDIT the diff and DELEGATE via the Agent tool.
-# It MUST NOT mutate worktree, index, or filesystem state. The
-# review-supervisor.md prompt instructs only Agent invocations and
-# `uv run devbench log-comment` / `log-verdict` calls. Any other
-# state-changing Bash command (file deletion, git mutation, redirection
-# to disk) is out of scope and is rejected here.
+# This agent has no pipeline role post-ADR-33: the orchestrate skill
+# dispatches the four review_team judges directly and aggregates their
+# verdicts itself, so review-supervisor neither delegates nor reviews.
+# It MUST NOT spawn subagents and MUST NOT mutate worktree, index, or
+# filesystem state. Any Agent-tool invocation, and any state-changing
+# Bash command (file deletion, git mutation, redirection to disk), is
+# out of scope and is rejected here.
 #
 # This hook is a no-op for any agent_type other than
 # "devbench-orchestrate:review-supervisor"; main-session and other-agent Bash calls
@@ -63,7 +64,7 @@ if [[ "$TOOL_NAME" == "Agent" ]]; then
   fi
   {
     printf 'guard-review-supervisor-scope: BLOCKED -- review-supervisor attempted to spawn subagent_type %s.\n' "$SUBAGENT"
-    printf 'Reason: review-supervisor is a deprecated non-dispatching stub (ADR-33) and may not spawn any subagent. The four review_team judges are dispatched directly by the orchestrate skill as first-level sub-agents; the documented pipeline is executor -> the 4 review_team judges -> security-reviewer -> git-ops -> mark-done.\n'
+    printf 'Reason: review-supervisor has no pipeline role (ADR-33) and may not spawn any subagent. The four review_team judges are dispatched directly by the orchestrate skill as first-level sub-agents; the documented pipeline is executor -> the 4 review_team judges -> security-reviewer -> git-ops -> mark-done.\n'
     printf 'Override: only an operator may set DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1 in the env to permit a one-off non-review-team subagent.\n'
   } >&2
   exit 2

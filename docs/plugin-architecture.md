@@ -28,7 +28,7 @@ plugin/devbench-orchestrate/
 │   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
 │   ├── executor.md              ← dev agent: implements work units via TDD
-│   ├── review-supervisor.md     ← DEPRECATED (ADR-33): non-dispatching stub, never invoked
+│   ├── review-supervisor.md     ← not invoked (ADR-33): no pipeline role, kept for config
 │   ├── security-reviewer.md     ← security review gate agent
 │   ├── blocker-resolver.md      ← dependency blocker assessment agent + proposal emission after amendment reject
 │   ├── manifest-amender.md      ← conditional judge for TDD GREEN manifest amendments

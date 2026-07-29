@@ -101,6 +101,7 @@ def _build_minimal_backlog(workspace: Path, repo_slug: str) -> None:
     task_content = (
         f"# E1-F1-S1-T1: Demo task\n\n"
         f"## Status: draft\n\n"
+        f"## Task Type: docs\n\n"
         f"## Target Repository\n\n"
         f"- **Repo:** `{repo_slug}`\n"
         f"- **Branch:** `main`\n\n"

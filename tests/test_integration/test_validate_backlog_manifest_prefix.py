@@ -38,6 +38,7 @@ def _make_work_unit(backlog_dir: Path, manifest_path: str) -> Path:
     wu.write_text(
         "# EX-F1-S1-T1\n\n"
         "## Status: in-queue\n\n"
+        "## Task Type: docs\n\n"
         "## Target Repository\n\n"
         "- **Repo:** `example-org/example-repo`\n\n"
         "## Description\n\nFunctional-test task.\n\n"

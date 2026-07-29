@@ -109,6 +109,7 @@ def _write_valid_backlog_input(workspace: Path, repo_slug: str) -> Path:
     task_content = (
         "# E1-F1-S1-T1: Demo task\n\n"
         "## Status: draft\n\n"
+        "## Task Type: docs\n\n"
         "## Target Repository\n\n"
         f"- **Repo:** `{repo_slug}`\n"
         "- **Branch:** `main`\n\n"

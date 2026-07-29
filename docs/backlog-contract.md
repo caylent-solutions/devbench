@@ -183,8 +183,9 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
 20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default on; set `false` to opt out per workspace)
+21. Task-Type taxonomy (every Task's `## Task Type:` value -- or the `behavior-fix` default when the section is absent -- must be one of the six recognized types, and its Changes Manifest must satisfy that type's per-type invariant; see "Task-Type Taxonomy Rule (FR-4.1)" below)
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rule 21 was added by FR-4.1 (E4-F2-S1-T1) to stop RED-gated Tasks from shipping a Manifest with zero production-source rows and to keep `test-only` / `docs` / `chore` Tasks honest about the files they claim to touch. Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 
@@ -224,6 +225,62 @@ Path normalisation strips the configured `checkout_directory` prefix, leading `.
 Each Task pushes to a branch derived either from an explicit `- **Branch:** \`<name>\`` line in its work-unit file or from the canonical `backlog/<unit-id-lowercase>` template. Two Tasks resolving to the same branch would collide on push, breaking auto-merge and producing false review failures. `validate-backlog` reports the collision with both Task IDs so authors can rename one.
 
 The rule is skipped entirely when `git_ops.single_branch` is set in `devbench.yaml` -- under single-PR mode every task legitimately shares the configured branch.
+
+#### Task-Type Taxonomy Rule (FR-4.1, rule 21)
+
+Every Task carries an optional `## Task Type:` section naming one of six
+recognized types (canonical vocabulary lives in `src/devbench/constants.py`
+as `VALID_TASK_TYPES`; no call site hard-codes the type strings):
+
+| Type | RED-gated | Changes Manifest invariant |
+|------|-----------|-----------------------------|
+| `behavior-fix` (default) | Yes | At least one production-source row. |
+| `feature` | Yes | At least one production-source row. |
+| `test-only` | No | Every row must be a test path. |
+| `refactor` | No | No per-row invariant -- its requirement is green-green (tests pass before AND after the change), which is a TDD-cycle-log concern, not a static Manifest shape. |
+| `docs` | No | Every row must be a documentation/markdown (`.md`) path. |
+| `chore` | No | Every row must be a dependency/config/lockfile path. |
+
+If the `## Task Type:` section is omitted entirely, the Task defaults to
+`behavior-fix` (`DEFAULT_TASK_TYPE`) -- the strictest type -- so an author
+who forgets to declare a type still gets the RED-gate protection rather
+than silently skipping it (fail-safe default).
+
+An unrecognized `## Task Type:` value fails validation naming the full
+allowed set:
+
+```
+EX-F1-S1-T1: unrecognized '## Task Type:' value 'bugfix'. Allowed values:
+behavior-fix, chore, docs, feature, refactor, test-only. See
+docs/backlog-contract.md 'Task-Type Taxonomy'.
+```
+
+A per-row invariant violation names the offending row, the declared type,
+and the violated invariant:
+
+```
+EX-F1-S1-T1: task type 'docs' allows only documentation/markdown rows in
+the Changes Manifest, but 'src/devbench/cli.py' is not a documentation
+path -- task-type invariant violated. See docs/backlog-contract.md
+'Task-Type Taxonomy'.
+```
+
+```
+EX-F1-S1-T1: task type 'feature' requires at least one production-source
+row in the Changes Manifest, but none was found -- task-type invariant
+violated. See docs/backlog-contract.md 'Task-Type Taxonomy'.
+```
+
+**Classification reuse (AC-47).** "Is this path production Python
+source" and "is this path a Python test" are decided in exactly one
+place -- `BacklogManager._is_test_source_path` (shared by
+`_is_production_source`, Rule 14's source-test atomicity check, and this
+rule's `behavior-fix` / `feature` / `test-only` invariants). The `docs`
+and `chore` invariants introduce two new, narrower extension-based
+classifiers (`_is_documentation_path` for `.md`; `_is_chore_path` for
+lockfile / config extensions) that do not overlap the production/test
+boundary Rule 14 already owns, so the production/test classification
+itself is never duplicated.
 
 ### Dependency satisfaction (E215)
 
@@ -287,6 +344,8 @@ All sections below are required unless noted as optional.
 # {ID}: {Title}
 
 ## Status: {status}
+
+## Task Type: {type}         ← optional; one of behavior-fix (default) / feature / test-only / refactor / docs / chore
 
 ## Target Repository
 
@@ -439,6 +498,7 @@ Status rolls up automatically when all children reach `done`.
 | Section | Required | Populated by |
 |---------|----------|-------------|
 | `## Status:` | Yes | `devbench set-status` / `devbench mark-done` |
+| `## Task Type:` | No (defaults to `behavior-fix` when absent) | Author at creation |
 | `## Target Repository` | Yes | Author at creation |
 | `## Description` | Yes | Author at creation |
 | `## Dependencies` | Yes (empty table OK) | Author at creation |

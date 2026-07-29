@@ -247,6 +247,43 @@ TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} -- {message}\n"
 VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
 
 # ---------------------------------------------------------------------------
+# Six-type task taxonomy (FR-4.1 / E4-F2-S1-T1).
+#
+# ``## Task Type:`` is an optional work-unit section. When present it must
+# name exactly one of the six values below; when absent, ``validate-backlog``
+# defaults the task to the strictest type (``behavior-fix``) so that a task
+# with no declared type is never accidentally exempted from the RED gate or
+# the production-source Manifest invariant.
+#
+# ``GATED_TASK_TYPES`` are the types that require a RED-gated TDD cycle and
+# at least one production-source row in the Changes Manifest.
+# ---------------------------------------------------------------------------
+TASK_TYPE_BEHAVIOR_FIX: str = "behavior-fix"
+TASK_TYPE_FEATURE: str = "feature"
+TASK_TYPE_TEST_ONLY: str = "test-only"
+TASK_TYPE_REFACTOR: str = "refactor"
+TASK_TYPE_DOCS: str = "docs"
+TASK_TYPE_CHORE: str = "chore"
+
+VALID_TASK_TYPES: frozenset[str] = frozenset(
+    {
+        TASK_TYPE_BEHAVIOR_FIX,
+        TASK_TYPE_FEATURE,
+        TASK_TYPE_TEST_ONLY,
+        TASK_TYPE_REFACTOR,
+        TASK_TYPE_DOCS,
+        TASK_TYPE_CHORE,
+    }
+)
+
+DEFAULT_TASK_TYPE: str = TASK_TYPE_BEHAVIOR_FIX
+
+GATED_TASK_TYPES: frozenset[str] = frozenset({TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_FEATURE})
+
+TASK_TYPE_SECTION_PREFIX: str = "## Task Type:"
+TASK_TYPE_LINE_RE = re.compile(r"^(##\s*Task Type:\s*)(.+)$", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
 # Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------

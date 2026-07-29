@@ -630,3 +630,109 @@ class TestOrchestratorQuotaResumeConstants:
             assert tag.startswith("[ORCHESTRATOR_"), f"audit tag must start with '[ORCHESTRATOR_' (got {tag!r})"
             assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"
         assert ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX != ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX
+
+
+class TestTaskTypeTaxonomyConstants:
+    """FR-4.1 / AC-E4-F2-S1-T1-4: the six-type taxonomy vocabulary lives in
+    constants.py so no type string is hard-coded at any call site."""
+
+    @pytest.mark.unit
+    def test_six_task_type_string_constants_exist(self) -> None:
+        from devbench.constants import (
+            TASK_TYPE_BEHAVIOR_FIX,
+            TASK_TYPE_CHORE,
+            TASK_TYPE_DOCS,
+            TASK_TYPE_FEATURE,
+            TASK_TYPE_REFACTOR,
+            TASK_TYPE_TEST_ONLY,
+        )
+
+        assert TASK_TYPE_BEHAVIOR_FIX == "behavior-fix"
+        assert TASK_TYPE_FEATURE == "feature"
+        assert TASK_TYPE_TEST_ONLY == "test-only"
+        assert TASK_TYPE_REFACTOR == "refactor"
+        assert TASK_TYPE_DOCS == "docs"
+        assert TASK_TYPE_CHORE == "chore"
+
+    @pytest.mark.unit
+    def test_valid_task_types_contains_exactly_six_values(self) -> None:
+        from devbench.constants import (
+            TASK_TYPE_BEHAVIOR_FIX,
+            TASK_TYPE_CHORE,
+            TASK_TYPE_DOCS,
+            TASK_TYPE_FEATURE,
+            TASK_TYPE_REFACTOR,
+            TASK_TYPE_TEST_ONLY,
+            VALID_TASK_TYPES,
+        )
+
+        assert isinstance(VALID_TASK_TYPES, frozenset)
+        assert (
+            frozenset(
+                {
+                    TASK_TYPE_BEHAVIOR_FIX,
+                    TASK_TYPE_FEATURE,
+                    TASK_TYPE_TEST_ONLY,
+                    TASK_TYPE_REFACTOR,
+                    TASK_TYPE_DOCS,
+                    TASK_TYPE_CHORE,
+                }
+            )
+            == VALID_TASK_TYPES
+        )
+
+    @pytest.mark.unit
+    def test_default_task_type_is_behavior_fix(self) -> None:
+        """The fail-safe default is the strictest type, per FR-4.1."""
+        from devbench.constants import DEFAULT_TASK_TYPE, TASK_TYPE_BEHAVIOR_FIX
+
+        assert DEFAULT_TASK_TYPE == TASK_TYPE_BEHAVIOR_FIX
+
+    @pytest.mark.unit
+    def test_default_task_type_is_a_member_of_valid_task_types(self) -> None:
+        from devbench.constants import DEFAULT_TASK_TYPE, VALID_TASK_TYPES
+
+        assert DEFAULT_TASK_TYPE in VALID_TASK_TYPES
+
+    @pytest.mark.unit
+    def test_gated_task_types_is_behavior_fix_and_feature_only(self) -> None:
+        """FR-4.1: only behavior-fix and feature carry the RED-gate obligation."""
+        from devbench.constants import GATED_TASK_TYPES, TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_FEATURE
+
+        assert frozenset({TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_FEATURE}) == GATED_TASK_TYPES
+
+    @pytest.mark.unit
+    def test_gated_task_types_is_subset_of_valid_task_types(self) -> None:
+        from devbench.constants import GATED_TASK_TYPES, VALID_TASK_TYPES
+
+        assert GATED_TASK_TYPES <= VALID_TASK_TYPES
+
+    @pytest.mark.unit
+    def test_task_type_section_header_constant(self) -> None:
+        from devbench.constants import TASK_TYPE_SECTION_PREFIX
+
+        assert TASK_TYPE_SECTION_PREFIX == "## Task Type:"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "line,expected",
+        [
+            ("## Task Type: behavior-fix", "behavior-fix"),
+            ("## Task Type: feature", "feature"),
+            ("##Task Type:test-only", "test-only"),
+            ("##   Task Type:   docs  ", "docs"),
+        ],
+    )
+    def test_task_type_line_re_extracts_value(self, line: str, expected: str) -> None:
+        from devbench.constants import TASK_TYPE_LINE_RE
+
+        match = TASK_TYPE_LINE_RE.search(line)
+        assert match is not None, f"TASK_TYPE_LINE_RE did not match {line!r}"
+        assert match.group(2).strip() == expected
+
+    @pytest.mark.unit
+    def test_task_type_line_re_does_not_match_absent_section(self) -> None:
+        from devbench.constants import TASK_TYPE_LINE_RE
+
+        content = "# EX-F1-S1-T1\n\n## Status: in-queue\n\n## Description\n\nbody\n"
+        assert TASK_TYPE_LINE_RE.search(content) is None

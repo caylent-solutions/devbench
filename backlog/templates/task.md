@@ -2,6 +2,26 @@
 
 ## Status: in-queue
 
+## Task Type: {{TASK_TYPE}}
+
+<!--
+  Optional section. If omitted entirely, validate-backlog defaults this task
+  to `behavior-fix` (the strictest type -- fail-safe default).
+
+  One of six values, each carrying a machine-checked Changes Manifest
+  invariant enforced by `validate-backlog` (FR-4.1):
+
+  - `behavior-fix` (default) -- RED-gated; Manifest needs >= 1 production-source row.
+  - `feature`                -- RED-gated; Manifest needs >= 1 production-source row.
+  - `test-only`              -- exempt from the RED gate; every Manifest row must be a test path.
+  - `refactor`               -- exempt; requires green-green (tests pass before AND after), no AC text change.
+  - `docs`                   -- exempt; every Manifest row must be documentation/markdown.
+  - `chore`                  -- exempt; every Manifest row must be dependency/config/lockfile.
+
+  See docs/backlog-contract.md "Task-Type Taxonomy" for the full invariant
+  table, the default rule, and the exact failure-message shapes.
+-->
+
 ## Target Repository
 
 - **Repo:** `{{REPO}}`

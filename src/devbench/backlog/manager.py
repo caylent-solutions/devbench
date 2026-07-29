@@ -51,9 +51,11 @@ from devbench.constants import (
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
     EM_DASH,
     EPIC_ID_RE,
+    GATED_TASK_TYPES,
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
@@ -66,10 +68,16 @@ from devbench.constants import (
     STATUS_SUMMARY_TABLE_HEADER,
     STRIP_SUMMARY_RE,
     TABLE_STATUS_VALUES,
+    TASK_TYPE_CHORE,
+    TASK_TYPE_DOCS,
+    TASK_TYPE_LINE_RE,
+    TASK_TYPE_REFACTOR,
+    TASK_TYPE_TEST_ONLY,
     TDD_CYCLE_LOG_SECTION_HEADER,
     TDD_ENTRY_TEMPLATE,
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
+    VALID_TASK_TYPES,
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
@@ -422,6 +430,11 @@ class BacklogManager:
             backtick-quoted path-shaped tokens in ``## Acceptance Criteria`` and
             ``## Definition of Done`` must appear in the Task's Changes Manifest after
             normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
+        21. Six-type task taxonomy (FR-4.1): the optional ``## Task Type:`` section
+            (defaulting to ``behavior-fix`` when absent) must name one of the six
+            allowed types, and each type's Changes Manifest rows must satisfy its
+            per-type invariant (production-source presence for gated types;
+            test-only / docs / chore row-shape restrictions for exempt types).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -456,6 +469,7 @@ class BacklogManager:
         self._check_manifest_conflicts(rows, workspace_root, errors)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
+        self._check_task_type_taxonomy(rows, workspace_root, errors)
         self._check_required_sections(rows, workspace_root, errors)
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
@@ -1934,6 +1948,12 @@ class BacklogManager:
         "infra/scripts/",
     )
     _PROD_SRC_NESTED_PATTERNS: ClassVar[tuple[str, ...]] = ("/src/",)
+    # Extensions consumed by the ``chore`` task-type invariant that are not
+    # already covered by ``_NON_PY_EXTS_TO_TIER`` (which is reused below for
+    # the config/dependency tiers it already tracks -- HCL, YAML, JSON, XML,
+    # TOML). Lockfiles and legacy setup/config formats have no dedicated
+    # tier entry, so they are listed explicitly here.
+    _CHORE_EXTRA_EXTS: ClassVar[tuple[str, ...]] = (".lock", ".cfg", ".ini", ".txt")
     _AC_FINAL_LANGUAGE_TIER_IDS: ClassVar[frozenset[str]] = frozenset(
         {
             "AC-FINAL-002",
@@ -1973,19 +1993,34 @@ class BacklogManager:
         return ""
 
     @classmethod
+    def _is_test_source_path(cls, path: str) -> bool:
+        """Return True if the path is a Python file located under a ``tests/`` dir.
+
+        This is the single shared authority for "is this path a Python test
+        file" used both by ``_is_production_source`` (Rule 14, source-test
+        atomicity) and by the task-type taxonomy invariants (FR-4.1 /
+        E4-F2-S1-T1, AC-47). Introducing a second, independent test-path
+        classifier is prohibited -- both call sites must reuse this method
+        so the production/test boundary can never drift out of sync.
+        """
+        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+            return False
+        return path.startswith("tests/") or "/tests/" in path
+
+    @classmethod
     def _is_production_source(cls, path: str) -> bool:
         """Return True if the path looks like production Python source.
 
         Used by the source-test pair rule to distinguish source files (which
         require a matching test entry) from one-off scripts in
         configuration-only directories. Test files themselves (paths under
-        any ``tests/`` segment) are excluded -- they are not production source
-        even when their extension is ``.py``.
+        any ``tests/`` segment, per ``_is_test_source_path``) are excluded --
+        they are not production source even when their extension is ``.py``.
         """
         if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
             return False
         # Exclude test files
-        if path.startswith("tests/") or "/tests/" in path:
+        if cls._is_test_source_path(path):
             return False
         # Exclude package marker files
         from pathlib import PurePosixPath
@@ -1995,6 +2030,32 @@ class BacklogManager:
         return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
             seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
         )
+
+    @staticmethod
+    def _is_documentation_path(path: str) -> bool:
+        """Return True if the path is a documentation/markdown file.
+
+        Used by the ``docs`` task-type invariant (FR-4.1). Deliberately
+        extension-based only (``.md``) -- documentation-only tasks author
+        markdown, never other file types.
+        """
+        return path.lower().endswith(".md")
+
+    @classmethod
+    def _is_chore_path(cls, path: str) -> bool:
+        """Return True if the path is a dependency/config/lockfile entry.
+
+        Used by the ``chore`` task-type invariant (FR-4.1). Reuses the
+        existing config/dependency tiers already tracked by
+        ``_NON_PY_EXTS_TO_TIER`` (HCL, YAML, JSON, XML, TOML) -- excluding
+        Markdown, which the ``docs`` task type owns instead -- plus a small
+        set of lockfile/legacy-config extensions with no dedicated tier
+        entry.
+        """
+        lower = path.lower()
+        if any(lower.endswith(ext) for ext in cls._CHORE_EXTRA_EXTS):
+            return True
+        return any(lower.endswith(ext) for ext, tier in cls._NON_PY_EXTS_TO_TIER.items() if tier != "Markdown")
 
     @staticmethod
     def _is_real_manifest_path(path: str) -> bool:
@@ -2316,6 +2377,123 @@ class BacklogManager:
                         f"{source_stem!r}, e.g., tests/unit/test_{source_stem}.py). "
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
+
+    def _check_task_type_taxonomy(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 21: six-type task taxonomy and per-type Manifest invariants (FR-4.1).
+
+        Parses the optional ``## Task Type:`` section (defaulting to
+        ``DEFAULT_TASK_TYPE`` when absent, per AC-46) and enforces the
+        per-type Changes Manifest invariant from the FR-4.1 taxonomy table:
+
+        - ``behavior-fix`` / ``feature`` (RED-gated, ``GATED_TASK_TYPES``):
+          the Manifest must contain at least one production-source row.
+        - ``test-only``: every Manifest row must be a test path.
+        - ``docs``: every Manifest row must be a documentation/markdown path.
+        - ``chore``: every Manifest row must be a dependency/config/lockfile
+          path.
+        - ``refactor``: exempt from the per-row invariants enforced here --
+          its green-green runtime requirement is a TDD-cycle-log concern,
+          out of scope for this static Manifest check.
+
+        An unrecognized ``## Task Type:`` value fails naming the full
+        allowed set (AC-45). Every invariant rejection names the offending
+        row_id, the declared type, and the violated invariant (AC-E4-F2-S1-T1-5).
+
+        Production/test classification reuses ``_is_production_source`` /
+        ``_is_test_source_path`` (Rule 14) exclusively -- no independent
+        classifier exists for that boundary (AC-47).
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            declared = self._extract_task_type(content)
+            task_type = declared if declared is not None else DEFAULT_TASK_TYPE
+
+            if task_type not in VALID_TASK_TYPES:
+                errors.append(
+                    f"{row_id}: unrecognized '## Task Type:' value {task_type!r}. "
+                    f"Allowed values: {', '.join(sorted(VALID_TASK_TYPES))}. "
+                    f"See docs/backlog-contract.md 'Task-Type Taxonomy'."
+                )
+                continue
+
+            if task_type == TASK_TYPE_REFACTOR:
+                continue
+
+            try:
+                manifest_paths = [m.file for m in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            paths = [p for p in manifest_paths if self._is_real_manifest_path(p)]
+            self._check_task_type_manifest_invariant(row_id, task_type, paths, errors)
+
+    # Per-type Manifest invariant: type -> (row classifier, human description).
+    # ``behavior-fix`` / ``feature`` are handled separately in
+    # ``_check_task_type_manifest_invariant`` (an aggregate "at least one"
+    # check, not a per-row classifier). ``refactor`` never reaches the
+    # dispatcher -- the caller filters it out before parsing the Manifest.
+    _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[str, str]]] = {
+        TASK_TYPE_TEST_ONLY: ("_is_test_source_path", "test"),
+        TASK_TYPE_DOCS: ("_is_documentation_path", "documentation/markdown"),
+        TASK_TYPE_CHORE: ("_is_chore_path", "dependency/config/lockfile"),
+    }
+
+    def _check_task_type_manifest_invariant(
+        self,
+        row_id: str,
+        task_type: str,
+        paths: list[str],
+        errors: list[str],
+    ) -> None:
+        """Dispatch to the per-type Changes Manifest invariant for ``task_type``.
+
+        ``behavior-fix`` / ``feature`` (``GATED_TASK_TYPES``) require an
+        aggregate check -- at least one production-source row anywhere in
+        the Manifest. ``test-only`` / ``docs`` / ``chore`` require a
+        per-row check via ``_TASK_TYPE_ROW_INVARIANTS`` -- every row must
+        classify as that type's allowed path shape.
+        """
+        if task_type in GATED_TASK_TYPES:
+            if not any(self._is_production_source(p) for p in paths):
+                errors.append(
+                    f"{row_id}: task type {task_type!r} requires at least "
+                    f"one production-source row in the Changes Manifest, "
+                    f"but none was found -- task-type invariant violated. "
+                    f"See docs/backlog-contract.md 'Task-Type Taxonomy'."
+                )
+            return
+
+        # Every VALID_TASK_TYPES member partitions into exactly one of
+        # GATED_TASK_TYPES (handled above), TASK_TYPE_REFACTOR (filtered
+        # by the caller before this method is reached), or a key in
+        # _TASK_TYPE_ROW_INVARIANTS -- direct indexing (not .get()) so a
+        # future type added to VALID_TASK_TYPES without a matching entry
+        # here raises immediately (fail-fast) instead of silently
+        # skipping its invariant.
+        classifier_name, description = self._TASK_TYPE_ROW_INVARIANTS[task_type]
+        classifier = getattr(self, classifier_name)
+        for path in paths:
+            if not classifier(path):
+                errors.append(
+                    f"{row_id}: task type {task_type!r} allows only "
+                    f"{description} rows in the Changes Manifest, but "
+                    f"{path!r} is not a {description} path -- task-type "
+                    f"invariant violated. See docs/backlog-contract.md "
+                    f"'Task-Type Taxonomy'."
+                )
 
     # ------------------------------------------------------------------
     # E209: Backlog-Contract Alignment hardening rules
@@ -2858,6 +3036,20 @@ class BacklogManager:
         """
         m = re.search(r"\*\*Repo:\*\*\s*`([^`]+)`", content)
         return m.group(1) if m else None
+
+    @staticmethod
+    def _extract_task_type(content: str) -> str | None:
+        """Extract the declared ``## Task Type:`` value from a work-unit body.
+
+        Returns the lowercased, whitespace-trimmed value, or ``None`` if the
+        section is absent (callers apply ``DEFAULT_TASK_TYPE`` in that case).
+        Value casing/whitespace is normalized here so authors may write
+        ``Test-Only`` or ``  docs  `` without tripping the taxonomy check.
+        """
+        m = TASK_TYPE_LINE_RE.search(content)
+        if not m:
+            return None
+        return m.group(2).strip().lower()
 
     @staticmethod
     def _is_task_id(unit_id: str) -> bool:

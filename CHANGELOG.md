@@ -3,6 +3,31 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] -- v-next
+
+### Fixed
+
+- **A work unit's commit could absorb another unit's unstaged changes.** Both
+  commit paths ran `git add -A`, staging the entire working tree and committing
+  it under the current unit's message, so any file another in-flight unit had
+  left modified-but-unstaged was swept in. The guard meant to prevent exactly
+  this could not see it: `assert_staged_matches_manifest` reads
+  `git diff --cached`, which by definition excludes unstaged changes, so it
+  verified the index, passed, and then `add -A` staged everything the check had
+  just ignored. The victim task was then unrecoverable -- its declared files
+  committed under another unit's name, failing `changes_manifest` permanently,
+  with no remedy short of an operator override or rewriting published history on
+  a shared branch. Both entry points now stage the Manifest paths the callers
+  already parse for the scope check. There is no degraded mode: a caller that
+  cannot resolve a Manifest, or whose Manifest holds only execution-time
+  sentinels, is refused rather than silently given a whole-tree commit.
+  `git-ops-finalize`, which batches many units and legitimately has no single
+  Manifest, opts into whole-tree staging explicitly via `stage_all`.
+
+  **Behaviour change:** `devbench git-ops` now exits non-zero when it cannot
+  resolve the work unit's file. Previously it warned and committed anyway. The
+  post-commit audit-comment write remains best-effort and never fails the run.
+
 ## [0.2.0] -- 2026-07-29
 
 This release bundles the orchestrator self-healing work, the canonical

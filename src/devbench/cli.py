@@ -3826,11 +3826,14 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     # class of bug deterministically before commit. Skipped only when the
     # work-unit file isn't resolvable (orchestrator runs without a backlog
     # context never reach this path in practice).
-    if wu_file is not None:
-        manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
+    if _refuse_unscoped_commit(unit_id, wu_file):
+        return 1
+    assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
+    manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+    manifest_files = [r.file for r in manifest_rows]
+    assert_staged_matches_manifest(repo_path, manifest_files)
 
-    ops.commit_local(canonical_repo, repo_path, branch, commit_message)
+    ops.commit_local(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
     logger.info("Committed locally (deferred PR): %s on %s", unit_id, branch)
     if wu_file is not None:
         mgr._append_agent_comment(wu_file, "git_ops", f"[COMMIT_DEFERRED] {commit_message}")
@@ -4693,6 +4696,25 @@ def _resolve_orphan_repo_path(arg: str) -> Path | None:
     return None
 
 
+def _refuse_unscoped_commit(unit_id: str, wu_file: Path | None) -> bool:
+    """Return True (and explain) when the commit cannot be scoped to a Manifest.
+
+    The Changes Manifest is the only thing that bounds what a work unit's commit
+    may contain. Without it, staging would absorb any other in-flight unit's
+    changes under this unit's message -- the defect behind commit b5201cb, which
+    left the victim task permanently unable to pass ``changes_manifest``.
+    Refusing is recoverable; committing an unknown scope is not.
+    """
+    if wu_file is not None:
+        return False
+    print(
+        f"ERROR: cannot resolve the work-unit file for {unit_id}; refusing to commit "
+        "because its Changes Manifest is the only thing that scopes the commit.",
+        file=sys.stderr,
+    )
+    return True
+
+
 def cmd_git_ops(unit_id: str) -> int:
     """Run the full git operations sequence for a completed work unit.
 
@@ -4731,26 +4753,24 @@ def cmd_git_ops(unit_id: str) -> int:
     ops = GitOpsService()
 
     wu_file = _resolve_unit_file(unit)
-    if wu_file is None:
-        logger.warning("Could not resolve work unit file for %s -- audit comments will be skipped", unit_id)
-
     mgr = BacklogManager()
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
 
-    # Orphan-pattern check (see _git_ops_deferred for rationale): refuse
-    # the commit on detection, auto-emit cleanup proposal, return non-zero.
-    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
+    # Two pre-commit refusals: orphan-pattern pollution (see _git_ops_deferred
+    # for rationale, auto-emits a cleanup proposal) and an unscopeable commit.
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path) or _refuse_unscoped_commit(unit_id, wu_file):
         return 1
 
-    # Manifest-scope check: every staged path must be in the work unit's
-    # Changes Manifest. Catches scope-violation pollution deterministically
-    # before commit. Skipped only when the work-unit file isn't resolvable.
-    if wu_file is not None:
-        manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
+    # Manifest-scope check: every staged path must be in the work unit's Changes
+    # Manifest. Catches scope-violation pollution deterministically before the
+    # commit, and supplies the pathspec that scopes the commit itself.
+    assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
+    manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+    manifest_files = [r.file for r in manifest_rows]
+    assert_staged_matches_manifest(repo_path, manifest_files)
 
-    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
+    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
     logger.info("Committed and pushed %s", unit_id)
 
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
@@ -5344,7 +5364,16 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     ops = GitOpsService()
     mgr = BacklogManager()
 
-    ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
+    ops.commit_and_push(
+        canonical_repo,
+        repo_path,
+        branch,
+        FINALIZE_COMMIT_TEMPLATE.format(branch=branch),
+        # The finalize commit batches every work unit already committed on
+        # this branch; it has no single Changes Manifest to scope by, so the
+        # whole tree is staged deliberately rather than by omission.
+        stage_all=True,
+    )
     logger.info("Pushed branch %s to %s", branch, canonical_repo)
 
     # Issue #220: probe for an existing open PR BEFORE calling create_pr so

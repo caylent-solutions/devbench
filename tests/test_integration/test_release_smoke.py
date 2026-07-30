@@ -86,6 +86,24 @@ def _make_mock_ops(
 
 
 @pytest.mark.integration
+def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
+    """Write a minimal work-unit file carrying a real Changes Manifest.
+
+    git-ops refuses to commit when it cannot resolve a Manifest, because the
+    Manifest is the only thing that scopes the commit: without it, staging would
+    absorb any other in-flight work unit's changes. Tests that drive the commit
+    path therefore need a resolvable work-unit file rather than ``None``.
+    """
+    wu = tmp_path / f"{unit_id}.md"
+    rows = "".join(f"| `{f}` | modify |\n" for f in files)
+    wu.write_text(
+        f"# {unit_id}: Test Task\n\n## Status: in-progress\n\n"
+        f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n{rows}\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    return wu
+
+
 class TestReleaseSmoke:
     """End-to-end smoke covering every v-next exit-code path."""
 
@@ -100,7 +118,8 @@ class TestReleaseSmoke:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -121,7 +140,8 @@ class TestReleaseSmoke:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
@@ -149,7 +169,8 @@ class TestReleaseSmoke:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
@@ -172,10 +193,15 @@ class TestReleaseSmoke:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
             patch("devbench.config.PAUSE_BEFORE_MERGE", True),
+            # The unit now resolves, so the in-review status transition actually
+            # runs; it writes through BacklogManager, which this smoke test does
+            # not stand up a real BACKLOG.md for.
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
         ):
             rc = cli.cmd_git_ops("E0-F1-S1-T1")
         assert rc == 0

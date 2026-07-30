@@ -2696,6 +2696,24 @@ class TestPreParseConfig:
         assert argv == original
 
 
+def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
+    """Write a minimal work-unit file carrying a real Changes Manifest.
+
+    git-ops refuses to commit when it cannot resolve a Manifest, because the
+    Manifest is the only thing that scopes the commit: without it, staging would
+    absorb any other in-flight work unit's changes. Tests that drive the commit
+    path therefore need a resolvable work-unit file rather than ``None``.
+    """
+    wu = tmp_path / f"{unit_id}.md"
+    rows = "".join(f"| `{f}` | modify |\n" for f in files)
+    wu.write_text(
+        f"# {unit_id}: Test Task\n\n## Status: in-progress\n\n"
+        f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n{rows}\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    return wu
+
+
 @pytest.mark.unit
 class TestCmdGitOpsSubmoduleGate:
     """Tests for T3 AC-1 and AC-2: UPDATE_SUBMODULE gates update_parent_submodule_ref."""
@@ -2731,6 +2749,8 @@ class TestCmdGitOpsSubmoduleGate:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -2754,6 +2774,8 @@ class TestCmdGitOpsSubmoduleGate:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -2829,6 +2851,8 @@ class TestCmdGitOpsChecksGate:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -2988,6 +3012,8 @@ class TestCmdGitOpsPostMergeCheckout:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3016,6 +3042,8 @@ class TestCmdGitOpsPostMergeCheckout:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3064,6 +3092,8 @@ class TestCmdGitOpsConflictingRetry:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3103,6 +3133,8 @@ class TestCmdGitOpsConflictingRetry:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3619,8 +3651,13 @@ class TestCmdGitOpsEventComments:
         ):
             result = cli.cmd_git_ops(unit_id)
 
-        # Must NOT fail due to missing file -- git ops already succeeded
-        assert result == 0
+        # Contract change: the commit is refused when the work-unit file cannot
+        # be resolved, because the Changes Manifest is the only thing that scopes
+        # it -- staging blind would absorb any other in-flight unit's changes
+        # under this unit's message (the defect behind commit b5201cb). AC-7's
+        # intent is preserved for what it actually protected: the post-commit
+        # audit-comment write, which is still best-effort and never fails the run.
+        assert result == 1
 
 
 @pytest.mark.unit
@@ -5136,11 +5173,13 @@ class TestCmdGitOpsDeferMode:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.config.DEFER_PR", True),
             patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
         ):
             result = cli.cmd_git_ops("E0-F1-S1-T1")
 
@@ -5170,6 +5209,8 @@ class TestCmdGitOpsBadPrNumber:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -6148,7 +6189,8 @@ class TestGitOpsDeferred:
             patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli._git_ops_deferred(
                 "E0-F1-S1-T1",
@@ -6164,6 +6206,7 @@ class TestGitOpsDeferred:
             tmp_path,
             "feature/x",
             "E0-F1-S1-T1: Test Task",
+            manifest_files=["src/foo.py"],
         )
         output = json.loads(capsys.readouterr().out.strip())
         assert output["mode"] == "deferred"
@@ -6188,7 +6231,8 @@ class TestGitOpsDeferred:
             patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             cli._git_ops_deferred(
                 "E0-F1-S1-T1",
@@ -6421,7 +6465,8 @@ class TestCmdGitOpsFinalizeNotifications:
                 return_value=MagicMock(parse_index=MagicMock(return_value=[unit])),
             ),
             patch("devbench.cli._find_most_recent_active_task", return_value=unit),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._finalize_audit_and_block"),
         ):
             rc = cli._handle_finalize_ci_result(
@@ -7236,7 +7281,8 @@ class TestCmdStatusBlockedSplit:
             patch("devbench.cli.BacklogParser", return_value=parser),
             patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
             patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             rc = cli.cmd_status("--detail")
         assert rc == 0
@@ -7283,7 +7329,8 @@ class TestCmdStatusBlockedSplit:
                 "devbench.cli.classify_blocked_task",
                 return_value=BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
             ),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             rc = cli.cmd_status("--detail")
         assert rc == 0
@@ -12343,7 +12390,8 @@ class TestCmdCheckMerge:
         mgr = MagicMock()
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=mgr),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12357,7 +12405,8 @@ class TestCmdCheckMerge:
         ops._gh.return_value = (0, "[]", "")
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12369,7 +12418,8 @@ class TestCmdCheckMerge:
         ops._gh.return_value = (1, "", "boom")
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12381,7 +12431,8 @@ class TestCmdCheckMerge:
         ops._gh.return_value = (0, "{not json", "")
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -13869,10 +13920,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
@@ -13905,10 +13958,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
@@ -13941,10 +13996,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
@@ -13977,10 +14034,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
@@ -14015,10 +14074,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 1),
@@ -14064,10 +14125,13 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_a_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
@@ -14091,7 +14155,8 @@ class TestCmdGitOpsMultiPrReplay:
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_b_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),

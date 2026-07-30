@@ -1040,7 +1040,19 @@ Append a non-verdict agent comment to the work-unit file's `## Comments` section
 uv run devbench log-tdd <id> <RED|GREEN|REFACTOR> <message>
 ```
 
-Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. Enforces the phase token (must be `RED`, `GREEN`, or `REFACTOR`, case-insensitive).
+Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. `devbench.constants.VALID_TDD_PHASES` names four phases -- `RED`, `GREEN`, `REFACTOR`, `RED_OBSERVED` -- but this agent-facing verb accepts only the agent-writable subset (`devbench.constants.AGENT_WRITABLE_TDD_PHASES`): `RED`, `GREEN`, `REFACTOR` (case-insensitive).
+
+`RED_OBSERVED` is a valid phase overall but is orchestrator-only (`devbench.constants.ORCHESTRATOR_ONLY_TDD_PHASES`). An agent invocation naming `RED_OBSERVED` -- for example `uv run devbench log-tdd <id> RED_OBSERVED <message>` -- is always rejected: `cmd_log_tdd` exits 1 and writes nothing to the `## TDD Cycle Log` section, printing:
+
+```
+ERROR: TDD phase 'RED_OBSERVED' is orchestrator-only and cannot be written via log-tdd; agent-writable phases are: GREEN, RED, REFACTOR.
+```
+
+The `RED_OBSERVED` entry itself is written exclusively by the orchestrator's internal `write_red_observed_entry` function after it independently runs the test suite and observes a nonzero exit code; there is no `log-tdd-red-observed` CLI subcommand an agent could invoke. The record is a fixed three-field message, not free text -- every field in `devbench.constants.RED_OBSERVED_RECORD_FIELDS` is required: `exit_code` (the test-runner's observed exit code), `test_node_id` (the failing pytest node ID), and `failure_digest` (a hash-shaped digest of the failure output). A record missing any field is rejected before it is written, naming the missing field:
+
+```
+RED_OBSERVED record is missing required field '<field>'.
+```
 
 ---
 

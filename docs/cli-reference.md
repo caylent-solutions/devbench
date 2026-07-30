@@ -63,7 +63,7 @@ The summary includes a `Draft N` row rendered between the `TOTAL` line and the `
 
 - `--session <name>` -- filter the output to the work units claimed by the named session. Only events emitted under `session=<name>` are counted; the status counts and active-task list reflect that session's view only. Without `--session`, the command aggregates across all active sessions and renders the unified backlog state. See [Named sessions](#named-sessions) for the full session reference.
 
-When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
+When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. The file is a JSON object with `include`, `exclude`, `expanded_ids`, `started_at` and `started_by`; a scope file in any other shape is rejected rather than guessed at. A session that runs unscoped writes no `scope.json` at all, since absent is how every reader expresses "no scope". When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
 
 ```
 SCOPE: include=[E1-E3, E5] exclude=[] (started 2026-05-14T13:42Z)

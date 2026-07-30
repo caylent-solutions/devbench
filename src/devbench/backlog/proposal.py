@@ -1635,11 +1635,44 @@ def list_proposals(workspace_root: Path) -> list[Proposal]:
 
 
 def _find_draft_file(backlog_root: Path, task_id: str) -> Path | None:
-    """Return the draft .md path for a proposed task ID, or ``None`` if missing."""
-    story_id = _extract_story_id(task_id)
-    story_dir = _story_dir(backlog_root, story_id)
-    target = story_dir / f"{task_id}.md"
-    return target if target.is_file() else None
+    """Return the work-unit .md path for ``task_id``, or ``None`` if it does not exist.
+
+    Issue #302: this previously looked in exactly one directory, the story
+    directory ``_story_dir`` computes for the ID. A work unit that lives
+    anywhere else was reported as absent, and callers act on that: a
+    proposal whose task already exists is classified ``UNMATERIALISED``,
+    so the orchestrate loop's opening ``sweep-proposals`` materialises it
+    again, in the canonical directory this time, producing two files and
+    two index rows under one ID. That repeated on every start, and each
+    replay had to be undone by hand.
+
+    A work-unit ID identifies one work unit wherever its file sits, so the
+    search is over the whole backlog tree.
+
+    Args:
+        backlog_root: Root of the backlog tree (``<workspace>/backlog``).
+        task_id: Work-unit identifier, e.g. ``E1-F2-S3-T4``.
+
+    Returns:
+        The single matching path, or ``None`` when no file exists.
+
+    Raises:
+        ProposalError: When more than one file carries this ID. Returning
+            either one would make every downstream decision depend on
+            directory-walk order; the duplicate is a backlog-integrity
+            fault that ``validate-backlog`` reports and an operator
+            resolves.
+    """
+    matches = sorted(p for p in backlog_root.rglob(f"{task_id}.md") if p.is_file())
+    if not matches:
+        return None
+    if len(matches) > 1:
+        rendered = ", ".join(str(p.relative_to(backlog_root)) for p in matches)
+        raise ProposalError(
+            f"duplicate work-unit file for {task_id!r}: {len(matches)} files carry this ID ({rendered}). "
+            "One ID must map to exactly one file; run 'devbench validate-backlog' and remove the duplicate."
+        )
+    return matches[0]
 
 
 def _rewrite_status(md_path: Path, new_status: str) -> None:

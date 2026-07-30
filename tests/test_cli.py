@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 import subprocess
 import types
@@ -5905,8 +5906,16 @@ class TestCmdStartNameFlag:
         assert started_by_path.read_text(encoding="utf-8").strip() == getpass.getuser()
 
     @pytest.mark.unit
-    def test_scope_json_written_when_no_include(self, tmp_path: Path) -> None:
-        """AC-192-1: scope.json is written to the session dir (empty scope when no --include)."""
+    def test_no_scope_json_written_when_no_include(self, tmp_path: Path) -> None:
+        """Issue #270: an unscoped session writes no scope.json at all.
+
+        This previously wrote a bare JSON array (``[]``). Every reader
+        requires the canonical object, and the array lands on the same path
+        the object writer uses, so the next read raised
+        ``scope.json top-level payload must be an object, got 'list'`` on
+        every unscoped run. Absent is the documented unscoped signal, so
+        writing nothing is both correct and readable.
+        """
         import sys
 
         mock_sdk = self._make_mock_sdk()
@@ -5919,7 +5928,9 @@ class TestCmdStartNameFlag:
 
         assert rc == 0
         scope_path = tmp_path / ".devbench" / "sessions" / "epsilon" / "scope.json"
-        assert scope_path.is_file(), f"Expected scope.json at {scope_path}"
+        assert not scope_path.exists(), f"unscoped session must not write {scope_path}"
+        # The session directory itself is still created and populated.
+        assert (tmp_path / ".devbench" / "sessions" / "epsilon" / "pid").is_file()
 
     @pytest.mark.unit
     def test_registry_json_updated(self, tmp_path: Path) -> None:
@@ -13127,20 +13138,12 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
                 ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
             ],
         )
-        # The promoter resolves the draft via _find_draft_file which expects
-        # the layout backlog/E0/E0-F1/E0-F1-S1/<id>.md. Replicate that here
-        # so the auto-promote actually finds the draft.
-        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        story_dir.mkdir(parents=True)
-        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
-        # Re-point the BACKLOG.md row to the nested location.
-        idx_text = index.read_text()
-        index.write_text(
-            idx_text.replace(
-                "`backlog/E0-F1-S1-T2.md`",
-                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md`",
-            )
-        )
+        # Issue #302: this test used to write a SECOND copy of the draft into
+        # backlog/E0/E0-F1/E0-F1-S1/ because _find_draft_file only looked in
+        # that one computed directory, leaving two files under one ID. The
+        # resolver now finds the unit wherever it lives, so the flat file
+        # _cascade_build_backlog already wrote is enough, and the duplicate
+        # the workaround created would now be refused outright.
 
         runtime_with_auto_accept = RuntimeConfig(task_factory=TaskFactoryConfig(auto_accept_proposals=True))
         with (
@@ -13155,8 +13158,9 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
         # only the orphan promote pass touches T2.
         out = capsys.readouterr().out
         assert "orphan auto-promoted 1" in out
-        # T2 transitioned to in-queue via promote_proposal.
-        t2_md = (story_dir / "E0-F1-S1-T2.md").read_text()
+        # T2 transitioned to in-queue via promote_proposal, resolved from the
+        # flat layout the fixture wrote rather than a hand-replicated nested one.
+        t2_md = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
         assert "## Status: in-queue" in t2_md
 
     def test_orphan_promote_skipped_when_toggle_off(
@@ -20742,3 +20746,56 @@ class TestLogQuarantine:
         ):
             cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
         assert any("quarantine audit comment failed" in r.getMessage() for r in caplog.records)
+
+
+class TestSessionScopeJsonShape:
+    """Issue #270: the per-session scope.json must be readable by its readers.
+
+    ``_write_session_state_files`` wrote a bare JSON array of IDs while every
+    reader requires the canonical object. Both land on the same path, because
+    ``resolve_scope_file_path`` routes there whenever DEVBENCH_SESSION_NAME is
+    set, so the array overwrote the object and the next read raised
+    ``scope.json top-level payload must be an object, got 'list'``.
+    """
+
+    @staticmethod
+    def _scope_path(tmp_path: Path, session: str = "s1") -> Path:
+        return tmp_path / ".devbench" / "sessions" / session / "scope.json"
+
+    def test_unscoped_session_writes_no_scope_file(self, tmp_path: Path) -> None:
+        """Absent is the unscoped signal; an empty scope would claim the opposite."""
+        cli._write_session_state_files(tmp_path, "s1", 4242, [])
+        assert not self._scope_path(tmp_path).exists()
+        assert (tmp_path / ".devbench" / "sessions" / "s1" / "pid").read_text() == "4242"
+
+    def test_scoped_session_writes_a_readable_object(self, tmp_path: Path) -> None:
+        cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1", "E1-F1-S1-T2"])
+        payload = json.loads(self._scope_path(tmp_path).read_text(encoding="utf-8"))
+        assert isinstance(payload, dict), f"payload must be an object, got {type(payload).__name__}"
+        assert sorted(payload["expanded_ids"]) == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
+        for field in ("include", "exclude", "expanded_ids", "started_at", "started_by"):
+            assert field in payload, f"canonical field {field!r} missing"
+
+    def test_written_scope_round_trips_through_the_reader(self, tmp_path: Path) -> None:
+        """The regression: writing then reading used to raise TypeError."""
+        from devbench.scope import ScopeFilter
+
+        cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1"])
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "s1"}):
+            restored = ScopeFilter.from_file(tmp_path)
+        assert restored.expanded_ids == {"E1-F1-S1-T1"}
+
+    def test_a_stale_array_scope_file_is_removed_when_the_session_is_unscoped(self, tmp_path: Path) -> None:
+        """A workspace carrying the old corrupt file must recover on next start."""
+        stale = self._scope_path(tmp_path)
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("[]", encoding="utf-8")
+        cli._write_session_state_files(tmp_path, "s1", 4242, [])
+        assert not stale.exists()
+
+    def test_a_stale_array_scope_file_is_replaced_when_the_session_is_scoped(self, tmp_path: Path) -> None:
+        stale = self._scope_path(tmp_path)
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("[]", encoding="utf-8")
+        cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1"])
+        assert isinstance(json.loads(stale.read_text(encoding="utf-8")), dict)

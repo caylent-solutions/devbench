@@ -7,6 +7,51 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every orchestrator start re-materialised a consumed proposal and recreated
+  a duplicate work unit** (issue #302). `_find_draft_file` looked in exactly
+  one directory, the story directory computed from the ID. A work unit living
+  anywhere else read as absent, so `classify_proposed_task` reported it
+  `UNMATERIALISED` and the orchestrate loop's opening `sweep-proposals`
+  created it again in the canonical location, leaving two files and two index
+  rows under one ID. Recovering cost roughly four minutes of orchestrator
+  turns before any work unit was claimed, and it repeated on every start. A
+  work-unit ID identifies one unit wherever its file sits, so the lookup now
+  searches the backlog tree and refuses, rather than picking arbitrarily, when
+  two files carry one ID. Separately, `sweep-proposals` now deletes a proposal
+  once every task in it is resolved; leaving the JSON on disk also pinned the
+  source task to `AWAITING_AMENDMENT_RECOVERY` indefinitely.
+
+- **Quoting a `[BLOCKED_PENDING_PROPOSAL]` token inside a comment created a
+  live marker** (issue #304). The scanner matched the token anywhere in the
+  `## Comments` body, so an audit comment recording that a marker had been
+  removed, quoting the removed line verbatim, silently re-blocked the unit on
+  the quoted ID. The file read as correct to a human, because the only
+  occurrence sat inside quotation marks, and agents write such narratives
+  routinely. Both writers emit the marker as the final token of an audit row,
+  so the pattern is now anchored there: writing *about* a marker no longer
+  creates one.
+
+- **An unscoped session wrote a `scope.json` its own readers reject** (issue
+  #270). Session startup wrote a bare JSON array of IDs while
+  `ScopeFilter.from_file` and `_read_scope_payload` require the canonical
+  object. The two writers target the same path, because `resolve_scope_file_path`
+  routes there whenever `DEVBENCH_SESSION_NAME` is set, so the array overwrote
+  the object and every subsequent read raised
+  `scope.json top-level payload must be an object, got 'list'`. Scoped
+  sessions now write the canonical payload; unscoped sessions write no file,
+  since absent is how every reader already expresses "no scope", and an empty
+  scope would assert a filter matching nothing. A stale array file left by an
+  earlier version is cleared on the next start.
+
+- **`devbench status` crashed with a traceback where `report` diagnosed**
+  (issue #305). A missing work-unit file or a malformed index escaped `status`
+  as a raw `FileNotFoundError` while `report` reported the same condition with
+  an actionable message and a non-zero exit. An operator running both saw a
+  crash and a clean error for one underlying state. The handler is now shared,
+  so the two cannot drift apart, and it still distinguishes a missing file
+  (possibly a transient writer-window race; re-run) from a malformed index
+  (run `validate-backlog`).
+
 - **The test suite wrote into the live workspace and orchestrator log**
   (issue #292). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
   `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH` with `os.environ.setdefault`,

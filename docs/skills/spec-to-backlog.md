@@ -154,5 +154,5 @@ The audit tags flow through the existing `devbench report` and
 - [`docs/skills/create-spec.md`](create-spec.md) -- the upstream skill that authors the spec
 - [`docs/skills/configure-devbench.md`](configure-devbench.md) -- configure devbench.yaml before running
 - [`docs/creating-specs-and-backlogs.md`](../creating-specs-and-backlogs.md) -- manual backlog authoring guide
-- [`docs/backlog-contract.md`](../backlog-contract.md) -- validate-backlog rule set (20 rules)
+- [`docs/backlog-contract.md`](../backlog-contract.md) -- validate-backlog rule set (21 rules)
 - [`docs/onboarding.md`](../onboarding.md) -- chained-skill operator workflow

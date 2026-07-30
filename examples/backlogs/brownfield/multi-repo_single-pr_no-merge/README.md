@@ -3,7 +3,8 @@
 A real-world DevBench backlog promoting `before/spec/kanon-list-add-lock-features-spec.md`
 into **207 work units across 13 epics + 14 features** driving three target repos
 in coordinated single-PR-per-repo runs with auto-finalize, auto-merge, and
-CI-failure retry. `devbench validate-backlog` passes clean.
+CI-failure retry. `devbench validate-backlog` passed clean against the
+20-rule contract in force when this snapshot was captured (predates rule 21).
 
 ## `before/` vs `after/`
 
@@ -34,7 +35,7 @@ so readers can see at a glance:
 | **PR review-comment polling** | `pr_review_resolution.enabled: true` + `decision_blocks: true`. The orchestrator polls `gh pr view` between CI-pass and merge for review-bot comments (Copilot, Amazon Q, internal services); `reviewDecision == CHANGES_REQUESTED` is a hard merge-block regardless of bot allowlist. |
 | **Manifest amendment + task factory** | `manifest_amendment.enabled: true` (TDD-green production fixes), `task_factory.enabled: true` + `auto_accept_proposals: true` (the blocker-resolver decomposes out-of-scope work into proposed drafts; the orchestrator promotes them automatically). |
 | **Brownfield realism** | Backlog edits THREE pre-existing repos (none of which were created for this example). Migration paths cover deprecation shims (E6 `kanon bootstrap`), bundled-content removal (E6-F2 catalog mirror), per-entry XML migration (E11), and read-only audit-only repos (E13). |
-| **Validate-backlog clean** | Every work unit passes the 20 backlog-contract rules: H1 heading, status, dep DAG acyclic, manifest conflicts serialised, source/test atomicity, no em-dashes, no orphan path tokens, AC/DoD/Manifest internally consistent. |
+| **Validate-backlog clean** | Every work unit passed the 20 backlog-contract rules in force when this snapshot was captured (predates rule 21): H1 heading, status, dep DAG acyclic, manifest conflicts serialised, source/test atomicity, no em-dashes, no orphan path tokens, AC/DoD/Manifest internally consistent. |
 
 ## Mode in one phrase: single-PR + no-manual-merge
 
@@ -212,6 +213,7 @@ file ships at `/path/to/kanon-deps-work/devbench-commands.txt` in any live run.
   canonical project README; links back to this example under "Real-world
   backlog examples".
 - [`../../../docs/backlog-contract.md`](../../../docs/backlog-contract.md) --
-  the 20 rules every work unit must satisfy; this example passes them all.
+  the rule set in force when this snapshot was captured (20 rules; predates
+  rule 21); this example passed them all at capture time.
 - [`../../../docs/creating-specs-and-backlogs.md`](../../../docs/creating-specs-and-backlogs.md) --
   the authoring guide this example follows.

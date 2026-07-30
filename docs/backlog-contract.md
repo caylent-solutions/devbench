@@ -183,7 +183,7 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
 20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default on; set `false` to opt out per workspace)
-21. Task-Type taxonomy (every Task's `## Task Type:` value -- or the `behavior-fix` default when the section is absent -- must be one of the six recognized types, and its Changes Manifest must satisfy that type's per-type invariant; see "Task-Type Taxonomy Rule (FR-4.1)" below)
+21. Task-Type taxonomy (a Task that declares a `## Task Type:` value must use one of the six recognized types, and its Changes Manifest must satisfy that type's per-type invariant; a Task with no `## Task Type:` section defaults to `behavior-fix`, the strictest type, so omitting the section is never an escape hatch; terminal Tasks -- `done` / `declined` -- are skipped entirely; see "Task-Type Taxonomy Rule (FR-4.1)" below)
 
 Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rule 21 was added by FR-4.1 (E4-F2-S1-T1) to stop RED-gated Tasks from shipping a Manifest with zero production-source rows and to keep `test-only` / `docs` / `chore` Tasks honest about the files they claim to touch. Together they catch hand-edited drift that the runtime parser would later silently survive.
 
@@ -234,17 +234,39 @@ as `VALID_TASK_TYPES`; no call site hard-codes the type strings):
 
 | Type | RED-gated | Changes Manifest invariant |
 |------|-----------|-----------------------------|
-| `behavior-fix` (default) | Yes | At least one production-source row. |
+| `behavior-fix` | Yes | At least one production-source row. |
 | `feature` | Yes | At least one production-source row. |
 | `test-only` | No | Every row must be a test path. |
 | `refactor` | No | No per-row invariant -- its requirement is green-green (tests pass before AND after the change), which is a TDD-cycle-log concern, not a static Manifest shape. |
 | `docs` | No | Every row must be a documentation/markdown (`.md`) path. |
 | `chore` | No | Every row must be a dependency/config/lockfile path. |
 
-If the `## Task Type:` section is omitted entirely, the Task defaults to
-`behavior-fix` (`DEFAULT_TASK_TYPE`) -- the strictest type -- so an author
-who forgets to declare a type still gets the RED-gate protection rather
-than silently skipping it (fail-safe default).
+If the `## Task Type:` section is omitted entirely, the Task defaults
+to `behavior-fix` -- the strictest type -- and the `behavior-fix`
+invariant (at least one production-source Manifest row) is enforced
+exactly as if the section had been declared explicitly. This fail-safe
+default is deliberate: a task type is not an escape hatch, so a Task
+cannot dodge the RED gate simply by omitting the section. The
+scaffolding template (`backlog/templates/task.md`) writes the literal
+value `behavior-fix` into every newly created Task, so the default
+path and the explicit declaration converge on the same value for
+freshly authored Tasks.
+
+Terminal Tasks (`done` or `declined`) are skipped by rule 21
+entirely, regardless of whether they declare a `## Task Type:`
+section: a Task that has already reached a terminal status cannot be
+retroactively rejected for a taxonomy violation, matching the
+precedent set by rule 19's own terminal-status skip.
+
+**Interaction with sentinel Manifests.** Rule 21 is NOT one of the
+rules sentinel values are exempt from (see "Sentinel Manifest Values"
+below). `_is_real_manifest_path` strips sentinel tokens before this
+rule's classification runs, so a sentinel-only Manifest always
+presents zero rows to the gated-type check. A sentinel-only Task
+therefore MUST declare a non-gated `## Task Type:` (`test-only`,
+`refactor`, `docs`, or `chore`); leaving the section absent, or
+declaring `behavior-fix` / `feature`, fails the zero-production-source
+invariant.
 
 An unrecognized `## Task Type:` value fails validation naming the full
 allowed set:
@@ -260,9 +282,9 @@ and the violated invariant:
 
 ```
 EX-F1-S1-T1: task type 'docs' allows only documentation/markdown rows in
-the Changes Manifest, but 'src/devbench/cli.py' is not a documentation
-path -- task-type invariant violated. See docs/backlog-contract.md
-'Task-Type Taxonomy'.
+the Changes Manifest, but 'src/devbench/cli.py' is not a
+documentation/markdown path -- task-type invariant violated. See
+docs/backlog-contract.md 'Task-Type Taxonomy'.
 ```
 
 ```
@@ -345,7 +367,7 @@ All sections below are required unless noted as optional.
 
 ## Status: {status}
 
-## Task Type: {type}         ← optional; one of behavior-fix (default) / feature / test-only / refactor / docs / chore
+## Task Type: {type}         ← optional; one of behavior-fix / feature / test-only / refactor / docs / chore; absent defaults to behavior-fix under rule 21 (the scaffolding template also writes behavior-fix by default)
 
 ## Target Repository
 
@@ -433,6 +455,21 @@ one of the accepted sentinel values in place of a real path. Sentinels
 are exempt from the Manifest Conflict Rule, the source-test atomicity
 rule, and the orphan-path-token rule.
 
+**Sentinels are NOT exempt from the Task-Type Taxonomy Rule (rule
+21).** `_is_real_manifest_path` strips every sentinel token before
+rule 21's per-type invariant runs, so a sentinel-only Manifest always
+resolves to zero real rows. A gated type (`behavior-fix`, the default
+when `## Task Type:` is omitted, or `feature`) requires at least one
+production-source row, and zero rows never satisfies that -- a
+sentinel-only Task with no `## Task Type:` section, or an explicit
+`behavior-fix` / `feature` declaration, is therefore rejected by rule
+21 even though the Manifest Conflict Rule, source-test atomicity, and
+the orphan-path-token rule all wave it through. A sentinel-only Task
+MUST declare a non-gated `## Task Type:` value -- `test-only`,
+`refactor`, `docs`, or `chore` -- so the aggregate production-source
+check never fires. See "Task-Type Taxonomy Rule (FR-4.1, rule 21)"
+above.
+
 Accepted sentinel values (canonical list in
 `src/devbench/backlog/sentinels.py`):
 
@@ -498,7 +535,7 @@ Status rolls up automatically when all children reach `done`.
 | Section | Required | Populated by |
 |---------|----------|-------------|
 | `## Status:` | Yes | `devbench set-status` / `devbench mark-done` |
-| `## Task Type:` | No (defaults to `behavior-fix` when absent) | Author at creation |
+| `## Task Type:` | No (defaults to `behavior-fix` under rule 21 when absent; template also writes `behavior-fix`) | Author at creation |
 | `## Target Repository` | Yes | Author at creation |
 | `## Description` | Yes | Author at creation |
 | `## Dependencies` | Yes (empty table OK) | Author at creation |

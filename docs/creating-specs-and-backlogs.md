@@ -182,6 +182,8 @@ Valid `## Status:` values: `in-queue`, `in-progress`, `in-review`, `done`, `bloc
 
 ## Status: in-queue
 
+## Task Type: behavior-fix    ← optional; one of behavior-fix / feature / test-only / refactor / docs / chore; absent defaults to behavior-fix under validate-backlog rule 21. See [docs/backlog-contract.md](backlog-contract.md) 'Task-Type Taxonomy'.
+
 ## Target Repository
 
 - **Repo:** `org/repo`

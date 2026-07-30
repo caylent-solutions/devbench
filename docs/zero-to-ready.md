@@ -775,7 +775,7 @@ file. Common patterns:
 
 Iterate: fix the reported error, re-run `validate-backlog`, repeat until exit 0.
 
-For the complete rule list (20 rules as of v-next), see
+For the complete rule list (21 rules as of v-next), see
 [`docs/backlog-contract.md`](backlog-contract.md) (ref).
 
 ---
@@ -889,7 +889,7 @@ edit prose; Claude does. Typical content edits:
 | Fix an em-dash / orphan-path / manifest-conflict that `validate-backlog` flagged | Edit the offending file per the rule; re-run `devbench validate-backlog` |
 
 After any content edit, run `devbench validate-backlog` to confirm the file still
-satisfies the 20 backlog-contract rules, then move state with the `devbench` CLI table
+satisfies the 21 backlog-contract rules, then move state with the `devbench` CLI table
 above. Restart with `make start` once the changes are in place. A worked example of
 this two-track workflow is described in
 [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/README.md`](../examples/backlogs/brownfield/multi-repo_single-pr_no-merge/README.md).

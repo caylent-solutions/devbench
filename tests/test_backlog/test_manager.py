@@ -3703,6 +3703,62 @@ class TestIsTestSourcePath:
         assert BacklogManager._is_production_source("src/foo/bar.py") is True
 
 
+class TestIsDocumentationPath:
+    """Direct boundary tests for the ``docs`` task-type predicate (FR-4.1).
+
+    Mirrors ``TestIsTestSourcePath``: ``_is_documentation_path`` is
+    deliberately extension-based (``.md`` only), so these cases pin the
+    exact boundary rather than inferring it indirectly through
+    ``validate()`` scenarios.
+    """
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("docs/architecture.md", True),
+            ("README.md", True),
+            ("docs/guide.MD", True),
+            ("docs/guide.rst", False),
+            ("docs/guide.txt", False),
+            ("src/foo.py", False),
+            ("pyproject.toml", False),
+        ],
+    )
+    def test_documentation_path_boundary(self, path: str, expected: bool) -> None:
+        assert BacklogManager._is_documentation_path(path) is expected
+
+
+class TestIsChorePath:
+    """Direct boundary tests for the ``chore`` task-type predicate (FR-4.1).
+
+    Mirrors ``TestIsTestSourcePath``: ``_is_chore_path`` unions the
+    non-Markdown ``_NON_PY_EXTS_TO_TIER`` tiers with the chore-only
+    lockfile/legacy-config extensions in ``_CHORE_EXTRA_EXTS``. These
+    cases pin the exact boundary, including the deliberate Markdown
+    exclusion (Markdown belongs to the ``docs`` type, not ``chore``).
+    """
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("pyproject.toml", True),
+            ("uv.lock", True),
+            ("setup.cfg", True),
+            ("tox.ini", True),
+            ("requirements.txt", True),
+            ("config.yaml", True),
+            ("config.yml", True),
+            ("package.json", True),
+            ("infra/main.tf", True),
+            ("docs/guide.md", False),
+            ("README.md", False),
+            ("src/foo.py", False),
+        ],
+    )
+    def test_chore_path_boundary(self, path: str, expected: bool) -> None:
+        assert BacklogManager._is_chore_path(path) is expected
+
+
 class TestExtractTaskType:
     """Direct tests for the ``## Task Type:`` line extractor (FR-4.1 / AC-45)."""
 
@@ -3774,9 +3830,10 @@ class TestValidateTaskTypeTaxonomy:
             assert allowed in matching[0], f"Allowed-set message missing {allowed!r}: {matching[0]}"
 
     def test_missing_task_type_defaults_to_behavior_fix(self, tmp_path: Path, backlog_dir: Path) -> None:
-        """AC-45: a missing '## Task Type:' section defaults to behavior-fix (the strictest type),
-        proven by the fact that a manifest with zero production-source rows is rejected exactly
-        as it would be for an explicit behavior-fix declaration."""
+        """A missing '## Task Type:' section defaults to behavior-fix (the strictest
+        type), never to an exempt type. Proven by the fact that a manifest with zero
+        production-source rows, which WOULD be rejected for an explicit behavior-fix
+        declaration, is ALSO rejected when the section is absent."""
         self.H.make_task(
             backlog_dir,
             "EX-F1-S1-T1",
@@ -3967,6 +4024,119 @@ class TestValidateTaskTypeTaxonomy:
         assert "EX-F1-S1-T1" in message  # the row
         assert "docs" in message  # the declared type
         assert "task-type invariant" in message  # the violated invariant is named
+
+    @pytest.mark.parametrize(
+        "status,expect_error",
+        [
+            ("done", False),
+            ("declined", False),
+            ("in-queue", True),
+        ],
+    )
+    def test_terminal_status_skip_is_scoped_not_a_blanket_bypass(
+        self, tmp_path: Path, backlog_dir: Path, status: str, expect_error: bool
+    ) -> None:
+        """The terminal-status skip (manager.py:2427 'if row_status in
+        _TERMINAL_CHILD_STATUSES: continue') exempts only done/declined
+        Tasks from rule 21, not every Task. A done or declined Task with no
+        '## Task Type:' section and zero production-source rows produces NO
+        rule-21 error, while an otherwise identical in-queue Task DOES --
+        proving the skip is scoped to terminal status rather than being a
+        universal escape hatch (mutation-verified: deleting the skip
+        condition must flip the done/declined cases below from pass to
+        fail)."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `tests/unit/test_foo.py` | new |\n",
+            task_type=None,
+            status=status,
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | {status} | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "behavior-fix" in e and "production-source" in e]
+        if expect_error:
+            assert matching, (
+                f"Expected a behavior-fix zero-production-source error for "
+                f"non-terminal status={status!r}; got: {errors}"
+            )
+        else:
+            assert not matching, (
+                f"Terminal status={status!r} should be skipped by rule 21 entirely; got matching errors: {matching}"
+            )
+
+    def test_malformed_manifest_skips_taxonomy_check_without_crashing(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The ManifestParseError swallow (manager.py 'except
+        ManifestParseError: continue' inside ``_check_task_type_taxonomy``)
+        mirrors the established pattern used by every other
+        Manifest-consuming validate rule (the manifest-conflict check, the
+        AC-language-tier check, the no-glob check and the Rule 14
+        source-test pair check): when a Task's '## Changes Manifest' table
+        cannot be parsed -- here a row with 3 columns instead of the
+        required 2 -- rule 21 skips enforcement for that Task instead of
+        crashing validate() or deriving a task-type-invariant error from a
+        partially/incorrectly parsed Manifest. The malformed row is not
+        silently accepted as valid: ``parse_manifest`` genuinely raises
+        ``ManifestParseError`` for it (verified directly below).
+
+        This test does NOT claim some other rule catches the malformed
+        table on the author's behalf -- it doesn't, for a repo with no
+        configured ``checkout_directory`` (verified below: the full
+        validate() pipeline returns zero errors for this row_id). That is
+        a pre-existing gap shared by all six ManifestParseError call sites
+        in manager.py, predating this task; fixing it repo-wide is out of
+        this task's scope (AC-E4-F2-S1-T1-1..6 concern only the taxonomy).
+        What this test pins is narrower and genuinely rule-21-specific:
+        rule 21 does not crash and does not manufacture a task-type
+        diagnostic out of a table it could not fully parse.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        malformed_content = (
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | new | extra column |\n"
+        )
+        with pytest.raises(ManifestParseError):
+            parse_manifest(malformed_content)
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new | extra column |\n",
+            task_type="behavior-fix",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        taxonomy_errors = [
+            e for e in errors if "EX-F1-S1-T1" in e and ("task-type invariant" in e or "production-source" in e)
+        ]
+        assert not taxonomy_errors, (
+            f"A malformed Changes Manifest must not surface a rule-21 "
+            f"error derived from a partially parsed table; got: {taxonomy_errors}"
+        )
+        # Documents (does not merely assume) that no OTHER rule catches this
+        # malformed row for a repo without a configured checkout_directory
+        # either: the whole pipeline is silent on it today. This is the
+        # pre-existing, repo-wide gap named in the docstring above, pinned
+        # here so a future fix to any of the six sites is a deliberate,
+        # visible change to this assertion rather than an unnoticed drift.
+        all_errors_for_row = [e for e in errors if "EX-F1-S1-T1" in e]
+        assert not all_errors_for_row, (
+            f"Known pre-existing gap: no validate() rule currently surfaces "
+            f"a malformed Changes Manifest table for a repo with no "
+            f"configured checkout_directory. If this assertion starts "
+            f"failing, some rule now catches it -- update this test's "
+            f"docstring to name that rule rather than reintroducing the "
+            f"'not it, but something else' claim this test replaced; "
+            f"got: {all_errors_for_row}"
+        )
 
 
 class TestValidateRequiredSections:

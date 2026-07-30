@@ -435,6 +435,7 @@ class BacklogManager:
             allowed types, and each type's Changes Manifest rows must satisfy its
             per-type invariant (production-source presence for gated types;
             test-only / docs / chore row-shape restrictions for exempt types).
+            Terminal Tasks (``done`` / ``declined``) are skipped.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -2386,9 +2387,15 @@ class BacklogManager:
     ) -> None:
         """Check 21: six-type task taxonomy and per-type Manifest invariants (FR-4.1).
 
-        Parses the optional ``## Task Type:`` section (defaulting to
-        ``DEFAULT_TASK_TYPE`` when absent, per AC-46) and enforces the
-        per-type Changes Manifest invariant from the FR-4.1 taxonomy table:
+        Parses the optional ``## Task Type:`` section. A task with no
+        ``## Task Type:`` section defaults to ``behavior-fix`` -- the
+        strictest type -- so that a missing declaration is never an escape
+        hatch from the RED gate or the production-source Manifest
+        invariant (AC-45). Terminal Tasks (``done`` / ``declined``) are
+        skipped entirely: they predate the taxonomy and cannot be
+        retroactively failed for a missing section. Non-terminal Tasks
+        have the per-type Changes Manifest invariant from the FR-4.1
+        taxonomy table enforced:
 
         - ``behavior-fix`` / ``feature`` (RED-gated, ``GATED_TASK_TYPES``):
           the Manifest must contain at least one production-source row.
@@ -2407,6 +2414,17 @@ class BacklogManager:
         Production/test classification reuses ``_is_production_source`` /
         ``_is_test_source_path`` (Rule 14) exclusively -- no independent
         classifier exists for that boundary (AC-47).
+
+        A Task whose ``## Changes Manifest`` table cannot be parsed (e.g. a
+        row with the wrong column count) is skipped by this rule rather
+        than crashing validate() or deriving a diagnostic from a partially
+        parsed table. This mirrors the ``except ManifestParseError:
+        continue`` pattern already used by every other Manifest-consuming
+        validate rule; it does NOT imply another rule catches the malformed
+        table on the author's behalf -- for a repo with no configured
+        ``checkout_directory`` none currently does. That gap predates this
+        check and is shared by all six ManifestParseError call sites in
+        this module, so closing it is out of scope here.
         """
         from devbench.backlog.manifest import ManifestParseError, parse_manifest
 
@@ -2424,11 +2442,11 @@ class BacklogManager:
                 continue
             content = wu_path.read_text(encoding="utf-8")
             declared = self._extract_task_type(content)
-            if declared is None:
-                # Tasks without an explicit ## Task Type: section predate
-                # the taxonomy and are exempt from invariant checks.
-                continue
-            task_type = declared
+            # A Task with no explicit ## Task Type: section defaults to
+            # the strictest type (behavior-fix) rather than being exempt,
+            # so omitting the section is never a way to dodge the RED gate
+            # or the production-source Manifest invariant (AC-45).
+            task_type = declared if declared is not None else DEFAULT_TASK_TYPE
 
             if task_type not in VALID_TASK_TYPES:
                 errors.append(
@@ -2444,6 +2462,23 @@ class BacklogManager:
             try:
                 manifest_paths = [m.file for m in parse_manifest(content)]
             except ManifestParseError:
+                # Rule 21 mirrors the ManifestParseError swallow already used
+                # by every other Manifest-consuming validate rule (the
+                # manifest-conflict, AC-language-tier, no-glob and Rule 14
+                # source-test-pair checks at lines 2115, 2245, 2307 and 2358).
+                # That established pattern does NOT currently guarantee any
+                # OTHER rule surfaces the malformed Manifest either -- for a
+                # repo with no configured checkout_directory, a malformed
+                # Manifest row today produces zero validate() errors from
+                # any rule, a pre-existing gap that predates this task and
+                # spans all six ManifestParseError call sites. Rule 21
+                # deliberately follows the established (imperfect) swallow
+                # convention rather than being the one rule that either (a)
+                # crashes validate() on an already-broken table or (b)
+                # derives a task-type-invariant diagnostic from a partially
+                # parsed Manifest. Closing the underlying gap requires
+                # auditing all six sites together and is out of this task's
+                # scope (AC-E4-F2-S1-T1-1..6 concern only the taxonomy).
                 continue
             paths = [p for p in manifest_paths if self._is_real_manifest_path(p)]
             self._check_task_type_manifest_invariant(row_id, task_type, paths, errors)
@@ -3050,9 +3085,11 @@ class BacklogManager:
         """Extract the declared ``## Task Type:`` value from a work-unit body.
 
         Returns the lowercased, whitespace-trimmed value, or ``None`` if the
-        section is absent (callers apply ``DEFAULT_TASK_TYPE`` in that case).
-        Value casing/whitespace is normalized here so authors may write
-        ``Test-Only`` or ``  docs  `` without tripping the taxonomy check.
+        section is absent. Callers (``_check_task_type_taxonomy``) resolve a
+        ``None`` result to ``DEFAULT_TASK_TYPE`` (``behavior-fix``), never
+        to an exemption. Value casing/whitespace is normalized here so
+        authors may write ``Test-Only`` or ``  docs  `` without tripping
+        the taxonomy check.
         """
         m = TASK_TYPE_LINE_RE.search(content)
         if not m:

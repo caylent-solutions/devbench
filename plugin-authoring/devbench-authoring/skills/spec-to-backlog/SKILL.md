@@ -36,7 +36,9 @@ If `skills.exemplar_backlog_path` is absent OR the file does not exist, skip the
 
 **Step 1b -- The 15 canonical task-file sections (authoritative quality bar)**
 
-Every leaf task `.md` file MUST contain these 15 sections, in this order:
+Every leaf task `.md` file MUST contain these 15 sections, in this order. One further
+OPTIONAL section, `## Task Type:`, is described immediately after the list -- author it
+whenever the task is not a behaviour fix.
 
 1. `# {id}: {title}` -- top-level heading with full task ID
 2. `## Status: <value>` where `<value>` is one of `draft`, `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `declined`, `hold`. **CONSTRAINT (issue #229)**: `draft` is ONLY VALID for Task work units. The validator's `_check_status_enum` rule (see `src/devbench/backlog/manager.py`) rejects `draft` on Epic / Feature / Story with `Status "draft" is only valid for Task work units; <ID> is type <Type>.`. For non-Task levels the operator may intend a "not-ready" state -- map that intent to `hold` (the orchestrator's claim sweep promotes `in-queue` -> claimed; `hold` / `draft` / `declined` all keep the WU paused).
@@ -59,6 +61,28 @@ Every leaf task `.md` file MUST contain these 15 sections, in this order:
 13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`)
 14. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
 15. `## Comments` -- header only (blank at authoring time)
+
+
+**Step 1c -- The optional `## Task Type:` section (validate-backlog rule 21)**
+
+Directly beneath `## Status:`, a leaf task MAY declare one of six types:
+
+| Type | Use when |
+|------|----------|
+| `behavior-fix` | Fixing wrong behaviour. **This is the default when the section is absent.** |
+| `feature` | Adding new behaviour that did not exist |
+| `test-only` | Adding or repairing tests with no production change |
+| `refactor` | Restructuring with no behaviour change |
+| `docs` | Documentation or prose only, no code |
+| `chore` | Dependency bumps, config, tooling, housekeeping |
+
+Omitting the section is valid: `validate-backlog` rule 21 defaults it to `behavior-fix`,
+so pre-existing backlogs do not retroactively fail. Author it explicitly anyway. The type is
+not decoration -- it selects which TDD evidence the review tier demands, and
+`behavior-fix` / `feature` are RED-gated, meaning the executor must record a genuinely
+observed failing test before the fix. Letting a docs-only or chore task inherit the
+`behavior-fix` default forces it through a RED gate it can never satisfy, which surfaces
+much later as an unexplained review failure. Match the type to the work.
 
 ---
 

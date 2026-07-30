@@ -738,9 +738,10 @@ class BacklogManager:
         dependency counts as satisfied is an ordering accident. Totals also
         double-count the unit.
 
-        Observed shape: ``E2-F4-S3-T2`` present as ``done`` under a bare-ID
-        tree and ``declined`` under the slug tree, with the integrity check
-        reporting success.
+        Typical shape: a task materialised once into a bare-``<id>`` tree and
+        again into the ``<id>-<slug>`` tree, the two rows carrying different
+        statuses (for example ``done`` and ``declined``), with the integrity
+        check reporting success.
 
         Args:
             rows: Parsed ``(id, status, file_path)`` index rows.

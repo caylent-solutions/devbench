@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -87,7 +88,7 @@ class TestCorruptDbConnectionClosePath:
             if call_count["n"] == 1:
                 wrapped = _FailingExecuteScriptConn(conn)
                 first_wrapper.append(wrapped)
-                return wrapped  # type: ignore[return-value]
+                return cast(sqlite3.Connection, wrapped)
             return conn
 
         with patch.object(ei_mod, "_open_connection", side_effect=open_wrapped):
@@ -556,3 +557,20 @@ class TestIsoTimezone:
         result_us = _iso_to_epoch_us("2025-01-01T00:00:00")
         expected = int(datetime(2025, 1, 1, tzinfo=UTC).timestamp() * 1_000_000)
         assert result_us == expected
+
+
+class TestRowToTotalsDictWidthGuard:
+    """A row of the wrong width means the aggregate query and the key list disagree."""
+
+    def test_wrong_width_row_raises_with_both_counts(self) -> None:
+        from devbench.reporting.event_index import _row_to_totals_dict
+
+        with pytest.raises(ValueError, match="aggregate row width mismatch"):
+            _row_to_totals_dict([1, 2, 3])
+
+    def test_correct_width_row_maps_every_key(self) -> None:
+        from devbench.reporting.event_index import _TOTALS_KEYS_ORDERED, _row_to_totals_dict
+
+        result = _row_to_totals_dict([1] * len(_TOTALS_KEYS_ORDERED))
+        assert set(result) == set(_TOTALS_KEYS_ORDERED)
+        assert all(value == 1 for value in result.values())

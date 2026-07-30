@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -161,7 +161,7 @@ class TestAmendmentRequestRoundTrip:
 
     def test_non_dict_input_rejected(self) -> None:
         with pytest.raises(ValueError, match="JSON object"):
-            AmendmentRequest.from_dict("a string")  # type: ignore[arg-type]
+            AmendmentRequest.from_dict(cast(Any, "a string"))
 
     def test_missing_field_rejected(self) -> None:
         bad = _sample_request_dict()
@@ -445,7 +445,13 @@ class TestRejectAmendment:
         original_set_status = manager_mod.BacklogManager._set_status
         observed: dict[str, bool] = {"archive_present_at_mark_blocked": False}
 
-        def _spy(self, work_unit_path, backlog_index, unit_id, status):  # type: ignore[no-untyped-def]
+        def _spy(
+            self: manager_mod.BacklogManager,
+            work_unit_path: Path,
+            backlog_index: Path,
+            unit_id: str,
+            status: str,
+        ) -> None:
             # At the moment mark_blocked transitions state (and triggers
             # classify_blocked_task), the archive must already be on disk.
             if status == "blocked" and unit_id == task_id:

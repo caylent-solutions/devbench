@@ -6,7 +6,7 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -153,7 +153,7 @@ class TestProposalDataclass:
 
     def test_from_dict_rejects_non_dict(self) -> None:
         with pytest.raises(ValueError, match="must be an object"):
-            Proposal.from_dict([1, 2, 3])  # type: ignore[arg-type]
+            Proposal.from_dict(cast(Any, [1, 2, 3]))
 
     def test_from_dict_rejects_missing_top_field(self) -> None:
         payload = _sample_proposal().to_dict()

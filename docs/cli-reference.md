@@ -364,16 +364,29 @@ uv run devbench claim <id>
 
 Set the work unit's status to `in-progress`. Fails if the unit is already in a terminal state. Invoked by the orchestrate SKILL at the start of each loop iteration.
 
-`claim` refuses, with a non-zero exit and no status write, when either precondition fails:
+`claim` refuses, with a non-zero exit and no status write, when the unit's Changes Manifest still carries a placeholder row. Replace it with real file entries, or let the manifest-amendment workflow fill it in.
 
-- The unit's Changes Manifest still carries a placeholder row. Replace it with real file entries, or let the manifest-amendment workflow fill it in.
-- The unit's target checkout holds uncommitted changes outside the unit's Changes Manifest. The error names every offending path.
+**Checkout quarantine.** Before claiming, `claim` clears any uncommitted change in the unit's target checkout that falls outside that unit's Changes Manifest.
 
-The second check exists because the single-branch modes (`git_ops.single_branch` with `defer_pr`) run every work unit in one shared checkout. A unit that blocks before its work is committed leaves that work in the tree, and the next unit to claim inherits it: its commit absorbs the sibling's files under the wrong unit's message, and the review judges reject it over code it does not own and cannot fix. Refusing the claim reports the residue against the unit that produced it, before any executor or judge time is spent.
+This exists because the single-branch modes (`git_ops.single_branch` with `defer_pr`) run every work unit in one shared checkout. A unit that blocks, or a run that is interrupted, leaves its work in the tree, and the next unit to claim inherits it: its commit absorbs the sibling's files under the wrong unit's message, and the review judges reject it over code it does not own and cannot fix.
 
-The check compares the full checkout state (staged, unstaged, and untracked-but-not-gitignored paths) against the manifest, so residue left by a unit that blocked before staging is caught too. Re-claiming an `in-progress` unit after an interrupted run is unaffected: the unit's own manifest files are allowed to be dirty.
+devbench runs unattended, so the residue is moved rather than reported. Each foreign path is stashed under the ID of the unit whose Changes Manifest declares it, and the claim proceeds against a checkout holding only the claiming unit's scope. Stopping to ask an operator would turn one blocked unit into a stopped run.
 
-To resolve a refusal, identify the unit that owns each named path, then either commit that unit's work or revert it, and claim again. When the unit's repo has no configured local checkout, there is no shared tree to guard; the check is logged as skipped and `git-ops` still fails fast on the same missing configuration at commit time.
+The scan covers staged, unstaged, and untracked-but-not-gitignored paths, so residue left by a unit that blocked before staging is caught too. The unit's own manifest files are never quarantined, so re-claiming an `in-progress` unit after an interrupted run keeps its work in place.
+
+Quarantine is non-destructive. Each entry is a normal git stash with a discoverable message:
+
+```
+$ git stash list
+stash@{0}: On <branch>: devbench-quarantine:<owner-id>: displaced by claim of <claiming-id>
+$ git stash apply stash@{0}     # recover it whenever you want
+```
+
+One entry is created per owning unit, so each unit's work stays recoverable as a unit. Paths that no work unit declares are quarantined under the `unattributed` key: they are still outside the claiming unit's scope and would corrupt its commit just the same. The owning unit also receives a `[WORK_QUARANTINED]` audit comment naming the stash.
+
+Nothing is restored automatically. A blocked unit re-executes from its Changes Manifest when it unblocks, and silently re-injecting a superseded attempt into a later run's tree would recreate the contamination the quarantine removed.
+
+`claim` fails, and does not claim, only when the quarantine itself fails or leaves residue behind. Both mean the checkout was not actually cleared, and proceeding would hand the unit exactly the contaminated tree the quarantine was meant to remove. When the unit's repo has no configured local checkout there is no shared tree to guard; the step is logged as skipped and `git-ops` still fails fast on the same missing configuration at commit time.
 
 ### `set-status`
 

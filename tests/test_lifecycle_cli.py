@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import NoReturn
 from unittest.mock import patch
 
 import pytest
@@ -248,7 +249,7 @@ class TestCmdTail:
         class FakeCompleted:
             returncode = 0
 
-        def _fake_run(cmd, check):  # type: ignore[no-untyped-def]
+        def _fake_run(cmd: list[str], check: bool) -> FakeCompleted:
             captured["cmd"] = cmd
             captured["check"] = check
             return FakeCompleted()
@@ -307,7 +308,7 @@ class TestCmdRestart:
         class FakeCompleted:
             returncode = 0
 
-        def _fake_run(cmd, env, check, cwd):  # type: ignore[no-untyped-def]
+        def _fake_run(cmd: list[str], env: dict[str, str], check: bool, cwd: str) -> FakeCompleted:
             captured["cmd"] = cmd
             captured["cwd"] = cwd
             return FakeCompleted()
@@ -352,7 +353,7 @@ class TestSetupDaemonAndPidFile:
     ) -> None:
         monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
 
-        def _boom(*_a, **_kw):  # type: ignore[no-untyped-def]
+        def _boom(*_a: object, **_kw: object) -> NoReturn:
             raise OSError("disk full")
 
         monkeypatch.setattr("devbench.instances.write_pid_file", _boom)

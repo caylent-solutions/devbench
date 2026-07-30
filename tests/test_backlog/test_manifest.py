@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import subprocess as _subprocess
+from pathlib import Path as _Path
+from typing import Any, cast
+from unittest.mock import patch as _patch
+
 import pytest
 
 from devbench.backlog.manifest import (
@@ -120,7 +125,7 @@ class TestManifestRow:
     def test_frozen(self) -> None:
         row = ManifestRow(file="src/a.py", change="x")
         with pytest.raises(AttributeError):
-            row.file = "other"  # type: ignore[misc]
+            cast(Any, row).file = "other"
 
     def test_equality(self) -> None:
         assert ManifestRow(file="a", change="b") == ManifestRow(file="a", change="b")
@@ -383,10 +388,6 @@ class TestAppendRows:
 # ---------------------------------------------------------------------------
 # Slice 3b: list_staged_files + assert_staged_matches_manifest
 # ---------------------------------------------------------------------------
-
-import subprocess as _subprocess  # noqa: E402
-from pathlib import Path as _Path  # noqa: E402
-from unittest.mock import patch as _patch  # noqa: E402
 
 
 def _init_repo_with_file(path: _Path, filename: str, contents: str = "x") -> None:

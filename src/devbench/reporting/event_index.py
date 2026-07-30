@@ -1203,7 +1203,7 @@ def _row_to_totals_dict(row: Iterable) -> dict[str, int]:
     """Convert a 19-column SQL aggregate row into the standard accumulator shape."""
     values = list(row)
     if len(values) != len(_TOTALS_KEYS_ORDERED):
-        raise ValueError(  # pragma: no cover - defensive; query is fixed
+        raise ValueError(
             f"event_index aggregate row width mismatch: got {len(values)}, expected {len(_TOTALS_KEYS_ORDERED)}"
         )
     return dict(zip(_TOTALS_KEYS_ORDERED, (int(v or 0) for v in values), strict=True))

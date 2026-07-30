@@ -87,7 +87,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   first line, and `<cmd> --help` prints the whole text.
 
 - **A blocked work unit's uncommitted changes contaminated every unit that
-  claimed after it.** The single-branch modes run every work unit in one shared
+  claimed after it, and now get quarantined instead.** The single-branch modes run every work unit in one shared
   checkout. When a unit blocked before its work was committed, that work stayed
   in the tree, and nothing cleared it or reported it. The next unit to claim
   inherited it, with two distinct failure modes observed in one run: a unit's
@@ -102,13 +102,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it. The check covers staged, unstaged, and untracked-but-not-gitignored paths;
   `assert_staged_matches_manifest` sees only the staged set, which is why a unit
   that blocked before staging read as a clean tree. Re-claiming an `in-progress`
-  unit is unaffected: its own manifest files may be dirty.
+  unit is unaffected: its own manifest files are never quarantined.
 
-  **Behaviour change:** `devbench claim` exits non-zero on a contaminated
-  checkout where it previously claimed successfully. Resolve by committing or
-  reverting the owning unit's work, then claiming again. When the unit's repo
-  has no configured local checkout there is no shared tree to guard; the check
-  logs that it was skipped rather than passing over it silently.
+  devbench runs unattended, so the residue is moved rather than reported. Each
+  foreign path is stashed under the ID of the unit whose Changes Manifest
+  declares it, and the claim proceeds against a checkout holding only the
+  claiming unit's scope. Stopping to ask an operator would turn one blocked
+  unit into a stopped run. Quarantine is non-destructive: each entry is a
+  normal git stash titled `devbench-quarantine:<owner-id>`, one per owning
+  unit, recoverable with `git stash list` / `git stash apply`, and the owning
+  unit receives a `[WORK_QUARANTINED]` audit comment naming it. Paths no unit
+  declares are quarantined under an `unattributed` key, since they would
+  corrupt the claiming unit's commit just the same. Nothing is restored
+  automatically: a blocked unit re-executes from its Changes Manifest when it
+  unblocks, and re-injecting a superseded attempt would recreate the
+  contamination.
+
+  **Behaviour change:** `devbench claim` exits non-zero only when the
+  quarantine itself fails or leaves residue behind, which means the checkout
+  was not actually cleared. When the unit's repo has no configured local
+  checkout there is no shared tree to guard; the step logs that it was skipped
+  rather than passing over it silently.
 
 - **A work unit's commit could absorb another unit's unstaged changes.** Both
   commit paths ran `git add -A`, staging the entire working tree and committing

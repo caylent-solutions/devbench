@@ -195,6 +195,9 @@ from devbench.constants import (
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
+from devbench.git_orphans import OrphanReport
+from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord
+from devbench.github.git_ops import GitOpsService
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
     materialise_shadow_plugin,
@@ -1083,7 +1086,7 @@ def cmd_claim(unit_id: str) -> int:
         )
         return 1
 
-    scope_error = _claim_worktree_scope_error(unit, wu_file, unit_id)
+    scope_error = _prepare_worktree_for_claim(unit, wu_file, unit_id)
     if scope_error is not None:
         print(scope_error, file=sys.stderr)
         return 1
@@ -1099,15 +1102,30 @@ def cmd_claim(unit_id: str) -> int:
     return 0
 
 
-def _claim_worktree_scope_error(unit: WorkUnit, wu_file: Path, unit_id: str) -> str | None:
-    """Return an error string when the target checkout holds another unit's work.
+def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> str | None:
+    """Clear another unit's uncommitted work out of the shared checkout, then allow the claim.
 
     devbench's single-branch modes run every work unit in one shared
-    checkout, and a unit that blocks before committing leaves its changes
-    behind. Claiming on top of that residue is what lets one unit's files be
-    committed under another unit's message, and what makes judges reject a
-    unit over code it does not own. This refuses the claim instead, naming
-    every offending path, so the residue is dealt with deliberately.
+    checkout. A unit that blocks, or a run that is interrupted, leaves its
+    uncommitted changes in the tree, and the next unit to claim inherits
+    them: its commit absorbs a sibling's files under the wrong unit's
+    message, and the review judges reject it over code it does not own and
+    cannot fix.
+
+    devbench runs unattended, so the residue is quarantined rather than
+    reported: each foreign path is stashed under the ID of the unit whose
+    Changes Manifest declares it, and the claim proceeds against a checkout
+    holding only the claiming unit's scope. Halting here would convert one
+    blocked unit into a stopped run.
+
+    Quarantine is non-destructive. Each stash entry carries a discoverable
+    ``devbench-quarantine:<owner-id>`` message and stays recoverable via
+    ``git stash list``. Nothing is auto-restored: a blocked unit re-executes
+    from its Changes Manifest when it unblocks, and re-injecting a superseded
+    attempt into a later run's tree would recreate the contamination.
+
+    Re-claiming an ``in-progress`` unit is unaffected, because the unit's own
+    manifest files are in scope and are never quarantined.
 
     The check needs a checkout to inspect. When the unit's repo has no
     configured local path, or that path is not a git work tree, there is no
@@ -1118,13 +1136,17 @@ def _claim_worktree_scope_error(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
     Args:
         unit: The work unit being claimed, used to resolve its target repo.
         wu_file: Absolute path to the work-unit ``.md`` file.
-        unit_id: Work-unit identifier, named in the returned error.
+        unit_id: Work-unit identifier, recorded in each stash message.
 
     Returns:
-        ``None`` when the checkout is scoped to this unit (or no checkout
-        applies); a human-readable error string otherwise.
+        ``None`` when the checkout is ready for the claim, whether it was
+        already clean or was cleared. A human-readable error string only when
+        the quarantine itself failed, which is a genuine fault: proceeding
+        would hand the claiming unit the contaminated tree the quarantine was
+        supposed to clear.
     """
-    from devbench.backlog.manifest import assert_worktree_scoped_to_manifest, parse_manifest
+    from devbench.backlog.manifest import list_changed_files, parse_manifest
+    from devbench.git_quarantine import quarantine_paths
 
     canonical_repo = resolve_repo(unit.repo)
     repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
@@ -1136,12 +1158,101 @@ def _claim_worktree_scope_error(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
         )
         return None
 
-    manifest_files = [row.file for row in parse_manifest(wu_file.read_text(encoding="utf-8"))]
+    manifest_files = {row.file for row in parse_manifest(wu_file.read_text(encoding="utf-8"))}
     try:
-        assert_worktree_scoped_to_manifest(repo_path, manifest_files, unit_id)
+        foreign = [path for path in list_changed_files(repo_path) if path not in manifest_files]
+        if not foreign:
+            return None
+        records = quarantine_paths(repo_path, foreign, _non_terminal_manifests(canonical_repo), unit_id)
+        remaining = [path for path in list_changed_files(repo_path) if path not in manifest_files]
     except RuntimeError as exc:
-        return f"ERROR: {exc}"
+        return f"ERROR: cannot prepare the checkout for {unit_id!r}: {exc}"
+
+    if remaining:
+        return (
+            f"ERROR: cannot prepare the checkout for {unit_id!r}: {len(remaining)} path(s) are still "
+            f"outside its Changes Manifest after quarantine: {remaining}. Refusing to claim rather than "
+            "commit or review another work unit's changes under this one."
+        )
+
+    for record in records:
+        _log_quarantine(record, unit_id)
     return None
+
+
+def _non_terminal_manifests(canonical_repo: str) -> dict[str, list[str]]:
+    """Return every non-terminal work unit's Changes Manifest for ``canonical_repo``.
+
+    Used to attribute quarantined paths to the unit that declared them.
+    Terminal units (``done`` / ``declined``) are excluded: their work is
+    already committed, so they cannot be the source of uncommitted residue.
+
+    Best-effort by design. A unit whose file is unreadable or whose Manifest
+    is malformed contributes nothing rather than aborting the claim; the
+    consequence is that its paths quarantine as ``unattributed``, which still
+    clears the checkout. Manifest validity is validate-backlog's job, not the
+    claim path's.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    manifests: dict[str, list[str]] = {}
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError, OSError):
+        return manifests
+
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    for candidate in units:
+        if candidate.unit_type is not WorkUnitType.TASK or candidate.status in terminal:
+            continue
+        if resolve_repo(candidate.repo) != canonical_repo:
+            continue
+        candidate_file = _resolve_unit_file(candidate)
+        if candidate_file is None or not candidate_file.is_file():
+            continue
+        try:
+            rows = parse_manifest(candidate_file.read_text(encoding="utf-8"))
+        except (ManifestParseError, OSError):
+            continue
+        manifests[candidate.id] = [row.file for row in rows]
+    return manifests
+
+
+def _log_quarantine(record: QuarantineRecord, claiming_unit_id: str) -> None:
+    """Record one quarantine in the log and in the owning unit's audit trail.
+
+    The audit comment is what tells the owning unit's next executor that its
+    previous attempt was displaced and where to find it. Comment-write
+    failures are logged and not raised: the checkout is already clear at this
+    point, and losing an audit line must not stop an unattended run.
+    """
+    owner_id = record.owner_id
+    paths = list(record.paths)
+    stash_message = record.stash_message
+    logger.info(
+        "[WORK_QUARANTINED] %d path(s) owned by %s displaced by claim of %s; recover with git stash list | grep %r",
+        len(paths),
+        owner_id,
+        claiming_unit_id,
+        stash_message,
+    )
+    if owner_id == UNATTRIBUTED_OWNER:
+        return
+    try:
+        owner_file = _resolve_unit_file_by_id(owner_id)
+        if owner_file is None:
+            return
+        BacklogManager()._append_agent_comment(
+            owner_file,
+            "orchestrator",
+            f"[WORK_QUARANTINED] {len(paths)} uncommitted path(s) from this unit were displaced from the "
+            f"shared checkout when {claiming_unit_id} claimed: {paths}. They are preserved in a git stash "
+            f"titled {stash_message!r} and are recoverable with 'git stash list'. Nothing was restored "
+            "automatically: re-execute from this unit's Changes Manifest when it unblocks.",
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("quarantine audit comment failed for %s: %s", owner_id, exc)
 
 
 def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:
@@ -3984,7 +4095,7 @@ class _InlineCleanupError(RuntimeError):
 def _run_inline_cleanup_steps(
     repo_path: Path,
     detected: list[str],
-) -> tuple[bool, object]:
+) -> tuple[bool, OrphanReport]:
     """Inner steps for inline orphan cleanup. Returns (cleanup_committed, report).
 
     Raises :class:`_InlineCleanupError` on any subprocess failure so the
@@ -4099,8 +4210,8 @@ def _inline_orphan_cleanup_or_refuse(
             "git-ops: inline-cleaned %d orphan(s) for %s (%d removed, gitignore %s)",
             len(detected),
             unit_id,
-            len(report.removed),  # type: ignore[attr-defined]
-            "updated" if report.gitignore_updated else "unchanged",  # type: ignore[attr-defined]
+            len(report.removed),
+            "updated" if report.gitignore_updated else "unchanged",
         )
         sample = ", ".join(detected[:5])
         if len(detected) > 5:
@@ -4369,7 +4480,7 @@ def _count_ci_fail_attempts(wu_file: Path | None) -> int:
 
 
 def _emit_ci_failure_feedback(
-    ops: object,
+    ops: GitOpsService,
     unit_id: str,
     canonical_repo: str,
     pr_number: int,
@@ -4386,15 +4497,11 @@ def _emit_ci_failure_feedback(
 
     summary_default = f"CI checks failed for PR #{pr_number} on {canonical_repo}; attempt {attempt}; log unavailable."
 
-    run_id = ops.get_latest_failing_run_id(  # type: ignore[attr-defined]
-        canonical_repo, pr_number, repo_path=repo_path
-    )
+    run_id = ops.get_latest_failing_run_id(canonical_repo, pr_number, repo_path=repo_path)
     if run_id is None:
         return None, summary_default
 
-    log_text = ops.fetch_run_log(  # type: ignore[attr-defined]
-        canonical_repo, run_id, CI_FAILURE_LOG_BYTES, repo_path=repo_path
-    )
+    log_text = ops.fetch_run_log(canonical_repo, run_id, CI_FAILURE_LOG_BYTES, repo_path=repo_path)
     if not log_text.strip():
         return None, summary_default
 
@@ -4411,13 +4518,13 @@ def _emit_ci_failure_feedback(
 
 def _handle_ci_failure(
     *,
-    ops: object,
+    ops: GitOpsService,
     unit_id: str,
     canonical_repo: str,
     pr_number: int,
     repo_path: Path,
     wu_file: Path | None,
-    mgr: object,
+    mgr: BacklogManager,
 ) -> int:
     """Issue #115 dispatch: CI failure -> rc=2 retry signal or rc=1 BLOCKED.
 
@@ -4448,7 +4555,7 @@ def _handle_ci_failure(
     if wu_file is not None:
         marker = "[CI_FAIL_BLOCKED]" if next_attempt >= MAX_RETRY_ATTEMPTS else "[CI_FAIL]"
         message = f"{marker} {summary}"
-        mgr._append_agent_comment(wu_file, "git_ops", message)  # type: ignore[attr-defined]
+        mgr._append_agent_comment(wu_file, "git_ops", message)
     from devbench.notifications import notify_ci_failure
 
     pr_url_for_notify = f"https://github.com/{canonical_repo}/pull/{pr_number}"
@@ -4481,13 +4588,13 @@ def _handle_ci_failure(
 
 def _handle_pr_review_resolution(
     *,
-    ops: object,
+    ops: GitOpsService,
     unit_id: str,
     canonical_repo: str,
     pr_number: int,
     repo_path: Path,
     wu_file: Path | None,
-    mgr: object,
+    mgr: BacklogManager,
 ) -> int:
     """Issue #116 dispatch: poll PR review state before merge.
 
@@ -4514,7 +4621,7 @@ def _handle_pr_review_resolution(
     if not PR_REVIEW_AGENTS and not PR_REVIEW_DECISION_BLOCKS:
         return 0
 
-    resolution = ops.poll_pr_review_resolution(  # type: ignore[attr-defined]
+    resolution = ops.poll_pr_review_resolution(
         canonical_repo,
         pr_number,
         repo_path=repo_path,
@@ -4539,7 +4646,7 @@ def _handle_pr_review_resolution(
             f"unresolved_reviews={len(resolution.unresolved_reviews)}; "
             f"feedback payload at {feedback_path}."
         )
-        mgr._append_agent_comment(wu_file, "git_ops", f"{marker} {summary}")  # type: ignore[attr-defined]
+        mgr._append_agent_comment(wu_file, "git_ops", f"{marker} {summary}")
 
     if next_attempt >= MAX_RETRY_ATTEMPTS:
         print(
@@ -4770,8 +4877,8 @@ def _refuse_unscoped_commit(unit_id: str, wu_file: Path | None) -> bool:
 
     The Changes Manifest is the only thing that bounds what a work unit's commit
     may contain. Without it, staging would absorb any other in-flight unit's
-    changes under this unit's message -- the defect behind commit b5201cb, which
-    left the victim task permanently unable to pass ``changes_manifest``.
+    changes under this unit's message, which leaves the victim task permanently
+    unable to pass ``changes_manifest``.
     Refusing is recoverable; committing an unknown scope is not.
     """
     if wu_file is not None:
@@ -4903,7 +5010,7 @@ def cmd_git_ops(unit_id: str) -> int:
 
 def _dispatch_post_ci_pass(
     *,
-    ops: object,
+    ops: GitOpsService,
     unit_id: str,
     canonical_repo: str,
     repo_path: Path,
@@ -4911,7 +5018,7 @@ def _dispatch_post_ci_pass(
     pr_number: int,
     pr_url: str,
     wu_file: Path | None,
-    mgr: object,
+    mgr: BacklogManager,
 ) -> int:
     """Issue #101 dispatch: pause-before-merge vs merge-now.
 
@@ -4948,7 +5055,7 @@ def _pause_before_merge(
     pr_number: int,
     pr_url: str,
     wu_file: Path | None,
-    mgr: object,
+    mgr: BacklogManager,
 ) -> int:
     """Issue #101: transition to in-review, do NOT merge.
 
@@ -4960,13 +5067,13 @@ def _pause_before_merge(
     Returns 0 -- the work unit moved successfully to in-review.
     """
     if wu_file is not None:
-        mgr.force_status(  # type: ignore[attr-defined]
+        mgr.force_status(
             wu_file,
             BACKLOG_INDEX,
             unit_id,
             STATUS_IN_REVIEW,
         )
-        mgr._append_agent_comment(  # type: ignore[attr-defined]
+        mgr._append_agent_comment(
             wu_file,
             "git_ops",
             f"[PR_AWAITING_MERGE] PR #{pr_number} open and awaiting human review + merge: {pr_url}",
@@ -4992,7 +5099,7 @@ def _pause_before_merge(
 
 
 def _check_merge_fetch_pr_state(
-    ops: object,
+    ops: GitOpsService,
     canonical_repo: str,
     unit_id: str,
     branch: str,
@@ -5003,7 +5110,7 @@ def _check_merge_fetch_pr_state(
     with rc=1. rc=0 + empty list means no PR found for the branch (caller
     treats as still-in-review with `pr_state=no-pr-found`).
     """
-    rc, stdout, stderr = ops._gh(  # type: ignore[attr-defined]
+    rc, stdout, stderr = ops._gh(
         ["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,url"],
         repo=canonical_repo,
     )
@@ -5029,13 +5136,13 @@ def _check_merge_handle_merged(
     pr_number: object,
     pr_url: str,
     wu_file: Path | None,
-    mgr: object,
+    mgr: BacklogManager,
 ) -> int:
     """Promote a merged-PR work unit to done via the done-gate."""
     if wu_file is not None:
         try:
-            mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)  # type: ignore[attr-defined]
-            mgr._append_agent_comment(  # type: ignore[attr-defined]
+            mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)
+            mgr._append_agent_comment(
                 wu_file,
                 "git_ops",
                 f"[PR_MERGED] PR #{pr_number} merged externally; transitioned to done: {pr_url}",
@@ -5119,7 +5226,7 @@ def cmd_check_merge(unit_id: str) -> int:
 
 def _finalize_merge_and_submodule(
     *,
-    ops: object,
+    ops: GitOpsService,
     unit_id: str,
     canonical_repo: str,
     repo_path: Path,
@@ -5127,7 +5234,7 @@ def _finalize_merge_and_submodule(
     pr_number: int,
     pr_url: str,
     wu_file: Path | None,
-    mgr: object,
+    mgr: BacklogManager,
 ) -> int:
     """Merge the PR (with one CONFLICTING-state retry) and update the parent submodule.
 
@@ -5138,16 +5245,16 @@ def _finalize_merge_and_submodule(
     from devbench.github.git_ops import ConflictingPRError
 
     try:
-        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)  # type: ignore[attr-defined]
+        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
     except ConflictingPRError:
         logger.warning(
             "PR #%d on %s is CONFLICTING -- rebasing and retrying merge once",
             pr_number,
             canonical_repo,
         )
-        ops.rebase_and_force_push(canonical_repo, repo_path, branch)  # type: ignore[attr-defined]
+        ops.rebase_and_force_push(canonical_repo, repo_path, branch)
         try:
-            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)  # type: ignore[attr-defined]
+            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
         except Exception as retry_exc:
             print(
                 f"ERROR: Merge retry failed for PR #{pr_number} on {canonical_repo}: {retry_exc}",
@@ -5156,18 +5263,18 @@ def _finalize_merge_and_submodule(
             return 1
 
     if wu_file is not None:
-        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")  # type: ignore[attr-defined]
+        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")
     from devbench.notifications import notify_pr_merged
 
     notify_pr_merged(unit_id, canonical_repo, pr_url)
 
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
 
-    ops.checkout_default_branch(canonical_repo, repo_path)  # type: ignore[attr-defined]
+    ops.checkout_default_branch(canonical_repo, repo_path)
     logger.info("Checked out default branch after merge for %s", unit_id)
 
     if UPDATE_SUBMODULE:
-        ops.update_parent_submodule_ref(  # type: ignore[attr-defined]
+        ops.update_parent_submodule_ref(
             canonical_repo,
             repo_path,
             f"chore: update {repo_path.name} submodule after {unit_id}",

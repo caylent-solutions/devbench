@@ -118,12 +118,19 @@ def resolve_timezone(name: str | None):
     ------
     InvalidTimezoneError
         When ``name`` is a non-empty string that does not resolve to a
-        known zoneinfo entry. Message includes the offending name.
+        known zoneinfo entry (message includes the offending name), or when
+        ``name`` is empty and the OS local zone cannot be resolved.
     """
     if not name:
         local = datetime.now().astimezone().tzinfo
-        if local is None:  # pragma: no cover -- astimezone always attaches a tzinfo
-            return ZoneInfo("UTC")
+        if local is None:
+            # Defensive, and deliberately not a silent substitution. Quietly
+            # rendering timestamps in UTC when the OS zone could not be
+            # resolved would present wrong local times as if they were right.
+            raise InvalidTimezoneError(
+                "could not resolve the local timezone: datetime.astimezone() returned no tzinfo. "
+                "Set an explicit IANA name via the display-timezone config or DEVBENCH_DISPLAY_TIMEZONE."
+            )
         return local
     try:
         return ZoneInfo(name)

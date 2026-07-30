@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import UTC
 from pathlib import Path
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -242,7 +243,7 @@ class TestFormatEntryFallbacks:
         assert "orch" in line
 
     def test_non_dict_entry_renders_fallback_sentinel(self) -> None:
-        line = format_entry("not a dict", ZoneInfo("UTC"), color=False)  # type: ignore[arg-type]
+        line = format_entry(cast(Any, "not a dict"), ZoneInfo("UTC"), color=False)
         assert "--:--:--" in line
         assert "not a dict" in line
 
@@ -343,7 +344,7 @@ class TestShouldUseColor:
             def isatty(self) -> bool:
                 return True
 
-        assert should_use_color(FakeTTY()) is False  # type: ignore[arg-type]
+        assert should_use_color(cast(Any, FakeTTY())) is False
 
     def test_non_tty_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("NO_COLOR", raising=False)
@@ -352,7 +353,7 @@ class TestShouldUseColor:
             def isatty(self) -> bool:
                 return False
 
-        assert should_use_color(NotTTY()) is False  # type: ignore[arg-type]
+        assert should_use_color(cast(Any, NotTTY())) is False
 
     def test_tty_enables_color(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("NO_COLOR", raising=False)
@@ -361,7 +362,7 @@ class TestShouldUseColor:
             def isatty(self) -> bool:
                 return True
 
-        assert should_use_color(FakeTTY()) is True  # type: ignore[arg-type]
+        assert should_use_color(cast(Any, FakeTTY())) is True
 
     def test_stream_without_isatty_defaults_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("NO_COLOR", raising=False)
@@ -369,7 +370,7 @@ class TestShouldUseColor:
         class NoIsatty:
             pass
 
-        assert should_use_color(NoIsatty()) is False  # type: ignore[arg-type]
+        assert should_use_color(cast(Any, NoIsatty())) is False
 
     def test_isatty_raises_value_error_treated_as_non_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("NO_COLOR", raising=False)
@@ -378,7 +379,7 @@ class TestShouldUseColor:
             def isatty(self) -> bool:
                 raise ValueError("closed")
 
-        assert should_use_color(BrokenTTY()) is False  # type: ignore[arg-type]
+        assert should_use_color(cast(Any, BrokenTTY())) is False
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +597,7 @@ class TestFollowLiveTail:
 @pytest.mark.unit
 class TestEdgeCases:
     def test_non_string_timestamp_does_not_crash(self) -> None:
-        entry = _entry(timestamp=12345)  # type: ignore[arg-type]
+        entry = _entry(timestamp=cast(Any, 12345))
         line = format_entry(entry, ZoneInfo("UTC"), color=False)
         assert line  # must render something
 
@@ -631,7 +632,7 @@ class TestEdgeCases:
         from dataclasses import FrozenInstanceError
 
         with pytest.raises(FrozenInstanceError):
-            opts.no_follow = True  # type: ignore[misc]
+            cast(Any, opts).no_follow = True
 
     def test_datetime_utc_alias_works(self) -> None:
         """The stdlib ``datetime.UTC`` alias works as a valid ``tz`` argument."""
@@ -861,3 +862,30 @@ class TestHookTailColumnConfig:
         assert hook_tail.TOOL_WIDTH == config.HOOK_TAIL_TOOL_WIDTH
         assert hook_tail.DESCRIPTION_MAX == config.HOOK_TAIL_DESCRIPTION_MAX
         assert hook_tail.STDOUT_PREVIEW_MAX == config.HOOK_TAIL_STDOUT_PREVIEW_MAX
+
+
+class TestResolveTimezoneLocalFailure:
+    """An unresolvable OS zone must fail fast, not silently render UTC.
+
+    Substituting UTC would present wrong local times as if they were right,
+    which is worse than refusing: every timestamp in the output would be
+    quietly shifted with nothing to indicate it.
+    """
+
+    def test_missing_local_tzinfo_raises_rather_than_defaulting_to_utc(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from devbench.hook_tail import InvalidTimezoneError, resolve_timezone
+
+        naive = MagicMock()
+        naive.tzinfo = None
+        fake_datetime = MagicMock()
+        fake_datetime.now.return_value.astimezone.return_value = naive
+
+        with (
+            patch("devbench.hook_tail.datetime", fake_datetime),
+            pytest.raises(InvalidTimezoneError) as exc,
+        ):
+            resolve_timezone(None)
+        assert "could not resolve the local timezone" in str(exc.value)
+        assert "DEVBENCH_DISPLAY_TIMEZONE" in str(exc.value)

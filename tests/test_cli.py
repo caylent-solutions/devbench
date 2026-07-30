@@ -998,20 +998,22 @@ def _make_noop_flock(entered: list[bool] | None = None) -> Any:
     return _flock
 
 
-class TestCmdClaimCheckoutScopeGuard:
-    """cmd_claim refuses to claim on top of another work unit's uncommitted work.
+class TestCmdClaimQuarantinesForeignWork:
+    """cmd_claim clears another unit's uncommitted work, then claims.
 
     The single-branch modes share one checkout across every work unit. A unit
-    that blocks before committing leaves its changes in that checkout, where
-    the next unit inherits them: its commit absorbs a sibling's files, and the
-    judges review code the unit under review does not own. The guard refuses
-    the claim instead, at the earliest point the owning unit is known.
+    that blocks, or a run that is interrupted, leaves its changes in the tree,
+    and the next unit to claim inherits them: its commit absorbs a sibling's
+    files under the wrong unit's message, and the judges reject it over code
+    it does not own. devbench runs unattended, so the residue is quarantined
+    into a named stash and the claim proceeds; halting would turn one blocked
+    unit into a stopped run.
     """
 
     _REPO = "caylent-solutions/git-repo"
 
     def _git_repo(self, tmp_path: Path) -> Path:
-        """Create a real git repo with one committed file and a clean tree."""
+        """Create a real git repo with one committed baseline and a clean tree."""
         repo = tmp_path / "checkout"
         repo.mkdir()
         for args in (
@@ -1041,7 +1043,13 @@ class TestCmdClaimCheckoutScopeGuard:
         )
         return wu_file
 
-    def _claim(self, mock_units: list[WorkUnit], backlog_dir: Path, repo: Path | None) -> tuple[int, MagicMock]:
+    def _claim(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        repo: Path | None,
+        manifests: dict[str, list[str]] | None = None,
+    ) -> tuple[int, MagicMock]:
         """Run cmd_claim with REPO_LOCAL_PATHS pointing at *repo* (or empty)."""
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
@@ -1052,16 +1060,28 @@ class TestCmdClaimCheckoutScopeGuard:
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli.resolve_repo", return_value=self._REPO),
+            patch("devbench.cli._non_terminal_manifests", return_value=manifests or {}),
             patch.dict("devbench.cli.REPO_LOCAL_PATHS", repo_paths, clear=True),
         ):
             return cli.cmd_claim("E0-F1-S1-T2"), mock_mgr
 
-    def test_claim_refused_when_sibling_left_unstaged_work(
+    @staticmethod
+    def _stash_subjects(repo: Path) -> list[str]:
+        out = subprocess.run(
+            ["git", "stash", "list", "--format=%gs"], cwd=repo, check=True, capture_output=True, text=True
+        )
+        return [line for line in out.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _dirty_paths(repo: Path) -> list[str]:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True)
+        return sorted(line[3:] for line in out.stdout.splitlines() if line.strip())
+
+    def test_unstaged_sibling_work_is_quarantined_and_the_claim_proceeds(
         self,
         mock_units: list[WorkUnit],
         backlog_dir: Path,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """The residue shape that made a docs-only unit fail another unit's security review."""
         repo = self._git_repo(tmp_path)
@@ -1070,79 +1090,200 @@ class TestCmdClaimCheckoutScopeGuard:
 
         result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
 
-        assert result == 1
-        err = capsys.readouterr().err
-        assert "Checkout scope violation" in err
-        assert "src/sibling.py" in err
-        assert "E0-F1-S1-T2" in err
-        # The claim must not have been recorded: no status write happened.
-        mock_mgr.force_status.assert_not_called()
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        # The run continues against a checkout holding only this unit's scope.
+        assert self._dirty_paths(repo) == []
+        assert (repo / "src/sibling.py").read_text() == "baseline\n"
 
-    def test_claim_refused_when_sibling_left_staged_work(
+    def test_staged_sibling_work_is_quarantined(
         self,
         mock_units: list[WorkUnit],
         backlog_dir: Path,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ) -> None:
         repo = self._git_repo(tmp_path)
         self._wu_file(backlog_dir)
         (repo / "src/sibling.py").write_text("another unit's staged work\n")
         subprocess.run(["git", "add", "src/sibling.py"], cwd=repo, check=True, capture_output=True)
 
-        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+        result, _ = self._claim(mock_units, backlog_dir, repo)
 
-        assert result == 1
-        assert "src/sibling.py" in capsys.readouterr().err
-        mock_mgr.force_status.assert_not_called()
+        assert result == 0
+        assert self._dirty_paths(repo) == []
 
-    def test_claim_refused_when_sibling_left_untracked_file(
+    def test_untracked_sibling_file_is_quarantined(
         self,
         mock_units: list[WorkUnit],
         backlog_dir: Path,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ) -> None:
         repo = self._git_repo(tmp_path)
         self._wu_file(backlog_dir)
         (repo / "tests").mkdir()
         (repo / "tests/test_sibling.py").write_text("another unit's new module\n")
 
+        result, _ = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        assert self._dirty_paths(repo) == []
+        assert not (repo / "tests/test_sibling.py").exists()
+
+    def test_quarantined_work_is_recoverable_not_destroyed(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Executor output is expensive; the stash must restore it byte for byte."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        sibling_work = "another unit's uncommitted work\n"
+        (repo / "src/sibling.py").write_text(sibling_work)
+
+        result, _ = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        subjects = self._stash_subjects(repo)
+        assert len(subjects) == 1
+        assert "devbench-quarantine:" in subjects[0]
+        subprocess.run(["git", "stash", "pop"], cwd=repo, check=True, capture_output=True)
+        assert (repo / "src/sibling.py").read_text() == sibling_work
+
+    def test_stash_is_keyed_to_the_unit_that_declared_the_path(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Attribution comes from the owning unit's Changes Manifest, not a guess."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("owned by T9\n")
+
+        result, _ = self._claim(mock_units, backlog_dir, repo, manifests={"E0-F1-S1-T9": ["src/sibling.py"]})
+
+        assert result == 0
+        subjects = self._stash_subjects(repo)
+        assert any("devbench-quarantine:E0-F1-S1-T9" in s for s in subjects)
+        assert any("displaced by claim of E0-F1-S1-T2" in s for s in subjects)
+
+    def test_paths_no_unit_declares_are_quarantined_as_unattributed(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Unowned residue still corrupts this unit's commit, so it must still be cleared."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("nobody declares this\n")
+
+        result, _ = self._claim(mock_units, backlog_dir, repo, manifests={})
+
+        assert result == 0
+        assert any("devbench-quarantine:unattributed" in s for s in self._stash_subjects(repo))
+
+    def test_each_owner_gets_its_own_stash_entry(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Grouping keeps each unit's work recoverable as a unit."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("owned by T8\n")
+        (repo / "src/other.py").write_text("owned by T9\n")
+
+        result, _ = self._claim(
+            mock_units,
+            backlog_dir,
+            repo,
+            manifests={"E0-F1-S1-T8": ["src/sibling.py"], "E0-F1-S1-T9": ["src/other.py"]},
+        )
+
+        assert result == 0
+        subjects = self._stash_subjects(repo)
+        assert any("devbench-quarantine:E0-F1-S1-T8" in s for s in subjects)
+        assert any("devbench-quarantine:E0-F1-S1-T9" in s for s in subjects)
+        assert self._dirty_paths(repo) == []
+
+    def test_own_manifest_files_are_never_quarantined(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Re-claiming an interrupted in-progress unit must keep its own work."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        own_work = "this unit's own work in progress\n"
+        (repo / "src/own.py").write_text(own_work)
+
         result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        assert (repo / "src/own.py").read_text() == own_work
+        assert self._stash_subjects(repo) == []
+
+    def test_clean_checkout_creates_no_stash(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        assert self._stash_subjects(repo) == []
+
+    def test_claim_refuses_when_quarantine_itself_fails(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A failed quarantine must not be swallowed: the tree was not cleared."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's work\n")
+
+        with patch("devbench.git_quarantine.quarantine_paths", side_effect=RuntimeError("stash refused")):
+            result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
 
         assert result == 1
-        assert "tests/test_sibling.py" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "cannot prepare the checkout" in err
+        assert "stash refused" in err
         mock_mgr.force_status.assert_not_called()
 
-    def test_claim_allowed_on_clean_checkout(
+    def test_claim_refuses_when_quarantine_leaves_residue_behind(
         self,
         mock_units: list[WorkUnit],
         backlog_dir: Path,
         tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
+        """A quarantine that silently no-ops must not be reported as success."""
         repo = self._git_repo(tmp_path)
         self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's work\n")
 
-        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+        with patch("devbench.git_quarantine.quarantine_paths", return_value=[]):
+            result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
 
-        assert result == 0
-        mock_mgr.force_status.assert_called_once()
-
-    def test_claim_allowed_when_only_own_manifest_files_are_dirty(
-        self,
-        mock_units: list[WorkUnit],
-        backlog_dir: Path,
-        tmp_path: Path,
-    ) -> None:
-        """Re-claiming an interrupted in-progress unit must still work."""
-        repo = self._git_repo(tmp_path)
-        self._wu_file(backlog_dir)
-        (repo / "src/own.py").write_text("this unit's own work in progress\n")
-
-        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
-
-        assert result == 0
-        mock_mgr.force_status.assert_called_once()
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "still outside its Changes Manifest after quarantine" in err
+        assert "src/sibling.py" in err
+        mock_mgr.force_status.assert_not_called()
 
     def test_claim_proceeds_and_logs_when_no_checkout_is_configured(
         self,
@@ -20449,3 +20590,155 @@ class TestDaemonizeGuard:
         with patch("devbench.cli.os.name", "nt"):
             with pytest.raises(RuntimeError, match="--daemon requires POSIX"):
                 cli._daemonize_to_background(tmp_path)
+
+
+class TestNonTerminalManifests:
+    """Ownership for quarantine comes from Changes Manifests, not guesswork.
+
+    Only non-terminal Tasks in the target repo can be the source of
+    uncommitted residue: a done or declined unit's work is already committed.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    @staticmethod
+    def _unit(
+        unit_id: str,
+        status: WorkUnitStatus,
+        *,
+        unit_type: WorkUnitType = WorkUnitType.TASK,
+        repo: str = "caylent-solutions/git-repo",
+    ) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="T",
+            status=status,
+            unit_type=unit_type,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    @staticmethod
+    def _wu(backlog_dir: Path, unit_id: str, manifest_rows: str) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}: T\n\n## Status: in-queue\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n" + manifest_rows + "\n## Comments\n"
+        )
+        return wu
+
+    def _resolve(self, units: list[WorkUnit], backlog_dir: Path) -> dict[str, list[str]]:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.resolve_repo", side_effect=lambda r: r),
+        ):
+            return cli._non_terminal_manifests(self._REPO)
+
+    def test_non_terminal_task_manifest_is_returned(self, backlog_dir: Path) -> None:
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        result = self._resolve([self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE)], backlog_dir)
+        assert result == {"E0-F1-S1-T2": ["src/a.py"]}
+
+    @pytest.mark.parametrize("status", [WorkUnitStatus.DONE, WorkUnitStatus.DECLINED])
+    def test_terminal_units_are_excluded(self, backlog_dir: Path, status: WorkUnitStatus) -> None:
+        """Their work is committed, so they cannot own uncommitted residue."""
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        assert self._resolve([self._unit("E0-F1-S1-T2", status)], backlog_dir) == {}
+
+    def test_non_task_levels_are_excluded(self, backlog_dir: Path) -> None:
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        units = [self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, unit_type=WorkUnitType.STORY)]
+        assert self._resolve(units, backlog_dir) == {}
+
+    def test_units_targeting_another_repo_are_excluded(self, backlog_dir: Path) -> None:
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        units = [self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, repo="other/repo")]
+        assert self._resolve(units, backlog_dir) == {}
+
+    def test_missing_work_unit_file_is_skipped(self, backlog_dir: Path) -> None:
+        assert self._resolve([self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE)], backlog_dir) == {}
+
+    def test_malformed_manifest_is_skipped_rather_than_aborting(self, backlog_dir: Path) -> None:
+        """Manifest validity is validate-backlog's job; a claim must not die on it."""
+        wu = backlog_dir / "E0-F1-S1-T2.md"
+        wu.write_text("# E0-F1-S1-T2: T\n\n## Status: in-queue\n\n## Comments\n")
+        assert self._resolve([self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE)], backlog_dir) == {}
+
+    def test_unreadable_backlog_index_yields_no_owners(self, backlog_dir: Path) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.side_effect = FileNotFoundError("no BACKLOG.md")
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            assert cli._non_terminal_manifests(self._REPO) == {}
+
+
+class TestLogQuarantine:
+    """Each quarantine is recorded in the log and in the owning unit's audit trail."""
+
+    @staticmethod
+    def _record(owner_id: str) -> cli.QuarantineRecord:
+        return cli.QuarantineRecord(
+            owner_id=owner_id,
+            paths=("src/a.py", "src/b.py"),
+            stash_message=f"devbench-quarantine:{owner_id}: displaced by claim of E0-F1-S1-T2",
+        )
+
+    def test_emits_a_work_quarantined_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            with patch("devbench.cli._resolve_unit_file_by_id", return_value=None):
+                cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        assert any("[WORK_QUARANTINED]" in r.getMessage() for r in caplog.records)
+
+    def test_owning_unit_receives_an_audit_comment(self, backlog_dir: Path) -> None:
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: blocked\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        mock_mgr._append_agent_comment.assert_called_once()
+        message = mock_mgr._append_agent_comment.call_args[0][2]
+        assert "[WORK_QUARANTINED]" in message
+        assert "git stash list" in message
+        assert "E0-F1-S1-T2" in message
+
+    def test_unattributed_paths_get_no_audit_comment(self) -> None:
+        """There is no owning unit to tell."""
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli._resolve_unit_file_by_id") as resolve,
+        ):
+            cli._log_quarantine(self._record(cli.UNATTRIBUTED_OWNER), "E0-F1-S1-T2")
+        resolve.assert_not_called()
+        mock_mgr._append_agent_comment.assert_not_called()
+
+    def test_missing_owner_file_is_skipped(self) -> None:
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        mock_mgr._append_agent_comment.assert_not_called()
+
+    def test_comment_write_failure_warns_and_does_not_raise(
+        self, backlog_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The checkout is already clear; losing an audit line must not stop the run."""
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: blocked\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        mock_mgr._append_agent_comment.side_effect = OSError("read-only filesystem")
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        assert any("quarantine audit comment failed" in r.getMessage() for r in caplog.records)

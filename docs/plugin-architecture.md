@@ -231,7 +231,7 @@ Agents never know how repo paths are resolved. Multi-repo routing is invisible t
 | `devbench run-tests <id>` | Run test suite in correct repo cwd, return output |
 | `devbench log-verdict <judge> <id> <pass\|fail> [msg]` | Append structured verdict to work unit Comments |
 | `devbench log-comment <agent> <id> <message>` | Append agent comment to work unit Comments |
-| `devbench log-tdd <id> <RED\|GREEN\|REFACTOR> <message>` | Append TDD phase entry to work unit |
+| `devbench log-tdd <id> <RED\|GREEN\|REFACTOR> <message>` | Append TDD phase entry to work unit. `RED_OBSERVED` is a fourth phase; it is orchestrator-only, so an agent-facing invocation naming it is rejected with exit 1 |
 | `devbench mark-done <id>` | Done-gate verification + status update |
 | `devbench git-ops <id>` | Deterministic: branch → commit → push → PR → CI wait → merge |
 | `devbench validate-backlog` | Check backlog integrity before each cycle |

@@ -542,7 +542,7 @@ Status rolls up automatically when all children reach `done`.
 | `## Acceptance Criteria` | Yes | Author at creation |
 | `## Changes Manifest` | Yes | Author at creation |
 | `## Definition of Done` | Yes | Author at creation |
-| `## TDD Cycle Log` | Yes (may be empty) | `devbench log-tdd` during implementation |
+| `## TDD Cycle Log` | Yes (may be empty) | Agent-writable `RED`/`GREEN`/`REFACTOR` entries via `devbench log-tdd`; orchestrator-only `RED_OBSERVED` entries via `write_red_observed_entry` |
 | `## Comments` | Yes (may be empty) | `devbench log-verdict` / `devbench log-comment` |
 
 ---

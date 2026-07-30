@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -3296,13 +3299,14 @@ class TestReportInProgressDurationSuffix:
 
 
 class TestOrchestratorAliveBanner:
-    """Tests for the orchestrator-alive status banner (issue #161).
+    """Tests for the orchestrator-alive status banner (issues #161, #250).
 
-    The banner is rendered at the very top of every ``devbench report``
-    invocation and surfaces three liveness states derived from log-activity
-    recency: ALIVE (green) / STOPPED (red) / STARTING (yellow). The threshold
-    is sourced from ``stop_hook.window_seconds`` so the banner stays aligned
-    with the operator's circuit-breaker quiet window.
+    Issue #250: the process table decides ALIVE, not log recency. A recent
+    log line proves only that something wrote to the log, so recency alone
+    reported a healthy orchestrator when none was running. The banner now
+    reads the PID file and reports five states: ALIVE / STOPPED / STARTING /
+    NOT RUNNING / UNKNOWN. ``stop_hook.window_seconds`` no longer decides
+    liveness; it only distinguishes a busy live orchestrator from an idle one.
     """
 
     @staticmethod
@@ -3311,54 +3315,121 @@ class TestOrchestratorAliveBanner:
             f"2026-03-05T09:00:00Z [devbench.orch] INFO Started\n{last_ts_iso} [devbench.orch] INFO Tick\n"
         )
 
-    def test_alive_state_green_when_recent_activity(self, tmp_path: Path) -> None:
+    @staticmethod
+    def _write_pid(pid_path: Path, pid: int) -> Path:
+        """Write a well-formed instance PID file naming *pid*."""
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(
+            json.dumps(
+                {
+                    "instance_id": "ws-0001",
+                    "pid": pid,
+                    "workspace": "/tmp/ws",
+                    "workspace_name": "ws",
+                    "session": "default",
+                    "mode": "daemon",
+                    "started_at": "2026-03-05T09:00:00Z",
+                    "model": "claude-opus-5",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return pid_path
+
+    def _live_pid_file(self, tmp_path: Path) -> Path:
+        """PID file naming this test process, which is by definition alive."""
+        return self._write_pid(tmp_path / ".devbench" / "orchestrator.pid", os.getpid())
+
+    @staticmethod
+    def _dead_pid() -> int:
+        """Return a PID that is not running.
+
+        Allocated by starting a trivial child and reaping it, so the number
+        is real and definitively gone rather than an arbitrary guess that
+        could collide with a live process on a busy host.
+        """
+        proc = subprocess.Popen([sys.executable, "-c", ""])
+        proc.wait()
+        return proc.pid
+
+    def test_alive_when_pid_file_names_a_running_process(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _orchestrator_liveness_banner
 
         log = tmp_path / "orch.log"
         self._write_log(log, "2026-03-05T10:00:00Z")
         now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
         with patch("devbench.reporting.report._should_use_color", return_value=True):
-            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, self._live_pid_file(tmp_path), now=now)
         assert banner.startswith("\033[32m")
         assert "[ORCHESTRATOR ALIVE]" in banner
         assert "30s ago" in banner
         assert "session sess-A" in banner
         assert banner.endswith("\033[0m")
 
-    def test_stopped_state_red_when_quiet_past_threshold(self, tmp_path: Path) -> None:
+    def test_recent_log_without_a_pid_file_is_never_reported_alive(self, tmp_path: Path) -> None:
+        """Issue #250 regression: this exact input previously rendered ALIVE."""
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        banner = _orchestrator_liveness_banner(log, "sess-A", 180, tmp_path / "absent.pid", now=now)
+        assert "ALIVE" not in banner
+        assert "[ORCHESTRATOR UNKNOWN]" in banner
+        assert "no process is claiming this workspace" in banner
+
+    def test_stopped_when_pid_file_names_a_dead_process(self, tmp_path: Path) -> None:
+        """Authoritative: a dead PID is STOPPED even when the log is seconds old."""
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        pid_path = self._write_pid(tmp_path / ".devbench" / "orchestrator.pid", self._dead_pid())
+        now = datetime(2026, 3, 5, 10, 0, 5, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, pid_path, now=now)
+        assert banner.startswith("\033[91m")
+        assert "[ORCHESTRATOR STOPPED]" in banner
+        assert "names a process that is not running" in banner
+
+    def test_live_process_quiet_past_threshold_is_alive_but_idle(self, tmp_path: Path) -> None:
+        """A running orchestrator that is merely quiet must not be reported STOPPED."""
         from devbench.reporting.report import _orchestrator_liveness_banner
 
         log = tmp_path / "orch.log"
         self._write_log(log, "2026-03-05T10:00:00Z")
         now = datetime(2026, 3, 5, 10, 10, 0, tzinfo=UTC)
+        banner = _orchestrator_liveness_banner(log, "sess-A", 180, self._live_pid_file(tmp_path), now=now)
+        assert "[ORCHESTRATOR ALIVE]" in banner
+        assert "idle 10m" in banner
+        assert "STOPPED" not in banner
+
+    def test_not_running_when_no_pid_file_and_no_log(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
         with patch("devbench.reporting.report._should_use_color", return_value=True):
-            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+            banner = _orchestrator_liveness_banner(tmp_path / "no.log", "sess-A", 180, tmp_path / "absent.pid")
         assert banner.startswith("\033[91m")
-        assert "[ORCHESTRATOR STOPPED]" in banner
-        assert "no activity for 10m" in banner
-        assert "last seen" in banner
-        assert "session sess-A" in banner
-        assert banner.endswith("\033[0m")
+        assert "[ORCHESTRATOR NOT RUNNING]" in banner
+        assert "no pid file and no activity recorded" in banner
 
-    def test_starting_state_yellow_when_log_missing(self, tmp_path: Path) -> None:
+    def test_starting_when_pid_file_is_present_but_unparseable(self, tmp_path: Path) -> None:
+        """The daemon writes the PID file non-atomically; a partial read is STARTING, not ALIVE."""
         from devbench.reporting.report import _orchestrator_liveness_banner
 
-        missing = tmp_path / "no-such.log"
-        with patch("devbench.reporting.report._should_use_color", return_value=True):
-            banner = _orchestrator_liveness_banner(missing, "sess-A", 180)
-        assert banner.startswith("\033[33m")
+        pid_path = tmp_path / ".devbench" / "orchestrator.pid"
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text('{"instance_id": "ws-0001", "pi', encoding="utf-8")
+        banner = _orchestrator_liveness_banner(tmp_path / "no.log", "sess-A", 180, pid_path)
         assert "[ORCHESTRATOR STARTING]" in banner
-        assert "log file empty" in banner
-        assert banner.endswith("\033[0m")
+        assert "ALIVE" not in banner
 
-    def test_starting_state_when_log_empty(self, tmp_path: Path) -> None:
+    def test_alive_with_no_log_activity_yet(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _orchestrator_liveness_banner
 
-        log = tmp_path / "orch.log"
-        log.write_text("")
-        with patch("devbench.reporting.report._should_use_color", return_value=True):
-            banner = _orchestrator_liveness_banner(log, "sess-A", 180)
-        assert "[ORCHESTRATOR STARTING]" in banner
+        banner = _orchestrator_liveness_banner(tmp_path / "no.log", "sess-A", 180, self._live_pid_file(tmp_path))
+        assert "[ORCHESTRATOR ALIVE]" in banner
+        assert "no activity recorded yet" in banner
 
     def test_no_color_when_not_tty(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _orchestrator_liveness_banner
@@ -3367,23 +3438,9 @@ class TestOrchestratorAliveBanner:
         self._write_log(log, "2026-03-05T10:00:00Z")
         now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
         with patch("devbench.reporting.report._should_use_color", return_value=False):
-            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, self._live_pid_file(tmp_path), now=now)
         assert "\033[" not in banner
         assert "[ORCHESTRATOR ALIVE]" in banner
-
-    def test_boundary_at_threshold_is_alive(self, tmp_path: Path) -> None:
-        from devbench.reporting.report import _orchestrator_liveness_banner
-
-        log = tmp_path / "orch.log"
-        self._write_log(log, "2026-03-05T10:00:00Z")
-        # Exactly at threshold (180s) -> ALIVE.
-        at_threshold = datetime(2026, 3, 5, 10, 3, 0, tzinfo=UTC)
-        banner_at = _orchestrator_liveness_banner(log, "sess-A", 180, now=at_threshold)
-        assert "[ORCHESTRATOR ALIVE]" in banner_at
-        # One second past threshold -> STOPPED.
-        past_threshold = datetime(2026, 3, 5, 10, 3, 1, tzinfo=UTC)
-        banner_past = _orchestrator_liveness_banner(log, "sess-A", 180, now=past_threshold)
-        assert "[ORCHESTRATOR STOPPED]" in banner_past
 
     def test_no_session_id_suppresses_session_suffix(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _orchestrator_liveness_banner
@@ -3391,8 +3448,9 @@ class TestOrchestratorAliveBanner:
         log = tmp_path / "orch.log"
         self._write_log(log, "2026-03-05T10:00:00Z")
         now = datetime(2026, 3, 5, 10, 0, 10, tzinfo=UTC)
+        pid_file = self._live_pid_file(tmp_path)
         for empty in (None, ""):
-            banner = _orchestrator_liveness_banner(log, empty, 180, now=now)
+            banner = _orchestrator_liveness_banner(log, empty, 180, pid_file, now=now)
             assert "-- session" not in banner, f"empty session_id={empty!r} leaked suffix: {banner!r}"
 
     def test_threshold_sourced_from_stop_hook_window_seconds(self, tmp_path: Path) -> None:
@@ -3422,6 +3480,26 @@ class TestOrchestratorAliveBanner:
             report_mod.generate_report(log_path=log_file)
         assert captured["threshold"] == 999
 
+    def test_generate_report_passes_the_workspace_pid_file(self, tmp_path: Path) -> None:
+        """The banner is only authoritative if the real caller hands it the real PID path."""
+        from devbench.reporting import report as report_mod
+
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(_make_log(["2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'"]))
+        captured: dict[str, Path] = {}
+
+        def _capture(*, pid_path: Path, **_: Any) -> str:
+            captured["pid_path"] = pid_path
+            return "[ORCHESTRATOR ALIVE] capture-stub"
+
+        with (
+            patch("devbench.reporting.report.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report._orchestrator_liveness_banner", side_effect=_capture),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            report_mod.generate_report(log_path=log_file)
+        assert captured["pid_path"] == tmp_path / ".devbench" / "orchestrator.pid"
+
     def test_banner_prepended_as_first_line_of_report(self, tmp_path: Path) -> None:
         log_file = tmp_path / "orch.log"
         log_file.write_text(
@@ -3449,16 +3527,16 @@ class TestOrchestratorAliveBanner:
 
         log = tmp_path / "orch.log"
         self._write_log(log, "2026-03-05T10:00:00Z")
-        # First tick: 30s ago -> ALIVE 30s.
+        pid_file = self._live_pid_file(tmp_path)
         now1 = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
-        banner1 = _orchestrator_liveness_banner(log, "sess-A", 180, now=now1)
+        banner1 = _orchestrator_liveness_banner(log, "sess-A", 180, pid_file, now=now1)
         # Log advances; orchestrator wrote another line.
         log.write_text(
             "2026-03-05T09:00:00Z [devbench.orch] INFO Started\n"
             "2026-03-05T10:00:00Z [devbench.orch] INFO Tick\n"
             "2026-03-05T10:00:30Z [devbench.orch] INFO Tick\n"
         )
-        banner2 = _orchestrator_liveness_banner(log, "sess-A", 180, now=now1)
+        banner2 = _orchestrator_liveness_banner(log, "sess-A", 180, pid_file, now=now1)
         assert "30s ago" in banner1
         assert "0s ago" in banner2
         assert banner1 != banner2
@@ -4234,3 +4312,17 @@ class TestByRolePanelTotalsConsistency:
         total_lines = [line for line in lines if "TOTAL" in line]
         assert len(total_lines) == 1
         assert "2,000,000" in total_lines[0]
+
+
+class TestReadLastLogTimestampFailurePaths:
+    """A log the process cannot stat must not crash the liveness banner (issue #250)."""
+
+    def test_stat_failure_yields_no_timestamp(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        from devbench.reporting.report import _read_last_log_timestamp
+
+        log = tmp_path / "orch.log"
+        log.write_text("2026-03-05T10:00:00Z [devbench.orch] INFO Tick\n", encoding="utf-8")
+        with patch.object(Path, "stat", side_effect=OSError("permission denied")):
+            assert _read_last_log_timestamp(log) is None

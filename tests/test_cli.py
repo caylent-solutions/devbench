@@ -2832,6 +2832,41 @@ class TestHelp:
         assert result == 1
         assert "Unknown command" in err
 
+    @pytest.mark.parametrize("flag", ["--daemon", "--name", "--include", "--exclude", "--allow-overlap"])
+    def test_start_help_documents_every_flag_start_accepts(self, flag: str, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #249: every flag ``cmd_start`` parses must appear in its help text.
+
+        The scope-filter flags were accepted but undocumented, so operators had
+        no way to discover them short of reading the parser.
+        """
+        with patch("sys.argv", ["judges.cli", "start", "--help"]):
+            result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert flag in out
+
+    def test_top_level_list_shows_only_first_line_of_a_multiline_description(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Per-command help may span lines; the command list must stay one row per command."""
+        multiline = "Summary line.\n\nUsage: devbench demo [--flag]\n  --flag   does a thing."
+        with patch("sys.argv", ["judges.cli", "--help"]):
+            with patch.dict(cli._COMMANDS, {"demo": (MagicMock(return_value=0), 0, multiline)}):
+                result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "  demo                 Summary line." in out
+        assert "--flag   does a thing." not in out
+
+    def test_per_command_help_prints_the_whole_multiline_description(self, capsys: pytest.CaptureFixture[str]) -> None:
+        multiline = "Summary line.\n\nUsage: devbench demo [--flag]\n  --flag   does a thing."
+        with patch("sys.argv", ["judges.cli", "demo", "--help"]):
+            with patch.dict(cli._COMMANDS, {"demo": (MagicMock(return_value=0), 0, multiline)}):
+                result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "--flag   does a thing." in out
+
 
 class TestPreParseConfig:
     """Test --config CLI pre-parse helper."""
@@ -13476,7 +13511,7 @@ class TestInProgressAttemptDurationRender:
     ) -> None:
         log_path = tmp_path / "orchestrator.log"
         log_path.write_text(
-            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
+            "2026-05-02T12:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
             encoding="utf-8",
         )
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
@@ -13565,9 +13600,9 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
     ) -> None:
         log_path = tmp_path / "orchestrator.log"
         log_path.write_text(
-            "2026-05-02T08:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
-            "2026-05-02T09:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'blocked'\n"
-            "2026-05-02T11:30:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            "2026-05-02T08:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-02T09:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'blocked'\n"
+            "2026-05-02T11:30:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
@@ -13581,6 +13616,53 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
         # 4h vs 30m vs 4h+30m: most recent wins -> 30m.
         assert result == "30m"
+
+    def test_sdk_dump_quoting_the_claim_does_not_win_over_the_real_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Issue #293: a line that merely quotes the claim must not anchor the timer.
+
+        The orchestrator logs whole SDK messages. When a tool result reads the
+        work unit's ``[WU_CLAIMED]`` audit comment, the phrase
+        ``Set <id> to 'in-progress'`` reappears inside a line stamped with the
+        time of the dump, not the time of the claim. Taking the max over every
+        matching line made the later echo win, under-reporting the unit's age.
+        """
+        log_path = tmp_path / "orchestrator.log"
+        real_record = (
+            "2026-05-02T08:00:00Z [devbench.backlog_manager] INFO "
+            "Set E0-F1-S1-T1 to 'in-progress' in both work-unit file and BACKLOG.md\n"
+        )
+        # Verbatim shape of the contaminating line: devbench.cli logging an SDK
+        # message whose tool result embeds the work unit's audit comment.
+        echoed_dump = (
+            "2026-05-02T11:30:00Z [devbench.cli] INFO sdk message: UserMessage(content=[ToolResultBlock("
+            'content="229-[2026-05-02 08:00 UTC] [agent/orchestrator] [WU_CLAIMED] '
+            "Set E0-F1-S1-T1 to 'in-progress' session=default\", is_error=False)])\n"
+        )
+        log_path.write_text(real_record + echoed_dump, encoding="utf-8")
+        fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+        # Anchored to the 08:00 record, not the 11:30 echo: 4h, not 30m.
+        assert cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path) == "4h 0m"
+
+    def test_only_an_echoed_dump_yields_no_timestamp(self, tmp_path: Path) -> None:
+        """An echo alone is not evidence of a claim, so nothing is inferred from it."""
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "2026-05-02T11:30:00Z [devbench.cli] INFO sdk message: UserMessage(content=[ToolResultBlock("
+            "content=\"Set E0-F1-S1-T1 to 'in-progress'\")])\n",
+            encoding="utf-8",
+        )
+        assert cli._latest_log_in_progress_ts("E0-F1-S1-T1", log_path) is None
 
     def test_format_duration_thresholds(self) -> None:
         assert cli._format_duration(0) == "0s"
@@ -13598,7 +13680,7 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
     ) -> None:
         log_path = tmp_path / "orchestrator.log"
         log_path.write_text(
-            "9999-99-99T99:99:99Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            "9999-99-99T99:99:99Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
@@ -13664,7 +13746,7 @@ class TestTryResolveLogFilePath:
         log_path = tmp_path / "logs" / "orch.log"
         log_path.parent.mkdir(parents=True)
         log_path.write_text(
-            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            "2026-05-02T12:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)

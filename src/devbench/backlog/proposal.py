@@ -185,6 +185,7 @@ class BlockedTaskState(Enum):
       will unblock this task automatically once the dependency completes.
       Operator does nothing.
     - ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no regular-dep blocker,
+      no ``[RETRY_BUDGET_EXHAUSTED]`` tag,
       but at least one recovery signal is present on disk: a pending proposal
       JSON, a rejected-amendment archive, or a recent ``[BLOCKED]`` audit
       comment from a recovery agent (``agent/orchestrator``,
@@ -192,7 +193,10 @@ class BlockedTaskState(Enum):
       ``agent/backlog_manager``). The orchestrator's next sweep cycle will
       advance the task. Operator does nothing for now.
     - ``OPERATOR_ACTION_REQUIRED`` -- none of the above conditions match:
-      no marker, no pending-dep, no recovery signal. Includes manual gates
+      no marker, no pending-dep, no recovery signal. Also covers a spent
+      executor retry budget, recorded by the orchestrate skill as
+      ``[RETRY_BUDGET_EXHAUSTED]``: no further executor run is coming, so
+      only an operator can move the unit (issue #248). Includes manual gates
       (``DO NOT CLAIM``), unknown marker targets, and cascade-stuck states.
       Operator must act.
     """
@@ -257,6 +261,13 @@ _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
 # emitted in upper-case by the manifest-amender; a lower-case occurrence
 # is a prose quote of the tag, not the tag itself.
 _REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
+# Issue #248: structured tag the orchestrate skill writes when a work unit
+# spends its entire executor retry budget. It is the one unambiguous
+# statement that no further executor run is coming, which is what separates
+# "reviews failed and the executor will try again" from "reviews failed and
+# there is nothing left to try". Case-sensitive for the same reason as
+# ``_REJECTION_TAG_RE``: a lower-case occurrence is prose quoting the tag.
+_RETRY_EXHAUSTED_TAG_RE: re.Pattern[str] = re.compile(r"\[RETRY_BUDGET_EXHAUSTED\]")
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
@@ -274,6 +285,31 @@ _RUNTIME_DEGRADATION_BODY_RE: re.Pattern[str] = re.compile(
 # matches the default review cycle; a longer-lived degradation marker
 # implies the operator already saw the alert and (perhaps) is debugging.
 _RUNTIME_DEGRADATION_WINDOW_SECONDS: int = 24 * 60 * 60
+
+
+def _has_retry_exhausted_signal(source_file: Path) -> bool:
+    """Return ``True`` when the work unit's audit trail records an exhausted retry budget.
+
+    Issue #248. Looks for the ``[RETRY_BUDGET_EXHAUSTED]`` tag written by the
+    orchestrate skill at the moment a judge's retry budget is spent. Unlike
+    the recovery-signal heuristics this is an exact structured tag, not a
+    prose match, because the distinction it draws is the difference between
+    "devbench will keep working on this" and "devbench is finished with this
+    and an operator must look".
+
+    Args:
+        source_file: The work unit's ``.md`` file.
+
+    Returns:
+        ``True`` when the tag is present. Unreadable files return ``False``
+        so a transient read error cannot manufacture an operator alert; the
+        file-level failure surfaces through the checks that need its content.
+    """
+    try:
+        content = source_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(_RETRY_EXHAUSTED_TAG_RE.search(content))
 
 
 def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
@@ -456,11 +492,12 @@ def classify_blocked_task(
     4. ``AWAITING_DEPENDENCY`` -- no marker present (or all markers terminal
        but a regular dep is still in flight), and a Dependencies-table row
        points at a non-terminal task.
-    5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, but at
-       least one recovery signal is on disk (pending proposal JSON,
-       rejected-amendment archive, or a recent ``[BLOCKED]`` audit comment
-       from a recovery agent).
-    6. ``OPERATOR_ACTION_REQUIRED`` -- none of the above; operator must act.
+    5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, no
+       ``[RETRY_BUDGET_EXHAUSTED]`` tag, but at least one recovery signal is
+       on disk (pending proposal JSON, rejected-amendment archive, or a
+       recent ``[BLOCKED]`` audit comment from a recovery agent).
+    6. ``OPERATOR_ACTION_REQUIRED`` -- none of the above, or the retry budget
+       is exhausted; operator must act.
 
     The optional ``workspace_root`` enables recovery checks (all three recovery
     signals under ``AWAITING_AMENDMENT_RECOVERY``). Callers that pass only
@@ -659,7 +696,19 @@ def _classify_recovery_or_attention(
     ``OPERATOR_ACTION_REQUIRED`` immediately (legacy two-state behaviour).
     The three recovery signals are checked cheapest-first: file-presence
     > glob-match > timestamp-window read of the source file.
+
+    Issue #248: an exhausted retry budget is checked first, because the
+    recovery-signal heuristic cannot tell the two cases apart on its own.
+    ``_RECOVERY_BODY_RE`` matches ``ALL_REVIEWS_FAILED`` / ``REVIEW_REJECTED``,
+    and the orchestrator's retry-exhaustion ``[BLOCKED]`` row is written under
+    ``agent/orchestrator`` and names the failing checks. It therefore looked
+    exactly like a recovery signal, so a task that had spent its entire
+    budget was reported as AWAITING_AMENDMENT_RECOVERY, whose contract is
+    "operator does nothing". No further executor run was coming, so nothing
+    ever cleared it and no operator alert fired.
     """
+    if _has_retry_exhausted_signal(source_file):
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     if workspace_root is None:
         return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     if _has_pending_proposal_json(workspace_root, task_id):

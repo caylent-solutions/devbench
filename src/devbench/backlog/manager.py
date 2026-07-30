@@ -422,6 +422,7 @@ class BacklogManager:
             backtick-quoted path-shaped tokens in ``## Acceptance Criteria`` and
             ``## Definition of Done`` must appear in the Task's Changes Manifest after
             normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
+        21. Unique work-unit IDs: no ID appears on more than one index row.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -441,6 +442,7 @@ class BacklogManager:
 
         errors: list[str] = []
         self._check_full_index_has_rows(backlog_index, errors)
+        self._check_unique_ids(rows, errors)
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
@@ -722,6 +724,49 @@ class BacklogManager:
         if COMMENTS_SECTION_HEADER in content:
             return content.rstrip("\n") + "\n\n" + audit_block + "\n"
         return content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + audit_block + "\n"
+
+    @staticmethod
+    def _check_unique_ids(rows: list[tuple[str, str, str]], errors: list[str]) -> None:
+        """Check 21: every work-unit ID appears exactly once in the index.
+
+        A work unit written into two directory trees produces two index rows
+        under one ID. Every other check still passes: each file exists, each
+        file's status matches its own row, and neither file is orphaned,
+        because both are indexed. The backlog is nonetheless incoherent. The
+        two rows can disagree about status, and a dependency on that ID
+        resolves against whichever row is reached first, so whether the
+        dependency counts as satisfied is an ordering accident. Totals also
+        double-count the unit.
+
+        Observed shape: ``E2-F4-S3-T2`` present as ``done`` under a bare-ID
+        tree and ``declined`` under the slug tree, with the integrity check
+        reporting success.
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` index rows.
+            errors: Accumulator appended to on violation.
+        """
+        seen: dict[str, list[tuple[str, str]]] = {}
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            # ``_parse_backlog_rows`` scans every pipe row in BACKLOG.md,
+            # including the Status Summary table, whose rows repeat an ID
+            # without a File Path cell. A row that names no file is not a Full
+            # Work Unit Index row, so it cannot be a duplicate work unit. This
+            # is the same test ``_check_files_and_statuses`` uses to recognise
+            # real index rows.
+            if not file_path_str:
+                continue
+            seen.setdefault(row_id, []).append((status, file_path_str))
+        for row_id, occurrences in sorted(seen.items()):
+            if len(occurrences) < 2:
+                continue
+            detail = "; ".join(f"status '{status}' at {path}" for status, path in occurrences)
+            errors.append(
+                f"{row_id}: duplicate work unit ID -- {len(occurrences)} index rows share this ID ({detail}). "
+                "One ID must map to exactly one work unit file; remove or re-key the duplicate."
+            )
 
     def _check_files_and_statuses(
         self,

@@ -7,6 +7,85 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The test suite wrote into the live workspace and orchestrator log**
+  (issue #292). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
+  `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH` with `os.environ.setdefault`,
+  so it INHERITED whatever the ambient shell already had. devbench is
+  developed with devbench, so the executor runs the suite from inside a live
+  workspace with those exported: fixture work-unit state landed in the real
+  `.devbench/ci-failures/` and `.devbench/pr-bot-feedback/` under IDs that
+  exist only in `tests/`, and fabricated lifecycle records were appended to
+  the live log -- `[ORCHESTRATOR_TERMINAL_EXIT]`, `[QUOTA_WAITING]`,
+  `[ORCHESTRATOR_AUTO_RESTART]`, `Merged PR #42` -- for events that never
+  happened. Those are exactly the markers the reporting layer parses, so a
+  test run could drive an operator's `status` and `report` output. Assignment
+  is now unconditional, to a fresh per-run temporary workspace; an ambient
+  value is the hazard, not a configuration to honour. Verified against a live
+  workspace: the suite leaves a 180 MB orchestrator log byte-identical and
+  the 197-file `.devbench/` tree unchanged.
+
+- **A spent executor retry budget was reported as "operator does nothing"**
+  (issue #248). The orchestrate skill writes its retry-exhaustion `[BLOCKED]`
+  row under `agent/orchestrator` naming the failing checks, which matched both
+  the recovery agent-tag allowlist and the recovery body pattern (it includes
+  `ALL_REVIEWS_FAILED` / `REVIEW_REJECTED`). The unit was therefore classified
+  `AWAITING_AMENDMENT_RECOVERY`, whose contract is that the operator does
+  nothing, while no further executor run was coming. Nothing cleared it, no
+  operator notification fired, and the run stalled silently. The skill now
+  emits an explicit `[RETRY_BUDGET_EXHAUSTED]` tag on genuine exhaustion and
+  the classifier returns `OPERATOR_ACTION_REQUIRED` for it. A live
+  `[BLOCKED_PENDING_PROPOSAL]` cascade still wins, because that genuinely will
+  clear the unit.
+
+- **The in-progress timer under-reported how long a work unit had been
+  running** (issue #293). The pattern allowed `.*` between the log timestamp
+  and the phrase `Set <id> to 'in-progress'`, so it matched lines that merely
+  quoted the transition. The orchestrator logs whole SDK messages, and a tool
+  result that read a work unit's `[WU_CLAIMED]` audit comment reproduces that
+  phrase inside a line stamped with the time of the dump; being later, the
+  echo won the `max()`. Observed: a unit claimed at 12:11 reported as claimed
+  at 12:38, and the error grew with every further echo, so a long-running unit
+  could keep resetting toward "just started". The pattern is now anchored to
+  the emitting logger and level.
+
+- **`validate-backlog` passed on duplicate work-unit IDs** (issue #291). One
+  unit written into two directory trees yields two index rows under one ID.
+  Every existing check passed -- both files exist, each matches its own row's
+  status, and neither is orphaned because both are indexed -- while the rows
+  disagreed about status (`done` in one tree, `declined` in the other) and a
+  dependency on that ID resolved against whichever row was reached first. New
+  check 21 reports every ID carrying more than one index row, naming each
+  status and path. Status Summary rows, which repeat an ID without a File
+  Path, are not index rows and are excluded.
+
+- **`devbench report` did not say whether the run could proceed** (issue
+  #251). `status` ended with `Next actionable` / `All work units are DONE.` /
+  `No actionable units. N blocked.`; `report` ended with none of them, and its
+  per-status counts cannot substitute -- a backlog can hold many `in-queue`
+  units with nothing actionable, because only leaf Tasks execute and every one
+  may be waiting on a dependency. Both commands now render the same line from
+  one shared helper. `devbench next` keeps its machine tokens, which are a
+  contract consumed by the orchestrate skill.
+
+- **The orchestrator-alive banner reported ALIVE with no orchestrator
+  running** (issue #250). Liveness was derived from log-activity recency
+  alone, but a recent log line proves only that something wrote to the log,
+  not that the writer still exists: a crashed or killed daemon read as ALIVE
+  for the whole quiet window, and any other writer kept it ALIVE indefinitely.
+  The banner now reads the workspace PID file and checks the process table,
+  and reports five states (ALIVE, with an idle variant; STOPPED; STARTING;
+  NOT RUNNING; UNKNOWN). `stop_hook.window_seconds` no longer decides
+  liveness; it distinguishes a busy live orchestrator from an idle one, so a
+  running-but-quiet orchestrator is never reported STOPPED.
+
+- **`devbench start --help` omitted the scope-filter flags** (issue #249).
+  `--include`, `--exclude`, `--name` and `--allow-overlap` were accepted by the
+  parser and documented nowhere, so the only way to discover them was to read
+  the parser. The registry description was also the single source for both the
+  one-line command list and per-command help, leaving no room for flag
+  documentation. A description may now span lines: the command list shows the
+  first line, and `<cmd> --help` prints the whole text.
+
 - **A blocked work unit's uncommitted changes contaminated every unit that
   claimed after it.** The single-branch modes run every work unit in one shared
   checkout. When a unit blocked before its work was committed, that work stayed

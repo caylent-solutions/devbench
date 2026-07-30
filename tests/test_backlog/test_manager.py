@@ -6711,3 +6711,86 @@ class TestManifestGlobRejection:
         )
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("glob pattern" in e for e in errors)
+
+
+class TestValidateBacklogUniqueIds:
+    """Check 21: one work-unit ID must map to exactly one index row.
+
+    A unit written into two directory trees yields two index rows under one
+    ID. Every other check still passes, because both files exist, each
+    matches its own row's status, and neither is orphaned. The backlog is
+    nonetheless incoherent: the rows can disagree about status, and a
+    dependency on that ID resolves against whichever row is reached first.
+    """
+
+    @staticmethod
+    def _build_workspace(tmp_path: Path, backlog_dir: Path, *, duplicate: bool) -> Path:
+        """Write a minimal backlog, optionally indexing one unit under two paths."""
+        rows = [
+            ("E1", "Epic One", "Epic", "in-queue", "backlog/E1.md"),
+            ("E1-F1-S1-T1", "Task Alpha", "Task", "done", "backlog/E1-F1-S1-T1.md"),
+        ]
+        if duplicate:
+            rows.append(("E1-F1-S1-T1", "Task Alpha", "Task", "declined", "backlog/dup/E1-F1-S1-T1.md"))
+
+        header = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n"
+        )
+        body = "".join(
+            f"| {rid} | {title} | {typ} | {st} | None | repo | `{fp}` |\n" for rid, title, typ, st, fp in rows
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(header + body, encoding="utf-8")
+
+        (backlog_dir / "E1.md").write_text("# E1\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_dir / "E1-F1-S1-T1.md").write_text("# E1-F1-S1-T1\n\n## Status: done\n", encoding="utf-8")
+        if duplicate:
+            dup_dir = backlog_dir / "dup"
+            dup_dir.mkdir(parents=True, exist_ok=True)
+            (dup_dir / "E1-F1-S1-T1.md").write_text("# E1-F1-S1-T1\n\n## Status: declined\n", encoding="utf-8")
+        return index_path
+
+    def test_unique_ids_produce_no_duplicate_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        index_path = self._build_workspace(tmp_path, backlog_dir, duplicate=False)
+        errors = BacklogManager().validate(index_path, tmp_path)
+        assert not [e for e in errors if "duplicate work unit ID" in e]
+
+    def test_duplicate_id_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The exact shape that previously passed: same ID, conflicting statuses, both files present."""
+        index_path = self._build_workspace(tmp_path, backlog_dir, duplicate=True)
+        errors = BacklogManager().validate(index_path, tmp_path)
+        duplicates = [e for e in errors if "duplicate work unit ID" in e]
+        assert len(duplicates) == 1
+        msg = duplicates[0]
+        assert msg.startswith("E1-F1-S1-T1:")
+        assert "2 index rows share this ID" in msg
+        # Both conflicting statuses and both paths are named so the operator can act.
+        assert "status 'done' at backlog/E1-F1-S1-T1.md" in msg
+        assert "status 'declined' at backlog/dup/E1-F1-S1-T1.md" in msg
+
+    def test_duplicate_id_is_not_masked_by_the_other_checks_passing(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Regression: file-existence, status-match and orphan checks all pass here."""
+        index_path = self._build_workspace(tmp_path, backlog_dir, duplicate=True)
+        errors = BacklogManager().validate(index_path, tmp_path)
+        assert not [e for e in errors if "work unit file missing" in e]
+        assert not [e for e in errors if "status mismatch" in e]
+        assert not [e for e in errors if "orphaned work unit file" in e]
+        assert [e for e in errors if "duplicate work unit ID" in e]
+
+    def test_three_rows_under_one_id_are_all_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        index_path = self._build_workspace(tmp_path, backlog_dir, duplicate=True)
+        extra_dir = backlog_dir / "dup2"
+        extra_dir.mkdir(parents=True, exist_ok=True)
+        (extra_dir / "E1-F1-S1-T1.md").write_text("# E1-F1-S1-T1\n\n## Status: hold\n", encoding="utf-8")
+        index_path.write_text(
+            index_path.read_text(encoding="utf-8")
+            + "| E1-F1-S1-T1 | Task Alpha | Task | hold | None | repo | `backlog/dup2/E1-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        errors = BacklogManager().validate(index_path, tmp_path)
+        duplicates = [e for e in errors if "duplicate work unit ID" in e]
+        assert len(duplicates) == 1
+        assert "3 index rows share this ID" in duplicates[0]

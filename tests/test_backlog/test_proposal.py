@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -4239,3 +4239,136 @@ class TestRejectionTagRegex:
         assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, (
             f"Expected AWAITING_AMENDMENT_RECOVERY for body {audit_body!r}, got {state.name}"
         )
+
+
+class TestClassifyBlockedTaskRetryBudgetExhausted:
+    """Issue #248: a spent retry budget is operator work, not recovery.
+
+    The orchestrate skill writes its retry-exhaustion row under
+    ``agent/orchestrator`` and names the failing checks, so it matched both
+    the recovery agent-tag allowlist and ``_RECOVERY_BODY_RE`` (which
+    includes ``ALL_REVIEWS_FAILED`` / ``REVIEW_REJECTED``). The unit was
+    therefore reported as ``AWAITING_AMENDMENT_RECOVERY``, whose contract is
+    "operator does nothing", while no further executor run was coming. The
+    run stalled with no alert.
+    """
+
+    def _workspace(self, tmp_path: Path, comments: str) -> Path:
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n" + comments
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    @staticmethod
+    def _classify(workspace: Path, now: datetime, window: int = 300) -> object:
+        from devbench.backlog.proposal import classify_blocked_task
+
+        return classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=window,
+        )
+
+    def test_exhausted_budget_classifies_operator_action_required(self, tmp_path: Path) -> None:
+        """The exact row shape that stalled a real run, now correctly classified."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] [RETRY_BUDGET_EXHAUSTED] "
+            "test_review REVIEW_REJECTED after 10 consecutive failures\n",
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    def test_same_row_without_the_tag_is_still_treated_as_recovery(self, tmp_path: Path) -> None:
+        """Guards the boundary: an ordinary REVIEW_REJECTED with retries left must not page the operator."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] test_review REVIEW_REJECTED, retrying\n",
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_exhausted_budget_beats_a_pending_proposal_json(self, tmp_path: Path) -> None:
+        """A leftover recovery artefact must not mask an exhausted budget."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] [RETRY_BUDGET_EXHAUSTED] budget spent\n",
+        )
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        assert self._classify(workspace, now) is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    def test_lowercase_prose_mention_of_the_tag_does_not_trigger(self, tmp_path: Path) -> None:
+        """Prose quoting the tag is not the tag, matching _REJECTION_TAG_RE's convention."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] ALL_REVIEWS_FAILED; "
+            "if this repeats we will see [retry_budget_exhausted]\n",
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_marker_driven_cascade_still_wins_over_the_tag(self, tmp_path: Path) -> None:
+        """A live cascade genuinely will clear the unit, so it must not be downgraded to operator work."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] [RETRY_BUDGET_EXHAUSTED] budget spent "
+            "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n",
+        )
+        # T2 exists and is non-terminal, so the ADR-07 cascade is genuinely in flight.
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            index.read_text()
+            + "| E0-F1-S1-T2 | Recovery | Task | in-queue | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+        )
+        (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md").write_text(
+            "# E0-F1-S1-T2: Recovery\n\n## Status: in-queue\n\n## Comments\n"
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+class TestHasRetryExhaustedSignalReadFailure:
+    """An unreadable work-unit file must not manufacture an operator alert (issue #248)."""
+
+    def test_unreadable_source_file_returns_false(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        from devbench.backlog.proposal import _has_retry_exhausted_signal
+
+        source = tmp_path / "E0-F1-S1-T1.md"
+        source.write_text("[RETRY_BUDGET_EXHAUSTED] present but unreadable", encoding="utf-8")
+        with patch.object(Path, "read_text", side_effect=OSError("permission denied")):
+            assert _has_retry_exhausted_signal(source) is False

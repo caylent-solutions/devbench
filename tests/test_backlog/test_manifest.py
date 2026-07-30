@@ -635,3 +635,20 @@ class TestMarkdownPipeEscapes:
         assert len(rows) == 1
         assert rows[0].file == "src/example/parser.py"
         assert rows[0].change == "add feature"
+
+
+class TestRepoPrefixedManifestRows:
+    """Multi-repo work units encode the repo in the File cell as `` `<org/repo>` -- <path> ``."""
+
+    def test_repo_prefixed_file_cell_yields_the_bare_path(self) -> None:
+        content = (
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `caylent-solutions/devbench` -- `src/devbench/cli.py` | modify |\n\n"
+            "## End\n"
+        )
+        rows = parse_manifest(content)
+        assert len(rows) == 1
+        assert rows[0].file == "src/devbench/cli.py"
+        assert rows[0].change == "modify"

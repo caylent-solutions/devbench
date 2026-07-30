@@ -160,11 +160,25 @@ Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKE
 
 **In-progress duration (issue #158):** the `In-progress tasks:` panel suffixes every row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). Multiple in-progress transitions for the same task (blocked-then-resumed) resolve to the most recent one. When neither the structured log nor the work-unit's audit comments yield a parseable timestamp the row renders `(in-progress, timer unavailable)` -- never silently omitted. The same suffix appears on `devbench status` and `devbench status --detail` Active rows.
 
-**Orchestrator-alive banner (issue #161):** the very first line of `devbench report` is a one-line liveness banner derived from log-activity recency. Three states:
+The duration is anchored to the transition record written by `devbench.backlog_manager`, matched on the full record shape rather than on the phrase alone (issue #293). The orchestrator logs whole SDK messages, so a tool result that read a work unit's `[WU_CLAIMED]` audit comment reproduces the text `Set <id> to 'in-progress'` inside a line stamped with the time of the *dump*. Matching the phrase anywhere in a line made those echoes win, under-reporting a unit's age by the gap between the claim and the echo, and the error grew with every further echo.
 
-- `[ORCHESTRATOR ALIVE]` (green) -- last log line is within `stop_hook.window_seconds`. Suffix names the elapsed-since duration (`last activity 12s ago`).
-- `[ORCHESTRATOR STOPPED]` (red) -- last log line older than `stop_hook.window_seconds`. Suffix names elapsed-since plus the last-seen UTC timestamp so the operator can see when the loop went quiet (`no activity for 14m (last seen 2026-05-04 13:21 UTC)`).
-- `[ORCHESTRATOR STARTING]` (yellow) -- log file missing or empty. The orchestrator is starting up or no events have been written yet.
+**Actionability line (issue #251):** both `devbench status` and `devbench report` end with the same one-line answer to "can the run proceed?", produced by a single shared helper so the two commands cannot disagree:
+
+- `Next actionable: <id> -- <title>` -- at least one unit is claimable.
+- `All work units are DONE.` -- nothing remains.
+- `No actionable units. <N> blocked.` -- work remains but none of it can start.
+
+The per-status counts do not answer this on their own: a backlog can hold many `in-queue` units and still have nothing actionable, because only leaf Tasks execute and every one of them may be waiting on a dependency. `devbench next` deliberately keeps its machine tokens (`ALL_DONE` / `NO_ACTIONABLE` / `NO_ACTIONABLE_IN_SCOPE`) instead; those are a contract consumed by the orchestrate skill's loop-continuation check.
+
+**Orchestrator-alive banner (issues #161, #250):** the very first line of `devbench report` is a one-line liveness banner. The process table decides whether an orchestrator is running; log recency only describes what it has been doing. Five states:
+
+- `[ORCHESTRATOR ALIVE]` (green) -- the PID file names a running process. Suffix names the pid and the elapsed-since duration (`pid 1669778; last activity 12s ago`).
+- `[ORCHESTRATOR ALIVE] ... idle` (yellow) -- running, but quiet for longer than `stop_hook.window_seconds`. A live orchestrator is never reported STOPPED merely for being quiet.
+- `[ORCHESTRATOR STOPPED]` (red) -- the PID file names a process that is not running. Authoritative: log recency is used only for the last-seen timestamp, not for the verdict.
+- `[ORCHESTRATOR STARTING]` (yellow) -- PID file present but not yet parseable, i.e. the daemon is mid-write.
+- `[ORCHESTRATOR NOT RUNNING]` (red) / `[ORCHESTRATOR UNKNOWN]` (yellow) -- no PID file, with and without log activity respectively.
+
+Deriving ALIVE from recency alone reported a healthy orchestrator when none was running: a recent log line proves only that *something* wrote to the log, not that the writer still exists. A crashed or killed daemon read as ALIVE for the whole quiet window, and any other process writing to the same log kept it ALIVE indefinitely.
 
 Every banner ends with the active session id when `DEVBENCH_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
 

@@ -393,20 +393,19 @@ def _print_actionable_summary(
     point at the next DIFFERENT task.  The ``active`` list is used to
     exclude already-running IDs.
 
+    Issue #251: the line itself is produced by
+    :func:`devbench.backlog.actionability.actionability_line`, shared with
+    ``devbench report`` so the two commands cannot disagree about whether
+    the run can proceed.
+
     Args:
         parser: The :class:`BacklogParser` instance.
         units: Full list of parsed work units.
         active: Work units currently IN_PROGRESS or IN_REVIEW.
     """
-    active_ids = {u.id for u in active}
-    actionable = [u for u in parser.get_parallel_candidates(units) if u.id not in active_ids]
-    if actionable:
-        print(f"\nNext actionable: {actionable[0].id} -- {actionable[0].title}")
-    elif parser.all_done(units):
-        print("\nAll work units are DONE.")
-    else:
-        blocked = parser.get_blocked_units(units)
-        print(f"\nNo actionable units. {len(blocked)} blocked.")
+    from devbench.backlog.actionability import actionability_line
+
+    print(f"\n{actionability_line(parser, units, active_ids=[u.id for u in active])}")
 
 
 @dataclass
@@ -748,10 +747,21 @@ def _print_blocked_rejection_categories(blocked_tasks: list[WorkUnit]) -> None:
 
 _HOLD_COMMENT_RE: re.Pattern[str] = re.compile(r"\[HOLD\]\s+(.+?)(?:\n|$)")
 
-# Issue #158: regex matching the structured-log line:
-#   2026-05-02T12:34:56Z [logger] LEVEL ... Set <id> to 'in-progress'
+# Issue #158: regex matching the structured-log line written by
+# ``BacklogManager.force_status`` when a work unit is claimed:
+#   2026-05-02T12:34:56Z [devbench.backlog_manager] INFO Set <id> to 'in-progress' in both ...
+#
+# Issue #293: this must match the transition RECORD, never a line that merely
+# quotes it. The orchestrator logs whole SDK messages, and a tool result that
+# read the work unit's ``[WU_CLAIMED]`` audit comment reproduces the phrase
+# "Set <id> to 'in-progress'" inside a line stamped with the time of the DUMP.
+# The previous pattern allowed ``.*`` between the timestamp and the phrase, so
+# those echoes matched and, being later, won the max(). A unit claimed at
+# 12:11 reported as claimed at 12:38, under-reporting its age by 27 minutes,
+# and the error grew with every further echo. Anchoring to the emitting
+# logger and level admits only the real record.
 _LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (\S+) to 'in-progress'",
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z \[devbench\.backlog_manager\] INFO Set (\S+) to 'in-progress'",
     re.MULTILINE,
 )
 # Fallback: agent-comment audit row of the form
@@ -9654,7 +9664,26 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "start": (
         cmd_start,
         0,
-        "Run orchestrate skill via Agent SDK (non-interactive). Flag: --daemon detaches to background (#209).",
+        (
+            "Run orchestrate skill via Agent SDK (non-interactive).\n"
+            "\n"
+            "Usage: devbench start [--daemon] [--name <session>] "
+            '[--include "<tokens>"] [--exclude "<tokens>"] [--allow-overlap]\n'
+            "\n"
+            "  --daemon, -d        Detach to the background and return immediately (#209).\n"
+            "  --name <session>    Named session to run under. Default: 'default'.\n"
+            '  --include "<t>"     Restrict the run to matching work units. Comma-separated\n'
+            "                      printer-pages tokens: IDs (E1-F2-S3-T4), last-segment\n"
+            "                      ranges (E2-F1-S1-T3-T7), and epic/feature/story\n"
+            "                      shorthands (E1, E2-F1, E2-F1-S1). Absent or empty means\n"
+            "                      every work unit is eligible.\n"
+            '  --exclude "<t>"     Subtract matching work units from the include set.\n'
+            "                      Applied after include expansion; only meaningful with\n"
+            "                      --include.\n"
+            "  --allow-overlap     Permit this scope to overlap another live session's\n"
+            "                      scope. Refused by default so two sessions cannot claim\n"
+            "                      the same work unit."
+        ),
     ),
     "instances": (cmd_instances, 0, "List every live devbench orchestrator on this host (#209). Flag: --json"),
     "stop-instance": (
@@ -9840,13 +9869,19 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
 
 
 def _print_usage() -> None:
-    """Print top-level usage and command list. Shared by the `-h`/`--help` path and the no-args path."""
+    """Print top-level usage and command list. Shared by the `-h`/`--help` path and the no-args path.
+
+    A registry description may span several lines so that
+    ``devbench <command> --help`` can document flags and usage in full. Only
+    its first line is shown here, which keeps the command column aligned;
+    the full text is printed by the per-command help path.
+    """
     print("Usage: devbench <command> [args]")
     print("       devbench <command> --help    (per-command usage)")
     print("       devbench --help              (this message)")
     print("\nCommands:")
     for name, (_, _, desc) in sorted(_COMMANDS.items()):
-        print(f"  {name:<20} {desc}")
+        print(f"  {name:<20} {desc.splitlines()[0]}")
 
 
 def _extract_watch_flag(raw_args: list[str]) -> tuple[int, list[str]]:

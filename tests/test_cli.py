@@ -13,6 +13,9 @@ from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+from test_tdd_gate import commit_scratch_repo as _tdd_gate_commit_all
+from test_tdd_gate import init_scratch_repo as _init_scratch_repo_for_cli
+from test_tdd_gate import write_scratch_file as _tdd_gate_write
 
 from devbench import cli
 from devbench.backlog.proposal import Proposal
@@ -20633,3 +20636,237 @@ class TestDaemonizeGuard:
         with patch("devbench.cli.os.name", "nt"):
             with pytest.raises(RuntimeError, match="--daemon requires POSIX"):
                 cli._daemonize_to_background(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# cmd_tdd_gate (FR-4.2, E4-F3-S1-T2) -- the orchestrator-facing wiring around
+# devbench.tdd_gate.observe_red. All git behavior under test is exercised
+# against real temporary git repositories (no mocked git); the wiring itself
+# (unit resolution, manifest parsing, RED_OBSERVED write-on-success,
+# rejection-message passthrough) is what this test class covers -- the full
+# stash/pytest/classification behavior is covered exhaustively at the
+# devbench.tdd_gate module level in tests/test_tdd_gate.py.
+# ---------------------------------------------------------------------------
+def _tdd_gate_init_repo(tmp_path: Path) -> Path:
+    return _init_scratch_repo_for_cli(
+        tmp_path,
+        dir_name="target-repo",
+        author_email="tdd-gate-cli-test@example.com",
+        author_name="Tdd Gate Cli Test",
+    )
+
+
+def _tdd_gate_work_unit_content(unit_id: str, manifest_rows: str, red_entry: str) -> str:
+    return (
+        f"# {unit_id}: TDD Gate CLI Test\n\n"
+        "## Status: in-progress\n\n"
+        "## Changes Manifest\n\n"
+        "| File | Change |\n"
+        "|------|--------|\n"
+        f"{manifest_rows}\n"
+        "## TDD Cycle Log\n\n"
+        f"{red_entry}\n\n"
+        "## Comments\n"
+    )
+
+
+def _tdd_gate_setup_unit(unit_id: str, wu_file: Path) -> tuple[WorkUnit, MagicMock]:
+    unit = WorkUnit(
+        id=unit_id,
+        title="TDD Gate CLI Test",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=wu_file,
+        repo="caylent-solutions/devbench",
+        dependencies=[],
+    )
+    mock_parser = MagicMock()
+    mock_parser.parse_index.return_value = [unit]
+    return unit, mock_parser
+
+
+@pytest.mark.unit
+class TestCmdTddGate:
+    """cmd_tdd_gate -- orchestrator-facing wiring for the machine-observed RED gate."""
+
+    def test_registered_in_commands(self) -> None:
+        assert "tdd-gate" in cli._COMMANDS, "tdd-gate command must be registered in cli._COMMANDS"
+
+    def test_success_writes_red_observed_and_returns_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/greeter.py", "def greet() -> str:\n    return 'hi'\n")
+        _tdd_gate_write(
+            repo,
+            "tests/test_greeter.py",
+            "from greeter import greet\n\n\ndef test_greet() -> None:\n    assert greet() == 'wrong'\n",
+        )
+        _tdd_gate_write(
+            repo,
+            "conftest.py",
+            "import sys\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path(__file__).parent / 'src'))\n",
+        )
+        _tdd_gate_commit_all(repo, "add greeter with a deliberately-wrong assertion")
+
+        unit_id = "E231-F3-S1-T1"
+        wu_file = tmp_path / f"{unit_id}.md"
+        node_id = "tests/test_greeter.py::test_greet"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(
+                unit_id,
+                "| `src/greeter.py` | add |\n| `tests/test_greeter.py` | add |\n",
+                f"- [RED] 2026-01-01T00:00:00+00:00 -- Command: pytest {node_id} -q. Exit: 1.\n",
+            ),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert node_id in out
+        assert "exit_code=1" in out
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RED_OBSERVED]" in content
+        assert f"test_node_id={node_id}" in content
+        # the gate must restore the working tree exactly as found
+        assert (repo / "src" / "greeter.py").read_text(encoding="utf-8") == "def greet() -> str:\n    return 'hi'\n"
+
+    def test_rejection_prints_message_and_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """No named test in the TDD Cycle Log -- the gate rejects before touching git."""
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/prod.py", "x = 1\n")
+        _tdd_gate_commit_all(repo, "baseline")
+
+        unit_id = "E231-F3-S1-T2"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(unit_id, "| `src/prod.py` | modify |\n", ""),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        before = wu_file.read_text(encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "RED gate rejected" in err
+        assert unit_id in err
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, "a rejected gate must write nothing to the work unit file"
+
+    def test_unit_not_found_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_tdd_gate("NONEXISTENT")
+
+        assert result == 1
+        assert "not found in backlog" in capsys.readouterr().err
+
+    def test_work_unit_file_not_on_disk_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The unit is present in the index, but its .md file exists nowhere on disk."""
+        unit_id = "E231-F3-S1-T5"
+        unit = WorkUnit(
+            id=unit_id,
+            title="TDD Gate CLI Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing-backlog-root"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "missing-workspace-root"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        assert "not found on disk" in capsys.readouterr().err
+
+    def test_missing_repo_local_path_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E231-F3-S1-T3"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(unit_id, "| `src/prod.py` | modify |\n", ""),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        assert "No local path configured" in capsys.readouterr().err
+
+    def test_manifest_parse_error_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A work-unit file with no Changes Manifest section fails fast (ManifestParseError)."""
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "README.md", "baseline\n")
+        _tdd_gate_commit_all(repo, "baseline")
+
+        unit_id = "E231-F3-S1-T4"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}: No Manifest\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        assert "Changes Manifest could not be parsed" in capsys.readouterr().err

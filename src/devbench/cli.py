@@ -38,6 +38,9 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     read-unit <id>                          Return work unit content and repo path as JSON
     get-diff <id>                           Return combined git diff for the work unit's repo
     run-tests <id>                          Run test suite for the work unit's repo
+    tdd-gate <id>                           Run the machine-observed RED gate for a gated task;
+                                             on a genuine RED, records the orchestrator-only
+                                             RED_OBSERVED entry (FR-4.2, exits 1 on any rejection)
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
     log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log;
@@ -4056,6 +4059,77 @@ def red_gate_satisfied(content: str) -> bool:
         _red_observed_message_has_all_required_fields(line_match.group("message"))
         for line_match in RED_OBSERVED_ENTRY_LINE_RE.finditer(section_body)
     )
+
+
+def cmd_tdd_gate(unit_id: str) -> int:
+    """Run the machine-observed RED gate for a gated task (FR-4.2, issue #257).
+
+    Orchestrator-facing entry point for :func:`devbench.tdd_gate.observe_red`:
+    resolves the work unit and its repo, parses the Changes Manifest, runs the
+    gate, and on a genuine RED writes the orchestrator-only ``RED_OBSERVED``
+    entry via :func:`write_red_observed_entry` -- the same machinery
+    ``red_gate_satisfied`` re-validates on read (E4-F3-S1-T1). This function
+    performs no observation logic itself (single responsibility); all
+    stash/pytest/classification behavior lives in ``devbench.tdd_gate``.
+
+    Usage::
+
+        tdd-gate <id>
+
+    Exits 0 and prints a one-line success message (including the observed
+    test node id and exit code) when a genuine RED is observed and recorded.
+    Exits 1 and prints the gate's standardized rejection message to stderr on
+    every fail-closed rejection path (dirty tree outside the manifest, no
+    production-source rows, no named test, a stash failure, or a false/no
+    RED) -- see ``devbench.tdd_gate.observe_red`` for the full rejection
+    taxonomy.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+    from devbench.tdd_gate import TddGateRejectionError, observe_red
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        print(f"ERROR: Work unit file for '{unit_id}' not found on disk", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    content = wu_file.read_text(encoding="utf-8")
+    try:
+        manifest_paths = [row.file for row in parse_manifest(content)]
+    except ManifestParseError as exc:
+        print(f"ERROR: Changes Manifest could not be parsed for '{unit_id}': {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        observation = observe_red(unit_id, repo_path, manifest_paths, content)
+    except TddGateRejectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    write_red_observed_entry(
+        unit_id,
+        observation.exit_code,
+        observation.test_node_id,
+        observation.failure_digest,
+    )
+    print(
+        f"RED gate satisfied for {unit_id}: test_node_id={observation.test_node_id} "
+        f"exit_code={observation.exit_code} failure_digest={observation.failure_digest}"
+    )
+    return 0
 
 
 def cmd_ensure_branch(unit_id: str) -> int:
@@ -10614,6 +10688,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
+    "tdd-gate": (
+        cmd_tdd_gate,
+        1,
+        "Run the machine-observed RED gate for a gated task and record RED_OBSERVED on success: tdd-gate <id>",
+    ),
     "log-verdict": (
         cmd_log_verdict,
         3,

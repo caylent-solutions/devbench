@@ -31,7 +31,7 @@ body:
       label: Output or logs
       description: >-
         Relevant output, log lines, or work-unit ids. Redact anything you would not
-        want in a public repository, including client names and internal paths.
+        want in a public repository, such as tokens, hostnames, or internal paths.
       render: text
 
   - type: dropdown

@@ -104,6 +104,7 @@ from devbench.backlog.amendment import (
     reject_amendment,
     write_request,
 )
+from devbench.backlog.index_errors import exit_with_index_error
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
@@ -566,7 +567,13 @@ def cmd_status(*argv: str) -> int:
     _render_drain_banner(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    all_units = parser.parse_index()
+    try:
+        all_units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        # Issue #305: this used to escape as a raw traceback while
+        # ``devbench report`` produced an actionable diagnostic for the same
+        # condition. Both now route through one handler.
+        exit_with_index_error("status", BACKLOG_INDEX, exc)
 
     # AC-192-12: when --session <name> is given, filter to only WUs whose most
     # recent [WU_CLAIMED] audit names that session.  Without --session, the full
@@ -6231,7 +6238,9 @@ def _write_session_state_files(
     - ``pid`` -- the process ID (plain integer text).
     - ``started_at`` -- UTC ISO-8601 timestamp of when the session was created.
     - ``started_by`` -- OS username of the process owner.
-    - ``scope.json`` -- JSON array of work-unit IDs in scope (may be empty).
+    - ``scope.json`` -- canonical ``ScopeFilter`` payload, written only when
+      the session is scoped. An unscoped session writes no file, because
+      absent is the unscoped signal every reader already honours (issue #270).
 
     Also registers the session in the
     ``<workspace_root>/.devbench/sessions/registry.json`` via
@@ -6268,8 +6277,26 @@ def _write_session_state_files(
     # started_by
     (state_dir / SESSION_STARTED_BY_FILENAME).write_text(started_by, encoding="utf-8")
 
-    # scope.json -- written as a JSON array of IDs
-    (state_dir / "scope.json").write_text(json.dumps(scope_ids, indent=2), encoding="utf-8")
+    # scope.json -- issue #270. This wrote a bare JSON array of IDs while
+    # every reader (``ScopeFilter.from_file``, ``_read_scope_payload``)
+    # requires the canonical object with include / exclude / expanded_ids /
+    # started_at / started_by. The two shapes land on the SAME path, because
+    # ``resolve_scope_file_path`` routes to this per-session file whenever
+    # DEVBENCH_SESSION_NAME is set, so the array overwrote the object and
+    # every subsequent read raised
+    # "scope.json top-level payload must be an object, got 'list'".
+    # Unscoped runs wrote "[]" and hit it on the next status call.
+    #
+    # An unscoped session writes no file at all: absent is the documented
+    # unscoped signal (``_read_scope_payload`` returns None, and
+    # ``ScopeFilter.from_file`` raises FileNotFoundError for callers that
+    # require one). Writing an empty scope would instead assert a scope that
+    # matches nothing, which is a different and much worse claim.
+    scope_path = state_dir / "scope.json"
+    if scope_ids:
+        ScopeFilter(include=[], exclude=[], expanded_ids=set(scope_ids)).to_file(workspace_root, path=scope_path)
+    elif scope_path.exists():
+        scope_path.unlink()
 
     # registry.json -- add or update this session
     registry = SessionRegistry(workspace_root)
@@ -8455,6 +8482,13 @@ def _sweep_one_proposal(
     needs_auto_promote = auto_accept and (unmaterialised_before > 0 or proposed_before > 0)
 
     if not needs_materialise and not needs_auto_promote:
+        # Issue #302: every task in this proposal is resolved, so the JSON
+        # has done its job. Leaving it on disk keeps the source task pinned
+        # to AWAITING_AMENDMENT_RECOVERY (``_has_pending_proposal_json`` is
+        # pure file presence) and keeps the sweep re-reading it on every
+        # orchestrate loop start. Delete it here, at the one point that
+        # knows the whole proposal is finished.
+        delete_proposal_if_consumed(WORKSPACE_ROOT, BACKLOG_ROOT, proposal)
         print(f"sweep-proposals: no-op {proposal.source_task_id}")
         return 0
 
@@ -8500,6 +8534,10 @@ def _sweep_one_proposal(
                     f"sweep-proposals: auto-promote failed for {task.suggested_id}: {exc}",
                     file=sys.stderr,
                 )
+
+    # Issue #302: a proposal whose tasks all resolved during this call is
+    # finished too, not only one that arrived resolved.
+    delete_proposal_if_consumed(WORKSPACE_ROOT, BACKLOG_ROOT, proposal)
 
     skipped_count = len(proposal.proposed_tasks) - len(drafts)
     line = f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped"

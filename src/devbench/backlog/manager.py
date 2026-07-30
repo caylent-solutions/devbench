@@ -95,8 +95,20 @@ _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLIN
 # (non-terminal), preventing the cascade from firing even when the real marker
 # target (e.g. E5-F3-S1-T4) was terminal. The fix narrows the pattern to only
 # capture canonical task IDs matching ``E\d+(-F\d+)?(-S\d+)?(-T\d+)?``.
+# Issue #304: the marker must be anchored to the end of its audit row.
+# Both writers -- ``_append_promote_comment`` (task-factory) and
+# ``_append_wired_comment`` (add-dep) -- emit the marker as the final token
+# of the row, so end-anchoring admits every marker devbench writes.
+#
+# Matching it anywhere in the Comments body meant prose that merely QUOTED a
+# marker created one. An operator audit comment recording that a marker had
+# been removed, quoting the removed line verbatim, silently re-blocked the
+# unit on the quoted ID with no diagnostic: the file read as correct to a
+# human because the only occurrence sat inside quotation marks. Agents write
+# such narratives routinely, so this was reachable without an operator.
 _BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
-    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)"
+    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)[ \t]*$",
+    re.MULTILINE,
 )
 
 

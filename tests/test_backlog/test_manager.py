@@ -6794,3 +6794,64 @@ class TestValidateBacklogUniqueIds:
         duplicates = [e for e in errors if "duplicate work unit ID" in e]
         assert len(duplicates) == 1
         assert "3 index rows share this ID" in duplicates[0]
+
+
+class TestMarkerScannerIgnoresQuotedMarkers:
+    """Issue #304: quoting a marker in prose must not create one.
+
+    Both writers emit ``[BLOCKED_PENDING_PROPOSAL] <id>`` as the final token
+    of an audit row, so end-anchoring admits every marker devbench writes
+    while excluding prose that merely mentions one. Before this, an operator
+    audit comment recording that a marker had been removed, quoting the
+    removed line verbatim, silently re-blocked the unit on the quoted ID.
+    """
+
+    @staticmethod
+    def _wu(tmp_path: Path, comments: str) -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(f"# E0-F1-S1-T1: T\n\n## Status: blocked\n\n## Comments\n{comments}", encoding="utf-8")
+        return wu
+
+    def test_marker_at_end_of_an_audit_row_is_live(self, tmp_path: Path) -> None:
+        wu = self._wu(
+            tmp_path,
+            "\n[2026-05-01 12:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] E0-F1-S1-T9 promoted and "
+            "wired as dependency of E0-F1-S1-T1. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n",
+        )
+        assert BacklogManager()._extract_pending_proposal_markers(wu) == {"E0-F1-S1-T9"}
+
+    def test_add_dep_marker_shape_is_live(self, tmp_path: Path) -> None:
+        wu = self._wu(
+            tmp_path,
+            "\n[2026-05-01 12:00 UTC] [agent/operator] [WU_WIRED] E0-F1-S1-T1 manually blocked on "
+            "E0-F1-S1-T9 via `devbench add-dep`. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n",
+        )
+        assert BacklogManager()._extract_pending_proposal_markers(wu) == {"E0-F1-S1-T9"}
+
+    def test_quoted_marker_mid_sentence_creates_no_marker(self, tmp_path: Path) -> None:
+        """The exact operator-audit shape that silently re-blocked a unit."""
+        wu = self._wu(
+            tmp_path,
+            "\n[2026-05-01 12:05 UTC] [agent/operator] [CYCLE_BROKEN] The inverted marker line was removed. "
+            "It read verbatim: '[2026-05-01 12:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] E0-F1-S1-T9 "
+            "promoted. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9' and the edge now runs the other way.\n",
+        )
+        assert BacklogManager()._extract_pending_proposal_markers(wu) == set()
+
+    def test_live_marker_survives_alongside_a_quoted_one(self, tmp_path: Path) -> None:
+        """Removing one marker while quoting another must not disturb the survivor."""
+        wu = self._wu(
+            tmp_path,
+            "\n[2026-05-01 12:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] E0-F1-S1-T8 promoted. "
+            "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T8\n"
+            "\n[2026-05-01 12:05 UTC] [agent/operator] [CYCLE_BROKEN] removed the row reading "
+            "'[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9' because it was inverted.\n",
+        )
+        assert BacklogManager()._extract_pending_proposal_markers(wu) == {"E0-F1-S1-T8"}
+
+    def test_trailing_whitespace_after_a_marker_is_tolerated(self, tmp_path: Path) -> None:
+        wu = self._wu(
+            tmp_path,
+            "\n[2026-05-01 12:00 UTC] [agent/operator] [WU_WIRED] x. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9   \n",
+        )
+        assert BacklogManager()._extract_pending_proposal_markers(wu) == {"E0-F1-S1-T9"}

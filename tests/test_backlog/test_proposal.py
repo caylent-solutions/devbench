@@ -4372,3 +4372,67 @@ class TestHasRetryExhaustedSignalReadFailure:
         source.write_text("[RETRY_BUDGET_EXHAUSTED] present but unreadable", encoding="utf-8")
         with patch.object(Path, "read_text", side_effect=OSError("permission denied")):
             assert _has_retry_exhausted_signal(source) is False
+
+
+class TestFindDraftFileResolvesAnywhere:
+    """Issue #302: a work-unit ID identifies one unit wherever its file sits.
+
+    The resolver previously looked in exactly one computed story directory.
+    A unit living elsewhere read as absent, so ``classify_proposed_task``
+    reported UNMATERIALISED and the orchestrate loop's opening
+    ``sweep-proposals`` created it again in the canonical directory. That
+    produced two files and two index rows under one ID, on every start.
+    """
+
+    @staticmethod
+    def _write(root: Path, rel: str, status: str = "done") -> Path:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"# {target.stem}: T\n\n## Status: {status}\n", encoding="utf-8")
+        return target
+
+    def test_finds_a_unit_outside_the_canonical_story_directory(self, tmp_path: Path) -> None:
+        """The exact shape that caused the repeated duplication."""
+        from devbench.backlog.proposal import _find_draft_file
+
+        root = tmp_path / "backlog"
+        # Bare-ID tree, not the <id>-<slug> layout the resolver used to assume.
+        expected = self._write(root, "E2/E2-F4/E2-F4-S3/E2-F4-S3-T2.md")
+        assert _find_draft_file(root, "E2-F4-S3-T2") == expected
+
+    def test_finds_a_unit_in_the_slug_directory(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _find_draft_file
+
+        root = tmp_path / "backlog"
+        expected = self._write(root, "E2-quota/E2-F4-orch/E2-F4-S3-loop/E2-F4-S3-T2.md")
+        assert _find_draft_file(root, "E2-F4-S3-T2") == expected
+
+    def test_absent_unit_still_returns_none(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _find_draft_file
+
+        (tmp_path / "backlog").mkdir()
+        assert _find_draft_file(tmp_path / "backlog", "E9-F9-S9-T9") is None
+
+    def test_existing_unit_is_not_classified_unmaterialised(self, tmp_path: Path) -> None:
+        """The consequence that mattered: sweep-proposals re-creating a live unit."""
+        from devbench.backlog.proposal import ProposalTaskState, classify_proposed_task
+
+        root = tmp_path / "backlog"
+        self._write(root, "E2/E2-F4/E2-F4-S3/E2-F4-S3-T2.md", status="done")
+        state = classify_proposed_task(root, tmp_path, "E2-F4-S3-T2")
+        assert state is ProposalTaskState.DONE
+        assert state is not ProposalTaskState.UNMATERIALISED
+
+    def test_duplicate_files_are_refused_rather_than_picked_arbitrarily(self, tmp_path: Path) -> None:
+        """Returning either would make downstream decisions depend on walk order."""
+        from devbench.backlog.proposal import ProposalError, _find_draft_file
+
+        root = tmp_path / "backlog"
+        self._write(root, "E2/E2-F4/E2-F4-S3/E2-F4-S3-T2.md", status="done")
+        self._write(root, "E2-quota/E2-F4-orch/E2-F4-S3-loop/E2-F4-S3-T2.md", status="declined")
+        with pytest.raises(ProposalError) as exc:
+            _find_draft_file(root, "E2-F4-S3-T2")
+        msg = str(exc.value)
+        assert "duplicate work-unit file" in msg
+        assert "2 files carry this ID" in msg
+        assert "validate-backlog" in msg

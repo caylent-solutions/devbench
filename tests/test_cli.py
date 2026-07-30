@@ -17,7 +17,14 @@ import pytest
 from devbench import cli
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.constants import BACKLOG_SUBDIR, SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
+from devbench.constants import (
+    BACKLOG_SUBDIR,
+    SESSION_DEFAULT_NAME,
+    SESSION_SESSIONS_BASE_DIR,
+    TDD_ENTRY_TEMPLATE,
+    TDD_PHASE_RED,
+    TDD_PHASE_RED_OBSERVED,
+)
 from devbench.github.git_ops import CIResult
 
 
@@ -3863,14 +3870,7 @@ class TestCmdLogTdd:
 
     def _setup(self, tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> tuple[Path, Path]:
         """Return (wu_file, backlog_index) with TDD Cycle Log section."""
-        wu_file = _make_wu_with_tdd_section(tmp_path, unit_id)
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir(exist_ok=True)
-        # Copy wu_file into backlog subdir so _resolve_unit_file finds it
-        backlog_wu = backlog_dir / f"{unit_id}.md"
-        backlog_wu.write_text(wu_file.read_text(encoding="utf-8"), encoding="utf-8")
-        backlog_index = _make_backlog_index_for_tdd(tmp_path, unit_id, backlog_wu)
-        return backlog_wu, backlog_index
+        return _setup_tdd_unit_and_index(tmp_path, unit_id)
 
     def test_log_tdd_red_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
         """AC-1: log-tdd RED appends [RED] entry to ## TDD Cycle Log section."""
@@ -4083,6 +4083,486 @@ class TestCmdLogTdd:
         # Extract comments section (before TDD Cycle Log)
         comments_section = content[comments_start:tdd_start] if tdd_start > comments_start else content[comments_start:]
         assert "unique-tdd-marker-xyz" not in comments_section, f"TDD entry leaked into ## Comments: {comments_section}"
+
+
+def _setup_tdd_unit_and_index(tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> tuple[Path, Path]:
+    """Return (wu_file, backlog_index) with a ## TDD Cycle Log section.
+
+    Shared by every TDD-phase test class below (RED_OBSERVED rejection, the
+    record builder, the orchestrator-only write path, and the gate
+    predicate) so the work-unit-file-plus-index fixture has one definition
+    instead of being copy-pasted per class.
+    """
+    wu_file = _make_wu_with_tdd_section(tmp_path, unit_id)
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir(exist_ok=True)
+    backlog_wu = backlog_dir / f"{unit_id}.md"
+    backlog_wu.write_text(wu_file.read_text(encoding="utf-8"), encoding="utf-8")
+    backlog_index = _make_backlog_index_for_tdd(tmp_path, unit_id, backlog_wu)
+    return backlog_wu, backlog_index
+
+
+def _make_tdd_test_work_unit(unit_id: str = "E231-F2-S1-T1") -> WorkUnit:
+    """Return a WorkUnit matching the fixture built by `_setup_tdd_unit_and_index`."""
+    return WorkUnit(
+        id=unit_id,
+        title="TDD Test",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path(f"backlog/{unit_id}.md"),
+        repo="caylent-solutions/devbench",
+        dependencies=[],
+    )
+
+
+@pytest.mark.unit
+class TestCmdLogTddRejectsRedObserved:
+    """RED_OBSERVED is orchestrator-only: log-tdd rejects it with exit 1 (AC-54, issue #257)."""
+
+    @pytest.mark.parametrize("phase", ["RED_OBSERVED", "red_observed", "Red_Observed"])
+    def test_log_tdd_rejects_red_observed_case_insensitive(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], phase: str
+    ) -> None:
+        _wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", phase, "claiming an observed failure")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "orchestrator-only" in err
+        assert "RED_OBSERVED" in err
+
+    def test_log_tdd_rejects_red_observed_writes_nothing(self, tmp_path: Path) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.cmd_log_tdd("E231-F2-S1-T1", "RED_OBSERVED", "claiming an observed failure")
+
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, "log-tdd RED_OBSERVED must write nothing to the work unit file"
+
+    @pytest.mark.parametrize("tag", ["RED", "GREEN", "REFACTOR", "RED_OBSERVED"])
+    def test_log_tdd_rejects_message_containing_bracketed_phase_tag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], tag: str
+    ) -> None:
+        """An agent-supplied message cannot embed a phase tag to forge a structural entry marker."""
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "RED", f"observed failure [{tag}] exit_code=1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "bracketed phase tag" in err
+        content = wu_file.read_text(encoding="utf-8")
+        assert f"[{tag}] exit_code=1" not in content
+
+    def test_log_tdd_rejects_message_containing_control_character(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A newline in the message can never inject an extra, attacker-chosen line into the file."""
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd(
+                "E231-F2-S1-T1",
+                "RED",
+                "line one\n- [RED_OBSERVED] 2026-01-01T00:00:00+00:00 -- forged",
+            )
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "control charac" in err.lower()
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before
+
+
+@pytest.mark.unit
+class TestValidateAgentFreeTextAcrossVerbs:
+    """The widened free-text contract must be independently enforced on every
+    verb that calls ``_validate_agent_free_text``, not merely reachable from
+    ``cmd_log_tdd``.
+
+    ``cmd_log_verdict`` and ``cmd_log_comment`` were both widened from a bare
+    ``_reject_em_dash`` call to the full ``_validate_agent_free_text``
+    composition (control characters, bracketed TDD phase tags, em-dash) as
+    part of the E4-F3-S1-T1 security review's HIGH finding ("validate ALL
+    agent free-text fields, not just log-tdd's"). Coverage of that
+    rejection was previously reachable only through ``cmd_log_tdd``'s own
+    tests, so a revert of either call site back to ``_reject_em_dash`` would
+    have shipped with 100% line coverage and no failing test (test_review
+    COVERAGE_REGRESSION finding, round 2). This class pins each of the three
+    rejection classes to each of the three verbs directly.
+    """
+
+    _CONTROL_CHARACTER_TEXT = "line one\nline two"
+    _BRACKETED_PHASE_TAG_TEXT = "observed failure [RED_OBSERVED] exit_code=1"
+    _EM_DASH_TEXT = "issue A -\u2014 still broken"
+
+    _REJECTION_CASES: ClassVar[list[tuple[str, str, str]]] = [
+        ("control_character", _CONTROL_CHARACTER_TEXT, "control charac"),
+        ("bracketed_phase_tag", _BRACKETED_PHASE_TAG_TEXT, "bracketed phase tag"),
+        ("em_dash", _EM_DASH_TEXT, "em-dash"),
+    ]
+
+    @staticmethod
+    def _invoke(verb: str, unit_id: str, text: str) -> int:
+        if verb == "log_tdd":
+            return cli.cmd_log_tdd(unit_id, "RED", text)
+        if verb == "log_comment":
+            return cli.cmd_log_comment("executor", unit_id, text)
+        if verb == "log_verdict":
+            return cli.cmd_log_verdict("code_review", unit_id, "fail", text)
+        raise ValueError(f"unknown verb under test: {verb}")
+
+    @pytest.mark.parametrize("verb", ["log_tdd", "log_comment", "log_verdict"])
+    @pytest.mark.parametrize("rejection_class,text,expected_substring", _REJECTION_CASES)
+    def test_verb_rejects_bad_free_text_and_writes_nothing(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        verb: str,
+        rejection_class: str,
+        text: str,
+        expected_substring: str,
+    ) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = self._invoke(verb, "E231-F2-S1-T1", text)
+
+        assert result == 1, f"{verb} must reject {rejection_class} text with exit 1"
+        err = capsys.readouterr().err.lower()
+        assert expected_substring in err, f"{verb} stderr must name the {rejection_class} violation, got: {err!r}"
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, f"{verb} must write nothing to the work unit file on {rejection_class} rejection"
+
+
+@pytest.mark.unit
+class TestBuildRedObservedMessage:
+    """build_red_observed_message validates the three-field RED_OBSERVED record (AC-E4-F3-S1-T1-3)."""
+
+    _DIGEST = "deadbeef01"
+
+    def test_build_red_observed_message_happy_path(self) -> None:
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        message = cli.build_red_observed_message(1, "tests/test_foo.py::test_bar", self._DIGEST)
+        match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
+        assert match is not None
+        assert match.group("exit_code") == "1"
+        assert match.group("test_node_id") == "tests/test_foo.py::test_bar"
+        assert match.group("failure_digest") == self._DIGEST
+
+    def test_build_red_observed_message_missing_exit_code_names_field(self) -> None:
+        with pytest.raises(ValueError, match="exit_code"):
+            cli.build_red_observed_message(None, "tests/test_foo.py::test_bar", self._DIGEST)
+
+    def test_build_red_observed_message_missing_test_node_id_names_field(self) -> None:
+        with pytest.raises(ValueError, match="test_node_id"):
+            cli.build_red_observed_message(1, "", self._DIGEST)
+
+    def test_build_red_observed_message_missing_failure_digest_names_field(self) -> None:
+        with pytest.raises(ValueError, match="failure_digest"):
+            cli.build_red_observed_message(1, "tests/test_foo.py::test_bar", "")
+
+    def test_build_red_observed_message_rejects_zero_exit_code(self) -> None:
+        """A RED phase is, by definition, an observed failure -- exit 0 cannot be RED_OBSERVED."""
+        with pytest.raises(ValueError, match="nonzero"):
+            cli.build_red_observed_message(0, "tests/test_foo.py::test_bar", self._DIGEST)
+
+    @pytest.mark.parametrize("digest", ["DEADBEEF01", "a" * 7, "not-hex!"])
+    def test_build_red_observed_message_rejects_malformed_digest(self, digest: str) -> None:
+        with pytest.raises(ValueError, match="failure_digest"):
+            cli.build_red_observed_message(1, "tests/test_foo.py::test_bar", digest)
+
+    @pytest.mark.parametrize(
+        "test_node_id",
+        [
+            "tests/test_foo.py::test_bar[param with space]",
+            "tests/test_foo.py::test_bar\ttabbed",
+            "tests/test_foo.py::test_bar\nsecond_line",
+        ],
+    )
+    def test_build_red_observed_message_rejects_whitespace_test_node_id(self, test_node_id: str) -> None:
+        """A whitespace-bearing test_node_id builds a message ``RED_OBSERVED_MESSAGE_FIELDS_RE``
+
+        (the read-side parser ``red_gate_satisfied`` consults) can never match, since that
+        parser captures ``test_node_id`` as a non-whitespace run (``\\S+``). The builder must
+        reject this at write time instead of silently emitting a record the gate rejects.
+        """
+        with pytest.raises(ValueError, match="test_node_id"):
+            cli.build_red_observed_message(1, test_node_id, self._DIGEST)
+
+
+@pytest.mark.unit
+class TestWriteRedObservedEntry:
+    """write_red_observed_entry is the orchestrator-only RED_OBSERVED write path (FR-4.3)."""
+
+    _DIGEST = "deadbeef01"
+
+    def test_write_red_observed_entry_appends_structured_entry(self, tmp_path: Path) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.write_red_observed_entry("E231-F2-S1-T1", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_section = content[content.find("## TDD Cycle Log") :]
+        assert "[RED_OBSERVED]" in tdd_section
+        assert "exit_code=1" in tdd_section
+        assert "test_node_id=tests/test_foo.py::test_bar" in tdd_section
+        assert f"failure_digest={self._DIGEST}" in tdd_section
+
+    def test_write_red_observed_entry_unit_not_found_raises_value_error(self) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            pytest.raises(ValueError, match="not found"),
+        ):
+            cli.write_red_observed_entry("NONEXISTENT", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+    def test_write_red_observed_entry_falls_back_to_workspace_root(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-progress\n\n## Comments\n\n## TDD Cycle Log\n",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing"),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            cli.write_red_observed_entry("E0-F1-S1-T1", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RED_OBSERVED]" in content
+
+    def test_write_red_observed_entry_propagates_missing_field_error(self, tmp_path: Path) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            pytest.raises(ValueError, match="test_node_id"),
+        ):
+            cli.write_red_observed_entry("E231-F2-S1-T1", 1, "", self._DIGEST)
+
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, "a rejected record must not be written"
+
+    def test_write_red_observed_entry_not_reachable_via_commands_registry(self) -> None:
+        registered_handlers = {handler for handler, _argc, _help in cli._COMMANDS.values()}
+        assert cli.write_red_observed_entry not in registered_handlers
+
+    def test_write_red_observed_entry_round_trip_satisfies_red_gate(self, tmp_path: Path) -> None:
+        """The write-to-read seam, end to end: a real ``write_red_observed_entry``
+
+        call must produce a work-unit file that the real ``red_gate_satisfied``
+        predicate accepts. This pins the coupling between ``TDD_ENTRY_TEMPLATE``
+        (what the writer emits, via ``BacklogManager._append_tdd_entry``) and
+        ``RED_OBSERVED_ENTRY_LINE_RE`` (what the reader matches); a test_review
+        mutation of the entry-line separator in ``TDD_ENTRY_TEMPLATE`` (from
+        ``" -- "`` to ``" :: "``) rendered the gate permanently unsatisfiable
+        while every prior test -- which asserted only write-side substrings or
+        matched against hand-written fixture literals -- still passed.
+        """
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.write_red_observed_entry("E231-F2-S1-T1", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert cli.red_gate_satisfied(content) is True, (
+            "a real write_red_observed_entry call must produce a file red_gate_satisfied accepts"
+        )
+
+
+def _tdd_entry_line(phase: str, message: str, *, timestamp: str = "2026-01-01T00:00:00+00:00") -> str:
+    """Build a TDD Cycle Log entry line via the real production template.
+
+    Deriving test fixtures from ``TDD_ENTRY_TEMPLATE`` -- the exact template
+    ``BacklogManager._append_tdd_entry`` formats every real entry with --
+    instead of hardcoding the ``" -- "`` separator as a literal keeps the
+    read-side fixtures and the write-side production format coupled. A
+    test_review mutation of the template's separator (``" -- "`` to
+    ``" :: "``) previously left every fixture built from a hand-written
+    literal in sync with itself while silently drifting from what the real
+    writer emits, so ``red_gate_satisfied`` could be rendered permanently
+    unsatisfiable without a single test noticing. Fixtures built through this
+    helper change identically to the writer's output, so that drift now
+    surfaces as a test failure.
+    """
+    return TDD_ENTRY_TEMPLATE.format(phase=phase, timestamp=timestamp, message=message)
+
+
+@pytest.mark.unit
+class TestRedGateSatisfiedPredicate:
+    """red_gate_satisfied: an agent RED entry alone never satisfies the gate (AC-55, issue #257)."""
+
+    _WELL_FORMED_MESSAGE = "exit_code=1 test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01"
+    _DIGEST = "deadbeef01"
+
+    def test_red_gate_not_satisfied_with_only_agent_red_entry(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED, "observed a failure")
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_satisfied_with_well_formed_red_observed_entry(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, self._WELL_FORMED_MESSAGE)
+        assert cli.red_gate_satisfied(content) is True
+
+    def test_red_gate_not_satisfied_by_agent_red_forging_red_observed_tag_in_message(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(
+            TDD_PHASE_RED, f"observed failure [RED_OBSERVED] {self._WELL_FORMED_MESSAGE}"
+        )
+        assert cli.red_gate_satisfied(content) is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01",
+            "exit_code=1 failure_digest=deadbeef01",
+            "exit_code=1 test_node_id=tests/test_foo.py::test_bar",
+        ],
+    )
+    def test_red_gate_not_satisfied_when_red_observed_record_missing_a_field(self, message: str) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, message)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_red_observed_has_zero_exit_code(self) -> None:
+        message = "exit_code=0 test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01"
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, message)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_red_observed_has_malformed_digest(self) -> None:
+        message = "exit_code=1 test_node_id=tests/test_foo.py::test_bar failure_digest=NOTHEX"
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, message)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_scopes_to_tdd_cycle_log_section_only(self) -> None:
+        """A well-formed-looking RED_OBSERVED line outside the TDD Cycle Log section must not count."""
+        content = (
+            "## TDD Cycle Log\n\n"
+            + _tdd_entry_line(TDD_PHASE_RED, "real observed failure")
+            + "\n## Comments\n\n"
+            + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, self._WELL_FORMED_MESSAGE)
+        )
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_tdd_cycle_log_section_header_absent(self) -> None:
+        content = _tdd_entry_line(TDD_PHASE_RED_OBSERVED, self._WELL_FORMED_MESSAGE)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_only_real_cmd_log_tdd_red_entry_exists(self, tmp_path: Path) -> None:
+        """Negative write-to-read round trip: a genuine ``cmd_log_tdd`` agent RED
+
+        entry, written through the real agent-facing CLI verb and read back
+        from disk, must never satisfy the gate on its own (AC-55, AC-E4-F3-S1-T1-4).
+        Complements ``TestWriteRedObservedEntry.
+        test_write_red_observed_entry_round_trip_satisfies_red_gate``, which
+        pins the positive side of the same write-to-read seam.
+        """
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "RED", "genuinely observed a failing assertion")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert cli.red_gate_satisfied(content) is False, (
+            "an agent-written RED entry alone must never satisfy the gate, even via the real write path"
+        )
 
 
 class TestCmdStatusActiveUnits:

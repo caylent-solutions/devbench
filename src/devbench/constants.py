@@ -244,7 +244,105 @@ COMMENT_AGENT_TEMPLATE: str = "[{timestamp}] [agent/{name}] {message}\n"
 # ---------------------------------------------------------------------------
 TDD_CYCLE_LOG_SECTION_HEADER: str = "## TDD Cycle Log"
 TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} -- {message}\n"
-VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
+
+TDD_PHASE_RED: str = "RED"
+TDD_PHASE_GREEN: str = "GREEN"
+TDD_PHASE_REFACTOR: str = "REFACTOR"
+
+# RED_OBSERVED (FR-4.3 / E4-F3-S1-T1, issue #257) is a fourth TDD Cycle Log
+# phase written exclusively by the orchestrator after it has independently
+# run the test suite and observed a nonzero exit code. It is a *valid* phase
+# (accepted by ``_append_tdd_entry``/parsed by ``red_gate_satisfied``) but it
+# is not agent-writable -- ``cmd_log_tdd`` (the CLI verb agents call) must
+# reject it outright. ``AGENT_WRITABLE_TDD_PHASES`` and
+# ``ORCHESTRATOR_ONLY_TDD_PHASES`` partition ``VALID_TDD_PHASES`` as data
+# (frozenset set-difference) rather than as scattered ``if phase == ...``
+# conditionals, so the authorization boundary has one definition.
+TDD_PHASE_RED_OBSERVED: str = "RED_OBSERVED"
+
+VALID_TDD_PHASES: frozenset[str] = frozenset(
+    {TDD_PHASE_RED, TDD_PHASE_GREEN, TDD_PHASE_REFACTOR, TDD_PHASE_RED_OBSERVED}
+)
+AGENT_WRITABLE_TDD_PHASES: frozenset[str] = frozenset({TDD_PHASE_RED, TDD_PHASE_GREEN, TDD_PHASE_REFACTOR})
+ORCHESTRATOR_ONLY_TDD_PHASES: frozenset[str] = VALID_TDD_PHASES - AGENT_WRITABLE_TDD_PHASES
+
+TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE: str = (
+    "ERROR: TDD phase '{phase}' is orchestrator-only and cannot be written via "
+    "log-tdd; agent-writable phases are: {agent_phases}."
+)
+
+# ---------------------------------------------------------------------------
+# RED_OBSERVED record fields (E4-F3-S1-T1).
+#
+# A RED_OBSERVED entry's message body is not free text -- it is a fixed
+# three-field record (``exit_code``, ``test_node_id``, ``failure_digest``)
+# built by ``devbench.cli.build_red_observed_message`` and re-validated by
+# ``devbench.cli.red_gate_satisfied`` on read. ``failure_digest`` is
+# constrained to a hash-shaped value (never raw free text) so a failure
+# message cannot leak secrets or filesystem paths into git history (LOW
+# finding, E4-F3-S1-T1 security review).
+# ---------------------------------------------------------------------------
+RED_OBSERVED_FIELD_EXIT_CODE: str = "exit_code"
+RED_OBSERVED_FIELD_TEST_NODE_ID: str = "test_node_id"
+RED_OBSERVED_FIELD_FAILURE_DIGEST: str = "failure_digest"
+RED_OBSERVED_RECORD_FIELDS: tuple[str, str, str] = (
+    RED_OBSERVED_FIELD_EXIT_CODE,
+    RED_OBSERVED_FIELD_TEST_NODE_ID,
+    RED_OBSERVED_FIELD_FAILURE_DIGEST,
+)
+
+RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE: str = "RED_OBSERVED record is missing required field '{field}'."
+RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE: str = (
+    "RED_OBSERVED requires a nonzero exit_code (a RED phase is, by definition, an observed failure); got exit_code=0."
+)
+RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE: str = (
+    "RED_OBSERVED test_node_id must not contain whitespace (the read-side parser "
+    "RED_OBSERVED_MESSAGE_FIELDS_RE requires a single non-whitespace token, so a "
+    "space, tab or newline would build a record the gate can never match); got {test_node_id!r}."
+)
+RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE: str = (
+    "RED_OBSERVED failure_digest must be a lowercase hex string of {min}-{max} characters; got {digest!r}."
+)
+
+FAILURE_DIGEST_MIN_LENGTH: int = 8
+FAILURE_DIGEST_MAX_LENGTH: int = 64
+FAILURE_DIGEST_RE = re.compile(rf"^[0-9a-f]{{{FAILURE_DIGEST_MIN_LENGTH},{FAILURE_DIGEST_MAX_LENGTH}}}$")
+
+RED_OBSERVED_MESSAGE_TEMPLATE: str = "exit_code={exit_code} test_node_id={test_node_id} failure_digest={failure_digest}"
+
+# Anchored (line-start) match for a RED_OBSERVED entry -- deliberately does
+# NOT use a bare substring/"in" check. A phase tag embedded mid-message
+# (e.g. an agent-written ``[RED]`` entry whose message body contains the
+# literal text ``[RED_OBSERVED]``) must never satisfy this pattern, since
+# that would let agent-controlled free text forge the gate (HIGH finding,
+# E4-F3-S1-T1 security review).
+RED_OBSERVED_ENTRY_LINE_RE = re.compile(
+    r"^-\s+\[RED_OBSERVED\]\s+\S+\s+--\s+(?P<message>.+)$",
+    re.MULTILINE,
+)
+
+# Parses the three RED_OBSERVED record fields out of an entry's message body.
+# Requires all three fields, in the fixed order emitted by
+# ``RED_OBSERVED_MESSAGE_TEMPLATE`` -- a message missing any field never
+# matches (no partial-record fallback). ``failure_digest`` is captured
+# permissively here (``\S+``); ``FAILURE_DIGEST_RE`` is the single source of
+# truth for the hash-shape validation applied on top of this parse.
+RED_OBSERVED_MESSAGE_FIELDS_RE = re.compile(
+    r"^exit_code=(?P<exit_code>-?\d+)\s+"
+    r"test_node_id=(?P<test_node_id>\S+)\s+"
+    r"failure_digest=(?P<failure_digest>\S+)$"
+)
+
+# Captures the body of the ``## TDD Cycle Log`` section only -- from the
+# header up to (but not including) the next ``## `` heading or end of
+# string. Mirrors ``STRIP_SUMMARY_RE`` above. ``red_gate_satisfied`` scopes
+# its search to this capture group so a RED_OBSERVED-shaped line planted in
+# any other section (e.g. ``## Comments``) can never satisfy the gate (HIGH
+# finding, E4-F3-S1-T1 security review).
+TDD_CYCLE_LOG_SECTION_BODY_RE = re.compile(
+    r"^## TDD Cycle Log\n(.*?)(?=^## |\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 
 # ---------------------------------------------------------------------------
 # Six-type task taxonomy (FR-4.1 / E4-F2-S1-T1).

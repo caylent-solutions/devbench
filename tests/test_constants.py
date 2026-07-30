@@ -736,3 +736,147 @@ class TestTaskTypeTaxonomyConstants:
 
         content = "# EX-F1-S1-T1\n\n## Status: in-queue\n\n## Description\n\nbody\n"
         assert TASK_TYPE_LINE_RE.search(content) is None
+
+
+class TestRedObservedTddPhaseConstants:
+    """FR-4.3 / E4-F3-S1-T1: RED_OBSERVED orchestrator-only TDD phase (issue #257)."""
+
+    @pytest.mark.unit
+    def test_valid_tdd_phases_gains_red_observed(self) -> None:
+        from devbench.constants import TDD_PHASE_RED_OBSERVED, VALID_TDD_PHASES
+
+        assert TDD_PHASE_RED_OBSERVED in VALID_TDD_PHASES
+        assert frozenset({"RED", "GREEN", "REFACTOR", "RED_OBSERVED"}) == VALID_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_agent_writable_tdd_phases_excludes_red_observed(self) -> None:
+        from devbench.constants import AGENT_WRITABLE_TDD_PHASES, TDD_PHASE_RED_OBSERVED
+
+        assert frozenset({"RED", "GREEN", "REFACTOR"}) == AGENT_WRITABLE_TDD_PHASES
+        assert TDD_PHASE_RED_OBSERVED not in AGENT_WRITABLE_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_orchestrator_only_tdd_phases_is_red_observed_only(self) -> None:
+        from devbench.constants import ORCHESTRATOR_ONLY_TDD_PHASES, TDD_PHASE_RED_OBSERVED
+
+        assert frozenset({TDD_PHASE_RED_OBSERVED}) == ORCHESTRATOR_ONLY_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_agent_writable_and_orchestrator_only_partition_valid_phases(self) -> None:
+        from devbench.constants import (
+            AGENT_WRITABLE_TDD_PHASES,
+            ORCHESTRATOR_ONLY_TDD_PHASES,
+            VALID_TDD_PHASES,
+        )
+
+        assert AGENT_WRITABLE_TDD_PHASES | ORCHESTRATOR_ONLY_TDD_PHASES == VALID_TDD_PHASES
+        assert frozenset() == AGENT_WRITABLE_TDD_PHASES & ORCHESTRATOR_ONLY_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_red_observed_record_fields_tuple_matches_field_name_constants(self) -> None:
+        from devbench.constants import (
+            RED_OBSERVED_FIELD_EXIT_CODE,
+            RED_OBSERVED_FIELD_FAILURE_DIGEST,
+            RED_OBSERVED_FIELD_TEST_NODE_ID,
+            RED_OBSERVED_RECORD_FIELDS,
+        )
+
+        assert RED_OBSERVED_RECORD_FIELDS == (
+            RED_OBSERVED_FIELD_EXIT_CODE,
+            RED_OBSERVED_FIELD_TEST_NODE_ID,
+            RED_OBSERVED_FIELD_FAILURE_DIGEST,
+        )
+
+    @pytest.mark.unit
+    def test_orchestrator_only_message_template_names_agent_writable_phases(self) -> None:
+        from devbench.constants import (
+            AGENT_WRITABLE_TDD_PHASES,
+            TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE,
+        )
+
+        rendered = TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE.format(
+            phase="RED_OBSERVED",
+            agent_phases=", ".join(sorted(AGENT_WRITABLE_TDD_PHASES)),
+        )
+        assert "RED_OBSERVED" in rendered
+        assert "orchestrator-only" in rendered
+        assert "GREEN" in rendered
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "digest",
+        ["a" * 8, "0123456789abcdef0123456789abcdef01234567", "b" * 64],
+    )
+    def test_failure_digest_re_accepts_valid_lowercase_hex_lengths(self, digest: str) -> None:
+        from devbench.constants import FAILURE_DIGEST_RE
+
+        assert FAILURE_DIGEST_RE.match(digest) is not None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "digest",
+        ["a" * 7, "a" * 65, "DEADBEEF", "not-hex!", ""],
+    )
+    def test_failure_digest_re_rejects_malformed_values(self, digest: str) -> None:
+        from devbench.constants import FAILURE_DIGEST_RE
+
+        assert FAILURE_DIGEST_RE.match(digest) is None
+
+    @pytest.mark.unit
+    def test_red_observed_entry_line_re_matches_anchored_entry(self) -> None:
+        from devbench.constants import RED_OBSERVED_ENTRY_LINE_RE
+
+        line = "- [RED_OBSERVED] 2026-07-30T12:00:00+00:00 -- exit_code=1 test_node_id=t::t failure_digest=deadbeef01"
+        match = RED_OBSERVED_ENTRY_LINE_RE.search(line)
+        assert match is not None
+        assert match.group("message") == "exit_code=1 test_node_id=t::t failure_digest=deadbeef01"
+
+    @pytest.mark.unit
+    def test_red_observed_entry_line_re_does_not_match_non_anchored_tag(self) -> None:
+        """A phase tag embedded mid-line (not at the entry's structural position) must not match."""
+        from devbench.constants import RED_OBSERVED_ENTRY_LINE_RE
+
+        line = "- [RED] 2026-07-30T12:00:00+00:00 -- observed failure [RED_OBSERVED] exit_code=1"
+        assert RED_OBSERVED_ENTRY_LINE_RE.search(line) is None
+
+    @pytest.mark.unit
+    def test_red_observed_message_fields_re_parses_all_three_fields(self) -> None:
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        message = "exit_code=1 test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01"
+        match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
+        assert match is not None
+        assert match.group("exit_code") == "1"
+        assert match.group("test_node_id") == "tests/test_foo.py::test_bar"
+        assert match.group("failure_digest") == "deadbeef01"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "test_node_id=t::t failure_digest=deadbeef01",
+            "exit_code=1 failure_digest=deadbeef01",
+            "exit_code=1 test_node_id=t::t",
+        ],
+    )
+    def test_red_observed_message_fields_re_returns_none_when_a_field_is_missing(self, message: str) -> None:
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        assert RED_OBSERVED_MESSAGE_FIELDS_RE.search(message) is None
+
+    @pytest.mark.unit
+    def test_tdd_cycle_log_section_body_re_scopes_to_next_heading(self) -> None:
+        from devbench.constants import TDD_CYCLE_LOG_SECTION_BODY_RE
+
+        content = "## TDD Cycle Log\n\n- [RED] ts -- msg\n\n## Comments\n\n- injected line\n"
+        match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+        assert match is not None
+        assert "injected line" not in match.group(1)
+        assert "[RED]" in match.group(1)
+
+    @pytest.mark.unit
+    def test_tdd_cycle_log_section_body_re_none_when_header_absent(self) -> None:
+        from devbench.constants import TDD_CYCLE_LOG_SECTION_BODY_RE
+
+        content = "## Comments\n\n- [RED_OBSERVED] ts -- exit_code=1 test_node_id=t failure_digest=deadbeef01\n"
+        assert TDD_CYCLE_LOG_SECTION_BODY_RE.search(content) is None

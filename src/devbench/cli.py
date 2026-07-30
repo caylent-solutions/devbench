@@ -40,7 +40,13 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     run-tests <id>                          Run test suite for the work unit's repo
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
-    log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log
+    log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log;
+                                             RED_OBSERVED is orchestrator-only and always rejected here
+
+    log-verdict/log-comment/log-tdd free-text fields (feedback/message) must be a single
+    line with no control characters (e.g. no embedded newline) and no bracketed TDD phase
+    tag such as '[RED_OBSERVED]'; a violation exits 1 and writes nothing to the work unit.
+
     request-amendment <id>                  Register amendment request (JSON payload on stdin)
     apply-amendment <id>                    Apply approved amendment with Layer 3 post-check
     reject-amendment <id> <reason>          Reject amendment and block the task
@@ -162,6 +168,7 @@ from devbench.config_loader import (
     get_effective_branch_prefix,
 )
 from devbench.constants import (
+    AGENT_WRITABLE_TDD_PHASES,
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
     BACKLOG_STATUS_RE,
@@ -175,15 +182,29 @@ from devbench.constants import (
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
+    FAILURE_DIGEST_MAX_LENGTH,
+    FAILURE_DIGEST_MIN_LENGTH,
+    FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_ONLY_TDD_PHASES,
     ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
     RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_TIMEOUT_SECONDS,
+    RED_OBSERVED_ENTRY_LINE_RE,
+    RED_OBSERVED_FIELD_EXIT_CODE,
+    RED_OBSERVED_FIELD_FAILURE_DIGEST,
+    RED_OBSERVED_FIELD_TEST_NODE_ID,
+    RED_OBSERVED_MESSAGE_FIELDS_RE,
+    RED_OBSERVED_MESSAGE_TEMPLATE,
+    RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE,
+    RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE,
+    RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE,
+    RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -198,6 +219,9 @@ from devbench.constants import (
     STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
+    TDD_CYCLE_LOG_SECTION_BODY_RE,
+    TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE,
+    TDD_PHASE_RED_OBSERVED,
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
@@ -3568,6 +3592,91 @@ def _reject_em_dash(field_name: str, text: str) -> int | None:
     return None
 
 
+def _reject_control_characters(field_name: str, text: str) -> int | None:
+    """Reject any ASCII control character (including newlines) in agent-supplied text.
+
+    A newline in an agent-controlled free-text field can inject an
+    attacker-chosen extra bulleted line into the work-unit markdown file --
+    including a forged ``- [RED_OBSERVED] ...`` entry that would otherwise
+    resemble a legitimate structural line (HIGH finding, E4-F3-S1-T1 security
+    review). Rejecting every control character at the input boundary (not
+    just newline) closes the same injection class via carriage return, tab,
+    or other C0 control codes.
+
+    Returns:
+        ``1`` (non-zero exit code) with stderr populated when a control
+        character is found; ``None`` when the text is clean.
+    """
+    if any(ord(ch) < 0x20 for ch in text):
+        print(
+            f"ERROR: {field_name} contains a control character (e.g. a newline); "
+            "agent-supplied text must be a single line with no control characters.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+# Matches a bracketed TDD phase tag anywhere in a string -- used to stop an
+# agent from embedding a structural-looking ``[RED_OBSERVED]``/``[RED]``/etc.
+# tag inside a message body (HIGH finding, E4-F3-S1-T1 security review).
+_BRACKETED_TDD_PHASE_TAG_RE = re.compile(
+    r"\[(?:" + "|".join(re.escape(phase) for phase in sorted(VALID_TDD_PHASES)) + r")\]"
+)
+
+
+def _reject_bracketed_phase_tag(field_name: str, text: str) -> int | None:
+    """Reject agent-supplied text embedding a bracketed TDD phase tag.
+
+    Prevents an agent from writing a message such as
+    ``"observed failure [RED_OBSERVED] exit_code=1"`` to a legitimate
+    ``RED`` entry -- the tag has no structural meaning inside a message body,
+    but leaving it unrejected would let free text visually mimic a
+    RED_OBSERVED entry line (HIGH finding, E4-F3-S1-T1 security review).
+
+    Returns:
+        ``1`` (non-zero exit code) with stderr populated when a bracketed
+        phase tag is found; ``None`` when the text is clean.
+    """
+    if _BRACKETED_TDD_PHASE_TAG_RE.search(text):
+        print(
+            f"ERROR: {field_name} contains a bracketed phase tag (e.g. '[RED_OBSERVED]'); "
+            "agent-supplied text cannot embed TDD phase markers.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _validate_agent_free_text(field_name: str, text: str) -> int | None:
+    """Validate an agent-supplied free-text field before it reaches the backlog.
+
+    Composes, in order: em-dash rejection (validate-backlog Check 10),
+    control-character rejection (blocks newline-injection forgery of a
+    structural line), and bracketed-TDD-phase-tag rejection (blocks a
+    message body visually mimicking a phase-tagged entry). This is the
+    single validation point shared by the three agent-facing verbs whose
+    free-text field feeds directly into a structured, judge-consulted
+    record: ``cmd_log_tdd``, ``cmd_log_comment`` and ``cmd_log_verdict``
+    (DRY; HIGH finding, E4-F3-S1-T1 security review: "validate ALL agent
+    free-text fields, not just log-tdd's"). Other reason-bearing verbs
+    (``cmd_decline``, ``_parse_id_and_reason`` feeding the hold/block
+    verbs, ``cmd_reject_amendment``, ``cmd_add_dep``, ``cmd_reject_proposal``)
+    are NOT wired into this function and still apply em-dash rejection
+    only via ``_reject_em_dash``; widening their input boundary is tracked
+    as separate follow-up work, not implied by this docstring.
+
+    Returns:
+        The first non-``None`` rejection code, or ``None`` when the text
+        passes every check.
+    """
+    return (
+        _reject_em_dash(field_name, text)
+        or _reject_control_characters(field_name, text)
+        or _reject_bracketed_phase_tag(field_name, text)
+    )
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -3575,7 +3684,11 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         judge_name:  Judge identifier, e.g. ``code_review`` (matches REVIEW_JUDGE_NAMES).
         unit_id:     Work unit ID, e.g. ``E0-F1-S1-T1``.
         verdict:     ``pass`` or ``fail``.
-        feedback:    One-line summary of the verdict (required for ``fail``).
+        feedback:    One-line summary of the verdict (required for ``fail``). Validated by
+                     ``_validate_agent_free_text``: must contain no em-dash, no control
+                     character (including newline), and no bracketed TDD phase tag such as
+                     ``[RED_OBSERVED]``; a violation exits 1 and writes nothing (HIGH
+                     finding, E4-F3-S1-T1 security review).
 
     The entry written to the work unit uses the same format as the orchestrator:
     ``[judge/<name>] [REVIEW_PASS|REVIEW_FAIL] <feedback>``
@@ -3614,7 +3727,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         )
         return 1
 
-    rc = _reject_em_dash("feedback", feedback)
+    rc = _validate_agent_free_text("feedback", feedback)
     if rc is not None:
         return rc
 
@@ -3625,9 +3738,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
+    wu_file = _resolve_work_unit_file(unit)
 
     action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
     agent_id = f"judge/{judge_name}"
@@ -3661,8 +3772,15 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
 
     Use for non-judge actors (executor, blocker-resolver, review-supervisor summary)
     that need to log progress without emitting a REVIEW_PASS/REVIEW_FAIL token.
+
+    Arguments:
+        message: Validated by ``_validate_agent_free_text``: must contain no
+            em-dash, no control character (including newline), and no
+            bracketed TDD phase tag such as ``[RED_OBSERVED]``; a violation
+            exits 1 and writes nothing (HIGH finding, E4-F3-S1-T1 security
+            review).
     """
-    rc = _reject_em_dash("message", message)
+    rc = _validate_agent_free_text("message", message)
     if rc is not None:
         return rc
 
@@ -3673,9 +3791,7 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
+    wu_file = _resolve_work_unit_file(unit)
 
     timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_AGENT_TEMPLATE.format(
@@ -3704,7 +3820,14 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
     Arguments:
         unit_id:  Work unit ID, e.g. ``E0-F1-S1-T1``.
         phase:    TDD phase, one of ``RED``, ``GREEN``, ``REFACTOR`` (case-insensitive).
-        message:  Description of the TDD phase outcome.
+                  ``RED_OBSERVED`` is a valid phase overall but is
+                  orchestrator-only (see ``write_red_observed_entry``); this
+                  agent-facing command always rejects it.
+        message:  Description of the TDD phase outcome. Validated by
+                  ``_validate_agent_free_text``: must contain no em-dash, no
+                  control character (including newline), and no bracketed
+                  TDD phase tag such as ``[RED_OBSERVED]``; a violation
+                  exits 1 and writes nothing.
 
     Exits 0 on success, non-zero on any error.  The ``## TDD Cycle Log``
     section must already exist in the work unit file; this command fails fast
@@ -3718,7 +3841,17 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
         )
         return 1
 
-    rc = _reject_em_dash("message", message)
+    if phase_upper in ORCHESTRATOR_ONLY_TDD_PHASES:
+        print(
+            TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE.format(
+                phase=phase_upper,
+                agent_phases=", ".join(sorted(AGENT_WRITABLE_TDD_PHASES)),
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    rc = _validate_agent_free_text("message", message)
     if rc is not None:
         return rc
 
@@ -3729,9 +3862,7 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
+    wu_file = _resolve_work_unit_file(unit)
 
     mgr = BacklogManager()
     try:
@@ -3743,6 +3874,188 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
     logger.info("TDD %s entry logged for %s", phase_upper, unit_id)
     print(json.dumps({"unit_id": unit_id, "phase": phase_upper}))
     return 0
+
+
+def _resolve_work_unit_file(unit: WorkUnit) -> Path:
+    """Resolve the work-unit markdown file path for the log-* CLI commands.
+
+    Tries ``BACKLOG_ROOT / unit.file_path`` first, then falls back to
+    ``WORKSPACE_ROOT / unit.file_path`` when the first candidate does not
+    exist. Shared by ``cmd_log_verdict``, ``cmd_log_comment``, ``cmd_log_tdd``,
+    and ``write_red_observed_entry`` so the two-location resolution logic has
+    one definition instead of being duplicated per command (DRY).
+
+    Args:
+        unit: WorkUnit whose file_path must be resolved.
+
+    Returns:
+        The resolved :class:`pathlib.Path`. Tries the ``BACKLOG_ROOT``
+        candidate first and falls back to the ``WORKSPACE_ROOT`` candidate
+        when the first does not exist; neither candidate's existence is
+        re-verified after this fallback, so the returned path may still not
+        exist. Callers that read or write the file must surface a clear
+        error on a missing path themselves.
+    """
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+    return wu_file
+
+
+def build_red_observed_message(exit_code: int | None, test_node_id: str, failure_digest: str) -> str:
+    """Build and validate the three-field RED_OBSERVED record message.
+
+    Enforces the field-level constraints ``red_gate_satisfied`` re-validates
+    on read, so a record that passes this builder always parses on read too:
+    a present, non-whitespace ``test_node_id`` (the read-side
+    ``RED_OBSERVED_MESSAGE_FIELDS_RE`` captures it as a single non-whitespace
+    token, so a space, tab or newline would build a record the gate can never
+    match), a nonzero ``exit_code``, and a hash-shaped ``failure_digest``
+    (MEDIUM/LOW findings inherited on E4-F3-S1-T1). Raising ``ValueError``
+    naming the offending field lets the orchestrator fail fast on a malformed
+    record instead of writing one that silently never satisfies the gate.
+
+    Args:
+        exit_code: The observed test-run exit code. Must be present and nonzero
+            -- a RED phase is, by definition, an observed failure.
+        test_node_id: The pytest node ID of the failing test. Must be
+            non-empty and contain no whitespace character.
+        failure_digest: A lowercase hex digest of the failure output. Must
+            match ``FAILURE_DIGEST_RE`` (8-64 lowercase hex characters) --
+            never raw free text, which could otherwise leak paths or secrets
+            into git history.
+
+    Returns:
+        The space-joined ``exit_code=<n> test_node_id=<id> failure_digest=<digest>``
+        message body (without the ``[RED_OBSERVED]`` tag or timestamp).
+
+    Raises:
+        ValueError: If any field is missing/empty, ``test_node_id`` contains
+            whitespace, ``exit_code`` is zero, or ``failure_digest`` is not
+            hash-shaped.
+    """
+    if exit_code is None:
+        raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_EXIT_CODE))
+    if not test_node_id:
+        raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_TEST_NODE_ID))
+    if any(character.isspace() for character in test_node_id):
+        raise ValueError(RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE.format(test_node_id=test_node_id))
+    if not failure_digest:
+        raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_FAILURE_DIGEST))
+    if exit_code == 0:
+        raise ValueError(RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE)
+    if not FAILURE_DIGEST_RE.match(failure_digest):
+        raise ValueError(
+            RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE.format(
+                min=FAILURE_DIGEST_MIN_LENGTH,
+                max=FAILURE_DIGEST_MAX_LENGTH,
+                digest=failure_digest,
+            )
+        )
+    return RED_OBSERVED_MESSAGE_TEMPLATE.format(
+        exit_code=exit_code,
+        test_node_id=test_node_id,
+        failure_digest=failure_digest,
+    )
+
+
+def write_red_observed_entry(unit_id: str, exit_code: int | None, test_node_id: str, failure_digest: str) -> None:
+    """Write the orchestrator-only RED_OBSERVED TDD Cycle Log entry (FR-4.3).
+
+    Unlike ``cmd_log_tdd`` -- the agent-facing CLI verb, which rejects
+    ``RED_OBSERVED`` outright -- this function is called directly by the
+    orchestrator after it has independently run the test suite and observed
+    a nonzero exit code. It is deliberately not registered in ``_COMMANDS``:
+    there is no ``log-tdd-red-observed`` subcommand an agent could invoke.
+
+    Args:
+        unit_id: Work unit ID, e.g. ``E0-F1-S1-T1``.
+        exit_code: The observed nonzero exit code from the orchestrator's own
+            test run.
+        test_node_id: The pytest node ID of the observed failing test.
+        failure_digest: A hash-shaped digest of the failure output.
+
+    Raises:
+        ValueError: If the unit is not found in the backlog, or if any
+            RED_OBSERVED field is invalid (propagated from
+            ``build_red_observed_message``).
+    """
+    message = build_red_observed_message(exit_code, test_node_id, failure_digest)
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        raise ValueError(f"Work unit '{unit_id}' not found in backlog")
+
+    wu_file = _resolve_work_unit_file(unit)
+
+    mgr = BacklogManager()
+    mgr._append_tdd_entry(wu_file, TDD_PHASE_RED_OBSERVED, message)
+
+    logger.info("TDD %s entry logged for %s", TDD_PHASE_RED_OBSERVED, unit_id)
+
+
+def _red_observed_message_has_all_required_fields(message: str) -> bool:
+    """Return True iff *message* parses into a well-formed RED_OBSERVED record.
+
+    Re-validates all three fields independently of whatever validation ran
+    at write time (MEDIUM/LOW findings inherited on E4-F3-S1-T1): the parsed
+    ``exit_code`` must not be ``"0"`` and the parsed ``failure_digest`` must
+    match ``FAILURE_DIGEST_RE``.
+
+    Args:
+        message: The message body captured from a RED_OBSERVED entry line.
+
+    Returns:
+        ``True`` only when all three fields are present, ``exit_code`` is
+        nonzero, and ``failure_digest`` is hash-shaped.
+    """
+    fields_match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
+    if fields_match is None:
+        return False
+    if fields_match.group("exit_code") == "0":
+        return False
+    return bool(FAILURE_DIGEST_RE.match(fields_match.group("failure_digest")))
+
+
+def red_gate_satisfied(content: str) -> bool:
+    """Return True iff the work unit's TDD Cycle Log contains a RED_OBSERVED entry.
+
+    Security-critical predicate (E4-F3-S1-T1 inherited findings): an
+    agent-written ``[RED]`` entry must never be able to satisfy this gate on
+    its own. Three defenses combine to close the forgery vectors identified
+    in review:
+
+    1. Section-scoping: only text inside the ``## TDD Cycle Log`` section is
+       considered (``TDD_CYCLE_LOG_SECTION_BODY_RE``) -- a RED_OBSERVED-shaped
+       line anywhere else (e.g. an agent's ``## Comments`` entry) never counts.
+       When the section header is absent, this returns ``False`` outright --
+       no fallback scan of the whole document.
+    2. Anchored line matching: ``RED_OBSERVED_ENTRY_LINE_RE`` only matches a
+       ``[RED_OBSERVED]`` tag at an entry line's structural start position, so
+       an agent cannot forge the tag by embedding it mid-message inside a
+       legitimate ``[RED]`` entry.
+    3. Full record re-validation: the matched entry's message must parse via
+       ``RED_OBSERVED_MESSAGE_FIELDS_RE`` into all three required fields, with
+       a nonzero ``exit_code`` and a hash-shaped ``failure_digest``.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+
+    Returns:
+        ``True`` only when a structurally well-formed, fully-populated
+        RED_OBSERVED record is present inside the TDD Cycle Log section;
+        ``False`` in every other case.
+    """
+    section_match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+    if section_match is None:
+        return False
+    section_body = section_match.group(1)
+    return any(
+        _red_observed_message_has_all_required_fields(line_match.group("message"))
+        for line_match in RED_OBSERVED_ENTRY_LINE_RE.finditer(section_body)
+    )
 
 
 def cmd_ensure_branch(unit_id: str) -> int:
@@ -10301,9 +10614,24 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
-    "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
-    "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),
-    "log-tdd": (cmd_log_tdd, 3, "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message>"),
+    "log-verdict": (
+        cmd_log_verdict,
+        3,
+        "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback] "
+        "(feedback: single-line, no control chars, no bracketed phase tags)",
+    ),
+    "log-comment": (
+        cmd_log_comment,
+        3,
+        "Log agent comment: log-comment <agent> <id> <message> "
+        "(message: single-line, no control chars, no bracketed phase tags)",
+    ),
+    "log-tdd": (
+        cmd_log_tdd,
+        3,
+        "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message> (RED_OBSERVED is orchestrator-only; "
+        "rejected here; message: single-line, no control chars, no bracketed phase tags)",
+    ),
     "request-amendment": (
         cmd_request_amendment,
         1,

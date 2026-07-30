@@ -1,0 +1,47 @@
+name: Feature request
+description: A new capability, or an improvement to one that exists
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve
+      description: >-
+        Describe the problem rather than the solution. What are you unable to do today,
+        or what is unreasonably hard?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Optional. A sketch of the behaviour or command surface you would expect.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >-
+        Optional, and genuinely useful: workarounds you are using now tell us how urgent
+        this is and where the sharp edges are.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of devbench. Pick the closest; a maintainer will adjust if needed.
+      options:
+        - "orchestrator - orchestrate loop, sessions, daemon lifecycle, drain, quota"
+        - "cli - command surface, flags, help, exit codes"
+        - "backlog - work units, validate-backlog, manifests, proposals, dependencies"
+        - "review - judges, review pipeline, verdicts, retry budgets"
+        - "git-ops - branching, staging, commits, PRs, CI integration"
+        - "reporting - status, report, notifications, liveness, metrics"
+        - "plugin - plugin, skills, agent definitions, hooks"
+        - "config - devbench.yaml, schema, env resolution"
+        - "docs - documentation and examples"
+        - "packaging - build, release, dependencies, CI workflows"
+        - "not sure"
+    validations:
+      required: true

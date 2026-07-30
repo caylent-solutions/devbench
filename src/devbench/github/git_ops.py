@@ -316,38 +316,7 @@ class GitOpsService:
 
         self.logger.info("Switched to branch %s in %s", branch, repo)
 
-    def _stage_for_commit(self, repo_path: Path, manifest_files: list[str] | None) -> None:
-        """Stage this work unit's files, or the whole tree when no Manifest is given.
-
-        ``git add -A`` stages every working-tree change, so a file another
-        in-flight work unit left modified-but-unstaged is swept into this unit's
-        commit under this unit's message. ``assert_staged_matches_manifest``
-        cannot catch that: it reads ``git diff --cached``, which by definition
-        does not see unstaged changes. The victim task then fails
-        ``changes_manifest`` permanently -- the files it declared are committed
-        under another unit's name, and the only remedies are an operator
-        override or rewriting published history on a shared branch.
-
-        Passing *manifest_files* stages exactly those paths, so deletions and
-        unstaged modifications of the unit's OWN files are still picked up while
-        every other path is left untouched. ``None`` preserves the previous
-        ``git add -A`` behaviour for callers with no Manifest to scope by.
-        """
-        if manifest_files is None:
-            self._git(["add", "-A"], repo_path)
-            return
-        concrete = [f for f in manifest_files if f and not f.startswith("<")]
-        if not concrete:
-            # Manifest is entirely sentinels (targets resolved at execution
-            # time), so there is no pathspec to scope by. Fall back rather than
-            # stage nothing and silently commit an empty change set.
-            self._git(["add", "-A"], repo_path)
-            return
-        self._git(["add", "--", *concrete], repo_path)
-
-    def commit_and_push(
-        self, repo: str, repo_path: Path, branch: str, message: str, manifest_files: list[str] | None = None
-    ) -> None:
+    def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
         """Validate inputs, stage all changes, commit, and push.
 
         Assumes the repository is already on the correct branch -- call
@@ -360,7 +329,7 @@ class GitOpsService:
         1. Validate *repo* against the allow-list (``validate_repo``).
         2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
            rejects consecutive special characters per git ref naming rules).
-        3. Stage this unit's Manifest paths (``git add -A`` when no Manifest is given).
+        3. ``git add -A`` -- stage all working-tree changes.
         4. ``git status --porcelain`` -- check whether anything was staged.
 
            - If the output is **non-empty**: proceed to commit and push (steps 5-6).
@@ -413,7 +382,7 @@ class GitOpsService:
         # orphan-branch class of bug where a commit lands on backlog/<id>
         # instead of the configured single_branch.
         self.assert_on_branch(repo_path, branch)
-        self._stage_for_commit(repo_path, manifest_files)
+        self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
@@ -436,9 +405,7 @@ class GitOpsService:
         self._git(["push", "origin", branch], repo_path)
         self.logger.info("Committed and pushed to %s on %s", branch, repo)
 
-    def commit_local(
-        self, repo: str, repo_path: Path, branch: str, message: str, manifest_files: list[str] | None = None
-    ) -> None:
+    def commit_local(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
         """Stage and commit locally without pushing.
 
         Used in single-branch / defer-PR mode.  Commits are accumulated
@@ -466,7 +433,7 @@ class GitOpsService:
         # Same orphan-branch protection as commit_and_push -- refuse to
         # commit when HEAD has drifted off the expected branch.
         self.assert_on_branch(repo_path, branch)
-        self._stage_for_commit(repo_path, manifest_files)
+        self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():

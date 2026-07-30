@@ -6159,61 +6159,14 @@ class TestGitOpsDeferred:
             )
 
         assert result == 0
-        # manifest_files is None here because _resolve_unit_file is patched to
-        # return None, so there is no work-unit file to parse a Manifest from --
-        # commit_local then falls back to `git add -A`, the pre-scoping
-        # behaviour. The scoped path is covered by
-        # test_git_ops_deferred_forwards_the_manifest_to_commit_local below.
         mock_ops.commit_local.assert_called_once_with(
             "caylent-solutions/git-repo",
             tmp_path,
             "feature/x",
             "E0-F1-S1-T1: Test Task",
-            manifest_files=None,
         )
         output = json.loads(capsys.readouterr().out.strip())
         assert output["mode"] == "deferred"
-
-    def test_git_ops_deferred_forwards_the_manifest_to_commit_local(self, tmp_path: Path) -> None:
-        """The Manifest already parsed for the scope check must also scope the commit.
-
-        Without this, `git add -A` sweeps another in-flight unit's unstaged files
-        into this unit's commit. The scope guard cannot see them: it reads
-        `git diff --cached`, which does not include unstaged changes.
-        """
-        wu = tmp_path / "E0-F1-S1-T1.md"
-        wu.write_text(
-            "# E0-F1-S1-T1: Test Task\n\n"
-            "## Changes Manifest\n\n"
-            "| File | Change |\n|------|--------|\n"
-            "| `src/mine.py` | modify |\n"
-            "| `tests/test_mine.py` | modify |\n",
-            encoding="utf-8",
-        )
-        unit = WorkUnit(
-            id="E0-F1-S1-T1",
-            title="Test Task",
-            status=WorkUnitStatus.IN_PROGRESS,
-            unit_type=WorkUnitType.TASK,
-            file_path=wu,
-            repo="caylent-solutions/git-repo",
-            dependencies=[],
-        )
-        mock_ops = MagicMock()
-
-        with (
-            patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
-            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
-            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
-            patch("devbench.cli._resolve_unit_file", return_value=wu),
-            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
-            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
-        ):
-            result = cli._git_ops_deferred("E0-F1-S1-T1", unit, "caylent-solutions/git-repo", tmp_path, "feature/x")
-
-        assert result == 0
-        _, kwargs = mock_ops.commit_local.call_args
-        assert kwargs["manifest_files"] == ["src/mine.py", "tests/test_mine.py"]
 
     def test_git_ops_deferred_calls_ensure_branch_before_commit(self, tmp_path: Path) -> None:
         """ensure_branch() must run before commit_local() so a drifted HEAD is corrected."""

@@ -3826,13 +3826,11 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     # class of bug deterministically before commit. Skipped only when the
     # work-unit file isn't resolvable (orchestrator runs without a backlog
     # context never reach this path in practice).
-    manifest_files: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        manifest_files = [r.file for r in manifest_rows]
-        assert_staged_matches_manifest(repo_path, manifest_files)
+        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
 
-    ops.commit_local(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
+    ops.commit_local(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed locally (deferred PR): %s on %s", unit_id, branch)
     if wu_file is not None:
         mgr._append_agent_comment(wu_file, "git_ops", f"[COMMIT_DEFERRED] {commit_message}")
@@ -4748,13 +4746,11 @@ def cmd_git_ops(unit_id: str) -> int:
     # Manifest-scope check: every staged path must be in the work unit's
     # Changes Manifest. Catches scope-violation pollution deterministically
     # before commit. Skipped only when the work-unit file isn't resolvable.
-    manifest_files: list[str] | None = None
     if wu_file is not None:
         manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-        manifest_files = [r.file for r in manifest_rows]
-        assert_staged_matches_manifest(repo_path, manifest_files)
+        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
 
-    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
+    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed and pushed %s", unit_id)
 
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)

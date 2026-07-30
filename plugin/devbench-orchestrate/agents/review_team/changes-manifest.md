@@ -84,6 +84,24 @@ Note: use the output of `devbench get-diff` (the scope contract source) as the p
 26. No mutable deployment patterns introduced (in-place updates, imperative scripts for state changes).
 27. Dockerfiles maintain non-root user, minimal images, no secrets baked in.
 
+## TASK-TYPE INVARIANT DETECTION (FR-4.4)
+28. Compare the work unit's declared `## Task Type:` value against the FR-4.1 manifest invariant it is bound to. REVIEW_FAIL when the declared type contradicts its own invariant -- for example, a `docs` task whose Changes Manifest (or actual diff) touches `src/` is a type contradiction: `docs` rows must be documentation/markdown only, never production source under `src/`.
+
+| Type | Manifest invariant |
+|---|---|
+| `behavior-fix` (default) | >= 1 production-source row |
+| `feature` | >= 1 production-source row |
+| `test-only` | only test rows |
+| `refactor` | no per-row Manifest invariant -- its requirement is green-green (tests pass before AND after the change), which is a TDD Cycle Log concern, not a static Manifest shape (see E4-F4-S1-T2) |
+| `docs` | only documentation / markdown rows |
+| `chore` | only dependency, config, and lockfile rows |
+
+Use the existing production-vs-test classification (`BacklogManager._is_production_source` / `_is_test_source_path`) to decide whether a Changes Manifest row is production source or test, and the narrower `_is_documentation_path` / `_is_chore_path` classifiers for the `docs` and `chore` rows -- do not invent a second classifier. On a contradiction, REVIEW_FAIL naming the declared type and the offending row(s).
+
+29. **Zero production source plus an immediately-passing new test (gated types only).** For a gated task (`behavior-fix` or `feature`), if the Changes Manifest contains zero production-source rows yet the diff adds a new test that passes immediately with no `RED_OBSERVED` record justifying the pass, REVIEW_FAIL with the exact message: "no genuine RED; fix may be absent or the test does not reproduce the failure". This check does NOT apply to `test-only`, `refactor`, `docs`, or `chore` tasks -- those types legitimately have zero production-source rows and never receive a `RED_OBSERVED` record (see SKILL.md step 4d.b and docs/backlog-contract.md rule 21).
+
+30. **Unable to evaluate.** If the `RED_OBSERVED` record needed to make either of the above judgments is unreadable, or the diff is unavailable, REVIEW_FAIL naming the cause (which file, which command failed). Never a pass-by-default when you were unable to evaluate -- an unevaluable review that passes is indistinguishable from a judge that never ran.
+
 If unexpected files appear, assess whether they are reasonable supporting changes (e.g., updating imports after a rename, updating tests for changed behavior) or truly out-of-scope modifications. Flag out-of-scope changes for human review.
 
 ## OUT OF SCOPE FOR FINDINGS

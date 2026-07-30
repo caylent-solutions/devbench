@@ -900,3 +900,253 @@ class TestSkillInvokesReviewJudgesDirectly:
             "SKILL.md must describe the review_team judges as first-level sub-agents "
             "invoked directly by the skill, not second-level spawns from review-supervisor."
         )
+
+
+# ---------------------------------------------------------------------------
+# E4-F4-S1-T1 -- Judge-side detection (spec FR-4.4, AC-56/AC-57/AC-58)
+# ---------------------------------------------------------------------------
+
+_FR44_EXACT_NO_GENUINE_RED_MESSAGE = "no genuine RED; fix may be absent or the test does not reproduce the failure"
+
+_FR44_JUDGE_PATHS = [
+    REVIEW_TEAM_DIR / "changes-manifest.md",
+    REVIEW_TEAM_DIR / "test-reviewer.md",
+]
+
+
+@pytest.mark.unit
+class TestChangesManifestTypeContradictionDetection:
+    """AC-E4-F4-S1-T1-1 / spec AC-56: the changes_manifest judge prompt must
+    instruct REVIEW_FAIL when a task's declared type contradicts its FR-4.1
+    Changes Manifest invariant, including the docs-task-touching-src example.
+    """
+
+    _PATH = REVIEW_TEAM_DIR / "changes-manifest.md"
+
+    def test_carries_fr41_invariant_table_for_every_task_type(self) -> None:
+        """The FR-4.1 invariant table (all six types) must be present so the
+        judge can look up which manifest rows each declared type permits."""
+        content = self._PATH.read_text(encoding="utf-8")
+        for type_name in ("behavior-fix", "feature", "test-only", "refactor", "docs", "chore"):
+            assert f"`{type_name}`" in content, (
+                f"changes-manifest.md must list task type `{type_name}` in its FR-4.1 "
+                "manifest invariant table so the judge can check declared type against "
+                "the actual Changes Manifest rows."
+            )
+
+    def test_carries_docs_touching_src_example(self) -> None:
+        """FR-4.4 names the docs-task-touching-src/ case explicitly as the
+        canonical type-contradiction example."""
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "docs" in content and "src/" in content, (
+            "changes-manifest.md must carry the docs-task-touching-src/ type-contradiction "
+            "example named in spec FR-4.4 / AC-56."
+        )
+
+    def test_instructs_review_fail_on_type_contradiction(self) -> None:
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "REVIEW_FAIL" in content and "contradict" in content.lower(), (
+            "changes-manifest.md must instruct REVIEW_FAIL when the declared task type "
+            "contradicts its FR-4.1 manifest invariant."
+        )
+
+    def test_refactor_row_has_no_per_row_manifest_invariant(self) -> None:
+        """docs/backlog-contract.md 'Task-Type Taxonomy Rule (FR-4.1, rule 21)' records
+        `refactor` as having no per-row Manifest invariant; green-green is a TDD Cycle
+        Log concern (deferred to E4-F4-S1-T2), not a static shape the manifest judge can
+        verdict on from a diff alone."""
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "no per-row Manifest invariant" in content, (
+            "changes-manifest.md's FR-4.1 table must state `refactor` has no per-row "
+            "Manifest invariant, matching docs/backlog-contract.md rule 21."
+        )
+        assert "E4-F4-S1-T2" in content, (
+            "changes-manifest.md must note that green-green enforcement for `refactor` "
+            "is deferred to E4-F4-S1-T2, not enforced by this judge from Manifest shape."
+        )
+
+    def test_cites_correct_classifier_symbols(self) -> None:
+        """The prompt must cite the real production/test classifiers
+        (`_is_production_source` / `_is_test_source_path`) and the real
+        documentation/chore classifiers (`_is_documentation_path` /
+        `_is_chore_path`), not `_check_source_test_pairs` (which is Rule 14's
+        source-test atomicity check, not a path classifier)."""
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "_is_production_source" in content, (
+            "changes-manifest.md must cite `_is_production_source` as the production-source "
+            "classifier (docs/backlog-contract.md 'Classification reuse (AC-47)')."
+        )
+        assert "_is_test_source_path" in content, (
+            "changes-manifest.md must cite `_is_test_source_path` as the test-path classifier."
+        )
+        assert "_is_documentation_path" in content, (
+            "changes-manifest.md must cite `_is_documentation_path` as the docs-row classifier."
+        )
+        assert "_is_chore_path" in content, (
+            "changes-manifest.md must cite `_is_chore_path` as the chore-row classifier."
+        )
+        assert "_check_source_test_pairs" not in content, (
+            "changes-manifest.md must NOT cite `_check_source_test_pairs` (Rule 14's source-test "
+            "atomicity RULE) as a path classifier -- it is a rule, not a classifier."
+        )
+
+
+@pytest.mark.unit
+class TestZeroProdCheckScopedToGatedTypes:
+    """Doc-review regression pin: rules 29 (changes-manifest.md) and 52
+    (test-reviewer.md) must scope the zero-production-source-plus-immediately-
+    passing-test REVIEW_FAIL to gated task types only (behavior-fix, feature),
+    matching SKILL.md step 4d.b and docs/backlog-contract.md rule 21, which
+    exempt test-only/refactor/docs/chore tasks from the RED gate entirely."""
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_zero_prod_rule_names_gated_types_explicitly(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "does not apply to" in lowered, (
+            f"{judge_path.name}'s zero-production-source-plus-passing-test rule must state "
+            "explicitly which types it does NOT apply to, so test-only, refactor, docs, and "
+            "chore tasks are not falsely REVIEW_FAILed for legitimately having zero "
+            "production-source rows and no RED_OBSERVED record."
+        )
+        assert "(gated types only)" in content or "for a gated task" in lowered, (
+            f"{judge_path.name} must scope the zero-production-source-plus-passing-test "
+            "REVIEW_FAIL to gated tasks (behavior-fix, feature) explicitly."
+        )
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_zero_prod_rule_excludes_exempt_types(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        for exempt_type in ("test-only", "refactor", "docs", "chore"):
+            assert f"`{exempt_type}`" in content, (
+                f"{judge_path.name} must name `{exempt_type}` as an exempt type not subject "
+                "to the zero-production-source-plus-passing-test REVIEW_FAIL."
+            )
+
+
+@pytest.mark.unit
+class TestTestReviewerRedObservedAndWeakTestDetection:
+    """AC-E4-F4-S1-T1-2 / spec AC-57: the test_review judge prompt must
+    REVIEW_FAIL a gated task with no RED_OBSERVED record, and carry the
+    weak-test check tying the recorded failure output to the AC path.
+    """
+
+    _PATH = REVIEW_TEAM_DIR / "test-reviewer.md"
+
+    def test_instructs_review_fail_on_missing_red_observed_record(self) -> None:
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "RED_OBSERVED" in content, "test-reviewer.md must reference the RED_OBSERVED evidence record."
+        assert "no RED_OBSERVED" in content or "no `RED_OBSERVED`" in content, (
+            "test-reviewer.md must instruct REVIEW_FAIL for a gated task with no RED_OBSERVED record (spec AC-57)."
+        )
+        assert "REVIEW_FAIL" in content
+
+    def test_carries_weak_test_check(self) -> None:
+        content = self._PATH.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "weak-test check" in lowered, "test-reviewer.md must name the weak-test check explicitly (spec FR-4.4)."
+        assert "failure-output digest" in lowered or "failure digest" in lowered, (
+            "test-reviewer.md must tie the weak-test check to the recorded failure-output digest."
+        )
+        assert "ac path" in lowered, (
+            "test-reviewer.md must state the weak-test check compares the recorded RED "
+            "output against the AC path the task exists to fix."
+        )
+
+    def test_weak_test_check_names_actual_record_fields_not_summary(self) -> None:
+        """Rule 51 must describe the RED_OBSERVED record's real three fields
+        (exit_code, test_node_id, failure_digest -- see
+        devbench.constants.RED_OBSERVED_RECORD_FIELDS) and must not claim the
+        record carries a 'failure summary' or readable 'failure output', since
+        the record is a fixed three-field message and failure_digest is a
+        hash-shaped identity token, not free text (doc_review FAIL, attempt 3).
+        """
+        content = self._PATH.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "failure summary" not in lowered, (
+            "test-reviewer.md rule 51 must not claim the RED_OBSERVED record carries a "
+            "'failure summary' -- the record has no such field."
+        )
+        assert "recorded `red_observed` failure output" not in lowered, (
+            "test-reviewer.md rule 51 must not describe the RED_OBSERVED record itself as "
+            "'failure output' -- the record is a fixed exit_code/test_node_id/failure_digest "
+            "message, not readable failure text."
+        )
+        assert "`test_node_id`" in content, (
+            "test-reviewer.md rule 51 must name the `test_node_id` field explicitly as the "
+            "human-readable field the AC-path comparison is based on."
+        )
+        assert "`failure_digest`" in content, (
+            "test-reviewer.md rule 51 must name the `failure_digest` field explicitly."
+        )
+        assert "human-readable" in lowered, (
+            "test-reviewer.md rule 51 must state that `test_node_id` is the only "
+            "human-readable field of the RED_OBSERVED record."
+        )
+        assert "hash-shaped" in lowered or "identity token" in lowered, (
+            "test-reviewer.md rule 51 must describe `failure_digest` as a hash-shaped "
+            "identity token computed over the failure output, not the failure output itself."
+        )
+
+
+@pytest.mark.unit
+class TestJudgePromptsCarryZeroProdExactMessage:
+    """AC-E4-F4-S1-T1-3 / spec AC-58: both changes_manifest and test_review
+    prompts must carry the FR-4.4 zero-production-source-plus-immediately-
+    passing-test message character-for-character."""
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_prompt_carries_exact_message(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        assert _FR44_EXACT_NO_GENUINE_RED_MESSAGE in content, (
+            f"{judge_path.name} must carry the exact spec FR-4.4 message "
+            f"{_FR44_EXACT_NO_GENUINE_RED_MESSAGE!r} character-for-character."
+        )
+
+
+@pytest.mark.unit
+class TestJudgePromptsNeverPassByDefaultWhenUnevaluable:
+    """AC-E4-F4-S1-T1-4: both prompts must state that a judge unable to
+    evaluate (RED_OBSERVED unreadable, diff unavailable) returns REVIEW_FAIL
+    with the cause, never a pass-by-default."""
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_prompt_states_unevaluable_review_fails_with_cause(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "unable to evaluate" in lowered, (
+            f"{judge_path.name} must describe the unable-to-evaluate case (RED_OBSERVED unreadable, diff unavailable)."
+        )
+        assert "pass-by-default" in lowered, (
+            f"{judge_path.name} must state that an unevaluable review REVIEW_FAILs with "
+            "the cause, never a pass-by-default."
+        )
+
+
+@pytest.mark.unit
+class TestSkillRoutesJudgeEvidenceInputs:
+    """AC-E4-F4-S1-T1-5: the orchestrate skill documents that the review leg
+    supplies each judge its evidence inputs -- declared type, Changes
+    Manifest, diff, and RED_OBSERVED record location -- so no judge is asked
+    to verdict without the material to falsify it.
+    """
+
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
+
+    def test_skill_documents_judge_evidence_inputs(self) -> None:
+        content = self._SKILL_PATH.read_text(encoding="utf-8")
+        for term in ("declared type", "Changes Manifest", "RED_OBSERVED"):
+            assert term in content, (
+                f"SKILL.md must document that the review leg supplies judges the "
+                f"evidence input {term!r} (spec FR-4.4 / AC-E4-F4-S1-T1-5)."
+            )
+        assert "diff" in content.lower()
+
+    def test_skill_states_unevaluable_judge_fails_with_cause(self) -> None:
+        content = self._SKILL_PATH.read_text(encoding="utf-8").lower()
+        assert "unable to evaluate" in content or "unevaluable" in content, (
+            "SKILL.md must state that a judge unable to evaluate REVIEW_FAILs with the cause, never a pass-by-default."
+        )
+        assert "pass-by-default" in content

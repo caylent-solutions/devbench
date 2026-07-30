@@ -1584,8 +1584,13 @@ class BacklogManager:
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
-            phase: TDD phase -- must be one of ``RED``, ``GREEN``, or ``REFACTOR``
-                (caller must pass normalized uppercase value).
+            phase: TDD phase -- any member of ``devbench.constants.VALID_TDD_PHASES``
+                (``RED``, ``GREEN``, ``REFACTOR``, ``RED_OBSERVED``; caller must pass
+                normalized uppercase value). This helper performs no phase
+                validation itself: the agent-writable versus orchestrator-only
+                boundary (``AGENT_WRITABLE_TDD_PHASES`` vs. ``RED_OBSERVED``) is
+                enforced by the caller -- ``cmd_log_tdd`` rejects phases outside
+                ``AGENT_WRITABLE_TDD_PHASES`` before this method is ever reached.
             message: Description of the TDD phase outcome.
 
         Raises:

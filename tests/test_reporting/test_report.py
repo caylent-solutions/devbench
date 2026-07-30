@@ -4318,11 +4318,21 @@ class TestReadLastLogTimestampFailurePaths:
     """A log the process cannot stat must not crash the liveness banner (issue #250)."""
 
     def test_stat_failure_yields_no_timestamp(self, tmp_path: Path) -> None:
+        """``is_file`` is pinned True so only the guarded ``stat`` call raises.
+
+        Patching ``Path.stat`` alone is not deterministic: ``Path.is_file``
+        calls ``stat`` internally, and whether it swallows the ``OSError`` or
+        propagates it varies by interpreter version. Pinning ``is_file``
+        isolates the branch under test.
+        """
         from unittest.mock import patch
 
         from devbench.reporting.report import _read_last_log_timestamp
 
         log = tmp_path / "orch.log"
         log.write_text("2026-03-05T10:00:00Z [devbench.orch] INFO Tick\n", encoding="utf-8")
-        with patch.object(Path, "stat", side_effect=OSError("permission denied")):
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(Path, "stat", side_effect=OSError("permission denied")),
+        ):
             assert _read_last_log_timestamp(log) is None

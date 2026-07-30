@@ -1089,6 +1089,90 @@ class TestRebaseAndForcePush:
         assert fetch_idx < rebase_idx < push_idx
 
 
+def _real_repo(tmp_path: Path) -> Path:
+    """A real git repo with one commit, for tests that must observe actual staging."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "x@y.z"],
+        ["config", "user.name", "test"],
+        ["config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    (repo / "mine.py").write_text("original\n")
+    (repo / "theirs.py").write_text("original\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "-M", "feature/x"], check=True)
+    return repo
+
+
+def _committed_files(repo: Path) -> set[str]:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line for line in out.stdout.split() if line}
+
+
+@pytest.mark.unit
+class TestCommitScopedToManifest:
+    """A commit must carry only its own work unit's files.
+
+    ``git add -A`` stages the whole working tree, so any file another work unit
+    left modified-but-unstaged is swept into this unit's commit under this
+    unit's message. ``assert_staged_matches_manifest`` cannot catch it: that
+    guard reads ``git diff --cached``, which by definition does not see unstaged
+    changes. The victim task then fails ``changes_manifest`` forever, because
+    the files it declared are already committed under someone else's name, and
+    the only remedies are an operator override or rewriting published history on
+    a shared branch. Observed in production as commit b5201cb.
+    """
+
+    def test_commit_local_ignores_another_units_unstaged_work(self, tmp_path: Path) -> None:
+        repo = _real_repo(tmp_path)
+        # This unit's file: staged, and the only entry in its Manifest.
+        (repo / "mine.py").write_text("mine change\n")
+        subprocess.run(["git", "-C", str(repo), "add", "mine.py"], check=True)
+        # Another in-flight unit's file: modified but NOT staged.
+        (repo / "theirs.py").write_text("their in-flight change\n")
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo", repo, "feature/x", "E0-F1-S1-T1: mine", manifest_files=["mine.py"]
+        )
+
+        committed = _committed_files(repo)
+        assert "mine.py" in committed
+        assert "theirs.py" not in committed, (
+            f"commit swallowed another unit's unstaged file; committed={sorted(committed)}"
+        )
+        # And their work must survive in the working tree, unharmed.
+        assert (repo / "theirs.py").read_text() == "their in-flight change\n"
+
+    def test_commit_local_stages_manifest_paths_left_unstaged(self, tmp_path: Path) -> None:
+        """The unit's own Manifest paths are staged even when the executor left them unstaged."""
+        repo = _real_repo(tmp_path)
+        (repo / "mine.py").write_text("mine change\n")  # never `git add`-ed
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo", repo, "feature/x", "E0-F1-S1-T1: mine", manifest_files=["mine.py"]
+        )
+
+        assert "mine.py" in _committed_files(repo)
+
+    def test_commit_local_without_manifest_keeps_add_all(self, tmp_path: Path) -> None:
+        """Back-compat: callers that pass no Manifest retain the previous behaviour."""
+        repo = _real_repo(tmp_path)
+        (repo / "theirs.py").write_text("sweep me\n")
+
+        GitOpsService().commit_local("caylent-solutions/git-repo", repo, "feature/x", "legacy")
+
+        assert "theirs.py" in _committed_files(repo)
+
+
 class TestCommitLocal:
     """Test commit_local method."""
 

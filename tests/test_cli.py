@@ -2492,7 +2492,9 @@ class TestCmdValidateBacklogPathResolution:
             "## Description\n\nTest task.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
-            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `src/f.py` | New |\n"
+            "| `tests/unit/test_f.py` | New |\n\n"
             "## Definition of Done\n\n- [ ] All ACs checked\n\n"
             "## TDD Cycle Log\n\n## Comments\n",
             encoding="utf-8",

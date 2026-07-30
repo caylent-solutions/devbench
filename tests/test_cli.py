@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import re
+import subprocess
 import types
 from collections.abc import Generator
 from datetime import UTC, datetime
@@ -994,6 +996,169 @@ def _make_noop_flock(entered: list[bool] | None = None) -> Any:
         return _FakeFlock(root, timeout_seconds, entered=entered)
 
     return _flock
+
+
+class TestCmdClaimCheckoutScopeGuard:
+    """cmd_claim refuses to claim on top of another work unit's uncommitted work.
+
+    The single-branch modes share one checkout across every work unit. A unit
+    that blocks before committing leaves its changes in that checkout, where
+    the next unit inherits them: its commit absorbs a sibling's files, and the
+    judges review code the unit under review does not own. The guard refuses
+    the claim instead, at the earliest point the owning unit is known.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    def _git_repo(self, tmp_path: Path) -> Path:
+        """Create a real git repo with one committed file and a clean tree."""
+        repo = tmp_path / "checkout"
+        repo.mkdir()
+        for args in (
+            ["git", "init"],
+            ["git", "config", "user.email", "t@ex.com"],
+            ["git", "config", "user.name", "Test"],
+        ):
+            subprocess.run(args, cwd=repo, check=True, capture_output=True)
+        (repo / "src").mkdir()
+        (repo / "src/own.py").write_text("baseline\n")
+        (repo / "src/sibling.py").write_text("baseline\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _wu_file(self, backlog_dir: Path) -> Path:
+        """Write a claimable work-unit file whose Manifest declares src/own.py."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T2: Second Task\n\n"
+            "## Status: in-queue\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `src/own.py` | modify |\n\n"
+            "## Comments\n"
+        )
+        return wu_file
+
+    def _claim(self, mock_units: list[WorkUnit], backlog_dir: Path, repo: Path | None) -> tuple[int, MagicMock]:
+        """Run cmd_claim with REPO_LOCAL_PATHS pointing at *repo* (or empty)."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+        repo_paths = {} if repo is None else {self._REPO: repo}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.resolve_repo", return_value=self._REPO),
+            patch.dict("devbench.cli.REPO_LOCAL_PATHS", repo_paths, clear=True),
+        ):
+            return cli.cmd_claim("E0-F1-S1-T2"), mock_mgr
+
+    def test_claim_refused_when_sibling_left_unstaged_work(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The residue shape that made a docs-only unit fail another unit's security review."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's uncommitted work\n")
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "Checkout scope violation" in err
+        assert "src/sibling.py" in err
+        assert "E0-F1-S1-T2" in err
+        # The claim must not have been recorded: no status write happened.
+        mock_mgr.force_status.assert_not_called()
+
+    def test_claim_refused_when_sibling_left_staged_work(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's staged work\n")
+        subprocess.run(["git", "add", "src/sibling.py"], cwd=repo, check=True, capture_output=True)
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 1
+        assert "src/sibling.py" in capsys.readouterr().err
+        mock_mgr.force_status.assert_not_called()
+
+    def test_claim_refused_when_sibling_left_untracked_file(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "tests").mkdir()
+        (repo / "tests/test_sibling.py").write_text("another unit's new module\n")
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 1
+        assert "tests/test_sibling.py" in capsys.readouterr().err
+        mock_mgr.force_status.assert_not_called()
+
+    def test_claim_allowed_on_clean_checkout(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+
+    def test_claim_allowed_when_only_own_manifest_files_are_dirty(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Re-claiming an interrupted in-progress unit must still work."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/own.py").write_text("this unit's own work in progress\n")
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+
+    def test_claim_proceeds_and_logs_when_no_checkout_is_configured(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No configured checkout means no shared tree to guard; say so rather than pass over it."""
+        self._wu_file(backlog_dir)
+
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            result, mock_mgr = self._claim(mock_units, backlog_dir, None)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        assert any("claim scope check skipped for E0-F1-S1-T2" in record.message for record in caplog.records)
 
 
 class TestCmdClaimAtomicArbitration:

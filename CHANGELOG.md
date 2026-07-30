@@ -7,6 +7,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A blocked work unit's uncommitted changes contaminated every unit that
+  claimed after it.** The single-branch modes run every work unit in one shared
+  checkout. When a unit blocked before its work was committed, that work stayed
+  in the tree, and nothing cleared it or reported it. The next unit to claim
+  inherited it, with two distinct failure modes observed in one run: a unit's
+  judges rejected it for staged files belonging to a blocked sibling, and a
+  docs-only unit was blocked by a security review whose every finding cited a
+  blocked sibling's unstaged source, which the docs-only unit neither owned nor
+  was permitted to touch. Neither unit could act on the rejection, and the
+  residue survived to contaminate the unit after that. `devbench claim` now
+  refuses, before any executor or judge time is spent, when the target checkout
+  holds uncommitted changes outside the claiming unit's Changes Manifest, naming
+  every offending path so the residue is attributed to the unit that produced
+  it. The check covers staged, unstaged, and untracked-but-not-gitignored paths;
+  `assert_staged_matches_manifest` sees only the staged set, which is why a unit
+  that blocked before staging read as a clean tree. Re-claiming an `in-progress`
+  unit is unaffected: its own manifest files may be dirty.
+
+  **Behaviour change:** `devbench claim` exits non-zero on a contaminated
+  checkout where it previously claimed successfully. Resolve by committing or
+  reverting the owning unit's work, then claiming again. When the unit's repo
+  has no configured local checkout there is no shared tree to guard; the check
+  logs that it was skipped rather than passing over it silently.
+
 - **A work unit's commit could absorb another unit's unstaged changes.** Both
   commit paths ran `git add -A`, staging the entire working tree and committing
   it under the current unit's message, so any file another in-flight unit had

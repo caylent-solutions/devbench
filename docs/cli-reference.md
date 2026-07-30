@@ -350,6 +350,17 @@ uv run devbench claim <id>
 
 Set the work unit's status to `in-progress`. Fails if the unit is already in a terminal state. Invoked by the orchestrate SKILL at the start of each loop iteration.
 
+`claim` refuses, with a non-zero exit and no status write, when either precondition fails:
+
+- The unit's Changes Manifest still carries a placeholder row. Replace it with real file entries, or let the manifest-amendment workflow fill it in.
+- The unit's target checkout holds uncommitted changes outside the unit's Changes Manifest. The error names every offending path.
+
+The second check exists because the single-branch modes (`git_ops.single_branch` with `defer_pr`) run every work unit in one shared checkout. A unit that blocks before its work is committed leaves that work in the tree, and the next unit to claim inherits it: its commit absorbs the sibling's files under the wrong unit's message, and the review judges reject it over code it does not own and cannot fix. Refusing the claim reports the residue against the unit that produced it, before any executor or judge time is spent.
+
+The check compares the full checkout state (staged, unstaged, and untracked-but-not-gitignored paths) against the manifest, so residue left by a unit that blocked before staging is caught too. Re-claiming an `in-progress` unit after an interrupted run is unaffected: the unit's own manifest files are allowed to be dirty.
+
+To resolve a refusal, identify the unit that owns each named path, then either commit that unit's work or revert it, and claim again. When the unit's repo has no configured local checkout, there is no shared tree to guard; the check is logged as skipped and `git-ops` still fails fast on the same missing configuration at commit time.
+
 ### `set-status`
 
 ```

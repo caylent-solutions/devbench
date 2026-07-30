@@ -1030,6 +1030,15 @@ def cmd_claim(unit_id: str) -> int:
     true``) or surfaces the failure to the operator -- either way the
     placeholder never reaches the executor.
 
+    Also refuses to claim when the unit's target checkout holds uncommitted
+    changes outside this unit's Changes Manifest. In the single-branch modes
+    every work unit shares one checkout, so a unit that blocked before
+    committing leaves its work in the tree for the next unit to inherit --
+    which is how a sibling's files end up committed under the wrong unit's
+    message, and how judges come to reject a unit over code it does not own.
+    Re-claiming an ``in-progress`` unit is unaffected: the unit's own
+    manifest files are allowed to be dirty.
+
     Spec 4.4.2 / AC-192-5: wraps the status write in an exclusive
     ``flock(BACKLOG.lock)`` so that two concurrent sessions cannot claim the
     same work unit.  Under the lock the current on-disk status is re-read; if
@@ -1064,6 +1073,11 @@ def cmd_claim(unit_id: str) -> int:
         )
         return 1
 
+    scope_error = _claim_worktree_scope_error(unit, wu_file, unit_id)
+    if scope_error is not None:
+        print(scope_error, file=sys.stderr)
+        return 1
+
     session_name: str | None = os.environ.get("DEVBENCH_SESSION_NAME", "").strip() or None
     error_message = _claim_under_lock(wu_file, unit_id, session_name)
     if error_message is not None:
@@ -1073,6 +1087,51 @@ def cmd_claim(unit_id: str) -> int:
     logger.info("Claimed %s (set to in-progress)", unit_id)
     print(f"Claimed {unit_id}")
     return 0
+
+
+def _claim_worktree_scope_error(unit: WorkUnit, wu_file: Path, unit_id: str) -> str | None:
+    """Return an error string when the target checkout holds another unit's work.
+
+    devbench's single-branch modes run every work unit in one shared
+    checkout, and a unit that blocks before committing leaves its changes
+    behind. Claiming on top of that residue is what lets one unit's files be
+    committed under another unit's message, and what makes judges reject a
+    unit over code it does not own. This refuses the claim instead, naming
+    every offending path, so the residue is dealt with deliberately.
+
+    The check needs a checkout to inspect. When the unit's repo has no
+    configured local path, or that path is not a git work tree, there is no
+    shared checkout for this unit and the check does not apply; that is
+    logged rather than passed over silently, and ``cmd_git_ops`` still fails
+    fast on the same missing configuration at commit time.
+
+    Args:
+        unit: The work unit being claimed, used to resolve its target repo.
+        wu_file: Absolute path to the work-unit ``.md`` file.
+        unit_id: Work-unit identifier, named in the returned error.
+
+    Returns:
+        ``None`` when the checkout is scoped to this unit (or no checkout
+        applies); a human-readable error string otherwise.
+    """
+    from devbench.backlog.manifest import assert_worktree_scoped_to_manifest, parse_manifest
+
+    canonical_repo = resolve_repo(unit.repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None or not (repo_path / ".git").exists():
+        logger.info(
+            "claim scope check skipped for %s: no git checkout resolved for repo %r",
+            unit_id,
+            canonical_repo,
+        )
+        return None
+
+    manifest_files = [row.file for row in parse_manifest(wu_file.read_text(encoding="utf-8"))]
+    try:
+        assert_worktree_scoped_to_manifest(repo_path, manifest_files, unit_id)
+    except RuntimeError as exc:
+        return f"ERROR: {exc}"
+    return None
 
 
 def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:

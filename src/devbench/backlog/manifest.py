@@ -13,6 +13,12 @@ This module provides:
 - ``append_rows`` -- splice additional rows into an existing work-unit
   Markdown string without modifying anything outside the Changes Manifest
   section body.
+- ``list_staged_files`` / ``list_changed_files`` -- read-only git queries for
+  the staged set and for the full changed set (staged, unstaged, untracked).
+- ``assert_staged_matches_manifest`` -- commit-time guard: nothing outside
+  the manifest may be staged.
+- ``assert_worktree_scoped_to_manifest`` -- claim-time guard: nothing outside
+  the manifest may be dirty anywhere in the shared checkout.
 
 The writer is used by the manifest amendment workflow to add production-fix
 rows to a work-unit's manifest at runtime after a judge has approved the
@@ -102,15 +108,28 @@ def render_manifest_rows(rows: list[ManifestRow]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def list_staged_files(repo_path: Path) -> list[str]:
-    """Return the staged file set for ``repo_path`` via ``git diff --cached --name-only``.
+def _read_git_paths(repo_path: Path, args: list[str]) -> list[str]:
+    """Run a read-only, NUL-delimited git path query and return the paths.
 
-    Pure read-only operation. Bounded by ``_GIT_DIFF_TIMEOUT``. Returns paths
-    relative to ``repo_path`` -- the same shape that appears in the Changes
-    Manifest. Raises ``RuntimeError`` if git itself fails (not when the diff
-    is empty -- that's an empty list).
+    Shared by :func:`list_staged_files` and :func:`list_changed_files` so the
+    subprocess invocation, timeout, and failure handling exist once. ``args``
+    must be a git subcommand that emits NUL-separated paths (``-z``), which
+    keeps paths containing spaces or newlines intact instead of relying on
+    git's quoting rules.
+
+    Args:
+        repo_path: Local repo root the query runs against.
+        args: Git subcommand and flags, without the leading ``git -C <path>``.
+
+    Returns:
+        Paths relative to ``repo_path``, in the order git emitted them.
+
+    Raises:
+        RuntimeError: If git times out or exits non-zero. An empty result set
+            is not an error; it returns an empty list.
     """
-    cmd = ["git", "-C", str(repo_path), "diff", "--cached", "--name-only"]
+    cmd = ["git", "-C", str(repo_path), *args]
+    printable = " ".join(args)
     try:
         result = subprocess.run(
             cmd,
@@ -120,12 +139,96 @@ def list_staged_files(repo_path: Path) -> list[str]:
             timeout=_GIT_DIFF_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"git diff --cached --name-only timed out in {repo_path}") from exc
+        raise RuntimeError(f"git {printable} timed out in {repo_path}") from exc
     if result.returncode != 0:
-        raise RuntimeError(
-            f"git diff --cached --name-only failed in {repo_path} (exit {result.returncode}): {result.stderr.strip()}"
-        )
-    return [line for line in result.stdout.splitlines() if line.strip()]
+        raise RuntimeError(f"git {printable} failed in {repo_path} (exit {result.returncode}): {result.stderr.strip()}")
+    return [path for path in result.stdout.split("\0") if path.strip()]
+
+
+def list_staged_files(repo_path: Path) -> list[str]:
+    """Return the staged file set for ``repo_path`` via ``git diff --cached``.
+
+    Pure read-only operation. Bounded by ``_GIT_DIFF_TIMEOUT``. Returns paths
+    relative to ``repo_path`` -- the same shape that appears in the Changes
+    Manifest. Raises ``RuntimeError`` if git itself fails (not when the diff
+    is empty -- that's an empty list).
+    """
+    return _read_git_paths(repo_path, ["diff", "--cached", "--name-only", "-z"])
+
+
+def list_changed_files(repo_path: Path) -> list[str]:
+    """Return every path in ``repo_path`` that differs from the last commit.
+
+    The union of three read-only queries, so nothing a work unit could have
+    left behind is missed:
+
+    - ``git diff --cached`` -- staged against HEAD.
+    - ``git diff`` -- unstaged, tracked modifications.
+    - ``git ls-files --others --exclude-standard`` -- untracked files that
+      are not gitignored.
+
+    :func:`list_staged_files` sees only the first of the three, which is why
+    it cannot serve as the claim-time guard: a work unit that blocked before
+    staging leaves unstaged and untracked residue that a staged-only query
+    reports as a clean tree.
+
+    Args:
+        repo_path: Local repo root to inspect.
+
+    Returns:
+        Sorted, de-duplicated paths relative to ``repo_path``.
+
+    Raises:
+        RuntimeError: If any of the three git queries times out or fails.
+    """
+    staged = _read_git_paths(repo_path, ["diff", "--cached", "--name-only", "-z"])
+    unstaged = _read_git_paths(repo_path, ["diff", "--name-only", "-z"])
+    untracked = _read_git_paths(repo_path, ["ls-files", "--others", "--exclude-standard", "-z"])
+    return sorted({*staged, *unstaged, *untracked})
+
+
+def assert_worktree_scoped_to_manifest(repo_path: Path, manifest_files: list[str], unit_id: str) -> None:
+    """Verify the whole checkout holds only paths ``unit_id`` is authorized to touch.
+
+    devbench's single-branch modes run every work unit in one shared
+    checkout. A unit that blocks before its work is committed leaves that
+    work in the tree, where the next unit inherits it: the executor commits
+    a sibling's files under its own message, and the judges review, and
+    reject over, code the unit under review does not own and cannot fix.
+
+    Called at claim time, before any executor work begins, so the residue is
+    reported against the unit that produced it instead of surfacing as a
+    review failure against an innocent successor several agent-turns later.
+
+    Re-claiming an ``in-progress`` unit after an interrupted run is a
+    supported path, so the unit's own manifest files are permitted to be
+    dirty; only paths outside the manifest are refused.
+
+    Args:
+        repo_path: Local repo root the claiming unit targets.
+        manifest_files: The exact file-path list from the claiming unit's
+            ``## Changes Manifest`` (parsed via :func:`parse_manifest`).
+        unit_id: Work-unit identifier, named in the error so the operator
+            knows which claim was refused.
+
+    Raises:
+        RuntimeError: When any changed path falls outside ``manifest_files``.
+            The message lists every offending path so the operator can
+            attribute the residue and clear it deliberately.
+    """
+    changed = list_changed_files(repo_path)
+    allowed = set(manifest_files)
+    foreign = [path for path in changed if path not in allowed]
+    if not foreign:
+        return
+    raise RuntimeError(
+        f"Checkout scope violation in {repo_path}: cannot claim {unit_id!r} because "
+        f"{len(foreign)} path(s) in the shared checkout are outside its Changes Manifest: "
+        f"{foreign}. Manifest declares: {sorted(allowed)}. These are uncommitted changes "
+        "left by another work unit; committing or reviewing on top of them attributes one "
+        "unit's work to another. Identify the unit that owns each path, then either commit "
+        "that unit's work or revert it, and claim again."
+    )
 
 
 def assert_staged_matches_manifest(repo_path: Path, manifest_files: list[str]) -> None:

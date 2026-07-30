@@ -16,7 +16,6 @@ from devbench.backlog.manifest import (
     ManifestRow,
     append_rows,
     assert_staged_matches_manifest,
-    assert_worktree_scoped_to_manifest,
     list_changed_files,
     list_staged_files,
     parse_manifest,
@@ -512,70 +511,6 @@ class TestListChangedFiles:
     def test_non_git_dir_raises(self, tmp_path: _Path) -> None:
         with pytest.raises(RuntimeError, match=r"git diff --cached --name-only -z failed"):
             list_changed_files(tmp_path)
-
-
-class TestAssertWorktreeScopedToManifest:
-    def test_clean_tree_passes(self, tmp_path: _Path) -> None:
-        _init_repo_with_file(tmp_path, "src/a.py")
-        _commit_baseline(tmp_path)
-        assert_worktree_scoped_to_manifest(tmp_path, ["src/a.py"], "E1-F1-S1-T1")
-
-    def test_dirty_within_own_manifest_passes(self, tmp_path: _Path) -> None:
-        """Re-claiming an interrupted in-progress unit must remain possible."""
-        _init_repo_with_file(tmp_path, "src/a.py")
-        _commit_baseline(tmp_path)
-        (tmp_path / "src/a.py").write_text("own work in progress")
-        (tmp_path / "tests/test_a.py").parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / "tests/test_a.py").write_text("own new test")
-        assert_worktree_scoped_to_manifest(tmp_path, ["src/a.py", "tests/test_a.py"], "E1-F1-S1-T1")
-
-    def test_foreign_staged_file_is_refused(self, tmp_path: _Path) -> None:
-        _init_repo_with_file(tmp_path, "src/a.py")
-        _init_repo_with_file(tmp_path, "docs/sibling.md")
-        _commit_baseline(tmp_path)
-        (tmp_path / "docs/sibling.md").write_text("another unit's staged work")
-        _subprocess.run(["git", "add", "docs/sibling.md"], cwd=tmp_path, check=True, capture_output=True)
-        with pytest.raises(RuntimeError) as exc:
-            assert_worktree_scoped_to_manifest(tmp_path, ["src/a.py"], "E1-F1-S1-T1")
-        msg = str(exc.value)
-        assert "Checkout scope violation" in msg
-        assert "E1-F1-S1-T1" in msg
-        assert "docs/sibling.md" in msg
-
-    def test_foreign_unstaged_file_is_refused(self, tmp_path: _Path) -> None:
-        """The exact residue shape that made a docs-only unit fail security review."""
-        _init_repo_with_file(tmp_path, "docs/own.md")
-        _init_repo_with_file(tmp_path, "src/sibling.py")
-        _commit_baseline(tmp_path)
-        (tmp_path / "src/sibling.py").write_text("another unit's uncommitted source")
-        with pytest.raises(RuntimeError) as exc:
-            assert_worktree_scoped_to_manifest(tmp_path, ["docs/own.md"], "E4-F3-S1-T3")
-        msg = str(exc.value)
-        assert "src/sibling.py" in msg
-        assert "E4-F3-S1-T3" in msg
-
-    def test_foreign_untracked_file_is_refused(self, tmp_path: _Path) -> None:
-        _init_repo_with_file(tmp_path, "src/a.py")
-        _commit_baseline(tmp_path)
-        (tmp_path / "tests/test_sibling.py").parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / "tests/test_sibling.py").write_text("another unit's new test module")
-        with pytest.raises(RuntimeError) as exc:
-            assert_worktree_scoped_to_manifest(tmp_path, ["src/a.py"], "E1-F1-S1-T1")
-        assert "tests/test_sibling.py" in str(exc.value)
-
-    def test_error_lists_every_offender_and_the_manifest(self, tmp_path: _Path) -> None:
-        _init_repo_with_file(tmp_path, "src/own.py")
-        _init_repo_with_file(tmp_path, "src/one.py")
-        _init_repo_with_file(tmp_path, "src/two.py")
-        _commit_baseline(tmp_path)
-        (tmp_path / "src/one.py").write_text("residue one")
-        (tmp_path / "src/two.py").write_text("residue two")
-        with pytest.raises(RuntimeError) as exc:
-            assert_worktree_scoped_to_manifest(tmp_path, ["src/own.py"], "E1-F1-S1-T1")
-        msg = str(exc.value)
-        assert "2 path(s)" in msg
-        assert "['src/one.py', 'src/two.py']" in msg
-        assert "Manifest declares: ['src/own.py']" in msg
 
 
 # ---------------------------------------------------------------------------

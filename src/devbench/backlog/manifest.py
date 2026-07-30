@@ -17,8 +17,6 @@ This module provides:
   the staged set and for the full changed set (staged, unstaged, untracked).
 - ``assert_staged_matches_manifest`` -- commit-time guard: nothing outside
   the manifest may be staged.
-- ``assert_worktree_scoped_to_manifest`` -- claim-time guard: nothing outside
-  the manifest may be dirty anywhere in the shared checkout.
 
 The writer is used by the manifest amendment workflow to add production-fix
 rows to a work-unit's manifest at runtime after a judge has approved the
@@ -185,50 +183,6 @@ def list_changed_files(repo_path: Path) -> list[str]:
     unstaged = _read_git_paths(repo_path, ["diff", "--name-only", "-z"])
     untracked = _read_git_paths(repo_path, ["ls-files", "--others", "--exclude-standard", "-z"])
     return sorted({*staged, *unstaged, *untracked})
-
-
-def assert_worktree_scoped_to_manifest(repo_path: Path, manifest_files: list[str], unit_id: str) -> None:
-    """Verify the whole checkout holds only paths ``unit_id`` is authorized to touch.
-
-    devbench's single-branch modes run every work unit in one shared
-    checkout. A unit that blocks before its work is committed leaves that
-    work in the tree, where the next unit inherits it: the executor commits
-    a sibling's files under its own message, and the judges review, and
-    reject over, code the unit under review does not own and cannot fix.
-
-    Called at claim time, before any executor work begins, so the residue is
-    reported against the unit that produced it instead of surfacing as a
-    review failure against an innocent successor several agent-turns later.
-
-    Re-claiming an ``in-progress`` unit after an interrupted run is a
-    supported path, so the unit's own manifest files are permitted to be
-    dirty; only paths outside the manifest are refused.
-
-    Args:
-        repo_path: Local repo root the claiming unit targets.
-        manifest_files: The exact file-path list from the claiming unit's
-            ``## Changes Manifest`` (parsed via :func:`parse_manifest`).
-        unit_id: Work-unit identifier, named in the error so the operator
-            knows which claim was refused.
-
-    Raises:
-        RuntimeError: When any changed path falls outside ``manifest_files``.
-            The message lists every offending path so the operator can
-            attribute the residue and clear it deliberately.
-    """
-    changed = list_changed_files(repo_path)
-    allowed = set(manifest_files)
-    foreign = [path for path in changed if path not in allowed]
-    if not foreign:
-        return
-    raise RuntimeError(
-        f"Checkout scope violation in {repo_path}: cannot claim {unit_id!r} because "
-        f"{len(foreign)} path(s) in the shared checkout are outside its Changes Manifest: "
-        f"{foreign}. Manifest declares: {sorted(allowed)}. These are uncommitted changes "
-        "left by another work unit; committing or reviewing on top of them attributes one "
-        "unit's work to another. Identify the unit that owns each path, then either commit "
-        "that unit's work or revert it, and claim again."
-    )
 
 
 def assert_staged_matches_manifest(repo_path: Path, manifest_files: list[str]) -> None:

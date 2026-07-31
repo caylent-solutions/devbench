@@ -3,6 +3,193 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] -- v-next
+
+### Fixed
+
+- **Every orchestrator start re-materialised a consumed proposal and recreated
+  a duplicate work unit** (issue #302). `_find_draft_file` looked in exactly
+  one directory, the story directory computed from the ID. A work unit living
+  anywhere else read as absent, so `classify_proposed_task` reported it
+  `UNMATERIALISED` and the orchestrate loop's opening `sweep-proposals`
+  created it again in the canonical location, leaving two files and two index
+  rows under one ID. Recovering cost roughly four minutes of orchestrator
+  turns before any work unit was claimed, and it repeated on every start. A
+  work-unit ID identifies one unit wherever its file sits, so the lookup now
+  searches the backlog tree and refuses, rather than picking arbitrarily, when
+  two files carry one ID. Separately, `sweep-proposals` now deletes a proposal
+  once every task in it is resolved; leaving the JSON on disk also pinned the
+  source task to `AWAITING_AMENDMENT_RECOVERY` indefinitely.
+
+- **Quoting a `[BLOCKED_PENDING_PROPOSAL]` token inside a comment created a
+  live marker** (issue #304). The scanner matched the token anywhere in the
+  `## Comments` body, so an audit comment recording that a marker had been
+  removed, quoting the removed line verbatim, silently re-blocked the unit on
+  the quoted ID. The file read as correct to a human, because the only
+  occurrence sat inside quotation marks, and agents write such narratives
+  routinely. Both writers emit the marker as the final token of an audit row,
+  so the pattern is now anchored there: writing *about* a marker no longer
+  creates one.
+
+- **An unscoped session wrote a `scope.json` its own readers reject** (issue
+  #270). Session startup wrote a bare JSON array of IDs while
+  `ScopeFilter.from_file` and `_read_scope_payload` require the canonical
+  object. The two writers target the same path, because `resolve_scope_file_path`
+  routes there whenever `DEVBENCH_SESSION_NAME` is set, so the array overwrote
+  the object and every subsequent read raised
+  `scope.json top-level payload must be an object, got 'list'`. Scoped
+  sessions now write the canonical payload; unscoped sessions write no file,
+  since absent is how every reader already expresses "no scope", and an empty
+  scope would assert a filter matching nothing. A stale array file left by an
+  earlier version is cleared on the next start.
+
+- **`devbench status` crashed with a traceback where `report` diagnosed**
+  (issue #305). A missing work-unit file or a malformed index escaped `status`
+  as a raw `FileNotFoundError` while `report` reported the same condition with
+  an actionable message and a non-zero exit. An operator running both saw a
+  crash and a clean error for one underlying state. The handler is now shared,
+  so the two cannot drift apart, and it still distinguishes a missing file
+  (possibly a transient writer-window race; re-run) from a malformed index
+  (run `validate-backlog`).
+
+- **The test suite wrote into the live workspace and orchestrator log**
+  (issue #292). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
+  `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH` with `os.environ.setdefault`,
+  so it INHERITED whatever the ambient shell already had. devbench is
+  developed with devbench, so the executor runs the suite from inside a live
+  workspace with those exported: fixture work-unit state landed in the real
+  `.devbench/ci-failures/` and `.devbench/pr-bot-feedback/` under IDs that
+  exist only in `tests/`, and fabricated lifecycle records were appended to
+  the live log -- `[ORCHESTRATOR_TERMINAL_EXIT]`, `[QUOTA_WAITING]`,
+  `[ORCHESTRATOR_AUTO_RESTART]`, `Merged PR #42` -- for events that never
+  happened. Those are exactly the markers the reporting layer parses, so a
+  test run could drive an operator's `status` and `report` output. Assignment
+  is now unconditional, to a fresh per-run temporary workspace; an ambient
+  value is the hazard, not a configuration to honour. Verified against a live
+  workspace: the suite leaves a 180 MB orchestrator log byte-identical and
+  the 197-file `.devbench/` tree unchanged.
+
+- **A spent executor retry budget was reported as "operator does nothing"**
+  (issue #248). The orchestrate skill writes its retry-exhaustion `[BLOCKED]`
+  row under `agent/orchestrator` naming the failing checks, which matched both
+  the recovery agent-tag allowlist and the recovery body pattern (it includes
+  `ALL_REVIEWS_FAILED` / `REVIEW_REJECTED`). The unit was therefore classified
+  `AWAITING_AMENDMENT_RECOVERY`, whose contract is that the operator does
+  nothing, while no further executor run was coming. Nothing cleared it, no
+  operator notification fired, and the run stalled silently. The skill now
+  emits an explicit `[RETRY_BUDGET_EXHAUSTED]` tag on genuine exhaustion and
+  the classifier returns `OPERATOR_ACTION_REQUIRED` for it. A live
+  `[BLOCKED_PENDING_PROPOSAL]` cascade still wins, because that genuinely will
+  clear the unit.
+
+- **The in-progress timer under-reported how long a work unit had been
+  running** (issue #293). The pattern allowed `.*` between the log timestamp
+  and the phrase `Set <id> to 'in-progress'`, so it matched lines that merely
+  quoted the transition. The orchestrator logs whole SDK messages, and a tool
+  result that read a work unit's `[WU_CLAIMED]` audit comment reproduces that
+  phrase inside a line stamped with the time of the dump; being later, the
+  echo won the `max()`. Observed: a unit claimed at 12:11 reported as claimed
+  at 12:38, and the error grew with every further echo, so a long-running unit
+  could keep resetting toward "just started". The pattern is now anchored to
+  the emitting logger and level.
+
+- **`validate-backlog` passed on duplicate work-unit IDs** (issue #291). One
+  unit written into two directory trees yields two index rows under one ID.
+  Every existing check passed -- both files exist, each matches its own row's
+  status, and neither is orphaned because both are indexed -- while the rows
+  disagreed about status (`done` in one tree, `declined` in the other) and a
+  dependency on that ID resolved against whichever row was reached first. New
+  check 21 reports every ID carrying more than one index row, naming each
+  status and path. Status Summary rows, which repeat an ID without a File
+  Path, are not index rows and are excluded.
+
+- **`devbench report` did not say whether the run could proceed** (issue
+  #251). `status` ended with `Next actionable` / `All work units are DONE.` /
+  `No actionable units. N blocked.`; `report` ended with none of them, and its
+  per-status counts cannot substitute -- a backlog can hold many `in-queue`
+  units with nothing actionable, because only leaf Tasks execute and every one
+  may be waiting on a dependency. Both commands now render the same line from
+  one shared helper. `devbench next` keeps its machine tokens, which are a
+  contract consumed by the orchestrate skill.
+
+- **The orchestrator-alive banner reported ALIVE with no orchestrator
+  running** (issue #250). Liveness was derived from log-activity recency
+  alone, but a recent log line proves only that something wrote to the log,
+  not that the writer still exists: a crashed or killed daemon read as ALIVE
+  for the whole quiet window, and any other writer kept it ALIVE indefinitely.
+  The banner now reads the workspace PID file and checks the process table,
+  and reports five states (ALIVE, with an idle variant; STOPPED; STARTING;
+  NOT RUNNING; UNKNOWN). `stop_hook.window_seconds` no longer decides
+  liveness; it distinguishes a busy live orchestrator from an idle one, so a
+  running-but-quiet orchestrator is never reported STOPPED.
+
+- **`devbench start --help` omitted the scope-filter flags** (issue #249).
+  `--include`, `--exclude`, `--name` and `--allow-overlap` were accepted by the
+  parser and documented nowhere, so the only way to discover them was to read
+  the parser. The registry description was also the single source for both the
+  one-line command list and per-command help, leaving no room for flag
+  documentation. A description may now span lines: the command list shows the
+  first line, and `<cmd> --help` prints the whole text.
+
+- **A blocked work unit's uncommitted changes contaminated every unit that
+  claimed after it, and now get quarantined instead.** The single-branch modes run every work unit in one shared
+  checkout. When a unit blocked before its work was committed, that work stayed
+  in the tree, and nothing cleared it or reported it. The next unit to claim
+  inherited it, with two distinct failure modes observed in one run: a unit's
+  judges rejected it for staged files belonging to a blocked sibling, and a
+  docs-only unit was blocked by a security review whose every finding cited a
+  blocked sibling's unstaged source, which the docs-only unit neither owned nor
+  was permitted to touch. Neither unit could act on the rejection, and the
+  residue survived to contaminate the unit after that. `devbench claim` now
+  refuses, before any executor or judge time is spent, when the target checkout
+  holds uncommitted changes outside the claiming unit's Changes Manifest, naming
+  every offending path so the residue is attributed to the unit that produced
+  it. The check covers staged, unstaged, and untracked-but-not-gitignored paths;
+  `assert_staged_matches_manifest` sees only the staged set, which is why a unit
+  that blocked before staging read as a clean tree. Re-claiming an `in-progress`
+  unit is unaffected: its own manifest files are never quarantined.
+
+  devbench runs unattended, so the residue is moved rather than reported. Each
+  foreign path is stashed under the ID of the unit whose Changes Manifest
+  declares it, and the claim proceeds against a checkout holding only the
+  claiming unit's scope. Stopping to ask an operator would turn one blocked
+  unit into a stopped run. Quarantine is non-destructive: each entry is a
+  normal git stash titled `devbench-quarantine:<owner-id>`, one per owning
+  unit, recoverable with `git stash list` / `git stash apply`, and the owning
+  unit receives a `[WORK_QUARANTINED]` audit comment naming it. Paths no unit
+  declares are quarantined under an `unattributed` key, since they would
+  corrupt the claiming unit's commit just the same. Nothing is restored
+  automatically: a blocked unit re-executes from its Changes Manifest when it
+  unblocks, and re-injecting a superseded attempt would recreate the
+  contamination.
+
+  **Behaviour change:** `devbench claim` exits non-zero only when the
+  quarantine itself fails or leaves residue behind, which means the checkout
+  was not actually cleared. When the unit's repo has no configured local
+  checkout there is no shared tree to guard; the step logs that it was skipped
+  rather than passing over it silently.
+
+- **A work unit's commit could absorb another unit's unstaged changes.** Both
+  commit paths ran `git add -A`, staging the entire working tree and committing
+  it under the current unit's message, so any file another in-flight unit had
+  left modified-but-unstaged was swept in. The guard meant to prevent exactly
+  this could not see it: `assert_staged_matches_manifest` reads
+  `git diff --cached`, which by definition excludes unstaged changes, so it
+  verified the index, passed, and then `add -A` staged everything the check had
+  just ignored. The victim task was then unrecoverable -- its declared files
+  committed under another unit's name, failing `changes_manifest` permanently,
+  with no remedy short of an operator override or rewriting published history on
+  a shared branch. Both entry points now stage the Manifest paths the callers
+  already parse for the scope check. There is no degraded mode: a caller that
+  cannot resolve a Manifest, or whose Manifest holds only execution-time
+  sentinels, is refused rather than silently given a whole-tree commit.
+  `git-ops-finalize`, which batches many units and legitimately has no single
+  Manifest, opts into whole-tree staging explicitly via `stage_all`.
+
+  **Behaviour change:** `devbench git-ops` now exits non-zero when it cannot
+  resolve the work unit's file. Previously it warned and committed anyway. The
+  post-commit audit-comment write remains best-effort and never fails the run.
+
 ## [0.2.0] -- 2026-07-29
 
 This release bundles the orchestrator self-healing work, the canonical

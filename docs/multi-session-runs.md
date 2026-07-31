@@ -166,8 +166,11 @@ Each `devbench start` call:
 
 1. Validates that `DEVBENCH_SESSION_NAME` does not collide with an already-active
    session's scope (fails fast with a clear error if it does).
-2. Writes `<workspace>/.devbench/sessions/<name>/pid`,
-   `scope.json`, `started_at`, and `started_by`.
+2. Writes `<workspace>/.devbench/sessions/<name>/pid`, `started_at`, and
+   `started_by`, plus `scope.json` when the session is scoped. An unscoped
+   session writes no `scope.json`: absent is the unscoped signal every
+   reader honours, and an empty scope would instead assert a filter that
+   matches nothing.
 3. Registers the session in `<workspace>/.devbench/sessions/registry.json`.
 4. Claims and executes work units from its scope slice only.
 
@@ -358,7 +361,7 @@ these audit stamps to build the per-session view.
       registry.json          # JSON array of all registered Session objects
       early/
         pid                  # OS PID of the orchestrator process
-        scope.json           # Session-scoped work-unit scope filter
+        scope.json           # Session-scoped work-unit scope filter (scoped sessions only)
         drain.signal         # Session-scoped drain request marker (if pending)
         orchestrator.log     # Session-scoped orchestration log
         report.json          # Session-scoped report cache

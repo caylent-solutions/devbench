@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -59,7 +60,7 @@ def _make_window_stats(**overrides: object) -> WindowStats:
         "api_efficiency": None,
     }
     defaults.update(overrides)
-    return WindowStats(**defaults)  # type: ignore[arg-type]
+    return WindowStats(**cast(Any, defaults))
 
 
 class TestExtractUsageTotals:

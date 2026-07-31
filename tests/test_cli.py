@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import os
 import re
+import subprocess
 import types
 from collections.abc import Generator
 from datetime import UTC, datetime
@@ -994,6 +997,310 @@ def _make_noop_flock(entered: list[bool] | None = None) -> Any:
         return _FakeFlock(root, timeout_seconds, entered=entered)
 
     return _flock
+
+
+class TestCmdClaimQuarantinesForeignWork:
+    """cmd_claim clears another unit's uncommitted work, then claims.
+
+    The single-branch modes share one checkout across every work unit. A unit
+    that blocks, or a run that is interrupted, leaves its changes in the tree,
+    and the next unit to claim inherits them: its commit absorbs a sibling's
+    files under the wrong unit's message, and the judges reject it over code
+    it does not own. devbench runs unattended, so the residue is quarantined
+    into a named stash and the claim proceeds; halting would turn one blocked
+    unit into a stopped run.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    def _git_repo(self, tmp_path: Path) -> Path:
+        """Create a real git repo with one committed baseline and a clean tree."""
+        repo = tmp_path / "checkout"
+        repo.mkdir()
+        for args in (
+            ["git", "init"],
+            ["git", "config", "user.email", "t@ex.com"],
+            ["git", "config", "user.name", "Test"],
+        ):
+            subprocess.run(args, cwd=repo, check=True, capture_output=True)
+        (repo / "src").mkdir()
+        (repo / "src/own.py").write_text("baseline\n")
+        (repo / "src/sibling.py").write_text("baseline\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _wu_file(self, backlog_dir: Path) -> Path:
+        """Write a claimable work-unit file whose Manifest declares src/own.py."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T2: Second Task\n\n"
+            "## Status: in-queue\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `src/own.py` | modify |\n\n"
+            "## Comments\n"
+        )
+        return wu_file
+
+    def _claim(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        repo: Path | None,
+        manifests: dict[str, list[str]] | None = None,
+    ) -> tuple[int, MagicMock]:
+        """Run cmd_claim with REPO_LOCAL_PATHS pointing at *repo* (or empty)."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+        repo_paths = {} if repo is None else {self._REPO: repo}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.resolve_repo", return_value=self._REPO),
+            patch("devbench.cli._non_terminal_manifests", return_value=manifests or {}),
+            patch.dict("devbench.cli.REPO_LOCAL_PATHS", repo_paths, clear=True),
+        ):
+            return cli.cmd_claim("E0-F1-S1-T2"), mock_mgr
+
+    @staticmethod
+    def _stash_subjects(repo: Path) -> list[str]:
+        out = subprocess.run(
+            ["git", "stash", "list", "--format=%gs"], cwd=repo, check=True, capture_output=True, text=True
+        )
+        return [line for line in out.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _dirty_paths(repo: Path) -> list[str]:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True)
+        return sorted(line[3:] for line in out.stdout.splitlines() if line.strip())
+
+    def test_unstaged_sibling_work_is_quarantined_and_the_claim_proceeds(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The residue shape that made a docs-only unit fail another unit's security review."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's uncommitted work\n")
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        # The run continues against a checkout holding only this unit's scope.
+        assert self._dirty_paths(repo) == []
+        assert (repo / "src/sibling.py").read_text() == "baseline\n"
+
+    def test_staged_sibling_work_is_quarantined(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's staged work\n")
+        subprocess.run(["git", "add", "src/sibling.py"], cwd=repo, check=True, capture_output=True)
+
+        result, _ = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        assert self._dirty_paths(repo) == []
+
+    def test_untracked_sibling_file_is_quarantined(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "tests").mkdir()
+        (repo / "tests/test_sibling.py").write_text("another unit's new module\n")
+
+        result, _ = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        assert self._dirty_paths(repo) == []
+        assert not (repo / "tests/test_sibling.py").exists()
+
+    def test_quarantined_work_is_recoverable_not_destroyed(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Executor output is expensive; the stash must restore it byte for byte."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        sibling_work = "another unit's uncommitted work\n"
+        (repo / "src/sibling.py").write_text(sibling_work)
+
+        result, _ = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        subjects = self._stash_subjects(repo)
+        assert len(subjects) == 1
+        assert "devbench-quarantine:" in subjects[0]
+        subprocess.run(["git", "stash", "pop"], cwd=repo, check=True, capture_output=True)
+        assert (repo / "src/sibling.py").read_text() == sibling_work
+
+    def test_stash_is_keyed_to_the_unit_that_declared_the_path(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Attribution comes from the owning unit's Changes Manifest, not a guess."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("owned by T9\n")
+
+        result, _ = self._claim(mock_units, backlog_dir, repo, manifests={"E0-F1-S1-T9": ["src/sibling.py"]})
+
+        assert result == 0
+        subjects = self._stash_subjects(repo)
+        assert any("devbench-quarantine:E0-F1-S1-T9" in s for s in subjects)
+        assert any("displaced by claim of E0-F1-S1-T2" in s for s in subjects)
+
+    def test_paths_no_unit_declares_are_quarantined_as_unattributed(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Unowned residue still corrupts this unit's commit, so it must still be cleared."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("nobody declares this\n")
+
+        result, _ = self._claim(mock_units, backlog_dir, repo, manifests={})
+
+        assert result == 0
+        assert any("devbench-quarantine:unattributed" in s for s in self._stash_subjects(repo))
+
+    def test_each_owner_gets_its_own_stash_entry(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Grouping keeps each unit's work recoverable as a unit."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("owned by T8\n")
+        (repo / "src/other.py").write_text("owned by T9\n")
+
+        result, _ = self._claim(
+            mock_units,
+            backlog_dir,
+            repo,
+            manifests={"E0-F1-S1-T8": ["src/sibling.py"], "E0-F1-S1-T9": ["src/other.py"]},
+        )
+
+        assert result == 0
+        subjects = self._stash_subjects(repo)
+        assert any("devbench-quarantine:E0-F1-S1-T8" in s for s in subjects)
+        assert any("devbench-quarantine:E0-F1-S1-T9" in s for s in subjects)
+        assert self._dirty_paths(repo) == []
+
+    def test_own_manifest_files_are_never_quarantined(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Re-claiming an interrupted in-progress unit must keep its own work."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        own_work = "this unit's own work in progress\n"
+        (repo / "src/own.py").write_text(own_work)
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        assert (repo / "src/own.py").read_text() == own_work
+        assert self._stash_subjects(repo) == []
+
+    def test_clean_checkout_creates_no_stash(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+
+        result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        assert self._stash_subjects(repo) == []
+
+    def test_claim_refuses_when_quarantine_itself_fails(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A failed quarantine must not be swallowed: the tree was not cleared."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's work\n")
+
+        with patch("devbench.git_quarantine.quarantine_paths", side_effect=RuntimeError("stash refused")):
+            result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "cannot prepare the checkout" in err
+        assert "stash refused" in err
+        mock_mgr.force_status.assert_not_called()
+
+    def test_claim_refuses_when_quarantine_leaves_residue_behind(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A quarantine that silently no-ops must not be reported as success."""
+        repo = self._git_repo(tmp_path)
+        self._wu_file(backlog_dir)
+        (repo / "src/sibling.py").write_text("another unit's work\n")
+
+        with patch("devbench.git_quarantine.quarantine_paths", return_value=[]):
+            result, mock_mgr = self._claim(mock_units, backlog_dir, repo)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "still outside its Changes Manifest after quarantine" in err
+        assert "src/sibling.py" in err
+        mock_mgr.force_status.assert_not_called()
+
+    def test_claim_proceeds_and_logs_when_no_checkout_is_configured(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No configured checkout means no shared tree to guard; say so rather than pass over it."""
+        self._wu_file(backlog_dir)
+
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            result, mock_mgr = self._claim(mock_units, backlog_dir, None)
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        assert any("claim scope check skipped for E0-F1-S1-T2" in record.message for record in caplog.records)
 
 
 class TestCmdClaimAtomicArbitration:
@@ -2667,6 +2974,41 @@ class TestHelp:
         assert result == 1
         assert "Unknown command" in err
 
+    @pytest.mark.parametrize("flag", ["--daemon", "--name", "--include", "--exclude", "--allow-overlap"])
+    def test_start_help_documents_every_flag_start_accepts(self, flag: str, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #249: every flag ``cmd_start`` parses must appear in its help text.
+
+        The scope-filter flags were accepted but undocumented, so operators had
+        no way to discover them short of reading the parser.
+        """
+        with patch("sys.argv", ["judges.cli", "start", "--help"]):
+            result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert flag in out
+
+    def test_top_level_list_shows_only_first_line_of_a_multiline_description(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Per-command help may span lines; the command list must stay one row per command."""
+        multiline = "Summary line.\n\nUsage: devbench demo [--flag]\n  --flag   does a thing."
+        with patch("sys.argv", ["judges.cli", "--help"]):
+            with patch.dict(cli._COMMANDS, {"demo": (MagicMock(return_value=0), 0, multiline)}):
+                result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "  demo                 Summary line." in out
+        assert "--flag   does a thing." not in out
+
+    def test_per_command_help_prints_the_whole_multiline_description(self, capsys: pytest.CaptureFixture[str]) -> None:
+        multiline = "Summary line.\n\nUsage: devbench demo [--flag]\n  --flag   does a thing."
+        with patch("sys.argv", ["judges.cli", "demo", "--help"]):
+            with patch.dict(cli._COMMANDS, {"demo": (MagicMock(return_value=0), 0, multiline)}):
+                result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "--flag   does a thing." in out
+
 
 class TestPreParseConfig:
     """Test --config CLI pre-parse helper."""
@@ -2694,6 +3036,24 @@ class TestPreParseConfig:
         original = argv.copy()
         cli._pre_parse_config(argv)
         assert argv == original
+
+
+def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
+    """Write a minimal work-unit file carrying a real Changes Manifest.
+
+    git-ops refuses to commit when it cannot resolve a Manifest, because the
+    Manifest is the only thing that scopes the commit: without it, staging would
+    absorb any other in-flight work unit's changes. Tests that drive the commit
+    path therefore need a resolvable work-unit file rather than ``None``.
+    """
+    wu = tmp_path / f"{unit_id}.md"
+    rows = "".join(f"| `{f}` | modify |\n" for f in files)
+    wu.write_text(
+        f"# {unit_id}: Test Task\n\n## Status: in-progress\n\n"
+        f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n{rows}\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    return wu
 
 
 @pytest.mark.unit
@@ -2731,6 +3091,8 @@ class TestCmdGitOpsSubmoduleGate:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -2754,6 +3116,8 @@ class TestCmdGitOpsSubmoduleGate:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -2829,6 +3193,8 @@ class TestCmdGitOpsChecksGate:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -2988,6 +3354,8 @@ class TestCmdGitOpsPostMergeCheckout:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3016,6 +3384,8 @@ class TestCmdGitOpsPostMergeCheckout:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3064,6 +3434,8 @@ class TestCmdGitOpsConflictingRetry:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3103,6 +3475,8 @@ class TestCmdGitOpsConflictingRetry:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -3619,8 +3993,13 @@ class TestCmdGitOpsEventComments:
         ):
             result = cli.cmd_git_ops(unit_id)
 
-        # Must NOT fail due to missing file -- git ops already succeeded
-        assert result == 0
+        # Contract change: the commit is refused when the work-unit file cannot
+        # be resolved, because the Changes Manifest is the only thing that scopes
+        # it -- staging blind would absorb any other in-flight unit's changes
+        # under this unit's message (the defect behind commit b5201cb). AC-7's
+        # intent is preserved for what it actually protected: the post-commit
+        # audit-comment write, which is still best-effort and never fails the run.
+        assert result == 1
 
 
 @pytest.mark.unit
@@ -5136,11 +5515,13 @@ class TestCmdGitOpsDeferMode:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.config.DEFER_PR", True),
             patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
         ):
             result = cli.cmd_git_ops("E0-F1-S1-T1")
 
@@ -5170,6 +5551,8 @@ class TestCmdGitOpsBadPrNumber:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
@@ -5523,8 +5906,16 @@ class TestCmdStartNameFlag:
         assert started_by_path.read_text(encoding="utf-8").strip() == getpass.getuser()
 
     @pytest.mark.unit
-    def test_scope_json_written_when_no_include(self, tmp_path: Path) -> None:
-        """AC-192-1: scope.json is written to the session dir (empty scope when no --include)."""
+    def test_no_scope_json_written_when_no_include(self, tmp_path: Path) -> None:
+        """Issue #270: an unscoped session writes no scope.json at all.
+
+        This previously wrote a bare JSON array (``[]``). Every reader
+        requires the canonical object, and the array lands on the same path
+        the object writer uses, so the next read raised
+        ``scope.json top-level payload must be an object, got 'list'`` on
+        every unscoped run. Absent is the documented unscoped signal, so
+        writing nothing is both correct and readable.
+        """
         import sys
 
         mock_sdk = self._make_mock_sdk()
@@ -5537,7 +5928,9 @@ class TestCmdStartNameFlag:
 
         assert rc == 0
         scope_path = tmp_path / ".devbench" / "sessions" / "epsilon" / "scope.json"
-        assert scope_path.is_file(), f"Expected scope.json at {scope_path}"
+        assert not scope_path.exists(), f"unscoped session must not write {scope_path}"
+        # The session directory itself is still created and populated.
+        assert (tmp_path / ".devbench" / "sessions" / "epsilon" / "pid").is_file()
 
     @pytest.mark.unit
     def test_registry_json_updated(self, tmp_path: Path) -> None:
@@ -6148,7 +6541,8 @@ class TestGitOpsDeferred:
             patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli._git_ops_deferred(
                 "E0-F1-S1-T1",
@@ -6164,6 +6558,7 @@ class TestGitOpsDeferred:
             tmp_path,
             "feature/x",
             "E0-F1-S1-T1: Test Task",
+            manifest_files=["src/foo.py"],
         )
         output = json.loads(capsys.readouterr().out.strip())
         assert output["mode"] == "deferred"
@@ -6188,7 +6583,8 @@ class TestGitOpsDeferred:
             patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             cli._git_ops_deferred(
                 "E0-F1-S1-T1",
@@ -6421,7 +6817,8 @@ class TestCmdGitOpsFinalizeNotifications:
                 return_value=MagicMock(parse_index=MagicMock(return_value=[unit])),
             ),
             patch("devbench.cli._find_most_recent_active_task", return_value=unit),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._finalize_audit_and_block"),
         ):
             rc = cli._handle_finalize_ci_result(
@@ -7236,7 +7633,8 @@ class TestCmdStatusBlockedSplit:
             patch("devbench.cli.BacklogParser", return_value=parser),
             patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
             patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             rc = cli.cmd_status("--detail")
         assert rc == 0
@@ -7283,7 +7681,8 @@ class TestCmdStatusBlockedSplit:
                 "devbench.cli.classify_blocked_task",
                 return_value=BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
             ),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             rc = cli.cmd_status("--detail")
         assert rc == 0
@@ -12343,7 +12742,8 @@ class TestCmdCheckMerge:
         mgr = MagicMock()
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=mgr),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12357,7 +12757,8 @@ class TestCmdCheckMerge:
         ops._gh.return_value = (0, "[]", "")
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12369,7 +12770,8 @@ class TestCmdCheckMerge:
         ops._gh.return_value = (1, "", "boom")
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12381,7 +12783,8 @@ class TestCmdCheckMerge:
         ops._gh.return_value = (0, "{not json", "")
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.github.git_ops.GitOpsService", return_value=ops),
         ):
@@ -12735,20 +13138,12 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
                 ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
             ],
         )
-        # The promoter resolves the draft via _find_draft_file which expects
-        # the layout backlog/E0/E0-F1/E0-F1-S1/<id>.md. Replicate that here
-        # so the auto-promote actually finds the draft.
-        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        story_dir.mkdir(parents=True)
-        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
-        # Re-point the BACKLOG.md row to the nested location.
-        idx_text = index.read_text()
-        index.write_text(
-            idx_text.replace(
-                "`backlog/E0-F1-S1-T2.md`",
-                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md`",
-            )
-        )
+        # Issue #302: this test used to write a SECOND copy of the draft into
+        # backlog/E0/E0-F1/E0-F1-S1/ because _find_draft_file only looked in
+        # that one computed directory, leaving two files under one ID. The
+        # resolver now finds the unit wherever it lives, so the flat file
+        # _cascade_build_backlog already wrote is enough, and the duplicate
+        # the workaround created would now be refused outright.
 
         runtime_with_auto_accept = RuntimeConfig(task_factory=TaskFactoryConfig(auto_accept_proposals=True))
         with (
@@ -12763,8 +13158,9 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
         # only the orphan promote pass touches T2.
         out = capsys.readouterr().out
         assert "orphan auto-promoted 1" in out
-        # T2 transitioned to in-queue via promote_proposal.
-        t2_md = (story_dir / "E0-F1-S1-T2.md").read_text()
+        # T2 transitioned to in-queue via promote_proposal, resolved from the
+        # flat layout the fixture wrote rather than a hand-replicated nested one.
+        t2_md = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
         assert "## Status: in-queue" in t2_md
 
     def test_orphan_promote_skipped_when_toggle_off(
@@ -13260,7 +13656,7 @@ class TestInProgressAttemptDurationRender:
     ) -> None:
         log_path = tmp_path / "orchestrator.log"
         log_path.write_text(
-            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
+            "2026-05-02T12:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
             encoding="utf-8",
         )
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
@@ -13349,9 +13745,9 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
     ) -> None:
         log_path = tmp_path / "orchestrator.log"
         log_path.write_text(
-            "2026-05-02T08:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
-            "2026-05-02T09:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'blocked'\n"
-            "2026-05-02T11:30:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            "2026-05-02T08:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-02T09:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'blocked'\n"
+            "2026-05-02T11:30:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
@@ -13365,6 +13761,53 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
         # 4h vs 30m vs 4h+30m: most recent wins -> 30m.
         assert result == "30m"
+
+    def test_sdk_dump_quoting_the_claim_does_not_win_over_the_real_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Issue #293: a line that merely quotes the claim must not anchor the timer.
+
+        The orchestrator logs whole SDK messages. When a tool result reads the
+        work unit's ``[WU_CLAIMED]`` audit comment, the phrase
+        ``Set <id> to 'in-progress'`` reappears inside a line stamped with the
+        time of the dump, not the time of the claim. Taking the max over every
+        matching line made the later echo win, under-reporting the unit's age.
+        """
+        log_path = tmp_path / "orchestrator.log"
+        real_record = (
+            "2026-05-02T08:00:00Z [devbench.backlog_manager] INFO "
+            "Set E0-F1-S1-T1 to 'in-progress' in both work-unit file and BACKLOG.md\n"
+        )
+        # Verbatim shape of the contaminating line: devbench.cli logging an SDK
+        # message whose tool result embeds the work unit's audit comment.
+        echoed_dump = (
+            "2026-05-02T11:30:00Z [devbench.cli] INFO sdk message: UserMessage(content=[ToolResultBlock("
+            'content="229-[2026-05-02 08:00 UTC] [agent/orchestrator] [WU_CLAIMED] '
+            "Set E0-F1-S1-T1 to 'in-progress' session=default\", is_error=False)])\n"
+        )
+        log_path.write_text(real_record + echoed_dump, encoding="utf-8")
+        fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+        # Anchored to the 08:00 record, not the 11:30 echo: 4h, not 30m.
+        assert cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path) == "4h 0m"
+
+    def test_only_an_echoed_dump_yields_no_timestamp(self, tmp_path: Path) -> None:
+        """An echo alone is not evidence of a claim, so nothing is inferred from it."""
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "2026-05-02T11:30:00Z [devbench.cli] INFO sdk message: UserMessage(content=[ToolResultBlock("
+            "content=\"Set E0-F1-S1-T1 to 'in-progress'\")])\n",
+            encoding="utf-8",
+        )
+        assert cli._latest_log_in_progress_ts("E0-F1-S1-T1", log_path) is None
 
     def test_format_duration_thresholds(self) -> None:
         assert cli._format_duration(0) == "0s"
@@ -13382,7 +13825,7 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
     ) -> None:
         log_path = tmp_path / "orchestrator.log"
         log_path.write_text(
-            "9999-99-99T99:99:99Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            "9999-99-99T99:99:99Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
@@ -13448,7 +13891,7 @@ class TestTryResolveLogFilePath:
         log_path = tmp_path / "logs" / "orch.log"
         log_path.parent.mkdir(parents=True)
         log_path.write_text(
-            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            "2026-05-02T12:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
@@ -13869,10 +14312,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
@@ -13905,10 +14350,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
@@ -13941,10 +14388,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
@@ -13977,10 +14426,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
@@ -14015,10 +14466,12 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.MAX_RETRY_ATTEMPTS", 1),
@@ -14064,10 +14517,13 @@ class TestCmdGitOpsMultiPrReplay:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_a_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
@@ -14091,7 +14547,8 @@ class TestCmdGitOpsMultiPrReplay:
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", mock_ops_b_cls),
-            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._resolve_unit_file", return_value=_seed_wu_file(tmp_path)),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
             patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
             patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
             patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
@@ -20137,3 +20594,208 @@ class TestDaemonizeGuard:
         with patch("devbench.cli.os.name", "nt"):
             with pytest.raises(RuntimeError, match="--daemon requires POSIX"):
                 cli._daemonize_to_background(tmp_path)
+
+
+class TestNonTerminalManifests:
+    """Ownership for quarantine comes from Changes Manifests, not guesswork.
+
+    Only non-terminal Tasks in the target repo can be the source of
+    uncommitted residue: a done or declined unit's work is already committed.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    @staticmethod
+    def _unit(
+        unit_id: str,
+        status: WorkUnitStatus,
+        *,
+        unit_type: WorkUnitType = WorkUnitType.TASK,
+        repo: str = "caylent-solutions/git-repo",
+    ) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="T",
+            status=status,
+            unit_type=unit_type,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    @staticmethod
+    def _wu(backlog_dir: Path, unit_id: str, manifest_rows: str) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}: T\n\n## Status: in-queue\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n" + manifest_rows + "\n## Comments\n"
+        )
+        return wu
+
+    def _resolve(self, units: list[WorkUnit], backlog_dir: Path) -> dict[str, list[str]]:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.resolve_repo", side_effect=lambda r: r),
+        ):
+            return cli._non_terminal_manifests(self._REPO)
+
+    def test_non_terminal_task_manifest_is_returned(self, backlog_dir: Path) -> None:
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        result = self._resolve([self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE)], backlog_dir)
+        assert result == {"E0-F1-S1-T2": ["src/a.py"]}
+
+    @pytest.mark.parametrize("status", [WorkUnitStatus.DONE, WorkUnitStatus.DECLINED])
+    def test_terminal_units_are_excluded(self, backlog_dir: Path, status: WorkUnitStatus) -> None:
+        """Their work is committed, so they cannot own uncommitted residue."""
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        assert self._resolve([self._unit("E0-F1-S1-T2", status)], backlog_dir) == {}
+
+    def test_non_task_levels_are_excluded(self, backlog_dir: Path) -> None:
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        units = [self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, unit_type=WorkUnitType.STORY)]
+        assert self._resolve(units, backlog_dir) == {}
+
+    def test_units_targeting_another_repo_are_excluded(self, backlog_dir: Path) -> None:
+        self._wu(backlog_dir, "E0-F1-S1-T2", "| `src/a.py` | modify |\n")
+        units = [self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, repo="other/repo")]
+        assert self._resolve(units, backlog_dir) == {}
+
+    def test_missing_work_unit_file_is_skipped(self, backlog_dir: Path) -> None:
+        assert self._resolve([self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE)], backlog_dir) == {}
+
+    def test_malformed_manifest_is_skipped_rather_than_aborting(self, backlog_dir: Path) -> None:
+        """Manifest validity is validate-backlog's job; a claim must not die on it."""
+        wu = backlog_dir / "E0-F1-S1-T2.md"
+        wu.write_text("# E0-F1-S1-T2: T\n\n## Status: in-queue\n\n## Comments\n")
+        assert self._resolve([self._unit("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE)], backlog_dir) == {}
+
+    def test_unreadable_backlog_index_yields_no_owners(self, backlog_dir: Path) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.side_effect = FileNotFoundError("no BACKLOG.md")
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            assert cli._non_terminal_manifests(self._REPO) == {}
+
+
+class TestLogQuarantine:
+    """Each quarantine is recorded in the log and in the owning unit's audit trail."""
+
+    @staticmethod
+    def _record(owner_id: str) -> cli.QuarantineRecord:
+        return cli.QuarantineRecord(
+            owner_id=owner_id,
+            paths=("src/a.py", "src/b.py"),
+            stash_message=f"devbench-quarantine:{owner_id}: displaced by claim of E0-F1-S1-T2",
+        )
+
+    def test_emits_a_work_quarantined_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            with patch("devbench.cli._resolve_unit_file_by_id", return_value=None):
+                cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        assert any("[WORK_QUARANTINED]" in r.getMessage() for r in caplog.records)
+
+    def test_owning_unit_receives_an_audit_comment(self, backlog_dir: Path) -> None:
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: blocked\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        mock_mgr._append_agent_comment.assert_called_once()
+        message = mock_mgr._append_agent_comment.call_args[0][2]
+        assert "[WORK_QUARANTINED]" in message
+        assert "git stash list" in message
+        assert "E0-F1-S1-T2" in message
+
+    def test_unattributed_paths_get_no_audit_comment(self) -> None:
+        """There is no owning unit to tell."""
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli._resolve_unit_file_by_id") as resolve,
+        ):
+            cli._log_quarantine(self._record(cli.UNATTRIBUTED_OWNER), "E0-F1-S1-T2")
+        resolve.assert_not_called()
+        mock_mgr._append_agent_comment.assert_not_called()
+
+    def test_missing_owner_file_is_skipped(self) -> None:
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        mock_mgr._append_agent_comment.assert_not_called()
+
+    def test_comment_write_failure_warns_and_does_not_raise(
+        self, backlog_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The checkout is already clear; losing an audit line must not stop the run."""
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: blocked\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        mock_mgr._append_agent_comment.side_effect = OSError("read-only filesystem")
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
+        assert any("quarantine audit comment failed" in r.getMessage() for r in caplog.records)
+
+
+class TestSessionScopeJsonShape:
+    """Issue #270: the per-session scope.json must be readable by its readers.
+
+    ``_write_session_state_files`` wrote a bare JSON array of IDs while every
+    reader requires the canonical object. Both land on the same path, because
+    ``resolve_scope_file_path`` routes there whenever DEVBENCH_SESSION_NAME is
+    set, so the array overwrote the object and the next read raised
+    ``scope.json top-level payload must be an object, got 'list'``.
+    """
+
+    @staticmethod
+    def _scope_path(tmp_path: Path, session: str = "s1") -> Path:
+        return tmp_path / ".devbench" / "sessions" / session / "scope.json"
+
+    def test_unscoped_session_writes_no_scope_file(self, tmp_path: Path) -> None:
+        """Absent is the unscoped signal; an empty scope would claim the opposite."""
+        cli._write_session_state_files(tmp_path, "s1", 4242, [])
+        assert not self._scope_path(tmp_path).exists()
+        assert (tmp_path / ".devbench" / "sessions" / "s1" / "pid").read_text() == "4242"
+
+    def test_scoped_session_writes_a_readable_object(self, tmp_path: Path) -> None:
+        cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1", "E1-F1-S1-T2"])
+        payload = json.loads(self._scope_path(tmp_path).read_text(encoding="utf-8"))
+        assert isinstance(payload, dict), f"payload must be an object, got {type(payload).__name__}"
+        assert sorted(payload["expanded_ids"]) == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
+        for field in ("include", "exclude", "expanded_ids", "started_at", "started_by"):
+            assert field in payload, f"canonical field {field!r} missing"
+
+    def test_written_scope_round_trips_through_the_reader(self, tmp_path: Path) -> None:
+        """The regression: writing then reading used to raise TypeError."""
+        from devbench.scope import ScopeFilter
+
+        cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1"])
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "s1"}):
+            restored = ScopeFilter.from_file(tmp_path)
+        assert restored.expanded_ids == {"E1-F1-S1-T1"}
+
+    def test_a_stale_array_scope_file_is_removed_when_the_session_is_unscoped(self, tmp_path: Path) -> None:
+        """A workspace carrying the old corrupt file must recover on next start."""
+        stale = self._scope_path(tmp_path)
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("[]", encoding="utf-8")
+        cli._write_session_state_files(tmp_path, "s1", 4242, [])
+        assert not stale.exists()
+
+    def test_a_stale_array_scope_file_is_replaced_when_the_session_is_scoped(self, tmp_path: Path) -> None:
+        stale = self._scope_path(tmp_path)
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("[]", encoding="utf-8")
+        cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1"])
+        assert isinstance(json.loads(stale.read_text(encoding="utf-8")), dict)

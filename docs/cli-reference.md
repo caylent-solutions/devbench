@@ -63,7 +63,7 @@ The summary includes a `Draft N` row rendered between the `TOTAL` line and the `
 
 - `--session <name>` -- filter the output to the work units claimed by the named session. Only events emitted under `session=<name>` are counted; the status counts and active-task list reflect that session's view only. Without `--session`, the command aggregates across all active sessions and renders the unified backlog state. See [Named sessions](#named-sessions) for the full session reference.
 
-When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
+When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. The file is a JSON object with `include`, `exclude`, `expanded_ids`, `started_at` and `started_by`; a scope file in any other shape is rejected rather than guessed at. A session that runs unscoped writes no `scope.json` at all, since absent is how every reader expresses "no scope". When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
 
 ```
 SCOPE: include=[E1-E3, E5] exclude=[] (started 2026-05-14T13:42Z)
@@ -160,11 +160,25 @@ Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKE
 
 **In-progress duration (issue #158):** the `In-progress tasks:` panel suffixes every row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). Multiple in-progress transitions for the same task (blocked-then-resumed) resolve to the most recent one. When neither the structured log nor the work-unit's audit comments yield a parseable timestamp the row renders `(in-progress, timer unavailable)` -- never silently omitted. The same suffix appears on `devbench status` and `devbench status --detail` Active rows.
 
-**Orchestrator-alive banner (issue #161):** the very first line of `devbench report` is a one-line liveness banner derived from log-activity recency. Three states:
+The duration is anchored to the transition record written by `devbench.backlog_manager`, matched on the full record shape rather than on the phrase alone (issue #293). The orchestrator logs whole SDK messages, so a tool result that read a work unit's `[WU_CLAIMED]` audit comment reproduces the text `Set <id> to 'in-progress'` inside a line stamped with the time of the *dump*. Matching the phrase anywhere in a line made those echoes win, under-reporting a unit's age by the gap between the claim and the echo, and the error grew with every further echo.
 
-- `[ORCHESTRATOR ALIVE]` (green) -- last log line is within `stop_hook.window_seconds`. Suffix names the elapsed-since duration (`last activity 12s ago`).
-- `[ORCHESTRATOR STOPPED]` (red) -- last log line older than `stop_hook.window_seconds`. Suffix names elapsed-since plus the last-seen UTC timestamp so the operator can see when the loop went quiet (`no activity for 14m (last seen 2026-05-04 13:21 UTC)`).
-- `[ORCHESTRATOR STARTING]` (yellow) -- log file missing or empty. The orchestrator is starting up or no events have been written yet.
+**Actionability line (issue #251):** both `devbench status` and `devbench report` end with the same one-line answer to "can the run proceed?", produced by a single shared helper so the two commands cannot disagree:
+
+- `Next actionable: <id> -- <title>` -- at least one unit is claimable.
+- `All work units are DONE.` -- nothing remains.
+- `No actionable units. <N> blocked.` -- work remains but none of it can start.
+
+The per-status counts do not answer this on their own: a backlog can hold many `in-queue` units and still have nothing actionable, because only leaf Tasks execute and every one of them may be waiting on a dependency. `devbench next` deliberately keeps its machine tokens (`ALL_DONE` / `NO_ACTIONABLE` / `NO_ACTIONABLE_IN_SCOPE`) instead; those are a contract consumed by the orchestrate skill's loop-continuation check.
+
+**Orchestrator-alive banner (issues #161, #250):** the very first line of `devbench report` is a one-line liveness banner. The process table decides whether an orchestrator is running; log recency only describes what it has been doing. Five states:
+
+- `[ORCHESTRATOR ALIVE]` (green) -- the PID file names a running process. Suffix names the pid and the elapsed-since duration (`pid 1669778; last activity 12s ago`).
+- `[ORCHESTRATOR ALIVE] ... idle` (yellow) -- running, but quiet for longer than `stop_hook.window_seconds`. A live orchestrator is never reported STOPPED merely for being quiet.
+- `[ORCHESTRATOR STOPPED]` (red) -- the PID file names a process that is not running. Authoritative: log recency is used only for the last-seen timestamp, not for the verdict.
+- `[ORCHESTRATOR STARTING]` (yellow) -- PID file present but not yet parseable, i.e. the daemon is mid-write.
+- `[ORCHESTRATOR NOT RUNNING]` (red) / `[ORCHESTRATOR UNKNOWN]` (yellow) -- no PID file, with and without log activity respectively.
+
+Deriving ALIVE from recency alone reported a healthy orchestrator when none was running: a recent log line proves only that *something* wrote to the log, not that the writer still exists. A crashed or killed daemon read as ALIVE for the whole quiet window, and any other process writing to the same log kept it ALIVE indefinitely.
 
 Every banner ends with the active session id when `DEVBENCH_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
 
@@ -349,6 +363,30 @@ uv run devbench claim <id>
 ```
 
 Set the work unit's status to `in-progress`. Fails if the unit is already in a terminal state. Invoked by the orchestrate SKILL at the start of each loop iteration.
+
+`claim` refuses, with a non-zero exit and no status write, when the unit's Changes Manifest still carries a placeholder row. Replace it with real file entries, or let the manifest-amendment workflow fill it in.
+
+**Checkout quarantine.** Before claiming, `claim` clears any uncommitted change in the unit's target checkout that falls outside that unit's Changes Manifest.
+
+This exists because the single-branch modes (`git_ops.single_branch` with `defer_pr`) run every work unit in one shared checkout. A unit that blocks, or a run that is interrupted, leaves its work in the tree, and the next unit to claim inherits it: its commit absorbs the sibling's files under the wrong unit's message, and the review judges reject it over code it does not own and cannot fix.
+
+devbench runs unattended, so the residue is moved rather than reported. Each foreign path is stashed under the ID of the unit whose Changes Manifest declares it, and the claim proceeds against a checkout holding only the claiming unit's scope. Stopping to ask an operator would turn one blocked unit into a stopped run.
+
+The scan covers staged, unstaged, and untracked-but-not-gitignored paths, so residue left by a unit that blocked before staging is caught too. The unit's own manifest files are never quarantined, so re-claiming an `in-progress` unit after an interrupted run keeps its work in place.
+
+Quarantine is non-destructive. Each entry is a normal git stash with a discoverable message:
+
+```
+$ git stash list
+stash@{0}: On <branch>: devbench-quarantine:<owner-id>: displaced by claim of <claiming-id>
+$ git stash apply stash@{0}     # recover it whenever you want
+```
+
+One entry is created per owning unit, so each unit's work stays recoverable as a unit. Paths that no work unit declares are quarantined under the `unattributed` key: they are still outside the claiming unit's scope and would corrupt its commit just the same. The owning unit also receives a `[WORK_QUARANTINED]` audit comment naming the stash.
+
+Nothing is restored automatically. A blocked unit re-executes from its Changes Manifest when it unblocks, and silently re-injecting a superseded attempt into a later run's tree would recreate the contamination the quarantine removed.
+
+`claim` fails, and does not claim, only when the quarantine itself fails or leaves residue behind. Both mean the checkout was not actually cleared, and proceeding would hand the unit exactly the contaminated tree the quarantine was meant to remove. When the unit's repo has no configured local checkout there is no shared tree to guard; the step is logged as skipped and `git-ops` still fails fast on the same missing configuration at commit time.
 
 ### `set-status`
 

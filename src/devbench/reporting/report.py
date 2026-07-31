@@ -53,6 +53,8 @@ from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from devbench.backlog.actionability import actionability_line
+from devbench.backlog.index_errors import exit_with_index_error
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
@@ -82,6 +84,7 @@ from devbench.constants import (
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
+from devbench.instances import pid_file_path
 from devbench.reporting.event_index import EventIndex
 from devbench.scope import ScopeFilter
 
@@ -1252,62 +1255,149 @@ def _read_last_log_timestamp(log_path: Path) -> datetime | None:
     return _parse_ts(matches[-1].group(1))
 
 
+def _liveness_process_state(pid_path: Path) -> tuple[bool, int | None]:
+    """Return ``(pid_file_present, live_pid)`` for the orchestrator PID file.
+
+    ``live_pid`` is the PID when the file names a running process, and
+    ``None`` when the file is absent, unparseable, or names a process that
+    is no longer in the kernel's process table.
+    """
+    from devbench.instances import is_pid_alive, read_pid_file
+
+    instance = read_pid_file(pid_path)
+    if instance is None:
+        return pid_path.is_file(), None
+    return True, instance.pid if is_pid_alive(instance.pid) else None
+
+
 def _orchestrator_liveness_banner(
     log_path: Path,
     session_id: str | None,
     threshold_seconds: int,
+    pid_path: Path,
     *,
     display_tz: tzinfo | None = None,
     now: datetime | None = None,
 ) -> str:
     """Render a one-line orchestrator-alive status banner (issue #161).
 
-    Three states derived from log-activity recency:
-      * **ALIVE** (green) -- last log line within ``threshold_seconds``.
-      * **STOPPED** (red) -- last log line older than ``threshold_seconds``.
-        Banner includes the elapsed-since duration and last-seen timestamp.
-      * **STARTING** (yellow) -- log file missing or empty.
+    Issue #250: the process table decides whether an orchestrator is
+    running; log recency only describes what it has been doing. Deriving
+    ALIVE from recency alone reported a healthy orchestrator when none was
+    running, because a recent log line proves only that something wrote to
+    the log, not that the writer still exists. A crashed or killed daemon
+    read as ALIVE for the whole quiet window, and any other process writing
+    to the same log kept it ALIVE indefinitely.
 
-    Boundary: a delta exactly equal to ``threshold_seconds`` is ALIVE; one
-    second past is STOPPED. ANSI colour is emitted only when stdout is a
-    TTY and ``NO_COLOR`` is unset (mirrors ``_should_use_color``); pipes
-    and CI redirects receive plain text.
+    Five states:
+      * **ALIVE** (green) -- PID file names a running process. Log recency
+        is appended as detail, and a live process that has been quiet
+        longer than ``threshold_seconds`` is reported as alive but idle
+        rather than being downgraded to STOPPED.
+      * **STOPPED** (red) -- PID file names a process that is not running.
+        This is authoritative and does not consult log recency for the
+        verdict, only for the last-seen timestamp.
+      * **STARTING** (yellow) -- PID file present but not yet parseable as
+        an instance record, i.e. the daemon is mid-write.
+      * **NOT RUNNING** (red) -- no PID file and no log activity recorded.
+      * **UNKNOWN** (yellow) -- no PID file, but the log holds activity.
+        Nothing entitles the banner to claim ALIVE here; the log may belong
+        to a foreground run, another host, or a dead instance whose PID
+        file was removed.
 
-    The threshold is sourced by callers from ``stop_hook.window_seconds``
-    so the banner stays aligned with the operator's already-tuned
-    circuit-breaker quiet window.
+    ANSI colour is emitted only when stdout is a TTY and ``NO_COLOR`` is
+    unset (mirrors ``_should_use_color``); pipes and CI redirects receive
+    plain text.
 
     Args:
         log_path: Path to the structured orchestrator log.
         session_id: Optional ``DEVBENCH_ORCHESTRATOR_SESSION_ID`` value. When
             empty/None, the banner suppresses the trailing
             ``-- session ...`` suffix.
-        threshold_seconds: Quiet-window cap. ``stop_hook.window_seconds``.
-        display_tz: Display-timezone for the STOPPED-state last-seen
-            timestamp. ``None`` falls back to system local.
+        threshold_seconds: Quiet-window cap, used to describe an idle but
+            live orchestrator. ``stop_hook.window_seconds``.
+        pid_path: Path to the orchestrator PID file. Required: without it
+            the banner cannot distinguish a running orchestrator from a
+            recently-written log, which is the defect this parameter fixes.
+        display_tz: Display-timezone for last-seen timestamps. ``None``
+            falls back to system local.
         now: Override for the current wall-clock (test injection point).
     """
     current = now if now is not None else datetime.now(UTC)
     last_ts = _read_last_log_timestamp(log_path)
     suffix = f" -- session {session_id}" if session_id else ""
+    pid_file_present, live_pid = _liveness_process_state(pid_path)
 
-    if last_ts is None:
-        body = "[ORCHESTRATOR STARTING] log file empty; no activity recorded yet"
-        color = _COLOR_YELLOW
-    else:
-        delta = max(0.0, (current - last_ts).total_seconds())
-        if delta <= threshold_seconds:
-            body = f"[ORCHESTRATOR ALIVE] last activity {_format_duration(delta)} ago"
-            color = _COLOR_GREEN
-        else:
-            seen = _format_local_timestamp(last_ts, display_tz)
-            body = f"[ORCHESTRATOR STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
-            color = _COLOR_RED_LIGHT
+    body, color = _liveness_body(
+        pid_file_present=pid_file_present,
+        live_pid=live_pid,
+        last_ts=last_ts,
+        current=current,
+        threshold_seconds=threshold_seconds,
+        display_tz=display_tz,
+    )
 
     line = body + suffix
     if not _should_use_color():
         return line
     return f"{color}{line}{_COLOR_RESET}"
+
+
+def _liveness_body(
+    *,
+    pid_file_present: bool,
+    live_pid: int | None,
+    last_ts: datetime | None,
+    current: datetime,
+    threshold_seconds: int,
+    display_tz: tzinfo | None,
+) -> tuple[str, str]:
+    """Return ``(body, color)`` for the five liveness states. See the banner docstring."""
+    seen = _format_local_timestamp(last_ts, display_tz) if last_ts is not None else None
+    delta = max(0.0, (current - last_ts).total_seconds()) if last_ts is not None else None
+    if live_pid is not None:
+        return _liveness_body_running(live_pid, delta, seen, threshold_seconds)
+    return _liveness_body_not_running(pid_file_present, delta, seen)
+
+
+def _liveness_body_running(
+    live_pid: int,
+    delta: float | None,
+    seen: str | None,
+    threshold_seconds: int,
+) -> tuple[str, str]:
+    """Body for a PID file naming a live process: ALIVE, busy or idle."""
+    if delta is None:
+        return f"[ORCHESTRATOR ALIVE] pid {live_pid}; no activity recorded yet", _COLOR_GREEN
+    if delta <= threshold_seconds:
+        return f"[ORCHESTRATOR ALIVE] pid {live_pid}; last activity {_format_duration(delta)} ago", _COLOR_GREEN
+    return (
+        f"[ORCHESTRATOR ALIVE] pid {live_pid}; idle {_format_duration(delta)} (last seen {seen})",
+        _COLOR_YELLOW,
+    )
+
+
+def _liveness_body_not_running(
+    pid_file_present: bool,
+    delta: float | None,
+    seen: str | None,
+) -> tuple[str, str]:
+    """Body when no live process owns this workspace: STARTING / STOPPED / NOT RUNNING / UNKNOWN."""
+    if pid_file_present:
+        if delta is None:
+            return "[ORCHESTRATOR STARTING] pid file present but no process recorded yet", _COLOR_YELLOW
+        return (
+            f"[ORCHESTRATOR STOPPED] pid file names a process that is not running "
+            f"(last activity {_format_duration(delta)} ago, last seen {seen})",
+            _COLOR_RED_LIGHT,
+        )
+    if delta is None:
+        return "[ORCHESTRATOR NOT RUNNING] no pid file and no activity recorded", _COLOR_RED_LIGHT
+    return (
+        f"[ORCHESTRATOR UNKNOWN] no pid file; log last wrote {_format_duration(delta)} ago "
+        f"(last seen {seen}) but no process is claiming this workspace",
+        _COLOR_YELLOW,
+    )
 
 
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
@@ -2727,6 +2817,7 @@ def generate_report(
         log_path=log_path,
         session_id=session_id,
         threshold_seconds=STOP_HOOK_WINDOW_SECONDS,
+        pid_path=pid_file_path(WORKSPACE_ROOT),
         display_tz=banner_display_tz,
     )
 
@@ -2750,33 +2841,10 @@ def generate_report(
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     try:
         units = parser.parse_index()
-    except FileNotFoundError as exc:
-        # FileNotFoundError can name either BACKLOG.md itself or a WU md
-        # referenced by it. Surface the actual path so the diagnostic
-        # stops blaming the index when the real culprit is a transient
-        # writer-window race on a single WU md (SDK-driven Write/Edit
-        # tools outside BacklogManager can leave a WU md momentarily
-        # unreadable; the parser already does one retry, this prefix
-        # tells the operator what to re-run if even the retry lost).
-        missing = getattr(exc, "filename", None) or str(exc)
-        sys.stderr.write(
-            f"devbench report: cannot read '{missing}' "
-            f"(referenced by '{BACKLOG_INDEX}'): {exc}\n"
-            "  If the missing path is a work-unit md and your orchestrator is\n"
-            "  active, this may be a transient writer-window race; re-run.\n"
-            "  Otherwise run `devbench validate-backlog` for a full index audit.\n"
-        )
-        sys.exit(1)
-    except ValueError as exc:
-        # Issue #174: a malformed or non-canonical BACKLOG.md surfaces here
-        # as a parser-level exception. Fail fast with an actionable
-        # diagnostic naming the file + the parse failure so the operator
-        # can fix the index directly instead of seeing a raw stack trace.
-        sys.stderr.write(
-            f"devbench report: cannot parse '{BACKLOG_INDEX}': {exc}\n"
-            "  Run `devbench validate-backlog` for a full list of issues with the index.\n"
-        )
-        sys.exit(1)
+    except (FileNotFoundError, ValueError) as exc:
+        # Issue #305: shared with ``devbench status`` so the two commands
+        # cannot report the same condition differently.
+        exit_with_index_error("report", BACKLOG_INDEX, exc)
 
     # AC-192-12 / AC-192-13: apply session filter first when provided, then scope.
     # Session filter restricts to WUs claimed by the named session; without it,
@@ -3014,5 +3082,14 @@ def generate_report(
         lines.extend(_in_progress_listing(units, log_path))
         lines.extend(_blocked_listing(units))
         lines.extend(_declined_listing(units))
+
+    # Issue #251: close with the same actionability statement ``status``
+    # prints. The per-status counts above do not answer whether the run can
+    # proceed: a backlog can hold many ``in-queue`` units and still have
+    # nothing actionable, because only leaf Tasks execute and every one of
+    # them may be waiting on a dependency.
+    active_ids = [u.id for u in units if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)]
+    lines.append("")
+    lines.append(actionability_line(parser, units, active_ids=active_ids))
 
     return "\n".join(lines)

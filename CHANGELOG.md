@@ -3,7 +3,7 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] -- v-next
+## [0.3.0] -- 2026-07-31
 
 ### Fixed
 

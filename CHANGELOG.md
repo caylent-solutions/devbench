@@ -267,6 +267,57 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and issue #231 (the upstream lock-advance tracking issue) are both
   closed as a result.
 
+### Dependencies
+
+- **Eight open dependabot PRs reconciled against the resolved lock; six
+  closed unmerged, two deferred** (spec FR-6.1, FR-6.2, D-14; AC-78, AC-79,
+  AC-80). Per decision D-14, E6 reconciles the dependabot backlog against
+  what `uv.lock` actually resolves rather than blind-merging every open
+  branch, which would guarantee lock conflicts. `tools/check_dependabot_targets.py`
+  is added as the reconciliation checker: it parses `uv.lock` with stdlib
+  `tomllib`, compares each of the eight targets below against the locked
+  version with a numeric version-tuple comparison, and prints one line per
+  target in spec G-6's worked-example format. Resolved-version matrix as of
+  commit `6ec06c7a02deeb1714fd5c8bb45230971f65b603` (E6-F1-S1-T3's mcp-family
+  lock advance):
+
+  | PR | Package | Locked | Target | Verdict |
+  |---|---|---|---|---|
+  | #287 | mcp | 1.29.0 | 1.28.1 | SATISFIED |
+  | #278 | pydantic-settings | 2.14.2 | 2.14.2 | SATISFIED |
+  | #277 | starlette | 1.3.1 | 1.3.1 | SATISFIED |
+  | #276 | cryptography | 50.0.0 | 48.0.1 | SATISFIED |
+  | #275 | python-multipart | 0.0.32 | 0.0.31 | SATISFIED |
+  | #274 | pyjwt | 2.13.0 | 2.13.0 | SATISFIED |
+  | #216 | idna | 3.11 | 3.15 | NEEDS BUMP (deferred to E6-F1-S1-T2) |
+  | #179 | urllib3 | 2.6.3 | 2.7.0 | NEEDS BUMP (deferred to E6-F1-S1-T2) |
+
+  **Starlette major-jump evidence (FR-6.2).** #277 moves starlette from
+  `0.52.1` to `1.3.1`, a major-version jump reached transitively via `mcp`
+  and `sse-starlette`; devbench imports no starlette symbol directly, so
+  this is recorded evidence rather than an assumed zero blast radius.
+  `mcp==1.29.0`'s own package metadata declares `starlette>=0.27` for
+  `python_version < '3.14'` and `starlette>=0.48.0` for
+  `python_version >= '3.14'`; `sse-starlette==3.3.2` (the lock's only other
+  starlette parent) declares `starlette>=0.49.1`. The resolved `starlette
+  1.3.1` satisfies every one of those lower bounds, confirming `mcp` accepts
+  the resolved starlette rather than rejecting it -- the FR-6.2 BLOCK path
+  (close #277 not-applicable with resolver evidence, never force-merge) was
+  not triggered.
+
+  **Six PRs closed unmerged with satisfying-commit evidence (AC-79).** Each
+  of #287, #278, #277, #276, #275, and #274 is closed via `gh pr close`
+  with a comment naming commit `6ec06c7a02deeb1714fd5c8bb45230971f65b603`
+  as the satisfying lock advance; `gh pr view` confirms all six show
+  `state=CLOSED`, `mergedAt=null`. None is merged, per FR-6.1's error
+  handling: a dependabot branch whose target is already satisfied by the
+  resolved lock is never merged.
+
+  **Two targets deferred (FR-6.3).** #216 (idna, via anyio/httpx) and #179
+  (urllib3, via botocore) are independent of the mcp cascade and remain
+  below target; the checker's captured NEEDS BUMP lines for both are handed
+  to E6-F1-S1-T2, which owns the explicit bump.
+
 ## [0.3.0] -- 2026-07-31
 
 ### Fixed

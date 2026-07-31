@@ -270,16 +270,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Dependencies
 
 - **Eight open dependabot PRs reconciled against the resolved lock; six
-  closed unmerged, two deferred** (spec FR-6.1, FR-6.2, D-14; AC-78, AC-79,
-  AC-80). Per decision D-14, E6 reconciles the dependabot backlog against
+  closed unmerged, two bumped explicitly** (spec FR-6.1, FR-6.2, FR-6.3,
+  D-14; AC-78, AC-79, AC-80, AC-81, AC-82, AC-83). Per decision D-14, E6
+  reconciles the dependabot backlog against
   what `uv.lock` actually resolves rather than blind-merging every open
   branch, which would guarantee lock conflicts. `tools/check_dependabot_targets.py`
   is added as the reconciliation checker: it parses `uv.lock` with stdlib
   `tomllib`, compares each of the eight targets below against the locked
   version with a numeric version-tuple comparison, and prints one line per
-  target in spec G-6's worked-example format. Resolved-version matrix as of
-  commit `6ec06c7a02deeb1714fd5c8bb45230971f65b603` (E6-F1-S1-T3's mcp-family
-  lock advance):
+  target in spec G-6's worked-example format. Resolved-version matrix after
+  both E6-F1-S1-T3's mcp-family lock advance (commit
+  `6ec06c7a02deeb1714fd5c8bb45230971f65b603`) and this task's idna/urllib3
+  bump:
 
   | PR | Package | Locked | Target | Verdict |
   |---|---|---|---|---|
@@ -289,8 +291,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   | #276 | cryptography | 50.0.0 | 48.0.1 | SATISFIED |
   | #275 | python-multipart | 0.0.32 | 0.0.31 | SATISFIED |
   | #274 | pyjwt | 2.13.0 | 2.13.0 | SATISFIED |
-  | #216 | idna | 3.11 | 3.15 | NEEDS BUMP (deferred to E6-F1-S1-T2) |
-  | #179 | urllib3 | 2.6.3 | 2.7.0 | NEEDS BUMP (deferred to E6-F1-S1-T2) |
+  | #216 | idna | 3.18 | 3.15 | SATISFIED (E6-F1-S1-T2) |
+  | #179 | urllib3 | 2.7.0 | 2.7.0 | SATISFIED (E6-F1-S1-T2) |
 
   **Starlette major-jump evidence (FR-6.2).** #277 moves starlette from
   `0.52.1` to `1.3.1`, a major-version jump reached transitively via `mcp`
@@ -313,10 +315,36 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   handling: a dependabot branch whose target is already satisfied by the
   resolved lock is never merged.
 
-  **Two targets deferred (FR-6.3).** #216 (idna, via anyio/httpx) and #179
-  (urllib3, via botocore) are independent of the mcp cascade and remain
-  below target; the checker's captured NEEDS BUMP lines for both are handed
-  to E6-F1-S1-T2, which owns the explicit bump.
+  **Two targets bumped, independent of the mcp cascade (FR-6.3, AC-81,
+  AC-82).** #216 (idna) and #179 (urllib3) needed an explicit bump because
+  the mcp-family advance had no reason to move them, not because they sit
+  outside the dependency graph the advance touched. `idna` in fact sits
+  beneath `mcp` twice over: `mcp==1.29.0` depends on both `anyio` and
+  `httpx`, and both of those depend on `idna`; `starlette` (one of the six
+  targets moved by the mcp-family advance) also depends on `anyio` and so
+  also reaches `idna`. `urllib3` reaches devbench only via `botocore`, which
+  is not beneath `mcp`. In both cases the locked `idna 3.11` and
+  `urllib3 2.6.3` already satisfied every lower bound declared anywhere in
+  the resolved graph, so `uv lock --upgrade-package <mcp-family-target>`
+  had no unsatisfied constraint to pull a newer `idna` or `urllib3` in; a
+  targeted per-package upgrade of the mcp family simply never touches a
+  transitive dependency whose currently-locked version already clears every
+  floor. E6-F1-S1-T1's checker run captured both as
+  `idna 3.11 < 3.15 NEEDS BUMP` and `urllib3 2.6.3 < 2.7.0 NEEDS BUMP`,
+  reflecting the FR-6.3 target floor rather than a graph-resolution
+  constraint. This task closes both with a single resolution:
+  `uv lock --upgrade-package idna
+  --upgrade-package urllib3` resolved cleanly on the first attempt (no
+  per-target isolation was needed), moving `idna 3.11 -> 3.18` and `urllib3
+  2.6.3 -> 2.7.0`. The `uv.lock` diff is exactly the two packages' version,
+  sdist and wheel hash blocks -- no unrelated drift. The re-run checker shows
+  all eight targets `SATISFIED`, closing the reconciliation E6-F1-S1-T1
+  started, and `uv sync && make validate` exits 0 (6226 passed, 98.24%
+  coverage), closing the dependency wave (AC-82). `.github/BATCH_PR_BODY.md`
+  is added carrying the closing-keyword list for every issue this run
+  resolves plus non-closing references to the six superseded dependabot PRs
+  and the two bumped ones (#216, #179), for the operator to paste into the
+  deferred single batch PR (spec S9, AC-83).
 
 ## [0.3.0] -- 2026-07-31
 

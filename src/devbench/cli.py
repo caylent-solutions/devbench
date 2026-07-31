@@ -76,7 +76,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -114,7 +114,34 @@ from devbench.backlog.amendment import (
     reject_amendment,
     write_request,
 )
-from devbench.backlog.manager import BacklogManager
+
+# Re-export from manager.py so existing ``cli.red_gate_satisfied`` /
+# ``cli.green_green_observed_satisfied`` callers and tests resolve unchanged
+# after the predicates moved to manager.py (code_review FAIL round 3 --
+# check-merge's ``_check_merge_handle_merged`` -> ``BacklogManager.mark_done``
+# path previously bypassed the done-gate entirely because the checks lived
+# only in cli.py's ``cmd_mark_done``-only wrapper). Single source of truth
+# now lives in manager.py because every ``mark_done()`` caller must inherit
+# it, and manager.py cannot depend on cli.py without a circular import.
+#
+# code_review FAIL round 4 (non-blocking) observed that the module-level
+# ``__all__`` below -- which marks these as intentional re-exports so
+# ruff does not flag them F401 -- reads as if it declared cli.py's
+# entire public surface, misleading for a CLI module with dozens of
+# ``cmd_*`` entry points. The self-aliased ``import x as x`` idiom (PEP
+# 484's usual alternative for exactly this situation) was evaluated and
+# rejected: this repo's ruff configuration enables ``PLC0414`` ("import
+# alias does not rename original package"), which flags that idiom as an
+# error, so ``__all__`` remains the only lint-clean mechanism available
+# here. Read it as "these names are deliberately re-exported", not as
+# "this is the whole module".
+from devbench.backlog.manager import (
+    _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE,
+    BacklogManager,
+    _build_remedies_rejection_message,
+    green_green_observed_satisfied,
+    red_gate_satisfied,
+)
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
     BlockedTaskState,
@@ -198,11 +225,9 @@ from devbench.constants import (
     ORCHESTRATOR_RESTART_EXIT_CODE,
     RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_TIMEOUT_SECONDS,
-    RED_OBSERVED_ENTRY_LINE_RE,
     RED_OBSERVED_FIELD_EXIT_CODE,
     RED_OBSERVED_FIELD_FAILURE_DIGEST,
     RED_OBSERVED_FIELD_TEST_NODE_ID,
-    RED_OBSERVED_MESSAGE_FIELDS_RE,
     RED_OBSERVED_MESSAGE_TEMPLATE,
     RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE,
     RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE,
@@ -222,7 +247,7 @@ from devbench.constants import (
     STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
-    TDD_CYCLE_LOG_SECTION_BODY_RE,
+    TDD_PHASE_GREEN_GREEN_OBSERVED,
     TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE,
     TDD_PHASE_RED_OBSERVED,
     VALID_TDD_PHASES,
@@ -250,14 +275,16 @@ from devbench.quota import (
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
 # resolve unchanged after the function moved to report.py for the issue #161
 # orchestrator-alive banner. Single source of truth lives in report.py because
-# the banner is implemented there and reporting must not depend on cli.py.
+# the banner is implemented there and reporting must not depend on cli.py. See
+# the ``__all__``-vs-self-aliased-``as`` rationale above the
+# ``devbench.backlog.manager`` re-export block.
 from devbench.reporting.report import _format_duration
 from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
-__all__ = ["_format_duration"]
+__all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
 
 logger = logging.getLogger("devbench.cli")
 
@@ -1627,9 +1654,35 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
 def cmd_mark_done(unit_id: str) -> int:
     """Mark a work unit as Done, enforcing the done-gate check.
 
-    Calls ``BacklogManager.mark_done()`` which verifies that all required
-    review judges passed in the most recent round before allowing the transition.
-    Raises ``RuntimeError`` if the gate check fails.
+    Calls :meth:`BacklogManager.mark_done`, which itself enforces two
+    invariants before writing ``STATUS_DONE`` anywhere (E4-F4-S1-T2 round
+    3 moved both out of this CLI-layer wrapper and into ``mark_done``
+    directly, via ``_check_task_type_done_invariant``, so every caller --
+    this command and ``devbench check-merge``'s merged-PR path alike --
+    inherits them identically; this docstring described the pre-round-3
+    architecture, where the checks ran here before delegating, until
+    doc_review FAIL round 4 flagged the staleness):
+
+    - **Done-gate** (FR-4.4): all required review judges must have passed
+      in the most recent review round.
+    - **FR-4.5/FR-4.6 task-type completion invariant** (AC-60 /
+      AC-E4-F4-S1-T2-4): a gated task (``## Task Type:`` absent --
+      defaults to ``DEFAULT_TASK_TYPE``, the strictest type, per the same
+      fail-closed precedent as ``BacklogManager._check_task_type_taxonomy``
+      -- or explicitly ``behavior-fix``/``feature``) must carry a
+      machine-observed ``RED_OBSERVED`` record (``red_gate_satisfied``);
+      a ``refactor`` task is exempt from the RED gate but not from its
+      own invariant and must instead carry a machine-observed
+      ``GREEN_GREEN_OBSERVED`` record (``green_green_observed_satisfied``),
+      written only by a passing ``devbench green-green-check`` run.
+      Without the applicable record, ``mark_done`` raises ``RuntimeError``
+      rather than claiming a fix or a behavior-preservation guarantee
+      never actually proved: honest exits are a genuine RED, a re-type,
+      an already-satisfied decline, or (for ``refactor``) a passing
+      ``green-green-check`` run -- never a silent done.
+
+    This function catches that ``RuntimeError`` and reports it on stderr
+    with exit code 1; it performs no invariant checking of its own.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -1685,16 +1738,66 @@ def cmd_decline(*argv: str) -> int:
 
     Usage::
 
-        decline <id> --reason "<message>"
+        decline <id> --reason "<message>" [--citation <commit-hash-or-task-id>]
 
     Declined is a deliberate final-decision status, distinct from Blocked
     (waiting on something) and Done (completed). Declined children count
     as terminal-complete for parent rollup. The ``--reason`` is REQUIRED
     because the decision must leave an audit trail; em-dashes are
     rejected at the input boundary for backlog hygiene.
+
+    FR-4.5 (AC-E4-F4-S1-T2-2/3): when *reason* names remedy 3
+    (``already-satisfied``), the decline is an unfalsifiable claim without
+    proof it was checked, so ``--citation`` (the closing commit hash or
+    task id, validated by ``BacklogManager.is_valid_citation``) is
+    REQUIRED too. On success the citation is folded into the persisted
+    reason (``"... (citing <value>)"``) so ``BacklogManager``'s
+    comment-format check (which re-reads the persisted ``[DECLINED]``
+    comment, not this command's argv) can verify it independently.
+    """
+    parsed = _parse_decline_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason, citation = parsed
+
+    rc = _reject_em_dash("reason", reason)
+    if rc is not None:
+        return rc
+
+    persisted_reason = _resolve_decline_persisted_reason(task_id, reason, citation)
+    if persisted_reason is None:
+        return 1
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().mark_declined(wu_file, BACKLOG_INDEX, task_id, persisted_reason)
+    logger.info("Declined %s: %s", task_id, persisted_reason)
+    print(json.dumps({"task_id": task_id, "status": "declined", "reason": persisted_reason}))
+    return 0
+
+
+def _parse_decline_argv(argv: tuple[str, ...] | list[str]) -> tuple[str, str, str] | int:
+    """Parse ``decline`` argv into ``(task_id, reason, citation)``.
+
+    Returns the parsed triple when ``<id>`` and ``--reason`` are both
+    present, or an integer non-zero exit code when parsing failed (the
+    error message is already on stderr). Mirrors the ``_parse_new_task_argv``
+    idiom so the many single-purpose validation branches live in a
+    dedicated parser rather than inflating ``cmd_decline``'s own
+    return/branch count.
     """
     task_id = ""
     reason = ""
+    citation = ""
     args = list(argv)
     i = 0
     while i < len(args):
@@ -1709,31 +1812,48 @@ def cmd_decline(*argv: str) -> int:
             reason = args[i + 1]
             i += 2
             continue
+        if arg == "--citation":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --citation requires a value", file=sys.stderr)
+                return 1
+            citation = args[i + 1]
+            i += 2
+            continue
         if not task_id:
             task_id = arg
         i += 1
     if not task_id or not reason:
         print("ERROR: decline requires <id> --reason <message>", file=sys.stderr)
         return 1
-    rc = _reject_em_dash("reason", reason)
-    if rc is not None:
-        return rc
+    return task_id, reason, citation
 
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    target = _find_unit(units, task_id)
-    if target is None:
-        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
-        return 1
-    wu_file = _resolve_unit_file(target)
-    if wu_file is None:
-        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
-        return 1
 
-    BacklogManager().mark_declined(wu_file, BACKLOG_INDEX, task_id, reason)
-    logger.info("Declined %s: %s", task_id, reason)
-    print(json.dumps({"task_id": task_id, "status": "declined", "reason": reason}))
-    return 0
+def _resolve_decline_persisted_reason(task_id: str, reason: str, citation: str) -> str | None:
+    """Return the reason text to persist, or ``None`` when an already-satisfied decline lacks a citation.
+
+    FR-4.5 (AC-E4-F4-S1-T2-2/3): when *reason* names remedy 3
+    (``already-satisfied``), the decline is an unfalsifiable claim without
+    proof it was checked, so a valid ``citation`` (the closing commit hash
+    or task id, validated by ``BacklogManager.is_valid_citation``) is
+    REQUIRED too. On success the citation is folded into the returned
+    reason (``"... (citing <value>)"``) so ``BacklogManager``'s
+    comment-format check (which re-reads the persisted ``[DECLINED]``
+    comment, not this command's argv) can verify it independently. On
+    failure the three-remedy rejection message is already printed to
+    stderr before ``None`` is returned.
+    """
+    if BacklogManager._ALREADY_SATISFIED_TOKEN not in reason.lower():
+        return reason
+    if not citation or not BacklogManager.is_valid_citation(citation):
+        message = _build_remedies_rejection_message(
+            f"ERROR: Cannot decline {task_id} as already-satisfied without a valid citation.",
+            "FR-4.5 requires an already-satisfied decline to cite the closing commit hash "
+            "(7-40 lowercase hex characters) or task id via --citation <value>; an uncited "
+            "already-satisfied decline is as unfalsifiable as a fabricated RED.",
+        )
+        print(message, file=sys.stderr)
+        return None
+    return f"{reason} (citing {citation})"
 
 
 _TEMPLATE_KIND_BY_ID_SHAPE: dict[str, str] = {
@@ -3999,68 +4119,6 @@ def write_red_observed_entry(unit_id: str, exit_code: int | None, test_node_id: 
     logger.info("TDD %s entry logged for %s", TDD_PHASE_RED_OBSERVED, unit_id)
 
 
-def _red_observed_message_has_all_required_fields(message: str) -> bool:
-    """Return True iff *message* parses into a well-formed RED_OBSERVED record.
-
-    Re-validates all three fields independently of whatever validation ran
-    at write time (MEDIUM/LOW findings inherited on E4-F3-S1-T1): the parsed
-    ``exit_code`` must not be ``"0"`` and the parsed ``failure_digest`` must
-    match ``FAILURE_DIGEST_RE``.
-
-    Args:
-        message: The message body captured from a RED_OBSERVED entry line.
-
-    Returns:
-        ``True`` only when all three fields are present, ``exit_code`` is
-        nonzero, and ``failure_digest`` is hash-shaped.
-    """
-    fields_match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
-    if fields_match is None:
-        return False
-    if fields_match.group("exit_code") == "0":
-        return False
-    return bool(FAILURE_DIGEST_RE.match(fields_match.group("failure_digest")))
-
-
-def red_gate_satisfied(content: str) -> bool:
-    """Return True iff the work unit's TDD Cycle Log contains a RED_OBSERVED entry.
-
-    Security-critical predicate (E4-F3-S1-T1 inherited findings): an
-    agent-written ``[RED]`` entry must never be able to satisfy this gate on
-    its own. Three defenses combine to close the forgery vectors identified
-    in review:
-
-    1. Section-scoping: only text inside the ``## TDD Cycle Log`` section is
-       considered (``TDD_CYCLE_LOG_SECTION_BODY_RE``) -- a RED_OBSERVED-shaped
-       line anywhere else (e.g. an agent's ``## Comments`` entry) never counts.
-       When the section header is absent, this returns ``False`` outright --
-       no fallback scan of the whole document.
-    2. Anchored line matching: ``RED_OBSERVED_ENTRY_LINE_RE`` only matches a
-       ``[RED_OBSERVED]`` tag at an entry line's structural start position, so
-       an agent cannot forge the tag by embedding it mid-message inside a
-       legitimate ``[RED]`` entry.
-    3. Full record re-validation: the matched entry's message must parse via
-       ``RED_OBSERVED_MESSAGE_FIELDS_RE`` into all three required fields, with
-       a nonzero ``exit_code`` and a hash-shaped ``failure_digest``.
-
-    Args:
-        content: The full text of a work-unit markdown file.
-
-    Returns:
-        ``True`` only when a structurally well-formed, fully-populated
-        RED_OBSERVED record is present inside the TDD Cycle Log section;
-        ``False`` in every other case.
-    """
-    section_match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
-    if section_match is None:
-        return False
-    section_body = section_match.group(1)
-    return any(
-        _red_observed_message_has_all_required_fields(line_match.group("message"))
-        for line_match in RED_OBSERVED_ENTRY_LINE_RE.finditer(section_body)
-    )
-
-
 def cmd_tdd_gate(unit_id: str) -> int:
     """Run the machine-observed RED gate for a gated task (FR-4.2, issue #257).
 
@@ -4129,6 +4187,309 @@ def cmd_tdd_gate(unit_id: str) -> int:
         f"RED gate satisfied for {unit_id}: test_node_id={observation.test_node_id} "
         f"exit_code={observation.exit_code} failure_digest={observation.failure_digest}"
     )
+    return 0
+
+
+# DRY (E4-F4-S1-T2, code_review FAIL round 4): the scoped stash push/pop
+# green-green-check needs for its "before"/"after" reconstruction is
+# identical to `devbench.tdd_gate`'s own RED-gate stash helpers. Those
+# helpers (`stash_push_scoped`, `stash_pop`, `STASH_NO_LOCAL_CHANGES_MARKER`)
+# were promoted from module-private to public in tdd_gate.py specifically so
+# this module can import and reuse them instead of duplicating the git
+# invocations a second time; see the module-level note above
+# `STASH_NO_LOCAL_CHANGES_MARKER` in tdd_gate.py for the full history.
+
+
+def _gg_clear_pycache(repo_path: Path) -> None:
+    """Remove every ``__pycache__`` directory under *repo_path*.
+
+    A green-green check runs the named tests twice in the same repository
+    checkout, once per side, with a ``git stash`` round-trip of the
+    production source in between. On filesystems with coarse mtime
+    resolution, that round-trip can leave a compiled ``.pyc`` that Python's
+    import machinery still considers valid for the different on-disk source
+    now in its place, which would make the before-state run silently
+    execute stale after-state bytecode instead of the actual before-state
+    content -- reporting a pass that never happened. Clearing the cache
+    before every run removes that risk at negligible cost.
+
+    Skips any ``__pycache__`` found under a ``.venv`` directory
+    (code_review FAIL round 4, non-blocking note): a target repository's
+    virtualenv can contain thousands of installed packages' compiled
+    bytecode, none of which the stash round-trip above touches or
+    invalidates, so walking and deleting it on every one of the two
+    per-side runs is pure wasted work with no correctness benefit.
+    """
+    for cache_dir in repo_path.rglob("__pycache__"):
+        if ".venv" in cache_dir.relative_to(repo_path).parts:
+            continue
+        shutil.rmtree(cache_dir, ignore_errors=False)
+
+
+def _gg_run_named_tests(unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+    """Run every node id in *test_node_ids* on one *side* of a green-green check.
+
+    Reuses :func:`devbench.tdd_gate.default_pytest_runner` -- the identical
+    runner the RED gate itself uses -- so the pytest-invocation behavior
+    (file-scoped, ``-rA``) is defined exactly once (DRY), never duplicated.
+    Clears the bytecode cache first (see ``_gg_clear_pycache``).
+
+    Args:
+        unit_id: The work unit id, named in every rejection message.
+        side: ``"before"`` or ``"after"``, named in every rejection message
+            so an operator can tell which state failed.
+        test_node_ids: The pytest node ids to run.
+        repo_path: The target repository's working tree.
+
+    Returns:
+        ``None`` when every named test PASSED with exit code
+        ``PYTEST_EXIT_OK``. Otherwise a fully-formed rejection message
+        (fail-closed): a node whose outcome could not be determined at all
+        (``node_outcome is None``) is reported as a collection failure --
+        never silently as a pass -- mirroring FR-4.2's exit-2 semantics.
+    """
+    from devbench.tdd_gate import PYTEST_EXIT_OK, default_pytest_runner
+
+    _gg_clear_pycache(repo_path)
+    for test_node_id in test_node_ids:
+        observation = default_pytest_runner(test_node_id, repo_path)
+        if observation.node_outcome is None:
+            return (
+                f"ERROR: green-green check rejected task '{unit_id}': the {side}-state run could "
+                f"not collect test '{test_node_id}' (exit code {observation.exit_code}); a "
+                "collection failure is reported as a failure, never as a pass, per FR-4.6's "
+                "fail-closed semantics."
+            )
+        if observation.exit_code != PYTEST_EXIT_OK or observation.node_outcome != "PASSED":
+            return (
+                f"ERROR: green-green check rejected task '{unit_id}': the {side}-state run of "
+                f"'{test_node_id}' did not pass (exit code {observation.exit_code}, outcome "
+                f"{observation.node_outcome})."
+            )
+    return None
+
+
+def cmd_green_green_check(*argv: str) -> int:
+    """Run the refactor green-green check: named tests pass before and after (FR-4.6).
+
+    Usage::
+
+        green-green-check <id> <test_node_id> [<test_node_id> ...]
+
+    A ``refactor`` task is exempt from the RED gate but not from its own
+    invariant: the change must be behavior-preserving, proven by the same
+    named tests passing both before and after it. The change is already
+    applied in the working tree when this command runs (the "after"
+    state), so this command:
+
+    1. Confirms every named test passes in the current ("after") tree.
+    2. Path-scoped stashes the Changes Manifest's production-source rows
+       (the same stash discipline as ``devbench.tdd_gate.observe_red``) to
+       reconstruct the pre-change ("before") state, and confirms the same
+       tests pass there too.
+    3. Restores the stash unconditionally, even when the before-state test
+       run itself raises, mirroring ``observe_red``'s fail-closed restore
+       guarantee.
+
+    A collection failure (a named test whose outcome cannot be determined
+    at all) on either side fails closed, naming the side and the collection
+    error -- "could not run" is never reported as "passed" (FR-4.6).
+
+    On success, appends a machine-observed ``GREEN_GREEN_OBSERVED`` entry to
+    the work unit's TDD Cycle Log (``green_green_observed_satisfied``
+    re-validates it on read) so ``cmd_mark_done`` can refuse a ``refactor``
+    task that never actually ran this check (AC-E4-F4-S1-T2-4). A rejection
+    writes nothing -- the record is proof-of-success only, never
+    proof-of-attempt.
+
+    Exits 0 only when every named test PASSED on both sides. Exits 1 on
+    every rejection path: a dirty tree outside the Manifest, no
+    production-source rows to reconstruct a "before" state from, no
+    uncommitted production-source change to stash (nothing to reconstruct
+    the "before" state from), a stash push/pop failure, or any test
+    failing/not-collecting on either side.
+    """
+    args = list(argv)
+    if len(args) < 2:
+        print("ERROR: green-green-check requires <id> <test_node_id> [<test_node_id> ...]", file=sys.stderr)
+        return 1
+    unit_id, test_node_ids = args[0], args[1:]
+
+    resolved = _gg_resolve_target(unit_id)
+    if isinstance(resolved, int):
+        return resolved
+    repo_path, manifest_paths, wu_file = resolved
+
+    prod_paths = _gg_preflight(unit_id, repo_path, manifest_paths)
+    if isinstance(prod_paths, int):
+        return prod_paths
+
+    result = _gg_run_before_after(unit_id, repo_path, prod_paths, test_node_ids)
+    if result != 0:
+        return result
+
+    mgr = BacklogManager()
+    mgr._append_tdd_entry(
+        wu_file,
+        TDD_PHASE_GREEN_GREEN_OBSERVED,
+        _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE.format(test_node_ids=",".join(test_node_ids)),
+    )
+
+    print(f"green-green check passed for {unit_id}: {', '.join(test_node_ids)} PASSED before and after.")
+    return 0
+
+
+def _gg_resolve_target(unit_id: str) -> tuple[Path, list[str], Path] | int:
+    """Resolve the target repo path, Changes Manifest paths, and work-unit file
+    for green-green-check.
+
+    Returns ``(repo_path, manifest_paths, wu_file)`` on success, or an
+    integer non-zero exit code (error already printed) on any resolution
+    failure. Consolidates the work-unit/repo/manifest lookups that would
+    otherwise be four separate early-return branches directly in
+    ``cmd_green_green_check``. ``wu_file`` is returned (not just consumed
+    here) so the caller can append the GREEN_GREEN_OBSERVED record to the
+    same file on success without re-resolving it.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        print(f"ERROR: Work unit file for '{unit_id}' not found on disk", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    content = wu_file.read_text(encoding="utf-8")
+    try:
+        manifest_paths = [row.file for row in parse_manifest(content)]
+    except ManifestParseError as exc:
+        print(f"ERROR: Changes Manifest could not be parsed for '{unit_id}': {exc}", file=sys.stderr)
+        return 1
+
+    return repo_path, manifest_paths, wu_file
+
+
+def _gg_preflight(unit_id: str, repo_path: Path, manifest_paths: Sequence[str]) -> list[str] | int:
+    """Return the classified production-source paths, or an int error code.
+
+    Rejects a working tree carrying changes outside the Changes Manifest
+    (the check never stashes work it does not own) and a Manifest with no
+    production-source rows (Rule 14 classifier) to reconstruct a "before"
+    state from.
+    """
+    from devbench.tdd_gate import classify_production_paths, find_paths_outside_manifest
+
+    outside_paths = find_paths_outside_manifest(repo_path, manifest_paths)
+    if outside_paths:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': the working tree carries "
+            f"changes outside the Changes Manifest: {', '.join(outside_paths)}. The check never "
+            "stashes work it does not own; clear or commit these paths before retrying.",
+            file=sys.stderr,
+        )
+        return 1
+
+    prod_paths = classify_production_paths(manifest_paths)
+    if not prod_paths:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': the Changes Manifest contains "
+            "no production-source rows (Rule 14 classifier); a refactor task must ship at least "
+            "one production file to demonstrate green-green.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return prod_paths
+
+
+def _gg_run_before_after(unit_id: str, repo_path: Path, prod_paths: Sequence[str], test_node_ids: Sequence[str]) -> int:
+    """Run the after/stash/before/pop sequence for green-green-check.
+
+    Prints its own rejection messages and returns 0 when every named test
+    PASSED on both sides, 1 on any rejection. Re-raises whatever the
+    before-state test run itself raises, after the stash has been popped
+    (fail-closed restore, mirroring ``observe_red``) -- the pop-failure
+    message is printed before the re-raise so it is never silently lost.
+
+    A ``git stash push`` that reports "no local changes to save"
+    (``devbench.tdd_gate.stash_push_scoped`` returning ``pushed=False`` with
+    no error) is itself a rejection, not a pass: it means the working tree
+    has no uncommitted production-source change to reconstruct a "before"
+    state from, so running the before-state check would silently re-run the
+    same ("after") tree twice and report a guaranteed, meaningless pass --
+    the exact "could not run reported as passed" hole FR-4.6 forbids
+    (code_review FAIL, round 2).
+    """
+    from devbench.tdd_gate import stash_pop, stash_push_scoped
+
+    after_rejection = _gg_run_named_tests(unit_id, "after", test_node_ids, repo_path)
+    if after_rejection is not None:
+        print(after_rejection, file=sys.stderr)
+        return 1
+
+    pushed, push_error = stash_push_scoped(repo_path, prod_paths)
+    if push_error is not None:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': "
+            f"'git stash push -u -- {' '.join(prod_paths)}' failed: {push_error}",
+            file=sys.stderr,
+        )
+        return 1
+    if not pushed:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': "
+            f"'git stash push -u -- {' '.join(prod_paths)}' found no uncommitted production-source "
+            f"change from the Changes Manifest ({', '.join(prod_paths)}); the pre-change ('before') "
+            "state could not be reconstructed. A refactor's change must still be uncommitted in the "
+            "working tree when this check runs.",
+            file=sys.stderr,
+        )
+        return 1
+
+    check_exception: BaseException | None = None
+    before_rejection: str | None = None
+    pop_error: str | None = None
+    try:
+        before_rejection = _gg_run_named_tests(unit_id, "before", test_node_ids, repo_path)
+    except BaseException as caught:
+        # Broad and intentional, mirroring observe_red: the pop in the
+        # finally block below MUST still run when the before-state test
+        # step raises -- including KeyboardInterrupt and SystemExit -- so
+        # the exception is captured here and re-raised only after the
+        # stash has been popped (fail-closed restore).
+        check_exception = caught
+    finally:
+        pop_error = stash_pop(repo_path)
+
+    if pop_error is not None:
+        detail = f"'git stash pop' failed after the before-state run: {pop_error}."
+        if check_exception is not None:
+            detail += f" The test step also raised {check_exception!r}; both failures are reported together."
+        print(f"ERROR: green-green check rejected task '{unit_id}': {detail}", file=sys.stderr)
+        if check_exception is not None:
+            raise check_exception
+        return 1
+
+    if check_exception is not None:
+        raise check_exception
+
+    if before_rejection is not None:
+        print(before_rejection, file=sys.stderr)
+        return 1
+
     return 0
 
 
@@ -5372,8 +5733,19 @@ def cmd_check_merge(unit_id: str) -> int:
     Issue #101 reconciliation step. Queries the PR for *unit_id* via
     ``gh pr list --head <branch> --json number,state,mergedAt``:
 
-    - **merged** (``mergedAt`` non-null) -> transition to ``done`` via :meth:`BacklogManager.mark_done`
-      (enforces the done-gate: every required judge must have passed).
+    - **merged** (``mergedAt`` non-null) -> transition to ``done`` via
+      :meth:`BacklogManager.mark_done`, which enforces two things before
+      any status write happens: the done-gate (every required judge must
+      have passed in the most recent review round) *and* the task's own
+      FR-4.5/FR-4.6 task-type completion invariant
+      (:meth:`BacklogManager._check_task_type_done_invariant` -- a
+      machine-observed ``RED_OBSERVED`` record for gated task types, or a
+      machine-observed ``GREEN_GREEN_OBSERVED`` record for ``refactor``).
+      This surface is not a thinner variant of ``devbench mark-done``'s
+      checks: both refuse identically because both call the same
+      ``mark_done`` method (doc_review FAIL, E4-F4-S1-T2 round 4 -- prior
+      wording here named only the judge gate, which undersold the FR-4.5/
+      FR-4.6 refusal ``check-merge`` also performs).
     - **closed without merge** -> transition to ``blocked`` with an audit
       comment naming the PR.
     - **still open** -> log + return 0; orchestrator picks it up next loop.
@@ -10476,7 +10848,8 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "decline": (
         cmd_decline,
         2,
-        "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message>",
+        "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message> "
+        "[--citation <commit-hash-or-task-id>] (--citation required when reason names already-satisfied)",
     ),
     "hold": (
         cmd_hold,
@@ -10693,6 +11066,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         1,
         "Run the machine-observed RED gate for a gated task and record RED_OBSERVED on success: tdd-gate <id>",
     ),
+    "green-green-check": (
+        cmd_green_green_check,
+        2,
+        "Run the refactor green-green check, named tests pass before and after the change: "
+        "green-green-check <id> <test_node_id> [<test_node_id> ...]",
+    ),
     "log-verdict": (
         cmd_log_verdict,
         3,
@@ -10789,6 +11168,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "notify-test",
         "add-dep",
         "decline",
+        # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
+        "green-green-check",
         "hold",
         "unhold",
         "status",

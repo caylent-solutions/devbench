@@ -746,7 +746,7 @@ class TestRedObservedTddPhaseConstants:
         from devbench.constants import TDD_PHASE_RED_OBSERVED, VALID_TDD_PHASES
 
         assert TDD_PHASE_RED_OBSERVED in VALID_TDD_PHASES
-        assert frozenset({"RED", "GREEN", "REFACTOR", "RED_OBSERVED"}) == VALID_TDD_PHASES
+        assert frozenset({"RED", "GREEN", "REFACTOR", "RED_OBSERVED", "GREEN_GREEN_OBSERVED"}) == VALID_TDD_PHASES
 
     @pytest.mark.unit
     def test_agent_writable_tdd_phases_excludes_red_observed(self) -> None:
@@ -756,10 +756,10 @@ class TestRedObservedTddPhaseConstants:
         assert TDD_PHASE_RED_OBSERVED not in AGENT_WRITABLE_TDD_PHASES
 
     @pytest.mark.unit
-    def test_orchestrator_only_tdd_phases_is_red_observed_only(self) -> None:
+    def test_orchestrator_only_tdd_phases_includes_red_observed(self) -> None:
         from devbench.constants import ORCHESTRATOR_ONLY_TDD_PHASES, TDD_PHASE_RED_OBSERVED
 
-        assert frozenset({TDD_PHASE_RED_OBSERVED}) == ORCHESTRATOR_ONLY_TDD_PHASES
+        assert TDD_PHASE_RED_OBSERVED in ORCHESTRATOR_ONLY_TDD_PHASES
 
     @pytest.mark.unit
     def test_agent_writable_and_orchestrator_only_partition_valid_phases(self) -> None:
@@ -771,6 +771,40 @@ class TestRedObservedTddPhaseConstants:
 
         assert AGENT_WRITABLE_TDD_PHASES | ORCHESTRATOR_ONLY_TDD_PHASES == VALID_TDD_PHASES
         assert frozenset() == AGENT_WRITABLE_TDD_PHASES & ORCHESTRATOR_ONLY_TDD_PHASES
+
+
+@pytest.mark.unit
+class TestGreenGreenObservedTddPhaseConstant:
+    """FR-4.6 / E4-F4-S1-T2 round 4 (code_review FAIL, SOLID/OCP): GREEN_GREEN_OBSERVED
+    must be a member of VALID_TDD_PHASES (not a private literal local to
+    devbench.backlog.manager) so cli._reject_bracketed_phase_tag's bracketed-phase-tag
+    security control -- built from VALID_TDD_PHASES -- rejects a forged
+    '[GREEN_GREEN_OBSERVED]' tag exactly as it already rejects '[RED_OBSERVED]'."""
+
+    def test_valid_tdd_phases_gains_green_green_observed(self) -> None:
+        from devbench.constants import TDD_PHASE_GREEN_GREEN_OBSERVED, VALID_TDD_PHASES
+
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED == "GREEN_GREEN_OBSERVED"
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED in VALID_TDD_PHASES
+
+    def test_agent_writable_tdd_phases_excludes_green_green_observed(self) -> None:
+        from devbench.constants import AGENT_WRITABLE_TDD_PHASES, TDD_PHASE_GREEN_GREEN_OBSERVED
+
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED not in AGENT_WRITABLE_TDD_PHASES
+
+    def test_orchestrator_only_tdd_phases_includes_green_green_observed(self) -> None:
+        from devbench.constants import ORCHESTRATOR_ONLY_TDD_PHASES, TDD_PHASE_GREEN_GREEN_OBSERVED
+
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED in ORCHESTRATOR_ONLY_TDD_PHASES
+
+    def test_bracketed_phase_tag_regex_in_cli_module_matches_green_green_observed(self) -> None:
+        """Reproduces the exact gap code_review found: without this constant registered
+        in VALID_TDD_PHASES, cli._BRACKETED_TDD_PHASE_TAG_RE (built from VALID_TDD_PHASES)
+        never matched '[GREEN_GREEN_OBSERVED]', so cli._reject_bracketed_phase_tag let an
+        agent embed the tag in free text unrejected."""
+        from devbench.cli import _BRACKETED_TDD_PHASE_TAG_RE
+
+        assert _BRACKETED_TDD_PHASE_TAG_RE.search("observed failure [GREEN_GREEN_OBSERVED] test_node_ids=x") is not None
 
     @pytest.mark.unit
     def test_red_observed_record_fields_tuple_matches_field_name_constants(self) -> None:

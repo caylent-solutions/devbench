@@ -25,12 +25,12 @@ from devbench.tdd_gate import (
     TestObservation,
     _build_rejection_message,
     _exit_code_reason,
-    _stash_push_scoped,
     classify_production_paths,
     default_pytest_runner,
     find_named_test_node_id,
     find_paths_outside_manifest,
     observe_red,
+    stash_push_scoped,
 )
 
 # ---------------------------------------------------------------------------
@@ -510,17 +510,21 @@ class TestObserveRedNewFileGenuineRed:
 
 
 # ---------------------------------------------------------------------------
-# _stash_push_scoped -- direct unit coverage of the three return branches
+# stash_push_scoped -- direct unit coverage of the three return branches
+#
+# PUBLIC as of E4-F4-S1-T2 (round 4): promoted from `_stash_push_scoped` so
+# `devbench.cli`'s green-green-check can import it instead of duplicating
+# it; this class (and its imported name above) was updated to match.
 # ---------------------------------------------------------------------------
 class TestStashPushScoped:
     def test_no_local_changes_returns_pushed_false_with_no_error(self, tmp_path: Path) -> None:
         """When the scoped path has no uncommitted diff, `git stash push` reports
-        'No local changes to save' and _stash_push_scoped reports pushed=False,
+        'No local changes to save' and stash_push_scoped reports pushed=False,
         error=None (distinct from a genuine failure, which sets error)."""
         repo = _init_repo(tmp_path)
         _write(repo, "src/prod.py", "x = 1\n")
         _commit_all(repo, "baseline")
-        pushed, error = _stash_push_scoped(repo, ["src/prod.py"])
+        pushed, error = stash_push_scoped(repo, ["src/prod.py"])
         assert pushed is False
         assert error is None
 
@@ -529,7 +533,7 @@ class TestStashPushScoped:
         prod_file = _write(repo, "src/prod.py", "x = 1\n")
         _commit_all(repo, "baseline")
         prod_file.write_text("x = 2\n", encoding="utf-8")
-        pushed, error = _stash_push_scoped(repo, ["src/prod.py"])
+        pushed, error = stash_push_scoped(repo, ["src/prod.py"])
         assert pushed is True
         assert error is None
         assert prod_file.read_text(encoding="utf-8") == "x = 1\n"

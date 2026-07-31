@@ -77,7 +77,15 @@ _EXIT_CODE_REASONS: dict[int, str] = {
 # whether `git stash pop` is safe to run afterward (popping with no stash
 # entry created by this call would risk popping an unrelated stash entry
 # from the same stack).
-_STASH_NO_LOCAL_CHANGES_MARKER: str = "No local changes to save"
+#
+# PUBLIC (E4-F4-S1-T2, code_review FAIL round 4, DRY): this marker and the
+# `stash_push_scoped`/`stash_pop` helpers below were module-private until
+# `devbench.cli`'s green-green-check needed the identical scoped-stash
+# behavior for its own before/after reconstruction and, unable to import a
+# private name across modules, duplicated all three verbatim as `_gg_*`.
+# Promoting them to public symbols here (and importing them in cli.py
+# instead) is the single source of truth; the `_gg_*` duplicates are gone.
+STASH_NO_LOCAL_CHANGES_MARKER: str = "No local changes to save"
 
 # Matches a pytest node id embedded in an agent's free-text RED entry
 # message, e.g. "tests/test_foo.py::test_baz" or
@@ -263,8 +271,12 @@ def find_paths_outside_manifest(repo_path: Path, manifest_paths: Sequence[str]) 
     return outside
 
 
-def _stash_push_scoped(repo_path: Path, prod_paths: Sequence[str]) -> tuple[bool, str | None]:
+def stash_push_scoped(repo_path: Path, prod_paths: Sequence[str]) -> tuple[bool, str | None]:
     """Run ``git stash push -u -- <prod_paths>``.
+
+    PUBLIC: also the shared "before"-state reconstruction step used by
+    ``devbench.cli``'s green-green-check (FR-4.6) -- see the module-level
+    note above ``STASH_NO_LOCAL_CHANGES_MARKER``.
 
     Returns:
         A ``(pushed, error)`` pair. ``pushed`` is ``True`` only when a stash
@@ -276,13 +288,17 @@ def _stash_push_scoped(repo_path: Path, prod_paths: Sequence[str]) -> tuple[bool
     exit_code, stdout, stderr = run_command(["git", "stash", "push", "-u", "--", *prod_paths], cwd=repo_path)
     if exit_code != 0:
         return False, (stderr.strip() or stdout.strip() or f"git stash push exited {exit_code}")
-    if _STASH_NO_LOCAL_CHANGES_MARKER in stdout:
+    if STASH_NO_LOCAL_CHANGES_MARKER in stdout:
         return False, None
     return True, None
 
 
-def _stash_pop(repo_path: Path) -> str | None:
-    """Run ``git stash pop``. Returns an error description, or ``None`` on success."""
+def stash_pop(repo_path: Path) -> str | None:
+    """Run ``git stash pop``. Returns an error description, or ``None`` on success.
+
+    PUBLIC: also the shared "after"-state restore step used by
+    ``devbench.cli``'s green-green-check (FR-4.6) -- see ``stash_push_scoped``.
+    """
     exit_code, stdout, stderr = run_command(["git", "stash", "pop"], cwd=repo_path)
     if exit_code != 0:
         return stderr.strip() or stdout.strip() or f"git stash pop exited {exit_code}"
@@ -396,7 +412,7 @@ def observe_red(
             )
         )
 
-    pushed, push_error = _stash_push_scoped(repo_path, prod_paths)
+    pushed, push_error = stash_push_scoped(repo_path, prod_paths)
     if push_error is not None:
         raise TddGateRejectionError(
             _build_rejection_message(
@@ -422,7 +438,7 @@ def observe_red(
         test_exception = caught
     finally:
         if pushed:
-            pop_error = _stash_pop(repo_path)
+            pop_error = stash_pop(repo_path)
 
     if pushed and pop_error is not None:
         detail = f"'git stash pop' failed after observing the test run: {pop_error}."

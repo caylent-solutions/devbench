@@ -260,8 +260,29 @@ TDD_PHASE_REFACTOR: str = "REFACTOR"
 # conditionals, so the authorization boundary has one definition.
 TDD_PHASE_RED_OBSERVED: str = "RED_OBSERVED"
 
+# GREEN_GREEN_OBSERVED (FR-4.6 / E4-F4-S1-T2, issue #257) is a fifth TDD
+# Cycle Log phase, mirroring RED_OBSERVED: written exclusively by the
+# orchestrator (``devbench green-green-check``) after it has independently
+# run a refactor task's named tests both before and after the change and
+# observed both sides pass. It is a *valid* phase but not agent-writable.
+# Registering it here (rather than as a private literal local to
+# ``devbench.backlog.manager``, as it was through round 3 -- code_review
+# FAIL round 4, SOLID/OCP) is load-bearing, not cosmetic:
+# ``cli._reject_bracketed_phase_tag``'s bracketed-phase-tag security control
+# (HIGH finding, E4-F3-S1-T1) is built directly from ``VALID_TDD_PHASES``, so
+# a phase absent from this set is a phase agent free text can forge
+# unrejected. Adding it here, and only here, closes that gap for every
+# consumer of ``VALID_TDD_PHASES``/``ORCHESTRATOR_ONLY_TDD_PHASES`` at once.
+TDD_PHASE_GREEN_GREEN_OBSERVED: str = "GREEN_GREEN_OBSERVED"
+
 VALID_TDD_PHASES: frozenset[str] = frozenset(
-    {TDD_PHASE_RED, TDD_PHASE_GREEN, TDD_PHASE_REFACTOR, TDD_PHASE_RED_OBSERVED}
+    {
+        TDD_PHASE_RED,
+        TDD_PHASE_GREEN,
+        TDD_PHASE_REFACTOR,
+        TDD_PHASE_RED_OBSERVED,
+        TDD_PHASE_GREEN_GREEN_OBSERVED,
+    }
 )
 AGENT_WRITABLE_TDD_PHASES: frozenset[str] = frozenset({TDD_PHASE_RED, TDD_PHASE_GREEN, TDD_PHASE_REFACTOR})
 ORCHESTRATOR_ONLY_TDD_PHASES: frozenset[str] = VALID_TDD_PHASES - AGENT_WRITABLE_TDD_PHASES

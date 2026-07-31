@@ -223,8 +223,14 @@ class TestMarkDone:
     """Test mark_done delegates to set_status and updates both files."""
 
     def test_mark_done_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
-        # Append required judge pass entries so the done-gate check passes
+        # Append required judge pass entries so the done-gate check passes.
+        # Declare an exempt Task Type (E4-F4-S1-T2 round 3: mark_done() now
+        # enforces the FR-4.5/FR-4.6 task-type invariant directly, so an
+        # undeclared type would default to the strictest gated type and
+        # this test -- which is about the judges-pass gate, not the
+        # task-type gate -- would fail for an unrelated reason).
         content = tmp_work_unit_file.read_text(encoding="utf-8")
+        content = content.replace("## Status: in-queue\n", "## Status: in-queue\n\n## Task Type: chore\n", 1)
         tmp_work_unit_file.write_text(content + _ALL_JUDGES_PASSED_COMMENTS, encoding="utf-8")
 
         judge = BacklogManager()
@@ -246,7 +252,10 @@ class TestMarkDone:
 
     def test_mark_done_raises_when_no_status_line(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         bad_file = tmp_path / "bad.md"
-        bad_file.write_text("# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS)
+        # Declare an exempt Task Type so this test exercises only the
+        # missing-status-line ValueError, not the task-type invariant that
+        # mark_done() now also enforces (E4-F4-S1-T2 round 3).
+        bad_file.write_text("# No status here\n\n## Task Type: chore\n\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS)
 
         judge = BacklogManager()
         with pytest.raises(ValueError, match="Could not find"):
@@ -581,10 +590,24 @@ class TestSecurityGate:
 class TestMarkDoneGate:
     """Test that mark_done enforces the done-gate check."""
 
-    def _make_wu(self, tmp_path: Path, comments: str = "") -> Path:
+    def _make_wu(
+        self,
+        tmp_path: Path,
+        comments: str = "",
+        *,
+        task_type: str | None = "chore",
+        tdd_cycle_log: str = "",
+    ) -> Path:
+        # Defaults to an exempt Task Type ("chore") so these judges-gate
+        # tests exercise only the judges-passed check, not the FR-4.5/FR-4.6
+        # task-type invariant mark_done() now also enforces directly
+        # (E4-F4-S1-T2 round 3). Tests targeting the task-type invariant
+        # itself pass ``task_type`` explicitly.
+        task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
         wu = tmp_path / "E0-F1-S1-T1.md"
         wu.write_text(
-            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n{task_type_section}"
+            f"## TDD Cycle Log\n\n{tdd_cycle_log}\n## Comments\n\n{comments}",
             encoding="utf-8",
         )
         return wu
@@ -609,6 +632,66 @@ class TestMarkDoneGate:
 
     def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
         wu = self._make_wu(tmp_path, _all_five_judges_pass_block())
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_raises_when_gated_default_type_missing_red_observed(self, tmp_path: Path) -> None:
+        """code_review FAIL round 3 regression: BacklogManager.mark_done() itself
+        must enforce the RED_OBSERVED invariant for a gated task, not merely
+        cli.py's cmd_mark_done wrapper -- so every caller (including
+        _check_merge_handle_merged / check-merge) inherits the block."""
+        # No ``## Task Type:`` section declared at all -> defaults to the
+        # strictest gated type (DEFAULT_TASK_TYPE), same fail-closed
+        # precedent as _check_task_type_taxonomy.
+        wu = self._make_wu(tmp_path, _all_five_judges_pass_block(), task_type=None)
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        with pytest.raises(RuntimeError, match="no RED_OBSERVED record found"):
+            judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: in-review" in wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_succeeds_when_gated_type_has_red_observed(self, tmp_path: Path) -> None:
+        red_observed = (
+            "- [RED_OBSERVED] 2026-01-01T00:00:00+00:00 -- exit_code=1 "
+            "test_node_id=tests/test_x.py::test_y "
+            f"failure_digest={'a' * 64}\n"
+        )
+        wu = self._make_wu(
+            tmp_path,
+            _all_five_judges_pass_block(),
+            task_type="behavior-fix",
+            tdd_cycle_log=red_observed,
+        )
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_raises_when_refactor_missing_green_green_observed(self, tmp_path: Path) -> None:
+        """code_review FAIL round 3 regression: a refactor task with all judges
+        passed but no machine-observed GREEN_GREEN_OBSERVED record must be
+        blocked by BacklogManager.mark_done() itself."""
+        wu = self._make_wu(tmp_path, _all_five_judges_pass_block(), task_type="refactor")
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        with pytest.raises(RuntimeError, match="no GREEN_GREEN_OBSERVED record found"):
+            judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: in-review" in wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_succeeds_when_refactor_has_green_green_observed(self, tmp_path: Path) -> None:
+        green_green_observed = (
+            "- [GREEN_GREEN_OBSERVED] 2026-01-01T00:00:00+00:00 -- test_node_ids=tests/test_x.py::test_y\n"
+        )
+        wu = self._make_wu(
+            tmp_path,
+            _all_five_judges_pass_block(),
+            task_type="refactor",
+            tdd_cycle_log=green_green_observed,
+        )
         idx = self._make_index(tmp_path)
         judge = BacklogManager()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")
@@ -2311,7 +2394,14 @@ class TestParseSummaryTableEdgeCases:
 # ---------------------------------------------------------------------------
 
 
-def _unit_body(unit_id: str, status: str, *, deps: list[str] | None = None, comments: str = "") -> str:
+def _unit_body(
+    unit_id: str,
+    status: str,
+    *,
+    deps: list[str] | None = None,
+    comments: str = "",
+    task_type: str | None = None,
+) -> str:
     """Build a minimal well-formed work-unit file body for the scan tests.
 
     Produces the sections the parser and scan require (``Status``, ``Dependencies``,
@@ -2319,11 +2409,20 @@ def _unit_body(unit_id: str, status: str, *, deps: list[str] | None = None, comm
     task-level files (``Description``, ``Acceptance Criteria``, ``Changes Manifest``,
     ``Definition of Done``). Keeps every fixture self-contained so a test
     failure points at the scan logic rather than a malformed fixture.
+
+    ``task_type``, when provided, inserts a ``## Task Type:`` section so
+    callers that drive a real ``BacklogManager.mark_done()`` can declare an
+    exempt type (e.g. ``"chore"``) and avoid tripping the FR-4.5/FR-4.6
+    task-type invariant mark_done() enforces directly (E4-F4-S1-T2 round 3)
+    when the fixture's concern is unrelated (status transitions, auto-requeue
+    cascades).
     """
     dep_rows = "| none | | |" if not deps else "\n".join(f"| {d} | (auto) | proposed |" for d in deps)
+    task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
     return (
         f"# {unit_id}: Test Task\n\n"
         f"## Status: {status}\n\n"
+        f"{task_type_section}"
         "## Description\n\nAuto-requeue test fixture.\n\n"
         "## Dependencies\n\n"
         "| ID | Title | Status |\n"
@@ -2707,7 +2806,7 @@ class TestAutoRequeueMarkerDependents:
         # completed review round. Dep starts as in-review so mark_done is
         # the transition under test.
         review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
-        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n", task_type="chore")
         index = _write_workspace(
             tmp_path,
             rows=[
@@ -2746,7 +2845,7 @@ class TestAutoRequeueMarkerDependents:
             comments=markers,
         )
         review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
-        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n", task_type="chore")
 
         # Use a richer BACKLOG.md that includes the Story parent so rollup
         # has something to consider.
@@ -3026,7 +3125,7 @@ class TestAutoRequeueRegularDepDependents:
             comments=sync_blocked_audit,
         )
         review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
-        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n", task_type="chore")
         index = _write_workspace(
             tmp_path,
             rows=[
@@ -5052,6 +5151,145 @@ class TestValidateNoOrphanPathTokens:
         # error for the same Task, but that error does not start with
         # the orphan-rule prefix.
         assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+
+class TestIsValidCitation:
+    """BacklogManager.is_valid_citation (FR-4.5): commit hash or task id shape.
+
+    A citation is either a git commit hash (7-40 lowercase hex characters,
+    covering both abbreviated and full SHA forms) or a canonical work-unit
+    ID matching the same shape enforced by Check 17's dependency-ID format
+    rule. Free text is never a valid citation -- it must be independently
+    verifiable.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "abc1234",
+            "0123456789abcdef0123456789abcdef01234567",
+            "deadbeef",
+            "E4-F4-S1-T2",
+            "E4",
+            "E4-F4",
+            "E4-F4-S1",
+        ],
+        ids=[
+            "commit-min-length",
+            "commit-40-char",
+            "commit-hex-word",
+            "task-id-full",
+            "task-id-epic-only",
+            "task-id-epic-feature",
+            "task-id-epic-feature-story",
+        ],
+    )
+    def test_valid_citations_accepted(self, value: str) -> None:
+        assert BacklogManager.is_valid_citation(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "   ",
+            "abc12",  # too short for a commit hash
+            "not-a-commit-hash-or-task-id",
+            "ABCDEF1",  # uppercase hex is never a git-reported hash
+            "closed by a prior task",
+            "1234567890abcdef1234567890abcdef123456789",  # 43 chars, too long
+        ],
+        ids=[
+            "empty",
+            "whitespace-only",
+            "too-short-hash",
+            "free-text",
+            "uppercase-hex",
+            "prose-sentence",
+            "too-long-hash",
+        ],
+    )
+    def test_invalid_citations_rejected(self, value: str) -> None:
+        assert BacklogManager.is_valid_citation(value) is False
+
+    def test_citation_with_surrounding_whitespace_is_trimmed(self) -> None:
+        assert BacklogManager.is_valid_citation("  abc1234  ") is True
+
+
+class TestValidateAlreadySatisfiedDeclineCitation:
+    """Check 22: an already-satisfied decline must cite a commit or task id (FR-4.5).
+
+    An uncited already-satisfied decline is rejected by validate-backlog's
+    comment-format checks; a cited decline is accepted and the citation is
+    preserved verbatim in the Comments section.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _append_declined_comment(wu_path: Path, message: str) -> None:
+        content = wu_path.read_text(encoding="utf-8")
+        entry = f"[2026-01-01 00:00 UTC] [backlog_manager] [DECLINED] {message}\n"
+        content += ("\n## Comments\n\n" + entry) if "## Comments" not in content else ("\n" + entry)
+        wu_path.write_text(content, encoding="utf-8")
+
+    def _errors_for(self, tmp_path: Path, backlog_dir: Path, row_id: str, declined_message: str) -> list[str]:
+        wu = self.H.make_task(
+            backlog_dir,
+            row_id,
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            status="declined",
+        )
+        self._append_declined_comment(wu, declined_message)
+        idx = self.H.make_index(
+            tmp_path,
+            f"| {row_id} | T | Task | declined | none | ex/foo | `backlog/{row_id}.md` |\n",
+        )
+        return BacklogManager().validate(idx, tmp_path)
+
+    def test_uncited_already_satisfied_decline_is_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T1", "already-satisfied")
+        matches = [e for e in errors if "EX-F1-S1-T1" in e and "already-satisfied" in e]
+        assert len(matches) == 1
+        assert "citation" in matches[0]
+
+    def test_cited_already_satisfied_decline_with_commit_hash_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T2", "already-satisfied (citing abc1234)")
+        assert not any("EX-F1-S1-T2" in e and "already-satisfied" in e for e in errors)
+
+    def test_cited_already_satisfied_decline_with_task_id_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T3", "already-satisfied (citing E1-F1-S1-T9)")
+        assert not any("EX-F1-S1-T3" in e and "already-satisfied" in e for e in errors)
+
+    def test_declined_for_unrelated_reason_without_citation_unaffected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T4", "duplicate of E1-F1-S1-T2")
+        assert not any("EX-F1-S1-T4" in e and "citation" in e for e in errors)
+
+    def test_non_declined_task_unaffected_even_with_already_satisfied_text(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        wu = self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T5",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            status="in-queue",
+        )
+        self._append_declined_comment(wu, "already-satisfied")
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T5 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T5.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("EX-F1-S1-T5" in e and "citation" in e for e in errors)
+
+    def test_missing_file_path_row_skipped(self, tmp_path: Path) -> None:
+        """Defensive guard: rows with empty file_path should not crash the rule."""
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "declined", "")]
+        manager._check_already_satisfied_decline_citation(rows, tmp_path, errors)
+        assert errors == []
 
 
 class TestAutoRequeueOnDeclineTransition:

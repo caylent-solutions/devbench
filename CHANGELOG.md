@@ -225,6 +225,71 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Honest completion paths for the machine-observed RED gate: three
+  named remedies, a cited already-satisfied decline, and a refactor
+  green-green check** (FR-4.5/FR-4.6, E4-F4-S1-T2). The RED gate
+  (`devbench.tdd_gate._build_rejection_message`, shipped by
+  E4-F3-S1-T2) already named all three legitimate ways forward --
+  produce a genuine RED, re-type the task, or decline it as
+  already-satisfied -- in every rejection it raises. This task adds two
+  new surfaces that reuse the same `tdd_gate.REMEDY_1`/`REMEDY_2`/
+  `REMEDY_3` constants via a new
+  `devbench.backlog.manager._build_remedies_rejection_message` helper so
+  the same three remedies are named consistently there too: the
+  gated-task-type block enforced by `BacklogManager.mark_done` (below),
+  and `devbench decline`'s citation requirement. `devbench decline`
+  gained a `--citation
+  <commit-hash-or-task-id>` flag: declining a task with a reason naming
+  "already-satisfied" now requires a valid citation (a 7-40 character
+  lowercase hex commit hash or a task id, checked by the new
+  `BacklogManager.is_valid_citation`); an uncited already-satisfied
+  decline is rejected as unfalsifiable, and `validate-backlog` gained a
+  matching static check (check 22) that flags any already-satisfied
+  `[DECLINED]` comment persisted without one. The FR-4.5/FR-4.6
+  task-type completion invariant now lives in
+  `BacklogManager.mark_done` itself
+  (`_check_task_type_done_invariant`), not in a CLI-layer wrapper, so
+  every caller inherits it identically: both `devbench mark-done` and
+  `devbench check-merge` (on a merged PR) now refuse a gated task
+  (`behavior-fix` / `feature`, including the default when `## Task
+  Type:` is omitted) that carries no `[RED_OBSERVED]` record in its TDD
+  Cycle Log, so a behavior-fix whose test already passed before any
+  change is routed to decline rather than silently claimed as done via
+  either surface. A new `devbench green-green-check <id>
+  <test_node_id> [...]` command gives `refactor` tasks -- exempt from
+  the RED gate but not from their own invariant -- a way to prove the
+  change is behavior-preserving: it confirms the named tests pass in
+  the current ("after") tree, path-scoped stashes the Changes
+  Manifest's production-source rows to reconstruct the pre-change
+  ("before") state, confirms the same tests pass there too, and
+  restores the stash unconditionally (including when the before-state
+  run itself raises). If the stash push finds no uncommitted
+  production-source change to save, the check rejects rather than
+  silently comparing the tree to itself, so a refactor with nothing
+  actually changed cannot false-pass. A collection failure on either
+  side fails closed, never reported as a pass. On success, the check
+  appends a machine-observed `[GREEN_GREEN_OBSERVED]` entry to the work
+  unit's TDD Cycle Log naming the confirmed test node ids.
+  `GREEN_GREEN_OBSERVED` is registered in `constants.VALID_TDD_PHASES`
+  as orchestrator-only (not in `AGENT_WRITABLE_TDD_PHASES`), mirroring
+  the `RED_OBSERVED` control: an agent cannot write it via `log-tdd`,
+  and `cli._reject_bracketed_phase_tag`'s bracketed-phase-tag forgery
+  check now also rejects a forged `[GREEN_GREEN_OBSERVED]` tag in
+  `log-tdd`/`log-comment`/`log-verdict` free text. Because the
+  same `BacklogManager.mark_done` invariant check backs both surfaces,
+  both `devbench mark-done` and `devbench check-merge` now refuse a
+  `refactor` task carrying no such record, so `green-green-check` is a
+  gate a refactor task must pass through, not an optional, unconsumed
+  command. Three end-to-end journeys in the new
+  `tests/test_integration/test_tdd_red_gate_e2e.py` script the
+  operator-facing scenarios against real git repositories: a false-fix
+  attempt is judged REVIEW_FAIL with the exact FR-4.4 message pulled
+  verbatim from the judge prompts; an honest behavior-fix (real RED
+  observed, real fix applied, real GREEN) reaches done with the
+  `[RED_OBSERVED]` record present; and all five required judge verdicts
+  are independently attributable, with any one of the four review-team
+  judges missing blocking done.
+
 - **Quota wait-and-resume** (ADR-24, issue #236). `devbench start`
   detects Anthropic subscription rate-limit exhaustion mid-session
   (HTTP 429, the CLI's verbatim "You've hit your limit" text, or an

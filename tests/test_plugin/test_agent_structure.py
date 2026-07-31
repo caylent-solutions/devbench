@@ -43,7 +43,7 @@ class TestReviewTeamDirectory:
 
 @pytest.mark.unit
 class TestReviewSupervisorFrontmatter:
-    """AC-2: review-supervisor.md exists with correct frontmatter."""
+    """AC-2 / ADR-28: review-supervisor.md exists, tools: Bash, NO Agent tool."""
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
@@ -156,6 +156,95 @@ class TestReviewSupervisorNonSpawningAggregation:
             "review-supervisor.md Step 1 must state that entries above the "
             "[REVIEW_REJECTED] boundary belong to a prior round and are never collected, "
             "while entries below it (the current round) count."
+        )
+
+
+@pytest.mark.unit
+class TestReviewSupervisorRetainedContractDetails:
+    """Regression pins carried over from origin/main commit 9c462f2 (issue #288).
+
+    That commit deprecated review-supervisor to a never-invoked stub (ADR-33's
+    original framing); this merge instead keeps the feat/updates topology where
+    review-supervisor IS invoked, but only as a non-spawning aggregator. Three
+    of that commit's assertions describe properties that hold regardless of
+    which topology wins -- both ADRs must stay cited, the file must never
+    regain its pre-flatten parallel-dispatch instructions, and the
+    ``model:`` frontmatter line plugin_shadow rewrites must survive -- so they
+    are restored here verbatim rather than dropped.
+    """
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    def test_supervisor_references_the_governing_adrs(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "ADR-33" in content, "the flatten decision (ADR-33) must be cited"
+        assert "ADR-28" in content, "the original root-cause analysis (ADR-28) must remain cited"
+
+    def test_supervisor_retains_the_model_frontmatter_line(self) -> None:
+        """plugin_shadow._rewrite_agent_model raises when this line is missing."""
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert re.search(r"^model:[ \t]+\S", content, re.MULTILINE), (
+            "per-agent model overrides rewrite this line; without it the override is a hard error"
+        )
+
+    def test_supervisor_no_pre_flatten_parallel_dispatch_instructions(self) -> None:
+        """The pre-flatten Step-0 self-check and parallel-dispatch instructions
+        must not reappear -- the non-spawning aggregator contract (ADR-33)
+        forbids review-supervisor from ever invoking the judges itself, in
+        either topology.
+        """
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "Step 0" not in content, "the pre-flatten Step-0 self-check must not reappear (ADR-33)"
+        assert "invoke them in parallel" not in content, (
+            "review-supervisor must not carry pre-flatten parallel-dispatch instructions"
+        )
+
+
+@pytest.mark.unit
+class TestReviewSupervisorNeverSelfLogsJudgeVerdicts:
+    """Adapted from origin/main's TestReviewSupervisorVerdictFormat::test_supervisor_logs_no_verdicts
+    and TestReviewSupervisorEmitsNoJudgeNames::test_supervisor_declares_no_log_verdict_calls
+    (commit 9c462f2, issue #288).
+
+    Those two tests asserted the literal substring ``log-verdict`` never
+    appears in review-supervisor.md at all -- true only under the never-
+    invoked-stub topology. Under the feat/updates aggregator topology the
+    file legitimately quotes ``log-verdict`` lines as illustrative examples
+    of what the judges themselves already logged. The invariant both parents
+    actually agree on is narrower: review-supervisor itself must never be
+    the one calling ``log-verdict`` for the four review_team judges -- it
+    only confirms their already-persisted calls and reports its own findings
+    via ``log-comment``. This class pins that narrower, topology-correct
+    invariant instead of the literal (and now false) substring-absence check.
+    """
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    def test_supervisor_declares_it_never_logs_verdicts_for_the_judges(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        normalized = re.sub(r"\s+", " ", content)
+        assert "never call `log-verdict` yourself for the review_team judges" in normalized, (
+            "review-supervisor.md must explicitly state it never calls log-verdict "
+            "itself for the review_team judges -- only the judges self-log."
+        )
+
+    def test_supervisor_confirms_rather_than_re_emits_judge_verdicts(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        normalized = re.sub(r"\s+", " ", content)
+        assert "confirm their presence, do not re-emit them" in normalized, (
+            "review-supervisor.md must instruct confirming the judges' already-logged "
+            "verdicts rather than re-emitting log-verdict calls for them."
+        )
+
+    def test_supervisor_reports_its_own_findings_via_log_comment(self) -> None:
+        """review-supervisor's own reporting channel is log-comment, never
+        log-verdict -- it has no canonical judge name of its own to log a
+        verdict under.
+        """
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "log-comment review-supervisor" in content, (
+            "review-supervisor.md must report its own findings and summaries via "
+            "'log-comment review-supervisor', not via 'log-verdict'."
         )
 
 

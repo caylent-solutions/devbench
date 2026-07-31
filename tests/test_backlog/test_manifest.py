@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import subprocess as _subprocess
+from pathlib import Path as _Path
+from typing import Any, cast
+from unittest.mock import patch as _patch
+
 import pytest
 
 from devbench.backlog.manifest import (
@@ -10,6 +15,9 @@ from devbench.backlog.manifest import (
     ManifestParseError,
     ManifestRow,
     append_rows,
+    assert_staged_matches_manifest,
+    list_changed_files,
+    list_staged_files,
     parse_manifest,
     render_manifest_rows,
 )
@@ -116,7 +124,7 @@ class TestManifestRow:
     def test_frozen(self) -> None:
         row = ManifestRow(file="src/a.py", change="x")
         with pytest.raises(AttributeError):
-            row.file = "other"  # type: ignore[misc]
+            cast(Any, row).file = "other"
 
     def test_equality(self) -> None:
         assert ManifestRow(file="a", change="b") == ManifestRow(file="a", change="b")
@@ -380,12 +388,6 @@ class TestAppendRows:
 # Slice 3b: list_staged_files + assert_staged_matches_manifest
 # ---------------------------------------------------------------------------
 
-import subprocess as _subprocess  # noqa: E402
-from pathlib import Path as _Path  # noqa: E402
-from unittest.mock import patch as _patch  # noqa: E402
-
-from devbench.backlog.manifest import assert_staged_matches_manifest, list_staged_files  # noqa: E402
-
 
 def _init_repo_with_file(path: _Path, filename: str, contents: str = "x") -> None:
     _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
@@ -408,7 +410,7 @@ class TestListStagedFiles:
         assert sorted(staged) == ["src/a.py", "src/b.py"]
 
     def test_non_git_dir_raises(self, tmp_path: _Path) -> None:
-        with pytest.raises(RuntimeError, match="git diff --cached --name-only failed"):
+        with pytest.raises(RuntimeError, match=r"git diff --cached --name-only -z failed"):
             list_staged_files(tmp_path)
 
     def test_timeout_raises_runtime_error(self, tmp_path: _Path) -> None:
@@ -444,6 +446,71 @@ class TestAssertStagedMatchesManifest:
         assert "TRACE_FILE" in msg
         # src/a.py appears in the "Manifest declares" list but not in the offender list
         assert "staged file(s) not in Changes Manifest: ['TRACE_FILE']" in msg
+
+
+# ---------------------------------------------------------------------------
+# Claim-time checkout scope guard: the shared single-branch checkout must hold
+# only paths the claiming work unit is authorized to touch.
+# ---------------------------------------------------------------------------
+
+
+def _commit_baseline(path: _Path) -> None:
+    """Stage everything present and commit it, so the tree starts clean."""
+    _subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "baseline"], cwd=path, check=True, capture_output=True)
+
+
+class TestListChangedFiles:
+    def test_clean_tree_returns_empty_list(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _commit_baseline(tmp_path)
+        assert list_changed_files(tmp_path) == []
+
+    def test_staged_change_is_reported(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _commit_baseline(tmp_path)
+        (tmp_path / "src/a.py").write_text("changed")
+        _subprocess.run(["git", "add", "src/a.py"], cwd=tmp_path, check=True, capture_output=True)
+        assert list_changed_files(tmp_path) == ["src/a.py"]
+
+    def test_unstaged_tracked_modification_is_reported(self, tmp_path: _Path) -> None:
+        """The case ``list_staged_files`` misses: a unit that blocked before staging."""
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _commit_baseline(tmp_path)
+        (tmp_path / "src/a.py").write_text("changed")
+        assert list_staged_files(tmp_path) == []
+        assert list_changed_files(tmp_path) == ["src/a.py"]
+
+    def test_untracked_file_is_reported(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _commit_baseline(tmp_path)
+        (tmp_path / "leftover.py").write_text("residue")
+        assert list_changed_files(tmp_path) == ["leftover.py"]
+
+    def test_gitignored_file_is_not_reported(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        (tmp_path / ".gitignore").write_text("build/\n")
+        _commit_baseline(tmp_path)
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build/out.o").write_text("binary")
+        assert list_changed_files(tmp_path) == []
+
+    def test_union_is_sorted_and_deduplicated(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/z.py")
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _commit_baseline(tmp_path)
+        # src/a.py is both staged AND modified again in the worktree, so it is
+        # reported by two of the three underlying queries.
+        (tmp_path / "src/a.py").write_text("staged")
+        _subprocess.run(["git", "add", "src/a.py"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "src/a.py").write_text("and then modified again")
+        (tmp_path / "src/z.py").write_text("unstaged only")
+        (tmp_path / "new.py").write_text("untracked")
+        assert list_changed_files(tmp_path) == ["new.py", "src/a.py", "src/z.py"]
+
+    def test_non_git_dir_raises(self, tmp_path: _Path) -> None:
+        with pytest.raises(RuntimeError, match=r"git diff --cached --name-only -z failed"):
+            list_changed_files(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -504,3 +571,20 @@ class TestMarkdownPipeEscapes:
         assert len(rows) == 1
         assert rows[0].file == "src/example/parser.py"
         assert rows[0].change == "add feature"
+
+
+class TestRepoPrefixedManifestRows:
+    """Multi-repo work units encode the repo in the File cell as `` `<org/repo>` -- <path> ``."""
+
+    def test_repo_prefixed_file_cell_yields_the_bare_path(self) -> None:
+        content = (
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `caylent-solutions/devbench` -- `src/devbench/cli.py` | modify |\n\n"
+            "## End\n"
+        )
+        rows = parse_manifest(content)
+        assert len(rows) == 1
+        assert rows[0].file == "src/devbench/cli.py"
+        assert rows[0].change == "modify"

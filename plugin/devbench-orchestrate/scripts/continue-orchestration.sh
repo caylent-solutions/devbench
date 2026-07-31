@@ -22,13 +22,21 @@ CONFIG_FILE="${WORKSPACE_ROOT}/backlog/config/devbench.yaml"
 SESSION_NAME="${DEVBENCH_SESSION_NAME:-}"
 
 # Per-session circuit-breaker state file (AC-192-15):
+# State lives under DEVBENCH_STOP_HOOK_STATE_DIR when set, else /tmp. The seam
+# exists because the default directory is shared machine-wide: a test suite and
+# a live orchestrator on the same host would otherwise contend for the identical
+# file, and a test asserting the shared state file is absent fails whenever a
+# real hook run happens to write it. Callers that need isolation set the env var;
+# the unset default preserves the original paths exactly.
+STATE_DIR="${DEVBENCH_STOP_HOOK_STATE_DIR:-/tmp}"
+
 # When DEVBENCH_SESSION_NAME is set, scope the state file to the named session
 # so concurrent orchestrator sessions maintain independent block counters.
 # When unset, fall back to the shared path for single-session (legacy) behaviour.
 if [ -n "$SESSION_NAME" ]; then
-    STATE_FILE="/tmp/devbench-stop-hook-state-${SESSION_NAME}.json"
+    STATE_FILE="${STATE_DIR}/devbench-stop-hook-state-${SESSION_NAME}.json"
 else
-    STATE_FILE="/tmp/devbench-stop-hook-state.json"
+    STATE_FILE="${STATE_DIR}/devbench-stop-hook-state.json"
 fi
 
 # If no workspace root or no backlog, allow stop.

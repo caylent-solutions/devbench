@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -153,7 +153,7 @@ class TestProposalDataclass:
 
     def test_from_dict_rejects_non_dict(self) -> None:
         with pytest.raises(ValueError, match="must be an object"):
-            Proposal.from_dict([1, 2, 3])  # type: ignore[arg-type]
+            Proposal.from_dict(cast(Any, [1, 2, 3]))
 
     def test_from_dict_rejects_missing_top_field(self) -> None:
         payload = _sample_proposal().to_dict()
@@ -243,6 +243,44 @@ class TestPathHelpers:
     def test_story_dir_valid(self, tmp_path: Path) -> None:
         path = _story_dir(tmp_path, "E0-F1-S1")
         assert path == tmp_path / "E0" / "E0-F1" / "E0-F1-S1"
+
+    def test_story_dir_resolves_existing_slug_directories(self, tmp_path: Path) -> None:
+        """spec-to-backlog names dirs ``<id>-<slug>``; materialise must reuse them."""
+        slug = tmp_path / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        slug.mkdir(parents=True)
+        assert _story_dir(tmp_path, "E0-F1-S1") == slug
+
+    def test_story_dir_prefers_directory_holding_the_story_file(self, tmp_path: Path) -> None:
+        """When a bare orphan tree and the canonical slug tree both exist, pick the canonical one."""
+        orphan = tmp_path / "E0" / "E0-F1" / "E0-F1-S1"
+        orphan.mkdir(parents=True)
+        canonical = tmp_path / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        canonical.mkdir(parents=True)
+        (canonical / "E0-F1-S1.md").write_text("# E0-F1-S1: Story\n")
+        assert _story_dir(tmp_path, "E0-F1-S1") == canonical
+
+    def test_story_dir_does_not_match_a_longer_story_number(self, tmp_path: Path) -> None:
+        """``E0-F1-S10-*`` must not satisfy a lookup for ``E0-F1-S1``."""
+        (tmp_path / "E0-epic" / "E0-F1-feat" / "E0-F1-S10-story").mkdir(parents=True)
+        assert _story_dir(tmp_path, "E0-F1-S1") == tmp_path / "E0" / "E0-F1" / "E0-F1-S1"
+
+    def test_scan_story_sees_tasks_inside_slug_directory(self, tmp_path: Path) -> None:
+        slug = tmp_path / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        slug.mkdir(parents=True)
+        for tid in ("E0-F1-S1-T1", "E0-F1-S1-T2"):
+            (slug / f"{tid}.md").write_text(f"# {tid}\n")
+        assert scan_story_for_task_ids(tmp_path, "E0-F1-S1") == {"E0-F1-S1-T1", "E0-F1-S1-T2"}
+
+    def test_allocate_next_ids_does_not_collide_with_slug_directory_tasks(self, tmp_path: Path) -> None:
+        """Allocating blind to the slug dir would return T1 and overwrite an existing task."""
+        slug = tmp_path / "backlog" / "E0-epic-slug" / "E0-F1-feature-slug" / "E0-F1-S1-story-slug"
+        slug.mkdir(parents=True)
+        for tid in ("E0-F1-S1-T1", "E0-F1-S1-T2"):
+            (slug / f"{tid}.md").write_text(f"# {tid}\n")
+        assert allocate_next_ids(tmp_path, tmp_path / "backlog", "E0-F1-S1", 2) == [
+            "E0-F1-S1-T3",
+            "E0-F1-S1-T4",
+        ]
 
     def test_constants_present(self) -> None:
         assert LOCK_FILE_NAME
@@ -562,6 +600,77 @@ class TestMaterialiseProposal:
         backlog = (workspace / "BACKLOG.md").read_text()
         assert "E0-F1-S1-T2" in backlog
         assert "E0-F1-S1-T3" in backlog
+
+    def test_promote_all_deletes_the_proposal_json_once_consumed(self, tmp_path: Path) -> None:
+        """A consumed proposal must not linger as a permanent AWAITING_AMENDMENT_RECOVERY signal.
+
+        Left on disk it classifies its source task as auto-recovering forever
+        -- the classifier keeps promising a task-factory sweep that will never
+        run again -- and ``write_proposal`` then refuses to emit a replacement,
+        so the task can neither recover nor be re-proposed.
+        """
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal()
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        assert proposal_path(workspace, "E0-F1-S1-T1").is_file()
+
+        promote_all_from_source(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            source_task_id="E0-F1-S1-T1",
+        )
+
+        assert not proposal_path(workspace, "E0-F1-S1-T1").exists()
+        # And the blocker-resolver can now emit a replacement -- this would
+        # raise ProposalError("Proposal already exists ...") otherwise.
+        write_proposal(workspace, _sample_proposal(task_ids=["E0-F1-S1-T4"]))
+
+    def test_promote_all_wires_every_task_before_deleting(self, tmp_path: Path) -> None:
+        """Deleting mid-loop would strip the JSON that later promotions read for wiring."""
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal()
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        promote_all_from_source(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            source_task_id="E0-F1-S1-T1",
+        )
+
+        source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert source_text.count("[BLOCKED_PENDING_PROPOSAL]") == 2
+
+    def test_consumed_check_is_a_noop_without_a_proposal(self, tmp_path: Path) -> None:
+        """A draft with no originating proposal must not trip the consumed check."""
+        workspace = _build_workspace(tmp_path)
+        proposal_mod.delete_proposal_if_consumed(workspace, workspace / "backlog", None)
+
+    def test_consumed_check_deletes_once_the_last_draft_is_declined(self, tmp_path: Path) -> None:
+        workspace = _build_workspace(tmp_path)
+        backlog_root = workspace / "backlog"
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2", "E0-F1-S1-T3"])
+        write_proposal(workspace, proposal)
+        _seed_draft(backlog_root, "E0-F1-S1-T2", "in-queue")
+        _seed_draft(backlog_root, "E0-F1-S1-T3", "declined")
+
+        proposal_mod.delete_proposal_if_consumed(workspace, backlog_root, proposal)
+
+        assert not proposal_path(workspace, "E0-F1-S1-T1").exists()
 
     def test_refuses_when_unresolved_proposed_rows_exist(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
@@ -4248,3 +4357,200 @@ class TestRejectionTagRegex:
         assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, (
             f"Expected AWAITING_AMENDMENT_RECOVERY for body {audit_body!r}, got {state.name}"
         )
+
+
+class TestClassifyBlockedTaskRetryBudgetExhausted:
+    """Issue #248: a spent retry budget is operator work, not recovery.
+
+    The orchestrate skill writes its retry-exhaustion row under
+    ``agent/orchestrator`` and names the failing checks, so it matched both
+    the recovery agent-tag allowlist and ``_RECOVERY_BODY_RE`` (which
+    includes ``ALL_REVIEWS_FAILED`` / ``REVIEW_REJECTED``). The unit was
+    therefore reported as ``AWAITING_AMENDMENT_RECOVERY``, whose contract is
+    "operator does nothing", while no further executor run was coming. The
+    run stalled with no alert.
+    """
+
+    def _workspace(self, tmp_path: Path, comments: str) -> Path:
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n" + comments
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    @staticmethod
+    def _classify(workspace: Path, now: datetime, window: int = 300) -> object:
+        from devbench.backlog.proposal import classify_blocked_task
+
+        return classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=window,
+        )
+
+    def test_exhausted_budget_classifies_operator_action_required(self, tmp_path: Path) -> None:
+        """The exact row shape that stalled a real run, now correctly classified."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] [RETRY_BUDGET_EXHAUSTED] "
+            "test_review REVIEW_REJECTED after 10 consecutive failures\n",
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    def test_same_row_without_the_tag_is_still_treated_as_recovery(self, tmp_path: Path) -> None:
+        """Guards the boundary: an ordinary REVIEW_REJECTED with retries left must not page the operator."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] test_review REVIEW_REJECTED, retrying\n",
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_exhausted_budget_beats_a_pending_proposal_json(self, tmp_path: Path) -> None:
+        """A leftover recovery artefact must not mask an exhausted budget."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] [RETRY_BUDGET_EXHAUSTED] budget spent\n",
+        )
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        assert self._classify(workspace, now) is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    def test_lowercase_prose_mention_of_the_tag_does_not_trigger(self, tmp_path: Path) -> None:
+        """Prose quoting the tag is not the tag, matching _REJECTION_TAG_RE's convention."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] ALL_REVIEWS_FAILED; "
+            "if this repeats we will see [retry_budget_exhausted]\n",
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_marker_driven_cascade_still_wins_over_the_tag(self, tmp_path: Path) -> None:
+        """A live cascade genuinely will clear the unit, so it must not be downgraded to operator work."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"\n[{ts}] [agent/orchestrator] [BLOCKED] [RETRY_BUDGET_EXHAUSTED] budget spent "
+            "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n",
+        )
+        # T2 exists and is non-terminal, so the ADR-07 cascade is genuinely in flight.
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            index.read_text()
+            + "| E0-F1-S1-T2 | Recovery | Task | in-queue | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+        )
+        (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md").write_text(
+            "# E0-F1-S1-T2: Recovery\n\n## Status: in-queue\n\n## Comments\n"
+        )
+        assert self._classify(workspace, now) is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+class TestHasRetryExhaustedSignalReadFailure:
+    """An unreadable work-unit file must not manufacture an operator alert (issue #248)."""
+
+    def test_unreadable_source_file_returns_false(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        from devbench.backlog.proposal import _has_retry_exhausted_signal
+
+        source = tmp_path / "E0-F1-S1-T1.md"
+        source.write_text("[RETRY_BUDGET_EXHAUSTED] present but unreadable", encoding="utf-8")
+        with patch.object(Path, "read_text", side_effect=OSError("permission denied")):
+            assert _has_retry_exhausted_signal(source) is False
+
+
+class TestFindDraftFileResolvesAnywhere:
+    """Issue #302: a work-unit ID identifies one unit wherever its file sits.
+
+    The resolver previously looked in exactly one computed story directory.
+    A unit living elsewhere read as absent, so ``classify_proposed_task``
+    reported UNMATERIALISED and the orchestrate loop's opening
+    ``sweep-proposals`` created it again in the canonical directory. That
+    produced two files and two index rows under one ID, on every start.
+    """
+
+    @staticmethod
+    def _write(root: Path, rel: str, status: str = "done") -> Path:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"# {target.stem}: T\n\n## Status: {status}\n", encoding="utf-8")
+        return target
+
+    def test_finds_a_unit_outside_the_canonical_story_directory(self, tmp_path: Path) -> None:
+        """The exact shape that caused the repeated duplication."""
+        from devbench.backlog.proposal import _find_draft_file
+
+        root = tmp_path / "backlog"
+        # Bare-ID tree, not the <id>-<slug> layout the resolver used to assume.
+        expected = self._write(root, "E2/E2-F4/E2-F4-S3/E2-F4-S3-T2.md")
+        assert _find_draft_file(root, "E2-F4-S3-T2") == expected
+
+    def test_finds_a_unit_in_the_slug_directory(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _find_draft_file
+
+        root = tmp_path / "backlog"
+        expected = self._write(root, "E2-quota/E2-F4-orch/E2-F4-S3-loop/E2-F4-S3-T2.md")
+        assert _find_draft_file(root, "E2-F4-S3-T2") == expected
+
+    def test_absent_unit_still_returns_none(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _find_draft_file
+
+        (tmp_path / "backlog").mkdir()
+        assert _find_draft_file(tmp_path / "backlog", "E9-F9-S9-T9") is None
+
+    def test_existing_unit_is_not_classified_unmaterialised(self, tmp_path: Path) -> None:
+        """The consequence that mattered: sweep-proposals re-creating a live unit."""
+        from devbench.backlog.proposal import ProposalTaskState, classify_proposed_task
+
+        root = tmp_path / "backlog"
+        self._write(root, "E2/E2-F4/E2-F4-S3/E2-F4-S3-T2.md", status="done")
+        state = classify_proposed_task(root, tmp_path, "E2-F4-S3-T2")
+        assert state is ProposalTaskState.DONE
+        assert state is not ProposalTaskState.UNMATERIALISED
+
+    def test_duplicate_files_are_refused_rather_than_picked_arbitrarily(self, tmp_path: Path) -> None:
+        """Returning either would make downstream decisions depend on walk order."""
+        from devbench.backlog.proposal import ProposalError, _find_draft_file
+
+        root = tmp_path / "backlog"
+        self._write(root, "E2/E2-F4/E2-F4-S3/E2-F4-S3-T2.md", status="done")
+        self._write(root, "E2-quota/E2-F4-orch/E2-F4-S3-loop/E2-F4-S3-T2.md", status="declined")
+        with pytest.raises(ProposalError) as exc:
+            _find_draft_file(root, "E2-F4-S3-T2")
+        msg = str(exc.value)
+        assert "duplicate work-unit file" in msg
+        assert "2 files carry this ID" in msg
+        assert "validate-backlog" in msg

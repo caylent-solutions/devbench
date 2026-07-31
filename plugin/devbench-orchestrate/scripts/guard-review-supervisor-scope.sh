@@ -50,6 +50,13 @@ fi
 # invokes them, and spawning any subagent (judge or otherwise) from
 # review-supervisor bypasses the documented pipeline. The override env
 # var still applies operator-wide.
+#
+# Issue #118: the prior Bash-only guard let the supervisor escalate by
+# spawning subagents (executor / git-ops) via the Agent tool. Issue #118
+# allow-listed the four review_team subagents because the supervisor
+# fanned out to them itself; ADR-33 moved that fan-out to the orchestrate
+# skill as a first-level dispatch, so the allowlist described a contract
+# that no longer exists.
 TOOL_NAME=$(extract_field "$INPUT" "tool_name")
 if [[ "$TOOL_NAME" == "Agent" ]]; then
   # Claude Code's PreToolUse Agent payload puts subagent_type under

@@ -185,6 +185,7 @@ class BlockedTaskState(Enum):
       will unblock this task automatically once the dependency completes.
       Operator does nothing.
     - ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no regular-dep blocker,
+      no ``[RETRY_BUDGET_EXHAUSTED]`` tag,
       but at least one recovery signal is present on disk: a pending proposal
       JSON, a rejected-amendment archive, or a recent ``[BLOCKED]`` audit
       comment from a recovery agent (``agent/orchestrator``,
@@ -192,7 +193,10 @@ class BlockedTaskState(Enum):
       ``agent/backlog_manager``). The orchestrator's next sweep cycle will
       advance the task. Operator does nothing for now.
     - ``OPERATOR_ACTION_REQUIRED`` -- none of the above conditions match:
-      no marker, no pending-dep, no recovery signal. Includes manual gates
+      no marker, no pending-dep, no recovery signal. Also covers a spent
+      executor retry budget, recorded by the orchestrate skill as
+      ``[RETRY_BUDGET_EXHAUSTED]``: no further executor run is coming, so
+      only an operator can move the unit (issue #248). Includes manual gates
       (``DO NOT CLAIM``), unknown marker targets, and cascade-stuck states.
       Operator must act.
     """
@@ -262,6 +266,13 @@ _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
 # emitted in upper-case by the manifest-amender; a lower-case occurrence
 # is a prose quote of the tag, not the tag itself.
 _REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
+# Issue #248: structured tag the orchestrate skill writes when a work unit
+# spends its entire executor retry budget. It is the one unambiguous
+# statement that no further executor run is coming, which is what separates
+# "reviews failed and the executor will try again" from "reviews failed and
+# there is nothing left to try". Case-sensitive for the same reason as
+# ``_REJECTION_TAG_RE``: a lower-case occurrence is prose quoting the tag.
+_RETRY_EXHAUSTED_TAG_RE: re.Pattern[str] = re.compile(r"\[RETRY_BUDGET_EXHAUSTED\]")
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
@@ -286,6 +297,31 @@ _RUNTIME_DEGRADATION_BODY_RE: re.Pattern[str] = re.compile(
 # matches the default review cycle; a longer-lived degradation marker
 # implies the operator already saw the alert and (perhaps) is debugging.
 _RUNTIME_DEGRADATION_WINDOW_SECONDS: int = 24 * 60 * 60
+
+
+def _has_retry_exhausted_signal(source_file: Path) -> bool:
+    """Return ``True`` when the work unit's audit trail records an exhausted retry budget.
+
+    Issue #248. Looks for the ``[RETRY_BUDGET_EXHAUSTED]`` tag written by the
+    orchestrate skill at the moment a judge's retry budget is spent. Unlike
+    the recovery-signal heuristics this is an exact structured tag, not a
+    prose match, because the distinction it draws is the difference between
+    "devbench will keep working on this" and "devbench is finished with this
+    and an operator must look".
+
+    Args:
+        source_file: The work unit's ``.md`` file.
+
+    Returns:
+        ``True`` when the tag is present. Unreadable files return ``False``
+        so a transient read error cannot manufacture an operator alert; the
+        file-level failure surfaces through the checks that need its content.
+    """
+    try:
+        content = source_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(_RETRY_EXHAUSTED_TAG_RE.search(content))
 
 
 def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
@@ -479,11 +515,12 @@ def classify_blocked_task(
     4. ``AWAITING_DEPENDENCY`` -- no marker present (or all markers terminal
        but a regular dep is still in flight), and a Dependencies-table row
        points at a non-terminal task.
-    5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, but at
-       least one recovery signal is on disk (pending proposal JSON,
-       rejected-amendment archive, or a recent ``[BLOCKED]`` audit comment
-       from a recovery agent).
-    6. ``OPERATOR_ACTION_REQUIRED`` -- none of the above; operator must act.
+    5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, no
+       ``[RETRY_BUDGET_EXHAUSTED]`` tag, but at least one recovery signal is
+       on disk (pending proposal JSON, rejected-amendment archive, or a
+       recent ``[BLOCKED]`` audit comment from a recovery agent).
+    6. ``OPERATOR_ACTION_REQUIRED`` -- none of the above, or the retry budget
+       is exhausted; operator must act.
 
     The optional ``workspace_root`` enables recovery checks (all three recovery
     signals under ``AWAITING_AMENDMENT_RECOVERY``). Callers that pass only
@@ -682,7 +719,19 @@ def _classify_recovery_or_attention(
     ``OPERATOR_ACTION_REQUIRED`` immediately (legacy two-state behaviour).
     The three recovery signals are checked cheapest-first: file-presence
     > glob-match > timestamp-window read of the source file.
+
+    Issue #248: an exhausted retry budget is checked first, because the
+    recovery-signal heuristic cannot tell the two cases apart on its own.
+    ``_RECOVERY_BODY_RE`` matches ``ALL_REVIEWS_FAILED`` / ``REVIEW_REJECTED``,
+    and the orchestrator's retry-exhaustion ``[BLOCKED]`` row is written under
+    ``agent/orchestrator`` and names the failing checks. It therefore looked
+    exactly like a recovery signal, so a task that had spent its entire
+    budget was reported as AWAITING_AMENDMENT_RECOVERY, whose contract is
+    "operator does nothing". No further executor run was coming, so nothing
+    ever cleared it and no operator alert fired.
     """
+    if _has_retry_exhausted_signal(source_file):
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     if workspace_root is None:
         return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     if _has_pending_proposal_json(workspace_root, task_id):
@@ -1167,11 +1216,49 @@ def _id_allocation_lock(workspace_root: Path) -> Iterator[None]:
 
 
 def _story_dir(backlog_root: Path, story_id: str) -> Path:
-    """Return the filesystem path that holds the given story's task files."""
+    """Return the filesystem path that holds the given story's task files.
+
+    Backlogs authored by the ``spec-to-backlog`` skill name every level
+    ``<id>-<slug>`` (``backlog/E4-tdd-red-gate/E4-F1-spawn-topology/
+    E4-F1-S1-topology``), so deriving the path from bare IDs alone writes
+    materialised tasks into a parallel orphan tree that has no Epic /
+    Feature / Story work-unit files. That in turn hides existing siblings
+    from :func:`scan_story_for_task_ids`, which makes
+    :func:`allocate_next_ids` hand out an ID that already exists.
+
+    An existing directory therefore always wins. When several candidates
+    match, the one holding the Story's own ``<story_id>.md`` work-unit file
+    is canonical. The bare-ID form remains the fallback for a story whose
+    directory has not been created yet.
+    """
     if not _STORY_ID_RE.match(story_id):
         raise ProposalError(f"story_id {story_id!r} is not a valid Story ID (expected ``E<N>-F<N>-S<N>``)")
+    candidates = _existing_story_dirs(backlog_root, story_id)
+    for candidate in candidates:
+        if (candidate / f"{story_id}.md").is_file():
+            return candidate
+    if candidates:
+        return candidates[0]
     parts = story_id.split("-")
     return backlog_root / parts[0] / "-".join(parts[:2]) / story_id
+
+
+def _existing_story_dirs(backlog_root: Path, story_id: str) -> list[Path]:
+    """Return every existing ``<story_id>`` / ``<story_id>-<slug>`` directory, sorted.
+
+    Matching on the ``<story_id>-`` prefix (rather than ``<story_id>``) keeps
+    ``E0-F1-S10-<slug>`` from satisfying a lookup for ``E0-F1-S1``. The scan
+    is depth-3 (epic/feature/story), which is the only layout the backlog
+    contract allows.
+    """
+    if not backlog_root.is_dir():
+        return []
+    prefix = f"{story_id}-"
+    return sorted(
+        path
+        for path in backlog_root.glob("*/*/*")
+        if path.is_dir() and (path.name == story_id or path.name.startswith(prefix))
+    )
 
 
 def scan_story_for_task_ids(backlog_root: Path, story_id: str) -> set[str]:
@@ -1571,11 +1658,44 @@ def list_proposals(workspace_root: Path) -> list[Proposal]:
 
 
 def _find_draft_file(backlog_root: Path, task_id: str) -> Path | None:
-    """Return the draft .md path for a proposed task ID, or ``None`` if missing."""
-    story_id = _extract_story_id(task_id)
-    story_dir = _story_dir(backlog_root, story_id)
-    target = story_dir / f"{task_id}.md"
-    return target if target.is_file() else None
+    """Return the work-unit .md path for ``task_id``, or ``None`` if it does not exist.
+
+    Issue #302: this previously looked in exactly one directory, the story
+    directory ``_story_dir`` computes for the ID. A work unit that lives
+    anywhere else was reported as absent, and callers act on that: a
+    proposal whose task already exists is classified ``UNMATERIALISED``,
+    so the orchestrate loop's opening ``sweep-proposals`` materialises it
+    again, in the canonical directory this time, producing two files and
+    two index rows under one ID. That repeated on every start, and each
+    replay had to be undone by hand.
+
+    A work-unit ID identifies one work unit wherever its file sits, so the
+    search is over the whole backlog tree.
+
+    Args:
+        backlog_root: Root of the backlog tree (``<workspace>/backlog``).
+        task_id: Work-unit identifier, e.g. ``E1-F2-S3-T4``.
+
+    Returns:
+        The single matching path, or ``None`` when no file exists.
+
+    Raises:
+        ProposalError: When more than one file carries this ID. Returning
+            either one would make every downstream decision depend on
+            directory-walk order; the duplicate is a backlog-integrity
+            fault that ``validate-backlog`` reports and an operator
+            resolves.
+    """
+    matches = sorted(p for p in backlog_root.rglob(f"{task_id}.md") if p.is_file())
+    if not matches:
+        return None
+    if len(matches) > 1:
+        rendered = ", ".join(str(p.relative_to(backlog_root)) for p in matches)
+        raise ProposalError(
+            f"duplicate work-unit file for {task_id!r}: {len(matches)} files carry this ID ({rendered}). "
+            "One ID must map to exactly one file; run 'devbench validate-backlog' and remove the duplicate."
+        )
+    return matches[0]
 
 
 def _rewrite_status(md_path: Path, new_status: str) -> None:
@@ -1749,6 +1869,39 @@ def promote_proposal(
                 logger.info("promote-proposal: wired marker + dep on %s", target_id)
 
     return PromoteResult(draft_path=draft, wired_targets=wired_targets)
+
+
+def delete_proposal_if_consumed(workspace_root: Path, backlog_root: Path, proposal: Proposal | None) -> None:
+    """Drop the proposal JSON once no task in it is still awaiting resolution.
+
+    ``_has_pending_proposal_json`` is pure file-presence, so a JSON left on
+    disk after its last draft is resolved pins the source task to
+    ``AWAITING_AMENDMENT_RECOVERY`` forever: the classifier keeps promising a
+    task-factory sweep that will never run again, ``write_proposal`` refuses
+    to emit a replacement, and because the task is bucketed as auto-clearing
+    it never surfaces as ``OPERATOR_ACTION_REQUIRED`` either. The task can
+    then neither recover nor be re-proposed.
+
+    "Consumed" means no ``proposed_tasks[].suggested_id`` is still
+    ``UNMATERIALISED`` or ``PROPOSED``. Call this only from a caller that has
+    finished promoting every task in the proposal -- never from inside
+    ``promote_proposal`` itself. Under
+    ``default_status_for_new_work_units: in-queue`` every draft is born
+    ``PROMOTED``, so a per-task check would report "consumed" on the first
+    promotion and delete the JSON that the remaining promotions still need
+    for their dependency wiring.
+    """
+    if proposal is None:
+        return
+    pending = {ProposalTaskState.UNMATERIALISED, ProposalTaskState.PROPOSED}
+    for entry in proposal.proposed_tasks:
+        if classify_proposed_task(backlog_root, workspace_root, entry.suggested_id) in pending:
+            return
+    delete_proposal(workspace_root, proposal.source_task_id)
+    logger.info(
+        "Proposal for %s fully consumed (every proposed task resolved); removed the JSON",
+        proposal.source_task_id,
+    )
 
 
 def _append_promote_comment(
@@ -1951,6 +2104,7 @@ def promote_all_from_source(
             dep_on_source=dep_on_source,
         )
         promoted.append(result.draft_path)
+    delete_proposal_if_consumed(workspace_root, backlog_root, proposal)
     return promoted
 
 

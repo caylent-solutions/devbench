@@ -183,6 +183,14 @@ stop_hook:
   stale_task_minutes: 120
 ```
 
+**`DEVBENCH_STOP_HOOK_STATE_DIR`** (env var only, default `/tmp`) -- the
+directory `continue-orchestration.sh` uses for its Stop-hook state file.
+`/tmp` is shared machine-wide, so a test suite running alongside a live
+orchestrator on the same host can collide on that file; set this env var to a
+private directory in the test environment to isolate the two. Leaving it
+unset preserves the previous `/tmp` behaviour exactly -- this is an optional
+knob, not a required migration step.
+
 ---
 
 ## `hook_tail:` -- column caps for `devbench hook-tail`

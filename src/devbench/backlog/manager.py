@@ -107,8 +107,20 @@ _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLIN
 # (non-terminal), preventing the cascade from firing even when the real marker
 # target (e.g. E5-F3-S1-T4) was terminal. The fix narrows the pattern to only
 # capture canonical task IDs matching ``E\d+(-F\d+)?(-S\d+)?(-T\d+)?``.
+# Issue #304: the marker must be anchored to the end of its audit row.
+# Both writers -- ``_append_promote_comment`` (task-factory) and
+# ``_append_wired_comment`` (add-dep) -- emit the marker as the final token
+# of the row, so end-anchoring admits every marker devbench writes.
+#
+# Matching it anywhere in the Comments body meant prose that merely QUOTED a
+# marker created one. An operator audit comment recording that a marker had
+# been removed, quoting the removed line verbatim, silently re-blocked the
+# unit on the quoted ID with no diagnostic: the file read as correct to a
+# human because the only occurrence sat inside quotation marks. Agents write
+# such narratives routinely, so this was reachable without an operator.
 _BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
-    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)"
+    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)[ \t]*$",
+    re.MULTILINE,
 )
 
 
@@ -681,13 +693,14 @@ class BacklogManager:
             backtick-quoted path-shaped tokens in ``## Acceptance Criteria`` and
             ``## Definition of Done`` must appear in the Task's Changes Manifest after
             normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
-        21. Six-type task taxonomy (FR-4.1): the optional ``## Task Type:`` section
+        21. Unique work-unit IDs: no ID appears on more than one index row.
+        22. Six-type task taxonomy (FR-4.1): the optional ``## Task Type:`` section
             (defaulting to ``behavior-fix`` when absent) must name one of the six
             allowed types, and each type's Changes Manifest rows must satisfy its
             per-type invariant (production-source presence for gated types;
             test-only / docs / chore row-shape restrictions for exempt types).
             Terminal Tasks (``done`` / ``declined``) are skipped.
-        22. Already-satisfied decline citation (FR-4.5): a ``declined`` Task whose
+        23. Already-satisfied decline citation (FR-4.5): a ``declined`` Task whose
             ``[DECLINED]`` comment reason contains ``already-satisfied`` must cite
             the closing commit hash or task id somewhere in that reason; an
             uncited already-satisfied decline is an unfalsifiable claim and is
@@ -711,6 +724,7 @@ class BacklogManager:
 
         errors: list[str] = []
         self._check_full_index_has_rows(backlog_index, errors)
+        self._check_unique_ids(rows, errors)
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
@@ -994,6 +1008,50 @@ class BacklogManager:
         if COMMENTS_SECTION_HEADER in content:
             return content.rstrip("\n") + "\n\n" + audit_block + "\n"
         return content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + audit_block + "\n"
+
+    @staticmethod
+    def _check_unique_ids(rows: list[tuple[str, str, str]], errors: list[str]) -> None:
+        """Check 21: every work-unit ID appears exactly once in the index.
+
+        A work unit written into two directory trees produces two index rows
+        under one ID. Every other check still passes: each file exists, each
+        file's status matches its own row, and neither file is orphaned,
+        because both are indexed. The backlog is nonetheless incoherent. The
+        two rows can disagree about status, and a dependency on that ID
+        resolves against whichever row is reached first, so whether the
+        dependency counts as satisfied is an ordering accident. Totals also
+        double-count the unit.
+
+        Typical shape: a task materialised once into a bare-``<id>`` tree and
+        again into the ``<id>-<slug>`` tree, the two rows carrying different
+        statuses (for example ``done`` and ``declined``), with the integrity
+        check reporting success.
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` index rows.
+            errors: Accumulator appended to on violation.
+        """
+        seen: dict[str, list[tuple[str, str]]] = {}
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            # ``_parse_backlog_rows`` scans every pipe row in BACKLOG.md,
+            # including the Status Summary table, whose rows repeat an ID
+            # without a File Path cell. A row that names no file is not a Full
+            # Work Unit Index row, so it cannot be a duplicate work unit. This
+            # is the same test ``_check_files_and_statuses`` uses to recognise
+            # real index rows.
+            if not file_path_str:
+                continue
+            seen.setdefault(row_id, []).append((status, file_path_str))
+        for row_id, occurrences in sorted(seen.items()):
+            if len(occurrences) < 2:
+                continue
+            detail = "; ".join(f"status '{status}' at {path}" for status, path in occurrences)
+            errors.append(
+                f"{row_id}: duplicate work unit ID -- {len(occurrences)} index rows share this ID ({detail}). "
+                "One ID must map to exactly one work unit file; remove or re-key the duplicate."
+            )
 
     def _check_files_and_statuses(
         self,

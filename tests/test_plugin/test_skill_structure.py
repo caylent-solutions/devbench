@@ -154,8 +154,8 @@ class TestOrchestrateSkillStep7SecurityPass:
     def test_step7_no_rerun_review_supervisor(self) -> None:
         """AC-5: Step 7 must say 'Do NOT re-run review-supervisor' on security PASS."""
         content = SKILL_PATH.read_text()
-        assert "Do NOT re-run review-supervisor" in content, (
-            "SKILL.md step 7 must say 'Do NOT re-run review-supervisor' on security PASS"
+        assert "Do NOT re-run the review_team reviewers" in content, (
+            "SKILL.md step 7 must say 'Do NOT re-run the review_team reviewers' on security PASS (ADR-28)"
         )
 
 

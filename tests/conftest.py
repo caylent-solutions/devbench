@@ -3,21 +3,43 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
-# Set required env vars before any devbench modules are imported.
-# config.py raises RuntimeError at import time if DEVBENCH_WORKSPACE_ROOT is unset.
-os.environ.setdefault("DEVBENCH_CLAUDE_MODEL", "test-model")
-os.environ.setdefault("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
-os.environ.setdefault("DEVBENCH_LOG_FILE", "/tmp/judges-test-orchestrator.log")
+# ---------------------------------------------------------------------------
+# Workspace isolation (issue #292).
+#
+# These were previously ``os.environ.setdefault``, which meant the suite
+# INHERITED whatever the ambient shell already had. devbench is developed with
+# devbench, so the executor runs the suite from inside a live workspace with
+# DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE exported. Tests therefore
+# resolved live paths and wrote to them: fixture work-unit state landed in the
+# real ``.devbench/ci-failures/`` and ``.devbench/pr-bot-feedback/``, and
+# fabricated lifecycle records -- [ORCHESTRATOR_TERMINAL_EXIT], [QUOTA_WAITING],
+# [ORCHESTRATOR_AUTO_RESTART], "Merged PR #42" -- were appended to the live
+# orchestrator log for events that never happened. Those are the exact markers
+# the reporting layer parses, so a test run could drive an operator's status
+# and report output.
+#
+# Assignment is now unconditional. An ambient value is not a configuration the
+# suite may honour; it is the hazard. The root is a fresh per-run temporary
+# directory rather than a fixed path so concurrent runs cannot collide and no
+# run can be steered onto a real workspace.
+# ---------------------------------------------------------------------------
+os.environ["DEVBENCH_CLAUDE_MODEL"] = "test-model"
+os.environ["DEVBENCH_WORKSPACE_ROOT"] = tempfile.mkdtemp(prefix="devbench-test-workspace-")
+os.environ["DEVBENCH_PROJECT_ROOT"] = os.environ["DEVBENCH_WORKSPACE_ROOT"]
+os.environ["DEVBENCH_LOG_FILE"] = str(Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / "orchestrator.log")
 # Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
-# from the YAML repos section (the only supported source).
-os.environ.setdefault(
-    "DEVBENCH_CONFIG_PATH",
-    str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
-)
+# from the YAML repos section (the only supported source). Also forced: an
+# inherited config path would reintroduce the operator's real repo list.
+os.environ["DEVBENCH_CONFIG_PATH"] = str(Path(__file__).parent / "fixtures" / "test_devbench.yaml")
+# A session name makes log_setup resolve a per-session directory under the
+# workspace root; leaving an inherited one in place would send session logs to
+# the live workspace's session tree.
+os.environ.pop("DEVBENCH_SESSION_NAME", None)
 
 import pytest
 from fixtures.data import WORK_UNIT_MARKDOWN_TEMPLATE as _WORK_UNIT_TEMPLATE

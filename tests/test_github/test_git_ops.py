@@ -25,18 +25,18 @@ class TestCommitAndPush:
     def test_validates_repo(self, tmp_path: Path) -> None:
         judge = GitOpsService()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.commit_and_push("evil/repo", tmp_path, "branch", "msg")
+            judge.commit_and_push("evil/repo", tmp_path, "branch", "msg", stage_all=True)
 
     def test_rejects_invalid_branch_name(self, tmp_path: Path) -> None:
         judge = GitOpsService()
         with pytest.raises(ValueError, match="Invalid branch name"):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg", stage_all=True)
 
     def test_raises_on_git_failure(self, tmp_path: Path) -> None:
         judge = GitOpsService()
         with patch.object(judge, "_git", side_effect=RuntimeError("git failed")):
             with pytest.raises(RuntimeError, match="git failed"):
-                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "b", "m")
+                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "b", "m", stage_all=True)
 
     # ------------------------------------------------------------------
     # Happy path: changes present → commit and push
@@ -56,7 +56,7 @@ class TestCommitAndPush:
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "commit msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "commit msg", stage_all=True)
 
         assert ["add", "-A"] in git_calls
         assert ["commit", "-m", "commit msg"] in git_calls
@@ -88,7 +88,7 @@ class TestCommitAndPush:
             patch.object(judge, "_git", side_effect=stub),
             patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] not in git_calls
@@ -113,7 +113,7 @@ class TestCommitAndPush:
             patch.object(judge, "_git", side_effect=stub),
             patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
@@ -140,7 +140,7 @@ class TestCommitAndPush:
             patch.object(judge, "_git", side_effect=stub),
             patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
@@ -163,7 +163,7 @@ class TestCommitAndPush:
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
         checkout_calls = [c for c in git_calls if c[0] == "checkout"]
         assert checkout_calls == [], "commit_and_push must not call git checkout"
@@ -421,7 +421,7 @@ class TestLocalOnlyMode:
         with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
             mock_cfg.git_ops.local_only = True
             with pytest.raises(RuntimeError, match=r"commit_and_push is not available .*local_only"):
-                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
     def test_create_tag_raises_when_local_only(self, tmp_path: Path) -> None:
         judge = GitOpsService()
@@ -1089,6 +1089,127 @@ class TestRebaseAndForcePush:
         assert fetch_idx < rebase_idx < push_idx
 
 
+def _real_repo(tmp_path: Path) -> Path:
+    """A real git repo with one commit, for tests that must observe actual staging."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "x@y.z"],
+        ["config", "user.name", "test"],
+        ["config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    (repo / "mine.py").write_text("original\n")
+    (repo / "theirs.py").write_text("original\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "-M", "feature/x"], check=True)
+    return repo
+
+
+def _committed_files(repo: Path) -> set[str]:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line for line in out.stdout.split() if line}
+
+
+@pytest.mark.unit
+class TestCommitScopedToManifest:
+    """A commit carries only its own work unit's files, or it refuses.
+
+    ``git add -A`` stages the whole working tree, so a file another work unit
+    left modified-but-unstaged is swept into this unit's commit under this
+    unit's message. ``assert_staged_matches_manifest`` cannot catch it: that
+    guard reads ``git diff --cached``, which by definition does not see unstaged
+    changes. The victim task then fails ``changes_manifest`` forever -- the files
+    it declared are committed under someone else's name, and the only remedies
+    are an operator override or rewriting published history on a shared branch.
+    Observed in production as commit b5201cb.
+
+    Every staging path is an explicit caller decision. There is deliberately no
+    degraded mode: a caller that cannot name its scope is refused, never given a
+    silent whole-tree commit.
+    """
+
+    def test_commit_local_ignores_another_units_unstaged_work(self, tmp_path: Path) -> None:
+        repo = _real_repo(tmp_path)
+        (repo / "mine.py").write_text("mine change\n")
+        subprocess.run(["git", "-C", str(repo), "add", "mine.py"], check=True)
+        (repo / "theirs.py").write_text("their in-flight change\n")  # NOT staged
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo", repo, "feature/x", "E0-F1-S1-T1: mine", manifest_files=["mine.py"]
+        )
+
+        committed = _committed_files(repo)
+        assert "mine.py" in committed
+        assert "theirs.py" not in committed, (
+            f"commit swallowed another unit's unstaged file; committed={sorted(committed)}"
+        )
+        assert (repo / "theirs.py").read_text() == "their in-flight change\n"
+
+    def test_commit_local_stages_manifest_paths_left_unstaged(self, tmp_path: Path) -> None:
+        """The unit's OWN Manifest paths are staged even when the executor left them unstaged."""
+        repo = _real_repo(tmp_path)
+        (repo / "mine.py").write_text("mine change\n")  # never `git add`-ed
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo", repo, "feature/x", "E0-F1-S1-T1: mine", manifest_files=["mine.py"]
+        )
+
+        assert "mine.py" in _committed_files(repo)
+
+    def test_commit_refuses_when_scope_is_unknown(self, tmp_path: Path) -> None:
+        """No Manifest and no explicit stage_all is a refusal, not a whole-tree commit."""
+        repo = _real_repo(tmp_path)
+        (repo / "theirs.py").write_text("must not be committed\n")
+
+        with pytest.raises(RuntimeError, match="cannot determine"):
+            GitOpsService().commit_local("caylent-solutions/git-repo", repo, "feature/x", "msg")
+
+        assert _committed_files(repo) == {"mine.py", "theirs.py"}  # base commit only
+
+    def test_commit_refuses_a_manifest_of_only_sentinels(self, tmp_path: Path) -> None:
+        """An all-sentinel Manifest yields no pathspec, so it refuses rather than staging everything."""
+        repo = _real_repo(tmp_path)
+
+        with pytest.raises(RuntimeError, match="no concrete file paths"):
+            GitOpsService().commit_local(
+                "caylent-solutions/git-repo",
+                repo,
+                "feature/x",
+                "msg",
+                manifest_files=["<targets-determined-at-execution>"],
+            )
+
+    def test_stage_all_is_an_explicit_opt_in(self, tmp_path: Path) -> None:
+        """The finalize path has no work-unit Manifest and stages the batch deliberately."""
+        repo = _real_repo(tmp_path)
+        (repo / "theirs.py").write_text("batch content\n")
+
+        GitOpsService().commit_local("caylent-solutions/git-repo", repo, "feature/x", "finalize", stage_all=True)
+
+        assert "theirs.py" in _committed_files(repo)
+
+    def test_stage_all_and_manifest_together_is_a_contradiction(self, tmp_path: Path) -> None:
+        repo = _real_repo(tmp_path)
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            GitOpsService().commit_local(
+                "caylent-solutions/git-repo",
+                repo,
+                "feature/x",
+                "msg",
+                manifest_files=["mine.py"],
+                stage_all=True,
+            )
+
+
 class TestCommitLocal:
     """Test commit_local method."""
 
@@ -1111,6 +1232,7 @@ class TestCommitLocal:
                 tmp_path,
                 "feature/x",
                 "local commit",
+                stage_all=True,
             )
 
         assert ["add", "-A"] in git_calls
@@ -1139,6 +1261,7 @@ class TestCommitLocal:
                 tmp_path,
                 "feature/x",
                 "local commit",
+                stage_all=True,
             )
 
         assert ["add", "-A"] in git_calls
@@ -1151,7 +1274,7 @@ class TestCommitLocal:
         """commit_local raises ValueError for invalid branch names."""
         judge = GitOpsService()
         with pytest.raises(ValueError, match="Invalid branch name"):
-            judge.commit_local("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg")
+            judge.commit_local("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg", stage_all=True)
 
 
 class TestAssertOnBranch:
@@ -1198,7 +1321,7 @@ class TestCommitMethodsRejectWrongBranch:
             patch.object(judge, "_git", side_effect=stub),
             pytest.raises(RuntimeError, match="HEAD is on 'backlog/wrong-branch'"),
         ):
-            judge.commit_local("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_local("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
     def test_commit_and_push_rejects_when_head_drifted(self, tmp_path: Path) -> None:
         judge = GitOpsService()
@@ -1212,7 +1335,7 @@ class TestCommitMethodsRejectWrongBranch:
             patch.object(judge, "_git", side_effect=stub),
             pytest.raises(RuntimeError, match="HEAD is on 'main'"),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg", stage_all=True)
 
 
 class TestGetDefaultBranch:

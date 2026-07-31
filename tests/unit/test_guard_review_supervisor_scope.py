@@ -6,10 +6,11 @@ agent. It blocks two classes of escalation:
 1. **Bash mutations** -- destructive shell commands (rm, git commit, sed -i,
    `>` redirection, etc.) executed via the Bash tool. Existing rule, sanity-
    tested here for regression coverage.
-2. **Agent-tool subagent spawn** (issue #118) -- Agent-tool invocations
-   whose ``subagent_type`` is not in the canonical review_team allowlist
-   (``devbench-orchestrate:code_review`` / ``devbench-orchestrate:test_review`` /
-   ``devbench-orchestrate:doc_review`` / ``devbench-orchestrate:changes_manifest``). New branch.
+2. **Agent-tool subagent spawn** (issue #118, tightened by ADR-33) -- every
+   Agent-tool invocation, whatever its ``subagent_type``. Issue #118 allow-listed
+   the four review_team subagents because the supervisor fanned out to them
+   itself; ADR-33 moved that fan-out to the orchestrate skill as a first-level
+   dispatch, so the supervisor dispatches nothing and the allowlist was removed.
 
 Both paths share the operator override env var
 ``DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1``.
@@ -91,19 +92,29 @@ class TestAgentToolAlwaysBlocked:
     unconditionally. Spawning the judges directly is now the orchestrate
     skill's own first-level responsibility (SKILL.md step 5), never
     review-supervisor's.
+
+    Issue #118 originally allow-listed the four ``review_team`` subagents because
+    the supervisor fanned out to them itself. The flatten moved that fan-out to
+    the orchestrate skill as a first-level dispatch, so the allowlist described a
+    contract that no longer exists. The former allowlist entries are kept in the
+    parametrisation below precisely so a regression that reinstates them fails.
     """
 
     @pytest.mark.parametrize(
         "subagent_type",
         [
+            # Former allowlist entries (namespaced review_team form used by
+            # the flattened skill) -- must now be blocked like any other.
             "devbench-orchestrate:review_team:code-reviewer",
             "devbench-orchestrate:review_team:test-reviewer",
             "devbench-orchestrate:review_team:doc-reviewer",
             "devbench-orchestrate:review_team:changes-manifest",
+            # Former allowlist entries (bare canonical-name form).
             "devbench-orchestrate:code_review",
             "devbench-orchestrate:test_review",
             "devbench-orchestrate:doc_review",
             "devbench-orchestrate:changes_manifest",
+            # Never-allowed agents.
             "devbench-orchestrate:executor",
             "devbench-orchestrate:blocker_resolver",
             "devbench-orchestrate:task_factory",

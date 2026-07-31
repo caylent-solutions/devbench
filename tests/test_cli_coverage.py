@@ -612,8 +612,8 @@ class TestLatestLogInProgressTs:
         # (9999-99-99) -- the strptime ValueError is caught and the line skipped.
         log = tmp_path / "log"
         log.write_text(
-            "9999-99-99T99:99:99Z [logger] INFO Set E1-F1-S1-T1 to 'in-progress'\n"
-            "2025-01-01T00:00:00Z [logger] INFO Set E1-F1-S1-T1 to 'in-progress'\n",
+            "9999-99-99T99:99:99Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress'\n"
+            "2025-01-01T00:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
         result = cli_mod._latest_log_in_progress_ts("E1-F1-S1-T1", log)

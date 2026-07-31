@@ -378,4 +378,4 @@ and exits cleanly. See [`docs/zero-to-ready.md` -- Stopping a run cleanly](zero-
 - [`docs/zero-to-ready.md`](zero-to-ready.md) -- manual step-by-step alternative (no skills required)
 - [`docs/creating-specs-and-backlogs.md`](creating-specs-and-backlogs.md) -- manual spec and backlog authoring guide
 - [`docs/cli-reference.md`](cli-reference.md) -- full CLI command reference
-- [`docs/backlog-contract.md`](backlog-contract.md) -- validate-backlog rule set (21 rules)
+- [`docs/backlog-contract.md`](backlog-contract.md) -- validate-backlog rule set (22 rules)

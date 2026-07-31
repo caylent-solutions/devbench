@@ -184,8 +184,9 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
 20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default on; set `false` to opt out per workspace)
 21. Task-Type taxonomy (a Task that declares a `## Task Type:` value must use one of the six recognized types, and its Changes Manifest must satisfy that type's per-type invariant; a Task with no `## Task Type:` section defaults to `behavior-fix`, the strictest type, so omitting the section is never an escape hatch; terminal Tasks -- `done` / `declined` -- are skipped entirely; see "Task-Type Taxonomy Rule (FR-4.1)" below)
+22. Already-satisfied decline citation (FR-4.5): a `declined` Task whose `[DECLINED]` comment reason contains `already-satisfied` must cite the closing commit hash or task id somewhere in that reason; an uncited already-satisfied decline is an unfalsifiable claim and is rejected
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rule 21 was added by FR-4.1 (E4-F2-S1-T1) to stop RED-gated Tasks from shipping a Manifest with zero production-source rows and to keep `test-only` / `docs` / `chore` Tasks honest about the files they claim to touch. Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Rule 21 was added by FR-4.1 (E4-F2-S1-T1) to stop RED-gated Tasks from shipping a Manifest with zero production-source rows and to keep `test-only` / `docs` / `chore` Tasks honest about the files they claim to touch. Rule 22 was added by FR-4.5 (E4-F4-S1-T2) so an `already-satisfied` decline can't be used as an unfalsifiable escape hatch from doing the work: the reason must name proof (a commit hash or task id) that the claim was actually checked. Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 
@@ -542,7 +543,7 @@ Status rolls up automatically when all children reach `done`.
 | `## Acceptance Criteria` | Yes | Author at creation |
 | `## Changes Manifest` | Yes | Author at creation |
 | `## Definition of Done` | Yes | Author at creation |
-| `## TDD Cycle Log` | Yes (may be empty) | Agent-writable `RED`/`GREEN`/`REFACTOR` entries via `devbench log-tdd`; orchestrator-only `RED_OBSERVED` entries via `write_red_observed_entry` |
+| `## TDD Cycle Log` | Yes (may be empty) | Agent-writable `RED`/`GREEN`/`REFACTOR` entries via `devbench log-tdd`; orchestrator-only `RED_OBSERVED` entries via `write_red_observed_entry` (gated types); orchestrator-only `GREEN_GREEN_OBSERVED` entries via `devbench green-green-check` (`refactor` done-gate precondition) |
 | `## Comments` | Yes (may be empty) | `devbench log-verdict` / `devbench log-comment` |
 
 ---

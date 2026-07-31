@@ -231,7 +231,8 @@ Agents never know how repo paths are resolved. Multi-repo routing is invisible t
 | `devbench run-tests <id>` | Run test suite in correct repo cwd, return output |
 | `devbench log-verdict <judge> <id> <pass\|fail> [msg]` | Append structured verdict to work unit Comments |
 | `devbench log-comment <agent> <id> <message>` | Append agent comment to work unit Comments |
-| `devbench log-tdd <id> <RED\|GREEN\|REFACTOR> <message>` | Append TDD phase entry to work unit. `RED_OBSERVED` is a fourth phase; it is orchestrator-only, so an agent-facing invocation naming it is rejected with exit 1 |
+| `devbench log-tdd <id> <RED\|GREEN\|REFACTOR> <message>` | Append TDD phase entry to work unit. `VALID_TDD_PHASES` has two orchestrator-only phases: `RED_OBSERVED` (written by `write_red_observed_entry`) and `GREEN_GREEN_OBSERVED` (written by `devbench green-green-check`); an agent-facing invocation naming either is rejected with exit 1 |
+| `devbench green-green-check <id> <test_node_id> [...]` | Orchestrator-only: machine-observe that the named test(s) PASS before and after a `refactor` task's production change; writes `GREEN_GREEN_OBSERVED` on success |
 | `devbench mark-done <id>` | Done-gate verification + status update |
 | `devbench git-ops <id>` | Deterministic: branch → commit → push → PR → CI wait → merge |
 | `devbench validate-backlog` | Check backlog integrity before each cycle |

@@ -775,7 +775,7 @@ file. Common patterns:
 
 Iterate: fix the reported error, re-run `validate-backlog`, repeat until exit 0.
 
-For the complete rule list (21 rules as of v-next), see
+For the complete rule list (22 rules as of v-next), see
 [`docs/backlog-contract.md`](backlog-contract.md) (ref).
 
 ---

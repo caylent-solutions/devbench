@@ -430,13 +430,22 @@ uv run devbench mark-done <id>
 
 Mark the unit as `done`. Enforces the done-gate: all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) must have logged `[REVIEW_PASS]` in the most recent round (after any intervening `[REVIEW_REJECTED]`). Security review must also have passed. Exits 1 with a clear error naming the missing judge(s) when the gate fails.
 
+**Task-type completion invariant (FR-4.5/FR-4.6, E4-F4-S1-T2).** Before either the review-judge check above or the status write, `cmd_mark_done` delegates to `BacklogManager.mark_done`, which calls `_check_task_type_done_invariant` and refuses (rc=1, `RuntimeError` message naming all three FR-4.5 remedies) unless the task's own declared `## Task Type:` invariant is machine-provably satisfied:
+
+- **Gated types** (`behavior-fix`, `feature`, and the default when `## Task Type:` is omitted): requires a machine-observed `RED_OBSERVED` entry in the TDD Cycle Log, written only by `uv run devbench tdd-gate <id>`.
+- **`refactor`**: requires a machine-observed `GREEN_GREEN_OBSERVED` entry in the TDD Cycle Log, written only by `uv run devbench green-green-check <id> <test_node_id> [...]`.
+
+This invariant check is deliberately implemented once in `BacklogManager.mark_done` -- not in a CLI-layer wrapper -- so every caller inherits it identically; see `check-merge` below.
+
 ### `decline`
 
 ```
-uv run devbench decline <id> --reason "<message>"
+uv run devbench decline <id> --reason "<message>" [--citation <commit-hash-or-task-id>]
 ```
 
 Mark a work unit `declined`: it will never be done. Used when the operator decides the unit's scope is being removed, the functionality is being deleted instead, or a different task delivered the same outcome. Declined children count as terminal-complete for parent rollup. See [ADR-05](adr/05-declined-status.md).
+
+**`--citation` (FR-4.5, E4-F4-S1-T2).** When `--reason` contains the routing keyword `already-satisfied` (case-insensitive), an already-satisfied decline is an unfalsifiable claim without proof it was checked, so `--citation <value>` is REQUIRED too. `<value>` must be either a 7-40 character lowercase hex commit hash or a canonical work-unit id (validated by `BacklogManager.is_valid_citation`); an uncited already-satisfied decline is rejected (rc=1) with a message naming all three FR-4.5 remedies. On success the citation is folded into the persisted `[DECLINED]` comment as `"... (citing <value>)"`, which `validate-backlog` check 22 re-verifies independently on read (see [backlog-contract.md](backlog-contract.md)).
 
 ### `hold`
 
@@ -1040,9 +1049,9 @@ Append a non-verdict agent comment to the work-unit file's `## Comments` section
 uv run devbench log-tdd <id> <RED|GREEN|REFACTOR> <message>
 ```
 
-Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. `devbench.constants.VALID_TDD_PHASES` names four phases -- `RED`, `GREEN`, `REFACTOR`, `RED_OBSERVED` -- but this agent-facing verb accepts only the agent-writable subset (`devbench.constants.AGENT_WRITABLE_TDD_PHASES`): `RED`, `GREEN`, `REFACTOR` (case-insensitive).
+Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. `devbench.constants.VALID_TDD_PHASES` names five phases -- `RED`, `GREEN`, `REFACTOR`, `RED_OBSERVED`, `GREEN_GREEN_OBSERVED` -- but this agent-facing verb accepts only the agent-writable subset (`devbench.constants.AGENT_WRITABLE_TDD_PHASES`): `RED`, `GREEN`, `REFACTOR` (case-insensitive). The other two are `devbench.constants.ORCHESTRATOR_ONLY_TDD_PHASES`.
 
-`RED_OBSERVED` is a valid phase overall but is orchestrator-only (`devbench.constants.ORCHESTRATOR_ONLY_TDD_PHASES`). An agent invocation naming `RED_OBSERVED` -- for example `uv run devbench log-tdd <id> RED_OBSERVED <message>` -- is always rejected: `cmd_log_tdd` exits 1 and writes nothing to the `## TDD Cycle Log` section, printing:
+`RED_OBSERVED` is orchestrator-only. An agent invocation naming `RED_OBSERVED` -- for example `uv run devbench log-tdd <id> RED_OBSERVED <message>` -- is always rejected: `cmd_log_tdd` exits 1 and writes nothing to the `## TDD Cycle Log` section, printing:
 
 ```
 ERROR: TDD phase 'RED_OBSERVED' is orchestrator-only and cannot be written via log-tdd; agent-writable phases are: GREEN, RED, REFACTOR.
@@ -1053,6 +1062,34 @@ The `RED_OBSERVED` entry itself is written exclusively by the orchestrator's int
 ```
 RED_OBSERVED record is missing required field '<field>'.
 ```
+
+`GREEN_GREEN_OBSERVED` (FR-4.6, E4-F4-S1-T2) is the second orchestrator-only phase and is subject to the identical rejection path when an agent names it via `log-tdd`:
+
+```
+ERROR: TDD phase 'GREEN_GREEN_OBSERVED' is orchestrator-only and cannot be written via log-tdd; agent-writable phases are: GREEN, RED, REFACTOR.
+```
+
+The `GREEN_GREEN_OBSERVED` entry is written exclusively by `uv run devbench green-green-check` (see below) after it independently reconstructs the pre-change ("before") state and confirms the named tests pass on both sides; there is no `log-tdd-green-green-observed` CLI subcommand an agent could invoke.
+
+### `green-green-check`
+
+```
+uv run devbench green-green-check <id> <test_node_id> [<test_node_id> ...]
+```
+
+Each `<test_node_id>` must be a fully-qualified pytest node id -- there is no single fixed shape, since the shape depends on how the test is defined. Accepted forms:
+
+- `<path>.py::<test_name>` (a module-level test function, e.g. `tests/test_foo.py::test_bar`).
+- `<path>.py::<Class>::<test_name>` (a test method nested in a class -- the common case in this repo, since most files under `tests/` define their tests inside a `class Test*`, e.g. `tests/test_foo.py::TestFoo::test_bar`).
+- `<path>.py::<Class>::<test_name>[<param>]` (a parametrized test method, with its `pytest.mark.parametrize` id suffix, e.g. `tests/test_foo.py::TestFoo::test_bar[case-1]`).
+
+A bare test *file* path is not accepted, and neither is a two-segment id for a class-nested test (it is missing the class segment): `devbench.tdd_gate.default_pytest_runner` scopes the run to the file but then matches the exact node id against the `-rA` outcome line via `_parse_node_outcome`, so anything short of the exact node id pytest itself would print on that `PASSED` line yields `node_outcome=None` and the check fails closed with "could not collect test". The authoritative source for a given test's node id is what pytest reports for it -- run `pytest <path>.py --collect-only -q` (or `-rA`) and copy the emitted id verbatim rather than hand-deriving it from the file's source.
+
+Orchestrator-only helper that machine-observes the FR-4.6 done-gate precondition for `refactor`-type work units: the named test(s) must PASS in the current ("after") working tree state AND PASS again in a reconstructed "before" state (the production-source `## Changes Manifest` rows stashed out, path-scoped, so only the refactor's own production edits are reverted -- test files and unrelated files are left as-is). This proves the refactor changed implementation without changing observable behavior for the tests that pin it.
+
+On success, appends an orchestrator-only `GREEN_GREEN_OBSERVED` entry to the work unit's `## TDD Cycle Log` section and exits 0. `BacklogManager.mark_done`'s `_check_task_type_done_invariant` requires this record before a `refactor` task can reach `done` (see `mark-done` above).
+
+Exits 1 (writing nothing) when: the tree is dirty outside the declared Changes Manifest; the Manifest contains no production-source rows to reconstruct a "before" state from; the stash push finds no uncommitted production-source change to reconstruct a "before" state from (a refactor's change must still be uncommitted in the working tree when this check runs); the stash operation fails; or any named test fails or fails to collect on either the "after" or the reconstructed "before" side (the check fails closed on collection failure rather than treating a missing test as vacuously passing). The stash is always restored, success or failure.
 
 ---
 
@@ -1152,12 +1189,14 @@ uv run devbench check-merge <id>
 
 Issue #101 reconciliation step for `pause_before_merge: true` workspaces. Queries `gh pr list --head <branch> --json number,state,merged,url` for the PR associated with the work unit's branch and dispatches:
 
-- **PR merged externally**: promote the work unit to `done` via the existing done-gate (every required judge must have passed in the most recent round). Logs `[PR_MERGED]` audit comment.
+- **PR merged externally**: promote the work unit to `done` via the existing done-gate (every required judge must have passed in the most recent round, AND the task's own `## Task Type:` completion invariant is satisfied). Logs `[PR_MERGED]` audit comment.
 - **PR closed without merge**: transition the work unit to `blocked` with a `[BLOCKED]` audit comment naming the PR.
 - **PR still open**: no-op; the orchestrator's loop picks the work unit up again on the next iteration.
 - **No PR found for branch**: prints `{"pr_state": "no-pr-found"}` and returns 0; the orchestrator treats it the same as "still open".
 
 Returns rc=0 in every normal case; rc=1 only on hard failure (gh API failure, malformed JSON, done-gate refusal). Output is a single JSON line so the orchestrator skill's step 1b reconciliation can parse it.
+
+**Same task-type invariant as `mark-done` (FR-4.5/FR-4.6, E4-F4-S1-T2).** The merged-PR path promotes through the identical `BacklogManager.mark_done` call `cmd_mark_done` uses -- not a separate, possibly-divergent status write -- so a gated task (`behavior-fix` / `feature`) merged externally with no `RED_OBSERVED` record, or a `refactor` task merged with no `GREEN_GREEN_OBSERVED` record, is refused (rc=1) exactly as `mark-done` would refuse it. See `mark-done` above for the full invariant.
 
 The orchestrator skill (`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`) calls this command on every `in-review` work unit at the top of each loop iteration when `git_ops.pause_before_merge: true` is set in the YAML. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full pause-before-merge mode reference and [ADR-13](adr/13-pause-before-merge.md) for the design rationale.
 

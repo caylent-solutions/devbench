@@ -47,7 +47,39 @@ repos:
     checkout_directory: devbench  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
     merge_strategy: squash        # optional -- overrides top-level merge_strategy
     branch_prefix: wg_004         # optional -- overrides top-level git_ops.branch_prefix
+    shared_file_patterns:         # optional -- see "repos.<repo>.shared_file_patterns" below
+      - "src/app/Shell.tsx"
+      - "src/hooks/useAuth.*"
 ```
+
+---
+
+### `repos.<repo>.shared_file_patterns` (issue #04 -- shared-file full-suite regression gate)
+
+Optional list of `fnmatch`-style glob patterns, matched against POSIX paths relative to the
+repo root. Identifies "shared/high-fan-in" files for this repo -- app-level composition roots,
+shared shell/container components, widely-consumed hooks -- where a change can silently break
+already-passing code in unrelated features that never appear in the changing task's own Changes
+Manifest.
+
+When a work unit's diff touches a path matching one of these patterns,
+`devbench check-shared-file-impact <unit-id>` (invoked by the executor, enforced by the
+`assert-shared-file-impact.sh` guard hook) runs the FULL test suite -- not the task's scoped
+subset -- and diffs the resulting failing-test set against a stored baseline at
+`<workspace>/.devbench/test-baselines/<repo>.json`. It blocks task completion only on **newly
+introduced** failures, so pre-existing/flaky failures never stall an unrelated task. See
+`devbench check-shared-file-impact --help` and `src/devbench/cli.py::cmd_check_shared_file_impact`
+for the full algorithm (bootstrap-on-first-run, ratchet-on-pass).
+
+**Known limitation (v1):** this registry is hand-maintained per repo, not auto-derived from an
+import/mount-graph analysis of actual fan-in. Auto-derivation (which files are imported by
+unusually many otherwise-unrelated features) was judged out of scope for the same change that
+introduced the gate; the manual list is a deliberate, honest starting point rather than a
+promise of completeness. Regenerate/review the list periodically as the codebase evolves --
+nothing here does that automatically yet.
+
+Omitting `shared_file_patterns` entirely (or leaving it empty) makes `check-shared-file-impact`
+a permanent no-op for that repo, identical to today's behavior before this feature existed.
 
 ---
 

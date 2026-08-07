@@ -32,6 +32,11 @@
             "branch_prefix": {
               "type": "string",
               "description": "Per-repo task-branch prefix override. When set, task branches are named backlog/<prefix>/<unit-id-lower> instead of backlog/<unit-id-lower>. Overrides the top-level git_ops.branch_prefix for this repo. Must not be empty, have leading/trailing '/', or contain '..'."
+            },
+            "shared_file_patterns": {
+              "type": "array",
+              "description": "Glob patterns (fnmatch-style, matched against POSIX paths relative to the repo root, e.g. 'src/app/shell/**') identifying shared/high-fan-in composition-root files for this repo -- files with unusually broad blast radius (app shells, shared hooks, widely-imported components). When a task's diff touches a path matching one of these patterns, 'devbench check-shared-file-impact' requires a full test-suite run and blocks task completion on newly-introduced failures (vs. a stored baseline) instead of accepting the task's scoped Changes-Manifest test run as sufficient regression coverage. Hand-maintained per repo in v1: auto-derivation from an import/mount-graph is a known follow-up (see docs/devbench-yaml-reference.md).",
+              "items": { "type": "string", "minLength": 1 }
             }
           }
         }

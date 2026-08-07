@@ -18,6 +18,18 @@ repos:
     # merge_strategy: squash
     # Per-repo branch_prefix override; falls back to the top-level git_ops.branch_prefix.
     # branch_prefix: wg_004
+    # Shared/high-fan-in file registry (issue #04). Glob patterns (fnmatch-style,
+    # relative to the repo root) for composition-root files whose blast radius
+    # extends beyond any one task's Changes Manifest (app shells, shared hooks,
+    # widely-consumed components). A diff touching one of these triggers
+    # `devbench check-shared-file-impact` to run the FULL suite and block on
+    # NEW failures vs. a stored baseline, instead of accepting the task's
+    # scoped test run as sufficient regression coverage. See
+    # docs/devbench-yaml-reference.md for the full algorithm and known
+    # limitations (v1 is a hand-maintained list, not auto-derived).
+    # shared_file_patterns:
+    #   - "src/app/Shell.tsx"
+    #   - "src/hooks/useAuth.*"
 
 # ---------------------------------------------------------------------------
 # Top-level identity / runtime knobs

@@ -58,7 +58,13 @@ plugin/devbench-orchestrate/
     │                              review_team allowlist (devbench:code_review, test_review, doc_review,
     │                              changes_manifest). Issue #118 -- closes the loophole where the
     │                              supervisor escalated to repo-mutation rights via subagent spawn.
-    └── assert-tests-pass.sh     ← enforces test suite passes after Bash
+    ├── assert-tests-pass.sh     ← enforces test suite passes after Bash
+    └── assert-shared-file-impact.sh
+                                 ← enforces the shared-file full-suite regression gate (issue #04):
+                                   blocks when `devbench check-shared-file-impact` reports a diff
+                                   touched a `repos.<repo>.shared_file_patterns` match AND the
+                                   full-suite run introduced failures not present in the stored
+                                   baseline.
 ```
 
 ---

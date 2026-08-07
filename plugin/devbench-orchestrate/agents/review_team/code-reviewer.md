@@ -14,6 +14,9 @@ Work unit and repo context:
 Git diff (authoritative work-unit scope per ADR-12):
 !`uv run devbench get-diff $ARGUMENTS`
 
+Reachability evidence (heuristic candidates only -- see REACHABILITY rubric below for how to judge):
+!`uv run devbench check-reachability $ARGUMENTS`
+
 **Scope contract:** `devbench get-diff` is the AUTHORITATIVE source of "what changed in this work unit". Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any other raw-git command to compute scope; in single-branch + defer_pr mode those views include accumulated work from prior tasks (ADR-12) and produce false positives.
 
 ---
@@ -101,6 +104,14 @@ Evaluate the code diff against the acceptance criteria and CLAUDE.md standards.
 51. Deployment smoke tests (`tests/smoke/`) must exist for every new API endpoint: at minimum a `/health` GET and one authenticated endpoint call that verifies HTTP status codes against the deployed environment.
 52. The local development table-creation script (`scripts/create-local-tables.sh`) must be updated whenever a new DynamoDB table is added.
 
+## REACHABILITY
+53. The reachability evidence above lists newly-added source files with zero non-test references found elsewhere in the target repo -- candidates only, not verdicts. For each file marked `[POTENTIALLY UNREACHABLE]`:
+    a. Check whether it is genuinely orphaned: not imported/mounted/routed from any real composition root (a route table, a parent container's prop list, a shell's child composition), reachable only from its own test/story file, or not reachable at all.
+    b. Rule out known false-positive shapes before failing: a dynamic `import()` / lazy route split, a barrel re-export the grep missed, a symbol name that differs from what the tool guessed, or a consumer added in a different file not yet visible to a plain grep (e.g. computed/templated identifiers). If you can find the real importer yourself from the diff or evidence, treat it as a false positive and note it as a confirmation, not a finding.
+    c. Accept the escape hatch: a file marked `[DEFERRED]` is exempt IF the logged reason is a legitimate, specific justification (feature flag, Storybook-only, explicitly scoped follow-up task). A vague or absent reason (e.g. "TODO", "later") is itself a finding -- the escape hatch requires a real reason, not a silent bypass.
+    d. If a file is genuinely orphaned and not legitimately deferred, FAIL with finding code `UNREACHABLE_ARTIFACT`: name the file, the symbol(s) checked, and state plainly that it is not imported by any non-test file, then require it be wired into the real app (or given a proper `devbench-defer-reachability: <reason>` marker).
+    e. A `[SKIPPED]` entry (file unreadable) or "No newly-added source files" is informational only -- not itself a finding.
+
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
 - `BACKLOG.md` -- work-unit status index
@@ -130,7 +141,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback code_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`, `UNREACHABLE_ARTIFACT`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

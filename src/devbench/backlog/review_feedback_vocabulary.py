@@ -30,6 +30,7 @@ JUDGE_CATEGORIES: Final[dict[str, frozenset[str]]] = {
             "SCOPE_VIOLATION",
             "MANIFEST_TODO_UNFILLED",
             "AGENT_LOG_CONTRADICTS_DIFF",
+            "UNREACHABLE_ARTIFACT",
         }
     ),
     "test_review": frozenset(

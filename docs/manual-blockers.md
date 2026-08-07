@@ -19,6 +19,7 @@ This document covers the manual-blocker (`DO NOT CLAIM`) operator pattern. For t
 |---|---|
 | Task A produces a file Task B reads, both in this backlog | Regular `## Dependencies` entry: `B` lists `A` as a dependency. `devbench next` skips B until A is done. |
 | Task A is in this backlog; Task B is in a different backlog driven by a separate orchestrator | Manual blocker. Anchor the dependency in this backlog; another agent / manual flip clears it. |
+| Task A is in this backlog; the prerequisite is another **devbench work group's branch** merging into a shared target branch | **Ancestry gate**, not a manual blocker -- this is git-verifiable, so devbench can check it itself via `devbench check-ancestry` instead of waiting on an operator. See [`cross-backlog-dependencies.md`](cross-backlog-dependencies.md#special-case-the-producer-is-another-devbench-work-groups-branch). Fall back to a manual blocker only when no ancestry-preserving ref exists (e.g. the upstream branch was squash-merged/rebased away). |
 | External team owns the deliverable; devbench cannot detect completion | Manual blocker. Operator flips to `done` once they verify externally. |
 | Code change in a third-party repo we can't auto-modify | Manual blocker. |
 

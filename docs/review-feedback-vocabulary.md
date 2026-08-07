@@ -26,6 +26,7 @@ example remediations.
 | `SCOPE_VIOLATION` | Diff touches files outside the Changes Manifest | Either revert the out-of-scope change OR file an amendment request. |
 | `MANIFEST_TODO_UNFILLED` | Manifest still has a `TBD` placeholder row | Replace placeholder with real file/change rows before claim. |
 | `AGENT_LOG_CONTRADICTS_DIFF` | TDD log claims work that does not appear in the diff | Reconcile log + diff; re-stage if work was lost, or trim the log claim. |
+| `NEWLY_REACHABLE_PATH_UNVERIFIED` | Bug-fix-shaped task has no `[NEWLY_REACHABLE]` entry, or an entry with unverified paths | Enumerate the paths the fix newly unlocks and live-verify each at smoke-test level; see `docs/newly-reachable-paths.md`. |
 
 ## `test_review`
 

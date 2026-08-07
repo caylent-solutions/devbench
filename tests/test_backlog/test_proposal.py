@@ -473,6 +473,60 @@ class TestGenerateDraftMd:
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
         assert "- **Branch:** `backlog/e0-f1-s1-t9`" in md
 
+    def test_fix_titled_task_gets_newly_reachable_paths_dod_item(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Fix the exporter crash",
+            files_to_own=["src/a.py"],
+            linked_scenarios=[],
+            suggested_acs=["AC-FIX-001 exporter no longer crashes"],
+            suggested_approach="Do the fix.",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "Newly-reachable code paths enumerated and live-verified" in md
+        assert "[NEWLY_REACHABLE]" in md
+        assert "docs/newly-reachable-paths.md" in md
+
+    def test_fix_title_is_case_insensitive(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="FIX the exporter crash",
+            files_to_own=[],
+            linked_scenarios=[],
+            suggested_acs=[],
+            suggested_approach="",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "Newly-reachable code paths enumerated and live-verified" in md
+
+    def test_non_fix_titled_task_omits_newly_reachable_paths_dod_item(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Add exporter caching",
+            files_to_own=["src/a.py"],
+            linked_scenarios=[],
+            suggested_acs=["AC-ADD-001 caching added"],
+            suggested_approach="Do the thing.",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "Newly-reachable code paths enumerated and live-verified" not in md
+        assert "[NEWLY_REACHABLE]" not in md
+
+    def test_base_dod_items_always_present(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Fix the exporter crash",
+            files_to_own=[],
+            linked_scenarios=[],
+            suggested_acs=[],
+            suggested_approach="",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "- [ ] All acceptance criteria checked" in md
+        assert "- [ ] Tests green" in md
+        assert "- [ ] Lint and format clean" in md
+        assert "- [ ] Only files in Changes Manifest are staged with `git add`" in md
+
     def test_branch_line_namespaced_by_configured_branch_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The generated draft's Branch: line must match the branch devbench
         will actually push to -- so it stays namespaced when git_ops.branch_prefix

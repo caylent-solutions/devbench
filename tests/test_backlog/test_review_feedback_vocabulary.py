@@ -28,6 +28,9 @@ class TestIsValidCode:
     def test_valid_code_returns_true(self) -> None:
         assert is_valid_code("code_review", "MAKE_VALIDATE_FAILURE") is True
 
+    def test_newly_reachable_path_unverified_is_a_valid_code_review_code(self) -> None:
+        assert is_valid_code("code_review", "NEWLY_REACHABLE_PATH_UNVERIFIED") is True
+
     def test_valid_code_for_each_judge(self) -> None:
         for judge, codes in JUDGE_CATEGORIES.items():
             for code in codes:

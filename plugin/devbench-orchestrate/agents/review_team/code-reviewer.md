@@ -14,6 +14,9 @@ Work unit and repo context:
 Git diff (authoritative work-unit scope per ADR-12):
 !`uv run devbench get-diff $ARGUMENTS`
 
+Optional cross-cutting-primitives registry, if the workspace defines one (see `docs/newly-reachable-paths.md`):
+!`test -f backlog/config/cross-cutting-primitives.md && cat backlog/config/cross-cutting-primitives.md || echo "No cross-cutting-primitives registry at backlog/config/cross-cutting-primitives.md -- skip rule 55."`
+
 **Scope contract:** `devbench get-diff` is the AUTHORITATIVE source of "what changed in this work unit". Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any other raw-git command to compute scope; in single-branch + defer_pr mode those views include accumulated work from prior tasks (ADR-12) and produce false positives.
 
 ---
@@ -101,6 +104,13 @@ Evaluate the code diff against the acceptance criteria and CLAUDE.md standards.
 51. Deployment smoke tests (`tests/smoke/`) must exist for every new API endpoint: at minimum a `/health` GET and one authenticated endpoint call that verifies HTTP status codes against the deployed environment.
 52. The local development table-creation script (`scripts/create-local-tables.sh`) must be updated whenever a new DynamoDB table is added.
 
+## BUG-FIX COMPLETENESS
+This section applies only when the work unit is bug-fix-shaped: its title starts with "Fix", or its Description / Approach explicitly frames the work as correcting a defect (a crash, a permanently-disabled control, an exception that was silently short-circuiting downstream logic, a component that never mounted, a condition that always took the early-return branch). Skip this section entirely for greenfield feature work, refactors with no reported defect, and documentation-only tasks. Full rationale and worked examples: `docs/newly-reachable-paths.md`.
+
+53. The Comments / Agent Log contains a `[NEWLY_REACHABLE]` entry -- an explicit enumeration of the code paths this fix newly makes reachable (or an explicit "none" with a one-sentence justification). FAIL if a bug-fix-shaped task's log has no such entry; do not accept "the original repro now passes" as a substitute -- that is a different claim.
+54. Each enumerated newly-reachable path in the `[NEWLY_REACHABLE]` entry is backed by evidence of a real/live check (a test run, command output, or an explicit manual-verification note naming what was exercised and the result) -- not just restated confidence that the code "should" work. FAIL if any listed path has no verification evidence attached.
+55. If the diff touches a file named in the optional cross-cutting-primitives registry (read in Evidence above, when present), the `[NEWLY_REACHABLE]` entry explicitly addresses that primitive's other named consumers. FAIL if the registry flags an overlap and the entry does not mention it.
+
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
 - `BACKLOG.md` -- work-unit status index
@@ -130,7 +140,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback code_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`, `NEWLY_REACHABLE_PATH_UNVERIFIED`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

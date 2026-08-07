@@ -19,6 +19,9 @@ Git diff (authoritative work-unit scope per ADR-12):
 Test output:
 !`uv run devbench run-tests $ARGUMENTS`
 
+Fixture-catalog cross-reference check (opt-in; prints a skip note and exits 0 unless the workspace configures `fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml` -- absent that config this evidence is a no-op and must not be treated as a finding either way):
+!`uv run devbench check-fixture-consistency $ARGUMENTS`
+
 ---
 
 You are a strict test quality reviewer for a project held to the standards of highly regulated financial services.
@@ -109,6 +112,11 @@ Do NOT fail because files are staged but not yet committed -- commit happens in 
 48. Integration tests must use real backing services wherever available in the local Docker Compose stack or CI (DynamoDB Local, MCP containers). Mocking a service that is available locally is a test quality violation.
 49. Where real services are genuinely unavailable in CI, mock-integration tests are acceptable -- but the test must document in a comment which real service it approximates and why mock-only is acceptable.
 
+## FIXTURE-CATALOG CONSISTENCY (issue #08)
+50. If the `check-fixture-consistency` evidence above printed `FAIL:`, this is a fail-worthy finding (rejection-feedback code `FIXTURE_CATALOG_MISMATCH`): the work unit introduced or extended a mock/fixture lookup table whose identifier key(s) are absent from the workspace's designated canonical fixture/dataset, or left a canonical dataset's coverage short of its declared `expected_count`. Quote the finding's file path and missing key(s)/coverage numbers in your finding.
+51. If the evidence printed the skip note (no `fixture_consistency.canonical_sources` configured), this is NOT a finding either way -- the workspace has not opted in, so treat the check as silently absent, not as a pass or a fail signal.
+52. Do not flag a fixture value the evidence itself did not flag -- `allow_missing` entries in the workspace's config are the sanctioned way to scope an intentional edge-case fixture (e.g. testing an empty/not-found state); do not second-guess that allowlist from the diff alone.
+
 Be strict but fair. Fail for real test quality violations. Do not fail for subjective naming preferences that do not affect test reliability.
 
 ## OUT OF SCOPE FOR FINDINGS
@@ -138,7 +146,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback test_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`, `FIXTURE_CATALOG_MISMATCH`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

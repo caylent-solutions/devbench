@@ -326,6 +326,39 @@ validate:
   check_orphan_path_tokens: true
 
 # ---------------------------------------------------------------------------
+# Fixture-catalog cross-reference check (issue #08). Opt-in and project-
+# specific: `devbench check-fixture-consistency` is a no-op unless this
+# section designates canonical_sources, since devbench cannot infer a
+# target repo's fixture/mock-file layout on its own. When configured, the
+# test-reviewer agent runs the check as review evidence and fails the
+# review if a scanned fixture references an identifier absent from its
+# canonical source, or a canonical source's coverage falls short of an
+# expected_count. See docs/backlog-contract.md.
+# ---------------------------------------------------------------------------
+# fixture_consistency:
+#   canonical_sources:
+#     # Repo-relative path to the canonical fixture/dataset file, and the
+#     # key name within each record holding the identifier value(s)
+#     # (SKU, product id, PO number, etc.) other fixtures must reference.
+#     - path: tests/fixtures/catalog.json
+#       identifier_field: sku
+#       # Optional: assert full backfill coverage -- fails the check when
+#       # the canonical file's distinct `sku` count differs from this.
+#       expected_count: 24
+#   scan:
+#     # Mock/fixture files to cross-reference against a canonical_sources
+#     # entry. `canonical_source` is inferred when exactly one
+#     # canonical_sources entry is configured (as above); set it
+#     # explicitly when more than one canonical source is configured.
+#     - path: tests/fixtures/mock_catalog_lookup.json
+#       identifier_field: sku
+#       # Explicit opt-out for fixtures that intentionally model a
+#       # not-found/empty-state edge case -- values here never produce a
+#       # missing-key finding for this scan target.
+#       allow_missing:
+#         - SKU-DOES-NOT-EXIST
+
+# ---------------------------------------------------------------------------
 # Plugin-skill (spec-to-backlog, create-spec) configuration (issue #221
 # E1-E10). The bundled skills are application-agnostic: by default they
 # operate against the canonical-section list embedded in their SKILL.md

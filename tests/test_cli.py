@@ -3611,6 +3611,224 @@ class TestCmdGetDiff:
 
 
 @pytest.mark.unit
+class TestCmdCheckAncestry:
+    """Tests for cmd_check_ancestry, the canonical git-ancestry dependency gate."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Dependency ancestry gate",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_returns_zero_and_ancestor_status_when_dependency_merged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: origin/dep-branch IS an ancestor of origin/main
+        When: cmd_check_ancestry is called with an explicit target-ref
+        Then: rc is 0 and the JSON status line reports "ancestor"
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload == {
+            "unit_id": "E1-F1-S1-T1",
+            "status": "ancestor",
+            "dependency_ref": "origin/dep-branch",
+            "target_ref": "origin/main",
+        }
+
+    def test_returns_one_and_not_ancestor_status_when_dependency_not_merged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: origin/dep-branch is NOT an ancestor of origin/main (merge-base rc=1)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, JSON reports "not_ancestor", and a BLOCKED message goes to stderr
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (1, "", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out.strip())
+        assert payload["status"] == "not_ancestor"
+        assert "BLOCKED" in captured.err
+        assert "not yet an ancestor" in captured.err
+
+    def test_returns_one_on_invalid_ref(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """
+        Given: merge-base cannot resolve a ref (rc=128, the git convention for a bad revision)
+        When: cmd_check_ancestry is called
+        Then: rc is 1 and an ERROR (not BLOCKED) is printed -- this is an evaluation failure,
+              not a confirmed "not merged" answer, and must not be conflated with it.
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (128, "", "fatal: Not a valid commit name origin/bogus-ref")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/bogus-ref", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+        assert "BLOCKED" not in captured.err
+
+    def test_defaults_target_ref_to_origin_default_branch_when_omitted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: no target-ref argument is supplied
+        When: cmd_check_ancestry is called with only unit_id + dependency_ref
+        Then: it resolves and uses origin/<default-branch> as the target
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 0
+        assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "origin/dep-branch", "origin/main"]]
+
+    def test_returns_one_when_unit_not_found(self) -> None:
+        """
+        Given: the unit_id does not exist in the backlog index
+        When: cmd_check_ancestry is called
+        Then: it fails fast with rc 1 before attempting any git call
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+
+    def test_returns_one_on_empty_dependency_ref(self) -> None:
+        """
+        Given: an empty/whitespace dependency-ref argument
+        When: cmd_check_ancestry is called
+        Then: it fails fast with rc 1 (guards against a silently-vacuous ancestry check)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "   ", "origin/main")
+
+        assert result == 1
+
+    def test_fetch_failure_is_non_fatal_and_check_still_runs(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: 'git fetch origin' fails (e.g. offline)
+        When: cmd_check_ancestry is called
+        Then: a WARNING is printed but the merge-base check still runs and can pass
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "fetch"]:
+                return (1, "", "fatal: unable to access origin")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        assert "WARNING" in capsys.readouterr().err
+
+
+class TestCheckAncestryRegistration:
+    """The check-ancestry command must be registered in the CLI dispatch table."""
+
+    def test_check_ancestry_in_commands(self) -> None:
+        assert "check-ancestry" in cli._COMMANDS
+        handler, argc, _help = cli._COMMANDS["check-ancestry"]
+        assert handler is cli.cmd_check_ancestry
+        assert argc == 2
+
+
+@pytest.mark.unit
 class TestCmdReadUnitStripComments:
     """Tests for --strip-comments flag on cmd_read_unit (E216-F1-S1-T1)."""
 

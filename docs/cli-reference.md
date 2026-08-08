@@ -1162,6 +1162,20 @@ Issue #101 reconciliation step for `pause_before_merge: true` workspaces. Querie
 
 Returns rc=0 in every normal case; rc=1 only on hard failure (gh API failure, malformed JSON, done-gate refusal). Output is a single JSON line so the orchestrator skill's step 1b reconciliation can parse it.
 
+### `check-ancestry`
+
+```
+uv run devbench check-ancestry <id> <dependency-ref> [<target-ref>]
+```
+
+**Canonical dependency-deliverability check.** Runs `git merge-base --is-ancestor <dependency-ref> <target-ref>` in the work unit's target repo to answer, with real git ancestry rather than a proxy (e.g. a local snapshot/report file), whether a declared prerequisite has actually merged. `target-ref` defaults to `origin/<default-branch>` when omitted. Best-effort `git fetch origin` runs first so a stale local view of `origin` cannot produce a false "not merged" result.
+
+This is the check `spec-to-backlog`-generated ancestry-gate tasks run (see [`cross-backlog-dependencies.md`](cross-backlog-dependencies.md)). Any other tooling that needs the same answer should shell out to this command rather than inventing a weaker proxy.
+
+Exit contract is intentionally stricter than most devbench commands: rc=0 only when the dependency IS an ancestor of the target (gate passes). rc=1 for "not yet an ancestor" (gate should block) and for any error that prevents a decision (unresolvable unit/repo/default-branch, invalid refs). A JSON status line (`{"unit_id", "status": "ancestor"|"not_ancestor", "dependency_ref", "target_ref"}`) is always printed to stdout.
+
+**Known limitation**: a strict commit-graph ancestry check can report "not an ancestor" for a logically-satisfied dependency when the producer branch was squash-merged, rebased, or landed via a fix-pack branch that doesn't carry the original commit hashes. Point `dependency-ref` at the actual merge commit/tag on the shared trunk in those topologies, or fall back to the manual-blocker idiom ([`manual-blockers.md`](manual-blockers.md)) with an operator-verified AC when no ancestry-preserving ref exists.
+
 The orchestrator skill (`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`) calls this command on every `in-review` work unit at the top of each loop iteration when `git_ops.pause_before_merge: true` is set in the YAML. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full pause-before-merge mode reference and [ADR-13](adr/13-pause-before-merge.md) for the design rationale.
 
 ### `git-ops` orphan-pattern auto-emit (Phase 10 hardening)

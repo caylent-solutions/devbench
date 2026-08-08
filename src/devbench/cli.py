@@ -57,6 +57,7 @@ for easy parsing by Claude Code or other automation.
 
 import asyncio
 import contextlib
+import fnmatch
 import getpass
 import json
 import logging
@@ -3683,6 +3684,22 @@ def cmd_get_diff(unit_id: str) -> int:
     return 0
 
 
+def _select_test_command(repo_path: Path) -> list[str]:
+    """Return the test-suite command to run in *repo_path*.
+
+    Uses ``make test`` when the repo has a Makefile with a ``test`` target,
+    otherwise falls back to a bare ``pytest`` invocation. Shared by
+    :func:`cmd_run_tests` (task-scoped evidence for the test-reviewer judge)
+    and :func:`cmd_check_shared_file_impact` (full-suite regression gate),
+    which always run the same command -- the two commands differ in how the
+    result is interpreted, not in what gets invoked.
+    """
+    rc, _stdout, _stderr = run_command(["make", "-n", "test"], cwd=repo_path)
+    if rc == 0:
+        return ["make", "test"]
+    return ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+
+
 def cmd_run_tests(unit_id: str) -> int:
     """Run the test suite for the work unit's target repo and return the output.
 
@@ -3690,6 +3707,16 @@ def cmd_run_tests(unit_id: str) -> int:
     otherwise falls back to ``pytest``.  Exits non-zero if the test run fails.
 
     Used by the test-reviewer agent to obtain test execution evidence.
+
+    Note: this always invokes the full suite command (`_select_test_command`);
+    it is not scoped to the work unit's Changes Manifest. What IS scoped by
+    convention is which parts of the *output* an executor/reviewer treats as
+    this task's responsibility -- nothing here enforces that at the tooling
+    level. When a task's diff touches a shared/high-fan-in file (per
+    `repos.<repo>.shared_file_patterns` in devbench.yaml),
+    `check-shared-file-impact` should be used instead: it runs this same
+    command but diffs the failure set against a stored baseline and blocks
+    on newly-introduced failures.
     """
     from devbench.config import TEST_TIMEOUT
 
@@ -3707,12 +3734,253 @@ def cmd_run_tests(unit_id: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    rc, stdout, _ = run_command(["make", "-n", "test"], cwd=repo_path)
-    cmd = ["make", "test"] if rc == 0 else ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+    cmd = _select_test_command(repo_path)
 
     rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
     combined = "\n".join(part for part in (stdout, stderr) if part.strip())
     print(combined if combined else "(no output)")
+    return rc
+
+
+# Best-effort per-test failure extraction for the shared-file regression gate.
+# Covers pytest's short summary line, `go test`'s `--- FAIL:` line, and the
+# jest/mocha-style spec-runner glyph. This is intentionally NOT a general
+# solution for every test runner devbench's target repos might use -- see
+# `_parse_failing_tests` docstring for the documented fallback behaviour.
+_FAILING_TEST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^FAILED\s+(\S+)", re.MULTILINE),
+    re.compile(r"^---\s+FAIL:\s+(\S+)", re.MULTILINE),
+    re.compile(r"^\s*(?:✕|✗)\s+(.+?)\s*$", re.MULTILINE),
+)
+
+_SHARED_FILE_BASELINE_DEGRADED_MARKER = "<suite-failed-no-per-test-detail-parsed>"
+
+
+def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -> list[str]:
+    """Return the subset of *changed_files* matching any glob in *patterns*.
+
+    Patterns are ``fnmatch``-style and matched against POSIX-relative paths
+    (the same shape :func:`devbench.backlog.manifest.list_changed_files`
+    returns). Sorted + de-duplicated for stable output.
+    """
+    return sorted({f for f in changed_files for pattern in patterns if fnmatch.fnmatch(f, pattern)})
+
+
+def _parse_failing_tests(output: str, rc: int) -> tuple[set[str], bool]:
+    """Best-effort extraction of individual failing-test identifiers from *output*.
+
+    Returns ``(failing_tests, degraded)``. ``degraded`` is ``True`` when the
+    suite failed (``rc != 0``) but none of the recognised formats (pytest,
+    ``go test``, jest/mocha-style) matched anything -- in that case
+    ``failing_tests`` is a single synthetic marker so the baseline-diff
+    logic still has something to compare, but callers surface ``degraded``
+    so it is visible that per-test attribution could not be computed for
+    this repo's test runner rather than silently treating it as precise.
+    """
+    found: set[str] = set()
+    for pattern in _FAILING_TEST_PATTERNS:
+        found.update(match.group(1).strip() for match in pattern.finditer(output))
+    if rc == 0 or found:
+        return found, False
+    return {_SHARED_FILE_BASELINE_DEGRADED_MARKER}, True
+
+
+def _shared_file_baseline_path(canonical_repo: str) -> Path:
+    """Return the per-repo baseline file path under the workspace's ``.devbench`` state dir."""
+    safe_name = canonical_repo.replace("/", "__")
+    return WORKSPACE_ROOT / ".devbench" / "test-baselines" / f"{safe_name}.json"
+
+
+def _load_shared_file_baseline(path: Path) -> dict[str, Any] | None:
+    """Return the parsed baseline JSON at *path*, or ``None`` when absent/unreadable.
+
+    A corrupt or unreadable baseline is treated the same as "no baseline yet"
+    (bootstrap path) rather than raising -- a hand-edited or partially
+    written baseline file must never be able to turn into a hard crash that
+    blocks every subsequent task touching a shared file.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_shared_file_baseline(path: Path, *, canonical_repo: str, failing_tests: set[str], unit_id: str) -> None:
+    """Persist *failing_tests* as the new baseline for *canonical_repo*, attributed to *unit_id*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "repo": canonical_repo,
+        "failing_tests": sorted(failing_tests),
+        "updated_by_unit": unit_id,
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+    }
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _evaluate_shared_file_gate(
+    *, unit_id: str, canonical_repo: str, repo_path: Path, matched_files: list[str]
+) -> tuple[dict[str, Any], int]:
+    """Run the full suite and baseline-diff for a matched shared-file impact.
+
+    Isolates the "a shared file WAS touched" branch of
+    :func:`cmd_check_shared_file_impact` into its own function purely to
+    keep the caller's cyclomatic/return-statement complexity low; the
+    bootstrap / block / pass decision described in that function's
+    docstring lives here. Returns ``(json_payload, exit_code)``.
+    """
+    from devbench.config import TEST_TIMEOUT
+
+    cmd = _select_test_command(repo_path)
+    rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
+    combined_output = "\n".join(part for part in (stdout, stderr) if part.strip())
+    current_failing, degraded = _parse_failing_tests(combined_output, rc)
+
+    baseline_path = _shared_file_baseline_path(canonical_repo)
+    baseline = _load_shared_file_baseline(baseline_path)
+
+    base_payload: dict[str, Any] = {
+        "unit_id": unit_id,
+        "repo": canonical_repo,
+        "shared_file_impact": True,
+        "matched_files": matched_files,
+        "full_suite_command": cmd,
+        "full_suite_exit_code": rc,
+        "degraded": degraded,
+        "baseline_path": str(baseline_path),
+    }
+
+    if baseline is None:
+        _write_shared_file_baseline(
+            baseline_path, canonical_repo=canonical_repo, failing_tests=current_failing, unit_id=unit_id
+        )
+        payload = {
+            **base_payload,
+            "verdict": "bootstrap",
+            "failing_tests": sorted(current_failing),
+            "note": (
+                "No prior baseline existed for this repo; the current failing-test set has "
+                "been recorded as the baseline. This run cannot distinguish pre-existing "
+                "failures from ones this task introduced -- the next task that touches a "
+                "shared file will be checked against this baseline."
+            ),
+        }
+        return payload, 0
+
+    baseline_failing: set[str] = set(baseline.get("failing_tests") or [])
+    new_failures = sorted(current_failing - baseline_failing)
+
+    if new_failures:
+        payload = {
+            **base_payload,
+            "verdict": "block",
+            "new_failures": new_failures,
+            "pre_existing_failures": sorted(current_failing & baseline_failing),
+        }
+        return payload, 1
+
+    _write_shared_file_baseline(
+        baseline_path, canonical_repo=canonical_repo, failing_tests=current_failing, unit_id=unit_id
+    )
+    payload = {**base_payload, "verdict": "pass", "failing_tests": sorted(current_failing)}
+    return payload, 0
+
+
+def cmd_check_shared_file_impact(unit_id: str) -> int:
+    """Gate a work unit's diff against the shared-file full-suite regression policy.
+
+    A task's regression verification (`run-tests`) is not scoped by the
+    Changes Manifest at the tooling level -- it always runs the full suite
+    command (`_select_test_command`) -- but nothing forces an executor to
+    actually invoke a full run, or to notice that a shared/high-fan-in file
+    (an app shell, a shared hook, a widely-consumed component) was touched.
+    A task can pass its own narrow verification while silently breaking
+    hundreds of already-passing tests elsewhere, discovered only when some
+    later, unrelated task happens to run the full suite. This command closes
+    that gap for repos with `repos.<repo>.shared_file_patterns` configured
+    in devbench.yaml:
+
+    1. Computes the work unit's changed-file set via
+       `list_changed_files` (staged + unstaged + untracked, relative to the
+       repo root -- the same read-only query the claim-scope guard uses).
+    2. Cross-references it against the repo's `shared_file_patterns` glob
+       list. No match: no-op (exit 0, `shared_file_impact: false`); the
+       task's normal `run-tests` evidence stands.
+    3. On a match (`_evaluate_shared_file_gate`): runs the full-suite
+       command, parses individual failing-test identifiers out of the
+       output (`_parse_failing_tests`), and diffs them against a stored
+       baseline at `<workspace>/.devbench/test-baselines/<repo>.json`.
+       Blocks (exit 1) only on tests failing now that were NOT in the
+       baseline -- so this does not stall on pre-existing/flaky failures.
+       The blocking output names the offending tests AND `unit_id`,
+       attributing the regression to the task that introduced it.
+    4. On a pass (no new failures), the baseline is refreshed to the
+       current failing set -- a ratchet, so a task that fixes a pre-existing
+       failure isn't later blamed by an unrelated task for "un-fixing" it.
+    5. No prior baseline: bootstraps (records current failures as the
+       baseline, exit 0) since there is nothing yet to compare against.
+
+    Known limitation (v1, documented rather than hidden): this is a
+    hand-maintained glob registry, not an auto-derived import/mount-graph
+    of actual fan-in -- see `docs/devbench-yaml-reference.md` for the
+    tradeoff. Per-test failure attribution is parsed from common textual
+    formats (pytest, `go test`, jest/mocha-style); other runners still get
+    suite-level bootstrap/ratchet behaviour but degrade to a single
+    synthetic marker instead of per-test identifiers, surfaced via the
+    `degraded` field in the JSON output.
+    """
+    from devbench.backlog.manifest import list_changed_files
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    repo_config = RUNTIME_CONFIG.repos.get(canonical_repo)
+    patterns = repo_config.shared_file_patterns if repo_config is not None else ()
+
+    try:
+        changed_files = list_changed_files(repo_path)
+    except RuntimeError as exc:
+        print(f"ERROR: could not compute changed files for '{canonical_repo}': {exc}", file=sys.stderr)
+        return 1
+
+    matched_files = _matched_shared_files(changed_files, patterns) if patterns else []
+    if not matched_files:
+        payload: dict[str, Any] = {
+            "unit_id": unit_id,
+            "repo": canonical_repo,
+            "shared_file_impact": False,
+            "changed_files": changed_files,
+        }
+        if not patterns:
+            payload["reason"] = "no shared_file_patterns configured for this repo"
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    result_payload, rc = _evaluate_shared_file_gate(
+        unit_id=unit_id, canonical_repo=canonical_repo, repo_path=repo_path, matched_files=matched_files
+    )
+    print(json.dumps(result_payload, indent=2))
+    if rc != 0:
+        print(
+            f"ERROR: {unit_id} touches shared file(s) {matched_files} and introduces "
+            f"{len(result_payload.get('new_failures', []))} new full-suite failure(s) not present "
+            f"in the baseline: {result_payload.get('new_failures')}. "
+            "Fix these before this task can be marked done.",
+            file=sys.stderr,
+        )
     return rc
 
 
@@ -9892,6 +10160,16 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
+    "check-shared-file-impact": (
+        cmd_check_shared_file_impact,
+        1,
+        (
+            "Full-suite regression gate for shared/high-fan-in files: "
+            "check-shared-file-impact <id>. No-op unless the diff touches a "
+            "repos.<repo>.shared_file_patterns match; blocks (exit 1) on new "
+            "failures vs. the stored baseline."
+        ),
+    ),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
     "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),
     "log-tdd": (cmd_log_tdd, 3, "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message>"),

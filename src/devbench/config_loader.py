@@ -942,6 +942,13 @@ class RepoConfig:
             populated by ``load_runtime_config`` from the YAML repos map
             key. Stored verbatim so consumers do not re-validate the
             shape per-call.
+        shared_file_patterns: Glob patterns (fnmatch-style, matched
+            against POSIX paths relative to the repo root) identifying
+            shared/high-fan-in composition-root files for this repo.
+            Consumed by ``devbench check-shared-file-impact`` (issue
+            #04 -- shared-file full-suite regression gate). Empty tuple
+            when unset, which means the gate never triggers for this
+            repo.
     """
 
     default_branch: str | None = None
@@ -950,6 +957,7 @@ class RepoConfig:
     branch_prefix: str | None = None
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
+    shared_file_patterns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1280,6 +1288,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
 
     repo_branch_prefix = _parse_branch_prefix(path, f"repos.{repo_name}.branch_prefix", repo_data.get("branch_prefix"))
+    shared_file_patterns = tuple(repo_data.get("shared_file_patterns") or ())
 
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
@@ -1287,6 +1296,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
             default_branch=default_branch,
             merge_strategy=repo_merge_strategy,
             branch_prefix=repo_branch_prefix,
+            shared_file_patterns=shared_file_patterns,
         )
 
     if Path(raw_checkout).is_absolute():
@@ -1304,6 +1314,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         checkout_directory=raw_checkout,
         merge_strategy=repo_merge_strategy,
         branch_prefix=repo_branch_prefix,
+        shared_file_patterns=shared_file_patterns,
     )
 
 

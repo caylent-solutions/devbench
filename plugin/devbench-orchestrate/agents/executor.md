@@ -340,6 +340,22 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
 - After writing a file, read it back to confirm contents match intent.
 - After running a command, check exit codes and output.
 - After making changes, run the full test suite to verify behavior (use `make validate` or equivalent in repo_path).
+- **Shared-file impact gate (issue #04).** Before logging completion, run:
+  ```bash
+  uv run devbench check-shared-file-impact $ARGUMENTS
+  ```
+  This is a no-op (exit 0, `shared_file_impact: false`) for most tasks -- it only does
+  anything when the target repo has `repos.<repo>.shared_file_patterns` configured in
+  `backlog/config/devbench.yaml` AND this task's diff touches one of those patterns (an
+  app-level composition root, a shared shell/container component, a widely-consumed shared
+  hook). When it matches, the command runs the FULL test suite (not just the files this task
+  touched) and blocks (non-zero exit) on any NEWLY introduced failure vs. the stored baseline
+  -- a regression this task caused in code that was never in its own Changes Manifest, and
+  therefore never exercised by the task's own scoped test run. A `PostToolUse` guard hook
+  (`assert-shared-file-impact.sh`) enforces this: a non-zero exit here blocks progression the
+  same way a failing `pytest` / `make test` already does via `assert-tests-pass.sh`. If it
+  blocks, fix every failure it names in `new_failures` (do not delete or skip those tests) and
+  re-run it before logging completion -- do not mark the task done with an unresolved block.
 - Document all verification steps in the log comment below.
 
 ---

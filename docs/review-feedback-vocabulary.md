@@ -26,6 +26,7 @@ example remediations.
 | `SCOPE_VIOLATION` | Diff touches files outside the Changes Manifest | Either revert the out-of-scope change OR file an amendment request. |
 | `MANIFEST_TODO_UNFILLED` | Manifest still has a `TBD` placeholder row | Replace placeholder with real file/change rows before claim. |
 | `AGENT_LOG_CONTRADICTS_DIFF` | TDD log claims work that does not appear in the diff | Reconcile log + diff; re-stage if work was lost, or trim the log claim. |
+| `UNREACHABLE_ARTIFACT` | New component/hook/slice/function has zero non-test importers per `devbench check-reachability` evidence | Import and wire the artifact into its real composition root (route table, parent container, shell), or add a `devbench-defer-reachability: <reason>` comment if intentionally deferred. |
 
 ## `test_review`
 

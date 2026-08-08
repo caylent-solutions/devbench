@@ -37,6 +37,7 @@ Plugin agent bridge commands (used by devbench plugin agents)::
 
     read-unit <id>                          Return work unit content and repo path as JSON
     get-diff <id>                           Return combined git diff for the work unit's repo
+    check-reachability <id>                 Flag newly-added source files with zero non-test importers
     run-tests <id>                          Run test suite for the work unit's repo
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
@@ -3714,6 +3715,341 @@ def cmd_run_tests(unit_id: str) -> int:
     combined = "\n".join(part for part in (stdout, stderr) if part.strip())
     print(combined if combined else "(no output)")
     return rc
+
+
+# Reachability check (issue #01: task-completion gate for orphaned artifacts).
+#
+# A grep-based heuristic is deliberately language-agnostic: devbench's target
+# repos span many stacks, so a hardcoded JS/TS import-graph walker would not
+# generalise. The tool's job is only to surface cheap candidates; the LLM
+# code-reviewer makes the final judgment call (dynamic imports, barrel
+# re-exports, and lazy route splits are known false-positive shapes it can
+# rule out that a grep cannot).
+
+_REACHABILITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".mjs",
+        ".cjs",
+        ".vue",
+        ".py",
+        ".go",
+        ".rb",
+        ".java",
+        ".kt",
+        ".swift",
+        ".cs",
+        ".php",
+    }
+)
+
+# Composition-root / package-entry filenames: nothing is expected to import
+# these by name, so flagging them as "unreachable" would be a guaranteed
+# false positive rather than a useful signal.
+_REACHABILITY_ENTRY_POINT_STEMS: frozenset[str] = frozenset(
+    {"index", "main", "app", "__init__", "setup", "conftest", "wsgi", "asgi"}
+)
+
+_REACHABILITY_TEST_PATH_MARKERS: tuple[str, ...] = (
+    "/__tests__/",
+    "/__mocks__/",
+    "/__snapshots__/",
+    "/test/",
+    "/tests/",
+    "/spec/",
+    "/specs/",
+    "/fixtures/",
+    "/mocks/",
+    "/.storybook/",
+    "/stories/",
+)
+
+_REACHABILITY_TEST_FILENAME_MARKERS: tuple[str, ...] = (
+    ".test.",
+    ".spec.",
+    ".stories.",
+)
+
+_REACHABILITY_DEFER_MARKER = "devbench-defer-reachability"
+
+_REACHABILITY_EXPORT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"export\s+default\s+(?:function|class)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"export\s+(?:const|function|class|let|var)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"^\s*def\s+([A-Za-z_]\w*)", re.MULTILINE),
+    re.compile(r"^\s*class\s+([A-Za-z_]\w*)", re.MULTILINE),
+    re.compile(r"^\s*func\s+([A-Za-z_]\w*)", re.MULTILINE),
+    re.compile(r"^\s*(?:public|private|protected)?\s*(?:static\s+)?class\s+([A-Za-z_]\w*)", re.MULTILINE),
+)
+
+_REACHABILITY_EXPORT_BRACE_RE = re.compile(r"export\s*\{([^}]+)\}")
+
+
+def _is_reachability_test_path(rel_path: str) -> bool:
+    """Return True when *rel_path* is a test, spec, story, or fixture file.
+
+    Used both to exclude such files from the "newly-added artifact"
+    candidate set and to exclude them when counting importers -- a file
+    referenced only by its own test/story file is exactly the orphan
+    pattern this check exists to catch.
+    """
+    normalized = "/" + rel_path.replace("\\", "/").lower()
+    if any(marker in normalized for marker in _REACHABILITY_TEST_PATH_MARKERS):
+        return True
+    filename = normalized.rsplit("/", 1)[-1]
+    if any(marker in filename for marker in _REACHABILITY_TEST_FILENAME_MARKERS):
+        return True
+    stem = filename.rsplit(".", 1)[0]
+    return stem.startswith("test_") or stem.endswith("_test")
+
+
+def _is_reachability_candidate(rel_path: str) -> bool:
+    """Return True when *rel_path* is a source file this check should examine."""
+    normalized = rel_path.replace("\\", "/")
+    suffix = "." + normalized.rsplit(".", 1)[-1].lower() if "." in normalized.rsplit("/", 1)[-1] else ""
+    if suffix not in _REACHABILITY_SOURCE_EXTENSIONS:
+        return False
+    if _is_reachability_test_path(normalized):
+        return False
+    filename = normalized.rsplit("/", 1)[-1]
+    stem = filename[: -len(suffix)] if suffix else filename
+    return stem.lower() not in _REACHABILITY_ENTRY_POINT_STEMS
+
+
+def _derive_reachability_basename_symbol(rel_path: str) -> str:
+    """Return the artifact name implied by *rel_path*'s basename.
+
+    ``Foo/index.tsx`` derives ``Foo`` (the directory name) rather than
+    ``index``, since barrel-file components are conventionally imported by
+    their containing folder's name.
+    """
+    normalized = rel_path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    filename = parts[-1] if parts else normalized
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    if stem.lower() == "index" and len(parts) > 1:
+        return parts[-2]
+    return stem
+
+
+def _extract_reachability_symbols(content: str, rel_path: str) -> list[str]:
+    """Return candidate exported symbol names for a file: basename + regex-extracted exports."""
+    symbols = {_derive_reachability_basename_symbol(rel_path)}
+
+    for pattern in _REACHABILITY_EXPORT_PATTERNS:
+        for match in pattern.finditer(content):
+            name = match.group(1)
+            if name:
+                symbols.add(name)
+
+    brace_match = _REACHABILITY_EXPORT_BRACE_RE.search(content)
+    if brace_match:
+        for token in brace_match.group(1).split(","):
+            name = token.strip().split(" as ")[0].strip()
+            if name and re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+                symbols.add(name)
+
+    return sorted(s for s in symbols if s)
+
+
+def _reachability_defer_reason(content: str) -> str | None:
+    """Return the escape-hatch reason if *content* contains a defer marker, else None."""
+    for line in content.splitlines():
+        marker_pos = line.find(_REACHABILITY_DEFER_MARKER)
+        if marker_pos == -1:
+            continue
+        remainder = line[marker_pos + len(_REACHABILITY_DEFER_MARKER) :].strip()
+        remainder = remainder.lstrip(":").strip()
+        for closer in ("*/", "-->", "#}", "}}"):
+            if remainder.endswith(closer):
+                remainder = remainder[: -len(closer)].strip()
+        return remainder or "(no reason given)"
+    return None
+
+
+def _parse_reachability_added_paths(name_status_output: str) -> list[str]:
+    """Return file paths marked ``A`` (added) in ``git diff --name-status`` output."""
+    paths: list[str] = []
+    for line in name_status_output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if fields[0].startswith("A") and len(fields) >= 2:
+            paths.append(fields[-1].strip())
+    return paths
+
+
+def _collect_reachability_new_files(canonical_repo: str, repo_path: Path) -> list[str]:
+    """Return every newly-added file path in the work unit's diff (staged/unstaged/branch/untracked).
+
+    Mode-aware per ADR-12, mirroring ``cmd_get_diff``'s scope contract: in
+    defer_pr mode the branch-vs-default comparison is skipped (it would
+    include prior tasks' commits on the shared branch) and ``git show
+    HEAD`` is used instead when staged/unstaged are both empty.
+    """
+    from devbench.config import DEFER_PR
+
+    new_files: set[str] = set()
+
+    rc, stdout, _ = run_command(["git", "diff", "--cached", "--name-status"], cwd=repo_path)
+    if rc == 0:
+        new_files.update(_parse_reachability_added_paths(stdout))
+
+    rc, stdout, _ = run_command(["git", "diff", "--name-status"], cwd=repo_path)
+    if rc == 0:
+        new_files.update(_parse_reachability_added_paths(stdout))
+
+    if DEFER_PR:
+        if not new_files:
+            rc, stdout, _ = run_command(["git", "show", "--format=", "--name-status", "HEAD"], cwd=repo_path)
+            if rc == 0:
+                new_files.update(_parse_reachability_added_paths(stdout))
+    else:
+        default_branch = _resolve_default_branch(canonical_repo, repo_path)
+        if default_branch is not None:
+            rc, stdout, _ = run_command(
+                ["git", "diff", f"origin/{default_branch}", "--name-status"], cwd=repo_path
+            )
+            if rc == 0:
+                new_files.update(_parse_reachability_added_paths(stdout))
+
+    rc, stdout, _ = run_command(["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_path)
+    if rc == 0:
+        for line in stdout.splitlines():
+            filepath = line.strip()
+            if filepath:
+                new_files.add(filepath)
+
+    return sorted(new_files)
+
+
+def _search_reachability_importers(repo_path: Path, rel_path: str, symbols: list[str]) -> list[str]:
+    """Return non-test files (excluding *rel_path* itself) that reference any of *symbols*.
+
+    Searches tracked and untracked files via ``git grep`` (fixed-string,
+    so symbol names with regex metacharacters like ``$`` are safe) and
+    drops any hit inside a test/spec/story/fixture file -- a reference
+    from a file's own test suite does not make it reachable from the app.
+    """
+    importers: set[str] = set()
+    for symbol in symbols:
+        rc, stdout, _ = run_command(
+            ["git", "grep", "--fixed-strings", "--files-with-matches", "--untracked", "--", symbol],
+            cwd=repo_path,
+        )
+        if rc != 0:
+            continue
+        for line in stdout.splitlines():
+            hit = line.strip()
+            if not hit or hit == rel_path:
+                continue
+            if _is_reachability_test_path(hit):
+                continue
+            importers.add(hit)
+    return sorted(importers)
+
+
+def cmd_check_reachability(unit_id: str) -> int:
+    """Surface newly-added source files in the work unit's diff with zero non-test importers.
+
+    Heuristic, language-agnostic evidence for the code-reviewer's
+    ``UNREACHABLE_ARTIFACT`` check (issue #01, reachability-check
+    task-completion gate): for every newly-added top-level source file in
+    the work unit's diff, derives candidate exported-symbol names (file
+    basename plus regex-extracted exports) and greps the rest of the
+    target repo -- tracked and untracked, excluding the file's own
+    test/story files -- for any non-test reference. Files with zero hits
+    are printed as reachability candidates.
+
+    This is deliberately a heuristic, not a gate: a grep miss can be a
+    false positive (dynamic ``import()``, barrel re-export the regex
+    missed, lazy route split). The tool's job is only to surface
+    candidates cheaply; the reviewing LLM makes the final call, and can
+    rule a candidate a false positive.
+
+    Honors an explicit escape hatch: a line anywhere in the file
+    containing ``devbench-defer-reachability: <reason>`` marks it as
+    intentionally deferred (feature-flagged, Storybook-only, follow-up
+    task) and excludes it from the unreachable-candidate list. The reason
+    is echoed in the report so the reviewer can judge whether it is
+    legitimate rather than a silent bypass.
+
+    Always exits 0 once the unit/repo resolve successfully -- this
+    command produces evidence, not a verdict. Exits 1 when the work unit
+    is not found or no local path is configured for its repo (same
+    contract as ``get-diff`` / ``run-tests``).
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    new_files = [
+        rel_path
+        for rel_path in _collect_reachability_new_files(canonical_repo, repo_path)
+        if _is_reachability_candidate(rel_path)
+    ]
+
+    print(f"Reachability check for {unit_id} (repo: {canonical_repo})")
+
+    if not new_files:
+        print("No newly-added source files found in this work unit's diff.")
+        return 0
+
+    print(f"Candidate artifacts examined: {len(new_files)}\n")
+
+    unreachable_count = 0
+    for rel_path in new_files:
+        abs_path = repo_path / rel_path
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"[SKIPPED] {rel_path}\n  Could not read file: {exc}\n")
+            continue
+
+        defer_reason = _reachability_defer_reason(content)
+        if defer_reason is not None:
+            print(f"[DEFERRED] {rel_path}\n  Escape hatch: devbench-defer-reachability: {defer_reason}\n")
+            continue
+
+        symbols = _extract_reachability_symbols(content, rel_path)
+        importers = _search_reachability_importers(repo_path, rel_path, symbols)
+
+        if importers:
+            print(f"[OK] {rel_path}")
+            print(f"  Symbols checked: {', '.join(symbols)}")
+            print(f"  Non-test importers found: {len(importers)}")
+            for importer in importers[:10]:
+                print(f"    - {importer}")
+            if len(importers) > 10:
+                print(f"    ... and {len(importers) - 10} more")
+            print()
+        else:
+            unreachable_count += 1
+            print(f"[POTENTIALLY UNREACHABLE] {rel_path}")
+            print(f"  Symbols checked: {', '.join(symbols)}")
+            print("  Non-test importers found: 0")
+            print(
+                "  No reference to these symbols was found outside test/story files in "
+                f"'{canonical_repo}'. Confirm this artifact is wired into the app's real "
+                "composition root (route table, parent container, shell), or add a "
+                "'devbench-defer-reachability: <reason>' comment if intentionally deferred."
+            )
+            print()
+
+    print(f"Summary: {len(new_files)} candidate(s) examined, {unreachable_count} flagged as potentially unreachable.")
+    return 0
 
 
 def _reject_em_dash(field_name: str, text: str) -> int | None:
@@ -9891,6 +10227,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     # Plugin agent bridge commands -- used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
+    "check-reachability": (
+        cmd_check_reachability,
+        1,
+        "Flag newly-added source files with zero non-test importers: check-reachability <id>",
+    ),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
     "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),

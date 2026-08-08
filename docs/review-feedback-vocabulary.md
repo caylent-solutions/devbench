@@ -36,6 +36,7 @@ example remediations.
 | `COVERAGE_REGRESSION` | Coverage on the gated modules dropped below 100% | Add tests that exercise every modified branch. |
 | `TDD_CYCLE_MISSING` | No `[RED]` / `[GREEN]` / `[REFACTOR]` audit entries | Re-run the TDD cycle and log the phases via `devbench log-tdd`. |
 | `DRY_VIOLATION` | Duplicated test logic that should be parameterised | Extract a helper or use `pytest.mark.parametrize`. |
+| `COMPOSITION_ROOT_MISSING` | Only coverage for a state-consuming UI component is an isolated render with hand-supplied props/mocked store/DI container (issue #02) | Add a test that renders/exercises the component through the app's real composition root, or a documented smallest-real-ancestor exception -- see `docs/composition-root-testing.md`. |
 
 ## `doc_review`
 

@@ -36,6 +36,7 @@ example remediations.
 | `COVERAGE_REGRESSION` | Coverage on the gated modules dropped below 100% | Add tests that exercise every modified branch. |
 | `TDD_CYCLE_MISSING` | No `[RED]` / `[GREEN]` / `[REFACTOR]` audit entries | Re-run the TDD cycle and log the phases via `devbench log-tdd`. |
 | `DRY_VIOLATION` | Duplicated test logic that should be parameterised | Extract a helper or use `pytest.mark.parametrize`. |
+| `LAYOUT_STUB_WITHOUT_LIVE_TEST` | Diff stubs a DOM-layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, etc.) for a `[LAYOUT-AC]`-tagged AC with no companion real-render test for the same AC | Add a companion real-render/live-browser test (e.g. Playwright) at the viewport/breakpoint the AC names; the stub alone does not prove the fix. |
 
 ## `doc_review`
 

@@ -39,6 +39,7 @@ JUDGE_CATEGORIES: Final[dict[str, frozenset[str]]] = {
             "COVERAGE_REGRESSION",
             "TDD_CYCLE_MISSING",
             "DRY_VIOLATION",
+            "LAYOUT_STUB_WITHOUT_LIVE_TEST",
         }
     ),
     "doc_review": frozenset(

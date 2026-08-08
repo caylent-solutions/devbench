@@ -109,6 +109,9 @@ Do NOT fail because files are staged but not yet committed -- commit happens in 
 48. Integration tests must use real backing services wherever available in the local Docker Compose stack or CI (DynamoDB Local, MCP containers). Mocking a service that is available locally is a test quality violation.
 49. Where real services are genuinely unavailable in CI, mock-integration tests are acceptable -- but the test must document in a comment which real service it approximates and why mock-only is acceptable.
 
+## LAYOUT / VISUAL AC VERIFICATION
+50. Standard jsdom-style unit-test environments have no real layout, paint, or cascade engine -- a test that stubs the browser layout/rendering primitive under test (e.g. `Object.defineProperty(el, 'offsetHeight', ...)`, a mocked `getBoundingClientRect`, a mocked `ResizeObserver`/`IntersectionObserver`/`matchMedia`, or the equivalent measured-geometry primitive in another test framework/stack) structurally cannot fail even when the live defect it targets still exists. If the diff introduces or modifies such a stub for an Acceptance Criterion tagged `[LAYOUT-AC]` in the work unit (sticky positioning, z-index/overlap, viewport/breakpoint, flex-shrink collapse, autosize, position: fixed/absolute, cascade/specificity -- the `spec-to-backlog` Step 3a keyword heuristic), that stub is NOT sufficient proof of completion on its own. FAIL unless the diff also contains a companion real-render/live-browser test (e.g. Playwright, or the equivalent real-renderer for the stack) covering the SAME AC at the viewport/breakpoint the AC names. A layout-primitive stub used for unrelated logic, or one paired with a companion live-render test for the same AC, is not a violation -- only flag the specific combination of "layout-primitive stub" + "AC is `[LAYOUT-AC]`-tagged" + "no companion live-render test for that AC in the diff."
+
 Be strict but fair. Fail for real test quality violations. Do not fail for subjective naming preferences that do not affect test reliability.
 
 ## OUT OF SCOPE FOR FINDINGS
@@ -138,7 +141,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback test_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`, `LAYOUT_STUB_WITHOUT_LIVE_TEST`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

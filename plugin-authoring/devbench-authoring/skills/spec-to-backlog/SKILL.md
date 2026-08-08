@@ -56,7 +56,7 @@ Every leaf task `.md` file MUST contain these 15 sections, in this order:
 10. `## Dependencies` -- table of upstream tasks this task depends on (`| ID | Title | Status |`)
 11. `## Acceptance Criteria` -- task-specific ACs tied to spec section numbers or AC-N identifiers from spec Section 6; no `AC-XCUT-N` cross-cutting blocks
 12. `## Changes Manifest` -- the canonical 2-column form `| File | Change |`. EXACTLY two columns; the validator's `parse_manifest` rejects any other column count with `ManifestParseError: Manifest row must have exactly 2 columns`. Each row's File cell is a backtick-wrapped relative path (or a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` when the file list is undetermined); the Change cell is one of `add`, `modify`, `delete` (lowercase). Multi-repo work units encode the repo in the File cell as `` `<org/repo>` -- <path> `` (no per-row Repo column). The `## Target Repository` block at the top of the work-unit file is where Repo / Branch live; the Manifest carries paths only. NEVER use glob patterns (``*`` or ``**``) -- use a sentinel instead. See `docs/backlog-contract.md` 'Changes Manifest' section.
-13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`)
+13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`). **Layout/Visual AC exception**: if any item in `## Acceptance Criteria` carries the `[LAYOUT-AC]` tag (Step 3a), one Definition of Done item MUST require real-render/live-browser verification (e.g. Playwright, or the equivalent real-renderer for the target stack) at the specific viewport/breakpoint named in the AC -- a jsdom-only test, or a DOM-testing-library test that stubs a layout primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent), does not satisfy that item on its own.
 14. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
 15. `## Comments` -- header only (blank at authoring time)
 
@@ -113,8 +113,46 @@ Extract:
 - All acceptance criteria (AC-N identifiers from the spec's Section 6 or equivalent)
 - All constraints, NFRs, and implementation notes
 - The target repository and branch
+- Layout/geometry-sensitive language within each AC (Step 3a tagging, below)
 
 Record the FR list for coverage validation in the iterate-until-perfect loop.
+
+### 3a -- Tag layout/geometry-sensitive acceptance criteria (heuristic, not a guarantee)
+
+Standard jsdom-style unit-test environments have no real layout, paint, or cascade
+engine -- they can assert prop wiring or CSS source text, never rendered geometry. An
+AC whose behaviour can only be *observed* by a real renderer (sticky positioning,
+circular height/width measurement, flex-shrink collapse across an ancestor chain,
+media-query cascade/specificity, third-party grid autosize side effects, overlapping or
+pointer-blocking elements) is not provable by that kind of test alone, no matter how the
+implementation is written.
+
+While extracting ACs (above), keyword-scan each AC's text (case-insensitive, substring
+match) for layout/CSS-geometry-sensitive language: `sticky`, `z-index`, `viewport`,
+`breakpoint`, `flex-shrink`, `autosize`, `overlap`, `position: fixed`,
+`position: absolute`, `cascade`, `specificity`. An AC matching one or more of these terms
+is a **Layout/Visual AC** -- tag it `[LAYOUT-AC]` so every leaf task descending from it
+carries the tag through Step 5.
+
+**This is a keyword heuristic, not a guarantee.** Expect both:
+- **False positives** -- an AC that mentions "width" or "position" with no real rendered-geometry
+  risk (e.g. "the API response includes the item's `position` field"). Tagging it costs an
+  extra DoD line the operator can waive with a one-line justification in `## Comments`; it
+  is not a hard scope boundary.
+- **False negatives** -- a layout risk that only becomes visible in the implementation (a
+  third-party component the AC text never named turns out to use `ResizeObserver`
+  internally) and was never named in the AC text to begin with. The executor or reviewer
+  may retroactively tag an untagged task the same way, with the same one-line
+  justification convention, if implementation reveals a layout risk the AC text didn't
+  surface.
+
+Any leaf task whose Acceptance Criteria include a `[LAYOUT-AC]`-tagged item MUST, when
+authored in Step 5a:
+- Carry the `[LAYOUT-AC]` marker on the AC line itself in `## Acceptance Criteria`.
+- Carry a Definition of Done line requiring real-render/live-browser verification (e.g.
+  Playwright -- the most common case for web UI work, though the check applies equally to
+  any stack whose standard unit-test harness has no real layout/rendering engine) at the
+  specific viewport(s)/breakpoint(s) the AC names. See Step 1b item 13.
 
 ---
 
@@ -189,6 +227,7 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
 - Generic 11-step Approach templates. Approach steps MUST reference the specific files, lines, and pytest commands for THIS task.
 - DoR / DoD items mentioning paths not in this task's Changes Manifest. Either include the path in the Manifest, or rewrite the item behaviourally (no path tokens), or suffix the token with `(ref)`.
 - Glob patterns (``*`` or ``**``) in any Manifest row. Use a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` instead and rely on the orchestrator's `manifest_amendment` workflow to concretise the file list at execution time.
+- A `[LAYOUT-AC]`-tagged task (Step 3a) whose `## Definition of Done` treats a jsdom-only test, or a test that stubs a layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent), as sufficient proof of completion. The DoD line required by Step 1b item 13 must be present and must not be satisfiable by stub-only evidence.
 
 **Canonical dep-ID form (issue #229)**: every row in `## Dependencies` and `### Depends On This` MUST have its first column match the regex `E\d+(-F\d+)?(-S\d+)?(-T\d+)?`. Directory names are slugs (e.g., `E16-test-cleanup`) and are NOT valid IDs. Use the bare `E<n>` / `E<n>-F<m>` form. When citing existing-backlog epics, look up the canonical ID from `BACKLOG.md`'s Full Work Unit Index ID column (the first cell of each index row). The validator's `_check_dep_id_format` rule rejects slug-form IDs with `dependency ID '<slug>' does not match the canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]`. The `normalize_dep_ids` post-processor pass (Step 5d) rewrites slug-form IDs to canonical form when found.
 
@@ -231,6 +270,7 @@ Score each item PASS or FAIL:
 10. **Approach-specificity check**: the Approach section names concrete files, line numbers (where applicable), and pytest commands for this task. FAIL if the Approach reads as a generic template substitutable across tasks.
 11. **Discovery-artifact coverage at task granularity** (issue #221 A1): when Step 2 supplied a `discovery_artifacts_dir`, if this task is the covering task for any artefact row (from the mapping established at Step 4b item 7), the AC or Approach explicitly cites the artefact row -- either by quoting the row text or by naming the artefact filename + the row identifier (line number, file path, claim ID, etc., depending on the artefact's row shape). FAIL if a discovery-artefact row mapped to this task has no citation in either AC or Approach. Skipped when `discovery_artifacts_dir` is absent or no rows map to this task.
 12. **AC-FINAL tier-suffix on non-Python tasks** (issue #228): when this task's Changes Manifest contains zero `.py` paths, the Python-tooling AC-FINAL lines (`AC-FINAL-002` ruff format, `AC-FINAL-003` ruff check, `AC-FINAL-004` mypy, `AC-FINAL-005` pytest tier, `AC-FINAL-006` pytest other tier, `AC-FINAL-008` bandit, `AC-FINAL-014` coverage) MUST carry the explicit suffix `-- N/A for <Tier> Tasks (no Python source authored)`. Tier is derived from the dominant Manifest file extension: `.yml` / `.yaml` -> `YAML`, `.md` -> `Markdown`, `.toml` -> `TOML`, `.tf` / `.hcl` / `.tfvars` -> `HCL`, `.json` -> `JSON`, `.xml` -> `XML`; manifests with multiple non-Python extensions report `Mixed`. FAIL if a non-Python task lacks the suffix on any of those AC-FINAL lines. The `suffix_na_on_non_python_tasks` post-processor pass (Step 5d) deterministically adds the suffix when missing. See `docs/acceptance-criteria-canonical.md`.
+13. **Layout/Visual AC Definition of Done**: when this task's `## Acceptance Criteria` contains any AC tagged `[LAYOUT-AC]` (Step 3a keyword heuristic: sticky, z-index, viewport, breakpoint, flex-shrink, autosize, overlap, position: fixed/absolute, cascade/specificity), `## Definition of Done` MUST contain an explicit real-render/live-browser verification line (e.g. Playwright, or the equivalent real-renderer for the target stack) naming the specific viewport(s)/breakpoint(s) from the AC. A jsdom-only test, or a test that stubs a layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent) without a companion real-render assertion for the same AC, is NOT sufficient proof of completion for that item. FAIL if a `[LAYOUT-AC]`-tagged task's Definition of Done omits this line or the line is satisfiable by stub-only evidence. This is a heuristic gate, not a guarantee -- false positives/negatives from the Step 3a keyword scan are expected and may be corrected with a one-line justification in `## Comments` rather than a rubric failure, provided the justification is present.
 
 ### 5c -- Revise
 
@@ -425,6 +465,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 - **Output files**: `BACKLOG.md` + work-unit `.md` files under `backlog/` in canonical 7-column format
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
 - **Per-task depth**: every task contains all 15 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
+- **Layout/Visual AC tagging**: ACs matching the Step 3a keyword heuristic are tagged `[LAYOUT-AC]` and their leaf tasks carry a Definition of Done line requiring real-render/live-browser verification -- a jsdom-only test is not sufficient proof of completion for those items. The keyword scan is a heuristic (documented false positives/negatives), not a guarantee -- see Step 3a.
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 

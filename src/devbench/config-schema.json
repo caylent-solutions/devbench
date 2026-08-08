@@ -482,6 +482,69 @@
         }
       }
     },
+    "fixture_consistency": {
+      "type": "object",
+      "description": "Opt-in per-workspace configuration for `devbench check-fixture-consistency`, consumed as test-reviewer evidence. Lets a workspace designate one or more canonical fixture/dataset files plus the identifier field(s) within them, and which mock/fixture files must stay cross-referenced against that canonical data. Devbench cannot infer a target repo's fixture-file layout on its own, so this section is absent (and the check is a no-op) by default. Absent `canonical_sources` means the check always passes trivially.",
+      "additionalProperties": false,
+      "properties": {
+        "canonical_sources": {
+          "type": "array",
+          "minItems": 1,
+          "description": "One or more designated canonical fixture/dataset files. Every scan target's identifier literals must cross-reference the identifier values found in the canonical source it targets.",
+          "items": {
+            "type": "object",
+            "required": ["path", "identifier_field"],
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo-relative path to the canonical fixture file (JSON or YAML)."
+              },
+              "identifier_field": {
+                "type": "string",
+                "description": "Key name within each canonical record (SKU, product id, PO number, or whatever the workspace's canonical identifier type is) whose values other fixtures must reference. Every dict found anywhere in the parsed file that has this key contributes its value."
+              },
+              "expected_count": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional: exact expected number of distinct identifier_field values in this canonical source. Set on a backfill task to assert full coverage (e.g. 'must cover N of N records'); the check fails when the actual distinct-value count differs."
+              }
+            }
+          }
+        },
+        "scan": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Mock/fixture files to scan for identifier literals that must cross-reference a canonical_sources entry. A key found in a scan target that is absent from its canonical source fails the check with a clear, actionable message naming the file and the missing key(s).",
+          "items": {
+            "type": "object",
+            "required": ["path", "identifier_field"],
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo-relative path to the mock/fixture file to scan (JSON or YAML)."
+              },
+              "identifier_field": {
+                "type": "string",
+                "description": "Key name within each scanned record holding the identifier literal(s) to cross-reference against the canonical source."
+              },
+              "canonical_source": {
+                "type": "string",
+                "description": "The `path` of the canonical_sources entry this scan target checks against. Optional and inferred when exactly one canonical_sources entry is configured; required (and validated against the configured canonical_sources paths) when more than one is configured."
+              },
+              "allow_missing": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Explicit allowlist of identifier values in this fixture that are permitted to be absent from the canonical source -- e.g. a fixture that deliberately models a not-found/empty-state edge case. This is the opt-out/scoping mechanism for legitimate edge-case fixtures; values listed here never produce a missing_key finding for this scan target."
+              }
+            }
+          }
+        }
+      }
+    },
     "skills": {
       "type": "object",
       "description": "Plugin-skill (spec-to-backlog, create-spec) operator-facing configuration. Lets operators point the skills at their own workspace exemplars (a representative backlog and a representative spec) rather than a hardcoded built-in path, plus tune the fan-out and iteration budget. All fields are optional; absent values fall through to skill-side defaults (issue #221 E1-E10).",

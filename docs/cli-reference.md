@@ -163,11 +163,17 @@ Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKE
 
 The duration is anchored to the transition record written by `devbench.backlog_manager`, matched on the full record shape rather than on the phrase alone (issue #293). The orchestrator logs whole SDK messages, so a tool result that read a work unit's `[WU_CLAIMED]` audit comment reproduces the text `Set <id> to 'in-progress'` inside a line stamped with the time of the *dump*. Matching the phrase anywhere in a line made those echoes win, under-reporting a unit's age by the gap between the claim and the echo, and the error grew with every further echo.
 
-**Actionability line (issue #251):** both `devbench status` and `devbench report` end with the same one-line answer to "can the run proceed?", produced by a single shared helper so the two commands cannot disagree:
+**Actionability line (issues #251, #309):** both `devbench status` and `devbench report` end with the same one-line answer to "can the run proceed?", produced by a single shared helper so the two commands cannot disagree. Exactly one of five statements prints, in priority order:
 
 - `Next actionable: <id> -- <title>` -- at least one unit is claimable.
 - `All work units are DONE.` -- nothing remains.
-- `No actionable units. <N> blocked.` -- work remains but none of it can start.
+- `<id> active; nothing else can start yet. <tail>` -- exactly one unit is already running (`in-progress` / `in-review`) and nothing else is claimable.
+- `<N> units active; nothing else can start yet. <tail>` -- two or more units are already running and nothing else is claimable.
+- `No actionable units. <tail>` -- work remains, nothing is running, and none of it can start.
+
+`<tail>` is `<B> blocked` when no unit is on hold, or `<B> blocked, <H> on hold` when `H` (units with status `HOLD`) is greater than zero.
+
+Issue #309: a serially-ordered backlog's steady state is exactly one unit `in-progress` and everything else `blocked` on it. `get_parallel_candidates` deliberately includes `in-progress` units (issue #185, resume support), so once the active ids are subtracted from the candidate list the result was always empty in that steady state, and the old stuck-state line (`No actionable units. <N> blocked.`) printed while work was actively executing -- camouflaging the genuine deadlock case that same line is meant to flag. The dedicated active-unit outcomes above name the running unit(s) instead, and the tail now counts `HOLD` units alongside `BLOCKED` ones so they no longer vanish from the total.
 
 The per-status counts do not answer this on their own: a backlog can hold many `in-queue` units and still have nothing actionable, because only leaf Tasks execute and every one of them may be waiting on a dependency. `devbench next` deliberately keeps its machine tokens (`ALL_DONE` / `NO_ACTIONABLE` / `NO_ACTIONABLE_IN_SCOPE`) instead; those are a contract consumed by the orchestrate skill's loop-continuation check.
 

@@ -15114,12 +15114,16 @@ class TestCmdStatusNextActionableFilter:
         # ... and Next actionable points at the DIFFERENT in-queue task.
         assert "Next actionable: E0-F1-S1-T2" in out
 
-    def test_no_actionable_message_when_only_active(
+    def test_active_line_shown_when_only_active(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """When the only candidate is the in-progress task itself, the
-        ``Next actionable`` line is suppressed (no genuine next task)."""
+        ``Next actionable`` line is suppressed and the active-units line
+        names the running task instead of the stuck-state message (issue
+        #309: a serially-ordered backlog's steady state is one unit
+        IN_PROGRESS and nothing else claimable, which is not the same as
+        genuinely nothing being actionable)."""
         in_prog = WorkUnit(
             id="E0-F1-S1-T1",
             title="Active",
@@ -15138,9 +15142,10 @@ class TestCmdStatusNextActionableFilter:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        # No "Next actionable" line; instead the no-actionable branch fires.
+        # No "Next actionable" line; instead the active-units branch fires.
         assert "Next actionable" not in out
-        assert "No actionable units." in out
+        assert "No actionable units." not in out
+        assert "E0-F1-S1-T1 active; nothing else can start yet. 0 blocked." in out
 
 
 class TestCmdWriteSnapshot:

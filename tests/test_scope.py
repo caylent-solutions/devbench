@@ -740,8 +740,6 @@ def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) 
 @pytest.mark.parametrize(
     "bad_top_level",
     [
-        "[]",  # empty list
-        "[1, 2, 3]",  # non-empty list
         '"a-bare-string"',  # bare string
         "42",  # bare integer
         "null",  # JSON null
@@ -750,20 +748,239 @@ def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) 
 )
 def test_from_file_non_object_top_level_raises(tmp_path: Path, bad_top_level: str) -> None:
     """from_file raises TypeError with an actionable message when scope.json's
-    top-level payload is not a JSON object (#205).
+    top-level payload is not a JSON object and not the legacy list shape (#205, #270).
 
     Before the fix, a top-level list payload reached the per-field shape check
     via ``data[field_name]``, which raised the raw Python ``TypeError: list
     indices must be integers or slices, not str`` (or analogue) and leaked the
     implementation detail to the operator. The fail-fast guard now rejects the
     bad top-level shape with a message naming the file path and the recovery
-    step.
+    step. A top-level list payload is no longer rejected here -- since #270 it
+    is migrated in place instead (see test_list_payload_migrates_without_crash);
+    those two cases were removed from this parametrize list because they no
+    longer raise.
     """
     scope_dir = tmp_path / ".devbench"
     scope_dir.mkdir(parents=True)
     (scope_dir / "scope.json").write_text(bad_top_level)
     with pytest.raises(TypeError, match="top-level payload must be an object"):
         ScopeFilter.from_file(tmp_path)
+
+
+@pytest.mark.unit
+def test_unrecognised_payload_still_raises(tmp_path: Path) -> None:
+    """A non-object, non-list top-level payload still raises the pre-existing TypeError.
+
+    Only the documented #270 list shape self-heals; every other malformed
+    shape keeps failing fast with the byte-identical message and file path
+    (obs-spec OD-1, AC-E7-F1-S1-T1-3).
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text('"a-bare-string"')
+    expected_message = (
+        f"scope.json top-level payload must be an object, got 'str'. "
+        f"The file at '{scope_path}' may be corrupt -- "
+        f"remove it and re-run 'devbench start --include ...' to recreate it."
+    )
+    with pytest.raises(TypeError, match=re.escape(expected_message)):
+        ScopeFilter.from_file(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Legacy list-shape migration (issue #270, obs-spec OD-1 / FR-D1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "list_payload",
+    [
+        [],
+        ["E1-F1-S1-T1", "E2-F1-S1-T1"],
+    ],
+    ids=["empty", "non_empty"],
+)
+def test_list_payload_migrates_without_crash(tmp_path: Path, list_payload: list[str]) -> None:
+    """A literal list-shaped scope.json is migrated in place, not rejected (#270).
+
+    Before the fix this raised 'scope.json top-level payload must be an
+    object, got list' on every read, forcing an operator to delete the file
+    to recover. The migration rewrites it to the canonical object form and a
+    second read proves non-recurrence: the file is now object-shaped, so the
+    ordinary dict path runs, not the migration branch.
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps(list_payload))
+
+    loaded = ScopeFilter.from_file(tmp_path)
+
+    assert loaded.include == []
+    assert loaded.exclude == []
+    assert loaded.expanded_ids == set(list_payload)
+
+    on_disk = json.loads(scope_path.read_text())
+    assert isinstance(on_disk, dict)
+    assert on_disk["expanded_ids"] == sorted(list_payload)
+    assert on_disk["include"] == []
+    assert on_disk["exclude"] == []
+
+    # Second read proves non-recurrence.
+    reloaded = ScopeFilter.from_file(tmp_path)
+    assert reloaded.expanded_ids == set(list_payload)
+
+
+@pytest.mark.unit
+def test_list_payload_migration_logs_exactly_one_info_line(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Migrating a list-shaped scope.json emits exactly one INFO line naming the file."""
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+    with caplog.at_level(logging.INFO, logger="devbench.scope"):
+        ScopeFilter.from_file(tmp_path)
+
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert len(info_records) == 1
+    assert str(scope_path) in info_records[0].message
+
+
+@pytest.mark.unit
+def test_list_payload_migration_temp_file_not_left_on_success(tmp_path: Path) -> None:
+    """Migration writes atomically: no .json.tmp artefact remains after success."""
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+    ScopeFilter.from_file(tmp_path)
+
+    assert not (scope_dir / "scope.json.tmp").exists()
+
+
+@pytest.mark.unit
+def test_list_payload_migration_write_failure_propagates(tmp_path: Path) -> None:
+    """An OSError during migration's atomic write propagates, never swallowed."""
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+    with patch.object(Path, "write_text", side_effect=OSError("disk full")):
+        with pytest.raises(OSError, match="disk full"):
+            ScopeFilter.from_file(tmp_path)
+
+
+@pytest.mark.unit
+def test_list_payload_with_invalid_element_raises_and_leaves_file_untouched(tmp_path: Path) -> None:
+    """A list element that is not a valid work-unit-ID string raises before any write.
+
+    Validating BEFORE writing prevents converting a recoverable corrupt state
+    into a permanently unreadable one: if the migration rewrote the file first
+    and only then discovered invalid content, the operator would be left with
+    a raw, unactionable error and no way to recover the original bytes.
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    original_text = json.dumps([{"a": 1}, "E1-F1-S1-T1"])
+    scope_path.write_text(original_text)
+
+    with pytest.raises(TypeError, match="index 0"):
+        ScopeFilter.from_file(tmp_path)
+
+    assert scope_path.read_text() == original_text
+    assert not (scope_dir / "scope.json.tmp").exists()
+
+
+@pytest.mark.unit
+def test_list_payload_with_non_string_ids_raises(tmp_path: Path) -> None:
+    """A list of non-string elements (e.g. bare integers) raises, not silently accepted.
+
+    Silently accepting [1, 2, 3] as expanded_ids would assert a scope that
+    matches zero real work units -- corruption masked as valid state, which
+    the NO FALLBACK LOGIC rule forbids.
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps([1, 2, 3]))
+
+    with pytest.raises(TypeError, match="non-empty work-unit-ID string"):
+        ScopeFilter.from_file(tmp_path)
+
+
+@pytest.mark.unit
+def test_list_payload_with_empty_string_element_raises(tmp_path: Path) -> None:
+    """A list containing an empty string element raises rather than migrating."""
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps(["E1-F1-S1-T1", ""]))
+
+    with pytest.raises(TypeError, match="non-empty work-unit-ID string"):
+        ScopeFilter.from_file(tmp_path)
+
+
+@pytest.mark.unit
+def test_list_payload_migration_reads_provenance_from_sibling_session_files(tmp_path: Path) -> None:
+    """Migrated started_at/started_by are read from sibling session-state files, not fabricated.
+
+    The migration must never invent a timestamp/user for a session that was
+    actually started at another time by another operator; it reads the true
+    values already written by ``_write_session_state_files``.
+    """
+    session_dir = tmp_path / ".devbench" / "sessions" / "default"
+    session_dir.mkdir(parents=True)
+    scope_path = session_dir / "scope.json"
+    scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+    (session_dir / "started_at").write_text("2026-01-02T03:04:05+00:00", encoding="utf-8")
+    (session_dir / "started_by").write_text("alice", encoding="utf-8")
+
+    with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "default"}, clear=False):
+        ScopeFilter.from_file(tmp_path)
+
+    migrated = json.loads(scope_path.read_text())
+    assert migrated["started_at"] == "2026-01-02T03:04:05+00:00"
+    assert migrated["started_by"] == "alice"
+
+
+@pytest.mark.unit
+def test_list_payload_migration_uses_unknown_provenance_when_no_sibling_files(tmp_path: Path) -> None:
+    """Without sibling session-state files, migration records the explicit 'unknown' sentinel.
+
+    Never fabricates started_at from the migration's own clock or started_by
+    from the current OS user when the true provenance is unavailable.
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    scope_path = scope_dir / "scope.json"
+    scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+    ScopeFilter.from_file(tmp_path)
+
+    migrated = json.loads(scope_path.read_text())
+    assert migrated["started_at"] == "unknown"
+    assert migrated["started_by"] == "unknown"
+
+
+@pytest.mark.unit
+def test_writer_never_emits_list_shape(tmp_path: Path) -> None:
+    """The unscoped-session writer never emits a list-shaped payload (#270).
+
+    Regression pin for the recurrence documented in issue #270: an unscoped
+    session's scope.json must always be the canonical object, never a bare
+    JSON array, so no reader is ever handed a list to reject or migrate.
+    """
+    sf = ScopeFilter(include=[], exclude=[], expanded_ids=set())
+    written = sf.to_file(tmp_path)
+    on_disk = json.loads(written.read_text())
+    assert isinstance(on_disk, dict)
+    assert on_disk["expanded_ids"] == []
 
 
 # ---------------------------------------------------------------------------

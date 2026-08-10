@@ -756,6 +756,48 @@ class TestCmdNextScopeFilter:
         assert "scope.json" in err
 
     # ------------------------------------------------------------------
+    # Legacy list-shaped scope.json self-heals rather than crashing (#270)
+    # ------------------------------------------------------------------
+
+    def test_legacy_list_session_scope_json_self_heals_via_cmd_next(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_next must self-heal a legacy list-shaped scope.json, not crash.
+
+        Reproduces issue #270's live-incident path: a bare JSON array left on
+        disk from an earlier devbench version used to raise 'scope.json
+        top-level payload must be an object, got list' on every call, forcing
+        an operator to manually delete the file. cmd_next now migrates the
+        file in place (via the shared devbench.scope migration primitive) and
+        proceeds normally.
+        """
+        units = self._make_units(["E1-F1-S1-T1", "E2-F1-S1-T1"])
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        scope_path = scope_dir / "scope.json"
+        scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [units[0]]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        captured = capsys.readouterr()
+        assert rc == 0, f"cmd_next must self-heal a legacy list-shaped scope.json, not crash. stderr={captured.err!r}"
+        data = json.loads(captured.out.strip())
+        assert data["id"] == "E1-F1-S1-T1"
+        migrated = json.loads(scope_path.read_text())
+        assert isinstance(migrated, dict)
+        assert migrated["expanded_ids"] == ["E1-F1-S1-T1"]
+
+    # ------------------------------------------------------------------
     # Integration: real fixture -- scope.json on disk selects correct WU
     # ------------------------------------------------------------------
 
@@ -16698,6 +16740,43 @@ class TestCmdStatusScopeBanner:
         assert bad_field in err
         assert "must be a list" in err
 
+    # ------------------------------------------------------------------
+    # Legacy list-shaped scope.json self-heals rather than crashing (#270)
+    # ------------------------------------------------------------------
+
+    def test_legacy_list_session_scope_json_self_heals_via_cmd_status(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_status must self-heal a legacy list-shaped scope.json, not crash.
+
+        Reproduces issue #270's live-incident path: a bare JSON array left on
+        disk from an earlier devbench version used to raise 'scope.json
+        top-level payload must be an object, got list' on every call, forcing
+        an operator to manually delete the file. cmd_status now migrates the
+        file in place (via the shared devbench.scope migration primitive) and
+        proceeds normally.
+        """
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        scope_path = scope_dir / "scope.json"
+        scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        err = capsys.readouterr().err
+        assert rc == 0, f"cmd_status must self-heal a legacy list-shaped scope.json, not crash. stderr={err!r}"
+        migrated = json.loads(scope_path.read_text())
+        assert isinstance(migrated, dict)
+        assert migrated["expanded_ids"] == ["E1-F1-S1-T1"]
+
 
 # ---------------------------------------------------------------------------
 # AC-190-10 / AC-190-11: cmd_report scope flags + SCOPE banner (E2-F2-S2-T2)
@@ -17358,6 +17437,37 @@ class TestCmdScope:
         assert rc == 0
         out = capsys.readouterr().out
         assert "E2" in out
+
+    # ------------------------------------------------------------------
+    # Legacy list-shaped scope.json self-heals rather than crashing (#270)
+    # ------------------------------------------------------------------
+
+    def test_show_legacy_list_session_scope_json_self_heals(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """scope show must self-heal a legacy list-shaped scope.json, not crash.
+
+        Reproduces issue #270's live-incident path via the third scope.json
+        reader, ``_scope_show``: a bare JSON array left on disk from an
+        earlier devbench version used to raise an uncaught 'list indices
+        must be integers or slices, not str' TypeError (the array does not
+        support ``data["include"]`` key access), forcing an operator to
+        manually delete the file. ``scope show`` now migrates the file in
+        place (via the shared ``devbench.scope`` migration primitive) and
+        prints the migrated state instead of crashing.
+        """
+        scope_path = self._scope_path(tmp_path)
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("show")
+
+        err = capsys.readouterr().err
+        assert rc == 0, f"scope show must self-heal a legacy list-shaped scope.json, not crash. stderr={err!r}"
+        migrated = json.loads(scope_path.read_text())
+        assert isinstance(migrated, dict)
+        assert migrated["expanded_ids"] == ["E1-F1-S1-T1"]
 
     # ------------------------------------------------------------------
     # Parametrised: multiple valid selector shapes

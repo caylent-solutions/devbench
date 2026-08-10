@@ -284,7 +284,14 @@ from devbench.quota import (
 # the ``__all__``-vs-self-aliased-``as`` rationale above the
 # ``devbench.backlog.manager`` re-export block.
 from devbench.reporting.report import _format_duration
-from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
+from devbench.scope import (
+    InvalidScopeError,
+    ScopeFilter,
+    _expand_prefix,
+    _read_and_migrate_scope_payload,
+    _scope_file_path,
+    _tokenise,
+)
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
@@ -366,34 +373,30 @@ def _parse_status_argv(argv: tuple[str, ...]) -> _StatusArgs:
 def _read_scope_banner_data(workspace_root: Path) -> dict[str, object] | None:
     """Return the raw scope.json payload when scope.json exists, else ``None``.
 
-    Reads scope.json directly to surface ``started_at`` / ``started_by``
-    metadata that :meth:`ScopeFilter.from_file` omits from the dataclass.
-    The file is read and parsed once; ``None`` is returned only when the
-    file is absent.
+    Reads scope.json to surface ``started_at`` / ``started_by`` metadata that
+    :meth:`ScopeFilter.from_file` omits from the dataclass. Delegates to
+    :func:`devbench.scope._read_and_migrate_scope_payload` so a legacy
+    list-shaped scope.json (issue #270) self-heals on this path exactly as it
+    does for ``ScopeFilter.from_file`` -- both ``devbench next`` and
+    ``devbench status`` reach this function, so neither crashes on a stale
+    array file. ``None`` is returned only when the file is absent.
 
     Args:
         workspace_root: Path to the workspace root directory.
 
     Returns:
-        The decoded JSON payload dict, or ``None`` if scope.json does not exist.
+        The decoded (and, for the legacy list shape, migrated) JSON payload
+        dict, or ``None`` if scope.json does not exist.
 
     Raises:
         json.JSONDecodeError: If the file exists but contains invalid JSON.
         KeyError: If required keys are missing from the JSON payload.
-        TypeError: If field types in the payload are invalid.
+        TypeError: If the top-level payload is neither an object nor the
+            legacy list shape, or if a legacy list element is invalid.
+        OSError: If migrating a legacy list payload fails to write.
     """
     scope_path = _scope_file_path(workspace_root)
-    if not scope_path.exists():
-        return None
-    payload = json.loads(scope_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(
-            f"scope.json top-level payload must be an object, "
-            f"got {type(payload).__name__!r}. "
-            f"The file at '{scope_path}' may be corrupt -- "
-            f"remove it and re-run 'devbench start --include ...' to recreate it."
-        )
-    return payload
+    return _read_and_migrate_scope_payload(scope_path)
 
 
 def _render_scope_banner(include: list[str], exclude: list[str], started_at: str) -> None:
@@ -8423,8 +8426,15 @@ def _scope_show(workspace_root: Path) -> int:
     """Print the active scope state or ``no scope pending``.
 
     Displays the include list, exclude list, expanded ID count, started_at,
-    and started_by metadata from scope.json.  Exits 0 in both cases (file
-    absent and file present).
+    and started_by metadata from scope.json.  Exits 0 when no scope.json is
+    present (prints ``no scope pending``); see the Returns section below for
+    the failure contract when scope.json exists but cannot be read.
+
+    Delegates to :func:`devbench.scope._read_and_migrate_scope_payload` so a
+    legacy list-shaped scope.json (issue #270) self-heals on this path
+    exactly as it does for :meth:`devbench.scope.ScopeFilter.from_file` and
+    :func:`_read_scope_banner_data` -- ``devbench scope show`` no longer
+    raises a raw ``TypeError`` on a stale array file.
 
     Uses ``[]`` key access (not ``.get()`` with defaults) so a corrupt
     scope.json with missing required fields raises ``KeyError`` immediately
@@ -8434,27 +8444,33 @@ def _scope_show(workspace_root: Path) -> int:
         workspace_root: The workspace root path.
 
     Returns:
-        Always 0.
+        0 on success or when no scope is pending; 1 when scope.json cannot
+        be resolved, read, migrated, or parsed (session name resolution
+        failure, OSError, JSON decode error, missing key, or a legacy
+        list-shaped payload whose elements fail migration validation).
 
     Raises:
-        Nothing -- all errors are caught and written to stderr.
+        Nothing -- ``ValueError`` from session-name resolution and
+        ``OSError``, ``json.JSONDecodeError``, ``KeyError``, and
+        ``TypeError`` from the read/migrate path are all caught here and
+        reported to stderr with a non-zero return instead of propagating.
     """
     try:
         target_path = _session_scope_file_path(workspace_root)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    if not target_path.exists():
-        print("no scope pending")
-        return 0
     try:
-        data = json.loads(target_path.read_text(encoding="utf-8"))
+        data = _read_and_migrate_scope_payload(target_path)
+        if data is None:
+            print("no scope pending")
+            return 0
         include = data["include"]
         exclude = data["exclude"]
         expanded_ids = data["expanded_ids"]
         started_at = data["started_at"]
         started_by = data["started_by"]
-    except (OSError, json.JSONDecodeError, KeyError) as exc:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
         print(f"ERROR: cannot read scope.json at {target_path}: {exc}", file=sys.stderr)
         return 1
     print(f"include:      {include}")

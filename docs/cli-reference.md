@@ -63,7 +63,7 @@ The summary includes a `Draft N` row rendered between the `TOTAL` line and the `
 
 - `--session <name>` -- filter the output to the work units claimed by the named session. Only events emitted under `session=<name>` are counted; the status counts and active-task list reflect that session's view only. Without `--session`, the command aggregates across all active sessions and renders the unified backlog state. See [Named sessions](#named-sessions) for the full session reference.
 
-When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. The file is a JSON object with `include`, `exclude`, `expanded_ids`, `started_at` and `started_by`; a scope file in any other shape is rejected rather than guessed at. A session that runs unscoped writes no `scope.json` at all, since absent is how every reader expresses "no scope". When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
+When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. The file is a JSON object with `include`, `exclude`, `expanded_ids`, `started_at` and `started_by`. A legacy list-shaped payload (issue #270) is migrated in place to this canonical object form -- see [Legacy list-shape migration (issue #270)](#legacy-list-shape-migration-issue-270) below -- while every OTHER non-object shape still raises with the pre-existing message text naming the file path. A session that runs unscoped writes no `scope.json` at all, since absent is how every reader expresses "no scope". When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
 
 ```
 SCOPE: include=[E1-E3, E5] exclude=[] (started 2026-05-14T13:42Z)
@@ -597,7 +597,7 @@ Persistent scope management without starting the orchestrator (spec section 4.2.
 
 - **`scope clear`** -- delete `<workspace>/.devbench/scope.json`. Idempotent: exits 0 with the message `no scope pending` when no file is present.
 
-- **`scope show`** -- print the active scope state (include list, exclude list, expanded ID count, `started_at`, `started_by`) or `no scope pending` when no scope file exists. Exits 0 in both cases.
+- **`scope show`** -- print the active scope state (include list, exclude list, expanded ID count, `started_at`, `started_by`) or `no scope pending` when no scope file exists. Exits 0 in both cases. A legacy list-shaped `scope.json` (issue #270) is migrated in place on this read path too, exactly as it is for `devbench status` -- see [Legacy list-shape migration (issue #270)](#legacy-list-shape-migration-issue-270); this makes `scope show` write to disk on that one legacy code path even though it is otherwise a pure display command.
 
 **scope.json schema:**
 
@@ -1007,6 +1007,15 @@ When `devbench start --include "..."` or `devbench scope set --include "..."` ru
 - Consumed (deleted) on clean orchestrator exit (`devbench start` clean shutdown). Survives orchestrator crashes.
 - `devbench status`, `devbench report`, and `devbench next` consult the file automatically when no per-command `--include`/`--exclude` flags are supplied. Per-command flags override the file for that invocation only.
 - `devbench validate-backlog` ignores `scope.json` entirely -- it always validates the whole backlog regardless of active scope.
+
+#### Legacy list-shape migration (issue #270)
+
+An older format wrote a bare JSON array of work-unit IDs directly to `scope.json` instead of the canonical object above. Rather than crashing on that shape forever, every scope.json read path migrates it in place to the canonical object form (empty `include`/`exclude`, the array as `expanded_ids`) with an atomic rewrite. The read paths that perform this migration are `ScopeFilter.from_file` (the scope-filtering path), the CLI scope-banner reader used by `devbench status`, `devbench report` and `devbench next`, and `devbench scope show`; all three delegate to the same shared migration routine, so no reader rejects the legacy list shape. A second read of the now-migrated file takes the ordinary object path -- the migration does not recur.
+
+- **Operator-visible signal:** migration emits exactly one INFO line naming the migrated file. A write failure during the atomic rewrite is never swallowed: it propagates as an `OSError` on the `ScopeFilter.from_file` and scope-banner (`devbench status` / `devbench report` / `devbench next`) paths, while `devbench scope show` catches it and reports `ERROR: cannot read scope.json at <path>: <exc>` on stderr with exit code 1 instead of letting it propagate.
+- **Provenance sourcing:** the migrated file's `started_at` and `started_by` are read from the sibling session-state files (the same `started_at` / `started_by` files a named session writes) when present. When either sibling file is absent, both fields are recorded as the explicit `"unknown"` sentinel. These values are never fabricated from the migration's own clock or the current OS user.
+- **Empty-list reconciliation:** a migrated file whose array is empty (`[]`) is not a counter-example to the [multi-session-runs.md](multi-session-runs.md) invariant "An unscoped session writes no `scope.json`: absent is the unscoped signal every reader honours." Migration only repairs an already-present, corrupt legacy file -- it never creates a `scope.json` for an unscoped session. A migrated empty array leaves the file present on disk with an active (if empty) scope; that is a repaired-corruption case, not an unscoped-session write.
+- Every other non-object top-level shape (string, number, null, bool) still raises the pre-existing `TypeError` naming the file path; the migration applies to the documented list shape only.
 
 ---
 

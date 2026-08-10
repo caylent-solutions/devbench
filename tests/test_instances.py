@@ -8,12 +8,14 @@ test process itself.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
 
 import pytest
 
+from devbench import instances
 from devbench.instances import (
     INSTANCE_SEARCH_ROOTS_ENV,
     ORCHESTRATOR_PID_FILENAME,
@@ -326,3 +328,22 @@ class TestRemovePidFile:
     def test_noop_when_missing(self, tmp_path: Path) -> None:
         # Should not raise.
         remove_pid_file(tmp_path / "no-such-workspace")
+
+
+@pytest.mark.unit
+class TestNoEmDashInInstancesModule:
+    """Pins the em-dash source-hygiene fix (workspace CLAUDE.md; spec AC-19).
+
+    A post-run review (spec Section 1 G9) found two U+2014 characters
+    surviving in instances.py docstrings: the branch's em-dash gate only
+    scans work-unit ``.md`` files, so this pair of source em-dashes went
+    undetected. This test fails loudly if either em-dash -- or any future
+    one -- returns to the module.
+    """
+
+    def test_no_em_dash_in_instances_module(self) -> None:
+        source = inspect.getsource(instances)
+        assert "\u2014" not in source, (
+            "src/devbench/instances.py must not contain the em-dash character "
+            "(U+2014); use '--' (double hyphen) instead."
+        )

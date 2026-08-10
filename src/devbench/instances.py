@@ -11,7 +11,7 @@ Instance ID format: ``<workspace_basename>-<pid-suffix>`` (e.g.
 ``kanon-deps-work-2281``).  Operators can also pass the raw PID to any
 lifecycle command; ``resolve_instance`` handles both forms.
 
-PID files are best-effort metadata — a missing / corrupt / non-object
+PID files are best-effort metadata -- a missing / corrupt / non-object
 payload is treated as no instance; a stale entry (PID dead) is filtered
 out by the liveness check.  No correctness gate depends on the PID
 file being present.
@@ -122,7 +122,7 @@ def read_pid_file(pid_path: Path) -> Instance | None:
 def is_pid_alive(pid: int) -> bool:
     """Return True iff *pid* refers to a live process.
 
-    Uses ``os.kill(pid, 0)`` — sends no signal, only checks the kernel's
+    Uses ``os.kill(pid, 0)`` -- sends no signal, only checks the kernel's
     process table.  ``PermissionError`` means the process exists but
     signaling is denied (still alive).  Any other error means dead.
     """

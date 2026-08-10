@@ -640,10 +640,14 @@ See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token 
 ### `start`
 
 ```
-uv run devbench start [--include "<tokens>"] [--exclude "<tokens>"] [--name <name>] [--allow-overlap]
+uv run devbench start [--daemon] [--include "<tokens>"] [--exclude "<tokens>"] [--name <name>] [--allow-overlap]
 ```
 
 Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin.
+
+**Daemon flag:**
+
+- `--daemon, -d` -- detach the orchestrator into the background and return immediately (issue #209). `start` double-forks: the invoking shell prints `started devbench orchestrator in daemon mode (parent pid <pid>); follow logs with: devbench tail <instance_id> --follow` and exits at once. The intermediate first-fork child calls `setsid()` to become a session leader detached from the controlling terminal, then exits once the second fork completes; the resulting grandchild is deliberately not a session leader, which prevents it from reacquiring a controlling terminal. The grandchild redirects stdin from `/dev/null` and appends stdout/stderr to `<workspace>/logs/orchestrator.log`, then writes the same PID file a foreground run writes, at `<workspace>/.devbench/orchestrator.pid`, recording its PID, session name, mode (`"daemon"`), and start time; this is the file `devbench instances` walks to discover and list the running instance. `--daemon` requires POSIX (`fork()`); on a non-POSIX platform it fails fast with an actionable error before any daemonisation begins.
 
 **Scope filter flags:**
 

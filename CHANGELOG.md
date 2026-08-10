@@ -151,6 +151,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   advance (98.01% coverage, 5084 passed, 8 skipped -- identical to the
   pre-upgrade baseline).
 
+- **`actionability_line` gains two active-run outcomes instead of collapsing
+  to the stuck-state message while work is executing** (issue #309, spec
+  Section 4 FR-1, E9-F1-S1-T1). `get_parallel_candidates` deliberately
+  includes `IN_PROGRESS` units (issue #185, resume support) and the function
+  then subtracted `active_ids`, so when the only candidate was the unit
+  already running, the list emptied and `No actionable units. N blocked.`
+  printed while work was actively executing -- in a serially-ordered backlog
+  that is the steady state, so the operator-facing line cried wolf for the
+  whole run and camouflaged the genuine deadlock case (issue #253). The
+  three-outcome contract in `src/devbench/backlog/actionability.py` is now
+  five: `Next actionable: <id> -- <title>` and `All work units are DONE.`
+  keep their byte-identical strings; a new third branch renders `<id>
+  active; nothing else can start yet. <tail>` for exactly one active id and
+  `<N> units active; nothing else can start yet. <tail>` for several; the
+  fall-through re-bases to `No actionable units. <tail>`; and `<tail>` is
+  now `<B> blocked` or `<B> blocked, <H> on hold` when `H` (units with
+  status `HOLD`) is greater than zero, computed directly from `units` via
+  `WorkUnitStatus.HOLD` with no parser change. Both callers (`cli.py`
+  `status`, `reporting/report.py` `report`) inherit the change untouched;
+  `devbench next`'s own machine-token output is not modified.
+
 ### Added
 
 - **Honest completion paths for the machine-observed RED gate: three
@@ -346,6 +367,41 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and the two bumped ones (#216, #179), for the operator to paste into the
   deferred single batch PR (spec S9, AC-83).
 
+### Fixed
+
+- **`devbench instances` still reported no running orchestrator for a daemon
+  whose workspace lived outside `$HOME`** (`spec/devbench-observability-hardening.md`
+  FR-D2/OAC-3, issue #270's companion defect D2, E7-F2-S1-T1).
+  `_resolve_search_roots` (`src/devbench/instances.py:140-168`) defaulted to
+  `[Path.home()]` alone whenever `DEVBENCH_INSTANCE_SEARCH_ROOTS` was unset, so
+  a daemon started under a workspace outside `$HOME` (for example one checked
+  out under `/workspaces`) was invisible to `devbench instances` unless the
+  operator remembered to export the search-roots override by hand. The
+  default now also includes the current `DEVBENCH_WORKSPACE_ROOT` (when set
+  and not already under `$HOME`), so a workspace's own daemon is discoverable
+  with no configuration; a workspace that already relies on
+  `DEVBENCH_INSTANCE_SEARCH_ROOTS` sees byte-identical behavior, since that
+  override still wins first and is returned verbatim. `docs/cli-reference.md`'s
+  "Instances (per-host discovery)" section documents the three-tier
+  resolution order.
+
+- **`quota_handling.log_structured_events: false` had no effect: every
+  `[QUOTA_*]` structured marker still emitted unconditionally** (spec
+  Section 4 FR-2, AC-16, E9-F1-S2-T1). The config key was parsed, schema
+  documented, and docstring-promised but consumed by zero call sites. A new
+  `_quota_structured_events_enabled()` helper in `src/devbench/cli.py` reads
+  `RUNTIME_CONFIG.quota_handling.log_structured_events` and now gates every
+  structured-marker emission across `_handle_quota_pause`,
+  `_dispatch_quota_detection`, `_dispatch_quota_timeout`, and the resume
+  loop; `wait_for_reset` / `_wait_toward_reset` in `src/devbench/quota.py`
+  gain a keyword-only `emit_structured_events: bool = True` gating the
+  `[QUOTA_POLLING]` heartbeat, threaded from config at the `cli.py` call
+  sites (`quota.py` still imports no config module). Slack notifications,
+  audit comments, non-marker log lines, and checkpoint writes are explicitly
+  NOT gated (decision D-10: markers only). Default `true` preserves
+  byte-identical behavior for every workspace that has not set the flag.
+  `docs/quota-handling.md` documents which markers are gated.
+
 ## [0.3.0] -- 2026-07-31
 
 ### Fixed
@@ -375,7 +431,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   creates one.
 
 - **An unscoped session wrote a `scope.json` its own readers reject** (issue
-  #270). Session startup wrote a bare JSON array of IDs while
+  #270; `spec/devbench-observability-hardening.md` FR-D1/OAC-1/OAC-2, defect
+  D1). Session startup wrote a bare JSON array of IDs while
   `ScopeFilter.from_file` and `_read_scope_payload` require the canonical
   object. The two writers target the same path, because `resolve_scope_file_path`
   routes there whenever `DEVBENCH_SESSION_NAME` is set, so the array overwrote
@@ -383,8 +440,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `scope.json top-level payload must be an object, got 'list'`. Scoped
   sessions now write the canonical payload; unscoped sessions write no file,
   since absent is how every reader already expresses "no scope", and an empty
-  scope would assert a filter matching nothing. A stale array file left by an
-  earlier version is cleared on the next start.
+  scope would assert a filter matching nothing; a stale array file present at
+  an unscoped session's start is still cleared at that point. Separately
+  (E7-F1-S1-T1), a stale list-shaped file encountered at ANY other read --
+  `ScopeFilter.from_file` and `_read_scope_banner_data` alike, so both
+  `devbench next` and `devbench status` are covered -- is now migrated to the
+  canonical object form in place (atomic rewrite, one INFO line naming the
+  file) instead of raising; a second read of the same file proves the
+  migration does not recur. Any other non-object shape still raises the
+  pre-existing `ValueError` with its message text byte-preserved.
 
 - **`devbench status` crashed with a traceback where `report` diagnosed**
   (issue #305). A missing work-unit file or a malformed index escaped `status`
@@ -396,21 +460,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (run `validate-backlog`).
 
 - **The test suite wrote into the live workspace and orchestrator log**
-  (issue #292). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
-  `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH` with `os.environ.setdefault`,
-  so it INHERITED whatever the ambient shell already had. devbench is
-  developed with devbench, so the executor runs the suite from inside a live
-  workspace with those exported: fixture work-unit state landed in the real
-  `.devbench/ci-failures/` and `.devbench/pr-bot-feedback/` under IDs that
-  exist only in `tests/`, and fabricated lifecycle records were appended to
-  the live log -- `[ORCHESTRATOR_TERMINAL_EXIT]`, `[QUOTA_WAITING]`,
+  (issue #292; `spec/devbench-observability-hardening.md` FR-D4/OAC-5,
+  defect D4). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
+  `DEVBENCH_PROJECT_ROOT`, `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH`
+  with `os.environ.setdefault`, so it INHERITED whatever the ambient shell
+  already had. devbench is developed with devbench, so the executor runs the
+  suite from inside a live workspace with those exported: fixture work-unit
+  state landed in the real `.devbench/ci-failures/` and
+  `.devbench/pr-bot-feedback/` under IDs that exist only in `tests/`, and
+  fabricated lifecycle records were appended to the live log --
+  `[ORCHESTRATOR_TERMINAL_EXIT]`, `[QUOTA_WAITING]`,
   `[ORCHESTRATOR_AUTO_RESTART]`, `Merged PR #42` -- for events that never
   happened. Those are exactly the markers the reporting layer parses, so a
   test run could drive an operator's `status` and `report` output. Assignment
-  is now unconditional, to a fresh per-run temporary workspace; an ambient
-  value is the hazard, not a configuration to honour. Verified against a live
-  workspace: the suite leaves a 180 MB orchestrator log byte-identical and
-  the 197-file `.devbench/` tree unchanged.
+  is now unconditional (force-assign, not `setdefault`), to a fresh per-run
+  temporary workspace; an ambient value is the hazard, not a configuration to
+  honour. Verified against a live workspace: the suite leaves a 180 MB
+  orchestrator log byte-identical and the 197-file `.devbench/` tree
+  unchanged. `tests/test_workspace_isolation.py` pins the isolation itself:
+  a child pytest subprocess launched with a decoy live-like workspace
+  exported proves the decoy log gains zero bytes and its `.devbench/`
+  directory stays empty.
 
 - **A spent executor retry budget was reported as "operator does nothing"**
   (issue #248). The orchestrate skill writes its retry-exhaustion `[BLOCKED]`
@@ -456,7 +526,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   contract consumed by the orchestrate skill.
 
 - **The orchestrator-alive banner reported ALIVE with no orchestrator
-  running** (issue #250). Liveness was derived from log-activity recency
+  running** (issue #250; `spec/devbench-observability-hardening.md`
+  FR-D3/OAC-4, defect D3). Liveness was derived from log-activity recency
   alone, but a recent log line proves only that something wrote to the log,
   not that the writer still exists: a crashed or killed daemon read as ALIVE
   for the whole quiet window, and any other writer kept it ALIVE indefinitely.
@@ -464,7 +535,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and reports five states (ALIVE, with an idle variant; STOPPED; STARTING;
   NOT RUNNING; UNKNOWN). `stop_hook.window_seconds` no longer decides
   liveness; it distinguishes a busy live orchestrator from an idle one, so a
-  running-but-quiet orchestrator is never reported STOPPED.
+  running-but-quiet orchestrator is never reported STOPPED. Per obs-spec
+  decision OD-3, this fix owns the verdict only; the "last activity" recency
+  line still reads whichever log `devbench report` resolved for the
+  invocation -- the workspace's aggregate `logs/orchestrator.log` by
+  default, or the named session's log when `--session <name>` is passed
+  (E7-F3-S1-T1, declined as superseded: PR #295 already carried this fix
+  before the task reached the queue).
 
 - **`devbench start --help` omitted the scope-filter flags** (issue #249).
   `--include`, `--exclude`, `--name` and `--allow-overlap` were accepted by the

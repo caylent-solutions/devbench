@@ -8789,9 +8789,11 @@ def cmd_instances(*argv: str) -> int:
     """List every live devbench orchestrator instance on this host (#209).
 
     Walks every ``<root>/**/.devbench/orchestrator.pid`` under the operator's
-    reachable search roots (override via ``DEVBENCH_INSTANCE_SEARCH_ROOTS``,
-    default home directory), filters to live PIDs, and prints either a
-    human-readable table (TTY default) or a JSON array (``--json``).
+    reachable search roots: ``DEVBENCH_INSTANCE_SEARCH_ROOTS`` (colon-separated)
+    when set; otherwise ``$HOME`` plus the current ``DEVBENCH_WORKSPACE_ROOT``
+    (deduplicated when the workspace already lives under ``$HOME``). Filters
+    to live PIDs, and prints either a human-readable table (default) or a
+    JSON array (``--json``).
 
     Args:
         *argv: Optional ``--json`` flag.

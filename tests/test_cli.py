@@ -23042,3 +23042,41 @@ class TestSessionScopeJsonShape:
         stale.write_text("[]", encoding="utf-8")
         cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1"])
         assert isinstance(json.loads(stale.read_text(encoding="utf-8")), dict)
+
+
+@pytest.mark.unit
+class TestCmdInstancesDocstringMatchesResolvedDefault:
+    """Pins the cmd_instances docstring to the three-tier default (obs-spec OD-2).
+
+    doc_review round-2 finding: the docstring still said "default home
+    directory" after _resolve_search_roots' default branch changed to
+    $HOME plus DEVBENCH_WORKSPACE_ROOT.
+    """
+
+    def test_docstring_does_not_claim_home_only_default(self) -> None:
+        doc = cli.cmd_instances.__doc__ or ""
+        assert "default home directory" not in doc, (
+            "cmd_instances docstring must not claim the search-root default is "
+            "the home directory alone; the default is now $HOME plus "
+            "DEVBENCH_WORKSPACE_ROOT (obs-spec OD-2)."
+        )
+
+    def test_docstring_names_workspace_root_in_default(self) -> None:
+        doc = cli.cmd_instances.__doc__ or ""
+        assert "DEVBENCH_WORKSPACE_ROOT" in doc, (
+            "cmd_instances docstring must name DEVBENCH_WORKSPACE_ROOT as part "
+            "of the default search-root resolution (obs-spec OD-2)."
+        )
+
+    def test_docstring_does_not_claim_tty_conditional_default(self) -> None:
+        """doc_review round-2 finding: cmd_instances performs no isatty()
+        check -- table output is the unconditional default and only --json
+        changes the format, so the docstring must not say "TTY default".
+        """
+        doc = cli.cmd_instances.__doc__ or ""
+        assert "TTY default" not in doc, (
+            "cmd_instances docstring must not claim table output is 'the "
+            "TTY default'; cmd_instances performs no isatty() check, so "
+            "table output is the unconditional default and only --json "
+            "changes the format."
+        )

@@ -606,8 +606,9 @@ sessions because it frees the terminal and supports targeted
 
 The lifecycle commands all read `<workspace>/.devbench/orchestrator.pid`
 (written by daemon-mode start) plus walk PID files under
-`DEVBENCH_INSTANCE_SEARCH_ROOTS` (default `~`), so they work without
-the operator needing to `cd` into the target workspace.
+`DEVBENCH_INSTANCE_SEARCH_ROOTS` (default: `$HOME` plus the current
+`DEVBENCH_WORKSPACE_ROOT`), so they work without the operator needing to
+`cd` into the target workspace.
 
 Template (substitute `/path/to/devbench` + `/path/to/kanon-deps-work`):
 

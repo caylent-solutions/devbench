@@ -30,6 +30,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 - [Backlog write](#backlog-write)
 - [Drain (graceful orchestrator stop)](#drain-graceful-orchestrator-stop)
 - [Named sessions](#named-sessions)
+- [Instances (per-host discovery)](#instances-per-host-discovery)
 - [Scope selectors (printer-pages syntax)](#scope-selectors-printer-pages-syntax)
 - [Orchestration and reporting](#orchestration-and-reporting)
 - [Orchestrator helpers (invoked by agents)](#orchestrator-helpers-invoked-by-agents)
@@ -916,6 +917,51 @@ uv run devbench stop --session alpha
 
 # Clean up the stale session entry:
 uv run devbench sessions --cleanup
+```
+
+---
+
+## Instances (per-host discovery)
+
+`devbench instances` discovers every live devbench orchestrator process on the current host by walking a set of search roots for `.devbench/orchestrator.pid` files (issue #209). Discovery is scoped to the current host only (it never contacts other hosts); unlike [Named sessions](#named-sessions) (which enumerate sessions registered against ONE workspace), `instances` finds every orchestrator process reachable from the search roots on this host, regardless of which workspace started it.
+
+### `instances`
+
+```
+uv run devbench instances [--json]
+```
+
+List every live devbench orchestrator instance on this host, one row per instance (`instance_id`, `pid`, `mode`, `session`, `workspace`, `started_at`). In table mode (the default), prints `no devbench orchestrator instances running` when the walk finds none; in `--json` mode an empty result prints `[]` instead of that message. Always exits 0 -- an empty result is not an error.
+
+**Search roots (resolution order):** `DEVBENCH_INSTANCE_SEARCH_ROOTS` (colon-separated) when set; otherwise `$HOME` plus the current `DEVBENCH_WORKSPACE_ROOT`. When `DEVBENCH_WORKSPACE_ROOT` is already under `$HOME` it is not duplicated in the returned roots. This default keeps a workspace outside `$HOME` (for example, one checked out under `/workspaces`) discoverable with no configuration, while a workspace that already has `DEVBENCH_INSTANCE_SEARCH_ROOTS` configured sees identical behavior to before (obs-spec FR-D2 / OD-2).
+
+**Flags:**
+
+- `--json` -- print a JSON array of instance objects instead of the human-readable table. Each object carries `instance_id`, `pid`, `workspace`, `workspace_name`, `session`, `mode`, `started_at`, and `model` (the full workspace path is available only here; the table's WORKSPACE column shows `workspace_name`, the basename).
+
+**Exit codes:**
+
+| Scenario | rc |
+|----------|----|
+| Zero or more instances listed (table or `--json`). | 0 |
+| Unknown flag supplied. | 2 |
+
+**Worked example:**
+
+```bash
+# With DEVBENCH_INSTANCE_SEARCH_ROOTS unset, from a workspace outside $HOME:
+DEVBENCH_WORKSPACE_ROOT=/workspaces/anywhere/workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run devbench start --daemon
+
+DEVBENCH_WORKSPACE_ROOT=/workspaces/anywhere/workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run devbench instances
+# INSTANCE_ID                     PID  MODE        SESSION         WORKSPACE                STARTED
+# ----------------------------------------------------------------------------------------------
+# workspace-3458                233458  daemon      default         workspace                 2026-07-28T18:40:38Z
+# The WORKSPACE column shows the workspace basename (workspace_name); the full
+# absolute path is available only in --json output.
 ```
 
 ---

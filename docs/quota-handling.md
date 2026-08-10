@@ -49,17 +49,35 @@ considered > asyncio.shield" for the full rationale.
 
 ## Markers
 
-| Marker | Format | Emitted when |
-|--------|--------|-------------|
-| `[QUOTA_WAITING]` | `[QUOTA_WAITING] reason=<r> reset_at=<ISO\|unknown>` | The pause begins, immediately after the checkpoint is written. |
-| `[QUOTA_POLLING]` | `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` | Once per poll interval on every waiting path -- both the provider-stated `reset_at` wait and the recovery-probe loop -- so a long wait is visibly alive in the log. Best-effort: a logging failure can never break or delay the wait. |
-| `[QUOTA_RESUMED]` | `[QUOTA_RESUMED] waited_seconds=<N>` | Recovery is confirmed (a known `reset_at` has elapsed, or the recovery probe succeeded). |
-| `[QUOTA_PROBE_UNAVAILABLE]` | `[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>` | The recovery probe cannot run (no or invalid API credential) and no usable `reset_at` is known; the wait stops fast rather than polling for the full `max_wait_seconds`. |
-| `[QUOTA_FAIL_FAST]` | `[QUOTA_FAIL_FAST] reason=<r>` | `on_exhaustion=fail` (at detection) or `on_exhaustion_timeout=fail` (at timeout) re-raises the quota error for a non-zero exit. |
-| `[QUOTA_DRAIN_REQUESTED]` | `[QUOTA_DRAIN_REQUESTED] reason=<r> phase=<detection\|timeout>` | `on_exhaustion=drain` (at detection) or `on_exhaustion_timeout=drain` (at timeout) requests a graceful drain instead of waiting or resuming. |
-| `[QUOTA_TIMEOUT_KEEP_WAITING]` | `[QUOTA_TIMEOUT_KEEP_WAITING] reason=<r>` | `on_exhaustion_timeout=keep_waiting` exits cleanly (rc 0) after the wait cap elapses, without draining or failing. |
-| `[ORCHESTRATOR_QUOTA_RESUME]` | `[ORCHESTRATOR_QUOTA_RESUME] resume=<n> max=<cap>` | A recovered wait is followed by a fresh in-process SDK session, within the resume cap. |
-| `[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]` | `[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>` | A recovered wait's resume cap has already been used up for this `cmd_start` invocation; the run stops instead of resuming again. |
+The first seven markers below (`[QUOTA_WAITING]` through
+`[QUOTA_TIMEOUT_KEEP_WAITING]`) are the **structured markers** gated by
+`quota_handling.log_structured_events`: with the flag at its default `true`
+they log exactly as documented here; with `log_structured_events: false` none
+of them is written to the log, and the "Gated?" column below records this.
+Nothing else changes -- the wait timing, the recovery decision, and every
+side effect other than the log line proceed identically either way.
+
+Explicitly **excluded** from the gate (decision D-10, never suppressed by
+`log_structured_events`): the Slack notifications fired on the wait/resume
+transitions (their own `notifications.events.*` toggles), the
+`[QUOTA_WAITING]` / `[QUOTA_RESUMED]` audit comments appended to the active
+work unit (`audit_comment_on_wait` / `audit_comment_on_resume`), the on-disk
+`quota_pause.json` checkpoint, and the two `[ORCHESTRATOR_QUOTA_*]` markers
+at the bottom of the table -- those belong to the in-process resume loop, a
+different marker family from the seven `[QUOTA_*]` structured markers this
+flag controls.
+
+| Marker | Format | Emitted when | Gated by `log_structured_events`? |
+|--------|--------|-------------|:--:|
+| `[QUOTA_WAITING]` | `[QUOTA_WAITING] reason=<r> reset_at=<ISO\|unknown>` | The pause begins, immediately after the checkpoint is written. | Yes |
+| `[QUOTA_POLLING]` | `[QUOTA_POLLING] elapsed=<s> probe=<n> next_in=<s>` | Once per poll interval on every waiting path -- both the provider-stated `reset_at` wait and the recovery-probe loop -- so a long wait is visibly alive in the log. Best-effort: a logging failure can never break or delay the wait. | Yes |
+| `[QUOTA_RESUMED]` | `[QUOTA_RESUMED] waited_seconds=<N>` | Recovery is confirmed (a known `reset_at` has elapsed, or the recovery probe succeeded). | Yes |
+| `[QUOTA_PROBE_UNAVAILABLE]` | `[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>` | The recovery probe cannot run (no or invalid API credential) and no usable `reset_at` is known; the wait stops fast rather than polling for the full `max_wait_seconds`. | Yes |
+| `[QUOTA_FAIL_FAST]` | `[QUOTA_FAIL_FAST] reason=<r>` | `on_exhaustion=fail` (at detection) or `on_exhaustion_timeout=fail` (at timeout) re-raises the quota error for a non-zero exit. | Yes |
+| `[QUOTA_DRAIN_REQUESTED]` | `[QUOTA_DRAIN_REQUESTED] reason=<r> phase=<detection\|timeout>` | `on_exhaustion=drain` (at detection) or `on_exhaustion_timeout=drain` (at timeout) requests a graceful drain instead of waiting or resuming. | Yes |
+| `[QUOTA_TIMEOUT_KEEP_WAITING]` | `[QUOTA_TIMEOUT_KEEP_WAITING] reason=<r>` | `on_exhaustion_timeout=keep_waiting` exits cleanly (rc 0) after the wait cap elapses, without draining or failing. | Yes |
+| `[ORCHESTRATOR_QUOTA_RESUME]` | `[ORCHESTRATOR_QUOTA_RESUME] resume=<n> max=<cap>` | A recovered wait is followed by a fresh in-process SDK session, within the resume cap. | No -- always logged |
+| `[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]` | `[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>` | A recovered wait's resume cap has already been used up for this `cmd_start` invocation; the run stops instead of resuming again. | No -- always logged |
 
 ## Resume cap
 
@@ -116,7 +134,7 @@ quota_handling:
 | `resume_strategy` | `continue_current_wu` | How the in-process resume re-enters the orchestrate loop after recovery -- see the table below. |
 | `audit_comment_on_wait` | `true` | When `true`, a `[QUOTA_WAITING]` audit comment is written to the active work unit. |
 | `audit_comment_on_resume` | `true` | When `true`, a `[QUOTA_RESUMED]` audit comment is written to the active work unit. |
-| `log_structured_events` | `true` | Parsed and validated but has no runtime consumer today -- quota transitions currently emit only the plain text markers via `logger.info`, not a JSON-structured event. |
+| `log_structured_events` | `true` | When `true`, the seven structured `[QUOTA_*]` markers in the table above are logged (`[QUOTA_WAITING]`, `[QUOTA_POLLING]`, `[QUOTA_RESUMED]`, `[QUOTA_PROBE_UNAVAILABLE]`, `[QUOTA_FAIL_FAST]`, `[QUOTA_DRAIN_REQUESTED]`, `[QUOTA_TIMEOUT_KEEP_WAITING]`). When `false`, none of the seven is written to the log -- everything else (Slack notifications, the `audit_comment_on_wait`/`audit_comment_on_resume` comments, the on-disk checkpoint, and the `[ORCHESTRATOR_QUOTA_*]` markers) is unaffected. |
 
 ### `resume_strategy` values
 

@@ -537,6 +537,7 @@ async def _wait_toward_reset(
     reset_at: datetime | None,
     poll_interval_seconds: int,
     max_wait_seconds: int,
+    emit_structured_events: bool = True,
 ) -> None:
     """Sleep toward a provider-stated ``reset_at`` in poll-interval-bounded steps.
 
@@ -567,6 +568,13 @@ async def _wait_toward_reset(
             > 0 -- ``wait_for_reset`` validates this before calling here, so
             this stepper never has to normalise or clamp an invalid cadence.
         max_wait_seconds: Maximum total wait in seconds.
+        emit_structured_events: When ``True`` (default), emits the
+            ``[QUOTA_POLLING]`` heartbeat before each sleep step. When
+            ``False``, the sleeps still happen -- only the heartbeat log
+            line is suppressed (FR-2, spec AC-9). Threaded in by the caller
+            from ``quota_handling.log_structured_events``; this module has
+            no dependency on any config-loading code, so the value always
+            arrives as a plain function parameter.
     """
     now = _get_current_utc()
     if reset_at is None or now >= reset_at:
@@ -577,7 +585,8 @@ async def _wait_toward_reset(
     elapsed = 0.0
     while elapsed < window:
         sleep_for = min(poll_step, window - elapsed)
-        _emit_polling_heartbeat(elapsed=elapsed, probe=0, next_in=sleep_for)
+        if emit_structured_events:
+            _emit_polling_heartbeat(elapsed=elapsed, probe=0, next_in=sleep_for)
         await asyncio.sleep(sleep_for)
         elapsed += sleep_for
 
@@ -589,6 +598,7 @@ async def wait_for_reset(
     max_wait_seconds: int,
     probe_fn: Callable[[], bool],
     backoff_config: BackoffConfig | None = None,
+    emit_structured_events: bool = True,
 ) -> bool:
     """Async poller that waits until the quota resets and a probe confirms recovery.
 
@@ -626,6 +636,11 @@ async def wait_for_reset(
             ``False`` when still exhausted. Non-quota exceptions propagate.
         backoff_config: Optional backoff configuration. When ``None`` the
             function uses a default aligned with ``poll_interval_seconds``.
+        emit_structured_events: When ``True`` (default), emits the
+            ``[QUOTA_POLLING]`` heartbeat on both the ``_wait_toward_reset``
+            step path and the probe-loop path. When ``False``, both
+            heartbeats are suppressed while every other behavior (sleeps,
+            probing, the return value) is unchanged (FR-2, spec AC-9).
 
     Returns:
         ``True`` when a known ``reset_at`` has elapsed (the provider-stated
@@ -676,6 +691,7 @@ async def wait_for_reset(
         reset_at=reset_at,
         poll_interval_seconds=poll_interval_seconds,
         max_wait_seconds=max_wait_seconds,
+        emit_structured_events=emit_structured_events,
     )
 
     raw_delay = float(backoff_config.initial_seconds)
@@ -707,8 +723,10 @@ async def wait_for_reset(
         # SEE the orchestrator is actively polling during a long wait,
         # rather than the log looking dead between [QUOTA_WAITING] and
         # [QUOTA_RESUMED]. Best-effort: a logging failure must never break
-        # the probe (same guarantee as the reset_at path).
-        _emit_polling_heartbeat(elapsed=elapsed, probe=probe_count, next_in=delay)
+        # the probe (same guarantee as the reset_at path). Suppressed
+        # entirely when emit_structured_events is False (FR-2, spec AC-9).
+        if emit_structured_events:
+            _emit_polling_heartbeat(elapsed=elapsed, probe=probe_count, next_in=delay)
 
         # RecoveryProbeUnavailableError (probe permanently unavailable, no
         # usable reset_at known) and any other probe_fn exception propagate

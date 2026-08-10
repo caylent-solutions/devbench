@@ -94,14 +94,27 @@ class TestPositiveLiveDispatcherClaimsPresent:
 
 
 @pytest.mark.unit
-class TestLogStructuredEventsQualifiedAsUnconsumed:
-    """log_structured_events is parsed/validated only; no code path in src/ reads it.
+class TestLogStructuredEventsDocSync:
+    """log_structured_events documentation must track its actual runtime status.
 
     Regression pin for the doc_review REVIEW_FAIL on E2-F4-S3-T2 attempt 1: rewriting
     the blanket "not yet consumed" disclaimer into a whole-block "live" claim silently
-    swept this field along, contradicting the code (grep across src/devbench/cli.py,
-    quota.py and notifications.py finds no read of log_structured_events; it is only
-    parsed in config_loader.py and declared in config-schema.json).
+    swept this field along, contradicting the code of the day (log_structured_events was
+    parsed in config_loader.py and declared in config-schema.json, but no code path in
+    src/ read it).
+
+    E9-F1-S2-T1 (doc_review REVIEW_FAIL, second round) wired the flag end to end:
+    ``_quota_structured_events_enabled()`` in cli.py now gates every one of the seven
+    structured ``[QUOTA_*]`` markers on it. docs/devbench-yaml-reference.md was updated
+    in that change to describe the flag as effective, so the "no runtime consumer"
+    qualifier this class pins is retired for that file.
+
+    sample-config.yaml carried the identical pre-wiring disclaimer (doc_review
+    REVIEW_FAIL, third round): the "no runtime consumer" wording contradicted the
+    same wired flag, so the comment block was rewritten to describe it as effective,
+    matching docs/devbench-yaml-reference.md and docs/quota-handling.md. The
+    "no runtime consumer" qualifier this class pinned for sample-config.yaml is
+    retired too; both files now pin the "gates the seven structured" claim.
     """
 
     # Must be specific enough that trivial mentions of "text markers" in an
@@ -109,20 +122,33 @@ class TestLogStructuredEventsQualifiedAsUnconsumed:
     # false-positive; the marker must actually assert *no consumption*.
     NO_RUNTIME_CONSUMER_MARKER = "no runtime consumer"
 
-    def test_yaml_reference_log_structured_events_row_is_qualified(self) -> None:
+    # Must be specific enough that a passing mention of "seven" elsewhere on the
+    # page does not false-positive; the marker must name the gated-markers claim
+    # in the same table row as the field.
+    GATES_SEVEN_MARKERS_MARKER = "gates the seven structured"
+
+    def test_yaml_reference_log_structured_events_row_documents_active_gating(self) -> None:
         text = _read(YAML_REFERENCE_DOC)
         row = next(line for line in text.splitlines() if "`log_structured_events`" in line and line.startswith("|"))
-        assert self.NO_RUNTIME_CONSUMER_MARKER in row.lower(), (
+        assert self.GATES_SEVEN_MARKERS_MARKER in row.lower(), (
             "docs/devbench-yaml-reference.md's log_structured_events table row must state "
-            f"it has no runtime consumer today. Row: {row!r}"
+            f"it gates the seven structured [QUOTA_*] markers. Row: {row!r}"
+        )
+        assert self.NO_RUNTIME_CONSUMER_MARKER not in row.lower(), (
+            "docs/devbench-yaml-reference.md's log_structured_events table row regressed to the "
+            f"retired 'no runtime consumer' disclaimer; the flag is wired (E9-F1-S2-T1). Row: {row!r}"
         )
 
-    def test_sample_config_log_structured_events_comment_is_qualified(self) -> None:
+    def test_sample_config_log_structured_events_comment_documents_active_gating(self) -> None:
         text = _read(SAMPLE_CONFIG)
         lines = text.splitlines()
         idx = next(i for i, line in enumerate(lines) if line.strip().startswith("# log_structured_events:"))
         comment_block = "\n".join(lines[idx : idx + 3]).lower()
-        assert self.NO_RUNTIME_CONSUMER_MARKER in comment_block, (
-            "sample-config.yaml's log_structured_events comment must state it has no "
-            f"runtime consumer today. Comment block: {comment_block!r}"
+        assert self.GATES_SEVEN_MARKERS_MARKER in comment_block, (
+            "sample-config.yaml's log_structured_events comment must state it gates the "
+            f"seven structured [QUOTA_*] markers. Comment block: {comment_block!r}"
+        )
+        assert self.NO_RUNTIME_CONSUMER_MARKER not in comment_block, (
+            "sample-config.yaml's log_structured_events comment regressed to the retired "
+            f"'no runtime consumer' disclaimer; the flag is wired (E9-F1-S2-T1). Comment block: {comment_block!r}"
         )

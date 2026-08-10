@@ -302,8 +302,9 @@ documented below, and `cmd_start` reads `enabled` / `on_exhaustion` / `on_exhaus
 `resume_strategy` / `audit_comment_on_wait` / `audit_comment_on_resume` at runtime via
 `_drive_orchestrate_with_quota_resume` -> `_dispatch_quota_detection` -> `_handle_quota_pause`
 (`src/devbench/cli.py`; landed by E2-F4-S3-T1) -- see the per-field table below for exactly
-when each is read. `log_structured_events` is the one exception: it is parsed and validated
-like every other field, but has no runtime consumer today (see its table row). `enabled: true`
+when each is read. `log_structured_events` is read too: `_quota_structured_events_enabled()`
+gates every one of the seven structured `[QUOTA_*]` markers on it (`src/devbench/cli.py`,
+`src/devbench/quota.py`; landed by E9-F1-S2-T1) -- see its table row. `enabled: true`
 (the default) makes the orchestrator pause and poll for reset instead of exiting non-zero;
 `enabled: false` restores the legacy non-zero exit.
 
@@ -334,7 +335,7 @@ quota_handling:
 | `resume_strategy` | string (enum) | `continue_current_wu`, `restart_wu`, `drain_and_resume` | `continue_current_wu` | How the orchestrator re-enters the loop after recovery. `continue_current_wu` resumes where it left off; `restart_wu` forces the current work unit back to `in-queue`; `drain_and_resume` removes the quota checkpoint and requests a graceful drain -- the run stops and must be restarted manually, since the Makefile auto-restart loop (`Makefile:117-123`) only fires on exit code 42, which a graceful drain does not produce. |
 | `audit_comment_on_wait` | boolean | `true`, `false` | `true` | Append a `[QUOTA_WAITING]` audit comment to the in-progress work unit when pausing. |
 | `audit_comment_on_resume` | boolean | `true`, `false` | `true` | Append a `[QUOTA_RESUMED]` audit comment after recovery. |
-| `log_structured_events` | boolean | `true`, `false` | `true` | Parsed and validated; has no runtime consumer today -- quota transitions currently emit only the plain text markers (`[QUOTA_WAITING]`/`[QUOTA_RESUMED]`) via `logger.info`, not a JSON-structured event. |
+| `log_structured_events` | boolean | `true`, `false` | `true` | Gates the seven structured `[QUOTA_*]` markers (`[QUOTA_WAITING]`, `[QUOTA_POLLING]`, `[QUOTA_RESUMED]`, `[QUOTA_PROBE_UNAVAILABLE]`, `[QUOTA_FAIL_FAST]`, `[QUOTA_DRAIN_REQUESTED]`, `[QUOTA_TIMEOUT_KEEP_WAITING]`); `false` suppresses all seven. Does not affect Slack notifications, the `audit_comment_on_wait`/`audit_comment_on_resume` comments, the on-disk checkpoint, or the `[ORCHESTRATOR_QUOTA_*]` markers -- see docs/quota-handling.md for the full breakdown. |
 
 **Enum and range enforcement happens at config-load time, never at dispatch time** (spec FR-2.9):
 an invalid `on_exhaustion` / `on_exhaustion_timeout` / `resume_strategy` value, or a

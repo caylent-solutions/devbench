@@ -886,3 +886,222 @@ class TestCmdQuotaWatcher:
         with patch("devbench.cli.WORKSPACE_ROOT", Path("/nonexistent-for-registry-check")):
             rc = cli.cmd_quota_watcher()
         assert rc == 1
+
+
+class TestQuotaStructuredEventsGating:
+    """FR-2 (G2): quota_handling.log_structured_events gates every [QUOTA_*] structured
+
+    marker emission (spec AC-7/AC-8/AC-9/AC-10, decision D-1/D-10)."""
+
+    @pytest.mark.unit
+    def test_helper_reads_runtime_config_quota_handling_flag(self) -> None:
+        """_quota_structured_events_enabled() is a thin, uncaught read of RUNTIME_CONFIG."""
+        cfg_false = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=False))
+        cfg_true = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=True))
+        with patch("devbench.cli.RUNTIME_CONFIG", cfg_false):
+            assert cli._quota_structured_events_enabled() is False
+        with patch("devbench.cli.RUNTIME_CONFIG", cfg_true):
+            assert cli._quota_structured_events_enabled() is True
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("log_structured_events", [True, False], ids=["flag-true", "flag-false"])
+    @pytest.mark.parametrize(
+        ("on_exhaustion", "expected_marker"),
+        [
+            ("fail", "[QUOTA_FAIL_FAST]"),
+            ("drain", "[QUOTA_DRAIN_REQUESTED]"),
+        ],
+        ids=["fail-fast", "drain-requested"],
+    )
+    def test_dispatch_quota_detection_marker_gated_by_flag(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        on_exhaustion: str,
+        expected_marker: str,
+        log_structured_events: bool,
+    ) -> None:
+        """AC-E9-F1-S2-T1-1/2 (spec AC-7/AC-8): detection-time markers appear iff the flag is true."""
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        quota_exc = _make_quota_exc(source="anthropic-api")
+        detected = cli._QuotaDetected(quota_exc)
+        cfg = SimpleNamespace(
+            quota_handling=QuotaHandlingConfig(
+                enabled=True, on_exhaustion=on_exhaustion, log_structured_events=log_structured_events
+            )
+        )
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            if on_exhaustion == "fail":
+                with pytest.raises(SubscriptionRateLimitError):
+                    cli._dispatch_quota_detection(detected, session_name="default")
+            else:
+                result = cli._dispatch_quota_detection(detected, session_name="default")
+                assert result == cli._QUOTA_STOP_REASON_DRAIN_DETECTION
+                drain_state = read_drain_state(tmp_path)
+                assert drain_state is not None
+        assert (expected_marker in caplog.text) is log_structured_events
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("log_structured_events", [True, False], ids=["flag-true", "flag-false"])
+    @pytest.mark.parametrize(
+        ("action", "expected_marker"),
+        [
+            ("fail", "[QUOTA_FAIL_FAST]"),
+            ("keep_waiting", "[QUOTA_TIMEOUT_KEEP_WAITING]"),
+            ("drain", "[QUOTA_DRAIN_REQUESTED]"),
+        ],
+        ids=["fail", "keep-waiting", "drain"],
+    )
+    def test_dispatch_quota_timeout_marker_gated_by_flag(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        action: str,
+        expected_marker: str,
+        log_structured_events: bool,
+    ) -> None:
+        """AC-E9-F1-S2-T1-1/2 (spec AC-7/AC-8): timeout-dispatch markers appear iff the flag is true."""
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        detected = _make_quota_detected(source="anthropic-api")
+        cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=log_structured_events))
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            if action == "fail":
+                with pytest.raises(SubscriptionRateLimitError):
+                    cli._dispatch_quota_timeout(detected, action)
+            else:
+                cli._dispatch_quota_timeout(detected, action)
+        assert (expected_marker in caplog.text) is log_structured_events
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("log_structured_events", [True, False], ids=["flag-true", "flag-false"])
+    def test_handle_quota_pause_waiting_and_resumed_markers_gated_by_flag(
+        self,
+        tmp_path: Path,
+        quota_pause_mocks: SimpleNamespace,
+        caplog: pytest.LogCaptureFixture,
+        log_structured_events: bool,
+    ) -> None:
+        """AC-E9-F1-S2-T1-1/2 (spec AC-7/AC-8): [QUOTA_WAITING]/[QUOTA_RESUMED] appear iff the flag is true.
+
+        The wait itself still completes normally regardless of the flag (only the log line is gated)."""
+        exc = _make_quota_exc(source="anthropic-api")
+        qh_cfg = QuotaHandlingConfig()
+        quota_pause_mocks.wait_for_reset.return_value = True
+        cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=log_structured_events))
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            result = asyncio.run(
+                cli._handle_quota_pause(exc=exc, qh_cfg=qh_cfg, workspace_root=tmp_path, session_name="s1")
+            )
+        assert result is True
+        assert ("[QUOTA_WAITING]" in caplog.text) is log_structured_events
+        assert ("[QUOTA_RESUMED]" in caplog.text) is log_structured_events
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("log_structured_events", [True, False], ids=["flag-true", "flag-false"])
+    def test_handle_quota_pause_probe_unavailable_marker_gated_by_flag(
+        self,
+        tmp_path: Path,
+        quota_pause_mocks: SimpleNamespace,
+        caplog: pytest.LogCaptureFixture,
+        log_structured_events: bool,
+    ) -> None:
+        """AC-E9-F1-S2-T1-1/2 (spec AC-7/AC-8): [QUOTA_PROBE_UNAVAILABLE] appears iff the flag is true."""
+        exc = _make_quota_exc(source="anthropic-api")
+        qh_cfg = QuotaHandlingConfig()
+        quota_pause_mocks.wait_for_reset.side_effect = RecoveryProbeUnavailableError("no credential")
+        cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=log_structured_events))
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            result = asyncio.run(
+                cli._handle_quota_pause(exc=exc, qh_cfg=qh_cfg, workspace_root=tmp_path, session_name="s1")
+            )
+        assert result is False
+        assert ("[QUOTA_PROBE_UNAVAILABLE]" in caplog.text) is log_structured_events
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("log_structured_events", [True, False], ids=["flag-true", "flag-false"])
+    def test_handle_quota_pause_threads_flag_into_wait_for_reset(
+        self,
+        tmp_path: Path,
+        quota_pause_mocks: SimpleNamespace,
+        log_structured_events: bool,
+    ) -> None:
+        """AC-E9-F1-S2-T1-3 (spec AC-9): the same flag decision is threaded into wait_for_reset's
+
+        emit_structured_events kwarg so the [QUOTA_POLLING] heartbeat (quota.py:526) obeys it too."""
+        exc = _make_quota_exc()
+        qh_cfg = QuotaHandlingConfig()
+        cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=log_structured_events))
+        captured: dict[str, object] = {}
+
+        async def _capture_wait_for_reset(**kwargs: object) -> bool:
+            captured["emit_structured_events"] = kwargs["emit_structured_events"]
+            return True
+
+        quota_pause_mocks.wait_for_reset.side_effect = _capture_wait_for_reset
+        with patch("devbench.cli.RUNTIME_CONFIG", cfg):
+            asyncio.run(cli._handle_quota_pause(exc=exc, qh_cfg=qh_cfg, workspace_root=tmp_path, session_name="s1"))
+        assert captured["emit_structured_events"] is log_structured_events
+
+    @pytest.mark.unit
+    def test_flag_false_does_not_suppress_slack_or_audit_comments(self, tmp_path: Path) -> None:
+        """AC-E9-F1-S2-T1-4 (spec AC-10, D-10): log_structured_events=False never touches Slack
+
+        notifications or audit comments -- both stay governed solely by their own toggles."""
+        wu = _write_in_progress_wu(tmp_path)
+        qh_cfg = QuotaHandlingConfig(audit_comment_on_wait=True, audit_comment_on_resume=True)
+        exc = _make_quota_exc(source="anthropic-api")
+        cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(log_structured_events=False))
+        fire_waiting = MagicMock()
+        fire_resumed = MagicMock()
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+            patch("devbench.cli.BacklogParser") as mock_parser_cls,
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.save_checkpoint"),
+            patch("devbench.cli.wait_for_reset", new=AsyncMock(return_value=True)),
+            patch("devbench.cli._fire_quota_waiting_notification", fire_waiting),
+            patch("devbench.cli._fire_quota_resumed_notification", fire_resumed),
+            patch("devbench.cli._apply_resume_strategy"),
+        ):
+            mock_parser_cls.return_value.parse_index.return_value = [wu]
+            result = asyncio.run(
+                cli._handle_quota_pause(exc=exc, qh_cfg=qh_cfg, workspace_root=tmp_path, session_name="s1")
+            )
+        assert result is True
+        fire_waiting.assert_called_once()
+        fire_resumed.assert_called_once()
+        content = wu.file_path.read_text(encoding="utf-8")
+        assert "[QUOTA_WAITING] reason=anthropic-api" in content
+        assert "[QUOTA_RESUMED] waited_seconds=" in content
+
+
+class TestStartDocstringDaemonFlag:
+    """AC-E9-F1-S2-T1-5 (spec AC-11, G4 docstring half): the cli.py module docstring's
+
+    ``start`` row names ``--daemon`` and ``-d``."""
+
+    @pytest.mark.unit
+    def test_module_docstring_start_row_names_daemon_flag(self) -> None:
+        assert cli.__doc__ is not None
+        lines = cli.__doc__.splitlines()
+        start_index = next(i for i, line in enumerate(lines) if line.strip().startswith("start "))
+        start_block = "\n".join(lines[start_index : start_index + 2])
+        assert "--daemon" in start_block
+        assert ", -d" in start_block

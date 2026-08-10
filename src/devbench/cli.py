@@ -29,7 +29,8 @@ Commands::
     git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
-    start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive)
+    start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive);
+                            --daemon, -d detaches to the background and returns immediately (#209)
     scope set/clear/show    Persistent scope management without starting the orchestrator
     watch [--watch N]       Show a live dashboard of the active orchestration
 
@@ -6928,6 +6929,33 @@ _QUOTA_FAIL_FAST_AUDIT_PREFIX: str = "[QUOTA_FAIL_FAST]"
 _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX: str = "[QUOTA_DRAIN_REQUESTED]"
 _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX: str = "[QUOTA_TIMEOUT_KEEP_WAITING]"
 
+
+def _quota_structured_events_enabled() -> bool:
+    """Return whether structured ``[QUOTA_*]`` log markers should be emitted (FR-2, spec AC-7/AC-8).
+
+    Reads ``RUNTIME_CONFIG.quota_handling.log_structured_events`` directly.
+    Performs no I/O and catches nothing: the config loader has already
+    validated the field as a boolean, so a try/except-default wrapper here
+    would be fallback logic (BLOCKED by this unit's error-handling contract).
+
+    Gates every ``[QUOTA_*]`` structured marker emission in this module
+    (``[QUOTA_WAITING]``, ``[QUOTA_RESUMED]``, ``[QUOTA_PROBE_UNAVAILABLE]``,
+    ``[QUOTA_FAIL_FAST]``, ``[QUOTA_DRAIN_REQUESTED]``,
+    ``[QUOTA_TIMEOUT_KEEP_WAITING]``) plus ``[QUOTA_POLLING]`` in
+    ``devbench.quota`` (threaded in as a parameter, since that module
+    imports no config). Explicitly NOT gated (decision D-10): Slack
+    notifications (``notifications.events.*``), audit comments
+    (``audit_comment_on_wait`` / ``audit_comment_on_resume``), ordinary
+    non-marker log lines, and checkpoint writes -- each has its own,
+    independently-tested toggle.
+
+    Returns:
+        ``True`` (the default) when structured quota markers should be
+        logged; ``False`` when the operator has disabled them.
+    """
+    return RUNTIME_CONFIG.quota_handling.log_structured_events
+
+
 _QUOTA_STOP_REASON_DRAIN_DETECTION: str = "quota-drain-requested"
 _QUOTA_STOP_REASON_DRAIN_TIMEOUT: str = "quota-wait-timeout-drain"
 #: Non-recovering quota stop reasons whose disposition is a drain request
@@ -7069,22 +7097,29 @@ async def _handle_quota_pause(
     Fixed sequence:
 
     1. Saves a checkpoint so SIGTERM does not lose pause state.
-    2. Emits ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>``, fires the
-       wrapped Slack notification, then (when ``audit_comment_on_wait`` is
-       true) appends the same marker to the in-flight work unit's Comments
-       section (FR-2.12, D-10).
+    2. When :func:`_quota_structured_events_enabled` is true (FR-2, spec
+       AC-7/AC-8), emits ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>``.
+       Fires the wrapped Slack notification, then (when ``audit_comment_on_wait``
+       is true) appends the same marker text to the in-flight work unit's
+       Comments section -- Slack and the audit comment are UNCONDITIONAL on
+       their own toggles regardless of the structured-events flag (FR-2.12,
+       D-10).
     3. Awaits ``wait_for_reset`` with no cancellation-shielding primitive
        (D-9): a SIGTERM must propagate naturally so ``devbench stop`` stays
-       responsive.
-    4. On recovery: emits ``[QUOTA_RESUMED] waited_seconds=<N>``, fires the
-       resumed notification, appends the audit comment when
+       responsive. Threads the same structured-events decision through as
+       ``emit_structured_events`` so the ``[QUOTA_POLLING]`` heartbeat
+       (quota.py:526) obeys the same flag.
+    4. On recovery: when structured events are enabled, emits
+       ``[QUOTA_RESUMED] waited_seconds=<N>``; fires the resumed
+       notification, appends the audit comment when
        ``audit_comment_on_resume`` is true, applies the configured resume
        strategy, and returns ``True``.
     5. On timeout: returns ``False`` (caller applies ``on_exhaustion_timeout``
        via :func:`_dispatch_quota_timeout`).
-    6. When the recovery probe is permanently unavailable: emits
-       ``[QUOTA_PROBE_UNAVAILABLE] reason=<r> detail=<msg>`` and returns
-       ``False`` immediately instead of polling out the full window.
+    6. When the recovery probe is permanently unavailable: when structured
+       events are enabled, emits ``[QUOTA_PROBE_UNAVAILABLE] reason=<r>
+       detail=<msg>``, then returns ``False`` immediately instead of polling
+       out the full window.
 
     Args:
         exc: The detected ``QuotaExhaustedError``.
@@ -7105,13 +7140,15 @@ async def _handle_quota_pause(
     )
     save_checkpoint(checkpoint, workspace_root)
 
+    emit_structured_events = _quota_structured_events_enabled()
     reset_at_str = _format_checkpoint_reset_at(exc.reset_at)
-    logger.info(
-        "%s reason=%s reset_at=%s",
-        _QUOTA_WAITING_AUDIT_PREFIX,
-        exc.source,
-        reset_at_str,
-    )
+    if emit_structured_events:
+        logger.info(
+            "%s reason=%s reset_at=%s",
+            _QUOTA_WAITING_AUDIT_PREFIX,
+            exc.source,
+            reset_at_str,
+        )
     _fire_quota_waiting_notification(exc.source, reset_at_str)
     if qh_cfg.audit_comment_on_wait:
         _append_quota_audit_comment(f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={exc.source} reset_at={reset_at_str}")
@@ -7130,25 +7167,28 @@ async def _handle_quota_pause(
                 request_size_tokens=RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
             ),
             backoff_config=backoff,
+            emit_structured_events=emit_structured_events,
         )
     except RecoveryProbeUnavailableError as probe_exc:
-        logger.info(
-            "%s reason=%s detail=%s",
-            _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX,
-            exc.source,
-            probe_exc,
-        )
+        if emit_structured_events:
+            logger.info(
+                "%s reason=%s detail=%s",
+                _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX,
+                exc.source,
+                probe_exc,
+            )
         return False
 
     if not recovered:
         return False
 
     waited_seconds = int((datetime.now(tz=UTC) - wait_start).total_seconds())
-    logger.info(
-        "%s waited_seconds=%d",
-        _QUOTA_RESUMED_AUDIT_PREFIX,
-        waited_seconds,
-    )
+    if emit_structured_events:
+        logger.info(
+            "%s waited_seconds=%d",
+            _QUOTA_RESUMED_AUDIT_PREFIX,
+            waited_seconds,
+        )
     _fire_quota_resumed_notification(waited_seconds)
     if qh_cfg.audit_comment_on_resume:
         _append_quota_audit_comment(f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}")
@@ -7245,7 +7285,9 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
       ``[QUOTA_FAIL_FAST]`` and re-raises immediately; ``"drain"`` logs
       ``[QUOTA_DRAIN_REQUESTED] phase=detection``, requests a drain, and
       stops without waiting; ``"wait"`` (default) enters
-      :func:`_handle_quota_pause`.
+      :func:`_handle_quota_pause`. Both marker logs are gated on
+      :func:`_quota_structured_events_enabled` (FR-2, spec AC-7); the drain
+      request itself is never gated.
     - On a wait timeout (or an unrecoverable probe), ``on_exhaustion_timeout``
       is applied via :func:`_dispatch_quota_timeout`.
 
@@ -7269,14 +7311,16 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
         raise detected.quota_exc from detected
 
     if qh_cfg.on_exhaustion == "fail":
-        logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        if _quota_structured_events_enabled():
+            logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
         raise detected.quota_exc from detected
     if qh_cfg.on_exhaustion == "drain":
-        logger.info(
-            "%s reason=%s phase=detection",
-            _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
-            detected.quota_exc.source,
-        )
+        if _quota_structured_events_enabled():
+            logger.info(
+                "%s reason=%s phase=detection",
+                _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+                detected.quota_exc.source,
+            )
         request_drain(WORKSPACE_ROOT, reason=f"quota-exhaustion:{detected.quota_exc.source}")
         return _QUOTA_STOP_REASON_DRAIN_DETECTION
 
@@ -7296,6 +7340,12 @@ def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> 
 
 def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
     """Apply ``on_exhaustion_timeout`` after the wait cap elapses or the probe is unavailable.
+
+    Every ``[QUOTA_FAIL_FAST]`` / ``[QUOTA_TIMEOUT_KEEP_WAITING]`` /
+    ``[QUOTA_DRAIN_REQUESTED] phase=timeout`` marker log is gated on
+    :func:`_quota_structured_events_enabled` (FR-2, spec AC-7); the
+    re-raise, the returned stop-reason, and the drain request itself are
+    never gated.
 
     Args:
         detected: The original quota sentinel (holds ``quota_exc`` for
@@ -7319,20 +7369,23 @@ def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
             f"unknown on_exhaustion_timeout action {action!r}. Allowed values: {sorted(_QUOTA_TIMEOUT_ACTIONS)}."
         )
     if action == "fail":
-        logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        if _quota_structured_events_enabled():
+            logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
         raise detected.quota_exc from detected
     if action == "keep_waiting":
+        if _quota_structured_events_enabled():
+            logger.info(
+                "%s reason=%s",
+                _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX,
+                detected.quota_exc.source,
+            )
+        return _QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING
+    if _quota_structured_events_enabled():
         logger.info(
-            "%s reason=%s",
-            _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX,
+            "%s reason=%s phase=timeout",
+            _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
             detected.quota_exc.source,
         )
-        return _QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING
-    logger.info(
-        "%s reason=%s phase=timeout",
-        _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
-        detected.quota_exc.source,
-    )
     request_drain(WORKSPACE_ROOT, reason=f"quota-timeout:{detected.quota_exc.source}")
     return _QUOTA_STOP_REASON_DRAIN_TIMEOUT
 

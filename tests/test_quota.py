@@ -1395,6 +1395,38 @@ class TestWaitTowardReset:
             )
         assert sum(d for _, d in recorder) == 45
 
+    def test_emit_structured_events_false_suppresses_heartbeat(self, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-E9-F1-S2-T1-3 (spec AC-9): emit_structured_events=False emits no [QUOTA_POLLING] line
+
+        while the sleeps themselves are unaffected (same step durations as the
+        default-True case in test_steps_toward_future_reset_never_one_blind_sleep)."""
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            caplog.at_level(logging.INFO, logger="devbench.quota"),
+        ):
+            asyncio.run(
+                _wait_toward_reset(
+                    reset_at=_NOW + timedelta(seconds=130),
+                    poll_interval_seconds=50,
+                    max_wait_seconds=1000,
+                    emit_structured_events=False,
+                )
+            )
+        sleep_durations = [call.args[0] for call in fake_sleep.await_args_list]
+        assert sleep_durations == [50, 50, 30]
+        heartbeat_lines = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert heartbeat_lines == []
+
+    def test_emit_structured_events_default_true_matches_documented_default(self) -> None:
+        """The keyword-only parameter defaults to True (spec AC-9: default emits exactly as today)."""
+        import inspect
+
+        signature = inspect.signature(_wait_toward_reset)
+        assert signature.parameters["emit_structured_events"].default is True
+
 
 @pytest.mark.unit
 class TestWaitForResetTDI003a:
@@ -1780,6 +1812,75 @@ class TestWaitForResetHeartbeat:
                 )
             )
         assert result is True
+
+    def test_emit_structured_events_false_suppresses_probe_loop_heartbeat(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-E9-F1-S2-T1-3 (spec AC-9): emit_structured_events=False emits no [QUOTA_POLLING]
+
+        on the probe-loop path either (mirrors test_heartbeat_emitted_once_per_poll with the
+        flag flipped) while the recovery outcome is unchanged."""
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        probe_results = [False, True]
+
+        def _fake_probe() -> bool:
+            return probe_results.pop(0)
+
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            patch("devbench.quota.secrets.SystemRandom", return_value=_FixedRng(0.0)),
+            caplog.at_level(logging.INFO, logger="devbench.quota"),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=None,
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=_fake_probe,
+                    emit_structured_events=False,
+                )
+            )
+        assert result is True
+        polling_lines = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert polling_lines == []
+
+    def test_emit_structured_events_false_suppresses_reset_at_path_heartbeat(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-E9-F1-S2-T1-3 (spec AC-9): the flag also reaches the _wait_toward_reset
+
+        heartbeat when threaded through the full wait_for_reset call (mirrors
+        test_heartbeat_on_reset_at_path_via_wait_for_reset with the flag flipped)."""
+        clock = _FakeClock(_NOW)
+        fake_sleep = _make_fake_sleep(clock)
+        probe_fn = MagicMock(return_value=False)
+        with (
+            patch("devbench.quota._get_current_utc", side_effect=clock.get),
+            patch("asyncio.sleep", fake_sleep),
+            caplog.at_level(logging.INFO, logger="devbench.quota"),
+        ):
+            result = asyncio.run(
+                wait_for_reset(
+                    reset_at=_NOW + timedelta(seconds=20),
+                    poll_interval_seconds=10,
+                    max_wait_seconds=1000,
+                    probe_fn=probe_fn,
+                    emit_structured_events=False,
+                )
+            )
+        assert result is True
+        probe_fn.assert_not_called()
+        polling_lines = [r.getMessage() for r in caplog.records if "[QUOTA_POLLING]" in r.getMessage()]
+        assert polling_lines == []
+
+    def test_emit_structured_events_default_true_matches_documented_default(self) -> None:
+        """The keyword-only parameter defaults to True (spec AC-9: default emits exactly as today)."""
+        import inspect
+
+        signature = inspect.signature(wait_for_reset)
+        assert signature.parameters["emit_structured_events"].default is True
 
 
 @pytest.mark.unit

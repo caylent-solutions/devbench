@@ -454,8 +454,8 @@ skills:
 # enabled / on_exhaustion are read on every quota-exhaustion signal,
 # on_exhaustion_timeout is read only when the wait cap elapses, and
 # resume_strategy only after a confirmed recovery. log_structured_events is
-# the one field that is parsed and validated but never read at runtime today
-# (see its own comment below).
+# read too: it gates the seven structured [QUOTA_*] markers (see its own
+# comment below).
 #
 # This block governs what the orchestrator does when the Claude CLI reports
 # a quota-exhaustion signal (HTTP 429 / CLI "You've hit your limit" message).
@@ -487,10 +487,13 @@ skills:
 #   work unit when pausing. Defaults to true.
 # audit_comment_on_resume: write a [QUOTA_RESUMED] audit comment when the
 #   wait ends. Defaults to true.
-# log_structured_events: has no runtime consumer today. Parsed and
-#   validated like every other field, but quota transitions currently emit
-#   only the plain text markers ([QUOTA_WAITING]/[QUOTA_RESUMED]) via
-#   logger.info, not a JSON-structured event. Defaults to true.
+# log_structured_events: gates the seven structured [QUOTA_*] markers
+#   ([QUOTA_WAITING], [QUOTA_POLLING], [QUOTA_RESUMED],
+#   [QUOTA_PROBE_UNAVAILABLE], [QUOTA_FAIL_FAST], [QUOTA_DRAIN_REQUESTED],
+#   [QUOTA_TIMEOUT_KEEP_WAITING]); false suppresses all seven. Does not
+#   affect Slack notifications, audit_comment_on_wait /
+#   audit_comment_on_resume, the on-disk checkpoint, or the
+#   [ORCHESTRATOR_QUOTA_*] markers. Defaults to true.
 # ---------------------------------------------------------------------------
 # quota_handling:
 #   enabled: true

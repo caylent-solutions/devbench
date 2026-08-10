@@ -221,7 +221,7 @@ report:
   cache_write_5min_multiplier: 1.25     # (built-in default)
   cache_write_1hr_multiplier: 2.0       # (built-in default)
   data_residency_multiplier: 1.10       # (built-in default)
-  fast_mode_multiplier: 6.0             # (built-in default)
+  fast_mode_multiplier: 2.0             # (built-in default)
   recent_pace_tasks: 10                 # (built-in default)
   display_timezone: America/New_York   # (unset; falls through to OS local)
 

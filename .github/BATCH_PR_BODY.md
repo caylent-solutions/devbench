@@ -15,8 +15,8 @@ This PR closes the E1-E6 run staged on the single deferred branch (spec S9),
 one clause per epic:
 
 - **E1 -- SDK upgrade.** Advances the `claude-agent-sdk` lock past the
-  cancel-scope teardown race floor and removes the now-dead
-  `sdk_teardown_filter` workaround.
+  cancel-scope teardown race floor and removes the now-dead SDK
+  teardown-filter workaround.
 - **E2 -- quota wait-and-resume (ADR-24).** Adds `devbench start` mid-session
   quota-exhaustion detection, an on-disk pause checkpoint, the
   `quota_handling` config block, the `devbench quota-watcher` command, and

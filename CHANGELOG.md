@@ -402,6 +402,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   byte-identical behavior for every workspace that has not set the flag.
   `docs/quota-handling.md` documents which markers are gated.
 
+- **`Recent pace (last N tasks)`, `Average time per task`, and the ETA
+  projection they feed sampled claim-to-done idle wall time as if it were
+  execution time** (issue #326). A completion whose only `in-progress`
+  anchor sat idle across an orchestrator session gap -- for example an
+  operator `set-status <id> done` against a claim made in an earlier
+  session -- was timed from that stale claim through to `done`, so the
+  pace and average estimators (and the ETA/cost projections derived from
+  them) could be skewed by wall-clock idle time that was never execution
+  time. `_recent_pace_minutes` and `_compute_window_stats`
+  (`src/devbench/reporting/report.py`) now accept a completion as a valid
+  sample only when its `in-progress` anchor exists AND falls in the same
+  orchestrator session as `done` (`_same_session`, session boundaries
+  derived from the log's own non-noise timestamps): pace, average, and ETA
+  no longer sample claim-to-done idle wall time. Both estimators now
+  compute the MEDIAN of the resulting same-session execution-time samples
+  instead of the arithmetic mean, so a single cross-session or outlier
+  completion can no longer dominate the estimate. Completions dropped for
+  having no execution window are no longer silently narrowed out of the
+  sample count: the `Average time per task` and `Recent pace (last N
+  tasks)` cells, and the trailing summary line when it drives the
+  sentence, append `(<k> excluded: no execution window)` naming how many
+  were dropped. `docs/cli-reference.md`'s ETA-formula note documents the
+  median estimator and the exclusion suffix.
+
 ## [0.3.0] -- 2026-07-31
 
 ### Fixed

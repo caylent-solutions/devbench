@@ -14,17 +14,28 @@ A round-trip failure names the offending file path (and, for doc-embedded
 blocks, the fenced-block's starting line number) via the pytest
 parametrize id AND the failure message, so the next stale example is
 diagnosed from the test output alone (AC-E3-F2-S1-T2-4).
+
+Spec Section 4 FR-9 (AC-21) extends this module with a second, independent
+drift guard: every line in the repaired example config annotated
+``# (built-in default)`` must resolve to the actual built-in default it
+claims to mirror (at minimum ``fast_mode_multiplier`` vs
+``DEFAULT_FAST_MODE_MULTIPLIER``, ``constants.py:867``), parametrized so a
+future annotated key is covered by adding one row to
+``_PATH_TO_EXPECTED_DEFAULT``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
+import yaml
 
-from devbench.config_loader import load_runtime_config
+from devbench import constants
+from devbench.config_loader import AmendmentConfig, GitOpsConfig, RuntimeConfig, load_runtime_config
 from devbench.constants import BEDROCK_AGENT_MODEL_PATTERN, DEFAULT_MODEL_RATES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -555,3 +566,256 @@ class TestReportFragmentBlocksRoundTripWhenMergedOntoMinimalConfig:
             pytest.fail(
                 f"report: fragment '{block.label}' failed config-load when merged onto a minimal base config: {exc}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Spec Section 4 FR-9 (AC-21): every line in the repaired example config
+# annotated `# (built-in default)` must resolve to the actual built-in
+# default it claims to mirror (at minimum fast_mode_multiplier vs
+# DEFAULT_FAST_MODE_MULTIPLIER), parametrized so a future annotated key is
+# covered by adding one row to _PATH_TO_EXPECTED_DEFAULT rather than a new
+# test.
+# ---------------------------------------------------------------------------
+
+_KEY_VALUE_LINE_RE = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_.-]+):(?P<rest>.*)$")
+_VALUE_COMMENT_RE = re.compile(r"^(?P<value>.*?)(?:\s+#\s*(?P<comment>.*))?$")
+_BUILT_IN_DEFAULT_COMMENT_RE = re.compile(r"^\(built-in default\b")
+
+
+class AnnotatedDefaultLine(NamedTuple):
+    """One `key: value  # (built-in default...)` leaf line from the example
+    config, identified by its full dotted YAML path (derived from
+    indentation, e.g. ``report.fast_mode_multiplier``), its raw (unparsed)
+    value text, and its 1-based source line number."""
+
+    path: str
+    raw_value: str
+    line_no: int
+
+
+def _iter_annotated_built_in_default_lines(text: str) -> list[AnnotatedDefaultLine]:
+    """Walk *text* line-by-line, tracking YAML nesting via 2-space-indent
+    bookkeeping, and return every leaf line whose trailing comment starts
+    with ``(built-in default``.
+
+    A "leaf" line is a ``key: value`` line with a non-empty value before any
+    trailing comment; a "header" line is a ``key:`` line with nothing but
+    optional whitespace/comment after the colon (e.g. ``report:``,
+    ``models:``) and is pushed onto the nesting stack instead of compared.
+    Non-key lines (blank lines, full-line comments, list items) are skipped
+    without disturbing the stack. Commented-out key lines (e.g. the
+    ``# debug:`` block) start with ``#`` before any key character and never
+    match ``_KEY_VALUE_LINE_RE``, so they are excluded automatically -- this
+    walk only ever sees the live, uncommented YAML body.
+    """
+    stack: list[tuple[int, str]] = []
+    discovered: list[AnnotatedDefaultLine] = []
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        key_match = _KEY_VALUE_LINE_RE.match(raw_line)
+        if key_match is None:
+            continue
+        indent = len(key_match.group("indent"))
+        key = key_match.group("key")
+        value_comment_match = _VALUE_COMMENT_RE.match(key_match.group("rest"))
+        assert value_comment_match is not None, f"line {line_no}: '{raw_line}' did not match the value/comment shape"
+        value_text = value_comment_match.group("value").strip()
+        comment_text = value_comment_match.group("comment") or ""
+
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+
+        if not value_text:
+            stack.append((indent, key))
+            continue
+
+        path = ".".join([*(k for _, k in stack), key])
+        if _BUILT_IN_DEFAULT_COMMENT_RE.match(comment_text):
+            discovered.append(AnnotatedDefaultLine(path=path, raw_value=value_text, line_no=line_no))
+    return discovered
+
+
+def _dataclass_scalar_default(dataclass_type: Any, field_name: str) -> object:
+    """Return the literal ``default=`` value declared for one dataclass field.
+
+    Ties config keys whose real built-in default lives only in a
+    config_loader.py dataclass field declaration (no separate constants.py
+    ``DEFAULT_*`` constant) directly to that declaration, rather than a
+    hand-copied literal that could itself drift from the dataclass without
+    this test noticing.
+    """
+    for declared_field in dataclasses.fields(dataclass_type):
+        if declared_field.name != field_name:
+            continue
+        assert declared_field.default is not dataclasses.MISSING, (
+            f"{dataclass_type.__name__}.{field_name} has no literal 'default='; "
+            "it may use default_factory= -- use _dataclass_factory_default instead."
+        )
+        return declared_field.default
+    raise AssertionError(f"{dataclass_type.__name__} has no field named {field_name!r}")
+
+
+def _dataclass_factory_default(dataclass_type: Any, field_name: str) -> object:
+    """Return the value produced by one dataclass field's ``default_factory``."""
+    for declared_field in dataclasses.fields(dataclass_type):
+        if declared_field.name != field_name:
+            continue
+        assert declared_field.default_factory is not dataclasses.MISSING, (
+            f"{dataclass_type.__name__}.{field_name} has no default_factory; "
+            "use _dataclass_scalar_default for a literal default= field instead."
+        )
+        return declared_field.default_factory()
+    raise AssertionError(f"{dataclass_type.__name__} has no field named {field_name!r}")
+
+
+_JUDGE_RETRY_KEYS: tuple[str, ...] = (
+    "code_review",
+    "test_review",
+    "doc_review",
+    "changes_manifest",
+    "security_review",
+)
+_OPUS_5_MODEL_ID = "claude-opus-5"
+
+# Path (dotted YAML key, matching _iter_annotated_built_in_default_lines'
+# derivation) -> the real built-in default it must equal. Grouped in the
+# same order as the example config's own sections for maintainability. Add
+# a new row here whenever a new `# (built-in default)` annotation is added
+# to the example config (spec Section 4 FR-9, AC-21).
+_PATH_TO_EXPECTED_DEFAULT: dict[str, object] = {
+    # Executor retry budget: config.py substitutes DEFAULT_MAX_RETRY_ATTEMPTS
+    # whenever max_executor_retries (or a per-judge override) is unset; the
+    # annotated per-judge rows restate that same default value per judge.
+    "max_executor_retries": constants.DEFAULT_MAX_RETRY_ATTEMPTS,
+    **{f"max_executor_retries_per_judge.{judge}": constants.DEFAULT_MAX_RETRY_ATTEMPTS for judge in _JUDGE_RETRY_KEYS},
+    # LLM routing.
+    "use_bedrock": _dataclass_scalar_default(RuntimeConfig, "use_bedrock"),
+    "bedrock_region": constants.DEFAULT_BEDROCK_REGION,
+    # Structured orchestrator log file.
+    "log_file": f"{constants.DEFAULT_LOG_SUBDIR}/{constants.DEFAULT_LOG_FILENAME}",
+    # Timeouts (seconds).
+    "timeouts.gh_api": constants.DEFAULT_GH_API_TIMEOUT,
+    "timeouts.test": constants.DEFAULT_TEST_TIMEOUT,
+    "timeouts.security_fetch": constants.DEFAULT_SECURITY_FETCH_TIMEOUT,
+    "timeouts.llm": constants.DEFAULT_LLM_TIMEOUT,
+    "timeouts.command": constants.DEFAULT_COMMAND_TIMEOUT,
+    "timeouts.orchestrator_poll_interval": constants.DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
+    "timeouts.github_check": constants.DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
+    # Limits / thresholds.
+    "limits.alert_summary": constants.DEFAULT_ALERT_SUMMARY_LIMIT,
+    "limits.output_truncation": constants.DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    "limits.llm_evidence_truncation": constants.DEFAULT_LLM_EVIDENCE_TRUNCATION,
+    "limits.llm_file_context": constants.DEFAULT_LLM_FILE_CONTEXT_LIMIT,
+    "limits.llm_file_preview_chars": constants.DEFAULT_LLM_FILE_PREVIEW_CHARS,
+    "limits.ci_failure_log_bytes": constants.DEFAULT_CI_FAILURE_LOG_BYTES,
+    # Git operations.
+    "git_ops.update_submodule": _dataclass_scalar_default(GitOpsConfig, "update_submodule"),
+    "git_ops.pause_before_merge": constants.DEFAULT_PAUSE_BEFORE_MERGE,
+    "git_ops.inline_orphan_cleanup": constants.DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
+    "git_ops.ci_failure_retry": constants.DEFAULT_CI_FAILURE_RETRY_ENABLED,
+    "git_ops.orphan_patterns": _dataclass_factory_default(GitOpsConfig, "orphan_patterns"),
+    "git_ops.local_only": _dataclass_scalar_default(GitOpsConfig, "local_only"),
+    "git_ops.pr_review_resolution.decision_blocks": constants.DEFAULT_PR_REVIEW_DECISION_BLOCKS,
+    "git_ops.pr_review_resolution.settle_seconds": constants.DEFAULT_PR_REVIEW_SETTLE_SECONDS,
+    "git_ops.pr_review_resolution.poll_interval": constants.DEFAULT_PR_REVIEW_POLL_INTERVAL,
+    # Stop-hook circuit breaker.
+    "stop_hook.max_blocks": constants.DEFAULT_STOP_HOOK_MAX_BLOCKS,
+    "stop_hook.window_seconds": constants.DEFAULT_STOP_HOOK_WINDOW_SECONDS,
+    "stop_hook.stale_task_minutes": constants.DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
+    # hook-tail column caps.
+    "hook_tail.agent_width": constants.DEFAULT_HOOK_TAIL_AGENT_WIDTH,
+    "hook_tail.tool_width": constants.DEFAULT_HOOK_TAIL_TOOL_WIDTH,
+    "hook_tail.description_max": constants.DEFAULT_HOOK_TAIL_DESCRIPTION_MAX,
+    "hook_tail.stdout_preview_max": constants.DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
+    # Orchestrator runtime tuning.
+    "orchestrate.max_cascade_depth": constants.DEFAULT_MAX_CASCADE_DEPTH,
+    # Report / cost estimation.
+    f"report.models.{_OPUS_5_MODEL_ID}.input": constants.DEFAULT_MODEL_RATES[_OPUS_5_MODEL_ID].input,
+    f"report.models.{_OPUS_5_MODEL_ID}.output": constants.DEFAULT_MODEL_RATES[_OPUS_5_MODEL_ID].output,
+    "report.default_model.input": constants.DEFAULT_FALLBACK_MODEL_RATES.input,
+    "report.default_model.output": constants.DEFAULT_FALLBACK_MODEL_RATES.output,
+    "report.cache_read_multiplier": constants.DEFAULT_CACHE_READ_MULTIPLIER,
+    "report.cache_write_5min_multiplier": constants.DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
+    "report.cache_write_1hr_multiplier": constants.DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
+    "report.data_residency_multiplier": constants.DEFAULT_DATA_RESIDENCY_MULTIPLIER,
+    # AC-21's explicit minimum coverage: fast_mode_multiplier vs
+    # DEFAULT_FAST_MODE_MULTIPLIER (constants.py:867).
+    "report.fast_mode_multiplier": constants.DEFAULT_FAST_MODE_MULTIPLIER,
+    "report.recent_pace_tasks": constants.DEFAULT_RECENT_PACE_TASKS,
+    # Manifest amendment workflow.
+    "manifest_amendment.max_requests_per_execution": _dataclass_scalar_default(
+        AmendmentConfig, "max_requests_per_execution"
+    ),
+}
+
+_ANNOTATED_DEFAULT_LINES = _iter_annotated_built_in_default_lines(_EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.mark.unit
+class TestBuiltInDefaultAnnotationDiscovery:
+    """Guards against the parametrized drift-guard test below silently
+    collecting fewer rows than expected -- a discovery-regex regression, or
+    a reverted/removed `# (built-in default)` annotation, would otherwise
+    pass vacuously (spec Section 4 FR-9, AC-21)."""
+
+    def test_discovers_at_least_thirty_annotated_lines(self) -> None:
+        assert len(_ANNOTATED_DEFAULT_LINES) >= 30, (
+            f"Expected >=30 '# (built-in default)' annotated lines in "
+            f"{_EXAMPLE_CONFIG_PATH.relative_to(REPO_ROOT)}, found "
+            f"{len(_ANNOTATED_DEFAULT_LINES)}: {[line.path for line in _ANNOTATED_DEFAULT_LINES]}"
+        )
+
+    def test_fast_mode_multiplier_row_is_discovered(self) -> None:
+        """AC-21's explicit minimum: fast_mode_multiplier vs DEFAULT_FAST_MODE_MULTIPLIER."""
+        paths = [line.path for line in _ANNOTATED_DEFAULT_LINES]
+        assert "report.fast_mode_multiplier" in paths, (
+            "The example config's 'report.fast_mode_multiplier' line must carry the "
+            "'# (built-in default)' annotation (spec Section 4 FR-9, AC-21)."
+        )
+
+    def test_every_mapped_path_was_actually_discovered(self) -> None:
+        """The inverse of the parametrized check below: a mapped path that is no
+        longer discovered means its annotated line (or just the annotation
+        comment) was removed or reverted. Without this check, that reversion
+        would silently shrink the parametrize list below while every
+        remaining row still passed -- a vacuous pass."""
+        discovered_paths = {line.path for line in _ANNOTATED_DEFAULT_LINES}
+        missing = sorted(set(_PATH_TO_EXPECTED_DEFAULT) - discovered_paths)
+        assert not missing, (
+            "The following built-in-default paths are mapped in "
+            f"_PATH_TO_EXPECTED_DEFAULT but no longer carry a '# (built-in default)' "
+            f"annotated line in {_EXAMPLE_CONFIG_PATH.relative_to(REPO_ROOT)}: {missing} "
+            "(spec Section 4 FR-9, AC-21 -- the annotation or the line itself was "
+            "removed/reverted)."
+        )
+
+
+@pytest.mark.unit
+class TestBuiltInDefaultAnnotationsMatchRealDefaults:
+    """AC-21 (spec Section 4 FR-9): every example-config line annotated
+    `# (built-in default)` resolves to the actual built-in default it claims
+    to mirror. A future edit that drifts the annotated value away from the
+    real default -- without also editing or removing the annotation -- turns
+    this parametrized row RED."""
+
+    @pytest.mark.parametrize(
+        "annotated_line",
+        _ANNOTATED_DEFAULT_LINES,
+        ids=[f"{line.path}:{line.line_no}" for line in _ANNOTATED_DEFAULT_LINES],
+    )
+    def test_annotated_value_equals_real_default(self, annotated_line: AnnotatedDefaultLine) -> None:
+        assert annotated_line.path in _PATH_TO_EXPECTED_DEFAULT, (
+            f"{_EXAMPLE_CONFIG_PATH.relative_to(REPO_ROOT)}:{annotated_line.line_no} annotates "
+            f"'{annotated_line.path}' as '# (built-in default)' but no row exists in "
+            "_PATH_TO_EXPECTED_DEFAULT for it -- add a mapping row so this drift guard covers "
+            "the new key (spec Section 4 FR-9, AC-21: 'parametrized so future annotated keys "
+            "are covered by adding a parameter row')."
+        )
+        expected = _PATH_TO_EXPECTED_DEFAULT[annotated_line.path]
+        actual = yaml.safe_load(annotated_line.raw_value)
+        assert actual == expected, (
+            f"{_EXAMPLE_CONFIG_PATH.relative_to(REPO_ROOT)}:{annotated_line.line_no} annotates "
+            f"'{annotated_line.path}: {annotated_line.raw_value}' as '# (built-in default)', "
+            f"but the real built-in default is {expected!r} (got {actual!r}) -- either the "
+            "example value or its annotation has drifted from the truth (spec Section 4 FR-9, "
+            "AC-21)."
+        )

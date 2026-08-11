@@ -1095,12 +1095,34 @@ uv run devbench get-diff <id>
 
 Print the combined git diff for the work unit's target repo, scoped to *what this work unit changed*. Used by review agents (all five review judges plus `security-reviewer`) as the authoritative scope source; agents must not run raw `git diff origin/main` to compute scope (see ADR-12).
 
-Mode-aware per ADR-12:
+**Manifest-scoped (db-296).** Every git query below is restricted to an explicit `-- <manifest_paths>` pathspec, derived from the unit's real Changes Manifest rows (sentinels like `(none)` / `<verification-only>` filtered via `_is_real_manifest_path`). This is what keeps a sibling task's dirty residue in the shared checkout out of this unit's diff. Two fail-fast cases precede every query:
 
-- **Per-task-branch mode** (default, `git_ops.defer_pr: false`): emits staged + unstaged + `git diff origin/<default_branch>` + untracked hunks. Each work unit runs on its own branch, so the branch-vs-default diff IS the task's scope.
-- **defer_pr mode** (`git_ops.single_branch: <branch>` + `git_ops.defer_pr: true`): emits staged + unstaged + untracked only. When staged and unstaged are both empty the executor has just committed, so `git show HEAD` is substituted. The branch-vs-default hunk is deliberately skipped because it would include every prior completed task's commits on the shared branch.
+- A missing work-unit file or a malformed `## Changes Manifest` table exits 1 with `ERROR: Cannot scope diff for '<unit_id>': Changes Manifest is malformed: <exc>` (or, for a missing file, the equivalent "work-unit file not found" variant).
+- An empty (verification-only) Manifest returns `(no changes)` immediately, before any git command runs -- never an unscoped whole-tree diff.
 
-Exit 0 on success; exit 1 when the work unit is not found or no local path is configured for its repo. Output is `(no changes)` when every hunk is empty.
+Mode-aware per ADR-12 (decision point 2 and its consequence superseded in place by db-247; see the ADR's "Correction" section):
+
+- **Per-task-branch mode** (default, `git_ops.defer_pr: false`): emits staged + unstaged + `git diff origin/<default_branch>` + untracked hunks, all Manifest-scoped. Each work unit runs on its own branch, so the branch-vs-default diff IS the task's scope.
+- **defer_pr mode** (`git_ops.single_branch: <branch>` + `git_ops.defer_pr: true`): emits staged + unstaged + untracked only, Manifest-scoped. When staged and unstaged are both empty the executor has just committed; instead of trusting HEAD (which may belong to a sibling task that committed later on the shared branch), this unit's OWN commit(s) are resolved via `git log --grep '^<unit_id>:' --format=%H` (matching every commit whose subject starts with the exact `<unit_id>: <title>` shape `git-ops` writes -- a task may carry more than one of its own commits, e.g. an initial commit plus a later `pr_review_resolution` fix commit) and emitted as `git show --format= <sha> -- <manifest_paths>` per commit. Zero matching commits fails fast (rc=1, no HEAD fallback):
+  ```
+  ERROR: get-diff (defer_pr, post-commit): no commit found for work unit '<unit_id>' on branch '<branch>'.
+  The working tree is clean but no commit subject matches '^<unit_id>:'. This task's changes were not
+  committed under its own name (possibly bundled into a sibling's commit, or the commit is missing).
+  Inspect with: git log --grep '^<unit_id>:' --format='%H %s' in <repo_path>.
+  ```
+  The branch-vs-default hunk is deliberately skipped because it would include every prior completed task's commits on the shared branch.
+
+Exit 0 on success; exit 1 when the work unit is not found, no local path is configured for its repo, the Changes Manifest cannot be resolved, or (defer_pr, post-commit) no commit matches this unit's own name. Output is `(no changes)` when every hunk is empty.
+
+### `check-manifest-scope`
+
+```
+uv run devbench check-manifest-scope <id>
+```
+
+Read-only, deterministic wrapper around `assert_staged_matches_manifest`'s check (spec 4.C, db-296 x db-327): prints the staged paths that are NOT in the unit's Changes Manifest and exits non-zero when that set is non-empty; exits zero when the staged set is within the Manifest. Same malformed-Manifest ERROR as `get-diff` on a missing/malformed Manifest.
+
+Exists because `get-diff` is now Manifest-scoped (above): a staged-but-unmanifested file no longer appears in the diff a judge reads, so the `changes-manifest` judge runs this verb to get a deterministic staged-vs-Manifest signal it cannot drift from. A non-empty result is an unconditional automatic REVIEW_FAIL for that judge (FR-11-A2), never a judged PASS.
 
 ### `run-tests`
 

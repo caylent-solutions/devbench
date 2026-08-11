@@ -4171,12 +4171,14 @@ class TestCmdGetDiff:
         """
         Given: a configured default branch of 'main3'
         When: cmd_get_diff is called
-        Then: run_command is invoked with ['git', 'diff', 'origin/main3'], not ['git', 'diff', 'main3'] (AC-1)
+        Then: run_command is invoked with ['git', 'diff', 'origin/main3', '--', 'foo.py'],
+        not ['git', 'diff', 'main3', ...] (AC-1)
         """
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
+        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
 
         diff_calls: list[list[str]] = []
 
@@ -4187,16 +4189,17 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
         ):
             cli.cmd_get_diff("E225-F1-S1-T1")
 
-        branch_diff_calls = [c for c in diff_calls if len(c) == 3 and c[2] not in ("--cached",)]
+        branch_diff_calls = [c for c in diff_calls if "origin/main3" in c]
         assert len(branch_diff_calls) == 1, f"Expected exactly one branch diff call, got: {branch_diff_calls}"
-        assert branch_diff_calls[0] == ["git", "diff", "origin/main3"], (
-            f"Expected 'origin/main3' ref but got: {branch_diff_calls[0]}"
+        assert branch_diff_calls[0] == ["git", "diff", "origin/main3", "--", "foo.py"], (
+            f"Expected Manifest-scoped 'origin/main3' pathspec but got: {branch_diff_calls[0]}"
         )
 
     def test_get_diff_output_unchanged_when_local_ref_current(
@@ -4211,15 +4214,17 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
+        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
         expected_diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "diff", "origin/main3"]:
+            if cmd == ["git", "diff", "origin/main3", "--", "foo.py"]:
                 return (0, expected_diff, "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -4242,6 +4247,7 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
+        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("new_feature.py",))
 
         # Simulate: bare main3 would include upstream-merged file, origin/main3 would not
         branch_only_diff = (
@@ -4250,14 +4256,15 @@ class TestCmdGetDiff:
         stale_extra_diff = branch_only_diff + "diff --git a/upstream_merged.py b/upstream_merged.py\n"
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "diff", "origin/main3"]:
+            if cmd == ["git", "diff", "origin/main3", "--", "new_feature.py"]:
                 return (0, branch_only_diff, "")
-            if cmd == ["git", "diff", "main3"]:
+            if cmd == ["git", "diff", "main3", "--", "new_feature.py"]:
                 return (0, stale_extra_diff, "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -5864,6 +5871,7 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("some/file.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
@@ -5872,6 +5880,7 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value=None),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -5887,6 +5896,7 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("some/file.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
@@ -5895,6 +5905,7 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value=None),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -5905,12 +5916,13 @@ class TestCmdGetDiffEdgeCases:
         assert "cannot determine default branch" in capsys.readouterr().err.lower()
 
     def test_get_diff_includes_untracked_files(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """Lines 434-453: untracked files are included as synthetic diff hunks."""
+        """Lines 434-453: untracked files IN the Manifest are included as synthetic diff hunks."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("new_file.py",))
         # Create an untracked file for the synthetic diff
         untracked_file = repo_path / "new_file.py"
         untracked_file.write_text("print('hello')\n", encoding="utf-8")
@@ -5922,6 +5934,7 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -5940,16 +5953,18 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("foo.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "diff", "--cached"]:
+            if cmd == ["git", "diff", "--cached", "--", "foo.py"]:
                 return (0, "staged-diff-content\n", "")
-            if cmd == ["git", "diff"] and len(cmd) == 2:
+            if cmd == ["git", "diff", "--", "foo.py"]:
                 return (0, "unstaged-diff-content\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -5970,6 +5985,7 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("nonexistent_file.py",))
         # Do NOT create the file so reading it raises OSError
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -5979,6 +5995,7 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -5994,6 +6011,7 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("valid.py",))
         # Create a valid file so one line succeeds, and one blank line gets skipped
         valid_file = repo_path / "valid.py"
         valid_file.write_text("x = 1\n", encoding="utf-8")
@@ -6006,6 +6024,7 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6017,13 +6036,466 @@ class TestCmdGetDiffEdgeCases:
         assert "valid.py" in output
 
 
+@pytest.mark.unit
+class TestCmdGetDiffManifestScoping:
+    """FR-12 (db-296): every ``get-diff`` git query is scoped to the unit's
+    real Changes Manifest paths, so a sibling task's dirty residue in the
+    shared checkout can never leak into this unit's diff."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Manifest-scoped get-diff test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_get_diff_excludes_sibling_untracked_residue(
+        self, tmp_repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-27: a unit owning only 'A.py' excludes a sibling's untracked residue."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("A.py",))
+
+        (tmp_repo_dir / "A.py").write_text("print('mine')\n", encoding="utf-8")
+        (tmp_repo_dir / "sibling.py").write_text("print('not mine')\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "A.py" in output, "The unit's own Manifest file must appear in the diff"
+        assert "sibling.py" not in output, (
+            "A sibling task's untracked residue leaked into this unit's Manifest-scoped diff"
+        )
+
+    def test_get_diff_excludes_sibling_unstaged_residue(
+        self, tmp_repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-27: a unit owning only 'A.py' excludes a sibling's unstaged
+        (tracked, modified-but-uncommitted) residue."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("A.py",))
+
+        # Both files are committed first so a later edit is "unstaged", not
+        # "untracked" -- this test targets the `git diff` pathspec, not
+        # `_render_untracked_hunks`.
+        (tmp_repo_dir / "A.py").write_text("original\n", encoding="utf-8")
+        (tmp_repo_dir / "sibling.py").write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "A.py", "sibling.py"], cwd=tmp_repo_dir, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "seed A.py and sibling.py"], cwd=tmp_repo_dir, check=True, capture_output=True
+        )
+        (tmp_repo_dir / "A.py").write_text("mine, modified\n", encoding="utf-8")
+        (tmp_repo_dir / "sibling.py").write_text("sibling, modified\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "mine, modified" in output, "The unit's own unstaged change must appear in the diff"
+        assert "sibling, modified" not in output, (
+            "A sibling task's unstaged residue leaked into this unit's Manifest-scoped diff"
+        )
+
+    def test_get_diff_empty_manifest_returns_no_changes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-28: a verification-only (empty-Manifest) unit prints '(no changes)'
+        without ever issuing an unscoped whole-tree git query."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=())
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"No git query should ever run for an empty Manifest, got: {cmd}")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == "(no changes)"
+
+    def test_get_diff_malformed_manifest_fails_fast(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-29: a malformed Changes Manifest exits non-zero with the verbatim ERROR."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Test Task\n\n## Status: in-progress\n\n"
+            "## Changes Manifest\n\n| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |\n",
+            encoding="utf-8",
+        )
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR: Cannot scope diff for 'E0-F1-S1-T1': Changes Manifest is malformed:" in err
+
+
+@pytest.mark.unit
+class TestCmdGetDiffTaskCommitAttribution:
+    """FR-13 (db-247): in defer_pr mode, a post-commit ``get-diff`` attributes
+    output to this unit's OWN commit(s), resolved via
+    ``git log --grep '^<unit_id>:'`` -- never HEAD, which may belong to a
+    sibling task on the shared branch."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Task-commit attribution test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_defer_pr_post_commit_resolves_task_own_commit_not_head(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-31: with a grep resolving to SHA X and HEAD pointing at a
+        sibling's SHA Y, get-diff outputs `git show X` (Manifest-scoped),
+        never HEAD/Y."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            calls.append(cmd)
+            if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
+                return (0, "sha-x\n", "")
+            if cmd == ["git", "show", "--format=", "sha-x", "--", "owned.py"]:
+                return (0, "OWNED-COMMIT-HUNK\n", "")
+            if cmd == ["git", "show", "--format=", "HEAD"]:
+                return (0, "SIBLING-HEAD-HUNK-SHOULD-NOT-APPEAR\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "OWNED-COMMIT-HUNK" in output
+        assert "SIBLING-HEAD-HUNK-SHOULD-NOT-APPEAR" not in output
+        assert ["git", "show", "--format=", "HEAD"] not in calls, (
+            "the superseded unconditional git show HEAD fallback must never run"
+        )
+
+    def test_defer_pr_post_commit_fails_fast_when_no_task_commit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-32: zero commits match '^<id>:' -> rc=1, verbatim diagnostic,
+        and `git show HEAD` is never run (no fallback)."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            calls.append(cmd)
+            if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "backlog/shared\n", "")
+            if cmd == ["git", "show", "--format=", "HEAD"]:
+                return (0, "SHOULD-NOT-RUN\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert (
+            "ERROR: get-diff (defer_pr, post-commit): no commit found for work unit "
+            "'E0-F1-S1-T1' on branch 'backlog/shared'." in err
+        )
+        assert "no commit subject matches '^E0-F1-S1-T1:'" in err
+        assert f"Inspect with: git log --grep '^E0-F1-S1-T1:' --format='%H %s' in {repo_path}." in err
+        assert ["git", "show", "--format=", "HEAD"] not in calls, "there is no HEAD fallback"
+
+    def test_defer_pr_post_commit_emits_all_matching_commits(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A task may carry more than one of its own commits (an initial
+        commit plus a later pr_review_resolution fix commit); every
+        matching commit is emitted."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
+                return (0, "sha-fix\nsha-initial\n", "")
+            if cmd == ["git", "show", "--format=", "sha-initial", "--", "owned.py"]:
+                return (0, "INITIAL-COMMIT-HUNK\n", "")
+            if cmd == ["git", "show", "--format=", "sha-fix", "--", "owned.py"]:
+                return (0, "FIX-COMMIT-HUNK\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "INITIAL-COMMIT-HUNK" in output
+        assert "FIX-COMMIT-HUNK" in output
+
+
+@pytest.mark.unit
+class TestCmdCheckManifestScope:
+    """spec 4.C (db-296 x db-327): ``check-manifest-scope`` prints
+    out-of-Manifest staged paths and exits non-zero on mismatch. Read-only,
+    deterministic, no LLM judgement -- the changes-manifest judge's
+    re-grounded signal (FR-11-A2)."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="check-manifest-scope test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_check_manifest_scope_reports_out_of_manifest_staged(
+        self, tmp_repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-30: a staged file NOT in the Manifest is reported and exits non-zero."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+
+        (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
+        (tmp_repo_dir / "unowned.py").write_text("not mine\n", encoding="utf-8")
+        subprocess.run(["git", "add", "owned.py", "unowned.py"], cwd=tmp_repo_dir, check=True, capture_output=True)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+        ):
+            result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "unowned.py" in err
+
+    def test_check_manifest_scope_passes_when_staged_set_within_manifest(
+        self, tmp_repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The staged set matching the Manifest exactly exits zero."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+
+        (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
+        subprocess.run(["git", "add", "owned.py"], cwd=tmp_repo_dir, check=True, capture_output=True)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+        ):
+            result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
+
+        assert result == 0
+        assert "within the Changes Manifest" in capsys.readouterr().out
+
+    def test_check_manifest_scope_malformed_manifest_fails_fast(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Same verbatim malformed-Manifest ERROR as get-diff (spec 4.C)."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-progress\n\n"
+            "## Changes Manifest\n\n| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |\n",
+            encoding="utf-8",
+        )
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+        ):
+            result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR: Cannot scope diff for 'E0-F1-S1-T1': Changes Manifest is malformed:" in err
+
+    def test_check_manifest_scope_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Same unit-not-found contract as get-diff."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_manifest_scope("NONEXISTENT")
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.unit
+class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
+    """FR-11 Leg A2 (db-327 x db-296): the changes-manifest judge is
+    re-grounded on the deterministic ``check-manifest-scope`` signal, now
+    that ``get-diff`` no longer surfaces a staged-but-unmanifested file
+    (Manifest-scoped per FR-12)."""
+
+    _PROMPT_PATH = (
+        Path(__file__).parent.parent
+        / "plugin"
+        / "devbench-orchestrate"
+        / "agents"
+        / "review_team"
+        / "changes-manifest.md"
+    )
+
+    def test_changes_manifest_prompt_auto_fails_on_staged_manifest_mismatch(self) -> None:
+        content = self._PROMPT_PATH.read_text(encoding="utf-8")
+        assert "check-manifest-scope" in content, (
+            "changes-manifest.md must invoke the deterministic check-manifest-scope verb (spec 4.C)."
+        )
+        assert "automatic REVIEW_FAIL" in content, (
+            "changes-manifest.md must state that a staged file outside the Manifest is an "
+            "automatic REVIEW_FAIL, never a judged PASS."
+        )
+        assert (
+            "MANIFEST_MISMATCH: staged file <path> is not in the Changes Manifest; this is an "
+            "automatic REVIEW_FAIL. Amend the Manifest (request-amendment) or unstage the file."
+        ) in content, "changes-manifest.md must carry the exact FR-11 MANIFEST_MISMATCH vocabulary."
+
+    def test_get_diff_and_check_manifest_scope_co_land_proof(
+        self, tmp_repo_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A sibling's out-of-Manifest untracked file never surfaces in
+        get-diff, while a THIS-unit staged-but-unmanifested path still trips
+        check-manifest-scope -- proving the judge is never blinded to scope
+        creep now that get-diff is Manifest-scoped (Section 9 constraint 6)."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Co-land proof",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+
+        # Sibling residue: untracked, never staged by this unit.
+        (tmp_repo_dir / "sibling.py").write_text("not mine\n", encoding="utf-8")
+        # This unit's own out-of-Manifest staged file.
+        (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
+        (tmp_repo_dir / "unmanifested.py").write_text("staged but not declared\n", encoding="utf-8")
+        subprocess.run(["git", "add", "owned.py", "unmanifested.py"], cwd=tmp_repo_dir, check=True, capture_output=True)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+        ):
+            diff_rc = cli.cmd_get_diff("E0-F1-S1-T1")
+            diff_output = capsys.readouterr().out
+            scope_rc = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
+            scope_err = capsys.readouterr().err
+
+        assert diff_rc == 0
+        assert "sibling.py" not in diff_output, "sibling residue leaked into the Manifest-scoped diff"
+        assert "unmanifested.py" not in diff_output, (
+            "this unit's own out-of-Manifest staged file leaked into the Manifest-scoped diff"
+        )
+        assert scope_rc == 1, "check-manifest-scope must trip on the unmanifested staged file"
+        assert "unmanifested.py" in scope_err
+
+
 class TestCmdGetDiffModeAware:
-    """Tests for ADR-12 mode-aware cmd_get_diff behaviour.
+    """Tests for ADR-12 mode-aware cmd_get_diff behaviour, updated for the
+    Manifest-scoped pathspec (db-296/FR-12) and task-commit attribution
+    (db-247/FR-13, ADR-12 superseded in place).
 
     The non-defer_pr mode is pinned against behavioural regression so that
-    the default per-task-branch workflow keeps working byte-identically.
-    The defer_pr-mode tests assert that the branch-vs-default hunk is
-    never emitted and that the post-commit state uses `git show HEAD`.
+    the default per-task-branch workflow keeps working (modulo the new
+    Manifest pathspec suffix on every git query). The defer_pr-mode tests
+    assert that the branch-vs-default hunk is never emitted and that the
+    post-commit state resolves this unit's OWN commit(s) via
+    ``git log --grep '^<unit_id>:'`` rather than trusting HEAD.
     """
 
     def _make_unit(self) -> WorkUnit:
@@ -6041,20 +6513,22 @@ class TestCmdGetDiffModeAware:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Back-compat pin: with defer_pr False, all four hunks (staged,
-        unstaged, branch-vs-default, untracked) appear in output."""
+        unstaged, branch-vs-default, untracked) appear in output, each
+        scoped to the Manifest pathspec."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py", "untracked.py"))
         (repo_path / "untracked.py").write_text("x = 1\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "diff", "--cached"]:
+            if cmd == ["git", "diff", "--cached", "--", "owned.py", "untracked.py"]:
                 return (0, "STAGED-HUNK\n", "")
-            if cmd == ["git", "diff"]:
+            if cmd == ["git", "diff", "--", "owned.py", "untracked.py"]:
                 return (0, "UNSTAGED-HUNK\n", "")
-            if cmd == ["git", "diff", "origin/main"]:
+            if cmd == ["git", "diff", "origin/main", "--", "owned.py", "untracked.py"]:
                 return (0, "BRANCH-VS-MAIN-HUNK\n", "")
             if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
                 return (0, "untracked.py\n", "")
@@ -6062,6 +6536,7 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6086,16 +6561,18 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "diff", "--cached"]:
+            if cmd == ["git", "diff", "--cached", "--", "owned.py"]:
                 return (0, "STAGED-HUNK\n", "")
-            if cmd == ["git", "diff", "origin/main"]:
+            if cmd == ["git", "diff", "origin/main", "--", "owned.py"]:
                 return (0, "BRANCH-VS-MAIN-SHOULD-NOT-APPEAR\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6112,24 +6589,27 @@ class TestCmdGetDiffModeAware:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Pre-commit: staged and unstaged are both present; both appear;
-        git show HEAD is not called because parts is already non-empty."""
+        the post-commit task-commit resolution never runs because parts is
+        already non-empty."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             calls.append(cmd)
-            if cmd == ["git", "diff", "--cached"]:
+            if cmd == ["git", "diff", "--cached", "--", "owned.py"]:
                 return (0, "STAGED-HUNK\n", "")
-            if cmd == ["git", "diff"]:
+            if cmd == ["git", "diff", "--", "owned.py"]:
                 return (0, "UNSTAGED-HUNK\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6141,28 +6621,43 @@ class TestCmdGetDiffModeAware:
         output = capsys.readouterr().out
         assert "STAGED-HUNK" in output
         assert "UNSTAGED-HUNK" in output
+        assert not any(c[:2] == ["git", "log"] for c in calls), (
+            "task-commit resolution should only run when staged/unstaged are empty"
+        )
         assert ["git", "show", "--format=", "HEAD"] not in calls, (
-            "git show HEAD should only be called when staged/unstaged are empty"
+            "the superseded unconditional git show HEAD substitution must never run"
         )
 
     def test_defer_pr_mode_post_commit_returns_git_show_head(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Post-commit: staged and unstaged are empty; git show HEAD is
-        emitted so the post-commit security review sees this task's commit."""
+        """Post-commit: staged and unstaged are empty; this unit's own
+        commit is resolved via `git log --grep '^<id>:'` (not HEAD) and its
+        Manifest-scoped `git show` output is emitted so the post-commit
+        security review still sees this task's commit (db-247, FR-13)."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        # Regression fixture update (db-247): the file(s) `git show` would
+        # emit now MUST be in the Manifest, since the show is pathspec-scoped.
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            calls.append(cmd)
+            if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
+                return (0, "task-sha\n", "")
+            if cmd == ["git", "show", "--format=", "task-sha", "--", "owned.py"]:
+                return (0, "GIT-SHOW-TASK-COMMIT-HUNK\n", "")
             if cmd == ["git", "show", "--format=", "HEAD"]:
-                return (0, "GIT-SHOW-HEAD-HUNK\n", "")
+                return (0, "SHOULD-NOT-APPEAR-HEAD-HUNK\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6172,7 +6667,11 @@ class TestCmdGetDiffModeAware:
 
         assert result == 0
         output = capsys.readouterr().out
-        assert "GIT-SHOW-HEAD-HUNK" in output
+        assert "GIT-SHOW-TASK-COMMIT-HUNK" in output
+        assert "SHOULD-NOT-APPEAR-HEAD-HUNK" not in output
+        assert ["git", "show", "--format=", "HEAD"] not in calls, (
+            "the superseded unconditional git show HEAD substitution must never run"
+        )
 
     def test_defer_pr_mode_with_accumulated_prior_commits_scopes_correctly(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -6185,18 +6684,20 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("current.py",))
         current_staged = "diff --git a/current.py b/current.py\n+new line\n"
         accumulated_branch = "".join(f"diff --git a/prior-{i}.py b/prior-{i}.py\n+prior line {i}\n" for i in range(10))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "diff", "--cached"]:
+            if cmd == ["git", "diff", "--cached", "--", "current.py"]:
                 return (0, current_staged, "")
-            if cmd == ["git", "diff", "origin/main"]:
+            if cmd == ["git", "diff", "origin/main", "--", "current.py"]:
                 return (0, accumulated_branch, "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6215,21 +6716,29 @@ class TestCmdGetDiffModeAware:
     def test_defer_pr_mode_untracked_files_still_rendered(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Untracked hunks are rendered in BOTH modes."""
+        """Untracked hunks IN the Manifest are rendered in BOTH modes."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("brand_new.py",))
         (repo_path / "brand_new.py").write_text("print('hi')\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
                 return (0, "brand_new.py\n", "")
+            # This unit's own commit exists but its Manifest-scoped diff is
+            # empty (e.g. a no-op commit) -- proves parts stays empty going
+            # into the untracked-hunk step rather than raising the no-commit
+            # fail-fast diagnostic.
+            if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
+                return (0, "task-sha\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
@@ -6245,19 +6754,26 @@ class TestCmdGetDiffModeAware:
     def test_defer_pr_mode_returns_no_changes_when_all_states_empty(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """When staged, unstaged, HEAD, and untracked are all empty, the
-        '(no changes)' sentinel is emitted as before."""
+        """When staged, unstaged, this unit's own commit diff, and untracked
+        are all empty, the '(no changes)' sentinel is emitted as before."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
 
-        def fake_run_command(_cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            # This unit's own commit exists (so the fail-fast no-commit
+            # diagnostic does not fire) but its Manifest-scoped diff is
+            # empty.
+            if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
+                return (0, "task-sha\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),

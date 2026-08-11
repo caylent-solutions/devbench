@@ -37,6 +37,7 @@ import itertools
 import logging
 import re
 from collections import deque
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -705,6 +706,16 @@ class BacklogManager:
             the closing commit hash or task id somewhere in that reason; an
             uncited already-satisfied decline is an unfalsifiable claim and is
             rejected.
+        24. Dependency cycle detection (FR-1) unions three edge channels that all
+            encode the same directed ``blocked_id -> blocker_id`` edge: the index
+            ``Dependencies`` column, each non-terminal Task's ``## Dependencies``
+            table, and its ``[BLOCKED_PENDING_PROPOSAL]`` markers. Terminal
+            (``done`` / ``declined``) Tasks contribute no table/marker edge, so a
+            stale marker on a closed Task cannot resurrect a historical cycle.
+        25. Dangling ``[BLOCKED_PENDING_PROPOSAL]`` markers (FR-7): a non-terminal
+            Task's marker referencing a WU-ID absent from the index is an error,
+            surfaced here instead of silently surviving until ``reconcile-cascade``
+            trips on it.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -728,7 +739,8 @@ class BacklogManager:
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
-        self._check_dep_cycles(backlog_index, errors)
+        self._check_dep_cycles(backlog_index, rows, workspace_root, errors)
+        self._check_dangling_markers(rows, workspace_root, known_ids, errors)
         self._check_status_summary(backlog_index, rows, errors)
         if fix:
             fix_count, fix_files = self._apply_fixes(rows, workspace_root)
@@ -1125,14 +1137,31 @@ class BacklogManager:
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
                     errors.append(f"{row_id}: dependency '{dep_id}' not found in backlog index")
 
-    def _check_dep_cycles(self, backlog_index: Path, errors: list[str]) -> None:
-        """Issue #151: detect dependency cycles via DFS-with-recursion-stack.
+    def _check_dep_cycles(
+        self,
+        backlog_index: Path,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Issue #151 / FR-1 (db-253 Gap 1, db-299 Defect 2): detect dependency
+        cycles via DFS-with-recursion-stack, over the UNION of every edge
+        channel the orchestrator honors.
 
-        Walks the dep graph derived from the Full Work Unit Index. A cycle
-        exists when, during DFS, we encounter a node that is currently in
-        the recursion stack (the "gray" set). Self-edges and chains of any
-        length (4-node, N-node) are detected because the recursion-stack
-        membership check is the unique cycle witness.
+        The dependency/ownership graph is written to three channels: the index
+        ``Dependencies`` column, each Task's own ``## Dependencies`` table, and
+        its ``[BLOCKED_PENDING_PROPOSAL]`` markers. All three encode the same
+        directed edge ``blocked_id -> blocker_id``, so unioning them cannot
+        invent a false edge -- it can only surface a cycle the index-only view
+        was blind to. See :meth:`_extend_dependency_graph_with_wu_edges` for the
+        table/marker union; terminal (``done`` / ``declined``) Tasks contribute
+        no table/marker edge there.
+
+        Walks the resulting graph via DFS. A cycle exists when, during DFS, we
+        encounter a node that is currently in the recursion stack (the "gray"
+        set). Self-edges and chains of any length (4-node, N-node) are
+        detected because the recursion-stack membership check is the unique
+        cycle witness.
 
         Reports one error per cycle, naming the participating node IDs in
         traversal order so the operator can spot the offending chain. Cycle
@@ -1141,6 +1170,7 @@ class BacklogManager:
         encounters it from multiple roots.
         """
         graph = self._build_dependency_graph(backlog_index)
+        self._extend_dependency_graph_with_wu_edges(graph, rows, workspace_root)
         if not graph:
             return
 
@@ -1217,6 +1247,118 @@ class BacklogManager:
                 deps.append(dep_id)
             graph[row_id] = deps
         return graph
+
+    def _iter_non_terminal_task_files(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> Iterator[tuple[str, Path]]:
+        """Yield ``(row_id, wu_path)`` for every real, non-terminal, on-disk Task row.
+
+        Shared eligibility filter reused by :meth:`_extend_dependency_graph_with_wu_edges`
+        (FR-1) and :meth:`_check_dangling_markers` (FR-7): both read a Task's own
+        ``## Dependencies`` table / ``[BLOCKED_PENDING_PROPOSAL]`` markers only
+        when the row is a genuine Task ID with a resolvable file, and only when
+        the Task is non-terminal (``done`` / ``declined`` Tasks are closed and
+        must not contribute stale edges or resurrect stale marker complaints).
+
+        Args:
+            rows: ``(row_id, status, file_path)`` tuples from
+                :meth:`_parse_backlog_rows`.
+            workspace_root: Workspace root used to resolve ``file_path``.
+
+        Yields:
+            ``(row_id, wu_path)`` pairs for eligible rows, in ``rows`` order.
+        """
+        for row_id, status, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not self._is_task_id(row_id) or not file_path:
+                continue
+            if status in _TERMINAL_CHILD_STATUSES:
+                continue
+            wu_path = workspace_root / file_path
+            if not wu_path.exists():
+                continue
+            yield row_id, wu_path
+
+    def _extend_dependency_graph_with_wu_edges(
+        self,
+        graph: dict[str, list[str]],
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> None:
+        """FR-1: union in each non-terminal Task's ``## Dependencies`` table
+        and ``[BLOCKED_PENDING_PROPOSAL]`` marker edges, in place.
+
+        The index ``Dependencies`` column (seeded by :meth:`_build_dependency_graph`)
+        is only one of three channels the orchestrator honors as a
+        ``blocked_id -> blocker_id`` edge; the other two are each non-terminal
+        Task's own ``## Dependencies`` table (:meth:`_extract_dep_ids`) and its
+        ``[BLOCKED_PENDING_PROPOSAL]`` markers (:meth:`_extract_pending_proposal_markers`).
+        Every channel encodes the same edge direction, so the union cannot
+        invent a cycle that none of the three channels individually encodes.
+
+        Terminal (``done`` / ``declined``) Tasks are skipped (see
+        :meth:`_iter_non_terminal_task_files`): a closed Task cannot deadlock
+        the orchestrator, and reading its table/markers would risk
+        resurrecting a historical cycle from a stale marker that was never
+        cleaned up after the Task closed.
+
+        Args:
+            graph: The ``{id: [dep_id, ...]}`` adjacency map, seeded from the
+                index and mutated in place with the additional edges.
+            rows: ``(row_id, status, file_path)`` tuples from
+                :meth:`_parse_backlog_rows`.
+            workspace_root: Workspace root used to resolve ``file_path``.
+        """
+        for row_id, wu_path in self._iter_non_terminal_task_files(rows, workspace_root):
+            content = wu_path.read_text(encoding="utf-8")
+            extra_deps = self._extract_dep_ids(content) | self._extract_pending_proposal_markers(wu_path)
+            if not extra_deps:
+                continue
+            existing = graph.setdefault(row_id, [])
+            for dep_id in sorted(extra_deps):
+                if dep_id not in existing:
+                    existing.append(dep_id)
+
+    def _check_dangling_markers(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        known_ids: set[str],
+        errors: list[str],
+    ) -> None:
+        """FR-7 (db-253 Gap 2b): a well-formed marker must reference a known WU-ID.
+
+        A ``[BLOCKED_PENDING_PROPOSAL]`` marker pointing at a WU-ID absent from
+        the index previously survived :meth:`validate` silently and only
+        tripped ``reconcile-cascade`` later, when the cascade tried (and
+        failed) to resolve the reference. This check surfaces the same
+        condition at validate time so the operator can fix it before it blocks
+        the cascade.
+
+        Terminal (``done`` / ``declined``) Tasks are skipped (see
+        :meth:`_iter_non_terminal_task_files`). A missing work-unit file
+        contributes no error here -- it is already reported by
+        :meth:`_check_files_and_statuses`.
+
+        Args:
+            rows: ``(row_id, status, file_path)`` tuples from
+                :meth:`_parse_backlog_rows`.
+            workspace_root: Workspace root used to resolve ``file_path``.
+            known_ids: Every row ID present in the backlog index.
+            errors: Error accumulator; a verbatim ERROR string is appended per
+                dangling marker.
+        """
+        for row_id, wu_path in self._iter_non_terminal_task_files(rows, workspace_root):
+            for marker_id in sorted(self._extract_pending_proposal_markers(wu_path)):
+                if marker_id not in known_ids:
+                    errors.append(
+                        f"work unit {row_id}: [BLOCKED_PENDING_PROPOSAL] marker references "
+                        f"unknown task '{marker_id}' -- the referenced task is not in the "
+                        f"index; remove the marker or fix the reference (blocks reconcile-cascade)."
+                    )
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.
@@ -2514,6 +2656,14 @@ class BacklogManager:
         canonical contract -- any DAG that totally orders the set (a clean
         N-1 chain, a branching DAG that merges, full N*(N-1)/2 pairwise
         edges) is accepted (issue #145).
+
+        FR-5 (db-311): the BFS traverses through EVERY child, including
+        non-claimant intermediates that are not themselves in ``ids`` --
+        ``deps`` (``deps_by_task``) already holds every task row's edges, so
+        the data is present. ``id_set`` is only applied at the end, via
+        ``seen & id_set``, so a correctly-ordered chain through a non-claimant
+        (``C -> B(non-claimant) -> A``) is no longer mis-scored as unordered.
+        ``seen`` still guards cycles so the traversal always terminates.
         """
         if len(ids) < 2:
             return True
@@ -2525,11 +2675,11 @@ class BacklogManager:
             while queue:
                 node = queue.popleft()
                 for child in deps.get(node, set()):
-                    if child not in id_set or child in seen:
+                    if child in seen:
                         continue
                     seen.add(child)
                     queue.append(child)
-            return seen
+            return seen & id_set
 
         reach = {tid: reachable(tid) for tid in ids}
         for i, a in enumerate(ids):

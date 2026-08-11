@@ -3349,6 +3349,12 @@ class TestTasksFormDepChainEdgeCases:
     def test_empty_id_list_is_trivially_a_chain(self) -> None:
         assert BacklogManager._tasks_form_dep_chain([], {}) is True
 
+    def test_chain_through_non_claimant_intermediate(self) -> None:
+        """FR-5 (db-311): C -> B(non-claimant) -> A is a chain even though B
+        is not itself one of the claimant ids being compared.
+        """
+        assert BacklogManager._tasks_form_dep_chain(["A", "C"], {"C": {"B"}, "B": {"A"}}) is True
+
 
 class TestSourceTestPairsDefensiveStemGuard:
     """Cover the `if not source_stem: continue` guard in `_check_source_test_pairs`.
@@ -5568,6 +5574,20 @@ class TestValidateDepCycle4Node:
         )
         return index
 
+    @staticmethod
+    def _run_check(manager: BacklogManager, index: Path, tmp_path: Path) -> list[str]:
+        """FR-1: `_check_dep_cycles` now takes `rows` + `workspace_root` too.
+
+        The fixture work-unit files here carry no `## Dependencies` table and
+        no `## Comments` section, so `rows`/`workspace_root` contribute zero
+        extra edges -- these regression cases stay pinned to index-only
+        behavior while exercising the new signature.
+        """
+        errors: list[str] = []
+        rows = manager._parse_backlog_rows(index)
+        manager._check_dep_cycles(index, rows, tmp_path, errors)
+        return errors
+
     def test_4_node_cycle_rejected(self, tmp_path: Path) -> None:
         index = self._index_with_deps(
             tmp_path,
@@ -5578,8 +5598,7 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T4": "E0-F1-S1-T3",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert any("cycle" in e for e in errors)
 
     def test_5_node_cycle_rejected(self, tmp_path: Path) -> None:
@@ -5593,8 +5612,7 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T5": "E0-F1-S1-T4",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert any("cycle" in e for e in errors)
 
     def test_4_node_dag_accepted(self, tmp_path: Path) -> None:
@@ -5608,15 +5626,13 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T4": "E0-F1-S1-T3",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert errors == []
 
     def test_self_dep_reported(self, tmp_path: Path) -> None:
         """A 1-node cycle (self-dep) is also caught."""
         index = self._index_with_deps(tmp_path, {"E0-F1-S1-T1": "E0-F1-S1-T1"})
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert any("cycle" in e for e in errors)
 
     def test_disjoint_cycle_reported_once(self, tmp_path: Path) -> None:
@@ -5630,15 +5646,14 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T4": "E0-F1-S1-T3",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         cycle_errors = [e for e in errors if "cycle" in e]
         assert len(cycle_errors) == 2
 
     def test_missing_index_no_crash(self, tmp_path: Path) -> None:
         """The cycle check on a missing BACKLOG.md returns silently."""
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", errors)
+        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", [], tmp_path, errors)
         assert errors == []
 
     def test_summary_row_skipped_when_cell_count_mismatches(self, tmp_path: Path) -> None:
@@ -5658,6 +5673,196 @@ class TestValidateDepCycle4Node:
         graph = BacklogManager()._build_dependency_graph(index)
         assert "E0-F1-S1-T1" in graph
         assert "short" not in graph
+
+
+class TestCheckDepCyclesUnionOfChannels:
+    """FR-1 (db-253 Gap 1, db-299 Defect 2): `_check_dep_cycles` unions the
+    index `Dependencies` column with each non-terminal Task's own
+    `## Dependencies` table and `[BLOCKED_PENDING_PROPOSAL]` markers. Before
+    the fix, `validate()` was blind to a cycle that existed only in the
+    table/marker channels because the index cells stayed `none`.
+    """
+
+    def test_marker_only_cycle_detected(self, tmp_path: Path) -> None:
+        """Two non-terminal tasks with MUTUAL markers and index cells 'none'."""
+        marker_to_t2 = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        marker_to_t1 = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T1\n"
+        t1 = _unit_body("E0-F1-S1-T1", "in-queue", comments=marker_to_t2)
+        t2 = _unit_body("E0-F1-S1-T2", "in-queue", comments=marker_to_t1)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "in-queue"), ("E0-F1-S1-T2", "T2", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert any("dependency cycle detected" in e for e in errors), errors
+
+    def test_work_unit_table_cycle_detected(self, tmp_path: Path) -> None:
+        """Two non-terminal tasks with MUTUAL `## Dependencies` table rows and
+        index cells 'none'.
+        """
+        t1 = _unit_body("E0-F1-S1-T1", "in-queue", deps=["E0-F1-S1-T2"])
+        t2 = _unit_body("E0-F1-S1-T2", "in-queue", deps=["E0-F1-S1-T1"])
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "in-queue"), ("E0-F1-S1-T2", "T2", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert any("dependency cycle detected" in e for e in errors), errors
+
+    def test_add_dep_x2_makes_validate_report_cycle(self, tmp_path: Path) -> None:
+        """AC-3: `add_dep(T1,T4)` then `add_dep(T4,T1)` makes `validate()`
+        report a cycle end-to-end, because the union reads the
+        `## Dependencies` tables and markers that `add_dep` writes.
+        """
+        from devbench.backlog.proposal import add_dep
+
+        t1 = _unit_body("E0-F1-S1-T1", "in-queue")
+        t4 = _unit_body("E0-F1-S1-T4", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "in-queue"), ("E0-F1-S1-T4", "T4", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T4": t4},
+        )
+        add_dep(
+            backlog_root=tmp_path / "backlog",
+            backlog_index=index,
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T4",
+        )
+        add_dep(
+            backlog_root=tmp_path / "backlog",
+            backlog_index=index,
+            blocked_task_id="E0-F1-S1-T4",
+            blocker_task_id="E0-F1-S1-T1",
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert any("dependency cycle detected" in e for e in errors), errors
+
+    def test_terminal_unit_stale_marker_not_a_cycle(self, tmp_path: Path) -> None:
+        """AC-4: a done/declined task's stale marker contributes no edge, so
+        it cannot resurrect a historical cycle even though the OTHER side of
+        the pair is a live, non-terminal marker edge.
+        """
+        stale_marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        live_marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T1\n"
+        t1 = _unit_body("E0-F1-S1-T1", "declined", comments=stale_marker)
+        t2 = _unit_body("E0-F1-S1-T2", "blocked", comments=live_marker)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "declined"), ("E0-F1-S1-T2", "T2", "blocked")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("dependency cycle detected" in e for e in errors), errors
+
+
+class TestValidateManifestConflictsThroughNonClaimant:
+    """FR-5 (db-311): `_tasks_form_dep_chain` traverses through a non-claimant
+    intermediate so a correctly-ordered chain is not a false Manifest
+    conflict, while genuinely unordered claimants (even considering
+    non-claimants) still conflict.
+    """
+
+    H = _ValidateRuleHarness
+    REPO = "ex/foo"
+
+    def test_chain_through_non_claimant_intermediate_no_conflict(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """T_b -> T_x(non-claimant) -> T_a resolves the ownership conflict
+        even though T_x never appears in the ownership map for the shared
+        path (db-311): T_x's Manifest claims a different file.
+        """
+        self.H.make_task(backlog_dir, "E7-F1-S1-T1", self.REPO, "| `pyproject.toml` | edit |\n")  # T_a
+        self.H.make_task(
+            backlog_dir,
+            "E7-F1-S1-T2",  # T_x, non-claimant intermediate
+            self.REPO,
+            "| `other.yaml` | edit |\n",
+            deps_rows="| E7-F1-S1-T1 | dep | proposed |",
+        )
+        self.H.make_task(
+            backlog_dir,
+            "E7-F1-S1-T3",  # T_b
+            self.REPO,
+            "| `pyproject.toml` | edit |\n",
+            deps_rows="| E7-F1-S1-T2 | dep | proposed |",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| E7-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/E7-F1-S1-T1.md` |\n"
+            "| E7-F1-S1-T2 | T2 | Task | in-queue | E7-F1-S1-T1 | ex/foo | `backlog/E7-F1-S1-T2.md` |\n"
+            "| E7-F1-S1-T3 | T3 | Task | in-queue | E7-F1-S1-T2 | ex/foo | `backlog/E7-F1-S1-T3.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_genuinely_unordered_claimants_still_conflict(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-13: two claimants with no path even through non-claimants still
+        conflict; a bystander non-claimant task (unrelated dep-free) must not
+        change the verdict.
+        """
+        self.H.make_task(backlog_dir, "E8-F1-S1-T1", self.REPO, "| `pyproject.toml` | edit |\n")
+        self.H.make_task(backlog_dir, "E8-F1-S1-T2", self.REPO, "| `pyproject.toml` | edit |\n")
+        self.H.make_task(backlog_dir, "E8-F1-S1-T3", self.REPO, "| `other.yaml` | edit |\n")
+        self.H.make_index(
+            tmp_path,
+            "| E8-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/E8-F1-S1-T1.md` |\n"
+            "| E8-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/E8-F1-S1-T2.md` |\n"
+            "| E8-F1-S1-T3 | T3 | Task | in-queue | none | ex/foo | `backlog/E8-F1-S1-T3.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        conflict = [e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e]
+        assert len(conflict) == 1
+
+
+class TestCheckDanglingMarkers:
+    """FR-7 (db-253 Gap 2b): a well-formed marker referencing a WU-ID absent
+    from the index is a `validate()` error, instead of silently surviving
+    until `reconcile-cascade` trips on it.
+    """
+
+    def test_marker_referencing_absent_id_is_error(self, tmp_path: Path) -> None:
+        marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        t1 = _unit_body("E0-F1-S1-T1", "blocked", comments=marker)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Source", "blocked")],
+            files={"E0-F1-S1-T1": t1},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        expected = (
+            "work unit E0-F1-S1-T1: [BLOCKED_PENDING_PROPOSAL] marker references "
+            "unknown task 'E0-F1-S1-T99' -- the referenced task is not in the "
+            "index; remove the marker or fix the reference (blocks reconcile-cascade)."
+        )
+        assert expected in errors
+
+    def test_marker_referencing_known_id_is_not_dangling(self, tmp_path: Path) -> None:
+        marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        t1 = _unit_body("E0-F1-S1-T1", "blocked", comments=marker)
+        t2 = _unit_body("E0-F1-S1-T2", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Source", "blocked"), ("E0-F1-S1-T2", "Target", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("marker references unknown task" in e for e in errors), errors
+
+    def test_terminal_unit_dangling_marker_not_reported(self, tmp_path: Path) -> None:
+        """A done Task's dangling marker is not reported: terminal units are
+        skipped, matching the FR-1 cycle-union gating.
+        """
+        marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        t1 = _unit_body("E0-F1-S1-T1", "done", comments=marker)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Source", "done")],
+            files={"E0-F1-S1-T1": t1},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("marker references unknown task" in e for e in errors), errors
 
 
 class TestValidateBrokenAndCanonicalBacklogFormat:

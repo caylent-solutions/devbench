@@ -1,6 +1,6 @@
 # The Changes Manifest amendment workflow
 
-This doc describes the runtime workflow (on by default; set `manifest_amendment.enabled: false` to opt out) that lets an executor update a work unit's `## Changes Manifest` during execution, when TDD GREEN exposes a production fix that was not pre-declared. For guidance on when to rely on this workflow versus pre-declaring files, see [docs/authoring-manifests.md](authoring-manifests.md).
+This doc describes the runtime workflow (on by default; set `manifest_amendment.enabled: false` to opt out) that lets an executor update a work unit's `## Changes Manifest` during execution, when TDD GREEN exposes a production fix that was not pre-declared, or when a `doc_review` REVIEW_FAIL demands an out-of-Manifest documentation sync. For guidance on when to rely on this workflow versus pre-declaring files, see [docs/authoring-manifests.md](authoring-manifests.md).
 
 ## Opt in
 
@@ -12,7 +12,13 @@ manifest_amendment:
   max_requests_per_execution: 1
   allowed_reasons:
     - tdd_green_production_fix
+    - doc_sync_review_fix
 ```
+
+Two amendment reasons are sanctioned by default:
+
+- `tdd_green_production_fix` -- a production fix that TDD GREEN exposed, not pre-declared in the Changes Manifest. Unrestricted paths.
+- `doc_sync_review_fix` (FR-11, db-327) -- an out-of-Manifest documentation sync mandated by a current-round `doc_review` REVIEW_FAIL. Restricted to documentation (`.md`) or documentation-pinning test paths only; the deterministic path guard rejects any other path with `Amendment reason 'doc_sync_review_fix' only permits documentation (.md) or documentation-pinning test paths, but these are not: <bad_paths>`.
 
 With `enabled: false` (the default, and the behavior of any backlog that has never configured this section), the workflow is inert: the executor does not emit amendment requests, the amender agent is never invoked, and the existing review pipeline runs exactly as before.
 
@@ -45,17 +51,17 @@ If the answer to any question is unclear or negative, the judge rejects. It does
 
 ### Layer 3 -- deterministic post-check + atomic rollback
 
-After the judge invokes `devbench apply-amendment`, the CLI appends the rows to the manifest, writes an audit comment, and performs the write atomically via temp-file-plus-rename. Immediately afterward the post-check runs:
+After the judge invokes `devbench apply-amendment`, the CLI captures a `baseline_errors` snapshot from `devbench validate-backlog` BEFORE writing the amended file, then appends the rows to the manifest, writes an audit comment, and performs the write atomically via temp-file-plus-rename. Immediately afterward the post-check runs, baseline-relative (FR-10, db-312):
 
-- No em-dash (U+2014) introduced in the updated work-unit file.
-- `devbench validate-backlog` still returns zero errors against the full backlog (catches BACKLOG.md drift, orphan references, status-summary count mismatches, and every other existing integrity rule).
+- No em-dash (U+2014) introduced in the updated work-unit file. This check is absolute, not baseline-relative: an amendment-introduced U+2014 always rolls back independent of `baseline_errors` (spec AC-22).
+- `devbench validate-backlog` is compared against the pre-write `baseline_errors` snapshot. Only errors the amendment itself INTRODUCED (`errors - baseline_errors`) roll back the apply. Errors that already existed before the amendment and survive unchanged (`errors & baseline_errors`) are logged as a WARNING and never silently dropped, but they do NOT block the apply -- an unrelated pre-existing backlog error cannot be used to veto an otherwise-clean amendment.
 
-If any post-check fails, the atomic rename is reversed and the work-unit file is restored to its pre-amendment content byte-for-byte. The task is left as it was before the amendment attempt, the request file is preserved so the caller (the amender agent) can log a REVIEW_FAIL verdict, and the orchestrator blocks the task.
+If either post-check fails, the atomic rename is reversed and the work-unit file is restored to its pre-amendment content byte-for-byte. The task is left as it was before the amendment attempt, the request file is preserved so the caller (the amender agent) can log a REVIEW_FAIL verdict, and the orchestrator blocks the task.
 
 ## Flow
 
-1. Executor hits TDD GREEN and discovers a production fix not in the Changes Manifest.
-2. Executor stages the fix in git and invokes `uv run devbench request-amendment <task-id>` with a JSON payload on stdin.
+1. Executor hits TDD GREEN and discovers a production fix not in the Changes Manifest, OR a current-round `doc_review` REVIEW_FAIL demands an out-of-Manifest documentation sync.
+2. Executor stages the fix (or doc sync) in git and invokes `uv run devbench request-amendment <task-id>` with a JSON payload on stdin, selecting `reason: "tdd_green_production_fix"` for a production fix or `reason: "doc_sync_review_fix"` for a `doc_review`-mandated documentation-only sync.
 3. `request-amendment` runs the Layer 1 schema checks and persists the request to `$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<task-id>.json`.
 4. The orchestrator detects the pending request file after the executor returns and invokes the `manifest-amender` agent.
 5. The agent reads the work unit, the staged diff, and the request JSON; decides `apply` or `reject`.
@@ -65,7 +71,7 @@ If any post-check fails, the atomic rename is reversed and the work-unit file is
 
 ## Amendment request JSON schema
 
-The executor writes JSON with these fields. `request-amendment` fills in `task_id` and `requested_at` so the executor only provides the semantic parts.
+The executor writes JSON with these fields. `request-amendment` fills in `task_id` and `requested_at` so the executor only provides the semantic parts. `reason` is one of the backlog's `allowed_reasons` -- by default `tdd_green_production_fix` (unrestricted paths) or `doc_sync_review_fix` (restricted to `.md` / documentation-pinning test paths; see the path guard in "The three-layer decision architecture" above).
 
 ```json
 {

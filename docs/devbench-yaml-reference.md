@@ -248,6 +248,7 @@ manifest_amendment:
   enabled: true                    # default; set false to opt out
   allowed_reasons:
     - tdd_green_production_fix
+    - doc_sync_review_fix
   max_requests_per_execution: 1
 ```
 

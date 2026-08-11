@@ -39,7 +39,7 @@ The judge / agent layer:
 | 3 | Review | `doc-reviewer` | Accuracy + sync with code |
 | 4 | Review | `changes-manifest` | Actual diff vs declared Manifest |
 | 5 | Security | `security-reviewer` | CodeQL / Dependabot / secret-scanning |
-| 6 | Amender | `manifest-amender` | Judges `tdd_green_production_fix` amendments |
+| 6 | Amender | `manifest-amender` | Judges `tdd_green_production_fix` and `doc_sync_review_fix` amendments |
 | 7 | Recovery | `blocker-resolver` | Decomposes amendment rejects into proposals |
 | 8 | Recovery | `task-factory` | Materialises draft work units from proposals |
 
@@ -82,8 +82,9 @@ Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
   |-- Pre-flight: validate-backlog    -- abort if index / files are out of sync
   |-- Parse BACKLOG.md, find next actionable work unit (topological-depth order, issue #121)
   |-- Implement work unit via TDD (RED -> GREEN -> REFACTOR)  [executor agent]
-  |     |-- Optional: manifest-amender judges a `tdd_green_production_fix`
-  |     |   amendment when the executor needs to expand the Manifest mid-cycle
+  |     |-- Optional: manifest-amender judges a `tdd_green_production_fix` or
+  |     |   `doc_sync_review_fix` amendment when the executor needs to expand
+  |     |   the Manifest mid-cycle
   |-- Run repo's task runners (make test, make validate)
   |-- Stage files, submit to judge review  [4 judges invoked directly, first-level (ADR-33)]
   |     |-- code-reviewer       -- SOLID, DRY, fail-fast, security, 12-factor
@@ -210,7 +211,7 @@ For the full annotated YAML, value-resolution precedence, and every config key, 
 - **CI-failure executor retry** (default-on; rc=2 from `git-ops` triggers an executor retry with the failing-job log as feedback under `.devbench/ci-failures/<id>-<n>.log`): toggle via `git_ops.ci_failure_retry` in `devbench.yaml` or `DEVBENCH_CI_FAILURE_RETRY_ENABLED`.
 - **PR-bot review polling** (between CI-pass and merge, polls for unresolved Copilot / Q-Dev / internal-bot comments and re-invokes the executor with structured feedback): opt in via `git_ops.pr_review_resolution.enabled: true` plus the `agents:` allowlist.
 - **Per-judge executor retry budgets** (different judges can flake at different rates; tune retries per failing judge instead of raising the global cap): set `max_executor_retries_per_judge:` map in `devbench.yaml`. Each entry falls back to `max_executor_retries` when absent.
-- **Manifest amendments** (executors can request a `tdd_green_production_fix` to expand their Changes Manifest mid-cycle when TDD GREEN reveals required production fixes; the manifest-amender judges scope, approach-coherence, and standards): toggle via `manifest_amendment.enabled`. See [docs/manifest-amendments.md](docs/manifest-amendments.md) and [ADR-02](docs/adr/02-manifest-amendment-workflow.md).
+- **Manifest amendments** (executors can request a `tdd_green_production_fix` to expand their Changes Manifest mid-cycle when TDD GREEN reveals required production fixes, or a `doc_sync_review_fix` when a `doc_review` REVIEW_FAIL mandates an out-of-Manifest documentation sync; the manifest-amender judges scope, approach-coherence, and standards): toggle via `manifest_amendment.enabled`. See [docs/manifest-amendments.md](docs/manifest-amendments.md) and [ADR-02](docs/adr/02-manifest-amendment-workflow.md).
 - **Task-factory loop** (after manifest-amendment rejects, blocker-resolver decomposes the rejection and task-factory materialises draft work units the source task can depend on): toggle via `task_factory.enabled` and `task_factory.auto_accept_proposals`. See [docs/task-factory.md](docs/task-factory.md) and [ADR-03](docs/adr/03-task-factory.md).
 - **Draft status default** (control whether newly created work units land in `draft` or `in-queue`; `draft` requires explicit `devbench promote` before the orchestrator can claim the task): set `backlog.default_status_for_new_work_units` in `devbench.yaml`. Default `in-queue` preserves backwards compatibility. See [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md).
 - **HOLD lifecycle** (`devbench hold <id>` / `devbench unhold <id>`): tasks deliberately deferred without breaking dep-chain math.

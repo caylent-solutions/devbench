@@ -476,13 +476,16 @@ class AmendmentConfig:
             Default ``True`` -- set ``false`` to opt out.
         allowed_reasons: Set of amendment reasons this backlog accepts.
             Requests whose reason is not in this set are rejected by the
-            pre-filter.
+            pre-filter. Default ``{"tdd_green_production_fix",
+            "doc_sync_review_fix"}`` (db-327 Leg A1).
         max_requests_per_execution: Upper bound on amendments applied to a
             single task during one executor run; prevents amendment loops.
     """
 
     enabled: bool = True
-    allowed_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"tdd_green_production_fix"}))
+    allowed_reasons: frozenset[str] = field(
+        default_factory=lambda: frozenset({"tdd_green_production_fix", "doc_sync_review_fix"})
+    )
     max_requests_per_execution: int = 1
 
 

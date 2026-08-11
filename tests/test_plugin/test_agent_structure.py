@@ -1239,3 +1239,50 @@ class TestSkillRoutesJudgeEvidenceInputs:
             "SKILL.md must state that a judge unable to evaluate REVIEW_FAILs with the cause, never a pass-by-default."
         )
         assert "pass-by-default" in content
+
+
+@pytest.mark.unit
+class TestExecutorDocSyncAmendmentBranch:
+    """FR-11 Leg A3: executor.md's Resolution protocol names the
+    ``doc_sync_review_fix`` amendment path for a ``doc_review``-mandated
+    out-of-Manifest documentation fix.
+    """
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_prompt_has_doc_sync_amendment_branch(self) -> None:
+        content = self._EXECUTOR_PATH.read_text(encoding="utf-8")
+        assert "doc_sync_review_fix" in content, (
+            "executor.md must name the 'doc_sync_review_fix' amendment reason in its "
+            "Resolution protocol so a doc_review-mandated out-of-Manifest fix has a sanctioned path."
+        )
+        assert "request-amendment" in content, (
+            "executor.md's doc_sync_review_fix branch must instruct the agent to run request-amendment."
+        )
+        assert "doc_review" in content, (
+            "executor.md's doc_sync_review_fix branch must cite the doc_review REVIEW_FAIL as the trigger."
+        )
+
+
+@pytest.mark.unit
+class TestManifestAmenderDocSyncBranch:
+    """FR-11 Leg A3: manifest-amender.md authorizes ``doc_sync_review_fix``
+    only when a current-round ``doc_review`` REVIEW_FAIL record for the task
+    exists under ``.devbench/review-failures/``.
+    """
+
+    _AMENDER_PATH = AGENTS_DIR / "manifest-amender.md"
+
+    def test_manifest_amender_prompt_has_doc_sync_branch(self) -> None:
+        content = self._AMENDER_PATH.read_text(encoding="utf-8")
+        assert "doc_sync_review_fix" in content, (
+            "manifest-amender.md must name 'doc_sync_review_fix' so the amender knows how to authorize it."
+        )
+        assert "doc_review" in content, (
+            "manifest-amender.md's doc_sync_review_fix branch must require a current-round "
+            "doc_review REVIEW_FAIL record."
+        )
+        assert ".devbench/review-failures/" in content, (
+            "manifest-amender.md's doc_sync_review_fix branch must name the review-failures "
+            "directory it checks for the authorizing record."
+        )

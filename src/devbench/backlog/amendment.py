@@ -15,10 +15,19 @@ judge approved.
 Layer 3 post-checks (all deterministic):
 
 - Updated Changes Manifest re-parses cleanly.
-- No em-dash (U+2014) introduced anywhere in the updated work-unit file.
-- ``BacklogManager.validate`` still returns zero errors against the full
-  backlog (this catches BACKLOG.md / file status drift, orphan references,
-  status-summary counts, and every other existing integrity rule).
+- No em-dash (U+2014) introduced anywhere in the updated work-unit file
+  (absolute -- rolls back independent of baseline; spec AC-22).
+- ``BacklogManager.validate`` is baseline-relative (FR-10, db-312): only
+  errors the amendment itself introduces trigger a rollback; pre-existing
+  errors the amendment did not cause are logged as a warning and never
+  block the apply (this still catches BACKLOG.md / file status drift,
+  orphan references, status-summary counts, and every other existing
+  integrity rule the amendment is responsible for).
+
+Two amendment reasons are sanctioned (``ALLOWED_AMENDMENT_REASONS``):
+``tdd_green_production_fix`` (unrestricted paths) and
+``doc_sync_review_fix`` (FR-11, db-327 -- restricted to documentation or
+documentation-pinning test paths via ``_check_reason_path_guard``).
 
 Pre-filter checks (schema, task state, file-in-diff, etc.) live in
 ``cmd_request_amendment`` in the CLI layer and in ``apply_amendment`` /
@@ -30,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,11 +73,32 @@ REJECTED_REQUESTS_DIR_NAME = ".devbench/rejected-requests"
 # REVIEW_FAILURES_DIR_NAME.
 AMENDER_REJECTIONS_DIR_NAME = ".devbench/amender-rejections"
 REVIEW_FAILURES_DIR_NAME = ".devbench/review-failures"
-ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset({"tdd_green_production_fix"})
+# db-327 Leg A1: a second, default-enabled amendment reason for a
+# doc_review-mandated out-of-Manifest documentation fix. Unlike
+# ``tdd_green_production_fix`` (unrestricted), this reason is path-guarded --
+# see ``_REASON_PATH_CLASSIFIERS`` / ``_check_reason_path_guard`` below.
+DOC_SYNC_REVIEW_FIX_REASON = "doc_sync_review_fix"
+ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset({"tdd_green_production_fix", DOC_SYNC_REVIEW_FIX_REASON})
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
 AMENDER_AGENT_ID = "agent/manifest-amender"
 COMMENTS_SECTION_HEADER = "## Comments"
+
+# db-327 Leg A1: reuse the db-300 classifiers on ``BacklogManager`` as the
+# single source of truth for "is this path documentation" / "is this path a
+# test source file" -- introducing an independent classifier here would let
+# the production/test/doc path boundary drift out of sync with the
+# task-type-taxonomy validate() rule that also depends on them.
+_is_documentation_path = BacklogManager._is_documentation_path
+_is_test_source_path = BacklogManager._is_test_source_path
+
+# Amendment reasons restricted to a subset of paths. Every classifier in the
+# tuple is tried; a path is accepted if ANY classifier returns True (OR
+# semantics -- documentation OR a documentation-pinning test). Reasons absent
+# from this mapping (``tdd_green_production_fix``) carry no path restriction.
+_REASON_PATH_CLASSIFIERS: dict[str, tuple[Callable[[str], bool], ...]] = {
+    DOC_SYNC_REVIEW_FIX_REASON: (_is_documentation_path, _is_test_source_path),
+}
 
 # Issue #154: canonical taxonomy of amender-rejection categories. The
 # blocker-resolver / executor-feedback consumer keys retry decisions off
@@ -174,6 +205,28 @@ def _require_keys(data: dict[str, Any], keys: list[str]) -> None:
         raise ValueError(f"missing required field(s): {', '.join(missing)}")
 
 
+def _check_reason_path_guard(reason: str, files: list[AmendmentFileEntry]) -> None:
+    """Reject a request whose files violate ``reason``'s path restriction.
+
+    ``doc_sync_review_fix`` (db-327 Leg A1) is restricted to documentation
+    (``.md``) or documentation-pinning test paths -- see
+    ``_REASON_PATH_CLASSIFIERS``. Reasons absent from that mapping (e.g.
+    ``tdd_green_production_fix``) carry no restriction and are unaffected.
+    Called from BOTH ``write_request`` and ``apply_amendment`` so the guard
+    cannot be bypassed by hand-editing a pending request file between the
+    two calls.
+    """
+    classifiers = _REASON_PATH_CLASSIFIERS.get(reason)
+    if classifiers is None:
+        return
+    bad_paths = [f.path for f in files if not any(classifier(f.path) for classifier in classifiers)]
+    if bad_paths:
+        raise AmendmentError(
+            f"Amendment reason {reason!r} only permits documentation (.md) or "
+            f"documentation-pinning test paths, but these are not: {', '.join(bad_paths)}"
+        )
+
+
 def request_path(workspace_root: Path, task_id: str) -> Path:
     """Return the filesystem path for a pending amendment request JSON file."""
     return workspace_root / AMENDMENT_DIR_NAME / f"{task_id}.json"
@@ -194,6 +247,7 @@ def write_request(workspace_root: Path, request: AmendmentRequest) -> Path:
         raise AmendmentError(
             f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(ALLOWED_AMENDMENT_REASONS)}"
         )
+    _check_reason_path_guard(request.reason, request.files_to_add)
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, json.dumps(request.to_dict(), indent=2) + "\n")
     return target
@@ -262,10 +316,17 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
         raise AmendmentError(
             f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(ALLOWED_AMENDMENT_REASONS)}"
         )
+    _check_reason_path_guard(request.reason, request.files_to_add)
 
     wu_file = _resolve_task_file(backlog_index, task_id)
 
     original_content = wu_file.read_text(encoding="utf-8")
+
+    # FR-10 (db-312): capture the backlog's pre-amendment error set BEFORE
+    # any write, so the Layer 3 post-check below can distinguish errors this
+    # amendment introduced from errors that already existed and are not this
+    # amendment's responsibility.
+    baseline_errors = frozenset(BacklogManager().validate(backlog_index, backlog_index.parent))
 
     try:
         manifest_rows = [ManifestRow(file=f.path, change=f.change) for f in request.files_to_add]
@@ -283,7 +344,7 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
     atomic_write_text(wu_file, final_content)
 
     try:
-        _post_check(final_content, backlog_index)
+        _post_check(final_content, backlog_index, baseline_errors)
     except AmendmentError:
         atomic_write_text(wu_file, original_content)
         raise
@@ -505,22 +566,43 @@ def _append_audit_comment(content: str, entry: str) -> str:
     return content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
 
 
-def _post_check(content: str, backlog_index: Path) -> None:
+def _post_check(content: str, backlog_index: Path, baseline_errors: frozenset[str]) -> None:
     """Run Layer 3 deterministic post-checks. Raise ``AmendmentError`` on failure.
 
     ``content`` is the post-amendment work-unit Markdown (already written to
-    disk). Checks the rendered content for em-dash introduction and runs the
-    full ``validate-backlog`` to detect any integrity regression caused by
-    the amendment.
+    disk). ``baseline_errors`` is the ``validate()`` error set captured
+    BEFORE the amendment was written.
+
+    The em-dash check is absolute (FR-10, spec AC-22): an amendment-
+    introduced U+2014 always rolls back, independent of baseline, because an
+    introduced em-dash is inherently the amendment's fault.
+
+    The whole-backlog ``validate()`` check is baseline-relative (FR-10,
+    db-312): only errors the amendment ITSELF introduced
+    (``errors - baseline_errors``) roll back. Pre-existing errors the
+    amendment did not cause (``errors & baseline_errors``) are logged as a
+    WARNING -- never silently dropped, and never able to mask a genuinely
+    new error, since only the introduced set drives the rollback decision.
     """
     if EM_DASH in content:
         raise AmendmentError("Post-check: em-dash (U+2014) found in updated work-unit file")
 
     mgr = BacklogManager()
-    errors = mgr.validate(backlog_index, backlog_index.parent)
-    if errors:
+    errors = frozenset(mgr.validate(backlog_index, backlog_index.parent))
+
+    new_errors = errors - baseline_errors
+    if new_errors:
         raise AmendmentError(
-            f"Post-check: backlog integrity violated after amendment ({len(errors)} error(s)): " + "; ".join(errors)
+            f"Post-check: amendment introduced {len(new_errors)} new backlog integrity error(s): "
+            + "; ".join(sorted(new_errors))
+        )
+
+    surviving_errors = errors & baseline_errors
+    if surviving_errors:
+        logger.warning(
+            "Amendment applied over %d pre-existing backlog integrity error(s) unrelated to this amendment: %s",
+            len(surviving_errors),
+            "; ".join(sorted(surviving_errors)),
         )
 
 

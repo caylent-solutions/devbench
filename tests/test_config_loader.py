@@ -1512,6 +1512,32 @@ class TestManifestAmendmentConfig:
         result = load_runtime_config(cfg, {})
         assert result.manifest_amendment.allowed_reasons == frozenset({"tdd_green_production_fix"})
 
+    def test_amendment_allowed_reasons_default_includes_doc_sync(self, tmp_path: Path) -> None:
+        """FR-11 Leg A1: the default allowed_reasons set carries both sanctioned reasons."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.allowed_reasons == frozenset(
+            {"tdd_green_production_fix", "doc_sync_review_fix"}
+        )
+
+    def test_config_schema_allowed_reasons_enum_includes_doc_sync(self) -> None:
+        """The config-schema.json enum must accept 'doc_sync_review_fix' for schema validation to pass."""
+        schema_path = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+        with schema_path.open(encoding="utf-8") as fh:
+            schema = json.load(fh)
+        enum = schema["properties"]["manifest_amendment"]["properties"]["allowed_reasons"]["items"]["enum"]
+        assert set(enum) == {"tdd_green_production_fix", "doc_sync_review_fix"}, (
+            f"config-schema.json ({schema_path}) manifest_amendment.allowed_reasons.items.enum "
+            f"must list exactly the two sanctioned reasons; got {enum}"
+        )
+
     def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",

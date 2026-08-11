@@ -424,9 +424,9 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["tdd_green_production_fix"]
+            "enum": ["tdd_green_production_fix", "doc_sync_review_fix"]
           },
-          "description": "List of amendment reasons this backlog accepts. Amendment requests whose reason is not in this list are rejected by the Layer 1 pre-filter. Default: ['tdd_green_production_fix']."
+          "description": "List of amendment reasons this backlog accepts. Amendment requests whose reason is not in this list are rejected by the Layer 1 pre-filter. 'doc_sync_review_fix' is restricted to documentation (.md) or documentation-pinning test paths. Default: ['tdd_green_production_fix', 'doc_sync_review_fix']."
         },
         "max_requests_per_execution": {
           "type": "integer",

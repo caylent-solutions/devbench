@@ -373,7 +373,28 @@ class GitOpsService:
                 "pathspec to scope the commit by. Resolve the sentinel to real paths via a manifest "
                 "amendment before committing."
             )
-        self._git(["add", "--", *concrete], repo_path)
+        to_add = self._exclude_already_staged_deletions(repo_path, concrete)
+        if not to_add:
+            return
+        self._git(["add", "--", *to_add], repo_path)
+
+    def _exclude_already_staged_deletions(self, repo_path: Path, concrete: list[str]) -> list[str]:
+        """Drop Manifest paths the executor already `git rm`'d from the add pathspec (db-310).
+
+        On git 2.55.0, once a Manifest delete-row path is removed from the
+        index via ``git rm``, the file no longer exists in the worktree, so
+        re-adding it with a plain pathspec (``git add -- <path>``) dies with
+        ``fatal: pathspec '<path>' did not match any files`` (exit 128) even
+        though the deletion is already correctly staged. A path is safe to
+        drop iff it is BOTH already staged as a deletion (``git diff --cached
+        --diff-filter=D``) AND absent from the worktree -- a ``git rm``'d-then
+        -recreated path stays in the pathspec so its new content is picked
+        up, and a bogus, never-existed path stays in the pathspec too, so
+        ``git add`` still fails fast on it.
+        """
+        _, deletions_out, _ = self._git(["diff", "--cached", "--name-only", "--diff-filter=D"], repo_path)
+        staged_deletions = {line for line in deletions_out.splitlines() if line}
+        return [f for f in concrete if not (f in staged_deletions and not (repo_path / f).exists())]
 
     def commit_and_push(
         self,

@@ -1210,6 +1210,138 @@ class TestCommitScopedToManifest:
             )
 
 
+@pytest.mark.unit
+class TestStagedDeletionPathspecExclusion:
+    """A Manifest delete row commits cleanly (db-310).
+
+    On git 2.55.0, once the executor ``git rm``s a Manifest delete-row path,
+    the file is gone from the worktree, so ``_stage_for_commit`` re-adding it
+    via a plain pathspec (``git add -- <path>``) dies with
+    ``fatal: pathspec '<path>' did not match any files`` (exit 128) even
+    though the deletion is already correctly staged. ``_stage_for_commit``
+    must exclude exactly the paths that are BOTH already staged as deletions
+    AND absent from the worktree, so the commit succeeds without losing
+    fail-fast behavior on a genuinely bogus path. Spec FR-14, AC-33, AC-34.
+    """
+
+    def test_commit_local_handles_manifest_delete_row(self, tmp_path: Path) -> None:
+        """A delete-row (`git rm`) plus another change commits cleanly. AC-33"""
+        repo = _real_repo(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "theirs.py"], check=True)
+        (repo / "mine.py").write_text("edited by the unit\n")  # left unstaged
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo",
+            repo,
+            "feature/x",
+            "E0-F1-S1-T1: delete row plus edit",
+            manifest_files=["mine.py", "theirs.py"],
+        )
+
+        committed = _committed_files(repo)
+        assert committed == {"mine.py", "theirs.py"}
+        assert not (repo / "theirs.py").exists()
+        assert (repo / "mine.py").read_text() == "edited by the unit\n"
+
+    def test_commit_local_manifest_all_deletions_skips_add(self, tmp_path: Path) -> None:
+        """An all-deletions Manifest skips `git add` entirely; the deletion still commits. AC-34"""
+        judge = GitOpsService()
+        repo = _real_repo(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "theirs.py"], check=True)
+
+        with patch.object(judge, "_git", wraps=judge._git) as spy:
+            judge.commit_local(
+                "caylent-solutions/git-repo",
+                repo,
+                "feature/x",
+                "E0-F1-S1-T1: deletion only",
+                manifest_files=["theirs.py"],
+            )
+
+        add_calls = [call.args[0] for call in spy.call_args_list if call.args[0][0] == "add"]
+        assert add_calls == [], f"git add must be skipped, all Manifest paths already staged-deleted: {add_calls}"
+        assert _committed_files(repo) == {"theirs.py"}
+        assert not (repo / "theirs.py").exists()
+
+    def test_commit_local_manifest_bogus_path_still_fails(self, tmp_path: Path) -> None:
+        """A bogus, never-existed Manifest path still trips `git add`'s exit-128 fail-fast. AC-34"""
+        repo = _real_repo(tmp_path)
+
+        with pytest.raises(RuntimeError, match=r"did not match any files"):
+            GitOpsService().commit_local(
+                "caylent-solutions/git-repo",
+                repo,
+                "feature/x",
+                "msg",
+                manifest_files=["never-existed.py"],
+            )
+
+    def test_commit_local_manifest_unstaged_rm_deletion_still_committed(self, tmp_path: Path) -> None:
+        """A plain (unstaged) `rm` of a Manifest path is still staged and committed. FR-14 boundary"""
+        repo = _real_repo(tmp_path)
+        (repo / "theirs.py").unlink()  # plain rm, NOT `git rm` -- deletion is not yet staged
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo",
+            repo,
+            "feature/x",
+            "E0-F1-S1-T1: unstaged deletion",
+            manifest_files=["theirs.py"],
+        )
+
+        assert _committed_files(repo) == {"theirs.py"}
+        assert not (repo / "theirs.py").exists()
+
+    def test_commit_local_manifest_git_rm_then_recreated_commits_new_content(self, tmp_path: Path) -> None:
+        """A `git rm`'d-then-recreated path (present in the worktree) is re-added, not excluded. FR-14 boundary"""
+        repo = _real_repo(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "theirs.py"], check=True)
+        (repo / "theirs.py").write_text("recreated content\n")
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo",
+            repo,
+            "feature/x",
+            "E0-F1-S1-T1: recreate after git rm",
+            manifest_files=["theirs.py"],
+        )
+
+        assert _committed_files(repo) == {"theirs.py"}
+        assert (repo / "theirs.py").read_text() == "recreated content\n"
+
+    def test_commit_and_push_excludes_staged_deletions_from_add(self, tmp_path: Path) -> None:
+        """commit_and_push inherits the fix via _stage_for_commit with no per-caller edits. AC-33"""
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["diff", "--cached", "--name-only", "--diff-filter=D"]:
+                return (0, "deleted.py\n", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "D  deleted.py\nM  mine.py\n", "")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.Path.exists", return_value=False),
+        ):
+            judge.commit_and_push(
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+                "msg",
+                manifest_files=["mine.py", "deleted.py"],
+            )
+
+        add_calls = [c for c in git_calls if c[0] == "add"]
+        assert add_calls == [["add", "--", "mine.py"]], f"expected only mine.py in the add pathspec, got {add_calls}"
+        assert ["commit", "-m", "msg"] in git_calls
+        assert ["push", "origin", "feature/x"] in git_calls
+
+
 class TestCommitLocal:
     """Test commit_local method."""
 

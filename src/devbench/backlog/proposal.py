@@ -44,6 +44,7 @@ from devbench.constants import (
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
+    DEPENDENCY_NONE_VALUES,
     STATUS_DECLINED,
     STATUS_DONE,
     STATUS_DRAFT,
@@ -51,6 +52,7 @@ from devbench.constants import (
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
 )
+from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -1752,6 +1754,48 @@ def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source
     atomic_write_text(source_unit, content[:idx] + section + remainder)
 
 
+def _append_dependency_to_index(backlog_index: Path, blocked_task_id: str, blocker_task_id: str) -> None:
+    """Sync the Dependencies cell (``cells[5]``) of ``blocked_task_id``'s BACKLOG.md row.
+
+    Mirrors :func:`_rewrite_backlog_status`: locates the row via
+    :data:`_BACKLOG_ROW_RE`, then replaces an empty or
+    :data:`~devbench.constants.DEPENDENCY_NONE_VALUES` cell with
+    ``blocker_task_id`` or appends ``, <blocker_task_id>`` when the cell
+    already carries other dependency tokens. Idempotent by construction: a
+    ``blocker_task_id`` already present among the comma-separated tokens is
+    left untouched, so a repeated call never writes a duplicate token.
+
+    Raises:
+        ProposalError: No row for ``blocked_task_id`` exists in
+            ``backlog_index`` -- a corruption guard, since the caller has
+            already validated the id is present in the parsed index.
+    """
+    content = backlog_index.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        match = _BACKLOG_ROW_RE.match(line)
+        if match is None or match.group(1) != blocked_task_id:
+            continue
+        cells = line.split("|")
+        # Cells layout: ['', ' ID ', ' Title ', ' Type ', ' Status ', ' Deps ', ' Repo ', ' Path ', '']
+        if len(cells) < 6:
+            continue
+        current = cells[5].strip()
+        tokens = [token.strip() for token in current.split(",") if token.strip()]
+        if blocker_task_id in tokens:
+            return
+        if not current or current.lower() in DEPENDENCY_NONE_VALUES:
+            cells[5] = f" {blocker_task_id} "
+        else:
+            cells[5] = f" {current}, {blocker_task_id} "
+        lines[i] = "|".join(cells)
+        atomic_write_text(backlog_index, "\n".join(lines) + "\n")
+        return
+    raise ProposalError(
+        f"add-dep: cannot sync index Dependencies cell -- row for '{blocked_task_id}' not found in {backlog_index}"
+    )
+
+
 def _find_source_task_file(backlog_root: Path, backlog_index: Path, task_id: str) -> Path | None:
     """Locate the .md file for an arbitrary task ID by walking the backlog tree."""
     parser = BacklogParser(backlog_root=backlog_root, backlog_index=backlog_index)
@@ -2015,6 +2059,12 @@ def add_dep(
     cross-task markers post-promote, for hand-authored tasks, or to correct a
     proposal that was authored without ``affected_task_ids``.
 
+    Whenever the Dependencies-table row is newly written, the BACKLOG.md index
+    Dependencies cell for ``blocked_task_id`` is synced in the same call (see
+    :func:`_append_dependency_to_index`) so the index never diverges from the
+    work-unit file's own table. Both writes run under a single
+    ``flock_backlog`` so a concurrent claim cannot observe a half-written index.
+
     Fail-fast:
       - ``blocker_task_id`` must be present in the backlog index.
       - ``blocker_task_id`` must NOT be in a terminal state (``done`` / ``declined``).
@@ -2057,7 +2107,10 @@ def add_dep(
 
     wrote_row = False
     if not _dep_row_has_task(blocked_file, blocker_task_id):
-        _append_dependency_to_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)
+        workspace_root = backlog_index.parent
+        with flock_backlog(workspace_root):
+            _append_dependency_to_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)
+            _append_dependency_to_index(backlog_index, blocked_task_id, blocker_task_id)
         wrote_row = True
 
     wrote_marker = False

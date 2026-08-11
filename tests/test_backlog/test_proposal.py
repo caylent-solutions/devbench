@@ -1612,6 +1612,113 @@ class TestAddDepCoreHelper:
                 blocker_task_id="E0-F1-S1-T2",
             )
 
+    def _workspace_with_blockers(self, tmp_path: Path, blocker_ids: list[str]) -> Path:
+        """Like ``_workspace`` but wires an arbitrary set of blocker task ids into the index."""
+        (tmp_path / "BACKLOG.md").write_text(_BACKLOG_TEMPLATE)
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(_SOURCE_TASK_TEMPLATE.format(task_id="E0-F1-S1-T1"))
+        for blocker_id in blocker_ids:
+            (story_dir / f"{blocker_id}.md").write_text(_SOURCE_TASK_TEMPLATE.format(task_id=blocker_id))
+            _append_backlog_row(
+                tmp_path / "BACKLOG.md",
+                _render_backlog_row(
+                    blocker_id,
+                    "Fix",
+                    "in-queue",
+                    "caylent-solutions/example",
+                    f"backlog/E0/E0-F1/E0-F1-S1/{blocker_id}.md",
+                ),
+            )
+        return tmp_path
+
+    @staticmethod
+    def _index_deps_cell(workspace: Path, task_id: str) -> str:
+        for line in (workspace / "BACKLOG.md").read_text().splitlines():
+            if line.strip().startswith(f"| {task_id} |"):
+                return line.split("|")[5].strip()
+        raise AssertionError(f"no BACKLOG.md row found for {task_id!r}")
+
+    def test_add_dep_syncs_index_dependencies_cell(self, tmp_path: Path) -> None:
+        """FR-2 / AC-5 (db-299): add_dep must sync the index Dependencies cell, not just the row+marker."""
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace_with_blockers(tmp_path, ["E0-F1-S1-T4"])
+        assert self._index_deps_cell(workspace, "E0-F1-S1-T1") == "None"
+
+        add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T4",
+        )
+        assert self._index_deps_cell(workspace, "E0-F1-S1-T1") == "E0-F1-S1-T4"
+
+    def test_add_dep_index_sync_idempotent(self, tmp_path: Path) -> None:
+        """FR-2 / AC-6 (db-299): repeated add_dep never duplicates a token; a distinct blocker appends."""
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace_with_blockers(tmp_path, ["E0-F1-S1-T4", "E0-F1-S1-T5"])
+
+        add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T4",
+        )
+        add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T4",
+        )
+        assert self._index_deps_cell(workspace, "E0-F1-S1-T1") == "E0-F1-S1-T4"
+
+        add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T5",
+        )
+        assert self._index_deps_cell(workspace, "E0-F1-S1-T1") == "E0-F1-S1-T4, E0-F1-S1-T5"
+
+    def test_add_dep_index_sync_raises_when_row_missing(self, tmp_path: Path) -> None:
+        """FR-2 / AC-7 (db-299): corruption guard -- missing index row fails fast with ProposalError."""
+        from devbench.backlog.proposal import _append_dependency_to_index
+
+        workspace = self._workspace(tmp_path)
+        with pytest.raises(
+            ProposalError,
+            match=r"cannot sync index Dependencies cell -- row for 'DOES-NOT-EXIST' not found",
+        ):
+            _append_dependency_to_index(workspace / "BACKLOG.md", "DOES-NOT-EXIST", "E0-F1-S1-T2")
+
+    def test_append_dependency_to_index_noop_on_direct_repeat_call(self, tmp_path: Path) -> None:
+        """Idempotent by construction at the helper level, not merely via add_dep's outer gate."""
+        from devbench.backlog.proposal import _append_dependency_to_index
+
+        workspace = self._workspace_with_blockers(tmp_path, ["E0-F1-S1-T4"])
+        backlog_index = workspace / "BACKLOG.md"
+        _append_dependency_to_index(backlog_index, "E0-F1-S1-T1", "E0-F1-S1-T4")
+        before = backlog_index.read_text()
+        _append_dependency_to_index(backlog_index, "E0-F1-S1-T1", "E0-F1-S1-T4")
+        assert backlog_index.read_text() == before
+        assert self._index_deps_cell(workspace, "E0-F1-S1-T1") == "E0-F1-S1-T4"
+
+    def test_append_dependency_to_index_treats_short_row_as_not_found(self, tmp_path: Path) -> None:
+        """A row too short to carry cells[5] is a corruption case -- skipped, not indexed into."""
+        from devbench.backlog.proposal import _append_dependency_to_index
+
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | short row | Task |\n"
+        )
+        with pytest.raises(ProposalError, match=r"row for 'E0-F1-S1-T1' not found"):
+            _append_dependency_to_index(backlog_index, "E0-F1-S1-T1", "E0-F1-S1-T2")
+
 
 class TestRejectProposal:
     def test_empty_reason_raises(self, tmp_path: Path) -> None:

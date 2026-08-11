@@ -174,7 +174,7 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 9. Tasks have a `## Definition of Done` section
 10. No em-dash characters (U+2014) anywhere in work-unit content
 11. Manifest paths do not start with a `checkout_directory` prefix
-12. Manifest path conflicts (no two in-queue Tasks claim the same file)
+12. Manifest path conflicts (no two HARD claimants -- `in-queue`, `proposed`, `blocked`, `in-progress` -- claim the same file with no ordering dependency; checked on every run. SOFT claimants -- `draft`, `hold` -- are folded into the conflict count only under `devbench validate-backlog --strict`)
 13. Language-AC alignment (non-Python tasks must mark Python ACs N/A)
 14. Source-test atomicity (every prod source has a paired test in the same Manifest)
 15. Required sections (`## Status:`, `## Dependencies`, `## Changes Manifest`) on every Task
@@ -697,22 +697,64 @@ aborts if any error is found.
 
 ## Manifest Conflict Rule (post-Backlog-A addendum)
 
-No two in-queue Tasks MAY list the same file path in their `## Changes Manifest` tables. Each file path in the workspace MUST have a single owning Task. If two Tasks legitimately need to modify the same file at different points in time, express the order via `## Dependencies` so they execute sequentially against the same path; the LATER Task's Manifest declares the file even if the EARLIER Task created it (the later Task's edit IS the change git records when its branch is staged).
+Claimants of a `## Changes Manifest` path fall into two sets. HARD claimants
+-- `in-queue`, `proposed`, `blocked`, `in-progress` -- are checked on every
+`devbench validate-backlog` run: no two HARD claimants MAY list the same file
+path with no ordering dependency between them (FR-3, db-313). SOFT claimants
+-- `draft`, `hold` -- are pre-lifecycle authoring states; they are folded
+into the conflict count only under `devbench validate-backlog --strict`
+(FR-4, db-267), so `spec-to-backlog` has an authoring-time exit gate while
+default runs stay unchanged (an all-draft backlog still exits 0 by default).
+A status outside both sets (`done`, `declined`, `in-review`, or an
+unrecognised value) belongs to neither and is never checked. Each file path
+in the workspace MUST have a single owning Task. If two Tasks legitimately
+need to modify the same file at different points in time, express the order
+via `## Dependencies` so they execute sequentially against the same path;
+the LATER Task's Manifest declares the file even if the EARLIER Task created
+it (the later Task's edit IS the change git records when its branch is
+staged).
 
 ### Why
 
-When two in-queue Tasks both claim the same file, the orchestrator's `next` command can claim them in either order. The first Task creates / modifies the file; the second Task tries to do the same and either (a) collides with the first Task's commit, or (b) writes a conflicting version that triggers a code-review failure. In production at `caylent-telemetry-spec/`, two file-ownership conflicts were observed:
+When two HARD claimants of one path have no ordering dependency, the
+orchestrator's `next` command can claim them in either order -- and an
+actively-executing (`in-progress`) claimant is just as real a collision risk
+as a queued one, since its commit lands whenever its executor finishes,
+independent of queue order (db-313). The first claimant creates / modifies
+the file; the second tries to do the same and either (a) collides with the
+first claimant's commit, or (b) writes a conflicting version that triggers a
+code-review failure. In production at `caylent-telemetry-spec/`, two
+file-ownership conflicts were observed:
 
 - `.github/actions/monorepo-check/action.yaml` -- claimed by both `E0-F2-S1-T1` (skeleton) and `E5-F1-S1-T2` (full implementation).
 - `.github/workflows/on-pr.yaml` -- claimed by both `E0-F2-S1-T2` (stub) and `E5-F2-S1-T1` (full).
 
 The fix in both cases was to add a `## Dependencies` entry: the full-implementation Task waits on the skeleton Task. The full-implementation Task's Manifest still lists the file (because the full-impl IS its change to git), but the structural ordering prevents collision.
 
+Before FR-4 (db-267), `draft`/`hold` claimants of the same path had no
+authoring-time check at all: `spec-to-backlog` could promote two drafts that
+claimed the same file and the collision would surface only after both
+promoted to `in-queue`, by which point it is a HARD conflict blocking the
+orchestrator instead of an authoring-time warning.
+
 ### Validation
 
-`devbench validate-backlog` SHOULD reject any backlog state where two in-queue Tasks list the same file path with no explicit dependency between them. (This rule is part of the post-Backlog-A Tier 3 tooling proposal; until it lands, authors are responsible for self-checking via grep across `## Changes Manifest` blocks.)
+`devbench validate-backlog` rejects any backlog state where two or more HARD
+claimants of the same file path have no explicit dependency between them;
+this check runs on every invocation, default or `--strict`. Under
+`devbench validate-backlog --strict`, a path whose HARD claimants did not
+already trigger a conflict is re-checked with SOFT claimants folded in, and
+a resulting collision is rejected with the verbatim ERROR:
 
-For N claimants of the same path, the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
+```
+Manifest conflict (draft/hold) on {path!r}: claimed by {ids}. These units are not yet in-queue; wire a serial dep chain before promoting. See docs/backlog-contract.md 'Manifest Conflict Rule'.
+```
+
+Default (non-`--strict`) runs never evaluate SOFT claimants, so an all-draft
+backlog still exits 0; `spec-to-backlog` adopts `validate-backlog --strict`
+as its authoring-time exit gate.
+
+For N claimants of the same path (HARD, or HARD+SOFT under `--strict`), the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
 
 The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
 

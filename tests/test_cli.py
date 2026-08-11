@@ -3341,6 +3341,120 @@ class TestCmdValidateBacklog:
         assert "E0-T1" in output
         assert "E0-T2" in output
 
+    def test_strict_flag_is_threaded_into_validate_call(self, tmp_path: Path) -> None:
+        """FR-4 (db-267): ``--strict`` must reach ``BacklogManager.validate`` as
+        the ``strict`` keyword so ``_check_manifest_conflicts`` can fold
+        draft/hold claimants into the conflict count.
+        """
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
+        with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
+            with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                with patch("devbench.cli.BACKLOG_ROOT", tmp_path):
+                    result = cli.cmd_validate_backlog("--strict")
+
+        assert result == 0
+        _, call_kwargs = mock_mgr.validate.call_args
+        assert call_kwargs.get("strict") is True
+
+    def test_no_strict_flag_defaults_validate_strict_to_false(self, tmp_path: Path) -> None:
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
+        with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
+            with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                with patch("devbench.cli.BACKLOG_ROOT", tmp_path):
+                    result = cli.cmd_validate_backlog()
+
+        assert result == 0
+        _, call_kwargs = mock_mgr.validate.call_args
+        assert call_kwargs.get("strict") is False
+
+
+class TestCmdValidateBacklogStrictFlagIntegration:
+    """FR-4 / AC-11 (db-267): ``validate-backlog --strict`` is the
+    authoring-time exit gate -- rc=0 on a clean all-draft backlog, rc=1 on
+    colliding drafts with no ordering dependency, and default (non-strict)
+    runs stay unchanged.
+    """
+
+    @staticmethod
+    def _write_task(backlog_dir: Path, unit_id: str, repo: str, manifest_rows: str, status: str = "draft") -> None:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}: Task\n\n## Status: {status}\n\n"
+            f"## Target Repository\n\n- **Repo:** `{repo}`\n\n"
+            f"## Description\n\nTest task.\n\n"
+            f"## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            f"## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
+            f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n{manifest_rows}\n"
+            f"## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_index(workspace: Path, rows: str) -> Path:
+        idx = workspace / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n" + rows,
+            encoding="utf-8",
+        )
+        return idx
+
+    def test_strict_rc0_on_clean_all_draft_backlog(self, tmp_path: Path) -> None:
+        backlog_dir = tmp_path / BACKLOG_SUBDIR
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+        self._write_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "ex/repo",
+            "| `src/f.py` | New |\n| `tests/unit/test_f.py` | New |\n",
+        )
+        idx = self._write_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | draft | none | ex/repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        with patch("devbench.cli.BACKLOG_INDEX", idx), patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+            result = cli.cmd_validate_backlog("--strict")
+        assert result == 0
+
+    def test_strict_rc1_on_colliding_drafts_default_rc0(self, tmp_path: Path) -> None:
+        backlog_dir = tmp_path / BACKLOG_SUBDIR
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+        self._write_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "ex/repo",
+            "| `src/shared.py` | New |\n| `tests/unit/test_shared.py` | New |\n",
+        )
+        self._write_task(
+            backlog_dir,
+            "E0-F1-S1-T2",
+            "ex/repo",
+            "| `src/shared.py` | Edit |\n| `tests/unit/test_shared2.py` | New |\n",
+        )
+        idx = self._write_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | draft | none | ex/repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | draft | none | ex/repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        with patch("devbench.cli.BACKLOG_INDEX", idx), patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+            default_result = cli.cmd_validate_backlog()
+        assert default_result == 0
+
+        with patch("devbench.cli.BACKLOG_INDEX", idx), patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+            strict_result = cli.cmd_validate_backlog("--strict")
+        assert strict_result == 1
+
 
 class TestMain:
     """Test main argument parsing."""

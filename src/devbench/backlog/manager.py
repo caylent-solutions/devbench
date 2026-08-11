@@ -68,6 +68,7 @@ from devbench.constants import (
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_LINE_RE,
+    STATUS_PROPOSED,
     STATUS_SUMMARY_SECTION_HEADER,
     STATUS_SUMMARY_TABLE_HEADER,
     STRIP_SUMMARY_RE,
@@ -667,7 +668,13 @@ class BacklogManager:
         )
         return count
 
-    def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
+    def validate(
+        self,
+        backlog_index: Path,
+        workspace_root: Path,
+        fix: bool = False,
+        strict: bool = False,
+    ) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
         Checks performed:
@@ -682,7 +689,11 @@ class BacklogManager:
         9. Task files have ## Definition of Done section.
         10. No em-dash character (U+2014) in work unit files.
         11. Changes Manifest paths do not start with a ``checkout_directory`` prefix.
-        12. Manifest path conflicts (no two in-queue Tasks claim the same file).
+        12. Manifest path conflicts: HARD claimants (``in-queue``, ``proposed``,
+            ``blocked``, ``in-progress``) of one path with no ordering dependency
+            are always an error (FR-3, db-313). Under ``strict=True``, SOFT
+            claimants (``draft``, ``hold``) are folded into the count too,
+            surfacing authoring-time draft/hold collisions (FR-4, db-267).
         13. Language-AC alignment (non-Python tasks must mark Python ACs N/A).
         14. Source-test atomicity (every prod source has a paired test in the same Manifest).
         15. Required sections (Status, Dependencies, Changes Manifest) on every Task.
@@ -725,6 +736,9 @@ class BacklogManager:
                 audit comment to each corrected file's ``## Comments`` section.
                 Violations that were corrected are NOT included in the returned
                 error list. Without ``fix``, the method is read-only.
+            strict: When ``True``, rule 12 (Manifest path conflicts) also
+                reports draft/hold collisions (FR-4, db-267). Defaults to
+                ``False``, preserving the all-draft rc=0 authoring gate.
 
         Returns:
             A list of error strings. Empty list means the backlog is valid (or
@@ -749,7 +763,7 @@ class BacklogManager:
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
         self._check_no_glob_in_manifest(rows, workspace_root, errors)
-        self._check_manifest_conflicts(rows, workspace_root, errors)
+        self._check_manifest_conflicts(rows, workspace_root, errors, strict=strict)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
         self._check_task_type_taxonomy(rows, workspace_root, errors)
@@ -2542,16 +2556,45 @@ class BacklogManager:
             return False
         return not is_sentinel_manifest_value(stripped)
 
+    # HARD claimants collide at git-ops time whether or not the operator has
+    # noticed yet -- ``in-progress`` is included (db-313, FR-3) because an
+    # actively-executing claimant is just as real a collision risk as a
+    # queued one. SOFT claimants are pre-lifecycle authoring states that
+    # have not committed to an execution order yet; they are only folded
+    # into the conflict count under ``strict=True`` (db-267, FR-4). Any
+    # other status (``done``, ``declined``, ``in-review``, or an unrecognised
+    # value) belongs to neither set and is excluded from both checks -- it
+    # can never be silently bucketed into HARD or SOFT to mask a genuine
+    # conflict.
+    _HARD_CLAIMANT_STATUSES: ClassVar[frozenset[str]] = frozenset(
+        {STATUS_IN_QUEUE, STATUS_PROPOSED, STATUS_BLOCKED, STATUS_IN_PROGRESS}
+    )
+    _SOFT_CLAIMANT_STATUSES: ClassVar[frozenset[str]] = frozenset({STATUS_DRAFT, STATUS_HOLD})
+
     def _check_manifest_conflicts(
         self,
         rows: list[tuple[str, str, str]],
         workspace_root: Path,
         errors: list[str],
+        strict: bool = False,
     ) -> None:
-        """Check 12: no two in-queue tasks in the SAME REPO own the same Manifest path.
+        """Check 12: no two in-flight claimants in the SAME REPO own the same Manifest path.
 
-        Per docs/backlog-contract.md "Manifest Conflict Rule": two in-queue
-        tasks claiming ownership of the same path collide at git-ops time.
+        Per docs/backlog-contract.md "Manifest Conflict Rule": two claimants
+        of one path collide at git-ops time. HARD claimants
+        (``in-queue``, ``proposed``, ``blocked``, ``in-progress``) are
+        checked on every run; two or more with no ordering dependency is an
+        ERROR using the unchanged Manifest-conflict wording (FR-3, db-313).
+
+        SOFT claimants (``draft``, ``hold``) are pre-lifecycle authoring
+        states. When ``strict`` is ``True``, a collision that exists only
+        once SOFT claimants are folded into the HARD set emits a distinct
+        draft/hold ERROR (FR-4, db-267), giving ``spec-to-backlog`` an
+        authoring-time exit gate. Default runs never evaluate SOFT
+        claimants, preserving the all-draft rc=0 authoring gate. A
+        collision already reported via the HARD check is not reported a
+        second time under the SOFT check.
+
         Tasks with explicit Dependencies between them are exempt because the
         ordering resolves the conflict. The check is scoped by ``(repo, path)``
         because two tasks targeting different repos can legitimately list the
@@ -2590,28 +2633,67 @@ class BacklogManager:
         for (repo, path), owners in ownership.items():
             if len(owners) < 2:
                 continue
-            # Filter to tasks not in done/declined/in-progress -- those are not
-            # in flight any more or are actively being executed; the conflict
-            # rule targets in-queue/proposed/blocked overlap.
-            relevant = [(tid, st) for tid, st in owners if st in ("in-queue", "proposed", "blocked")]
-            if len(relevant) < 2:
+            hard_ids = [tid for tid, st in owners if st in self._HARD_CLAIMANT_STATUSES]
+            hard_error = self._hard_manifest_conflict_error(path, repo, hard_ids, deps_by_task)
+            if hard_error:
+                errors.append(hard_error)
                 continue
-            # Check whether every pair is comparable via the transitive
-            # dep graph (any DAG that totally orders the set is sufficient).
-            ids = [tid for tid, _ in relevant]
-            if self._tasks_form_dep_chain(ids, deps_by_task):
+            if not strict:
                 continue
-            sorted_ids = sorted(ids)
-            chain_hint = "\n".join(
-                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
-            )
-            errors.append(
-                f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
-                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
-                f"{chain_hint}\n"
-                f"  -- or any other DAG that totally orders the set. See "
-                f"docs/backlog-contract.md 'Manifest Conflict Rule'."
-            )
+            soft_ids = [tid for tid, st in owners if st in self._SOFT_CLAIMANT_STATUSES]
+            soft_error = self._soft_manifest_conflict_error(path, hard_ids + soft_ids, deps_by_task)
+            if soft_error:
+                errors.append(soft_error)
+
+    def _hard_manifest_conflict_error(
+        self,
+        path: str,
+        repo: str,
+        hard_ids: list[str],
+        deps_by_task: dict[str, set[str]],
+    ) -> str | None:
+        """Return the unchanged Manifest-conflict ERROR text (FR-3), or ``None``.
+
+        Fires when two or more HARD claimants of ``path`` exist with no
+        ordering dependency between them (any DAG that totally orders the
+        set via transitive reachability is accepted).
+        """
+        if len(hard_ids) < 2 or self._tasks_form_dep_chain(hard_ids, deps_by_task):
+            return None
+        sorted_ids = sorted(hard_ids)
+        chain_hint = "\n".join(
+            f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+        )
+        return (
+            f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
+            f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+            f"{chain_hint}\n"
+            f"  -- or any other DAG that totally orders the set. See "
+            f"docs/backlog-contract.md 'Manifest Conflict Rule'."
+        )
+
+    def _soft_manifest_conflict_error(
+        self,
+        path: str,
+        combined_ids: list[str],
+        deps_by_task: dict[str, set[str]],
+    ) -> str | None:
+        """Return the strict-mode draft/hold Manifest-conflict ERROR text (FR-4), or ``None``.
+
+        Fires only under ``strict=True``, when the HARD check has not
+        already reported a conflict for ``path`` and folding SOFT
+        (``draft``/``hold``) claimants into the HARD set produces a
+        collision with no ordering dependency between them.
+        """
+        if len(combined_ids) < 2 or self._tasks_form_dep_chain(combined_ids, deps_by_task):
+            return None
+        sorted_combined = sorted(combined_ids)
+        return (
+            f"Manifest conflict (draft/hold) on {path!r}: "
+            f"claimed by {', '.join(sorted_combined)}. These units are not yet "
+            f"in-queue; wire a serial dep chain before promoting. See "
+            f"docs/backlog-contract.md 'Manifest Conflict Rule'."
+        )
 
     @staticmethod
     def _extract_dep_ids(content: str) -> set[str]:

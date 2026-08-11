@@ -23,7 +23,8 @@ Commands::
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
     hold <id> --reason M    Mark unit Hold (deferred / under debate); orchestrator skips it
     unhold <id> --reason M  Return a held unit to in-queue and capture why it was released
-    validate-backlog [--fix] Check backlog integrity; --fix auto-corrects rule-10/11 violations
+    validate-backlog [--fix] [--strict] Check backlog integrity; --fix auto-corrects rule-10/11
+                            violations; --strict also flags draft/hold Manifest conflicts
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
     git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
@@ -2901,17 +2902,22 @@ def cmd_validate_backlog(*argv: str) -> int:
     - All dependency IDs reference real work unit IDs.
     - Status Summary table exists and counts match the Full Work Unit Index.
 
-    Optional flag:
+    Optional flags:
     - ``--fix``: Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory
       prefix) violations in place and append an audit comment to each corrected
       file's ``## Comments`` section. Prints a summary of corrections made.
+    - ``--strict``: Additionally report draft/hold Manifest conflicts (FR-4,
+      db-267). Default runs report only in-queue/proposed/blocked/in-progress
+      conflicts (FR-3, db-313); ``spec-to-backlog`` runs this flag as its
+      authoring-time exit gate.
 
     Exits 0 if the backlog is consistent (or all violations were fixed); 1 with
     actionable error messages if any inconsistencies remain.
     """
     fix = "--fix" in argv
+    strict = "--strict" in argv
     mgr = BacklogManager()
-    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix)
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix, strict=strict)
     if fix:
         fix_count, files_fixed = mgr._fix_summary
         print(f"Fixed {fix_count} violation(s) across {files_fixed} file(s).")
@@ -11231,7 +11237,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "derived from the ID's last segment (T/S/F/E)."
         ),
     ),
-    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity [--fix: auto-correct rule-10/11]"),
+    "validate-backlog": (
+        cmd_validate_backlog,
+        0,
+        "Validate backlog integrity [--fix: auto-correct rule-10/11] "
+        "[--strict: also flag draft/hold Manifest conflicts]",
+    ),
     "check": (
         cmd_check,
         0,

@@ -3514,6 +3514,98 @@ class TestValidateManifestConflicts:
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("Manifest conflict" in e for e in errors)
 
+    def test_in_progress_plus_in_queue_same_path_no_dep_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """FR-3 / AC-8 (db-313): an actively-executing (in-progress) claimant
+        is a HARD claimant -- it collides with an in-queue claimant of the
+        same path exactly like two in-queue claimants would.
+        """
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status="in-progress")
+        self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status="in-queue")
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-progress | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+            f"| EX-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        conflict = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+        assert len(conflict) == 1
+        assert "EX-F1-S1-T1" in conflict[0]
+        assert "EX-F1-S1-T2" in conflict[0]
+
+    def test_in_progress_conflict_survives_flip_to_blocked(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """FR-3 / AC-9 (db-313): the verdict (and the emitted error text,
+        which embeds only ids, never status) is invariant across a
+        HARD-status flip -- in-progress and blocked are both HARD claimants.
+        """
+        repo = "ex/foo"
+
+        def _run(status_a: str) -> list[str]:
+            self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=status_a)
+            self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status="in-queue")
+            self.H.make_index(
+                tmp_path,
+                f"| EX-F1-S1-T1 | T1 | Task | {status_a} | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+                f"| EX-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+            )
+            errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+            return [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+
+        in_progress_conflict = _run("in-progress")
+        blocked_conflict = _run("blocked")
+        assert len(in_progress_conflict) == 1
+        assert len(blocked_conflict) == 1
+        assert in_progress_conflict[0] == blocked_conflict[0]
+
+    def test_two_draft_claimants_error_only_under_strict(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """FR-4 / AC-10 (db-267): two draft claimants of one path are silent
+        under the default run (preserving the all-draft rc=0 authoring gate)
+        but emit the new draft/hold ERROR once ``strict=True`` folds SOFT
+        claimants into the count.
+        """
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status="draft")
+        self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status="draft")
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | draft | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+            f"| EX-F1-S1-T2 | T2 | Task | draft | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        default_errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in default_errors)
+
+        strict_errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+        conflict = [e for e in strict_errors if "Manifest conflict (draft/hold)" in e]
+        assert len(conflict) == 1
+        assert "EX-F1-S1-T1" in conflict[0]
+        assert "EX-F1-S1-T2" in conflict[0]
+        assert "shared.yaml" in conflict[0]
+
+    def test_two_draft_claimants_with_explicit_dep_no_error_under_strict(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """FR-4 (db-267): an explicit Dependency between two draft claimants
+        resolves the ordering, so ``--strict`` stays silent -- mirrors
+        ``test_two_tasks_with_explicit_dep_no_error`` for the SOFT half.
+        """
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "E9-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status="draft")
+        self.H.make_task(
+            backlog_dir,
+            "E9-F1-S1-T2",
+            repo,
+            "| `shared.yaml` | edit |\n",
+            status="draft",
+            deps_rows="| E9-F1-S1-T1 | dep | draft |",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| E9-F1-S1-T1 | T1 | Task | draft | none | {repo} | `backlog/E9-F1-S1-T1.md` |\n"
+            f"| E9-F1-S1-T2 | T2 | Task | draft | E9-F1-S1-T1 | {repo} | `backlog/E9-F1-S1-T2.md` |\n",
+        )
+        strict_errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+        assert not any("Manifest conflict" in e for e in strict_errors)
+
 
 class TestValidateManifestConflictsTransitiveChain:
     """Issue #145 regression: a clean N-1 dep chain among N claimants of the

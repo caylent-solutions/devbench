@@ -460,6 +460,58 @@ class TestCmdNext:
         assert result == 0
         assert "NO_ACTIONABLE" in capsys.readouterr().out
 
+    def test_no_actionable_names_cause(self, capsys: pytest.CaptureFixture) -> None:
+        """FR-8 / AC-16 (db-253 Gap 2c): NO_ACTIONABLE stays the literal line-1
+        token (``_is_terminal_orchestrate_result`` depends on the substring),
+        followed by a diagnostic line naming the blocked/hold counts and any
+        detected dependency-cycle chain, computed from the parsed units.
+        """
+        units = [
+            WorkUnit(
+                id="T1",
+                title="Blocked One",
+                status=WorkUnitStatus.BLOCKED,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("t1.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=["T2"],
+            ),
+            WorkUnit(
+                id="T2",
+                title="Blocked Two",
+                status=WorkUnitStatus.BLOCKED,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("t2.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=["T1"],
+            ),
+            WorkUnit(
+                id="T3",
+                title="On Hold",
+                status=WorkUnitStatus.HOLD,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("t3.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            ),
+        ]
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_next()
+
+        assert result == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == "NO_ACTIONABLE"
+        assert lines[1] == (
+            "# 3 unit(s) remain and none are actionable: 2 blocked, 1 on hold, "
+            "dependency cycle: T1 -> T2 -> T1. Run 'devbench validate-backlog' and "
+            "'devbench reconcile-cascade' to diagnose."
+        )
+
     def test_next_does_not_mutate_status(self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture) -> None:
         """cmd_next must be read-only: BacklogManager.force_status must never be called."""
         mock_parser = MagicMock()
@@ -491,6 +543,42 @@ class TestCmdNext:
         assert data["repo"] == "caylent-solutions/git-repo"
         assert "file_path" in data
         assert "dependencies" in data
+
+
+class TestDetectUnitsDependencyCycle:
+    """FR-8 (db-253 Gap 2c): in-memory DFS cycle detector over the
+    already-parsed ``unit.dependencies`` edges that backs the
+    ``NO_ACTIONABLE`` diagnostic's cycle-chain clause.
+    """
+
+    @staticmethod
+    def _task(unit_id: str, deps: list[str]) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=unit_id,
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"{unit_id}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=deps,
+        )
+
+    def test_no_cycle_returns_empty_string(self) -> None:
+        units = [self._task("A", ["B"]), self._task("B", [])]
+        assert cli._detect_units_dependency_cycle(units) == ""
+
+    def test_direct_two_node_cycle_detected(self) -> None:
+        units = [self._task("A", ["B"]), self._task("B", ["A"])]
+        assert cli._detect_units_dependency_cycle(units) == "A -> B -> A"
+
+    def test_node_with_two_edges_stops_scanning_after_cycle_found(self) -> None:
+        """``A`` depends on both ``B`` and ``C``; ``A -> B -> A`` is a cycle
+        found via the first edge. The second edge (``C``) must not be
+        traversed once the cycle is already known -- covers the
+        early-exit ``if chain: break`` guard inside the DFS visitor.
+        """
+        units = [self._task("A", ["B", "C"]), self._task("B", ["A"]), self._task("C", [])]
+        assert cli._detect_units_dependency_cycle(units) == "A -> B -> A"
 
 
 class TestCmdNextScopeFilter:
@@ -14308,6 +14396,44 @@ class TestCmdReconcileCascade:
         skip_reasons = {item["unit_id"]: item["reason"] for item in envelope["skipped"]}
         assert "E0-F1-S1-T2" in skip_reasons
         assert "regular dep" in skip_reasons["E0-F1-S1-T2"]
+
+    def test_quoted_marker_prose_not_treated_as_target(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """FR-6 / AC-14 (db-253 Gap 2a): an audit line that merely QUOTES the
+        marker syntax inside prose (e.g. recording that an amendment was
+        rejected) must not mint a phantom marker target. The task must be
+        processed normally -- flipped once its real deps are satisfied --
+        instead of skipped with "unknown marker target Amendment".
+        """
+        prose_comment = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] Amendment rejected: quoting the "
+            "removed audit line '[BLOCKED_PENDING_PROPOSAL] Amendment rejected ...' "
+            "for the record.\n"
+        )
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", prose_comment),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        flipped_ids = [item["unit_id"] for item in envelope["flipped"]]
+        skip_reasons = {item["unit_id"]: item["reason"] for item in envelope["skipped"]}
+        assert "E0-F1-S1-T2" in flipped_ids
+        assert "E0-F1-S1-T2" not in skip_reasons
+        assert "unknown marker target" not in json.dumps(envelope)
 
     def test_registered_in_commands(self) -> None:
         assert "reconcile-cascade" in cli._COMMANDS

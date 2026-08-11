@@ -744,13 +744,17 @@ def _print_blocked_row(u: WorkUnit, units_by_id: dict[str, WorkUnit]) -> None:
     plus any unsuperseded ``[BLOCKED]`` audit lines beneath it."""
     wu_file = _resolve_unit_file(u)
     content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
-    # Issue #148: walk the markers and surface only non-terminal targets.
-    markers = [
+    # Issue #148 / FR-6 (db-253 Gap 2a): walk the markers via the strict,
+    # Comments-scoped, end-anchored helper -- prose that merely quotes the
+    # marker syntax elsewhere in the file cannot mint a phantom target --
+    # and surface only non-terminal targets.
+    marker_ids = BacklogManager()._extract_pending_proposal_markers(wu_file) if wu_file is not None else set()
+    markers = sorted(
         marker
-        for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
+        for marker in marker_ids
         if (target := units_by_id.get(marker)) is None
         or target.status not in {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
-    ]
+    )
     unsatisfied = _first_unsatisfied_dep(u, units_by_id)
     note_parts: list[str] = []
     if markers:
@@ -1057,6 +1061,75 @@ def _parse_next_argv(argv: tuple[str, ...]) -> tuple[str, str, int]:
     return include_str, exclude_str, 0
 
 
+def _detect_units_dependency_cycle(units: list[WorkUnit]) -> str:
+    """Return an ``A -> B -> C -> A`` cycle chain among ``units``' declared
+    dependencies, or ``""`` when no cycle exists.
+
+    FR-8 (db-253 Gap 2c): a cheap, in-memory companion to
+    :meth:`BacklogManager._check_dep_cycles` -- the authoritative,
+    file-scanning cycle check that ``validate-backlog`` runs. This helper
+    walks ONLY the already-parsed ``unit.dependencies`` edges (no extra file
+    I/O) via DFS-with-recursion-stack, so it stays cheap enough to run on
+    every ``devbench next`` invocation. It is a diagnostic pointer at
+    ``validate-backlog`` for the authoritative answer, not a replacement
+    for it.
+    """
+    graph = {u.id: u.dependencies for u in units}
+    color: dict[str, int] = dict.fromkeys(graph, 0)
+    stack: list[str] = []
+    chain = ""
+
+    def visit(node: str) -> None:
+        nonlocal chain
+        color[node] = 1
+        stack.append(node)
+        for nxt in graph.get(node, ()):
+            if chain:
+                break
+            if nxt not in color:
+                continue
+            if color[nxt] == 1:
+                cycle_start = stack.index(nxt)
+                cycle = stack[cycle_start:]
+                chain = " -> ".join([*cycle, cycle[0]])
+                break
+            if color[nxt] == 0:
+                visit(nxt)
+        stack.pop()
+        color[node] = 2
+
+    for node in sorted(graph):
+        if chain:
+            break
+        if color.get(node) == 0:
+            visit(node)
+    return chain
+
+
+def _no_actionable_diagnostic(units: list[WorkUnit]) -> str:
+    """Build the FR-8 (db-253 Gap 2c) diagnostic line ``cmd_next`` appends
+    after the terminal ``NO_ACTIONABLE`` token when nothing is actionable.
+
+    Computed entirely from the already-parsed ``units`` list -- no extra
+    file reads -- so the diagnostic is cheap on every invocation (D-R1-2).
+    Names how many TASK units are still non-terminal, splits out the
+    blocked and on-hold counts, and appends a dependency-cycle chain among
+    them when one is detected, pointing the operator at
+    ``validate-backlog`` and ``reconcile-cascade`` for the next step.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    remaining = [u for u in units if u.unit_type is WorkUnitType.TASK and u.status not in terminal]
+    blocked_count = sum(1 for u in remaining if u.status is WorkUnitStatus.BLOCKED)
+    hold_count = sum(1 for u in remaining if u.status is WorkUnitStatus.HOLD)
+    chain = _detect_units_dependency_cycle(remaining)
+    cycle_clause = f", dependency cycle: {chain}" if chain else ""
+    return (
+        f"# {len(remaining)} unit(s) remain and none are actionable: "
+        f"{blocked_count} blocked, {hold_count} on hold{cycle_clause}. "
+        "Run 'devbench validate-backlog' and 'devbench reconcile-cascade' to diagnose."
+    )
+
+
 def cmd_next(*argv: str) -> int:
     """Print the next actionable work unit.
 
@@ -1069,6 +1142,13 @@ def cmd_next(*argv: str) -> int:
     When neither flag is supplied, the active ``scope.json`` (if any) is
     consulted instead.  When a scope is active and no candidates match, prints
     ``NO_ACTIONABLE_IN_SCOPE`` and returns 0 (AC-190-15).
+
+    FR-8 (db-253 Gap 2c, AC-16): when no scope is active and nothing is
+    actionable, line 1 stays the literal ``NO_ACTIONABLE`` token (existing
+    consumers, including ``_is_terminal_orchestrate_result``, match on this
+    substring) and a second diagnostic line names the cause -- how many
+    units remain, the blocked/hold split, and any detected dependency-cycle
+    chain -- via :func:`_no_actionable_diagnostic`.
 
     Args:
         *argv: Optional flag arguments (``--include``, ``--exclude``).
@@ -1098,6 +1178,7 @@ def cmd_next(*argv: str) -> int:
             print("ALL_DONE")
         else:
             print("NO_ACTIONABLE")
+            print(_no_actionable_diagnostic(units))
         return 0
 
     unit = candidates[0]
@@ -2261,8 +2342,7 @@ def cmd_sync_blocked() -> int:
             wu_file = _resolve_unit_file(unit)
             if wu_file is None:
                 continue
-            content = wu_file.read_text(encoding="utf-8")
-            if _has_open_proposal_marker(content, units_by_id):
+            if _has_open_proposal_marker(wu_file, units_by_id):
                 # Issue #148: only skip when at least one marker target is
                 # still non-terminal. Stale markers pointing at finished
                 # tasks no longer represent active cascade work and must
@@ -2398,8 +2478,10 @@ def cmd_reconcile_cascade() -> int:
             skipped.append({"unit_id": unit.id, "reason": "work-unit file missing"})
             continue
 
-        content = wu_file.read_text(encoding="utf-8")
-        marker_ids = sorted(set(_BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)))
+        # FR-6 (db-253 Gap 2a): route through the strict, Comments-scoped,
+        # end-anchored helper so prose that merely quotes the marker syntax
+        # elsewhere in the file cannot mint a phantom marker target.
+        marker_ids = sorted(BacklogManager()._extract_pending_proposal_markers(wu_file))
 
         # Marker evaluation: every target must be terminal AND known.
         unresolved_marker = ""
@@ -2473,8 +2555,6 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
     return ""
 
 
-_BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
-
 # Captures the audit-comment classifier tag (``[BLOCKED]`` / ``[UNBLOCKED]`` /
 # ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk
 # the Comments section in chronological order and drop ``[BLOCKED]`` rows
@@ -2512,8 +2592,8 @@ def _unsuperseded_blocked_audits(content: str) -> list[str]:
     return pending_audits
 
 
-def _has_open_proposal_marker(content: str, units_by_id: dict[str, WorkUnit]) -> bool:
-    """Return ``True`` iff ``content`` carries at least one ``[BLOCKED_PENDING_PROPOSAL]``
+def _has_open_proposal_marker(wu_file: Path, units_by_id: dict[str, WorkUnit]) -> bool:
+    """Return ``True`` iff ``wu_file`` carries at least one ``[BLOCKED_PENDING_PROPOSAL]``
     marker whose target task is still non-terminal.
 
     Issue #148: the prior ``_BLOCKED_PENDING_PROPOSAL_OPEN_RE`` regex flagged
@@ -2525,9 +2605,14 @@ def _has_open_proposal_marker(content: str, units_by_id: dict[str, WorkUnit]) ->
     status (anything other than ``done`` / ``declined``). Unknown target
     IDs (rejected drafts whose backlog row was removed) count as
     non-terminal so the cascade owner stays in charge of clearing them.
+
+    FR-6 (db-253 Gap 2a): markers are read via the strict, Comments-scoped,
+    end-anchored ``BacklogManager._extract_pending_proposal_markers`` helper
+    so prose that merely quotes the marker syntax elsewhere in the file can
+    never be mistaken for a live target.
     """
     terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
-    for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content):
+    for marker in BacklogManager()._extract_pending_proposal_markers(wu_file):
         target = units_by_id.get(marker)
         if target is None:
             return True

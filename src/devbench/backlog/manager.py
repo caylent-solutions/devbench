@@ -2954,12 +2954,21 @@ class BacklogManager:
         - ``behavior-fix`` / ``feature`` (RED-gated, ``GATED_TASK_TYPES``):
           the Manifest must contain at least one production-source row.
         - ``test-only``: every Manifest row must be a test path.
-        - ``docs``: every Manifest row must be a documentation/markdown path.
+        - ``docs``: every Manifest row must be a documentation/markdown path
+          OR a documentation-pinning test path (db-300: a docs task may
+          legitimately own a test that pins its own documentation).
         - ``chore``: every Manifest row must be a dependency/config/lockfile
-          path.
+          path OR a documentation/markdown path (db-300: a chore task may
+          legitimately own ``CHANGELOG.md``).
         - ``refactor``: exempt from the per-row invariants enforced here --
           its green-green runtime requirement is a TDD-cycle-log concern,
           out of scope for this static Manifest check.
+
+        Every per-row invariant still rejects production Python source under
+        ``src/`` for docs/chore/test-only: each named classifier in the
+        OR-lists above independently rejects production source, so widening
+        a type's OR-list to accept a second classifier never widens it to
+        accept production source too.
 
         An unrecognized ``## Task Type:`` value fails naming the full
         allowed set (AC-45). Every invariant rejection names the offending
@@ -3037,15 +3046,28 @@ class BacklogManager:
             paths = [p for p in manifest_paths if self._is_real_manifest_path(p)]
             self._check_task_type_manifest_invariant(row_id, task_type, paths, errors)
 
-    # Per-type Manifest invariant: type -> (row classifier, human description).
-    # ``behavior-fix`` / ``feature`` are handled separately in
-    # ``_check_task_type_manifest_invariant`` (an aggregate "at least one"
-    # check, not a per-row classifier). ``refactor`` never reaches the
-    # dispatcher -- the caller filters it out before parsing the Manifest.
-    _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[str, str]]] = {
-        TASK_TYPE_TEST_ONLY: ("_is_test_source_path", "test"),
-        TASK_TYPE_DOCS: ("_is_documentation_path", "documentation/markdown"),
-        TASK_TYPE_CHORE: ("_is_chore_path", "dependency/config/lockfile"),
+    # Per-type Manifest invariant: type -> (OR-list of row classifier names,
+    # human description). A row is accepted if ANY named classifier accepts
+    # it (db-300: a type may legitimately own rows shaped like more than one
+    # classifier -- e.g. a docs task owning a documentation-pinning test, or
+    # a chore task owning CHANGELOG.md). ``behavior-fix`` / ``feature`` are
+    # handled separately in ``_check_task_type_manifest_invariant`` (an
+    # aggregate "at least one" check, not a per-row classifier).
+    # ``refactor`` never reaches the dispatcher -- the caller filters it out
+    # before parsing the Manifest. The three classifiers below
+    # (``_is_test_source_path``, ``_is_documentation_path``,
+    # ``_is_chore_path``) are the single source of truth reused across every
+    # OR-list entry -- no fourth classifier exists.
+    _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[tuple[str, ...], str]]] = {
+        TASK_TYPE_TEST_ONLY: (("_is_test_source_path",), "test"),
+        TASK_TYPE_DOCS: (
+            ("_is_documentation_path", "_is_test_source_path"),
+            "documentation/markdown or documentation-pinning test",
+        ),
+        TASK_TYPE_CHORE: (
+            ("_is_chore_path", "_is_documentation_path"),
+            "dependency/config/lockfile or documentation/markdown",
+        ),
     }
 
     def _check_task_type_manifest_invariant(
@@ -3060,8 +3082,11 @@ class BacklogManager:
         ``behavior-fix`` / ``feature`` (``GATED_TASK_TYPES``) require an
         aggregate check -- at least one production-source row anywhere in
         the Manifest. ``test-only`` / ``docs`` / ``chore`` require a
-        per-row check via ``_TASK_TYPE_ROW_INVARIANTS`` -- every row must
-        classify as that type's allowed path shape.
+        per-row check via ``_TASK_TYPE_ROW_INVARIANTS`` -- every row must be
+        accepted by AT LEAST ONE of that type's named classifiers (an
+        OR-list, db-300). Every classifier rejects production Python source
+        under ``src/``, so the OR-list widening never lets production
+        source through.
         """
         if task_type in GATED_TASK_TYPES:
             if not any(self._is_production_source(p) for p in paths):
@@ -3080,10 +3105,10 @@ class BacklogManager:
         # future type added to VALID_TASK_TYPES without a matching entry
         # here raises immediately (fail-fast) instead of silently
         # skipping its invariant.
-        classifier_name, description = self._TASK_TYPE_ROW_INVARIANTS[task_type]
-        classifier = getattr(self, classifier_name)
+        classifier_names, description = self._TASK_TYPE_ROW_INVARIANTS[task_type]
+        classifiers = [getattr(self, classifier_name) for classifier_name in classifier_names]
         for path in paths:
-            if not classifier(path):
+            if not any(classifier(path) for classifier in classifiers):
                 errors.append(
                     f"{row_id}: task type {task_type!r} allows only "
                     f"{description} rows in the Changes Manifest, but "

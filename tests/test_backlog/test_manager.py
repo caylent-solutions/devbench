@@ -4335,6 +4335,125 @@ class TestValidateTaskTypeTaxonomy:
             f"got: {all_errors_for_row}"
         )
 
+    def test_docs_task_with_markdown_and_doc_pin_test_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """db-300 / AC-17: a docs task legitimately owning a
+        documentation-pinning test row (e.g. ``tests/test_docs/test_guide_pin.py``)
+        is not a false-positive rejection -- the docs OR-list also accepts
+        test-source rows."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `tests/test_docs/test_guide_pin.py` | new |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    def test_chore_task_with_config_and_changelog_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """db-300 / AC-18: a chore task legitimately owning ``CHANGELOG.md``
+        is not a false-positive rejection -- the chore OR-list also accepts
+        documentation/markdown rows."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `pyproject.toml` | modify |\n| `CHANGELOG.md` | modify |\n",
+            task_type="chore",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    def test_docs_task_with_production_source_row_still_fails(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-19: the docs OR-list widening never lets production Python
+        source under src/ through -- every named classifier rejects it."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `src/devbench/foo.py` | new |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/devbench/foo.py" in e and "docs" in e]
+        assert matching, f"Expected a docs-invariant violation naming src/devbench/foo.py; got: {errors}"
+
+    def test_chore_task_with_production_source_row_still_fails(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-19: the chore OR-list widening never lets production Python
+        source under src/ through -- every named classifier rejects it."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `pyproject.toml` | modify |\n| `src/devbench/foo.py` | new |\n",
+            task_type="chore",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/devbench/foo.py" in e and "chore" in e]
+        assert matching, f"Expected a chore-invariant violation naming src/devbench/foo.py; got: {errors}"
+
+    @pytest.mark.parametrize(
+        "task_type,manifest_rows,expect_error",
+        [
+            ("behavior-fix", "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n", False),
+            ("behavior-fix", "| `tests/unit/test_foo.py` | new |\n", True),
+            ("feature", "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n", False),
+            ("feature", "| `tests/unit/test_foo.py` | new |\n", True),
+            ("test-only", "| `tests/unit/test_foo.py` | new |\n", False),
+            ("test-only", "| `src/foo.py` | new |\n", True),
+            ("refactor", "| `src/foo.py` | modify |\n| `docs/guide.md` | modify |\n", False),
+            ("docs", "| `docs/guide.md` | new |\n", False),
+            ("docs", "| `tests/test_docs/test_guide_pin.py` | new |\n", False),
+            ("docs", "| `src/foo.py` | new |\n", True),
+            ("chore", "| `pyproject.toml` | modify |\n", False),
+            ("chore", "| `CHANGELOG.md` | modify |\n", False),
+            ("chore", "| `src/foo.py` | new |\n", True),
+        ],
+    )
+    def test_task_type_row_invariant_matrix_unchanged(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        task_type: str,
+        manifest_rows: str,
+        expect_error: bool,
+    ) -> None:
+        """db-300: pins the accept/reject behavior of all six task types
+        across the OR-list widening. Proves the docs/chore widening only
+        ADDS acceptance of documentation-pinning-test / markdown rows
+        respectively -- it does not alter behavior-fix, feature, test-only,
+        or refactor behavior at all, and production-source rows under src/
+        are still rejected for docs/chore/test-only."""
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", manifest_rows, task_type=task_type)
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [
+            e for e in errors if "EX-F1-S1-T1" in e and ("task-type invariant" in e or "production-source" in e)
+        ]
+        if expect_error:
+            assert matching, f"Expected a task-type-invariant error for {task_type}; got: {errors}"
+        else:
+            assert not matching, f"Unexpected task-type-invariant error for {task_type}; got: {matching}"
+
 
 class TestValidateRequiredSections:
     """E209: every Task work-unit must declare Status, Dependencies, and Changes Manifest."""

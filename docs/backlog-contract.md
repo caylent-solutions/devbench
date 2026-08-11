@@ -239,8 +239,8 @@ as `VALID_TASK_TYPES`; no call site hard-codes the type strings):
 | `feature` | Yes | At least one production-source row. |
 | `test-only` | No | Every row must be a test path. |
 | `refactor` | No | No per-row invariant -- its requirement is green-green (tests pass before AND after the change), which is a TDD-cycle-log concern, not a static Manifest shape. |
-| `docs` | No | Every row must be a documentation/markdown (`.md`) path. |
-| `chore` | No | Every row must be a dependency/config/lockfile path. |
+| `docs` | No | Every row must be a documentation/markdown (`.md`) path OR a documentation-pinning test path. |
+| `chore` | No | Every row must be a dependency/config/lockfile path OR a documentation/markdown path. |
 
 If the `## Task Type:` section is omitted entirely, the Task defaults
 to `behavior-fix` -- the strictest type -- and the `behavior-fix`
@@ -282,9 +282,10 @@ A per-row invariant violation names the offending row, the declared type,
 and the violated invariant:
 
 ```
-EX-F1-S1-T1: task type 'docs' allows only documentation/markdown rows in
-the Changes Manifest, but 'src/devbench/cli.py' is not a
-documentation/markdown path -- task-type invariant violated. See
+EX-F1-S1-T1: task type 'docs' allows only documentation/markdown or
+documentation-pinning test rows in the Changes Manifest, but
+'src/devbench/cli.py' is not a documentation/markdown or
+documentation-pinning test path -- task-type invariant violated. See
 docs/backlog-contract.md 'Task-Type Taxonomy'.
 ```
 
@@ -299,11 +300,18 @@ source" and "is this path a Python test" are decided in exactly one
 place -- `BacklogManager._is_test_source_path` (shared by
 `_is_production_source`, Rule 14's source-test atomicity check, and this
 rule's `behavior-fix` / `feature` / `test-only` invariants). The `docs`
-and `chore` invariants introduce two new, narrower extension-based
-classifiers (`_is_documentation_path` for `.md`; `_is_chore_path` for
-lockfile / config extensions) that do not overlap the production/test
-boundary Rule 14 already owns, so the production/test classification
-itself is never duplicated.
+and `chore` invariants are each an OR-list over the three existing
+classifiers, not a fourth classifier: `docs` accepts a row when either
+`_is_documentation_path` (`.md`) or `_is_test_source_path` accepts it
+(a documentation-pinning test row, e.g. `tests/test_docs/test_guide_pin.py`,
+legitimately belongs to a `docs` task), and `chore` accepts a row when
+either `_is_chore_path` (lockfile / config extensions) or
+`_is_documentation_path` accepts it (e.g. `CHANGELOG.md` legitimately
+belongs to a `chore` task). `_is_documentation_path` and `_is_chore_path`
+remain the sole classifiers for their respective extension shapes; no
+fourth classifier is added, so every OR-list entry above is traceable
+to one of the same three classifiers, keeping a single source of
+truth for path classification.
 
 ### Dependency satisfaction (E215)
 

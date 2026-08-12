@@ -1294,6 +1294,24 @@ The `wait_for_checks_and_classify` step that runs between `gh pr create` and `gh
 
 Operators with unusual CI cadence override the knobs via the env vars above. Defaults live in `src/devbench/constants.py` (`DEFAULT_CHECK_REGISTRATION_RETRIES`, `DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS`).
 
+#### Head-SHA-pinned check quorum (db-328)
+
+Once `gh pr checks --watch` returns `rc == 0` (including after the workflow-registration retry above resolves), `wait_for_checks` does NOT declare the PR green on that return code alone: on a many-job repo the watch call can return success after an early subset of check-runs completes while later jobs are still queued. Instead, `GitOpsService._confirm_check_quorum` gates the verdict on a head-SHA-pinned, stability-confirmed quorum:
+
+1. Resolve the PR's current head commit SHA via `gh pr view <n> --json headRefOid` (`GitOpsService._resolve_pr_head_sha`). A head SHA that cannot be resolved raises `RuntimeError` rather than falling back to an assumed-green verdict.
+2. Poll `gh api repos/<repo>/commits/<sha>/check-runs --paginate` until: at least one check-run is present, every check-run's `status` is `completed`, every `conclusion` is in `{success, neutral, skipped}`, and the set of check-run ids is unchanged across `DEVBENCH_CHECK_QUORUM_STABLE_POLLS` consecutive polls (a check-run that first appears mid-poll resets the stability counter).
+3. Any completed check-run with a conclusion outside the good set (`failure`, `cancelled`, `timed_out`, `action_required`, or any other value) fails the quorum immediately.
+4. If the check-run set never stabilizes within the timeout budget, the merge is refused (no warn-and-pass fallback), and the log names the PR number, the pinned head SHA, and the `gh api` command an operator can re-run to inspect the stuck runs.
+
+Local `.github/workflows/*.y[a]ml` file counts are never used as the quorum source: `on:`/path filters skip files, and a single workflow file can fan out to a variable number of check-runs.
+
+| env var | purpose | scoping | default source |
+|---------|---------|---------|-----------------|
+| `DEVBENCH_CHECK_QUORUM_STABLE_POLLS` | number of consecutive polls the check-run id set must stay unchanged, with every run completed and every conclusion good, before the quorum is declared stable | env-only (no `devbench.yaml` field; no `DEFAULT_*` entry in `constants.py`) | module-private constant `_DEFAULT_CHECK_QUORUM_STABLE_POLLS = 3` in `src/devbench/config.py` |
+| `DEVBENCH_CHECK_QUORUM_POLL_INTERVAL_SECONDS` | seconds slept between successive `gh api .../check-runs` polls | env-only (no `devbench.yaml` field; no `DEFAULT_*` entry in `constants.py`) | module-private constant `_DEFAULT_CHECK_QUORUM_POLL_INTERVAL_SECONDS = 5` in `src/devbench/config.py` |
+
+Both knobs resolve with the standard **env > default** precedence (`devbench.config._resolve_int`); since neither has a YAML field, the middle tier of the usual env > YAML > default chain is always skipped for these two.
+
 ### `git-ops-finalize`
 
 ```

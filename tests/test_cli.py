@@ -8321,6 +8321,192 @@ class TestTransportErrorClassificationAndRestart:
         assert captured[0][0] == "transport-error-restart-cap-exhausted"
 
 
+class TestIssue331RegressionFixture:
+    """Regression fixture built from the observed #331 failure (spec FR-5, AC-12).
+
+    Traced through both codebases (spec Section 1.1): the Claude Code CLI emits a
+    result frame that is simultaneously ``is_error=True`` and ``subtype="success"``
+    with an empty ``errors`` list -- a self-contradictory frame that ``claude_agent_sdk``
+    (0.2.128 through 0.2.136, byte-identical in the relevant lines) renders as the
+    literal string ``"success"`` because it falls back to ``subtype`` when ``errors``
+    is empty. The SDK then raises the bare ``Exception("Claude Code returned an error
+    result: success")`` out of ``receive_messages``, which crossed devbench's SDK
+    boundary uncaught before E16-F1-S1-T1 (#331 FR-1/FR-2/FR-3) added the classify
+    and bounded-restart behaviour under test here.
+
+    Every test below stubs ``claude_agent_sdk.query`` to raise that verbatim upstream
+    ``Exception`` -- never a message string, never a custom subclass -- so the fixture
+    reproduces the real upstream shape rather than devbench's own approximation of it.
+    Fixing the upstream contradictory frame itself is explicitly out of scope (spec
+    Section 12 item 1; reported upstream as anthropics/claude-agent-sdk-python#1203).
+
+    This task is test-only (no production change is in scope): all five assertions
+    below must already pass against the E16-F1-S1-T1 end state, since that task is
+    where the classify-and-restart behaviour was implemented.
+    """
+
+    #: The exact upstream message observed on 2026-08-12 (spec Section 1.1 step 4).
+    _UPSTREAM_MESSAGE = "Claude Code returned an error result: success"
+
+    @staticmethod
+    def _install_fake_sdk(mock_query: Any) -> Any:
+        return TestTransportErrorClassificationAndRestart._install_fake_sdk(mock_query)
+
+    @pytest.mark.unit
+    def test_issue_331_regression_loop_restarts_rather_than_propagating(self, tmp_path: Path) -> None:
+        """Assertion 1 (spec FR-5.1, G-1): the loop restarts a fresh session
+        rather than letting the observed upstream exception propagate and end
+        the run."""
+        import sys
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                raise Exception(self._UPSTREAM_MESSAGE)  # reproduces upstream's own bare Exception verbatim
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0, "the loop must restart and finish cleanly, not propagate the observed exception"
+        assert call_count["n"] == 2, "a fresh session (second query() call) must have been opened by the restart"
+
+    @pytest.mark.unit
+    def test_issue_331_regression_verbatim_message_logged_at_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Assertion 2 (spec FR-5.2, FR-2.1): the verbatim upstream message
+        appears in the log at ERROR, unmodified and unparsed (D-4: no message
+        pattern-matching, just verbatim logging)."""
+        import sys
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                raise Exception(self._UPSTREAM_MESSAGE)  # reproduces upstream's own bare Exception verbatim
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.ERROR, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(self._UPSTREAM_MESSAGE in message for message in error_messages), (
+            f"expected the verbatim upstream message in an ERROR log record, got: {error_messages}"
+        )
+
+    @pytest.mark.unit
+    def test_issue_331_regression_permanent_failure_exhausts_cap_and_restart_count_equals_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Assertion 3 (spec FR-5.3, G-2): a generator that raises the observed
+        upstream exception on EVERY attempt exhausts the bounded-restart cap
+        and re-raises, with the number of restarts performed equal to the
+        cap -- no infinite retry loop."""
+        import sys
+
+        cap = 2
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", str(cap))
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            call_count["n"] += 1
+            raise Exception(self._UPSTREAM_MESSAGE)  # reproduces upstream's own bare Exception verbatim
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(cli._OrchestrateTransportError) as exc_info:
+                cli.cmd_start()
+
+        assert str(exc_info.value) == self._UPSTREAM_MESSAGE
+        # One initial attempt plus `cap` permitted restarts, then the cap
+        # refuses one more: the number of restarts actually performed
+        # (call_count - 1) equals the cap exactly.
+        assert call_count["n"] == cap + 1, "the restart count performed must equal the cap"
+
+    @pytest.mark.unit
+    def test_issue_331_regression_system_exit_from_generator_terminates_immediately(self, tmp_path: Path) -> None:
+        """Assertion 4 (spec FR-5.4, FR-1): a ``SystemExit`` raised from the
+        SDK generator is a ``BaseException`` that is not ``Exception`` and
+        must never be wrapped as ``_OrchestrateTransportError`` or retried --
+        it terminates the run immediately on the first attempt."""
+        import sys
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            call_count["n"] += 1
+            raise SystemExit(3)
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_start()
+
+        assert call_count["n"] == 1, "SystemExit must terminate immediately, no restart attempted"
+
+    @pytest.mark.unit
+    def test_issue_331_regression_devbench_originated_exception_not_wrapped(self, tmp_path: Path) -> None:
+        """Assertion 5 (spec FR-5.5, D-5): an exception raised by devbench's
+        own code inside the loop body -- outside the narrow SDK generator
+        boundary -- must propagate with its original type, never wrapped as
+        ``_OrchestrateTransportError`` and never retried, so a genuine
+        devbench defect still fails loudly."""
+        import sys
+
+        async def mock_query(**kwargs: object) -> object:
+            yield types.SimpleNamespace(result="turn-in-progress")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        def _boom(message: object) -> None:
+            raise RuntimeError("devbench bug: malformed message")
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._check_quota_and_drain", side_effect=_boom),
+        ):
+            with pytest.raises(RuntimeError, match="devbench bug") as exc_info:
+                cli.cmd_start()
+
+        assert type(exc_info.value) is RuntimeError, "exception must propagate with its original type, not wrapped"
+
+
 class _FakeSdkModule(types.ModuleType):
     """Typed fake claude_agent_sdk module for tests.
 

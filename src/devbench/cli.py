@@ -85,7 +85,7 @@ from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Seque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, NamedTuple, cast
+from typing import IO, TYPE_CHECKING, Any, NamedTuple, cast
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -235,6 +235,7 @@ from devbench.constants import (
     ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    ORCHESTRATOR_SOURCE_PREFIX,
     RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_TIMEOUT_SECONDS,
     RED_OBSERVED_FIELD_EXIT_CODE,
@@ -268,6 +269,7 @@ from devbench.drain import DrainState, _current_user, cancel_drain, consume_drai
 from devbench.git_orphans import OrphanReport
 from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord
 from devbench.github.git_ops import GitOpsService
+from devbench.install_parity import InstallParityError, resolve_install_parity
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
     materialise_shadow_plugin,
@@ -305,6 +307,9 @@ from devbench.scope import (
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
+
+if TYPE_CHECKING:
+    from devbench.install_parity import InstallIdentity
 
 __all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
 
@@ -8272,6 +8277,33 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
     return _CmdStartArgs(include=include, exclude=exclude, name=name, allow_overlap=allow_overlap, daemon=daemon)
 
 
+def _parse_start_args_and_check_parity(argv: tuple[str, ...]) -> _CmdStartArgs | int:
+    """Parse ``start`` arguments, then apply the install-parity gate (#301 FR-3).
+
+    Combines :func:`_parse_start_args` and :func:`_check_install_parity`
+    behind a single call so ``cmd_start`` itself only branches once on the
+    combined result, keeping ``cmd_start`` under the ruff PLR0912 threshold
+    (mirrors why :func:`_setup_daemon_and_pid_file` was extracted for
+    issue #209). The parity gate runs strictly after argument parsing
+    succeeds and strictly before any orchestration work, so a refused start
+    (bad args or a stale harness) leaves no residue.
+
+    Args:
+        argv: Trailing arguments after the ``start`` command name.
+
+    Returns:
+        A populated ``_CmdStartArgs`` when both argument parsing and the
+        parity gate pass; an integer exit code when either one fails.
+    """
+    parsed = _parse_start_args(argv)
+    if isinstance(parsed, int):
+        return parsed
+    parity_gate_rc = _check_install_parity()
+    if parity_gate_rc is not None:
+        return parity_gate_rc
+    return parsed
+
+
 def _write_session_state_files(
     workspace_root: Path,
     session_name: str,
@@ -8630,6 +8662,93 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
         )
 
 
+# Issue #301 FR-3: number of leading characters used for the short-form
+# revision shown in the parity gate's log line and refusal message,
+# matching git's own default abbreviated-SHA length.
+_INSTALL_PARITY_SHORT_REVISION_CHARS: int = 7
+
+
+def _check_install_parity() -> int | None:
+    """Refuse ``start`` when the harness install is behind a self-hosted target.
+
+    Calls :func:`~devbench.install_parity.resolve_install_parity` before any
+    orchestration work -- before the PID file is written, before the SDK
+    session opens, and before any backlog claim
+    (spec/harness-target-install-parity.md FR-3, issue #301) -- so a
+    refused start leaves no residue. The parity result is logged once at
+    INFO (spec Section 7, AC-12) so the orchestrator log records which code
+    the run executed.
+
+    There is deliberately no opt-out: a resolver failure is itself fatal to
+    ``start`` (spec D-3), and there is no flag, env var, or config key that
+    can disable this gate (spec D-4, AC-13) -- the only supported escape is
+    to resync, which the refusal message below spells out.
+
+    Returns:
+        ``1`` when ``start`` must be refused (the install could not be
+        introspected, or the harness is self-hosting and behind); ``None``
+        when the caller should proceed.
+    """
+    try:
+        parity = resolve_install_parity(RUNTIME_CONFIG)
+    except InstallParityError as exc:
+        print(f"ERROR: could not verify harness install parity: {exc}", file=sys.stderr)
+        return 1
+
+    if not parity.self_hosting or parity.target is None:
+        logger.info("install parity: not self-hosting; gate not applicable")
+        return None
+
+    # resolve_install_parity always resolves the harness identity before it
+    # ever computes self_hosting (see install_parity.py), so parity.harness
+    # is guaranteed non-None here. Cast (not a bypass annotation) so mypy's
+    # Optional narrowing type-checks without a second runtime branch for an
+    # invariant the resolver itself already enforces.
+    harness = cast("InstallIdentity", parity.harness)
+    target = parity.target
+    harness_branch = harness.branch or "detached HEAD"
+    target_branch = target.branch or "detached HEAD"
+    harness_short = harness.revision[:_INSTALL_PARITY_SHORT_REVISION_CHARS]
+    target_short = target.revision[:_INSTALL_PARITY_SHORT_REVISION_CHARS]
+
+    if parity.in_sync:
+        logger.info(
+            "install parity: harness %s (%s) == target %s (%s); IN SYNC",
+            harness_short,
+            harness_branch,
+            target_short,
+            target_branch,
+        )
+        return None
+
+    logger.info(
+        "install parity: harness %s (%s) != target %s (%s); BEHIND by %d commit(s) touching %s",
+        harness_short,
+        harness_branch,
+        target_short,
+        target_branch,
+        parity.behind_count,
+        ORCHESTRATOR_SOURCE_PREFIX,
+    )
+    resync_ref = target.branch or target.revision
+    print(
+        "\n".join(
+            [
+                "ERROR: harness install is behind the target checkout.",
+                f"  harness: {harness.path} @ {harness_short} ({harness_branch})",
+                f"  target:  {target.path} @ {target_short} ({target_branch})",
+                f"  The harness is missing {parity.behind_count} commit(s) touching {ORCHESTRATOR_SOURCE_PREFIX}.",
+                "  Resync before starting:",
+                f"    git -C {harness.path} fetch origin {resync_ref}",
+                f"    git -C {harness.path} checkout -B {resync_ref} origin/{resync_ref}",
+                f"    uv sync --project {harness.path}",
+            ]
+        ),
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _setup_daemon_and_pid_file(parsed: _CmdStartArgs) -> None:
     """Handle daemonisation (when ``--daemon``) and PID-file write (#209).
 
@@ -8829,7 +8948,12 @@ def cmd_start(*argv: str) -> int:
 
     from devbench.instances import remove_pid_file
 
-    parsed = _parse_start_args(argv)
+    # Issue #301 FR-3: the install-parity gate runs inside argument parsing
+    # (see _parse_start_args_and_check_parity) so it executes before any
+    # orchestration work -- before the PID file is written, before the SDK
+    # session opens, and before any backlog claim -- and a refused start
+    # leaves no residue behind.
+    parsed = _parse_start_args_and_check_parity(argv)
     if isinstance(parsed, int):
         return parsed
 

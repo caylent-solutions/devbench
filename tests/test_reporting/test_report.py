@@ -5540,6 +5540,204 @@ class TestGenerateReportThreadsSessionStarts:
         assert "(1 excluded: no execution window)" in report
 
 
+# --------------------------------------------------------------------------
+# #329 FR-4 (E13-F3-S2-T1, AC-16, AC-E13-F3-S2-T1-1): the regression fixture
+# built from the live-repro log's measured shape (spec/pace-anchor-integrity.md
+# Section 1.3): five completions, each with 3 to 16 candidate 'in-progress'
+# matches, of which 1 to 2 per task are genuine devbench.backlog_manager
+# transitions and the remainder are devbench.cli echoes carrying LATER
+# timestamps.
+# --------------------------------------------------------------------------
+
+_ISSUE_329_MEASURED_TABLE: tuple[dict[str, Any], ...] = (
+    {"task_id": "E11-F1-S1-T1", "genuine_claims": 1, "regex_matches": 7, "true_window_min": 32.1},
+    {"task_id": "E11-F1-S2-T1", "genuine_claims": 1, "regex_matches": 9, "true_window_min": 29.1},
+    {"task_id": "E11-F3-S1-T1", "genuine_claims": 1, "regex_matches": 3, "true_window_min": 17.1},
+    {"task_id": "E11-F1-S1-T2", "genuine_claims": 2, "regex_matches": 16, "true_window_min": 63.8},
+    {"task_id": "E11-F1-S2-T2", "genuine_claims": 1, "regex_matches": 7, "true_window_min": 32.3},
+)
+_ISSUE_329_RECLAIMED_TASK_ID = "E11-F1-S1-T2"
+# #326 regression guard: an unrelated sixth completion whose only claim
+# predates the current orchestrator session -- must stay excluded even
+# though FR-2 now selects the EARLIEST same-session claim among several.
+_ISSUE_329_STALE_TASK_ID = "E0-F9-S1-T1"
+
+
+def _issue_329_regression_fixture() -> tuple[
+    dict[str, datetime],
+    dict[str, list[datetime]],
+    dict[str, int],
+    dict[str, datetime],
+    list[datetime],
+]:
+    """Build the #329 live-repro regression shape from ``_ISSUE_329_MEASURED_TABLE``.
+
+    Each of the five measured tasks gets a ``done`` timestamp and a first
+    genuine claim placed exactly ``true_window_min`` minutes earlier, so
+    ``_execution_anchor`` resolves a window that matches the table's
+    measured value exactly by construction. ``E11-F1-S1-T2`` additionally
+    gets a SECOND, later same-session claim (genuine re-claim) that must NOT
+    win the anchor selection. ``unfiltered_progress_claim_counts`` carries each task's
+    ``regex_matches`` count, so ``_compute_window_stats`` derives
+    ``rejected_row_count`` as ``regex_matches - genuine_claims`` per task --
+    the fixture's built-in ``devbench.cli`` echo count -- without literally
+    materialising echo log lines. A sixth, stale-cross-session-claim task
+    (``_ISSUE_329_STALE_TASK_ID``) exercises the #326 exclusion guard inside
+    the SAME fixture.
+
+    Returns ``(done_times, progress_claims, unfiltered_progress_claim_counts,
+    first_claims, session_starts)``.
+    """
+    current_session_start = datetime(2026, 8, 11, 16, 0, tzinfo=UTC)
+    prior_session_start = datetime(2026, 8, 1, 8, 0, tzinfo=UTC)
+
+    done: dict[str, datetime] = {}
+    claims: dict[str, list[datetime]] = {}
+    unfiltered_counts: dict[str, int] = {}
+    first_claims: dict[str, datetime] = {}
+    for i, row in enumerate(_ISSUE_329_MEASURED_TABLE):
+        tid = row["task_id"]
+        done_at = current_session_start + timedelta(hours=i + 1)
+        first_claim = done_at - timedelta(minutes=row["true_window_min"])
+        task_claims = [first_claim]
+        if row["genuine_claims"] == 2:
+            task_claims.append(first_claim + (done_at - first_claim) * 0.6)
+        done[tid] = done_at
+        claims[tid] = task_claims
+        unfiltered_counts[tid] = row["regex_matches"]
+        first_claims[tid] = first_claim
+
+    done[_ISSUE_329_STALE_TASK_ID] = current_session_start + timedelta(hours=len(_ISSUE_329_MEASURED_TABLE) + 1)
+    claims[_ISSUE_329_STALE_TASK_ID] = [prior_session_start + timedelta(minutes=30)]
+
+    session_starts = [prior_session_start, current_session_start]
+    return done, claims, unfiltered_counts, first_claims, session_starts
+
+
+class TestIssue329RegressionFixture:
+    """FR-4 (AC-16, AC-E13-F3-S2-T1-1, spec Section 1.3): the #329 live-repro
+    regression fixture. Every assertion below is driven by
+    ``_ISSUE_329_MEASURED_TABLE`` rather than a single hardcoded expected
+    value, per the workspace standard on input-driven tests.
+    """
+
+    @pytest.mark.parametrize(
+        "row", _ISSUE_329_MEASURED_TABLE, ids=[row["task_id"] for row in _ISSUE_329_MEASURED_TABLE]
+    )
+    def test_issue_329_regression_each_task_anchors_to_its_first_genuine_claim(self, row: dict[str, Any]) -> None:
+        """Per-task guard, independent of the aggregate median below: every
+        task in the measured table -- including the twice-claimed
+        E11-F1-S1-T2 -- resolves its execution window from the FIRST
+        genuine claim, matching the table's ``true_window_min`` column."""
+        from devbench.reporting.report import _execution_anchor
+
+        done, claims, _unfiltered_counts, first_claims, session_starts = _issue_329_regression_fixture()
+        tid = row["task_id"]
+
+        anchor = _execution_anchor(claims[tid], done[tid], session_starts)
+
+        assert anchor == first_claims[tid]
+        duration_min = (done[tid] - anchor).total_seconds() / 60
+        assert duration_min == pytest.approx(row["true_window_min"], abs=0.01)
+
+    def test_issue_329_regression_average_time_per_task_equals_median_of_first_claim_windows(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-16 / AC-E13-F3-S2-T1-1: ``Average time per task`` equals the
+        median of the FIRST-claim windows -- computed from the measured
+        table at test time, not asserted as a bare literal -- and lands in
+        the corrected 17 to 64 min band, never the pre-#329 defect's
+        2.5 to 3.2 min band."""
+        from devbench.reporting.report import _compute_window_stats
+
+        done, claims, unfiltered_counts, _first_claims, session_starts = _issue_329_regression_fixture()
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            min(session_starts),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+            unfiltered_progress_claim_counts=unfiltered_counts,
+        )
+
+        expected_median = statistics.median(row["true_window_min"] for row in _ISSUE_329_MEASURED_TABLE)
+        assert stats.avg_minutes == pytest.approx(expected_median, abs=0.01)
+        assert 17.0 <= stats.avg_minutes <= 64.0
+        assert not (2.5 <= stats.avg_minutes <= 3.2)
+
+    def test_issue_329_regression_reclaimed_task_is_measured_from_first_claim_not_last(self) -> None:
+        """AC-8 / FR-4 item 3: the twice-claimed task's window is measured
+        from its FIRST claim (~63.8 min), never its second (later) claim."""
+        from devbench.reporting.report import _execution_anchor
+
+        done, claims, _unfiltered_counts, first_claims, session_starts = _issue_329_regression_fixture()
+        tid = _ISSUE_329_RECLAIMED_TASK_ID
+
+        anchor = _execution_anchor(claims[tid], done[tid], session_starts)
+
+        assert anchor == first_claims[tid]
+        assert anchor == min(claims[tid])
+        first_claim_duration = (done[tid] - anchor).total_seconds() / 60
+        second_claim_duration = (done[tid] - max(claims[tid])).total_seconds() / 60
+        assert first_claim_duration == pytest.approx(63.8, abs=0.01)
+        assert first_claim_duration != pytest.approx(second_claim_duration, abs=0.01)
+
+    def test_issue_329_regression_stale_cross_session_claim_still_excluded_with_326_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-4 item 4 / G-4: a stale cross-session claim added to the SAME
+        fixture is still excluded, and the rendered #326 exclusion suffix
+        text is byte-identical to its pre-#329 form."""
+        from devbench.reporting.report import _compute_window_stats, _no_execution_window_suffix
+
+        done, claims, unfiltered_counts, _first_claims, session_starts = _issue_329_regression_fixture()
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            min(session_starts),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+            unfiltered_progress_claim_counts=unfiltered_counts,
+        )
+
+        assert stats.pace_excluded_count == 1
+        assert _no_execution_window_suffix(stats.pace_excluded_count) == " (1 excluded: no execution window)"
+
+    def test_issue_329_regression_rejected_row_count_equals_the_fixtures_echo_count(self, tmp_path: Path) -> None:
+        """FR-4 item 5 / AC-18: the FR-6 rejected-row count equals the
+        number of devbench.cli echo lines built into the fixture -- summed,
+        across the measured table, as ``regex_matches - genuine_claims``."""
+        from devbench.reporting.report import _compute_window_stats
+
+        done, claims, unfiltered_counts, _first_claims, session_starts = _issue_329_regression_fixture()
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            min(session_starts),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+            unfiltered_progress_claim_counts=unfiltered_counts,
+        )
+
+        expected_echo_count = sum(row["regex_matches"] - row["genuine_claims"] for row in _ISSUE_329_MEASURED_TABLE)
+        assert stats.rejected_row_count == expected_echo_count
+
+
 class TestReadAllDrainStates:
     """db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2, AC-45):
     ``read_all_drain_states`` scans the workspace-root drain signal AND every

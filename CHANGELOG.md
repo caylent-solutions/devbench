@@ -446,6 +446,35 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   were dropped. `docs/cli-reference.md`'s ETA-formula note documents the
   median estimator and the exclusion suffix.
 
+- **`Recent pace (last N tasks)` and `Average time per task` still
+  understated the real execution window by roughly an order of magnitude
+  even after issue #326's same-session gate** (issue #329). Two compounding
+  defects. Defect A: the unanchored transition regex scanned the entire log
+  line rather than requiring the emitting logger, so a `devbench.cli` line
+  that echoed a prior transition -- for example inside an SDK
+  `ToolResultBlock` payload reproducing an earlier audit comment -- was
+  ingested as a genuine transition; on the reproduction log 85% of
+  `in-progress` matches and 47% of `done` matches were echoes, not
+  transitions. Defect B: even with Defect A fixed, a genuinely re-claimed
+  task (claimed, bounced by review, re-claimed in the same session) was
+  anchored to its LAST claim (`MAX(ts_epoch_us)`) rather than its first,
+  discarding the review-bounce time as if it were idle. On the
+  reproduction log (`logs/orchestrator.log`) the combined effect
+  understated the median execution window by ~10.6x (32.1 min true median
+  vs 3.0 min as sampled) and projected the remaining ETA at 0.5 h where the
+  corrected figure is 5.3 h. `event_index.py`'s transition queries now bind
+  `logger = 'devbench.backlog_manager'` -- the sole in-tree emitter of the
+  quoted `Set <id> to '<status>'` record -- as a SQL predicate so an
+  echoed line can never match, and `_execution_anchor` (`report.py`) now
+  selects the EARLIEST same-session claim rather than the latest.
+  Candidate `in-progress` rows rejected for failing the logger predicate
+  are surfaced rather than silently dropped: the `Average time per task`
+  and `Recent pace (last N tasks)` cells append a
+  `(<k> non-transition rows rejected)` suffix, composed AFTER the #326
+  `(<k> excluded: no execution window)` suffix, naming how many candidate
+  rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
+  the anchor contract and both suffixes.
+
 ## [0.3.0] -- 2026-07-31
 
 ### Fixed

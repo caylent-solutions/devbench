@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from devbench.config import (
+    CHECK_QUORUM_POLL_INTERVAL_SECONDS,
+    CHECK_QUORUM_STABLE_POLLS,
     CHECK_REGISTRATION_DELAY_SECONDS,
     CHECK_REGISTRATION_RETRIES,
     GH_API_TIMEOUT,
@@ -39,6 +41,12 @@ _TASK_MARKER_RE = re.compile(r"\[E\d+-F\d+-S\d+-T\d+\]")
 
 #: CI check states that indicate a failing run.
 _FAILING_CHECK_STATES: frozenset[str] = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"})
+
+#: db-328 / FR-15: conclusions on a `completed` check-run that count toward a
+#: green head-SHA-pinned quorum in :meth:`GitOpsService._confirm_check_quorum`.
+#: Any other conclusion on a completed run (failure, cancelled, timed_out,
+#: action_required, stale) refuses the merge immediately.
+_GOOD_CHECK_CONCLUSIONS: frozenset[str] = frozenset({"success", "neutral", "skipped"})
 
 
 def _first_failing_job_link(checks: object, failing_states: AbstractSet[str]) -> str:
@@ -687,11 +695,28 @@ class GitOpsService:
     ) -> bool:
         """Wait for all CI checks on a PR to complete.
 
-        Uses ``gh pr checks --watch`` with a timeout. When ``gh`` returns
-        ``"no checks reported"``, disambiguates between "repo legitimately
-        has no CI" and "GitHub Actions has not yet enqueued the workflow"
-        (issue #114) by checking the local ``<repo>/.github/workflows/``
-        directory:
+        Uses ``gh pr checks --watch`` with a timeout as the blocking wait.
+        ``rc == 0`` from that call is NOT sufficient to declare green
+        (db-328): on a many-job repo, ``gh pr checks --watch`` can return
+        success after an early subset of check-runs completes while later
+        jobs are still queued. Once the watch call returns ``rc == 0``, the
+        verdict is gated on a head-SHA-pinned, stability-confirmed quorum
+        (:meth:`_confirm_check_quorum`, FR-15): the PR head SHA is resolved
+        via ``gh pr view <n> --json headRefOid``, then
+        ``gh api repos/<repo>/commits/<sha>/check-runs --paginate`` is polled
+        until at least one check-run is present, every check-run is
+        ``completed``, every conclusion is in
+        ``{success, neutral, skipped}``, and the check-run id set is
+        unchanged across :data:`CHECK_QUORUM_STABLE_POLLS` consecutive
+        polls (a check-run that first appears mid-poll resets stability).
+        Local workflow-file count is explicitly never used as a quorum --
+        ``on:``/path filters skip files and files fan out to a variable
+        number of jobs.
+
+        When ``gh`` returns ``"no checks reported"``, disambiguates between
+        "repo legitimately has no CI" and "GitHub Actions has not yet
+        enqueued the workflow" (issue #114) by checking the local
+        ``<repo>/.github/workflows/`` directory:
 
         - Zero workflow files -> repo has no CI -> pass.
         - One or more workflow files -> race condition -> retry up to
@@ -703,19 +728,21 @@ class GitOpsService:
         Args:
             repo: GitHub repository in ``owner/name`` format.
             pr_number: The PR number to watch.
-            timeout: Maximum seconds to wait per ``gh pr checks`` call.
-                Defaults to config value.
+            timeout: Maximum seconds to wait per ``gh pr checks`` call, and
+                the budget given to the head-SHA quorum poll. Defaults to
+                config value.
             repo_path: Local filesystem path to the repository. Required
                 for the workflow-file disambiguation; ``None`` falls
                 back to assuming the repo has no CI (legacy behaviour
                 for callers that have not been migrated to pass it).
 
         Returns:
-            ``True`` if all checks passed, or if the repo legitimately has
-            no CI configured. ``False`` if checks were reported and one
-            or more failed, OR if the workflow-registration race
-            exhausted its retries (the failure mode is logged with the
-            elapsed wait + workflow files found).
+            ``True`` if all checks passed and the head-SHA quorum stabilized
+            green, or if the repo legitimately has no CI configured.
+            ``False`` if any check-run's conclusion failed, if the
+            workflow-registration race exhausted its retries, or if the
+            check-run quorum never stabilized within the timeout (refuse
+            to merge).
 
         Raises:
             ValueError: If the repo is not in the allow-list.
@@ -737,8 +764,7 @@ class GitOpsService:
                 repo=repo,
             )
             if rc == 0:
-                self.logger.info("All checks passed for PR #%d on %s", pr_number, repo)
-                return True
+                return self._confirm_check_quorum(repo, pr_number, repo_path, effective_timeout)
             if "no checks reported" not in stderr:
                 self.logger.warning(
                     "Checks did not pass for PR #%d on %s: %s",
@@ -782,6 +808,151 @@ class GitOpsService:
             [str(p.relative_to(repo_path)) if repo_path else str(p) for p in workflow_files],
         )
         return False
+
+    def _resolve_pr_head_sha(self, repo: str, pr_number: int, repo_path: Path | None) -> str:
+        """Resolve the current head commit SHA of *pr_number* via ``gh pr view``.
+
+        Used by :meth:`_confirm_check_quorum` (db-328 / FR-15) to pin the
+        check-run quorum to the exact commit ``gh pr checks --watch`` just
+        confirmed, rather than trusting an ambient local workflow-file
+        count. Raises ``RuntimeError`` on any ``gh`` failure or malformed
+        response -- a head SHA that cannot be resolved must never be
+        swallowed into a green verdict.
+        """
+        rc, stdout, stderr = self._gh(
+            ["pr", "view", str(pr_number), "--json", "headRefOid"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"wait_for_checks: failed to resolve head SHA for PR #{pr_number} on {repo}: {stderr.strip()}"
+            )
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"wait_for_checks: malformed 'gh pr view --json headRefOid' response for "
+                f"PR #{pr_number} on {repo}: {stdout.strip()}"
+            ) from exc
+        head_sha = str(payload.get("headRefOid") or "") if isinstance(payload, dict) else ""
+        if not head_sha:
+            raise RuntimeError(f"wait_for_checks: empty headRefOid for PR #{pr_number} on {repo}")
+        return head_sha
+
+    def _confirm_check_quorum(
+        self,
+        repo: str,
+        pr_number: int,
+        repo_path: Path | None,
+        timeout: int,
+    ) -> bool:
+        """Gate the ``gh pr checks --watch`` rc==0 verdict on a stable, head-SHA-pinned quorum.
+
+        db-328 / FR-15 (OD-2=a). Resolves the PR head SHA, then polls
+        ``gh api repos/<repo>/commits/<sha>/check-runs --paginate`` until:
+
+        - at least one check-run is present,
+        - every check-run's ``status`` is ``completed``,
+        - every ``conclusion`` is in :data:`_GOOD_CHECK_CONCLUSIONS`, and
+        - the set of check-run ids is unchanged across
+          :data:`CHECK_QUORUM_STABLE_POLLS` consecutive polls (a check-run
+          that first appears mid-poll resets the stability counter).
+
+        A queued/in_progress check-run keeps polling. Any completed
+        check-run with a failing conclusion returns ``False`` immediately.
+        On timeout, logs the verbatim FR-15 refuse-to-merge string and
+        returns ``False``. This is an active readiness poll bounded by
+        *timeout*, not a sleep-based synchronization primitive.
+        """
+        head_sha = self._resolve_pr_head_sha(repo, pr_number, repo_path)
+
+        start = time.monotonic()
+        deadline = start + max(0, int(timeout))
+        previous_ids: frozenset[str] | None = None
+        stable_polls = 0
+        poll_count = 0
+        last_run_count = 0
+        last_pending_count = 0
+
+        while True:
+            poll_count += 1
+            rc, stdout, stderr = self._gh(
+                ["api", f"repos/{repo}/commits/{head_sha}/check-runs", "--paginate"],
+                cwd=repo_path,
+                repo=None,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"wait_for_checks: failed to query check-runs for PR #{pr_number} on {repo} "
+                    f"at head {head_sha}: {stderr.strip()}"
+                )
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"wait_for_checks: malformed check-runs JSON for PR #{pr_number} on {repo} "
+                    f"at head {head_sha}: {stdout.strip()}"
+                ) from exc
+            raw_runs = payload.get("check_runs") if isinstance(payload, dict) else None
+            runs = [r for r in raw_runs if isinstance(r, dict)] if isinstance(raw_runs, list) else []
+
+            last_run_count = len(runs)
+            pending = [r for r in runs if r.get("status") != "completed"]
+            last_pending_count = len(pending)
+            failing = [
+                r for r in runs if r.get("status") == "completed" and r.get("conclusion") not in _GOOD_CHECK_CONCLUSIONS
+            ]
+            if failing:
+                self.logger.warning(
+                    "wait_for_checks: PR #%d on %s: check-run %r failed at head %s (conclusion=%s)",
+                    pr_number,
+                    repo,
+                    failing[0].get("name"),
+                    head_sha,
+                    failing[0].get("conclusion"),
+                )
+                return False
+
+            current_ids = frozenset(str(r.get("id")) for r in runs)
+            if runs and current_ids == previous_ids:
+                stable_polls += 1
+            else:
+                stable_polls = 1
+            previous_ids = current_ids
+
+            is_complete = bool(runs) and not pending
+            if is_complete and stable_polls >= CHECK_QUORUM_STABLE_POLLS:
+                self.logger.info(
+                    "wait_for_checks: PR #%d on %s: check quorum stable at head %s (%d check-runs, %d polls)",
+                    pr_number,
+                    repo,
+                    head_sha,
+                    last_run_count,
+                    poll_count,
+                )
+                return True
+
+            now = time.monotonic()
+            if now >= deadline:
+                elapsed = now - start
+                self.logger.warning(
+                    "wait_for_checks: PR #%d on %s: check set never stabilized at head %s within "
+                    "%ds (%d check-runs, %d still pending across the last %d polls). Refusing to "
+                    "merge. Inspect: gh api repos/%s/commits/%s/check-runs.",
+                    pr_number,
+                    repo,
+                    head_sha,
+                    round(elapsed),
+                    last_run_count,
+                    last_pending_count,
+                    poll_count,
+                    repo,
+                    head_sha,
+                )
+                return False
+
+            time.sleep(max(0, int(CHECK_QUORUM_POLL_INTERVAL_SECONDS)))
 
     def wait_for_checks_and_classify(
         self,

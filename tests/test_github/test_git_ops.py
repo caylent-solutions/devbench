@@ -691,7 +691,56 @@ class TestCreateTag:
 
 
 class TestWaitForChecks:
-    """Test wait_for_checks method."""
+    """Test wait_for_checks method.
+
+    db-328 / FR-15: once `gh pr checks --watch` returns rc==0, the green
+    verdict is gated on a head-SHA-pinned, stability-confirmed check-run
+    quorum (`_confirm_check_quorum`). The helpers below build a `_gh`
+    side_effect that dispatches on the three call shapes involved:
+    the watch call, `gh pr view --json headRefOid`, and
+    `gh api repos/<repo>/commits/<sha>/check-runs --paginate`.
+    """
+
+    @staticmethod
+    def _head_sha_json(sha: str) -> str:
+        import json as _json
+
+        return _json.dumps({"headRefOid": sha})
+
+    @staticmethod
+    def _check_runs_json(runs: list[dict[str, object]]) -> str:
+        import json as _json
+
+        return _json.dumps({"check_runs": runs})
+
+    @staticmethod
+    def _run(run_id: str, status: str = "completed", conclusion: str | None = "success") -> dict[str, object]:
+        return {"id": run_id, "status": status, "conclusion": conclusion, "name": f"job-{run_id}"}
+
+    @classmethod
+    def _quorum_gh_stub(
+        cls,
+        watch_result: tuple[int, str, str],
+        head_sha: str,
+        check_runs_polls: list[list[dict[str, object]]],
+    ):
+        """Return a `_gh` side_effect: watch call -> head-SHA call -> N check-runs polls."""
+        polls_iter = iter(check_runs_polls)
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return watch_result
+            if args[:2] == ["pr", "view"]:
+                return (0, cls._head_sha_json(head_sha), "")
+            if args and args[0] == "api":
+                try:
+                    runs = next(polls_iter)
+                except StopIteration as exc:
+                    raise AssertionError("check-runs API polled more times than the test stubbed") from exc
+                return (0, cls._check_runs_json(runs), "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        return fake_gh
 
     def test_validates_repo(self) -> None:
         judge = GitOpsService()
@@ -699,8 +748,16 @@ class TestWaitForChecks:
             judge.wait_for_checks("evil/repo", 1)
 
     def test_returns_true_on_success(self, tmp_path: Path) -> None:
+        """A stable, all-completed, all-good head-SHA check-run set returns True. AC-4"""
+        from devbench.github import git_ops as git_ops_mod
+
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "All checks passed", "")):
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), "sha-success", [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
     def test_returns_false_on_failure(self, tmp_path: Path) -> None:
@@ -715,19 +772,33 @@ class TestWaitForChecks:
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
     def test_uses_custom_timeout(self, tmp_path: Path) -> None:
+        from devbench.github import git_ops as git_ops_mod
+
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
+        fake_gh = self._quorum_gh_stub((0, "", ""), "sha-timeout-knob", [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
             judge.wait_for_checks("caylent-solutions/git-repo", 42, timeout=999, repo_path=tmp_path)
 
-        _, kwargs = mock_gh.call_args
+        _, kwargs = mock_gh.call_args_list[0]
         assert kwargs.get("timeout") == 999
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
+        from devbench.github import git_ops as git_ops_mod
+
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
+        fake_gh = self._quorum_gh_stub((0, "", ""), "sha-repo-flag", [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
             judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
 
-        _, kwargs = mock_gh.call_args
+        _, kwargs = mock_gh.call_args_list[0]
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
     def test_no_checks_with_workflow_files_retries_then_succeeds(self, tmp_path: Path) -> None:
@@ -735,7 +806,8 @@ class TestWaitForChecks:
 
         Mock `gh pr checks` to return "no checks reported" the first call,
         then a clean exit on the second. The retry loop should bridge the
-        gap and return True without merging blind.
+        gap and, once the watch call returns rc==0, still confirm the
+        head-SHA quorum before declaring green.
         """
         from devbench.github import git_ops as git_ops_mod
 
@@ -743,10 +815,25 @@ class TestWaitForChecks:
         workflows_dir = tmp_path / ".github" / "workflows"
         workflows_dir.mkdir(parents=True)
         (workflows_dir / "ci.yml").write_text("on: push\n")
-        responses = [(1, "", "no checks reported"), (0, "All checks passed", "")]
+        watch_calls = {"n": 0}
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:3] == ["pr", "checks", "42"]:
+                watch_calls["n"] += 1
+                if watch_calls["n"] == 1:
+                    return (1, "", "no checks reported")
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json("sha-114-retry"), "")
+            if args and args[0] == "api":
+                return (0, self._check_runs_json([self._run("r1")]), "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
         with (
-            patch.object(judge, "_gh", side_effect=responses),
+            patch.object(judge, "_gh", side_effect=fake_gh),
             patch.object(git_ops_mod, "CHECK_REGISTRATION_DELAY_SECONDS", 0),
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
         ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
@@ -768,6 +855,194 @@ class TestWaitForChecks:
             patch.object(git_ops_mod, "CHECK_REGISTRATION_RETRIES", 2),
         ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
+
+    def test_wait_for_checks_pins_head_sha(self, tmp_path: Path) -> None:
+        """The green verdict resolves the head SHA and queries check-runs at that SHA. AC-2"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "deadbeef1234567890"
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        assert result is True
+        calls = mock_gh.call_args_list
+        view_calls = [c for c in calls if c.args[0][:2] == ["pr", "view"]]
+        assert len(view_calls) == 1
+        assert view_calls[0].args[0] == ["pr", "view", "42", "--json", "headRefOid"]
+        api_calls = [c for c in calls if c.args[0][0] == "api"]
+        assert len(api_calls) == 1
+        expected_endpoint = f"repos/caylent-solutions/git-repo/commits/{head_sha}/check-runs"
+        assert api_calls[0].args[0] == ["api", expected_endpoint, "--paginate"]
+
+    def test_wait_for_checks_not_green_on_partial_registration(self, tmp_path: Path) -> None:
+        """A check-run that first appears on a later poll resets stability. AC-1"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "sha-partial-registration"
+        # Poll 1: only r1 registered and already completed. Poll 2: r2 appears
+        # (still queued) -- resets stability. Poll 3: r2 has completed and the
+        # id set now matches poll 2 -- 2 consecutive matching polls satisfies
+        # CHECK_QUORUM_STABLE_POLLS=2, so green is declared only at poll 3.
+        polls = [
+            [self._run("r1")],
+            [self._run("r1"), self._run("r2", status="queued", conclusion=None)],
+            [self._run("r1"), self._run("r2")],
+        ]
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, polls)
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 2),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        assert result is True
+        api_calls = [c for c in mock_gh.call_args_list if c.args[0][0] == "api"]
+        assert len(api_calls) == 3, "verdict must be withheld until the set is stable across 3 polls"
+
+    def test_wait_for_checks_fail_fast_on_unstable_timeout(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The check-run set never stabilizes; the method refuses to merge with the FR-15 string. AC-3"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "sha-never-stable"
+        # Every poll introduces a differently-shaped, incomplete set -- stability
+        # never accrues.
+        polls = [
+            [self._run("r1", status="in_progress", conclusion=None)],
+            [self._run("r2", status="in_progress", conclusion=None)],
+        ]
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, polls)
+        monotonic_values = iter([0.0, 0.0, 20.0])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 5),
+            patch("devbench.github.git_ops.time.sleep"),
+            patch("devbench.github.git_ops.time.monotonic", side_effect=lambda: next(monotonic_values)),
+            caplog.at_level("WARNING", logger="devbench.git_ops"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, timeout=15, repo_path=tmp_path)
+
+        assert result is False
+        api_calls = [c for c in mock_gh.call_args_list if c.args[0][0] == "api"]
+        assert len(api_calls) == 2
+        expected = (
+            "wait_for_checks: PR #42 on caylent-solutions/git-repo: check set never stabilized "
+            f"at head {head_sha} within 20s (1 check-runs, 1 still pending across the last 2 "
+            "polls). Refusing to merge. Inspect: gh api repos/caylent-solutions/git-repo/commits/"
+            f"{head_sha}/check-runs."
+        )
+        assert expected in caplog.text
+
+    def test_wait_for_checks_failing_conclusion_returns_false(self, tmp_path: Path) -> None:
+        """Any completed check-run with a bad conclusion refuses the merge immediately. AC-4"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "sha-failing-run"
+        polls = [[self._run("r1", conclusion="success"), self._run("r2", conclusion="failure")]]
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, polls)
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 3),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        assert result is False
+        api_calls = [c for c in mock_gh.call_args_list if c.args[0][0] == "api"]
+        assert len(api_calls) == 1, "a failing conclusion must short-circuit further polling"
+
+    def test_wait_for_checks_raises_when_head_sha_resolution_fails(self, tmp_path: Path) -> None:
+        """A `gh pr view` failure on the head-SHA lookup surfaces loudly -- never swallowed into green."""
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (1, "", "gh: could not resolve to a PullRequest")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="failed to resolve head SHA"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_head_sha_json_malformed(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, "{not json", "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="malformed 'gh pr view"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_head_sha_empty(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json(""), "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with patch.object(judge, "_gh", side_effect=fake_gh), pytest.raises(RuntimeError, match="empty headRefOid"):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_check_runs_api_fails(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json("sha-api-fail"), "")
+            if args and args[0] == "api":
+                return (1, "", "gh: rate limited")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="failed to query check-runs"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_check_runs_json_malformed(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json("sha-bad-json"), "")
+            if args and args[0] == "api":
+                return (0, "{not json", "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="malformed check-runs JSON"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
 
 
 class TestListWorkflowFiles:

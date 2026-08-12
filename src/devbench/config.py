@@ -275,6 +275,23 @@ CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
     RUNTIME_CONFIG.debug.check_registration_delay_seconds,
     DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
 )
+# db-328 / FR-15: head-SHA-pinned CI check quorum (see
+# GitOpsService._confirm_check_quorum). Env-only knobs -- this task's
+# Changes Manifest scopes it to config.py, so no `debug:` YAML field is
+# added to config_loader.py and no DEFAULT_* constant is added to
+# constants.py; the defaults are declared locally, module-private, below.
+_DEFAULT_CHECK_QUORUM_STABLE_POLLS: int = 3
+_DEFAULT_CHECK_QUORUM_POLL_INTERVAL_SECONDS: int = 5
+CHECK_QUORUM_STABLE_POLLS: int = _resolve_int(
+    "DEVBENCH_CHECK_QUORUM_STABLE_POLLS",
+    None,
+    _DEFAULT_CHECK_QUORUM_STABLE_POLLS,
+)
+CHECK_QUORUM_POLL_INTERVAL_SECONDS: int = _resolve_int(
+    "DEVBENCH_CHECK_QUORUM_POLL_INTERVAL_SECONDS",
+    None,
+    _DEFAULT_CHECK_QUORUM_POLL_INTERVAL_SECONDS,
+)
 # Recency cap for the AWAITING_AUTO_RECOVERY audit-comment heuristic in
 # the 3-state blocked-task classifier. Lives under YAML `debug:` for
 # the same reason as the registration knobs above.

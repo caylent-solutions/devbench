@@ -836,6 +836,63 @@ class EventIndex:
             series.setdefault(tid, []).append(_epoch_us_to_dt(int(ts)))
         return series
 
+    def task_transition_candidate_counts_for_workspace(
+        self,
+        workspace_root: Path,
+        live_log_path: Path,
+        transition: str,
+    ) -> dict[str, int]:
+        """Per-task count of candidate rows matching ``transition``, BEFORE the FR-1a logger filter.
+
+        Issue #329 FR-6: same ``file_id``/``transition`` predicates as
+        ``task_transition_time_series_for_workspace``, but WITHOUT the
+        ``logger = _TRANSITION_LOGGER`` predicate, so it counts every row
+        that has a populated ``task_id``/``transition`` regardless of which
+        logger wrote it.
+
+        On a cache built entirely under the current ingestion code this
+        returns the SAME counts as the logger-filtered query: FR-1b anchors
+        ``_TASK_TRANSITION_RE`` to the position right after a line's own
+        ``LEVEL`` token, so an echoed line (e.g. a ``devbench.cli`` SDK
+        payload quoting a prior transition) never populates
+        ``task_id``/``transition`` at ingestion time -- there is nothing
+        extra to count. The difference is non-zero only for a cache that was
+        populated BEFORE the FR-1b ingestion hardening landed and has not
+        been rebuilt: such a cache still holds the phantom ``task_id``/
+        ``transition`` values the old, unanchored ``.search(raw_line)``
+        match wrote for an echoed line (see ``_refresh_orchestrator_log_locked``'s
+        FR-1b history) -- rows FR-1a's query-side predicate already excludes
+        from every anchor-selection consumer, but which are real evidence of
+        exactly how many non-transition rows were silently miscounted before
+        this fix. ``report._compute_window_stats`` uses this method's counts,
+        minus ``len(progress_claims[tid])``, to populate
+        ``WindowStats.rejected_row_count`` (the FR-6 provenance suffix).
+
+        A row whose ``task_id`` is ``NULL`` never matched ``_TASK_TRANSITION_RE``
+        at all (no candidate to count) and is excluded by the same
+        ``task_id IS NOT NULL`` predicate used everywhere else in this class.
+        """
+        file_ids = self._orch_log_file_ids_for_workspace(workspace_root, live_log_path)
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        # SQL composed via list-join rather than an f-string so the static
+        # analyser does not misclassify the variable-arity ``IN`` clause
+        # as user-controlled input. ``placeholders`` is a comma-joined
+        # string of literal ``?`` characters; values bind through the
+        # parameter tuple below.
+        sql = "".join(
+            [
+                "SELECT task_id, COUNT(*) FROM orch_log_events ",
+                "WHERE file_id IN (",
+                placeholders,
+                ") AND transition = ? AND task_id IS NOT NULL ",
+                "GROUP BY task_id",
+            ]
+        )
+        rows = self._conn.execute(sql, (*file_ids, transition)).fetchall()
+        return {tid: int(count) for tid, count in rows}
+
     def all_log_timestamps_for_workspace(
         self,
         workspace_root: Path,

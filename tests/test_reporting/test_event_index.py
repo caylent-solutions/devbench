@@ -476,6 +476,110 @@ class TestTaskTransitionTimeSeriesForWorkspace:
             idx.close()
 
 
+class TestTaskTransitionCandidateCountsForWorkspace:
+    """Issue #329 FR-6: ``task_transition_candidate_counts_for_workspace``
+    counts every row matching ``transition`` regardless of ``logger`` --
+    the "unfiltered" side of the FR-6 provenance suffix. Composed against
+    ``task_transition_time_series_for_workspace``'s (FR-1a/FR-2) logger-
+    filtered count, the difference is the number of non-transition rows
+    rejected (``report._compute_window_stats`` / ``WindowStats.rejected_row_count``).
+    """
+
+    def test_fresh_ingestion_matches_the_filtered_count(self, workspace: Path) -> None:
+        """FR-1b already anchors ingestion to the line's own message, so an
+        echoed ``devbench.cli`` line never populates ``task_id``/``transition``
+        in a cache built entirely under the current code -- the unfiltered
+        candidate count equals the logger-filtered count exactly."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress' "
+                "in both work-unit file and BACKLOG.md",
+                "2026-05-04T10:38:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                "[WU_CLAIMED] Set E1-F1-S1-T1 to 'in-progress' session=default",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            candidate_counts = idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress")
+            filtered_series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert candidate_counts == {"E1-F1-S1-T1": 1}
+            assert candidate_counts["E1-F1-S1-T1"] == len(filtered_series["E1-F1-S1-T1"])
+        finally:
+            idx.close()
+
+    def test_pre_fix_cache_counts_the_phantom_echo_row(self, workspace: Path) -> None:
+        """A cache row shaped exactly as pre-FR-1b ingestion would have
+        written it (task_id/transition populated from a non-backlog_manager
+        logger) is counted here even though the logger-filtered series
+        excludes it -- the difference is what FR-6 surfaces."""
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            file_id = idx._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(log),)).fetchone()[0]
+            idx._conn.executemany(
+                "INSERT INTO orch_log_events "
+                "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (file_id, 1000, 1_746_353_400_000_000, "devbench.backlog_manager", "E1-F1-S1-T1", "in-progress"),
+                    # Shaped exactly as the unanchored pre-FR-1b ingestion
+                    # would have captured a later echo line.
+                    (file_id, 2000, 1_746_355_080_000_000, "devbench.cli", "E1-F1-S1-T1", "in-progress"),
+                ],
+            )
+            candidate_counts = idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress")
+            filtered_series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert candidate_counts == {"E1-F1-S1-T1": 2}
+            assert len(filtered_series["E1-F1-S1-T1"]) == 1
+            assert candidate_counts["E1-F1-S1-T1"] - len(filtered_series["E1-F1-S1-T1"]) == 1
+        finally:
+            idx.close()
+
+    def test_null_task_id_row_excluded(self, workspace: Path) -> None:
+        """A row that never matched ``_TASK_TRANSITION_RE`` at ingestion
+        (``task_id IS NULL``) is not a candidate and is not counted."""
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            assert idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_multiple_tasks_counted_independently(self, workspace: Path) -> None:
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                "2026-05-04T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            candidate_counts = idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress")
+            assert candidate_counts == {"E0-F1-S1-T1": 2, "E0-F1-S1-T2": 1}
+        finally:
+            idx.close()
+
+    def test_empty_workspace_returns_empty_dict(self, tmp_path: Path) -> None:
+        (tmp_path / ".devbench").mkdir()
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        idx = EventIndex.open(tmp_path)
+        try:
+            idx.refresh_orch_log_sources(tmp_path, live_log)
+            assert idx.task_transition_candidate_counts_for_workspace(tmp_path, live_log, "in-progress") == {}
+        finally:
+            idx.close()
+
+
 class TestHookLogAggregation:
     """Phase 4: hook-log entries aggregate via indexed range scans."""
 

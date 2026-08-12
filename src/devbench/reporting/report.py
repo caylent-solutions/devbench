@@ -194,6 +194,16 @@ class WindowStats:
     # number of the most-recent completions dropped from ``recent_pace_minutes``
     # for having no execution window.
     recent_pace_excluded_count: int = 0
+    # Issue #329 FR-6: count of in-window candidate "in-progress" rows that
+    # were never genuine transitions -- rejected because they failed the
+    # FR-1a ``logger = _TRANSITION_LOGGER`` predicate (an echoed log line
+    # such as a `devbench.cli` SDK payload quoting a prior transition).
+    # Orthogonal to ``pace_excluded_count``/``recent_pace_excluded_count``:
+    # those name completions with NO valid execution window; this names
+    # candidate rows that were never a transition in the first place. Zero
+    # for every window computed without ``unfiltered_progress_claim_counts``
+    # (the default), which keeps a clean log byte-identical (spec AC-19).
+    rejected_row_count: int = 0
     # Wall-clock completion moment = now() + est_hours. None when est_hours is
     # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
     # to the resolved display timezone.
@@ -1092,6 +1102,7 @@ def _compute_window_stats(
     recent_per_task_cost: float | None = None,
     lifetime_total_cost: float | None = None,
     session_starts: Sequence[datetime] = (),
+    unfiltered_progress_claim_counts: dict[str, int] | None = None,
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
@@ -1136,6 +1147,22 @@ def _compute_window_stats(
     the same session is measured from its FIRST claim, not its last. The
     ``max(anchor, window_start)`` clamp is unchanged: a claim before the
     window start is clamped to the window boundary, not the raw claim time.
+
+    Issue #329 FR-6: ``unfiltered_progress_claim_counts`` is the per-task
+    count of candidate "in-progress" rows BEFORE the FR-1a
+    ``logger = _TRANSITION_LOGGER`` predicate is applied -- i.e. before
+    non-genuine (echoed) rows are dropped. It is ``None`` by default, which
+    yields ``rejected_row_count == 0`` (the byte-identical, clean-log case,
+    spec AC-19): a cache built entirely under the current ingestion code
+    never populates ``transition``/``task_id`` for an echoed line (FR-1b), so
+    there is nothing to report. A caller supplies real counts only when it
+    has one -- ``generate_report`` sources it from
+    ``EventIndex.task_transition_candidate_counts_for_workspace``, whose
+    docstring explains why the difference is non-zero only for a cache that
+    predates the FR-1b ingestion hardening. A task present in
+    ``progress_claims`` but absent from this mapping falls back to its own
+    filtered count (zero rejected for that task) rather than manufacturing a
+    spurious rejection.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -1144,7 +1171,17 @@ def _compute_window_stats(
 
     task_durations: list[float] = []
     pace_excluded_count = 0
+    rejected_row_count = 0
     for tid in task_ids_done:
+        filtered_claim_count = len(progress_claims.get(tid, []))
+        if unfiltered_progress_claim_counts is not None:
+            unfiltered_claim_count = unfiltered_progress_claim_counts.get(tid, filtered_claim_count)
+            assert unfiltered_claim_count >= filtered_claim_count, (
+                f"unfiltered candidate count {unfiltered_claim_count} for task {tid!r} is smaller "
+                f"than its logger-filtered claim count {filtered_claim_count}; the logger-filtered "
+                "set can never be larger than the unfiltered candidates it was drawn from"
+            )
+            rejected_row_count += unfiltered_claim_count - filtered_claim_count
         anchor = _execution_anchor(progress_claims.get(tid, []), done_times[tid], session_starts)
         if anchor is None:
             pace_excluded_count += 1
@@ -1278,6 +1315,7 @@ def _compute_window_stats(
         pace_excluded_count=pace_excluded_count,
         recent_pace_minutes=recent_pace_minutes,
         recent_pace_excluded_count=recent_pace_excluded_count,
+        rejected_row_count=rejected_row_count,
         est_completion_at=est_completion_at,
         eta_active=tasks_active,
         eta_blocked_recovery=tasks_blocked_recovery,
@@ -1977,6 +2015,27 @@ def _no_execution_window_suffix(excluded: int) -> str:
     return f" ({excluded} excluded: no execution window)"
 
 
+def _rejected_rows_suffix(rejected: int) -> str:
+    """Return the value-cell suffix naming candidate rows rejected as non-transition lines.
+
+    Issue #329 (FR-6): ``""`` when nothing was rejected -- keeps the rendered
+    cell byte-identical to the pre-#329 form. Otherwise
+    ``" (<rejected> non-transition rows rejected)"``. Orthogonal to
+    ``_no_execution_window_suffix`` (#326): that suffix names completions
+    that have no valid execution window at all; this one names candidate
+    matches that were never genuine status transitions in the first place
+    (e.g. an echoed log line). The suffix interpolates only an ``int``, so no
+    formatting call in this helper can raise; a negative ``rejected`` is
+    impossible by construction (the logger-filtered count can never exceed
+    the unfiltered candidate count it is drawn from -- see the assertion in
+    ``_compute_window_stats``), so this helper documents that invariant by
+    trusting its caller rather than defensively clamping.
+    """
+    if rejected == 0:
+        return ""
+    return f" ({rejected} non-transition rows rejected)"
+
+
 def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS.
 
@@ -1988,6 +2047,12 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     dropped for having no execution window. The suffix is empty when nothing
     was dropped, so the zero-drop cells stay byte-identical to the pre-#326
     form.
+
+    Issue #329 (FR-6): both cells then append ``_rejected_rows_suffix(...)``,
+    AFTER the #326 suffix, naming any candidate rows rejected as
+    non-transition lines. Empty when nothing was rejected, so a clean log
+    (zero excluded, zero rejected) still renders byte-identically (spec
+    AC-19).
     """
     # API utilization > 100% means API time exceeds wall time -- concurrent
     # subagent calls (legitimate parallelism) or two orchestrators writing to
@@ -2018,11 +2083,16 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     # orchestrator session) so the reader can see the sample was pruned
     # rather than being silently narrowed.
     avg_min_display += _no_execution_window_suffix(stats.pace_excluded_count)
+    # Issue #329 (FR-6): name candidate rows rejected as non-transition
+    # lines, AFTER the #326 suffix (documented composition order).
+    avg_min_display += _rejected_rows_suffix(stats.rejected_row_count)
     # Recent pace is log-wide; same value across all window columns. None
     # when fewer than RECENT_PACE_TASKS completions exist.
     recent_pace_display = (
-        "n/a" if stats.recent_pace_minutes is None else f"{stats.recent_pace_minutes:.1f} min"
-    ) + _no_execution_window_suffix(stats.recent_pace_excluded_count)
+        ("n/a" if stats.recent_pace_minutes is None else f"{stats.recent_pace_minutes:.1f} min")
+        + _no_execution_window_suffix(stats.recent_pace_excluded_count)
+        + _rejected_rows_suffix(stats.rejected_row_count)
+    )
     est_hours_display = _format_est_hours_display(stats)
     # Wall-clock completion datetime rendered in the resolved display TZ.
     # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
@@ -3129,6 +3199,13 @@ def generate_report(
     progress_claims: dict[str, list[datetime]] = event_index.task_transition_time_series_for_workspace(
         WORKSPACE_ROOT, log_path, "in-progress"
     )
+    # Issue #329 FR-6: the unfiltered (pre-FR-1a) candidate count per task,
+    # for the provenance suffix. Non-zero only for a cache that predates the
+    # FR-1b ingestion hardening and has not been rebuilt -- see
+    # ``EventIndex.task_transition_candidate_counts_for_workspace``.
+    progress_claim_candidate_counts: dict[str, int] = event_index.task_transition_candidate_counts_for_workspace(
+        WORKSPACE_ROOT, log_path, "in-progress"
+    )
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
@@ -3180,6 +3257,7 @@ def generate_report(
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
             session_starts=session_starts,
+            unfiltered_progress_claim_counts=progress_claim_candidate_counts,
         )
         if log_started is not None
         else None
@@ -3213,6 +3291,7 @@ def generate_report(
             recent_per_task_cost=recent_per_task_cost,
             lifetime_total_cost=lifetime_total_cost,
             session_starts=session_starts,
+            unfiltered_progress_claim_counts=progress_claim_candidate_counts,
         )
         lines.extend(backlog_state_block)
         lines.append("")
@@ -3259,6 +3338,7 @@ def generate_report(
                         recent_per_task_cost=recent_per_task_cost,
                         lifetime_total_cost=lifetime_total_cost,
                         session_starts=session_starts,
+                        unfiltered_progress_claim_counts=progress_claim_candidate_counts,
                     )
                 )
 

@@ -5186,6 +5186,308 @@ class TestSummaryLineExclusionSuffix:
         assert "excluded" not in line
 
 
+class TestRejectedRowsSuffix:
+    """Issue #329 FR-6 (AC-18, AC-19): the rejected-row count renders as a
+    suffix on both the ``Average time per task`` and ``Recent pace`` cells,
+    composed AFTER the #326 ``_no_execution_window_suffix``."""
+
+    @pytest.mark.parametrize(
+        ("rejected", "expected"),
+        [
+            (0, ""),
+            (1, " (1 non-transition rows rejected)"),
+            (44, " (44 non-transition rows rejected)"),
+        ],
+    )
+    def test_suffix_text(self, rejected: int, expected: str) -> None:
+        from devbench.reporting.report import _rejected_rows_suffix
+
+        assert _rejected_rows_suffix(rejected) == expected
+
+    @staticmethod
+    def _make_stats(
+        avg_minutes: float,
+        pace_excluded_count: int,
+        recent_pace_minutes: float | None,
+        recent_pace_excluded_count: int,
+        rejected_row_count: int,
+    ) -> WindowStats:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        return WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=4,
+            avg_minutes=avg_minutes,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            pace_sample_count=3,
+            pace_excluded_count=pace_excluded_count,
+            recent_pace_minutes=recent_pace_minutes,
+            recent_pace_excluded_count=recent_pace_excluded_count,
+            rejected_row_count=rejected_row_count,
+        )
+
+    def test_field_defaults_to_zero_and_existing_construction_still_works(self) -> None:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        stats = WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+        )
+        assert stats.rejected_row_count == 0
+
+    def test_avg_minutes_cell_carries_rejected_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, None, 0, 44)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min (44 non-transition rows rejected)" in values
+
+    def test_avg_minutes_cell_has_no_suffix_when_nothing_rejected(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, None, 0, 0)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min" in values
+        assert "rejected" not in " ".join(values)
+
+    def test_recent_pace_cell_carries_rejected_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, 47.0, 0, 44)
+        values = _stats_to_value_list(stats)
+        assert "47.0 min (44 non-transition rows rejected)" in values
+
+    def test_recent_pace_cell_na_carries_rejected_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, None, 0, 44)
+        values = _stats_to_value_list(stats)
+        assert "n/a (44 non-transition rows rejected)" in values
+
+    def test_both_suffixes_compose_in_the_documented_order(self) -> None:
+        """AC-18: ``_no_execution_window_suffix`` (#326) renders FIRST, then
+        ``_rejected_rows_suffix`` (#329 FR-6)."""
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 1, 47.0, 2, 44)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min (1 excluded: no execution window) (44 non-transition rows rejected)" in values
+        assert "47.0 min (2 excluded: no execution window) (44 non-transition rows rejected)" in values
+
+    def test_clean_stats_render_byte_identical_to_pre_fr6(self) -> None:
+        """AC-19: zero excluded, zero rejected -> no suffix at all on either cell."""
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, 47.0, 0, 0)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min" in values
+        assert "47.0 min" in values
+        joined = " ".join(values)
+        assert "excluded" not in joined
+        assert "rejected" not in joined
+
+
+class TestComputeWindowStatsRejectedRowCount:
+    """Issue #329 FR-6: ``_compute_window_stats`` populates
+    ``rejected_row_count`` from the difference between
+    ``unfiltered_progress_claim_counts`` (the raw candidate count) and the
+    logger-filtered ``len(progress_claims[tid])``, summed over the tasks
+    done in the window."""
+
+    def test_default_none_yields_zero(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            claim - timedelta(minutes=1),
+            done[tid] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+        )
+        assert stats.rejected_row_count == 0
+
+    def test_supplied_counts_compute_the_difference(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            claim - timedelta(minutes=1),
+            done[tid] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            unfiltered_progress_claim_counts={tid: 8},
+        )
+        assert stats.rejected_row_count == 7
+
+    def test_task_missing_from_counts_contributes_zero_not_a_spurious_rejection(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            claim - timedelta(minutes=1),
+            done[tid] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            unfiltered_progress_claim_counts={},
+        )
+        assert stats.rejected_row_count == 0
+
+    def test_sums_across_multiple_tasks_in_the_window(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        base = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        done: dict[str, datetime] = {}
+        claims: dict[str, list[datetime]] = {}
+        counts: dict[str, int] = {}
+        extras = (1, 2, 3)
+        for i, extra in enumerate(extras):
+            tid = f"E0-F1-S1-T{i + 1}"
+            claim_at = base + timedelta(hours=i)
+            done[tid] = claim_at + timedelta(minutes=10)
+            claims[tid] = [claim_at]
+            counts[tid] = 1 + extra
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            base - timedelta(minutes=1),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            unfiltered_progress_claim_counts=counts,
+        )
+        assert stats.rejected_row_count == sum(extras)
+
+    def test_negative_would_be_count_raises_assertion_error(self, tmp_path: Path) -> None:
+        """Documented invariant: the unfiltered candidate count can never be
+        smaller than the logger-filtered claim count it is drawn from."""
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        with pytest.raises(AssertionError):
+            _compute_window_stats(
+                log_path,
+                claim - timedelta(minutes=1),
+                done[tid] + timedelta(minutes=1),
+                done,
+                claims,
+                tasks_active=0,
+                unfiltered_progress_claim_counts={tid: 0},
+            )
+
+
+class TestGenerateReportSurfacesRejectedRowCount:
+    """Issue #329 FR-6 end-to-end: ``generate_report`` wires
+    ``EventIndex.task_transition_candidate_counts_for_workspace`` into every
+    ``_compute_window_stats`` call, so a cache holding a phantom pre-FR-1b
+    echo row surfaces the provenance suffix through the real report
+    pipeline, not just the unit-level helper."""
+
+    def test_phantom_cache_row_surfaces_the_suffix_in_the_rendered_report(self, tmp_path: Path) -> None:
+        from devbench.reporting.event_index import EventIndex
+
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-08-11T16:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-08-11T16:32:06Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with (
+            patch("devbench.reporting.report.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            idx = EventIndex.open(tmp_path)
+            try:
+                idx.refresh_orch_log_sources(tmp_path, log_file)
+                file_id = idx._conn.execute(
+                    "SELECT file_id FROM source_files WHERE path = ?", (str(log_file),)
+                ).fetchone()[0]
+                # Shaped exactly as pre-FR-1b ingestion would have written a
+                # devbench.cli echo of the same 'in-progress' transition.
+                idx._conn.execute(
+                    "INSERT INTO orch_log_events "
+                    "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                    (file_id, 999_999, 1_754_929_326_000_000, "devbench.cli", "E0-F1-S1-T1", "in-progress"),
+                )
+            finally:
+                idx.close()
+
+            report = generate_report(log_path=log_file)
+
+        assert "(1 non-transition rows rejected)" in report
+
+    def test_no_phantom_row_renders_without_the_suffix(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-08-11T16:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-08-11T16:32:06Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with (
+            patch("devbench.reporting.report.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            report = generate_report(log_path=log_file)
+
+        assert "non-transition rows rejected" not in report
+
+
 class TestGenerateReportThreadsSessionStarts:
     """FR-5: generate_report computes session_starts once and threads it
     into every _compute_window_stats call site so an operator-closed stale

@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from devbench.config_loader import RuntimeConfig
@@ -1381,15 +1381,45 @@ DRAFT_TEMPLATE: str = """\
 
 ## Definition of Done
 
-- [ ] All acceptance criteria checked
-- [ ] Tests green
-- [ ] Lint and format clean
-- [ ] Only files in Changes Manifest are staged with `git add`
+{definition_of_done}
 
 ## TDD Cycle Log
 
 ## Comments
 """
+
+
+_BASE_DEFINITION_OF_DONE: Final[tuple[str, ...]] = (
+    "All acceptance criteria checked",
+    "Tests green",
+    "Lint and format clean",
+    "Only files in Changes Manifest are staged with `git add`",
+)
+
+# Bug-fix-specific Definition of Done item (newly-reachable-paths gate). See
+# docs/newly-reachable-paths.md for the full rationale: a bug-fix task's DoD is
+# not satisfied by the original repro passing alone -- it also requires the
+# executor to enumerate and live-verify the code paths the fix newly makes
+# reachable. Auto-appended below whenever the proposed task is bug-fix-shaped
+# (see `_is_bug_fix_shaped`), so materialised drafts carry the requirement
+# before a human ever edits them.
+_NEWLY_REACHABLE_PATHS_DOD_ITEM: Final[str] = (
+    "Newly-reachable code paths enumerated and live-verified at smoke-test "
+    "level (not just re-confirmation of the original repro), logged via "
+    "[NEWLY_REACHABLE] -- see docs/newly-reachable-paths.md"
+)
+
+
+def _is_bug_fix_shaped(title: str) -> bool:
+    """Return True when *title* reads as a defect-correction task.
+
+    Heuristic only. `blocker-resolver.md`'s PROPOSAL EMISSION contract already
+    requires imperative titles ("Fix X", "Add Y", "Document Z"), so a title
+    starting with "Fix" is the cheapest reliable signal available at
+    materialisation time that the drafted task corrects a defect rather than
+    adding new capability.
+    """
+    return title.strip().lower().startswith("fix ")
 
 
 def generate_draft_md(
@@ -1416,6 +1446,10 @@ def generate_draft_md(
         if proposed.files_to_own
         else "| `TODO` | TODO -- describe change |"
     )
+    dod_items = list(_BASE_DEFINITION_OF_DONE)
+    if _is_bug_fix_shaped(proposed.title):
+        dod_items.append(_NEWLY_REACHABLE_PATHS_DOD_ITEM)
+    definition_of_done = "\n".join(f"- [ ] {item}" for item in dod_items)
     return DRAFT_TEMPLATE.format(
         task_id=proposed.suggested_id,
         title=proposed.title,
@@ -1428,6 +1462,7 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=manifest_lines,
+        definition_of_done=definition_of_done,
     )
 
 

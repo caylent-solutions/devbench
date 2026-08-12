@@ -140,7 +140,8 @@ Ask the operator for each sub-field:
 >   llm          -- LLM API call timeout [default: env DEVBENCH_LLM_TIMEOUT or 300]
 >   command      -- Shell command execution timeout [default: env DEVBENCH_COMMAND_TIMEOUT or 120]
 >   orchestrator_poll_interval -- Orchestrator polling interval [default: 10]
->   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]"
+>   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]
+>   orchestrator_inactivity -- Orchestrator SDK message inactivity timeout [default: env DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT or 1800]"
 
 Validate each provided value is a positive integer. Reject with:
 

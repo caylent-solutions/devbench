@@ -542,6 +542,7 @@ timeouts:
   command: 120
   orchestrator_poll_interval: 10
   github_check: 600
+  orchestrator_inactivity: 1800
 
 # Truncation and context limits
 limits:

@@ -130,9 +130,21 @@ timeouts:
   command: 120
   orchestrator_poll_interval: 10
   github_check: 600
+  orchestrator_inactivity: 1800
 ```
 
 Environment variable overrides are applied by `config.py` (not this module).
+
+**`orchestrator_inactivity`** (integer, seconds, default `1800`) -- FR-17 (issues
+db-262 / db-325). Bounds how long `devbench start`'s `_run` SDK message loop
+will await the next message (`agen.__anext__()`) before treating the session
+as hung. On expiry the loop raises `_OrchestrateInactivityTimeout`, which
+`_drive_orchestrate_with_quota_resume` disposes as a bounded fresh-session
+restart (reusing the same cap enforced by `DEVBENCH_MAX_QUOTA_RESUMES`) rather
+than idling forever. Overridden at runtime by the
+`DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT` environment variable; the code
+default lives in `DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS`
+(`src/devbench/constants.py`).
 
 ---
 

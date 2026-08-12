@@ -267,6 +267,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a fail-safe cap. See `docs/quota-handling.md` and
   `docs/adr/24-quota-wait-and-resume.md`.
 
+- **Orchestrator inactivity net and cooperative SDK teardown** (FR-17,
+  issues db-262 / db-325). `devbench start`'s `_run` SDK message loop
+  no longer idles forever on a wound-down turn with no terminal
+  sentinel (an observed hang ran 2h24m before this fix): the loop now
+  awaits `agen.__anext__()` under a bounded `asyncio.wait_for`, and a
+  stall raises a new `_OrchestrateInactivityTimeout` sentinel that
+  `_drive_orchestrate_with_quota_resume` disposes as a bounded
+  fresh-session restart, reusing the same cap as
+  `DEVBENCH_MAX_QUOTA_RESUMES` -- never a stateful `ClaudeSDKClient`
+  continuation. The wait window is configurable via the new
+  `timeouts.orchestrator_inactivity` key in
+  `backlog/config/devbench.yaml` and the
+  `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT` environment variable,
+  defaulting to the new `DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS`
+  constant (1800 seconds). A `finally: await agen.aclose()` around the
+  loop (db-325) guarantees cooperative teardown before a quota or
+  inactivity sentinel unwinds, so `aclose()` is never invoked while
+  the generator is still running and the CLI subprocess is never
+  orphaned.
+
 ### Removed
 
 - **`sdk_teardown_filter` workaround module removed** (issues #232, #231).

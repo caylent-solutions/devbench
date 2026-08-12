@@ -229,6 +229,7 @@ from devbench.constants import (
     FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    INSTALL_PARITY_SHORT_REVISION_CHARS,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_ONLY_TDD_PHASES,
@@ -295,7 +296,7 @@ from devbench.quota import (
 # the banner is implemented there and reporting must not depend on cli.py. See
 # the ``__all__``-vs-self-aliased-``as`` rationale above the
 # ``devbench.backlog.manager`` re-export block.
-from devbench.reporting.report import _format_duration, read_all_drain_states
+from devbench.reporting.report import _format_duration, install_parity_line, read_all_drain_states
 from devbench.scope import (
     InvalidScopeError,
     ScopeFilter,
@@ -671,6 +672,14 @@ def cmd_status(*argv: str) -> int:
     in canonical order: auto-clearing, amendment-recovery, dependency, held,
     blocked-on-held, operator-required), and held (every Hold Task with
     the most recent ``[HOLD]`` reason from its Comments).
+
+    Immediately after the drain banner, renders the harness/target
+    install-parity row (issue #301 FR-4) via
+    :func:`~devbench.reporting.report.install_parity_line` -- the same
+    function ``devbench report`` uses -- omitted entirely when the
+    workspace is not self-hosting, and degraded to a single
+    ``Install parity   unavailable: <reason>`` line (rest of the status
+    still rendered) when the resolver fails.
     """
     parsed = _parse_status_argv(argv)
     if parsed.exit_code != 0:
@@ -684,6 +693,18 @@ def cmd_status(*argv: str) -> int:
         _render_scope_banner(scope.include, scope.exclude, scope.started_at)
 
     _render_drain_banner(WORKSPACE_ROOT)
+
+    # Harness/target install-parity row (issue #301 FR-4, AC-FIX-003..005).
+    # Reuses ``report.install_parity_line()`` verbatim -- the same function
+    # ``devbench report`` renders -- so the two surfaces cannot disagree
+    # about whether the harness install is behind. Rendered only when
+    # non-None: ``None`` means the configured workspace is not self-hosting
+    # (AC-FIX-004), and a resolver failure degrades to a single
+    # ``unavailable: <reason>`` line rather than aborting the rest of the
+    # status render (AC-FIX-005).
+    install_parity_row = install_parity_line()
+    if install_parity_row is not None:
+        print(install_parity_row)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     try:
@@ -8662,12 +8683,6 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
         )
 
 
-# Issue #301 FR-3: number of leading characters used for the short-form
-# revision shown in the parity gate's log line and refusal message,
-# matching git's own default abbreviated-SHA length.
-_INSTALL_PARITY_SHORT_REVISION_CHARS: int = 7
-
-
 def _check_install_parity() -> int | None:
     """Refuse ``start`` when the harness install is behind a self-hosted target.
 
@@ -8708,8 +8723,8 @@ def _check_install_parity() -> int | None:
     target = parity.target
     harness_branch = harness.branch or "detached HEAD"
     target_branch = target.branch or "detached HEAD"
-    harness_short = harness.revision[:_INSTALL_PARITY_SHORT_REVISION_CHARS]
-    target_short = target.revision[:_INSTALL_PARITY_SHORT_REVISION_CHARS]
+    harness_short = harness.revision[:INSTALL_PARITY_SHORT_REVISION_CHARS]
+    target_short = target.revision[:INSTALL_PARITY_SHORT_REVISION_CHARS]
 
     if parity.in_sync:
         logger.info(

@@ -363,6 +363,28 @@ Below the Status Summary, one row per work unit:
 
 The `File Path` column must be a path relative to `DEVBENCH_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
+### Task-row file-path policy (db-279)
+
+Only Task rows are required to name a file path. Epic, Feature, and Story
+rows may leave the `File Path` cell empty -- those rows are scaffolding-only
+and have no corresponding leaf work-unit file. The index parser and
+`validate-backlog` enforce this identical contract, each with its own error
+surface, so a file-less Task row can never pass one layer and crash the
+other:
+
+- `parse_index` (`src/devbench/backlog/parser.py`) infers each row's type
+  from its ID via `_infer_type_from_id`. When the `File Path` cell is empty
+  it raises `ValueError(f"Task work unit '{raw_id}' has no file path in
+  BACKLOG.md")` for a Task row, and otherwise `continue`s past a file-less
+  Epic/Feature/Story row without error.
+- `BacklogManager.validate()` runs the dedicated check
+  `_check_task_rows_have_files` (`src/devbench/backlog/manager.py`), which
+  uses the same `_is_task_id` idiom other Task-only rules use to append the
+  error `"<id>: Task-level work unit has no file path in BACKLOG.md --
+  every Task row must name a materialised work-unit file"` for a file-less
+  Task row, while skipping non-Task rows (including Status-Summary Epic
+  rows and the `**TOTAL**` row) without any special-casing.
+
 ### Managed removal (db-303)
 
 `devbench remove <id> --reason "<message>"` is the managed path for dropping a superseded work unit entirely -- it is the only sanctioned way to make a unit disappear from the index (as opposed to `decline`, which keeps the unit visible with a terminal `declined` status). `BacklogManager.remove_unit` runs the whole operation under a single `flock(BACKLOG.lock)` so a concurrent devbench session can never interleave a partial removal with another write:

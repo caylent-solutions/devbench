@@ -759,6 +759,18 @@ the LATER Task's Manifest declares the file even if the EARLIER Task created
 it (the later Task's edit IS the change git records when its branch is
 staged).
 
+**The dependency-edge contract (#330 FR-1).** The serial-dep chain this rule
+scans is read exclusively from each Task's `## Dependencies` table -- an
+audit-comment marker alone never satisfies it. `uv run devbench add-dep
+<blocked-task-id> <blocker-task-id>` is the canonical tool that writes the
+row this rule reads: it appends a canonical `## Dependencies` row to
+`<blocked-task-id>`'s work-unit file, in addition to (not instead of) the
+separate `[BLOCKED_PENDING_PROPOSAL]` marker consumed by the unrelated
+ADR-07 auto-requeue cascade (see
+[ADR-07](adr/07-auto-requeue-on-proposal-completion.md)). See
+[`add-dep`](cli-reference.md#add-dep) for the exit-code contract that
+governs whether the call actually produced a row this rule can see.
+
 ### Why
 
 When two HARD claimants of one path have no ordering dependency, the

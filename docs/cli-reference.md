@@ -1585,6 +1585,15 @@ Output JSON:
 }
 ```
 
+**Exit codes (#330 FR-2):**
+
+| Outcome | rc | `wired` |
+|---------|----|---------|
+| A `## Dependencies` row for `<blocker-task-id>` is validator-visible on `<blocked-task-id>`'s file as of this call (newly written or already present on a repeat call). | 0 | `true` |
+| Any Fail-fast precondition above is not met (bad ID format, blocked/blocker not found, blocker terminal, self-wire, unreadable file, missing `## Dependencies` section) -- no row could be written. | 1 | `false` |
+
+The exit code is what a script should branch on, not the printed `WARNING:` status line: the warning fires only on the soft, non-fatal "not currently blocked" case above and never changes the exit code, while every `wired: false` outcome exits non-zero with `reason` populated on the same JSON payload (same keys as the success path).
+
 ### `reject-proposal`
 
 ```

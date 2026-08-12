@@ -77,6 +77,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   deferred. `docs/cli-reference.md`, `docs/manual-blockers.md`, and
   `docs/cross-backlog-dependencies.md` document the corrected contract.
 
+### Changed
+
+- **Dependabot PRs #216 (`idna`) and #179 (`urllib3`) reconfirmed already
+  superseded on current `main`; GitHub closure stays deferred to the
+  batch-PR merge** (`spec/dep-remedy-and-dependency-currency.md` FR-4,
+  Section 8). Both targets' floors (`idna` >= 3.15, `urllib3` >= 2.7.0)
+  are already exceeded by the locked `idna` 3.18 and `urllib3` 2.7.0,
+  landed in the 0.4.0 release by task E6-F1-S1-T2 (`uv lock
+  --upgrade-package idna --upgrade-package urllib3`, commit
+  `4338773`). `uv lock --dry-run` reports zero lockfile changes on
+  current `main`, so re-running the bump would require hand-editing
+  `uv.lock` or moving an unrelated pin, both forbidden by spec decision
+  D-4; the task that would have re-landed the bump (E14-F2-S1-T1) is
+  therefore declined as already-satisfied rather than re-doing a
+  resolution with no unresolved constraint left to satisfy. `make
+  validate` re-confirms the full suite is green at or above the 98%
+  coverage floor on the current lock. Closing #216 and #179 on GitHub
+  remains deferred until the single batch PR carrying `feat/bug-closure`
+  merges to `main`, matching the posture already recorded for this
+  identical PR pair.
+
 ## [0.4.0] -- 2026-08-12
 
 ### Changed (model defaults)

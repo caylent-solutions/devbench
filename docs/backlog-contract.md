@@ -363,6 +363,21 @@ Below the Status Summary, one row per work unit:
 
 The `File Path` column must be a path relative to `DEVBENCH_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
+### Managed removal (db-303)
+
+`devbench remove <id> --reason "<message>"` is the managed path for dropping a superseded work unit entirely -- it is the only sanctioned way to make a unit disappear from the index (as opposed to `decline`, which keeps the unit visible with a terminal `declined` status). `BacklogManager.remove_unit` runs the whole operation under a single `flock(BACKLOG.lock)` so a concurrent devbench session can never interleave a partial removal with another write:
+
+1. Deletes the `<id>` row from the `BACKLOG.md` index (`_remove_backlog_index_row`). If no row matches `<id>`, a `ValueError` is raised *before* any file is touched, so a typo can never delete an unrelated unit or leave the index and the work-unit file out of sync.
+2. Deletes the work-unit `.md` file from disk.
+3. Re-rolls the `## Status Summary` table (`_update_status_summary`) so the per-epic counts reflect the removal immediately.
+4. Appends a `[WU_REMOVED] <id> -- <reason>` line to the workspace audit log, using the same timestamped-append shape as the `[BULK_STATUS_UPDATE]` row.
+
+`--reason` is REQUIRED (the CLI refuses with rc=1 and no write when it is missing) so the removal always leaves an audit trail, and em-dashes in the reason text are rejected at the input boundary per the workspace's em-dash hygiene rule. An unknown `<id>` fails fast with rc=1 before any file is touched -- there is no partial-removal state to recover from.
+
+### Block-by-default raw-edit guard on BACKLOG.md
+
+`BACKLOG.md` is normally written only by managed verbs (`devbench remove`/`set-status`/`decline`/`mark-done`/`hold`/`unhold`/...), which write through Python I/O -- not the Claude Code `Write`/`Edit` tools -- so they never reach the PreToolUse hook layer. A raw `Write`/`Edit` to `BACKLOG.md` (at the workspace root or nested) bypasses `flock(BACKLOG.lock)`, the Status-Summary rollup, and the audit trail, so `guard-work-unit-write.sh` blocks it by default with exit 2. The operator override is `DEVBENCH_ALLOW_BACKLOG_EDIT=1` (modeled on `DEVBENCH_ALLOW_DESTRUCTIVE_GIT=1`), which the hook accepts only as the exact literal string `1` -- no truthy-string fallback (`true`, `yes`, etc. still block) -- for a one-off hand-repair. This guard is independent of the `DEVBENCH_AGENT_ROLE` caller-role check that governs writes to individual work-unit `.md` files under `backlog/`; see [architecture.md](architecture.md#9-hooks-layer) for that mechanism.
+
 ---
 
 ## Work Unit File Structure

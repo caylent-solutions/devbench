@@ -508,6 +508,26 @@ uv run devbench unhold <id> --reason "<message>"
 
 Return a held work unit to `in-queue`. Refuses any unit whose current status is anything other than `hold` (fail-fast keeps the lifecycle linear -- use `set-status` for ad-hoc transitions). The `--reason` is REQUIRED and captured as `[UNHOLD] <reason>` in the Comments section, so a hold-then-unhold round-trip is fully reconstructible from the audit trail.
 
+### `remove`
+
+```
+uv run devbench remove <id> --reason "<message>"
+```
+
+Remove a work unit through the managed path (db-303): deletes the work-unit `.md` file and its `BACKLOG.md` index row under a single `flock(BACKLOG.lock)`, re-rolls the `## Status Summary` table, and appends a `[WU_REMOVED] <id> -- <reason>` line to the workspace audit log (`BacklogManager.remove_unit`). Unlike `decline`, which keeps a unit visible with a terminal `declined` status, `remove` is the managed path to make a superseded unit disappear from the backlog entirely. `BACKLOG.md` is otherwise protected by `guard-work-unit-write.sh`: a raw `Write`/`Edit` to it is blocked by default (see [architecture.md](architecture.md#9-hooks-layer)) unless the operator sets `DEVBENCH_ALLOW_BACKLOG_EDIT=1`, so `remove` -- which writes through Python I/O, not the `Write`/`Edit` tools -- is the normal path to drop a unit.
+
+The `--reason` is REQUIRED (rc=1 with no write when missing); em-dashes in the reason text are rejected at the input boundary, same as `hold`/`unhold`/`decline`. An unknown `<id>` fails fast with rc=1 before any file is touched -- the index row is only deleted after the id is confirmed to exist, and the row delete itself raises before the work-unit file delete runs, so there is no partial-removal state.
+
+**Exit codes:**
+
+| Scenario | rc |
+|----------|-----|
+| Unit removed successfully | 0 |
+| `<id>` or `--reason` missing | 1 |
+| `--reason` flag present with no value | 1 |
+| Em-dash detected in reason text | 1 |
+| `<id>` not found in `BACKLOG.md` | 1 |
+
 ### `promote`
 
 ```

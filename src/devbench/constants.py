@@ -1086,3 +1086,8 @@ SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"
 # invariant a config key would let an operator silently widen to nothing and
 # re-disable the gate.
 ORCHESTRATOR_SOURCE_PREFIX: str = "src/devbench/"
+
+# Shared install-parity short-revision / git-abbrev length (git short-hash
+# character count) consumed by every module that displays or compares
+# abbreviated revisions for the harness/target install-parity gate.
+INSTALL_PARITY_SHORT_REVISION_CHARS: int = 7

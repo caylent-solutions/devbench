@@ -116,15 +116,21 @@ class TestGuardWorkUnitWriteHook:
             "src/devbench/config.py",
             "tests/unit/test_something.py",
             "README.md",
-            "BACKLOG.md",
-            "/workspace/BACKLOG.md",
             "docs/architecture.md",
             "/home/user/plugin/devbench-orchestrate/scripts/guard-bash.sh",
             "plugin/devbench-orchestrate/hooks/hooks.json",
         ],
     )
     def test_non_backlog_file_paths_are_allowed(self, file_path: str) -> None:
-        """AC-3: Non-backlog file paths exit 0 (allowed)."""
+        """AC-3: Non-backlog file paths exit 0 (allowed).
+
+        BACKLOG.md is intentionally NOT in this list: db-303 (E12-F1-S2-T1,
+        spec 4.A / FR-16) flipped the previously-unconditional BACKLOG.md
+        carve-out to block-by-default (escape hatch:
+        DEVBENCH_ALLOW_BACKLOG_EDIT=1). See
+        ``tests/test_plugin/test_guard_backlog_write.py`` for the dedicated
+        BACKLOG.md block/override coverage.
+        """
         payload = _make_write_payload(file_path)
         result = _run_hook(payload)
         assert result.returncode == 0, (

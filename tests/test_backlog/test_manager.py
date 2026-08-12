@@ -327,6 +327,114 @@ class TestMarkHeldAndUnheld:
         assert "input received" in wu_content
 
 
+class TestRemoveUnit:
+    """db-303 (E12-F1-S2-T1): the managed ``remove`` verb (spec 4.A, FR-16).
+
+    ``remove_unit`` deletes the work-unit file and its BACKLOG.md index row
+    under a single ``flock_backlog``, re-rolls the Status Summary, and
+    appends a ``[WU_REMOVED] <id> -- <reason>`` line to the workspace audit
+    log. An unknown id fails fast with ``ValueError`` before any file is
+    touched.
+    """
+
+    def test_remove_unit_deletes_file_and_index_row_under_flock(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "logs" / "removals.log"
+        manager = BacklogManager()
+        manager.remove_unit(
+            tmp_work_unit_file,
+            backlog_index_titlecase,
+            "E0-F1-S1-T1",
+            "superseded by E0-F1-S1-T9",
+            audit_log_path,
+        )
+
+        # (1) the work-unit file is deleted.
+        assert not tmp_work_unit_file.exists()
+
+        # (2) the BACKLOG.md index row for the removed unit is gone, while
+        # sibling rows are untouched. Matched on the row's own ID cell (not
+        # a bare substring check) since E0-F1-S1-T1 also appears in T2's
+        # Dependencies column.
+        index_content = backlog_index_titlecase.read_text()
+        assert not any(line.strip().startswith("| E0-F1-S1-T1 |") for line in index_content.splitlines())
+        assert any(line.strip().startswith("| E0-F1-S1-T2 |") for line in index_content.splitlines())
+        assert any(line.strip().startswith("| E0-F1-S1-T3 |") for line in index_content.splitlines())
+
+        # (3) the Status Summary section was re-rolled.
+        assert "## Status Summary" in index_content
+
+        # (4) the workspace audit log has the [WU_REMOVED] line.
+        audit_content = audit_log_path.read_text()
+        assert "[WU_REMOVED] E0-F1-S1-T1 -- superseded by E0-F1-S1-T9" in audit_content
+
+    def test_remove_unit_unknown_id_raises(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "logs" / "removals.log"
+        manager = BacklogManager()
+
+        with pytest.raises(ValueError, match=r"remove: work unit 'NO-SUCH-ID' not found in BACKLOG\.md"):
+            manager.remove_unit(
+                tmp_work_unit_file,
+                backlog_index_titlecase,
+                "NO-SUCH-ID",
+                "typo",
+                audit_log_path,
+            )
+
+        # Nothing was deleted: the WU file and its index row survive, and no
+        # audit line was ever written.
+        assert tmp_work_unit_file.exists()
+        assert "E0-F1-S1-T1" in backlog_index_titlecase.read_text()
+        assert not audit_log_path.exists()
+
+    def test_remove_unit_creates_audit_log_parent_directories(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "nested" / "does" / "not" / "exist" / "removals.log"
+        manager = BacklogManager()
+        manager.remove_unit(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "cleanup", audit_log_path)
+
+        assert audit_log_path.exists()
+        assert "[WU_REMOVED] E0-F1-S1-T1 -- cleanup" in audit_log_path.read_text()
+
+    def test_remove_unit_appends_to_existing_audit_log(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "logs" / "removals.log"
+        audit_log_path.parent.mkdir(parents=True)
+        audit_log_path.write_text("[2020-01-01 00:00 UTC] [WU_REMOVED] E9-F1-S1-T1 -- earlier removal\n")
+
+        manager = BacklogManager()
+        manager.remove_unit(
+            tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "second removal", audit_log_path
+        )
+
+        content = audit_log_path.read_text()
+        assert "E9-F1-S1-T1 -- earlier removal" in content
+        assert "[WU_REMOVED] E0-F1-S1-T1 -- second removal" in content
+
+    def test_remove_backlog_index_row_raises_when_index_missing(self, tmp_path: Path) -> None:
+        manager = BacklogManager()
+        missing_index = tmp_path / "does-not-exist" / "BACKLOG.md"
+        with pytest.raises(FileNotFoundError, match="Backlog index not found"):
+            manager._remove_backlog_index_row(missing_index, "E0-F1-S1-T1")
+
+
 class TestRollupParentStatus:
     """Test that marking the last child Done rolls up to parent."""
 

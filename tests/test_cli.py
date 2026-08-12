@@ -10694,6 +10694,113 @@ class TestCmdUnhold:
         assert "unhold" in cli._VARIADIC_COMMANDS
 
 
+class TestCmdRemove:
+    """db-303 (E12-F1-S2-T1): ``devbench remove <id> --reason <text>``.
+
+    Deletes the work-unit file and its BACKLOG.md index row through the
+    managed path (``BacklogManager.remove_unit``), so a superseded unit no
+    longer requires a hand-edit that races the flock and desynchronises the
+    Status Summary.
+    """
+
+    def _make_minimal_unit(self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1") -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | in-queue | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        return backlog_md, wu_file
+
+    def test_cmd_remove_end_to_end(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, wu_file = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_remove("EX-F1-S1-T1", "--reason", "superseded by EX-F1-S1-T9")
+        assert rc == 0
+        assert not wu_file.exists()
+        assert "EX-F1-S1-T1" not in backlog_md.read_text()
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {
+            "task_id": "EX-F1-S1-T1",
+            "status": "removed",
+            "reason": "superseded by EX-F1-S1-T9",
+        }
+        audit_content = (tmp_path / "logs" / "bulk-updates.log").read_text()
+        assert "[WU_REMOVED] EX-F1-S1-T1 -- superseded by EX-F1-S1-T9" in audit_content
+
+    def test_cmd_remove_requires_reason(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_remove("EX-F1-S1-T1")
+        assert rc == 1
+        assert "requires" in capsys.readouterr().err
+
+    def test_reason_without_value_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_remove("EX-F1-S1-T1", "--reason")
+        assert rc == 1
+        assert "requires a value" in capsys.readouterr().err
+
+    def test_em_dash_in_reason_blocked(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_remove("EX-F1-S1-T1", "--reason", "bad—reason")
+        assert rc == 1
+        assert "em-dash" in capsys.readouterr().err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_remove("NO-SUCH-ID", "--reason", "n/a")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_wu_file_not_found_on_disk_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The unit is present in the (mocked) parsed index (so ``_find_unit`` succeeds) but its
+        work-unit file was never written to disk -- ``_resolve_unit_file`` returns ``None`` and
+        remove must reject rather than raise."""
+        unit_id = "EX-F1-S1-T9"
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        unit = WorkUnit(
+            id=unit_id,
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_remove(unit_id, "--reason", "n/a")
+        assert rc == 1
+        assert "Work unit file not found" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "remove" in cli._COMMANDS
+
+    def test_is_variadic_so_multi_token_reason_reaches_handler(self) -> None:
+        assert "remove" in cli._VARIADIC_COMMANDS
+
+
 class TestCmdPromote:
     """E1-F4-S1-T1: ``devbench promote <id>`` transitions draft -> in-queue."""
 

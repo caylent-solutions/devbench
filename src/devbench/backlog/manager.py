@@ -591,6 +591,100 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
         self._append_comment(work_unit_path, "UNHOLD", reason)
 
+    def remove_unit(
+        self,
+        work_unit_path: Path,
+        backlog_index: Path,
+        unit_id: str,
+        reason: str,
+        audit_log_path: Path,
+    ) -> None:
+        """Remove a work unit through the managed path (db-303, spec 4.A, FR-16).
+
+        Runs under a single ``flock(BACKLOG.lock)`` so a concurrent devbench
+        session cannot interleave a partial removal with another write.
+        Deletes the ``unit_id`` row from the BACKLOG.md index first --
+        :meth:`_remove_backlog_index_row` raises ``ValueError`` before any
+        file is touched when no row matches, so a typo can never delete an
+        unrelated unit -- then deletes the work-unit ``.md`` file, re-rolls
+        the ``## Status Summary`` table via :meth:`_update_status_summary`,
+        and appends a ``[WU_REMOVED] <id> -- <reason>`` line to
+        *audit_log_path* using the same timestamped-append shape as
+        :meth:`bulk_set_status`'s ``[BULK_STATUS_UPDATE]`` row.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file to delete.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier to remove.
+            reason: Human-readable rationale for the removal, captured
+                verbatim in the ``[WU_REMOVED]`` audit line.
+            audit_log_path: Path where the ``[WU_REMOVED]`` audit row is
+                appended. The file and its parent directories are created
+                when absent.
+
+        Raises:
+            ValueError: No BACKLOG.md row matches ``unit_id``. Nothing is
+                deleted.
+            FileNotFoundError: ``backlog_index`` does not exist, or
+                ``work_unit_path`` does not exist on disk.
+            TimeoutError: The BACKLOG.lock could not be acquired within the
+                default timeout.
+            OSError: An unexpected OS error from ``fcntl.flock`` or file I/O.
+        """
+        workspace_root = backlog_index.parent
+
+        with flock_backlog(workspace_root):
+            self._remove_backlog_index_row(backlog_index, unit_id)
+            work_unit_path.unlink()
+            self._update_status_summary(backlog_index)
+
+            audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+            audit_row = f"[{timestamp}] [WU_REMOVED] {unit_id} -- {reason}\n"
+            with audit_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(audit_row)
+
+        self.logger.info("Removed work unit %s (reason: %s)", unit_id, reason)
+
+    def _remove_backlog_index_row(self, backlog_index: Path, unit_id: str) -> None:
+        """Delete ``unit_id``'s row from the BACKLOG.md index table.
+
+        Mirrors :meth:`_update_backlog_index`'s row-match algorithm (the
+        row's first cell, ``cells[1]``, matched exactly against
+        ``unit_id``) but removes the matched line entirely instead of
+        rewriting a status cell within it.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier whose row is removed.
+
+        Raises:
+            FileNotFoundError: ``backlog_index`` does not exist.
+            ValueError: No row in the index matches ``unit_id``.
+        """
+        if not backlog_index.exists():
+            raise FileNotFoundError(f"Backlog index not found: {backlog_index}")
+
+        content = backlog_index.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        new_lines: list[str] = []
+        removed = False
+
+        for line in lines:
+            if not removed and line.strip().startswith("|"):
+                cells = line.split("|")
+                row_id = cells[1].strip() if len(cells) > 1 else ""
+                if row_id == unit_id:
+                    removed = True
+                    continue
+            new_lines.append(line)
+
+        if not removed:
+            raise ValueError(f"remove: work unit '{unit_id}' not found in BACKLOG.md")
+
+        atomic_write_text(backlog_index, "\n".join(new_lines) + "\n")
+        self.logger.info("Removed %s row from %s", unit_id, backlog_index.name)
+
     def bulk_set_status(
         self,
         unit_ids: list[tuple[str, Path]],

@@ -2741,6 +2741,52 @@ def cmd_unhold(*argv: str) -> int:
     return 0
 
 
+def cmd_remove(*argv: str) -> int:
+    """Remove a work unit through the managed path (db-303, spec 4.A, FR-16).
+
+    Usage::
+
+        remove <id> --reason "<message>"
+
+    Deletes the work-unit ``.md`` file and its BACKLOG.md index row under a
+    single ``flock(BACKLOG.lock)``, re-rolls the Status Summary, and appends
+    a ``[WU_REMOVED] <id> -- <reason>`` line to the workspace audit log
+    (``BacklogManager.remove_unit``). ``BACKLOG.md`` is otherwise protected
+    by ``guard-work-unit-write.sh``: a raw Edit/Write is blocked unless the
+    operator sets ``DEVBENCH_ALLOW_BACKLOG_EDIT=1``, so this managed verb --
+    which writes through Python I/O, not the Edit/Write tools -- is the
+    normal path to drop a superseded unit. The ``--reason`` is REQUIRED so
+    the removal leaves an audit trail; em-dashes are rejected at the input
+    boundary. An unknown ``<id>`` fails fast before any file is touched.
+    """
+    parsed = _parse_id_and_reason(argv, "remove")
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason = parsed
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    audit_log_path = WORKSPACE_ROOT / RUNTIME_CONFIG.backlog.bulk_update_audit_path
+    try:
+        BacklogManager().remove_unit(wu_file, BACKLOG_INDEX, task_id, reason, audit_log_path)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    logger.info("Removed %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "removed", "reason": reason}))
+    return 0
+
+
 def cmd_promote(*argv: str) -> int:
     """Transition one or more work units from ``draft`` to ``in-queue``.
 
@@ -11617,6 +11663,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "unhold <id> --reason <message>. Refuses units not currently on hold."
         ),
     ),
+    "remove": (
+        cmd_remove,
+        2,
+        (
+            "Remove a work unit through the managed path: remove <id> --reason <message> "
+            "(deletes the WU file + BACKLOG.md index row under flock, re-rolls the Status "
+            "Summary, and audits [WU_REMOVED]; db-303)"
+        ),
+    ),
     "promote": (
         cmd_promote,
         0,
@@ -11952,6 +12007,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "green-green-check",
         "hold",
         "unhold",
+        # db-303 (E12-F1-S2-T1): --reason <message> is multi-token like hold/unhold/decline.
+        "remove",
         "status",
         "new-task",
         "reject-proposal",

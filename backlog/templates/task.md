@@ -2,6 +2,36 @@
 
 ## Status: in-queue
 
+## Task Type: behavior-fix
+
+<!--
+  Optional section. If omitted entirely, this task DEFAULTS to
+  `behavior-fix` -- the strictest type -- under validate-backlog rule 21
+  (FR-4.1); omitting the section is never an escape hatch from the RED
+  gate. This scaffolding template always writes `behavior-fix` explicitly
+  so the default and the explicit declaration agree for newly created
+  tasks. Terminal tasks (`done` / `declined`) are skipped by rule 21
+  regardless of whether this section is present.
+
+  One of six values. Five carry a machine-checked Changes Manifest
+  invariant enforced by `validate-backlog` (FR-4.1); `refactor`'s
+  green-green requirement is NOT YET machine-checked (deferred to
+  E4-F4-S1-T2) and is a TDD-cycle-log concern today, not a static
+  Manifest-shape check:
+
+  - `behavior-fix` -- RED-gated; Manifest needs >= 1 production-source row.
+  - `feature`      -- RED-gated; Manifest needs >= 1 production-source row.
+  - `test-only`    -- exempt from the RED gate; every Manifest row must be a test path.
+  - `refactor`     -- exempt from the RED gate; requires green-green (tests pass before
+                       AND after), no AC text change -- not yet machine-checked by
+                       validate-backlog (see E4-F4-S1-T2).
+  - `docs`         -- exempt; every Manifest row must be documentation/markdown.
+  - `chore`        -- exempt; every Manifest row must be dependency/config/lockfile.
+
+  See docs/backlog-contract.md "Task-Type Taxonomy" for the full invariant
+  table, the default-when-absent rule, and the exact failure-message shapes.
+-->
+
 ## Target Repository
 
 - **Repo:** `{{REPO}}`

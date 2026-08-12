@@ -3371,6 +3371,124 @@ class TestHasRuntimeDegradationSignal:
         assert _has_runtime_degradation_signal(source, datetime(2026, 5, 1, tzinfo=UTC)) is False
 
 
+class TestRuntimeDegradationCommentRegressionSemantics:
+    """AC-E4-F1-S1-T2-67: post-flatten (ADR-33) review-supervisor no longer
+    runs a Step 0 self-check, so a healthy run must never emit the
+    ``agent-tool-unavailable`` / ``review-supervisor...only Bash`` payload
+    this classifier bucket matches on. The source comment and docstring
+    must describe a firing match as a topology REGRESSION signal, not a
+    transient condition an operator restart can clear -- while the regex
+    pattern itself (and its matching behaviour) stays byte-for-byte
+    unchanged.
+    """
+
+    def test_comment_documents_regression_not_transient_degradation(self) -> None:
+        """The module-level comment above ``_RUNTIME_DEGRADATION_BODY_RE``
+        must describe a match as a regression signal (something that
+        should not happen post-flatten), not as an expected transient
+        degradation an operator restart routinely clears.
+        """
+        import inspect
+
+        lines = inspect.getsource(proposal_mod).splitlines()
+        marker_line = next(i for i, line in enumerate(lines) if line.startswith("_RUNTIME_DEGRADATION_BODY_RE"))
+        comment_lines: list[str] = []
+        cursor = marker_line - 1
+        while cursor >= 0 and lines[cursor].lstrip().startswith("#"):
+            comment_lines.insert(0, lines[cursor])
+            cursor -= 1
+        comment_text = "\n".join(comment_lines).lower()
+        assert "regression" in comment_text, (
+            "the comment above _RUNTIME_DEGRADATION_BODY_RE must document that a match "
+            "signals a topology regression post-flatten (ADR-33), not routine transient "
+            "degradation"
+        )
+
+    def test_docstring_documents_regression_not_transient_degradation(self) -> None:
+        """``_has_runtime_degradation_signal``'s docstring must be updated
+        to the same regression-signal semantics as the comment above the
+        pattern it matches against.
+        """
+        from devbench.backlog.proposal import _has_runtime_degradation_signal
+
+        docstring = (_has_runtime_degradation_signal.__doc__ or "").lower()
+        assert "regression" in docstring, (
+            "_has_runtime_degradation_signal's docstring must document that a match "
+            "signals a topology regression post-flatten (ADR-33), not review-supervisor's "
+            "(now-removed) Step 0 self-check"
+        )
+
+    def test_pattern_source_unchanged_still_matches_historical_self_check_phrasing(self) -> None:
+        """The regex pattern's source string must be byte-for-byte
+        unchanged: only the surrounding comment/docstring prose may
+        change, per the work unit's scope boundary. Historical
+        self-check phrasing (from before the flatten) must still match,
+        since old audit rows already on disk must still classify.
+        """
+        from devbench.backlog.proposal import _RUNTIME_DEGRADATION_BODY_RE
+
+        assert _RUNTIME_DEGRADATION_BODY_RE.pattern == r"agent-tool-unavailable|review-supervisor[^\n]*only\s+Bash"
+        assert _RUNTIME_DEGRADATION_BODY_RE.search("agent-tool-unavailable") is not None
+        assert _RUNTIME_DEGRADATION_BODY_RE.search("review-supervisor has only Bash available") is not None
+
+    def test_pattern_does_not_fire_on_unrelated_blocked_body(self, tmp_path: Path) -> None:
+        """A [BLOCKED] audit unrelated to the (now-removed) self-check
+        payload must not match -- the pattern's scope must stay narrow
+        even though its documented meaning changed.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _has_runtime_degradation_signal
+
+        source = tmp_path / "wu.md"
+        source.write_text(
+            "## Comments\n[2026-05-01 00:00 UTC] [agent/executor] [BLOCKED] waiting on dependency E1-F1-S1-T9\n",
+            encoding="utf-8",
+        )
+        assert _has_runtime_degradation_signal(source, datetime(2026, 5, 1, 1, tzinfo=UTC)) is False
+
+    def test_enum_member_comment_documents_regression_not_transient_degradation(self) -> None:
+        """The comment above ``BlockedTaskState.RUNTIME_DEGRADATION`` itself
+        (not just the comment above the regex further down the module)
+        must describe a match as a topology regression, not a transient
+        runtime condition a ``make start`` restart routinely clears.
+        """
+        import inspect
+
+        from devbench.backlog.proposal import BlockedTaskState
+
+        lines = inspect.getsource(BlockedTaskState).splitlines()
+        marker_line = next(i for i, line in enumerate(lines) if line.strip().startswith("RUNTIME_DEGRADATION"))
+        comment_lines: list[str] = []
+        cursor = marker_line - 1
+        while cursor >= 0 and lines[cursor].lstrip().startswith("#"):
+            comment_lines.insert(0, lines[cursor])
+            cursor -= 1
+        comment_text = "\n".join(comment_lines).lower()
+        assert "regression" in comment_text, (
+            "the comment above BlockedTaskState.RUNTIME_DEGRADATION must document that a "
+            "match signals a topology regression post-flatten (ADR-33), not routine "
+            "transient degradation a restart clears"
+        )
+
+    def test_classify_blocked_task_docstring_documents_regression_semantics(self) -> None:
+        """``classify_blocked_task``'s priority-0 docstring bullet must be
+        updated to the same regression-signal semantics as the module
+        comment and ``_has_runtime_degradation_signal``'s docstring.
+        """
+        from devbench.backlog.proposal import classify_blocked_task
+
+        docstring = (classify_blocked_task.__doc__ or "").lower()
+        priority_0_start = docstring.index("0. ``runtime_degradation``")
+        priority_1_start = docstring.index("1. ``held``")
+        priority_0_bullet = docstring[priority_0_start:priority_1_start]
+        assert "regression" in priority_0_bullet, (
+            "classify_blocked_task's priority-0 docstring bullet must document that a "
+            "match signals a topology regression post-flatten (ADR-33), not a transient "
+            "runtime condition a make start restart resolves"
+        )
+
+
 class TestClassifyBlockedTaskRuntimeDegradation:
     """Issue #183(d): tasks with a recent agent-tool-unavailable [BLOCKED]
     audit comment must bucket as ``RUNTIME_DEGRADATION`` so the operator

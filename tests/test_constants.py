@@ -330,10 +330,13 @@ class TestSessionDrainSignalFilenameConstant:
 
 
 class TestAllowedAgentModelShortNamesHaikuRemoval:
-    """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({'opus', 'sonnet'}).
+    """AC-198-1 / AC-E3-F1-S1-T1-5: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal
+    frozenset({'opus', 'sonnet', 'fable'}).
 
     Haiku must not be present -- any value containing 'haiku' in the
     per-agent YAML block is rejected at config-load time (caylent-solutions/devbench#198).
+    'fable' was added by caylent-solutions/devbench#233 (E3 model refresh) to
+    alias the newly-priced ``claude-fable-5`` model.
     """
 
     @pytest.mark.unit
@@ -347,14 +350,15 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
         )
 
     @pytest.mark.unit
-    def test_allowed_short_names_equals_opus_sonnet(self) -> None:
-        """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal exactly {'opus', 'sonnet'}."""
+    def test_allowed_short_names_equals_opus_sonnet_fable(self) -> None:
+        """AC-E3-F1-S1-T1-5: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal exactly
+        {'opus', 'sonnet', 'fable'}."""
         from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
 
-        expected = frozenset({"opus", "sonnet"})
+        expected = frozenset({"opus", "sonnet", "fable"})
         assert expected == ALLOWED_AGENT_MODEL_SHORT_NAMES, (
-            f"ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({{'opus', 'sonnet'}}); "
-            f"got {ALLOWED_AGENT_MODEL_SHORT_NAMES!r} (caylent-solutions/devbench#198)."
+            f"ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({{'opus', 'sonnet', 'fable'}}); "
+            f"got {ALLOWED_AGENT_MODEL_SHORT_NAMES!r} (caylent-solutions/devbench#198, #233)."
         )
 
     @pytest.mark.unit
@@ -370,6 +374,107 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
         from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
 
         assert "sonnet" in ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+    @pytest.mark.unit
+    def test_fable_in_allowed_short_names(self) -> None:
+        """AC-E3-F1-S1-T1-5: 'fable' must be in ALLOWED_AGENT_MODEL_SHORT_NAMES
+        (spec AC-36, issue #233)."""
+        from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+        assert "fable" in ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+
+class TestDefaultModelRatesLineup:
+    """AC-E3-F1-S1-T1-1/2/3/8/9: DEFAULT_MODEL_RATES gains the current-lineup
+    entries (Fable 5, Opus 5, Opus 4.8, Sonnet 5), every pre-existing entry
+    (including the three Haiku rows) is retained, DEFAULT_FALLBACK_MODEL_RATES
+    moves to Opus 5 list rates, and DEFAULT_FAST_MODE_MULTIPLIER corrects to
+    2.0 (issue #233, spec FR-3.1/FR-3.2/FR-3.9a, section 5.3).
+
+    Rates re-verified against the official Anthropic pricing page
+    (https://platform.claude.com/docs/en/about-claude/pricing), captured
+    2026-07-28, per spec Section 1.0 rule 2 and this task's Definition of
+    Ready.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("model_id", "expected_input", "expected_output"),
+        [
+            ("claude-fable-5", 10.0, 50.0),
+            ("claude-opus-5", 5.0, 25.0),
+            ("claude-opus-4-8", 5.0, 25.0),
+            ("claude-sonnet-5", 3.0, 15.0),
+        ],
+    )
+    def test_new_lineup_entries_present_with_verified_rates(
+        self, model_id: str, expected_input: float, expected_output: float
+    ) -> None:
+        """AC-E3-F1-S1-T1-1: each new-lineup model id is present with its
+        re-verified list rate."""
+        from devbench.constants import DEFAULT_MODEL_RATES
+
+        assert model_id in DEFAULT_MODEL_RATES, f"{model_id} missing from DEFAULT_MODEL_RATES (issue #233)."
+        rates = DEFAULT_MODEL_RATES[model_id]
+        assert rates.input == expected_input, f"{model_id} input rate: expected {expected_input}, got {rates.input}"
+        assert rates.output == expected_output, (
+            f"{model_id} output rate: expected {expected_output}, got {rates.output}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("model_id", "expected_input", "expected_output"),
+        [
+            ("claude-opus-4-7", 5.0, 25.0),
+            ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-opus-4-5", 5.0, 25.0),
+            ("claude-opus-4-1", 15.0, 75.0),
+            ("claude-opus-4", 15.0, 75.0),
+            ("claude-sonnet-4-6", 3.0, 15.0),
+            ("claude-sonnet-4-5", 3.0, 15.0),
+            ("claude-sonnet-4", 3.0, 15.0),
+            ("claude-haiku-4-5", 1.0, 5.0),
+            ("claude-haiku-3-5", 0.80, 4.0),
+            ("claude-haiku-3", 0.25, 1.25),
+        ],
+    )
+    def test_preexisting_entries_retained(self, model_id: str, expected_input: float, expected_output: float) -> None:
+        """AC-E3-F1-S1-T1-8: every pre-existing DEFAULT_MODEL_RATES entry,
+        including the three Haiku pricing rows, is retained byte-for-byte."""
+        from devbench.constants import DEFAULT_MODEL_RATES
+
+        assert model_id in DEFAULT_MODEL_RATES, f"{model_id} must remain in DEFAULT_MODEL_RATES."
+        rates = DEFAULT_MODEL_RATES[model_id]
+        assert rates.input == expected_input
+        assert rates.output == expected_output
+
+    @pytest.mark.unit
+    def test_default_model_rates_entry_count(self) -> None:
+        """AC-E3-F1-S1-T1-1/8: the table has exactly the 11 pre-existing rows
+        plus the 4 new-lineup rows -- no accidental drops, no duplicates."""
+        from devbench.constants import DEFAULT_MODEL_RATES
+
+        assert len(DEFAULT_MODEL_RATES) == 15, (
+            f"Expected 15 DEFAULT_MODEL_RATES entries (11 retained + 4 new); got {len(DEFAULT_MODEL_RATES)}: "
+            f"{sorted(DEFAULT_MODEL_RATES)}"
+        )
+
+    @pytest.mark.unit
+    def test_default_fallback_model_rates_is_opus_5_list(self) -> None:
+        """AC-E3-F1-S1-T1-3: DEFAULT_FALLBACK_MODEL_RATES equals Opus 5 list
+        rates ($5/$25); no hard-coded Opus 4.7 value remains."""
+        from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES
+
+        assert DEFAULT_FALLBACK_MODEL_RATES.input == 5.0
+        assert DEFAULT_FALLBACK_MODEL_RATES.output == 25.0
+
+    @pytest.mark.unit
+    def test_default_fast_mode_multiplier_is_2_0(self) -> None:
+        """AC-E3-F1-S1-T1-9: DEFAULT_FAST_MODE_MULTIPLIER is 2.0 (Opus 5 /
+        Opus 4.8 fast-mode premium), not the stale Opus 4.6-era 6.0."""
+        from devbench.constants import DEFAULT_FAST_MODE_MULTIPLIER
+
+        assert DEFAULT_FAST_MODE_MULTIPLIER == 2.0
 
 
 class TestSkillIterateUntilPerfectConstants:
@@ -409,3 +514,403 @@ class TestSkillIterateUntilPerfectConstants:
             assert isinstance(tag, str)
             assert tag.startswith("[SKILL_"), f"audit tag must start with '[SKILL_' (got {tag!r})"
             assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"
+
+
+class TestRecoveryProbeModelConstant:
+    """AC-E2-F1-S2-T2-4: RECOVERY_PROBE_MODEL lands as claude-opus-5, deliberately
+    diverging from the source branch's claude-opus-4-8 per spec decision D-2."""
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_is_opus_5(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert RECOVERY_PROBE_MODEL == "claude-opus-5"
+
+    @pytest.mark.unit
+    def test_recovery_probe_model_is_str(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert isinstance(RECOVERY_PROBE_MODEL, str)
+
+    @pytest.mark.unit
+    def test_source_comment_records_d2_divergence_from_branch_value(self) -> None:
+        """The constant's comment must name the superseded branch value
+        claude-opus-4-8 so the D-2 divergence is not lost to a future editor."""
+        from pathlib import Path
+
+        module_path = Path(__file__).resolve().parent.parent / "src" / "devbench" / "constants.py"
+        source_text = module_path.read_text(encoding="utf-8")
+        marker_index = source_text.index('RECOVERY_PROBE_MODEL: str = "claude-opus-5"')
+        preceding_comment = source_text[max(0, marker_index - 800) : marker_index]
+        assert "claude-opus-4-8" in preceding_comment, (
+            "RECOVERY_PROBE_MODEL's comment must name the superseded branch value "
+            "'claude-opus-4-8' to record the deliberate D-2 divergence."
+        )
+        assert "D-2" in preceding_comment, (
+            "RECOVERY_PROBE_MODEL's comment must cite spec decision D-2, which "
+            "moved the default model lineup to Opus 5."
+        )
+
+
+class TestRecoveryProbeTimeoutAndRequestSizeConstants:
+    """AC-E2-F4-S2-T2-1, AC-E2-F4-S2-T2-2, AC-E2-F4-S2-T2-4: recovery probe
+    timeout and request-size constants exist, carry the correct type, and
+    satisfy the argument guards devbench.quota.recovery_probe enforces
+    (timeout_seconds > 0, request_size_tokens >= 1)."""
+
+    @pytest.mark.unit
+    def test_recovery_probe_timeout_seconds_value_and_type(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_TIMEOUT_SECONDS
+
+        assert RECOVERY_PROBE_TIMEOUT_SECONDS == 30.0
+        assert isinstance(RECOVERY_PROBE_TIMEOUT_SECONDS, float)
+
+    @pytest.mark.unit
+    def test_recovery_probe_request_size_tokens_value_and_type(self) -> None:
+        from devbench.constants import RECOVERY_PROBE_REQUEST_SIZE_TOKENS
+
+        assert RECOVERY_PROBE_REQUEST_SIZE_TOKENS == 1
+        assert isinstance(RECOVERY_PROBE_REQUEST_SIZE_TOKENS, int)
+
+    @pytest.mark.unit
+    def test_constants_satisfy_recovery_probe_argument_guards(self) -> None:
+        """devbench.quota.recovery_probe raises ValueError when
+        timeout_seconds <= 0 or request_size_tokens < 1 (quota.py lines
+        999-1001). The exported constants must actually satisfy those
+        guards, not merely restate the literals."""
+        from devbench.constants import (
+            RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+            RECOVERY_PROBE_TIMEOUT_SECONDS,
+        )
+
+        assert RECOVERY_PROBE_TIMEOUT_SECONDS > 0
+        assert RECOVERY_PROBE_REQUEST_SIZE_TOKENS >= 1
+
+
+class TestOrchestratorQuotaResumeConstants:
+    """AC-E2-F4-S3-T1-3/4: the in-process quota-resume cap and its two audit
+    markers live in constants.py, not inlined at cli.py call sites (spec
+    AC-21, AC-22; Section 7.3 configuration precedence)."""
+
+    @pytest.mark.unit
+    def test_default_max_quota_resumes_value_and_type(self) -> None:
+        from devbench.constants import DEFAULT_MAX_QUOTA_RESUMES
+
+        assert DEFAULT_MAX_QUOTA_RESUMES == 1000
+        assert isinstance(DEFAULT_MAX_QUOTA_RESUMES, int)
+
+    @pytest.mark.unit
+    def test_default_max_quota_resumes_is_positive(self) -> None:
+        """The built-in cap must itself be a usable positive bound (fail-safe target)."""
+        from devbench.constants import DEFAULT_MAX_QUOTA_RESUMES
+
+        assert DEFAULT_MAX_QUOTA_RESUMES > 0
+
+    @pytest.mark.unit
+    def test_orchestrator_quota_resume_audit_prefix(self) -> None:
+        from devbench.constants import ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX
+
+        assert ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX == "[ORCHESTRATOR_QUOTA_RESUME]"
+
+    @pytest.mark.unit
+    def test_orchestrator_quota_resumes_exhausted_audit_prefix(self) -> None:
+        from devbench.constants import ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX
+
+        assert ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX == "[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]"
+
+    @pytest.mark.unit
+    def test_prefixes_are_distinct_bracketed_tags(self) -> None:
+        """Both markers follow the ``[TAG]`` grammar shared by every other orchestrator audit prefix."""
+        from devbench.constants import (
+            ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+            ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
+        )
+
+        for tag in (ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX, ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX):
+            assert tag.startswith("[ORCHESTRATOR_"), f"audit tag must start with '[ORCHESTRATOR_' (got {tag!r})"
+            assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"
+        assert ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX != ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX
+
+
+class TestTaskTypeTaxonomyConstants:
+    """FR-4.1 / AC-E4-F2-S1-T1-4: the six-type taxonomy vocabulary lives in
+    constants.py so no type string is hard-coded at any call site."""
+
+    @pytest.mark.unit
+    def test_six_task_type_string_constants_exist(self) -> None:
+        from devbench.constants import (
+            TASK_TYPE_BEHAVIOR_FIX,
+            TASK_TYPE_CHORE,
+            TASK_TYPE_DOCS,
+            TASK_TYPE_FEATURE,
+            TASK_TYPE_REFACTOR,
+            TASK_TYPE_TEST_ONLY,
+        )
+
+        assert TASK_TYPE_BEHAVIOR_FIX == "behavior-fix"
+        assert TASK_TYPE_FEATURE == "feature"
+        assert TASK_TYPE_TEST_ONLY == "test-only"
+        assert TASK_TYPE_REFACTOR == "refactor"
+        assert TASK_TYPE_DOCS == "docs"
+        assert TASK_TYPE_CHORE == "chore"
+
+    @pytest.mark.unit
+    def test_valid_task_types_contains_exactly_six_values(self) -> None:
+        from devbench.constants import (
+            TASK_TYPE_BEHAVIOR_FIX,
+            TASK_TYPE_CHORE,
+            TASK_TYPE_DOCS,
+            TASK_TYPE_FEATURE,
+            TASK_TYPE_REFACTOR,
+            TASK_TYPE_TEST_ONLY,
+            VALID_TASK_TYPES,
+        )
+
+        assert isinstance(VALID_TASK_TYPES, frozenset)
+        assert (
+            frozenset(
+                {
+                    TASK_TYPE_BEHAVIOR_FIX,
+                    TASK_TYPE_FEATURE,
+                    TASK_TYPE_TEST_ONLY,
+                    TASK_TYPE_REFACTOR,
+                    TASK_TYPE_DOCS,
+                    TASK_TYPE_CHORE,
+                }
+            )
+            == VALID_TASK_TYPES
+        )
+
+    @pytest.mark.unit
+    def test_default_task_type_is_behavior_fix(self) -> None:
+        """The fail-safe default is the strictest type, per FR-4.1."""
+        from devbench.constants import DEFAULT_TASK_TYPE, TASK_TYPE_BEHAVIOR_FIX
+
+        assert DEFAULT_TASK_TYPE == TASK_TYPE_BEHAVIOR_FIX
+
+    @pytest.mark.unit
+    def test_default_task_type_is_a_member_of_valid_task_types(self) -> None:
+        from devbench.constants import DEFAULT_TASK_TYPE, VALID_TASK_TYPES
+
+        assert DEFAULT_TASK_TYPE in VALID_TASK_TYPES
+
+    @pytest.mark.unit
+    def test_gated_task_types_is_behavior_fix_and_feature_only(self) -> None:
+        """FR-4.1: only behavior-fix and feature carry the RED-gate obligation."""
+        from devbench.constants import GATED_TASK_TYPES, TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_FEATURE
+
+        assert frozenset({TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_FEATURE}) == GATED_TASK_TYPES
+
+    @pytest.mark.unit
+    def test_gated_task_types_is_subset_of_valid_task_types(self) -> None:
+        from devbench.constants import GATED_TASK_TYPES, VALID_TASK_TYPES
+
+        assert GATED_TASK_TYPES <= VALID_TASK_TYPES
+
+    @pytest.mark.unit
+    def test_task_type_section_header_constant(self) -> None:
+        from devbench.constants import TASK_TYPE_SECTION_PREFIX
+
+        assert TASK_TYPE_SECTION_PREFIX == "## Task Type:"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "line,expected",
+        [
+            ("## Task Type: behavior-fix", "behavior-fix"),
+            ("## Task Type: feature", "feature"),
+            ("##Task Type:test-only", "test-only"),
+            ("##   Task Type:   docs  ", "docs"),
+        ],
+    )
+    def test_task_type_line_re_extracts_value(self, line: str, expected: str) -> None:
+        from devbench.constants import TASK_TYPE_LINE_RE
+
+        match = TASK_TYPE_LINE_RE.search(line)
+        assert match is not None, f"TASK_TYPE_LINE_RE did not match {line!r}"
+        assert match.group(2).strip() == expected
+
+    @pytest.mark.unit
+    def test_task_type_line_re_does_not_match_absent_section(self) -> None:
+        from devbench.constants import TASK_TYPE_LINE_RE
+
+        content = "# EX-F1-S1-T1\n\n## Status: in-queue\n\n## Description\n\nbody\n"
+        assert TASK_TYPE_LINE_RE.search(content) is None
+
+
+class TestRedObservedTddPhaseConstants:
+    """FR-4.3 / E4-F3-S1-T1: RED_OBSERVED orchestrator-only TDD phase (issue #257)."""
+
+    @pytest.mark.unit
+    def test_valid_tdd_phases_gains_red_observed(self) -> None:
+        from devbench.constants import TDD_PHASE_RED_OBSERVED, VALID_TDD_PHASES
+
+        assert TDD_PHASE_RED_OBSERVED in VALID_TDD_PHASES
+        assert frozenset({"RED", "GREEN", "REFACTOR", "RED_OBSERVED", "GREEN_GREEN_OBSERVED"}) == VALID_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_agent_writable_tdd_phases_excludes_red_observed(self) -> None:
+        from devbench.constants import AGENT_WRITABLE_TDD_PHASES, TDD_PHASE_RED_OBSERVED
+
+        assert frozenset({"RED", "GREEN", "REFACTOR"}) == AGENT_WRITABLE_TDD_PHASES
+        assert TDD_PHASE_RED_OBSERVED not in AGENT_WRITABLE_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_orchestrator_only_tdd_phases_includes_red_observed(self) -> None:
+        from devbench.constants import ORCHESTRATOR_ONLY_TDD_PHASES, TDD_PHASE_RED_OBSERVED
+
+        assert TDD_PHASE_RED_OBSERVED in ORCHESTRATOR_ONLY_TDD_PHASES
+
+    @pytest.mark.unit
+    def test_agent_writable_and_orchestrator_only_partition_valid_phases(self) -> None:
+        from devbench.constants import (
+            AGENT_WRITABLE_TDD_PHASES,
+            ORCHESTRATOR_ONLY_TDD_PHASES,
+            VALID_TDD_PHASES,
+        )
+
+        assert AGENT_WRITABLE_TDD_PHASES | ORCHESTRATOR_ONLY_TDD_PHASES == VALID_TDD_PHASES
+        assert frozenset() == AGENT_WRITABLE_TDD_PHASES & ORCHESTRATOR_ONLY_TDD_PHASES
+
+
+@pytest.mark.unit
+class TestGreenGreenObservedTddPhaseConstant:
+    """FR-4.6 / E4-F4-S1-T2 round 4 (code_review FAIL, SOLID/OCP): GREEN_GREEN_OBSERVED
+    must be a member of VALID_TDD_PHASES (not a private literal local to
+    devbench.backlog.manager) so cli._reject_bracketed_phase_tag's bracketed-phase-tag
+    security control -- built from VALID_TDD_PHASES -- rejects a forged
+    '[GREEN_GREEN_OBSERVED]' tag exactly as it already rejects '[RED_OBSERVED]'."""
+
+    def test_valid_tdd_phases_gains_green_green_observed(self) -> None:
+        from devbench.constants import TDD_PHASE_GREEN_GREEN_OBSERVED, VALID_TDD_PHASES
+
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED == "GREEN_GREEN_OBSERVED"
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED in VALID_TDD_PHASES
+
+    def test_agent_writable_tdd_phases_excludes_green_green_observed(self) -> None:
+        from devbench.constants import AGENT_WRITABLE_TDD_PHASES, TDD_PHASE_GREEN_GREEN_OBSERVED
+
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED not in AGENT_WRITABLE_TDD_PHASES
+
+    def test_orchestrator_only_tdd_phases_includes_green_green_observed(self) -> None:
+        from devbench.constants import ORCHESTRATOR_ONLY_TDD_PHASES, TDD_PHASE_GREEN_GREEN_OBSERVED
+
+        assert TDD_PHASE_GREEN_GREEN_OBSERVED in ORCHESTRATOR_ONLY_TDD_PHASES
+
+    def test_bracketed_phase_tag_regex_in_cli_module_matches_green_green_observed(self) -> None:
+        """Reproduces the exact gap code_review found: without this constant registered
+        in VALID_TDD_PHASES, cli._BRACKETED_TDD_PHASE_TAG_RE (built from VALID_TDD_PHASES)
+        never matched '[GREEN_GREEN_OBSERVED]', so cli._reject_bracketed_phase_tag let an
+        agent embed the tag in free text unrejected."""
+        from devbench.cli import _BRACKETED_TDD_PHASE_TAG_RE
+
+        assert _BRACKETED_TDD_PHASE_TAG_RE.search("observed failure [GREEN_GREEN_OBSERVED] test_node_ids=x") is not None
+
+    @pytest.mark.unit
+    def test_red_observed_record_fields_tuple_matches_field_name_constants(self) -> None:
+        from devbench.constants import (
+            RED_OBSERVED_FIELD_EXIT_CODE,
+            RED_OBSERVED_FIELD_FAILURE_DIGEST,
+            RED_OBSERVED_FIELD_TEST_NODE_ID,
+            RED_OBSERVED_RECORD_FIELDS,
+        )
+
+        assert RED_OBSERVED_RECORD_FIELDS == (
+            RED_OBSERVED_FIELD_EXIT_CODE,
+            RED_OBSERVED_FIELD_TEST_NODE_ID,
+            RED_OBSERVED_FIELD_FAILURE_DIGEST,
+        )
+
+    @pytest.mark.unit
+    def test_orchestrator_only_message_template_names_agent_writable_phases(self) -> None:
+        from devbench.constants import (
+            AGENT_WRITABLE_TDD_PHASES,
+            TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE,
+        )
+
+        rendered = TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE.format(
+            phase="RED_OBSERVED",
+            agent_phases=", ".join(sorted(AGENT_WRITABLE_TDD_PHASES)),
+        )
+        assert "RED_OBSERVED" in rendered
+        assert "orchestrator-only" in rendered
+        assert "GREEN" in rendered
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "digest",
+        ["a" * 8, "0123456789abcdef0123456789abcdef01234567", "b" * 64],
+    )
+    def test_failure_digest_re_accepts_valid_lowercase_hex_lengths(self, digest: str) -> None:
+        from devbench.constants import FAILURE_DIGEST_RE
+
+        assert FAILURE_DIGEST_RE.match(digest) is not None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "digest",
+        ["a" * 7, "a" * 65, "DEADBEEF", "not-hex!", ""],
+    )
+    def test_failure_digest_re_rejects_malformed_values(self, digest: str) -> None:
+        from devbench.constants import FAILURE_DIGEST_RE
+
+        assert FAILURE_DIGEST_RE.match(digest) is None
+
+    @pytest.mark.unit
+    def test_red_observed_entry_line_re_matches_anchored_entry(self) -> None:
+        from devbench.constants import RED_OBSERVED_ENTRY_LINE_RE
+
+        line = "- [RED_OBSERVED] 2026-07-30T12:00:00+00:00 -- exit_code=1 test_node_id=t::t failure_digest=deadbeef01"
+        match = RED_OBSERVED_ENTRY_LINE_RE.search(line)
+        assert match is not None
+        assert match.group("message") == "exit_code=1 test_node_id=t::t failure_digest=deadbeef01"
+
+    @pytest.mark.unit
+    def test_red_observed_entry_line_re_does_not_match_non_anchored_tag(self) -> None:
+        """A phase tag embedded mid-line (not at the entry's structural position) must not match."""
+        from devbench.constants import RED_OBSERVED_ENTRY_LINE_RE
+
+        line = "- [RED] 2026-07-30T12:00:00+00:00 -- observed failure [RED_OBSERVED] exit_code=1"
+        assert RED_OBSERVED_ENTRY_LINE_RE.search(line) is None
+
+    @pytest.mark.unit
+    def test_red_observed_message_fields_re_parses_all_three_fields(self) -> None:
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        message = "exit_code=1 test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01"
+        match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
+        assert match is not None
+        assert match.group("exit_code") == "1"
+        assert match.group("test_node_id") == "tests/test_foo.py::test_bar"
+        assert match.group("failure_digest") == "deadbeef01"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "test_node_id=t::t failure_digest=deadbeef01",
+            "exit_code=1 failure_digest=deadbeef01",
+            "exit_code=1 test_node_id=t::t",
+        ],
+    )
+    def test_red_observed_message_fields_re_returns_none_when_a_field_is_missing(self, message: str) -> None:
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        assert RED_OBSERVED_MESSAGE_FIELDS_RE.search(message) is None
+
+    @pytest.mark.unit
+    def test_tdd_cycle_log_section_body_re_scopes_to_next_heading(self) -> None:
+        from devbench.constants import TDD_CYCLE_LOG_SECTION_BODY_RE
+
+        content = "## TDD Cycle Log\n\n- [RED] ts -- msg\n\n## Comments\n\n- injected line\n"
+        match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+        assert match is not None
+        assert "injected line" not in match.group(1)
+        assert "[RED]" in match.group(1)
+
+    @pytest.mark.unit
+    def test_tdd_cycle_log_section_body_re_none_when_header_absent(self) -> None:
+        from devbench.constants import TDD_CYCLE_LOG_SECTION_BODY_RE
+
+        content = "## Comments\n\n- [RED_OBSERVED] ts -- exit_code=1 test_node_id=t failure_digest=deadbeef01\n"
+        assert TDD_CYCLE_LOG_SECTION_BODY_RE.search(content) is None

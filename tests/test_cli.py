@@ -9,18 +9,28 @@ import os
 import re
 import subprocess
 import types
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+from test_tdd_gate import commit_scratch_repo as _tdd_gate_commit_all
+from test_tdd_gate import init_scratch_repo as _init_scratch_repo_for_cli
+from test_tdd_gate import write_scratch_file as _tdd_gate_write
 
 from devbench import cli
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.constants import BACKLOG_SUBDIR, SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
+from devbench.constants import (
+    BACKLOG_SUBDIR,
+    SESSION_DEFAULT_NAME,
+    SESSION_SESSIONS_BASE_DIR,
+    TDD_ENTRY_TEMPLATE,
+    TDD_PHASE_RED,
+    TDD_PHASE_RED_OBSERVED,
+)
 from devbench.github.git_ops import CIResult
 
 
@@ -744,6 +754,48 @@ class TestCmdNextScopeFilter:
         assert rc == 1
         err = capsys.readouterr().err
         assert "scope.json" in err
+
+    # ------------------------------------------------------------------
+    # Legacy list-shaped scope.json self-heals rather than crashing (#270)
+    # ------------------------------------------------------------------
+
+    def test_legacy_list_session_scope_json_self_heals_via_cmd_next(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_next must self-heal a legacy list-shaped scope.json, not crash.
+
+        Reproduces issue #270's live-incident path: a bare JSON array left on
+        disk from an earlier devbench version used to raise 'scope.json
+        top-level payload must be an object, got list' on every call, forcing
+        an operator to manually delete the file. cmd_next now migrates the
+        file in place (via the shared devbench.scope migration primitive) and
+        proceeds normally.
+        """
+        units = self._make_units(["E1-F1-S1-T1", "E2-F1-S1-T1"])
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        scope_path = scope_dir / "scope.json"
+        scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [units[0]]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        captured = capsys.readouterr()
+        assert rc == 0, f"cmd_next must self-heal a legacy list-shaped scope.json, not crash. stderr={captured.err!r}"
+        data = json.loads(captured.out.strip())
+        assert data["id"] == "E1-F1-S1-T1"
+        migrated = json.loads(scope_path.read_text())
+        assert isinstance(migrated, dict)
+        assert migrated["expanded_ids"] == ["E1-F1-S1-T1"]
 
     # ------------------------------------------------------------------
     # Integration: real fixture -- scope.json on disk selects correct WU
@@ -2782,6 +2834,412 @@ class TestCmdMarkDone:
         assert "not all required judges passed" in capsys.readouterr().err
 
 
+# ---------------------------------------------------------------------------
+# _build_remedies_rejection_message, and the FR-4.5 "honest completion
+# paths" gating it enables: every rejection message emitted by the
+# mark-done gated-task block and the decline-citation check names all
+# three legitimate remedies (AC-59 / AC-E4-F4-S1-T2-1).
+# ---------------------------------------------------------------------------
+def _mark_done_red_observed_line(test_node_id: str = "tests/test_x.py::test_y") -> str:
+    """Build a well-formed ``[RED_OBSERVED]`` TDD Cycle Log entry line."""
+    digest = "a" * 64
+    return (
+        f"- [RED_OBSERVED] 2026-01-01T00:00:00+00:00 -- exit_code=1 "
+        f"test_node_id={test_node_id} failure_digest={digest}\n"
+    )
+
+
+def _mark_done_green_green_observed_line(test_node_id: str = "tests/test_x.py::test_y") -> str:
+    """Build a well-formed ``[GREEN_GREEN_OBSERVED]`` TDD Cycle Log entry line."""
+    return f"- [GREEN_GREEN_OBSERVED] 2026-01-01T00:00:00+00:00 -- test_node_ids={test_node_id}\n"
+
+
+@pytest.mark.unit
+class TestBuildRemediesRejectionMessage:
+    """_build_remedies_rejection_message: shared three-remedy message builder (AC-59)."""
+
+    def test_message_names_all_three_remedies(self) -> None:
+        from devbench.tdd_gate import REMEDY_1, REMEDY_2, REMEDY_3
+
+        message = cli._build_remedies_rejection_message("ERROR: example headline.", "example detail.")
+
+        assert "ERROR: example headline." in message
+        assert "example detail." in message
+        assert REMEDY_1 in message
+        assert REMEDY_2 in message
+        assert REMEDY_3 in message
+
+
+@pytest.mark.unit
+class TestCmdMarkDoneGatedBlock:
+    """cmd_mark_done: gated tasks without a RED_OBSERVED record never reach done (AC-60)."""
+
+    def _setup(self, tmp_path: Path, unit_id: str, wu_body: str) -> tuple[Path, Path, MagicMock]:
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {unit_id} | Gated block test | Task | in-review | None | repo | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        wu_file.write_text(wu_body, encoding="utf-8")
+
+        unit = WorkUnit(
+            id=unit_id,
+            title="Gated block test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return backlog_index, wu_file, mock_parser
+
+    def test_gated_default_type_without_red_observed_blocked(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No ## Task Type: section defaults to behavior-fix (gated); no RED_OBSERVED blocks done."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+        from devbench.tdd_gate import REMEDY_1, REMEDY_2, REMEDY_3
+
+        unit_id = "E232-F1-S1-T1"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        body = f"# {unit_id}\n\n## Status: in-review\n\n## TDD Cycle Log\n\n## Comments\n\n{all_pass}"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "no RED_OBSERVED record found" in err
+        assert REMEDY_1 in err
+        assert REMEDY_2 in err
+        assert REMEDY_3 in err
+        assert wu_file.read_text(encoding="utf-8") == before, "a blocked mark-done must write nothing"
+
+    def test_explicit_behavior_fix_without_red_observed_blocked(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        unit_id = "E232-F1-S1-T2"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        body = (
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: behavior-fix\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}"
+        )
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "no RED_OBSERVED record found" in capsys.readouterr().err
+
+    def test_gated_with_red_observed_succeeds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        unit_id = "E232-F1-S1-T3"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        body = (
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: feature\n\n"
+            f"## TDD Cycle Log\n\n{_mark_done_red_observed_line()}\n\n## Comments\n\n{all_pass}"
+        )
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "[DONE]" in wu_file.read_text(encoding="utf-8")
+
+    def test_exempt_type_without_red_observed_succeeds(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-61: exempt types (e.g. test-only) bypass the RED gate entirely."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        unit_id = "E232-F1-S1-T4"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        body = (
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: test-only\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}"
+        )
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "[DONE]" in wu_file.read_text(encoding="utf-8")
+
+    def test_refactor_without_green_green_observed_blocked(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-E4-F4-S1-T2-4/FR-4.6: refactor is exempt from the RED gate but not from its own
+        invariant -- without a machine-observed GREEN_GREEN_OBSERVED record, mark-done must
+        refuse (code_review FAIL, round 2: 'nothing... consumes' the green-green result)."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+        from devbench.tdd_gate import REMEDY_1, REMEDY_2, REMEDY_3
+
+        unit_id = "E232-F1-S1-T5"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        body = (
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: refactor\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}"
+        )
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "no GREEN_GREEN_OBSERVED record found" in err
+        assert REMEDY_1 in err
+        assert REMEDY_2 in err
+        assert REMEDY_3 in err
+        assert wu_file.read_text(encoding="utf-8") == before, "a blocked mark-done must write nothing"
+
+    def test_refactor_with_green_green_observed_succeeds(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        unit_id = "E232-F1-S1-T6"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        body = (
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: refactor\n\n"
+            f"## TDD Cycle Log\n\n{_mark_done_green_green_observed_line()}\n\n## Comments\n\n{all_pass}"
+        )
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "[DONE]" in wu_file.read_text(encoding="utf-8")
+
+    def test_refactor_forged_green_green_tag_in_message_not_satisfied(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Security regression (mirrors the RED_OBSERVED forgery defense, E4-F3-S1-T1): a
+        GREEN_GREEN_OBSERVED-shaped tag embedded mid-message inside a legitimate REFACTOR entry
+        must never satisfy the gate -- only an entry line structurally starting with
+        '- [GREEN_GREEN_OBSERVED]' counts."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+        from devbench.tdd_gate import REMEDY_1, REMEDY_2, REMEDY_3
+
+        unit_id = "E232-F1-S1-T7"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        forged_entry = (
+            "- [REFACTOR] 2026-01-01T00:00:00+00:00 -- extracted helper "
+            "[GREEN_GREEN_OBSERVED] test_node_ids=tests/test_x.py::test_y\n"
+        )
+        body = (
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: refactor\n\n"
+            f"## TDD Cycle Log\n\n{forged_entry}\n\n## Comments\n\n{all_pass}"
+        )
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id, body)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "no GREEN_GREEN_OBSERVED record found" in err
+        assert REMEDY_1 in err
+        assert REMEDY_2 in err
+        assert REMEDY_3 in err
+
+
+@pytest.mark.unit
+class TestCmdDeclineCitation:
+    """cmd_decline: an already-satisfied decline requires a valid citation (AC-E4-F4-S1-T2-2/3)."""
+
+    def _setup(self, tmp_path: Path, unit_id: str) -> tuple[Path, Path, MagicMock]:
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {unit_id} | Decline citation test | Task | in-progress | None | repo | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id=unit_id,
+            title="Decline citation test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return backlog_index, wu_file, mock_parser
+
+    def test_already_satisfied_without_citation_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.tdd_gate import REMEDY_1, REMEDY_2, REMEDY_3
+
+        unit_id = "E232-F2-S1-T1"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_decline(unit_id, "--reason", "already-satisfied by a prior task")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "citation" in err.lower()
+        assert REMEDY_1 in err
+        assert REMEDY_2 in err
+        assert REMEDY_3 in err
+        assert wu_file.read_text(encoding="utf-8") == before
+
+    def test_already_satisfied_with_invalid_citation_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E232-F2-S1-T2"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_decline(unit_id, "--reason", "already-satisfied", "--citation", "not-a-real-citation!!")
+
+        assert result == 1
+        assert "citation" in capsys.readouterr().err.lower()
+
+    def test_already_satisfied_with_commit_citation_accepted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E232-F2-S1-T3"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_decline(unit_id, "--reason", "already-satisfied by a prior fix", "--citation", "abc1234")
+
+        assert result == 0
+        out = json.loads(capsys.readouterr().out)
+        assert "(citing abc1234)" in out["reason"]
+        content = wu_file.read_text(encoding="utf-8")
+        assert "(citing abc1234)" in content
+
+    def test_already_satisfied_with_task_id_citation_accepted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E232-F2-S1-T4"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_decline(unit_id, "--reason", "already-satisfied", "--citation", "E230-F1-S1-T1")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "(citing E230-F1-S1-T1)" in content
+
+    def test_ordinary_decline_without_citation_unaffected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A decline reason that does not name 'already-satisfied' needs no citation (regression)."""
+        unit_id = "E232-F2-S1-T5"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_decline(unit_id, "--reason", "out of scope for this backlog")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "out of scope for this backlog" in content
+        assert "(citing" not in content
+
+
 class TestCmdValidateBacklogPathResolution:
     """Bug fix: cmd_validate_backlog must pass workspace root (BACKLOG_INDEX.parent) to validate(),
     not BACKLOG_ROOT -- otherwise file paths of the form 'backlog/...' get resolved as
@@ -2799,7 +3257,9 @@ class TestCmdValidateBacklogPathResolution:
             "## Description\n\nTest task.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
-            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `src/f.py` | New |\n"
+            "| `tests/unit/test_f.py` | New |\n\n"
             "## Definition of Done\n\n- [ ] All ACs checked\n\n"
             "## TDD Cycle Log\n\n## Comments\n",
             encoding="utf-8",
@@ -4044,7 +4504,12 @@ class TestCmdMarkDoneEventComment:
         backlog_subdir.mkdir()
         wu_file = backlog_subdir / f"{unit_id}.md"
         wu_file.write_text(
-            f"# {unit_id}\n\n## Status: in-review\n\n## Comments\n\n{all_pass_comments}",
+            # AC-E4-F4-S1-T2-*: this test asserts the [DONE] comment shape, not
+            # the RED-gate routing, so it declares an exempt Task Type (docs)
+            # to bypass the gated-task RED_OBSERVED requirement introduced for
+            # behavior-fix/feature tasks (the DEFAULT_TASK_TYPE a missing
+            # section would otherwise resolve to).
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: docs\n\n## Comments\n\n{all_pass_comments}",
             encoding="utf-8",
         )
 
@@ -4097,7 +4562,10 @@ class TestCmdMarkDoneEventComment:
         backlog_subdir.mkdir()
         wu_file = backlog_subdir / f"{unit_id}.md"
         wu_file.write_text(
-            f"# {unit_id}\n\n## Status: in-review\n\n## Comments\n\n{all_pass_comments}",
+            # See test_mark_done_appends_done_comment above: declares an
+            # exempt Task Type so this comment-format assertion is not
+            # entangled with the gated-task RED_OBSERVED requirement.
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: docs\n\n## Comments\n\n{all_pass_comments}",
             encoding="utf-8",
         )
 
@@ -4240,14 +4708,7 @@ class TestCmdLogTdd:
 
     def _setup(self, tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> tuple[Path, Path]:
         """Return (wu_file, backlog_index) with TDD Cycle Log section."""
-        wu_file = _make_wu_with_tdd_section(tmp_path, unit_id)
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir(exist_ok=True)
-        # Copy wu_file into backlog subdir so _resolve_unit_file finds it
-        backlog_wu = backlog_dir / f"{unit_id}.md"
-        backlog_wu.write_text(wu_file.read_text(encoding="utf-8"), encoding="utf-8")
-        backlog_index = _make_backlog_index_for_tdd(tmp_path, unit_id, backlog_wu)
-        return backlog_wu, backlog_index
+        return _setup_tdd_unit_and_index(tmp_path, unit_id)
 
     def test_log_tdd_red_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
         """AC-1: log-tdd RED appends [RED] entry to ## TDD Cycle Log section."""
@@ -4460,6 +4921,531 @@ class TestCmdLogTdd:
         # Extract comments section (before TDD Cycle Log)
         comments_section = content[comments_start:tdd_start] if tdd_start > comments_start else content[comments_start:]
         assert "unique-tdd-marker-xyz" not in comments_section, f"TDD entry leaked into ## Comments: {comments_section}"
+
+
+def _setup_tdd_unit_and_index(tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> tuple[Path, Path]:
+    """Return (wu_file, backlog_index) with a ## TDD Cycle Log section.
+
+    Shared by every TDD-phase test class below (RED_OBSERVED rejection, the
+    record builder, the orchestrator-only write path, and the gate
+    predicate) so the work-unit-file-plus-index fixture has one definition
+    instead of being copy-pasted per class.
+    """
+    wu_file = _make_wu_with_tdd_section(tmp_path, unit_id)
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir(exist_ok=True)
+    backlog_wu = backlog_dir / f"{unit_id}.md"
+    backlog_wu.write_text(wu_file.read_text(encoding="utf-8"), encoding="utf-8")
+    backlog_index = _make_backlog_index_for_tdd(tmp_path, unit_id, backlog_wu)
+    return backlog_wu, backlog_index
+
+
+def _make_tdd_test_work_unit(unit_id: str = "E231-F2-S1-T1") -> WorkUnit:
+    """Return a WorkUnit matching the fixture built by `_setup_tdd_unit_and_index`."""
+    return WorkUnit(
+        id=unit_id,
+        title="TDD Test",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path(f"backlog/{unit_id}.md"),
+        repo="caylent-solutions/devbench",
+        dependencies=[],
+    )
+
+
+@pytest.mark.unit
+class TestCmdLogTddRejectsRedObserved:
+    """RED_OBSERVED is orchestrator-only: log-tdd rejects it with exit 1 (AC-54, issue #257)."""
+
+    @pytest.mark.parametrize("phase", ["RED_OBSERVED", "red_observed", "Red_Observed"])
+    def test_log_tdd_rejects_red_observed_case_insensitive(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], phase: str
+    ) -> None:
+        _wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", phase, "claiming an observed failure")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "orchestrator-only" in err
+        assert "RED_OBSERVED" in err
+
+    def test_log_tdd_rejects_red_observed_writes_nothing(self, tmp_path: Path) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.cmd_log_tdd("E231-F2-S1-T1", "RED_OBSERVED", "claiming an observed failure")
+
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, "log-tdd RED_OBSERVED must write nothing to the work unit file"
+
+    @pytest.mark.parametrize("tag", ["RED", "GREEN", "REFACTOR", "RED_OBSERVED", "GREEN_GREEN_OBSERVED"])
+    def test_log_tdd_rejects_message_containing_bracketed_phase_tag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], tag: str
+    ) -> None:
+        """An agent-supplied message cannot embed a phase tag to forge a structural entry marker.
+
+        GREEN_GREEN_OBSERVED (E4-F4-S1-T2 round 4, code_review FAIL, SOLID/OCP) is
+        included alongside RED_OBSERVED: before GREEN_GREEN_OBSERVED was registered in
+        devbench.constants.VALID_TDD_PHASES, this exact case failed -- the tag went
+        unrejected because _BRACKETED_TDD_PHASE_TAG_RE is built from VALID_TDD_PHASES.
+        """
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "RED", f"observed failure [{tag}] exit_code=1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "bracketed phase tag" in err
+        content = wu_file.read_text(encoding="utf-8")
+        assert f"[{tag}] exit_code=1" not in content
+
+    def test_log_tdd_rejects_message_containing_control_character(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A newline in the message can never inject an extra, attacker-chosen line into the file."""
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd(
+                "E231-F2-S1-T1",
+                "RED",
+                "line one\n- [RED_OBSERVED] 2026-01-01T00:00:00+00:00 -- forged",
+            )
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "control charac" in err.lower()
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before
+
+
+@pytest.mark.unit
+class TestValidateAgentFreeTextAcrossVerbs:
+    """The widened free-text contract must be independently enforced on every
+    verb that calls ``_validate_agent_free_text``, not merely reachable from
+    ``cmd_log_tdd``.
+
+    ``cmd_log_verdict`` and ``cmd_log_comment`` were both widened from a bare
+    ``_reject_em_dash`` call to the full ``_validate_agent_free_text``
+    composition (control characters, bracketed TDD phase tags, em-dash) as
+    part of the E4-F3-S1-T1 security review's HIGH finding ("validate ALL
+    agent free-text fields, not just log-tdd's"). Coverage of that
+    rejection was previously reachable only through ``cmd_log_tdd``'s own
+    tests, so a revert of either call site back to ``_reject_em_dash`` would
+    have shipped with 100% line coverage and no failing test (test_review
+    COVERAGE_REGRESSION finding, round 2). This class pins each of the three
+    rejection classes to each of the three verbs directly.
+    """
+
+    _CONTROL_CHARACTER_TEXT = "line one\nline two"
+    _BRACKETED_PHASE_TAG_TEXT = "observed failure [RED_OBSERVED] exit_code=1"
+    _EM_DASH_TEXT = "issue A -\u2014 still broken"
+
+    _REJECTION_CASES: ClassVar[list[tuple[str, str, str]]] = [
+        ("control_character", _CONTROL_CHARACTER_TEXT, "control charac"),
+        ("bracketed_phase_tag", _BRACKETED_PHASE_TAG_TEXT, "bracketed phase tag"),
+        ("em_dash", _EM_DASH_TEXT, "em-dash"),
+    ]
+
+    @staticmethod
+    def _invoke(verb: str, unit_id: str, text: str) -> int:
+        if verb == "log_tdd":
+            return cli.cmd_log_tdd(unit_id, "RED", text)
+        if verb == "log_comment":
+            return cli.cmd_log_comment("executor", unit_id, text)
+        if verb == "log_verdict":
+            return cli.cmd_log_verdict("code_review", unit_id, "fail", text)
+        raise ValueError(f"unknown verb under test: {verb}")
+
+    @pytest.mark.parametrize("verb", ["log_tdd", "log_comment", "log_verdict"])
+    @pytest.mark.parametrize("rejection_class,text,expected_substring", _REJECTION_CASES)
+    def test_verb_rejects_bad_free_text_and_writes_nothing(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        verb: str,
+        rejection_class: str,
+        text: str,
+        expected_substring: str,
+    ) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = self._invoke(verb, "E231-F2-S1-T1", text)
+
+        assert result == 1, f"{verb} must reject {rejection_class} text with exit 1"
+        err = capsys.readouterr().err.lower()
+        assert expected_substring in err, f"{verb} stderr must name the {rejection_class} violation, got: {err!r}"
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, f"{verb} must write nothing to the work unit file on {rejection_class} rejection"
+
+
+@pytest.mark.unit
+class TestBuildRedObservedMessage:
+    """build_red_observed_message validates the three-field RED_OBSERVED record (AC-E4-F3-S1-T1-3)."""
+
+    _DIGEST = "deadbeef01"
+
+    def test_build_red_observed_message_happy_path(self) -> None:
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        message = cli.build_red_observed_message(1, "tests/test_foo.py::test_bar", self._DIGEST)
+        match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
+        assert match is not None
+        assert match.group("exit_code") == "1"
+        assert match.group("test_node_id") == "tests/test_foo.py::test_bar"
+        assert match.group("failure_digest") == self._DIGEST
+
+    def test_build_red_observed_message_missing_exit_code_names_field(self) -> None:
+        with pytest.raises(ValueError, match="exit_code"):
+            cli.build_red_observed_message(None, "tests/test_foo.py::test_bar", self._DIGEST)
+
+    def test_build_red_observed_message_missing_test_node_id_names_field(self) -> None:
+        with pytest.raises(ValueError, match="test_node_id"):
+            cli.build_red_observed_message(1, "", self._DIGEST)
+
+    def test_build_red_observed_message_missing_failure_digest_names_field(self) -> None:
+        with pytest.raises(ValueError, match="failure_digest"):
+            cli.build_red_observed_message(1, "tests/test_foo.py::test_bar", "")
+
+    def test_build_red_observed_message_rejects_zero_exit_code(self) -> None:
+        """A RED phase is, by definition, an observed failure -- exit 0 cannot be RED_OBSERVED."""
+        with pytest.raises(ValueError, match="nonzero"):
+            cli.build_red_observed_message(0, "tests/test_foo.py::test_bar", self._DIGEST)
+
+    @pytest.mark.parametrize("digest", ["DEADBEEF01", "a" * 7, "not-hex!"])
+    def test_build_red_observed_message_rejects_malformed_digest(self, digest: str) -> None:
+        with pytest.raises(ValueError, match="failure_digest"):
+            cli.build_red_observed_message(1, "tests/test_foo.py::test_bar", digest)
+
+    @pytest.mark.parametrize(
+        "test_node_id",
+        [
+            "tests/test_foo.py::test_bar[param with space]",
+            "tests/test_foo.py::test_bar\ttabbed",
+            "tests/test_foo.py::test_bar\nsecond_line",
+        ],
+    )
+    def test_build_red_observed_message_rejects_whitespace_test_node_id(self, test_node_id: str) -> None:
+        """A whitespace-bearing test_node_id builds a message ``RED_OBSERVED_MESSAGE_FIELDS_RE``
+
+        (the read-side parser ``red_gate_satisfied`` consults) can never match, since that
+        parser captures ``test_node_id`` as a non-whitespace run (``\\S+``). The builder must
+        reject this at write time instead of silently emitting a record the gate rejects.
+        """
+        with pytest.raises(ValueError, match="test_node_id"):
+            cli.build_red_observed_message(1, test_node_id, self._DIGEST)
+
+
+@pytest.mark.unit
+class TestWriteRedObservedEntry:
+    """write_red_observed_entry is the orchestrator-only RED_OBSERVED write path (FR-4.3)."""
+
+    _DIGEST = "deadbeef01"
+
+    def test_write_red_observed_entry_appends_structured_entry(self, tmp_path: Path) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.write_red_observed_entry("E231-F2-S1-T1", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_section = content[content.find("## TDD Cycle Log") :]
+        assert "[RED_OBSERVED]" in tdd_section
+        assert "exit_code=1" in tdd_section
+        assert "test_node_id=tests/test_foo.py::test_bar" in tdd_section
+        assert f"failure_digest={self._DIGEST}" in tdd_section
+
+    def test_write_red_observed_entry_unit_not_found_raises_value_error(self) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            pytest.raises(ValueError, match="not found"),
+        ):
+            cli.write_red_observed_entry("NONEXISTENT", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+    def test_write_red_observed_entry_falls_back_to_workspace_root(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-progress\n\n## Comments\n\n## TDD Cycle Log\n",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing"),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            cli.write_red_observed_entry("E0-F1-S1-T1", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RED_OBSERVED]" in content
+
+    def test_write_red_observed_entry_propagates_missing_field_error(self, tmp_path: Path) -> None:
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        before = wu_file.read_text(encoding="utf-8")
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            pytest.raises(ValueError, match="test_node_id"),
+        ):
+            cli.write_red_observed_entry("E231-F2-S1-T1", 1, "", self._DIGEST)
+
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, "a rejected record must not be written"
+
+    def test_write_red_observed_entry_not_reachable_via_commands_registry(self) -> None:
+        registered_handlers = {handler for handler, _argc, _help in cli._COMMANDS.values()}
+        assert cli.write_red_observed_entry not in registered_handlers
+
+    def test_write_red_observed_entry_round_trip_satisfies_red_gate(self, tmp_path: Path) -> None:
+        """The write-to-read seam, end to end: a real ``write_red_observed_entry``
+
+        call must produce a work-unit file that the real ``red_gate_satisfied``
+        predicate accepts. This pins the coupling between ``TDD_ENTRY_TEMPLATE``
+        (what the writer emits, via ``BacklogManager._append_tdd_entry``) and
+        ``RED_OBSERVED_ENTRY_LINE_RE`` (what the reader matches); a test_review
+        mutation of the entry-line separator in ``TDD_ENTRY_TEMPLATE`` (from
+        ``" -- "`` to ``" :: "``) rendered the gate permanently unsatisfiable
+        while every prior test -- which asserted only write-side substrings or
+        matched against hand-written fixture literals -- still passed.
+        """
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.write_red_observed_entry("E231-F2-S1-T1", 1, "tests/test_foo.py::test_bar", self._DIGEST)
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert cli.red_gate_satisfied(content) is True, (
+            "a real write_red_observed_entry call must produce a file red_gate_satisfied accepts"
+        )
+
+
+def _tdd_entry_line(phase: str, message: str, *, timestamp: str = "2026-01-01T00:00:00+00:00") -> str:
+    """Build a TDD Cycle Log entry line via the real production template.
+
+    Deriving test fixtures from ``TDD_ENTRY_TEMPLATE`` -- the exact template
+    ``BacklogManager._append_tdd_entry`` formats every real entry with --
+    instead of hardcoding the ``" -- "`` separator as a literal keeps the
+    read-side fixtures and the write-side production format coupled. A
+    test_review mutation of the template's separator (``" -- "`` to
+    ``" :: "``) previously left every fixture built from a hand-written
+    literal in sync with itself while silently drifting from what the real
+    writer emits, so ``red_gate_satisfied`` could be rendered permanently
+    unsatisfiable without a single test noticing. Fixtures built through this
+    helper change identically to the writer's output, so that drift now
+    surfaces as a test failure.
+    """
+    return TDD_ENTRY_TEMPLATE.format(phase=phase, timestamp=timestamp, message=message)
+
+
+@pytest.mark.unit
+class TestRedGateSatisfiedPredicate:
+    """red_gate_satisfied: an agent RED entry alone never satisfies the gate (AC-55, issue #257)."""
+
+    _WELL_FORMED_MESSAGE = "exit_code=1 test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01"
+    _DIGEST = "deadbeef01"
+
+    def test_red_gate_not_satisfied_with_only_agent_red_entry(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED, "observed a failure")
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_satisfied_with_well_formed_red_observed_entry(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, self._WELL_FORMED_MESSAGE)
+        assert cli.red_gate_satisfied(content) is True
+
+    def test_red_gate_not_satisfied_by_agent_red_forging_red_observed_tag_in_message(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(
+            TDD_PHASE_RED, f"observed failure [RED_OBSERVED] {self._WELL_FORMED_MESSAGE}"
+        )
+        assert cli.red_gate_satisfied(content) is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01",
+            "exit_code=1 failure_digest=deadbeef01",
+            "exit_code=1 test_node_id=tests/test_foo.py::test_bar",
+        ],
+    )
+    def test_red_gate_not_satisfied_when_red_observed_record_missing_a_field(self, message: str) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, message)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_red_observed_has_zero_exit_code(self) -> None:
+        message = "exit_code=0 test_node_id=tests/test_foo.py::test_bar failure_digest=deadbeef01"
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, message)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_red_observed_has_malformed_digest(self) -> None:
+        message = "exit_code=1 test_node_id=tests/test_foo.py::test_bar failure_digest=NOTHEX"
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, message)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_scopes_to_tdd_cycle_log_section_only(self) -> None:
+        """A well-formed-looking RED_OBSERVED line outside the TDD Cycle Log section must not count."""
+        content = (
+            "## TDD Cycle Log\n\n"
+            + _tdd_entry_line(TDD_PHASE_RED, "real observed failure")
+            + "\n## Comments\n\n"
+            + _tdd_entry_line(TDD_PHASE_RED_OBSERVED, self._WELL_FORMED_MESSAGE)
+        )
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_tdd_cycle_log_section_header_absent(self) -> None:
+        content = _tdd_entry_line(TDD_PHASE_RED_OBSERVED, self._WELL_FORMED_MESSAGE)
+        assert cli.red_gate_satisfied(content) is False
+
+    def test_red_gate_not_satisfied_when_only_real_cmd_log_tdd_red_entry_exists(self, tmp_path: Path) -> None:
+        """Negative write-to-read round trip: a genuine ``cmd_log_tdd`` agent RED
+
+        entry, written through the real agent-facing CLI verb and read back
+        from disk, must never satisfy the gate on its own (AC-55, AC-E4-F3-S1-T1-4).
+        Complements ``TestWriteRedObservedEntry.
+        test_write_red_observed_entry_round_trip_satisfies_red_gate``, which
+        pins the positive side of the same write-to-read seam.
+        """
+        wu_file, backlog_index = _setup_tdd_unit_and_index(tmp_path)
+        unit = _make_tdd_test_work_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "RED", "genuinely observed a failing assertion")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert cli.red_gate_satisfied(content) is False, (
+            "an agent-written RED entry alone must never satisfy the gate, even via the real write path"
+        )
+
+
+@pytest.mark.unit
+class TestGreenGreenObservedSatisfiedPredicate:
+    """green_green_observed_satisfied: mirrors red_gate_satisfied's three defenses --
+    section-scoping, anchored-line matching, and full message-field re-validation --
+    for the refactor-only GREEN_GREEN_OBSERVED tag (FR-4.6, E4-F4-S1-T2)."""
+
+    _WELL_FORMED_MESSAGE = "test_node_ids=tests/test_foo.py::test_bar"
+
+    def test_not_satisfied_when_tdd_cycle_log_section_header_absent(self) -> None:
+        """No ``## TDD Cycle Log`` header at all: the section-scoping regex finds
+        no section to search, so the predicate must fail closed rather than
+        raise or scan the whole document."""
+        content = _tdd_entry_line("GREEN_GREEN_OBSERVED", self._WELL_FORMED_MESSAGE)
+        assert cli.green_green_observed_satisfied(content) is False
+
+    def test_satisfied_with_well_formed_entry(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line("GREEN_GREEN_OBSERVED", self._WELL_FORMED_MESSAGE)
+        assert cli.green_green_observed_satisfied(content) is True
+
+    def test_not_satisfied_with_empty_section(self) -> None:
+        content = "## TDD Cycle Log\n\n## Comments\n\nnothing here\n"
+        assert cli.green_green_observed_satisfied(content) is False
+
+    def test_not_satisfied_when_message_field_missing(self) -> None:
+        content = "## TDD Cycle Log\n\n" + _tdd_entry_line("GREEN_GREEN_OBSERVED", "not_the_right_field=1")
+        assert cli.green_green_observed_satisfied(content) is False
+
+    def test_scopes_to_tdd_cycle_log_section_only(self) -> None:
+        """A well-formed-looking GREEN_GREEN_OBSERVED line outside the TDD Cycle Log
+        section must not count."""
+        content = (
+            "## TDD Cycle Log\n\n"
+            + _tdd_entry_line("REFACTOR", "no real green-green record here")
+            + "\n## Comments\n\n"
+            + _tdd_entry_line("GREEN_GREEN_OBSERVED", self._WELL_FORMED_MESSAGE)
+        )
+        assert cli.green_green_observed_satisfied(content) is False
 
 
 class TestCmdStatusActiveUnits:
@@ -8771,6 +9757,59 @@ class TestCmdDecline:
         assert rc == 1
         assert "not found" in capsys.readouterr().err
 
+    def test_citation_flag_without_value_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """``_parse_decline_argv``: a trailing ``--citation`` with no following value is rejected
+        before the citation is ever validated, mirroring ``--reason``'s own value-required check."""
+        rc = cli.cmd_decline("EX-F1-S1-T1", "--reason", "n/a", "--citation")
+        assert rc == 1
+        assert "--citation requires a value" in capsys.readouterr().err
+
+    def test_empty_string_argv_tokens_are_skipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """``_parse_decline_argv`` tolerates empty-string tokens in argv (mirrors the existing
+        ``_parse_new_task_argv`` idiom this parser was modelled on) rather than misreading one as
+        the positional task id."""
+        backlog_md, wu_file = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_decline("", "EX-F1-S1-T1", "--reason", "scope determined unnecessary", "")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "scope determined unnecessary" in content
+
+    def test_wu_file_not_found_on_disk_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The unit is present in the (mocked) parsed index (so ``_find_unit`` succeeds) but its
+        work-unit file was never written to disk under either ``BACKLOG_ROOT`` or
+        ``WORKSPACE_ROOT`` -- ``_resolve_unit_file`` returns ``None`` and decline must reject
+        rather than raise. A mock parser is required here because the real ``BacklogParser``
+        eagerly reads every indexed file's content while building the index itself, so it cannot
+        model "indexed but the file went missing after indexing" the way ``_resolve_unit_file``
+        can."""
+        unit_id = "EX-F1-S1-T9"
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        unit = WorkUnit(
+            id=unit_id,
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_decline(unit_id, "--reason", "n/a")
+        assert rc == 1
+        assert "Work unit file not found" in capsys.readouterr().err
+
     def test_registered_in_commands(self) -> None:
         assert "decline" in cli._COMMANDS
 
@@ -12813,6 +13852,130 @@ class TestCmdCheckMerge:
             rc = cli.cmd_check_merge("E0-F1-S1-T1")
         assert rc == 1
 
+    def _make_merged_pr_ops(self) -> MagicMock:
+        ops = MagicMock()
+        ops._gh.return_value = (
+            0,
+            json.dumps([{"number": 42, "state": "MERGED", "mergedAt": "2026-05-07T00:00:00Z", "url": "u"}]),
+            "",
+        )
+        return ops
+
+    def test_returns_1_when_refactor_missing_green_green_observed_via_real_mark_done(self, tmp_path: Path) -> None:
+        """code_review FAIL round 3 regression: check-merge must inherit the
+        refactor GREEN_GREEN_OBSERVED done-gate from BacklogManager.mark_done()
+        -- not merely cmd_mark_done's wrapper -- so a refactor task with all
+        judges passed but no machine-observed GREEN_GREEN_OBSERVED record
+        cannot reach done through the PR-merged-externally path either."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n## Task Type: refactor\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | t | Task | in-review | None | repo | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        ops = self._make_merged_pr_ops()
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=BacklogManager()),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+        content = wu_file.read_text(encoding="utf-8")
+        assert "## Status: in-review" in content
+        assert "## Status: done" not in content
+
+    def test_returns_1_when_gated_type_missing_red_observed_via_real_mark_done(self, tmp_path: Path) -> None:
+        """code_review FAIL round 3 regression: check-merge must inherit the
+        gated-task RED_OBSERVED done-gate from BacklogManager.mark_done() --
+        a behavior-fix task with all judges passed but no machine-observed
+        RED_OBSERVED record cannot reach done through the PR-merged-externally
+        path either."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n## Task Type: behavior-fix\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | t | Task | in-review | None | repo | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        ops = self._make_merged_pr_ops()
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=BacklogManager()),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+        content = wu_file.read_text(encoding="utf-8")
+        assert "## Status: in-review" in content
+        assert "## Status: done" not in content
+
+    def test_returns_0_when_refactor_has_green_green_observed_via_real_mark_done(self, tmp_path: Path) -> None:
+        """Positive counterpart: a refactor task WITH a GREEN_GREEN_OBSERVED
+        record and all judges passed reaches done through check-merge."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n## Task Type: refactor\n\n"
+            f"## TDD Cycle Log\n\n{_mark_done_green_green_observed_line()}\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | t | Task | in-review | None | repo | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        ops = self._make_merged_pr_ops()
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=BacklogManager()),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
 
 class TestCheckMergeRegistration:
     """The check-merge command must be registered in the CLI dispatch table."""
@@ -13951,12 +15114,16 @@ class TestCmdStatusNextActionableFilter:
         # ... and Next actionable points at the DIFFERENT in-queue task.
         assert "Next actionable: E0-F1-S1-T2" in out
 
-    def test_no_actionable_message_when_only_active(
+    def test_active_line_shown_when_only_active(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """When the only candidate is the in-progress task itself, the
-        ``Next actionable`` line is suppressed (no genuine next task)."""
+        ``Next actionable`` line is suppressed and the active-units line
+        names the running task instead of the stuck-state message (issue
+        #309: a serially-ordered backlog's steady state is one unit
+        IN_PROGRESS and nothing else claimable, which is not the same as
+        genuinely nothing being actionable)."""
         in_prog = WorkUnit(
             id="E0-F1-S1-T1",
             title="Active",
@@ -13975,9 +15142,10 @@ class TestCmdStatusNextActionableFilter:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        # No "Next actionable" line; instead the no-actionable branch fires.
+        # No "Next actionable" line; instead the active-units branch fires.
         assert "Next actionable" not in out
-        assert "No actionable units." in out
+        assert "No actionable units." not in out
+        assert "E0-F1-S1-T1 active; nothing else can start yet. 0 blocked." in out
 
 
 class TestCmdWriteSnapshot:
@@ -15577,6 +16745,43 @@ class TestCmdStatusScopeBanner:
         assert bad_field in err
         assert "must be a list" in err
 
+    # ------------------------------------------------------------------
+    # Legacy list-shaped scope.json self-heals rather than crashing (#270)
+    # ------------------------------------------------------------------
+
+    def test_legacy_list_session_scope_json_self_heals_via_cmd_status(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_status must self-heal a legacy list-shaped scope.json, not crash.
+
+        Reproduces issue #270's live-incident path: a bare JSON array left on
+        disk from an earlier devbench version used to raise 'scope.json
+        top-level payload must be an object, got list' on every call, forcing
+        an operator to manually delete the file. cmd_status now migrates the
+        file in place (via the shared devbench.scope migration primitive) and
+        proceeds normally.
+        """
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        scope_path = scope_dir / "scope.json"
+        scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        err = capsys.readouterr().err
+        assert rc == 0, f"cmd_status must self-heal a legacy list-shaped scope.json, not crash. stderr={err!r}"
+        migrated = json.loads(scope_path.read_text())
+        assert isinstance(migrated, dict)
+        assert migrated["expanded_ids"] == ["E1-F1-S1-T1"]
+
 
 # ---------------------------------------------------------------------------
 # AC-190-10 / AC-190-11: cmd_report scope flags + SCOPE banner (E2-F2-S2-T2)
@@ -16237,6 +17442,37 @@ class TestCmdScope:
         assert rc == 0
         out = capsys.readouterr().out
         assert "E2" in out
+
+    # ------------------------------------------------------------------
+    # Legacy list-shaped scope.json self-heals rather than crashing (#270)
+    # ------------------------------------------------------------------
+
+    def test_show_legacy_list_session_scope_json_self_heals(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """scope show must self-heal a legacy list-shaped scope.json, not crash.
+
+        Reproduces issue #270's live-incident path via the third scope.json
+        reader, ``_scope_show``: a bare JSON array left on disk from an
+        earlier devbench version used to raise an uncaught 'list indices
+        must be integers or slices, not str' TypeError (the array does not
+        support ``data["include"]`` key access), forcing an operator to
+        manually delete the file. ``scope show`` now migrates the file in
+        place (via the shared ``devbench.scope`` migration primitive) and
+        prints the migrated state instead of crashing.
+        """
+        scope_path = self._scope_path(tmp_path)
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        scope_path.write_text(json.dumps(["E1-F1-S1-T1"]))
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("show")
+
+        err = capsys.readouterr().err
+        assert rc == 0, f"scope show must self-heal a legacy list-shaped scope.json, not crash. stderr={err!r}"
+        migrated = json.loads(scope_path.read_text())
+        assert isinstance(migrated, dict)
+        assert migrated["expanded_ids"] == ["E1-F1-S1-T1"]
 
     # ------------------------------------------------------------------
     # Parametrised: multiple valid selector shapes
@@ -20201,13 +21437,23 @@ class TestCostCalibrate:
         """When the operator calibrates a model not yet listed in
         ``report.models``, the helper seeds ``input``/``output`` from the
         canonical defaults so the resulting yaml is schema-valid.
+
+        AC-E3-F1-S1-T1-10 (spec FR-3.2 error handling, designed tripwire):
+        exercises the current default ``claude-opus-5`` (issue #233)
+        alongside the retained ``claude-opus-4-7`` row so the same test
+        that hard-pinned the Opus 4.7-era table catches any future
+        regression on either id.
         """
+        from devbench.constants import DEFAULT_MODEL_RATES
+
         config_yaml = tmp_path / "devbench.yaml"
         config_yaml.write_text(
             "repos:\n  org/repo:\n    default_branch: main\nreport:\n  models: {}\n",
             encoding="utf-8",
         )
-        cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], correction_factor=0.95)
+        cli.write_per_model_correction_factors(
+            config_yaml, ["claude-opus-4-7", "claude-opus-5"], correction_factor=0.95
+        )
         import yaml as _yaml
 
         round_tripped = _yaml.safe_load(config_yaml.read_text(encoding="utf-8"))
@@ -20215,6 +21461,19 @@ class TestCostCalibrate:
         # Seeded from DEFAULT_MODEL_RATES["claude-opus-4-7"]: $5/$25.
         assert opus["input"] == 5.0
         assert opus["output"] == 25.0
+
+        # claude-opus-5 is the current default lineup entry (issue #233).
+        # Assert it is an explicit DEFAULT_MODEL_RATES entry (not merely a
+        # value that happens to match the "<unknown>" fallback rate) so this
+        # tripwire actually catches the entry being dropped from the table.
+        assert "claude-opus-5" in DEFAULT_MODEL_RATES, (
+            "claude-opus-5 must be an explicit DEFAULT_MODEL_RATES entry, not just "
+            "coincidentally matching the fallback rate (issue #233)."
+        )
+        opus5 = round_tripped["report"]["models"]["claude-opus-5"]
+        # Seeded from DEFAULT_MODEL_RATES["claude-opus-5"]: $5/$25 list.
+        assert opus5["input"] == 5.0
+        assert opus5["output"] == 25.0
         assert opus["correction_factor"] == 0.95
 
     def test_write_per_model_correction_factors_rejects_non_mapping_yaml(self, tmp_path: Path) -> None:
@@ -20596,6 +21855,995 @@ class TestDaemonizeGuard:
                 cli._daemonize_to_background(tmp_path)
 
 
+# ---------------------------------------------------------------------------
+# cmd_tdd_gate (FR-4.2, E4-F3-S1-T2) -- the orchestrator-facing wiring around
+# devbench.tdd_gate.observe_red. All git behavior under test is exercised
+# against real temporary git repositories (no mocked git); the wiring itself
+# (unit resolution, manifest parsing, RED_OBSERVED write-on-success,
+# rejection-message passthrough) is what this test class covers -- the full
+# stash/pytest/classification behavior is covered exhaustively at the
+# devbench.tdd_gate module level in tests/test_tdd_gate.py.
+# ---------------------------------------------------------------------------
+def _tdd_gate_init_repo(tmp_path: Path) -> Path:
+    return _init_scratch_repo_for_cli(
+        tmp_path,
+        dir_name="target-repo",
+        author_email="tdd-gate-cli-test@example.com",
+        author_name="Tdd Gate Cli Test",
+    )
+
+
+def _tdd_gate_work_unit_content(unit_id: str, manifest_rows: str, red_entry: str) -> str:
+    return (
+        f"# {unit_id}: TDD Gate CLI Test\n\n"
+        "## Status: in-progress\n\n"
+        "## Changes Manifest\n\n"
+        "| File | Change |\n"
+        "|------|--------|\n"
+        f"{manifest_rows}\n"
+        "## TDD Cycle Log\n\n"
+        f"{red_entry}\n\n"
+        "## Comments\n"
+    )
+
+
+def _tdd_gate_setup_unit(unit_id: str, wu_file: Path) -> tuple[WorkUnit, MagicMock]:
+    unit = WorkUnit(
+        id=unit_id,
+        title="TDD Gate CLI Test",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=wu_file,
+        repo="caylent-solutions/devbench",
+        dependencies=[],
+    )
+    mock_parser = MagicMock()
+    mock_parser.parse_index.return_value = [unit]
+    return unit, mock_parser
+
+
+@pytest.mark.unit
+class TestCmdTddGate:
+    """cmd_tdd_gate -- orchestrator-facing wiring for the machine-observed RED gate."""
+
+    def test_registered_in_commands(self) -> None:
+        assert "tdd-gate" in cli._COMMANDS, "tdd-gate command must be registered in cli._COMMANDS"
+
+    def test_success_writes_red_observed_and_returns_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/greeter.py", "def greet() -> str:\n    return 'hi'\n")
+        _tdd_gate_write(
+            repo,
+            "tests/test_greeter.py",
+            "from greeter import greet\n\n\ndef test_greet() -> None:\n    assert greet() == 'wrong'\n",
+        )
+        _tdd_gate_write(
+            repo,
+            "conftest.py",
+            "import sys\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path(__file__).parent / 'src'))\n",
+        )
+        _tdd_gate_commit_all(repo, "add greeter with a deliberately-wrong assertion")
+
+        unit_id = "E231-F3-S1-T1"
+        wu_file = tmp_path / f"{unit_id}.md"
+        node_id = "tests/test_greeter.py::test_greet"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(
+                unit_id,
+                "| `src/greeter.py` | add |\n| `tests/test_greeter.py` | add |\n",
+                f"- [RED] 2026-01-01T00:00:00+00:00 -- Command: pytest {node_id} -q. Exit: 1.\n",
+            ),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert node_id in out
+        assert "exit_code=1" in out
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RED_OBSERVED]" in content
+        assert f"test_node_id={node_id}" in content
+        # the gate must restore the working tree exactly as found
+        assert (repo / "src" / "greeter.py").read_text(encoding="utf-8") == "def greet() -> str:\n    return 'hi'\n"
+
+    def test_rejection_prints_message_and_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """No named test in the TDD Cycle Log -- the gate rejects before touching git."""
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/prod.py", "x = 1\n")
+        _tdd_gate_commit_all(repo, "baseline")
+
+        unit_id = "E231-F3-S1-T2"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(unit_id, "| `src/prod.py` | modify |\n", ""),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        before = wu_file.read_text(encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "RED gate rejected" in err
+        assert unit_id in err
+        after = wu_file.read_text(encoding="utf-8")
+        assert after == before, "a rejected gate must write nothing to the work unit file"
+
+    def test_unit_not_found_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_tdd_gate("NONEXISTENT")
+
+        assert result == 1
+        assert "not found in backlog" in capsys.readouterr().err
+
+    def test_work_unit_file_not_on_disk_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The unit is present in the index, but its .md file exists nowhere on disk."""
+        unit_id = "E231-F3-S1-T5"
+        unit = WorkUnit(
+            id=unit_id,
+            title="TDD Gate CLI Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing-backlog-root"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "missing-workspace-root"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        assert "not found on disk" in capsys.readouterr().err
+
+    def test_missing_repo_local_path_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E231-F3-S1-T3"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(unit_id, "| `src/prod.py` | modify |\n", ""),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        assert "No local path configured" in capsys.readouterr().err
+
+    def test_manifest_parse_error_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A work-unit file with no Changes Manifest section fails fast (ManifestParseError)."""
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "README.md", "baseline\n")
+        _tdd_gate_commit_all(repo, "baseline")
+
+        unit_id = "E231-F3-S1-T4"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}: No Manifest\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        assert "Changes Manifest could not be parsed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# cmd_green_green_check (FR-4.6, E4-F4-S1-T2) -- the refactor green-green
+# check: named tests pass both before and after the change. All git
+# behavior under test is exercised against real temporary git repositories
+# (no mocked git), mirroring TestCmdTddGate's fixture discipline above.
+# ---------------------------------------------------------------------------
+def _gg_init_repo(tmp_path: Path) -> Path:
+    return _init_scratch_repo_for_cli(
+        tmp_path,
+        dir_name="gg-target-repo",
+        author_email="green-green-cli-test@example.com",
+        author_name="Green Green Cli Test",
+    )
+
+
+def _gg_conftest_content() -> str:
+    return "import sys\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path(__file__).parent / 'src'))\n"
+
+
+def _gg_work_unit_content(unit_id: str, manifest_rows: str) -> str:
+    return (
+        f"# {unit_id}: Green-Green CLI Test\n\n"
+        "## Status: in-progress\n\n"
+        "## Task Type: refactor\n\n"
+        "## Changes Manifest\n\n"
+        "| File | Change |\n"
+        "|------|--------|\n"
+        f"{manifest_rows}\n"
+        "## TDD Cycle Log\n\n"
+        "## Comments\n"
+    )
+
+
+def _gg_setup_unit(unit_id: str, wu_file: Path) -> tuple[WorkUnit, MagicMock]:
+    unit = WorkUnit(
+        id=unit_id,
+        title="Green-Green CLI Test",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=wu_file,
+        repo="caylent-solutions/devbench",
+        dependencies=[],
+    )
+    mock_parser = MagicMock()
+    mock_parser.parse_index.return_value = [unit]
+    return unit, mock_parser
+
+
+@pytest.mark.unit
+class TestGgClearPycache:
+    """_gg_clear_pycache -- clears __pycache__ dirs but skips .venv (code_review FAIL round 4)."""
+
+    def test_removes_pycache_outside_venv(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / "src" / "__pycache__"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "mod.cpython-312.pyc").write_bytes(b"stale")
+
+        cli._gg_clear_pycache(tmp_path)
+
+        assert not cache_dir.exists()
+
+    def test_skips_pycache_under_venv(self, tmp_path: Path) -> None:
+        venv_cache_dir = tmp_path / ".venv" / "lib" / "pkg" / "__pycache__"
+        venv_cache_dir.mkdir(parents=True)
+        (venv_cache_dir / "installed.cpython-312.pyc").write_bytes(b"unrelated")
+
+        cli._gg_clear_pycache(tmp_path)
+
+        assert venv_cache_dir.exists(), (
+            "a .venv's compiled bytecode is never touched by the green-green "
+            "stash round-trip and clearing it is pure wasted work"
+        )
+
+    def test_clears_outside_venv_while_skipping_inside(self, tmp_path: Path) -> None:
+        prod_cache_dir = tmp_path / "src" / "__pycache__"
+        prod_cache_dir.mkdir(parents=True)
+        venv_cache_dir = tmp_path / ".venv" / "lib" / "pkg" / "__pycache__"
+        venv_cache_dir.mkdir(parents=True)
+
+        cli._gg_clear_pycache(tmp_path)
+
+        assert not prod_cache_dir.exists()
+        assert venv_cache_dir.exists()
+
+
+@pytest.mark.unit
+class TestCmdGreenGreenCheck:
+    """cmd_green_green_check -- refactor's own invariant: named tests pass before and after."""
+
+    def test_registered_in_commands(self) -> None:
+        assert "green-green-check" in cli._COMMANDS
+        assert "green-green-check" in cli._VARIADIC_COMMANDS
+
+    def test_success_both_sides_pass(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        # The refactor is already applied, uncommitted, in the working tree.
+        # Behavior-preserving: same result, different implementation.
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    total = a + b\n    return total\n")
+
+        unit_id = "E233-F1-S1-T1"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n| `tests/test_calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "passed" in out
+        assert node_id in out
+        # the refactor's uncommitted change must survive the stash round trip
+        assert (repo / "src" / "calc.py").read_text(encoding="utf-8") == (
+            "def add(a, b):\n    total = a + b\n    return total\n"
+        )
+
+    def test_after_state_fails(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        # The uncommitted "refactor" is actually broken.
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a - b\n")
+
+        unit_id = "E233-F1-S1-T2"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "after-state" in err
+        # no stash should have happened -- the broken uncommitted file is untouched
+        assert (repo / "src" / "calc.py").read_text(encoding="utf-8") == "def add(a, b):\n    return a - b\n"
+
+    def test_before_state_fails(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        # Baseline is buggy (subtracts instead of adds).
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a - b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add() (buggy)")
+        # The uncommitted fix corrects it.
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+
+        unit_id = "E233-F1-S1-T3"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "before-state" in err
+        # the stash must be popped, restoring the uncommitted fix even on before-failure
+        assert (repo / "src" / "calc.py").read_text(encoding="utf-8") == "def add(a, b):\n    return a + b\n"
+
+    def test_collection_failure_after_fails_closed(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "x = 1\n")
+        _tdd_gate_commit_all(repo, "baseline, no tests directory at all")
+
+        unit_id = "E233-F1-S1-T4"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_missing.py::test_nothing"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "collection failure" in err
+        assert "after-state" in err
+
+    def test_collection_failure_before_fails_closed(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        # Baseline calc.py does not define add() at all -- importing the test
+        # module raises ImportError, a collection failure, not an assertion
+        # failure.
+        _tdd_gate_write(repo, "src/calc.py", "x = 1\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline, add() does not exist yet")
+        # The uncommitted change adds it.
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+
+        unit_id = "E233-F1-S1-T5"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "collection failure" in err
+        assert "before-state" in err
+        # the stash must still be popped, restoring the uncommitted fix
+        assert (repo / "src" / "calc.py").read_text(encoding="utf-8") == "def add(a, b):\n    return a + b\n"
+
+    def test_no_test_node_ids_supplied_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_green_green_check("E233-F1-S1-T6")
+
+        assert result == 1
+        assert "requires" in capsys.readouterr().err.lower()
+
+    def test_dirty_tree_outside_manifest_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_commit_all(repo, "baseline")
+        # An untracked file not listed in the Changes Manifest.
+        _tdd_gate_write(repo, "src/unrelated.py", "y = 2\n")
+
+        unit_id = "E233-F1-S1-T7"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, "tests/test_calc.py::test_add")
+
+        assert result == 1
+        assert "outside the Changes Manifest" in capsys.readouterr().err
+
+    def test_no_production_rows_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "tests/test_calc.py", "def test_noop() -> None:\n    assert True\n")
+        _tdd_gate_commit_all(repo, "baseline")
+
+        unit_id = "E233-F1-S1-T8"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `tests/test_calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, "tests/test_calc.py::test_noop")
+
+        assert result == 1
+        assert "no production-source rows" in capsys.readouterr().err
+
+    def test_unit_not_found_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_green_green_check("NONEXISTENT", "tests/test_x.py::test_y")
+
+        assert result == 1
+        assert "not found in backlog" in capsys.readouterr().err
+
+    def test_work_unit_file_not_on_disk_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E233-F1-S1-T9"
+        unit = WorkUnit(
+            id=unit_id,
+            title="Green-Green CLI Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing-backlog-root"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "missing-workspace-root"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_green_green_check(unit_id, "tests/test_x.py::test_y")
+
+        assert result == 1
+        assert "not found on disk" in capsys.readouterr().err
+
+    def test_missing_repo_local_path_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E233-F1-S1-T10"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, "tests/test_x.py::test_y")
+
+        assert result == 1
+        assert "No local path configured" in capsys.readouterr().err
+
+    def test_manifest_parse_error_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "README.md", "baseline\n")
+        _tdd_gate_commit_all(repo, "baseline")
+
+        unit_id = "E233-F1-S1-T11"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}: No Manifest\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, "tests/test_x.py::test_y")
+
+        assert result == 1
+        assert "Changes Manifest could not be parsed" in capsys.readouterr().err
+
+    def test_no_local_changes_to_stash_rejects(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """When the Changes Manifest's production row has no uncommitted diff (the "after" state
+        was already committed), ``git stash push`` reports "No local changes to save" and
+        ``devbench.tdd_gate.stash_push_scoped`` returns ``pushed=False``. Treating that as success would run the
+        "before"-state check against the unmodified after-state tree and report a guaranteed,
+        meaningless pass -- the exact "could not run reported as passed" hole FR-4.6 and AC-5
+        forbid (code_review FAIL, round 2). The check must reject instead, naming that no
+        uncommitted production-source change was found."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add() -- already the final, committed state")
+        # No uncommitted change follows: nothing left for git to stash.
+
+        unit_id = "E233-F1-S1-T12"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "no uncommitted production-source change" in err
+        assert "src/calc.py" in err
+        # a rejection must write nothing -- no GREEN_GREEN_OBSERVED record either.
+        assert wu_file.read_text(encoding="utf-8") == before
+
+    def test_success_records_green_green_observed_entry(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-E4-F4-S1-T2-4: a passing green-green check appends a machine-observed
+        GREEN_GREEN_OBSERVED record to the work unit's TDD Cycle Log, so a downstream gate
+        (cmd_mark_done) can verify the invariant actually ran instead of trusting an unrecorded
+        command (code_review FAIL, round 2)."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    total = a + b\n    return total\n")
+
+        unit_id = "E233-F1-S1-T17"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n| `tests/test_calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 0
+        assert "passed" in capsys.readouterr().out
+        content = wu_file.read_text(encoding="utf-8")
+        assert cli.green_green_observed_satisfied(content) is True
+        assert "[GREEN_GREEN_OBSERVED]" in content
+        assert node_id in content
+
+    def test_after_state_failure_records_no_green_green_observed_entry(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A rejected check (after-state fails) must never write a GREEN_GREEN_OBSERVED record --
+        the record is proof-of-success only, never proof-of-attempt."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a - b\n")
+
+        unit_id = "E233-F1-S1-T18"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        content = wu_file.read_text(encoding="utf-8")
+        assert cli.green_green_observed_satisfied(content) is False
+        assert "GREEN_GREEN_OBSERVED" not in content
+
+    def test_stash_push_failure_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A genuinely failing ``git stash push`` (simulated with a real, held ``index.lock``)
+        is reported by name and rejects the check -- the check never silently treats an
+        unstashed "before" state as having been reconstructed."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    total = a + b\n    return total\n")
+
+        unit_id = "E233-F1-S1-T13"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        lock_file = repo / ".git" / "index.lock"
+        lock_file.write_text("", encoding="utf-8")
+        try:
+            with (
+                patch("devbench.cli.BacklogParser", return_value=mock_parser),
+                patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+                patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+                patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+                patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            ):
+                result = cli.cmd_green_green_check(unit_id, node_id)
+        finally:
+            lock_file.unlink(missing_ok=True)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "git stash push" in err
+        assert "failed" in err
+
+    def test_stash_pop_conflict_returns_1_with_git_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A genuine ``git stash pop`` failure (a real merge conflict against a concurrent edit
+        to the same production file) is reported by name and rejects the check, rather than
+        silently discarding the stash entry."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    total = a + b\n    return total\n")
+
+        unit_id = "E233-F1-S1-T14"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        original_run_named_tests = cli._gg_run_named_tests
+
+        def conflicting_runner(gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+            if side == "before":
+                # Simulate a concurrent edit landing on the exact file the
+                # stash is about to restore, so the real `git stash pop`
+                # that follows genuinely conflicts.
+                (repo_path / "src" / "calc.py").write_text("def add(a, b):\n    return 'conflict'\n", encoding="utf-8")
+            return original_run_named_tests(gg_unit_id, side, test_node_ids, repo_path)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli._gg_run_named_tests", side_effect=conflicting_runner),
+        ):
+            result = cli.cmd_green_green_check(unit_id, node_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "git stash pop" in err
+        assert "failed" in err
+
+    def test_before_state_run_raises_pop_succeeds_reraises(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When the before-state test step itself raises, the stash is still popped
+        (fail-closed restore) before the original exception is re-raised."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        refactored_content = "def add(a, b):\n    total = a + b\n    return total\n"
+        _tdd_gate_write(repo, "src/calc.py", refactored_content)
+
+        unit_id = "E233-F1-S1-T15"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        def flaky_runner(gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+            if side == "before":
+                raise RuntimeError("simulated crash during before-state run")
+            return None
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli._gg_run_named_tests", side_effect=flaky_runner),
+            pytest.raises(RuntimeError, match="simulated crash during before-state run"),
+        ):
+            cli.cmd_green_green_check(unit_id, node_id)
+
+        # the stash must have been popped despite the raise, restoring the
+        # uncommitted refactor.
+        assert (repo / "src" / "calc.py").read_text(encoding="utf-8") == refactored_content
+
+    def test_before_state_run_raises_and_pop_also_fails_reports_both_and_reraises(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When the before-state step raises AND the subsequent pop also fails, both failures
+        are reported together on stderr before the original exception is re-raised -- neither
+        failure is allowed to silently swallow the other."""
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_write(
+            repo, "tests/test_calc.py", "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+        )
+        _tdd_gate_write(repo, "conftest.py", _gg_conftest_content())
+        _tdd_gate_commit_all(repo, "baseline add()")
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    total = a + b\n    return total\n")
+
+        unit_id = "E233-F1-S1-T16"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+        node_id = "tests/test_calc.py::test_add"
+
+        def flaky_runner(gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+            if side == "before":
+                raise RuntimeError("simulated crash during before-state run")
+            return None
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli._gg_run_named_tests", side_effect=flaky_runner),
+            # stash_pop is now imported locally from devbench.tdd_gate (the
+            # shared, promoted-to-public helper -- E4-F4-S1-T2 round 4 DRY
+            # fix) inside `_gg_run_before_after`, so the patch target is the
+            # defining module's attribute, not a module-level cli.py name.
+            patch("devbench.tdd_gate.stash_pop", return_value="simulated pop conflict"),
+            pytest.raises(RuntimeError, match="simulated crash during before-state run"),
+        ):
+            cli.cmd_green_green_check(unit_id, node_id)
+
+        err = capsys.readouterr().err
+        assert "git stash pop" in err
+        assert "simulated pop conflict" in err
+        assert "simulated crash during before-state run" in err
+        assert "both failures are reported together" in err
+
+
 class TestNonTerminalManifests:
     """Ownership for quarantine comes from Changes Manifests, not guesswork.
 
@@ -20799,3 +23047,41 @@ class TestSessionScopeJsonShape:
         stale.write_text("[]", encoding="utf-8")
         cli._write_session_state_files(tmp_path, "s1", 4242, ["E1-F1-S1-T1"])
         assert isinstance(json.loads(stale.read_text(encoding="utf-8")), dict)
+
+
+@pytest.mark.unit
+class TestCmdInstancesDocstringMatchesResolvedDefault:
+    """Pins the cmd_instances docstring to the three-tier default (obs-spec OD-2).
+
+    doc_review round-2 finding: the docstring still said "default home
+    directory" after _resolve_search_roots' default branch changed to
+    $HOME plus DEVBENCH_WORKSPACE_ROOT.
+    """
+
+    def test_docstring_does_not_claim_home_only_default(self) -> None:
+        doc = cli.cmd_instances.__doc__ or ""
+        assert "default home directory" not in doc, (
+            "cmd_instances docstring must not claim the search-root default is "
+            "the home directory alone; the default is now $HOME plus "
+            "DEVBENCH_WORKSPACE_ROOT (obs-spec OD-2)."
+        )
+
+    def test_docstring_names_workspace_root_in_default(self) -> None:
+        doc = cli.cmd_instances.__doc__ or ""
+        assert "DEVBENCH_WORKSPACE_ROOT" in doc, (
+            "cmd_instances docstring must name DEVBENCH_WORKSPACE_ROOT as part "
+            "of the default search-root resolution (obs-spec OD-2)."
+        )
+
+    def test_docstring_does_not_claim_tty_conditional_default(self) -> None:
+        """doc_review round-2 finding: cmd_instances performs no isatty()
+        check -- table output is the unconditional default and only --json
+        changes the format, so the docstring must not say "TTY default".
+        """
+        doc = cli.cmd_instances.__doc__ or ""
+        assert "TTY default" not in doc, (
+            "cmd_instances docstring must not claim table output is 'the "
+            "TTY default'; cmd_instances performs no isatty() check, so "
+            "table output is the unconditional default and only --json "
+            "changes the format."
+        )

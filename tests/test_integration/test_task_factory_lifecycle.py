@@ -233,10 +233,20 @@ class TestTaskFactoryLifecycleHappyPath:
         }
 
         def _stamp_reviews(draft: Path) -> None:
+            # Declare an exempt Task Type so this auto-requeue-cascade test
+            # exercises only the judges-passed done-gate, not the separate
+            # FR-4.5/FR-4.6 task-type invariant BacklogManager.mark_done()
+            # now also enforces directly (E4-F4-S1-T2 round 3: the check
+            # used to live only in cli.py's cmd_mark_done wrapper; a
+            # materialised draft with no ``## Task Type:`` section would
+            # otherwise default to the strictest gated type and this
+            # unrelated cascade test would fail for the wrong reason).
+            content = draft.read_text()
+            content = content.replace("## Status: in-queue\n", "## Status: in-queue\n\n## Task Type: chore\n", 1)
             review_block = "\n".join(
                 f"[2026-04-19 14:00 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in ALL_REQUIRED_JUDGE_NAMES
             )
-            draft.write_text(draft.read_text() + "\n" + review_block + "\n")
+            draft.write_text(content + "\n" + review_block + "\n")
 
         # (2) Partial: mark first draft done -- source stays blocked.
         _stamp_reviews(draft_paths["E0-F1-S1-T2"])

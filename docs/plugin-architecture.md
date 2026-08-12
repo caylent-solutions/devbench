@@ -28,12 +28,12 @@ plugin/devbench-orchestrate/
 │   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
 │   ├── executor.md              ← dev agent: implements work units via TDD
-│   ├── review-supervisor.md     ← not invoked (ADR-33): no pipeline role, kept for config
+│   ├── review-supervisor.md     ← non-spawning aggregator: reads the 4 judges' persisted verdicts
 │   ├── security-reviewer.md     ← security review gate agent
 │   ├── blocker-resolver.md      ← dependency blocker assessment agent + proposal emission after amendment reject
 │   ├── manifest-amender.md      ← conditional judge for TDD GREEN manifest amendments
 │   ├── task-factory.md          ← materialises blocker-resolver proposals into draft `proposed` work units
-│   └── review_team/             ← judges dispatched directly by the orchestrate skill
+│   └── review_team/             ← review team agents, invoked directly by SKILL.md as first-level sub-agents (ADR-33)
 │       ├── code-reviewer.md     ← SOLID, DRY, fail-fast, 12-factor review
 │       ├── test-reviewer.md     ← TDD discipline, test quality, assertions
 │       ├── doc-reviewer.md      ← accuracy, completeness, sync with code
@@ -52,12 +52,12 @@ plugin/devbench-orchestrate/
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
     ├── guard-destructive-git.sh ← blocks direct destructive git operations from non-git-ops agents
     ├── guard-review-supervisor-scope.sh
-    │                            ← enforces read-only scope on the review-supervisor agent.
+    │                            ← enforces read-only, non-spawning scope on the review-supervisor agent.
     │                              Blocks Bash mutations (git commit/push, rm, sed -i, > redirection, etc.)
-    │                              AND blocks Agent-tool spawn of any subagent_type outside the
-    │                              review_team allowlist (devbench:code_review, test_review, doc_review,
-    │                              changes_manifest). Issue #118 -- closes the loophole where the
-    │                              supervisor escalated to repo-mutation rights via subagent spawn.
+    │                              AND blocks every Agent-tool invocation unconditionally -- no allowlist
+    │                              (ADR-33: review-supervisor never spawns the judges itself). Issue #118
+    │                              -- closes the loophole where the supervisor escalated to repo-mutation
+    │                              rights via subagent spawn.
     └── assert-tests-pass.sh     ← enforces test suite passes after Bash
 ```
 
@@ -72,9 +72,9 @@ agent content:
 ---
 name: code-reviewer
 description: Reviews staged code changes against SOLID, DRY, fail-fast, and 12-factor standards
-model: haiku
-tools: Read, Bash, Glob, Grep
-disallowedTools: Write, Edit
+model: opus
+tools: Bash
+disallowedTools: Write, Edit, Read, Glob, Grep
 ---
 
 ## Evidence
@@ -94,7 +94,7 @@ explicitly (since it cannot rely on cwd auto-loading):
 ---
 name: executor
 description: Implements a work unit following TDD, SOLID, and all project standards
-model: opus
+model: sonnet
 tools: Read, Write, Edit, Bash, Glob, Grep
 ---
 
@@ -110,13 +110,28 @@ standards before starting. Use `repo_path` as your working root for all file ope
 
 ## Model Per Role
 
-Each agent specifies its own model in the frontmatter:
+Each agent specifies its own model in the frontmatter. Current shipped defaults
+(`plugin/devbench-orchestrate/agents/**/*.md` frontmatter, ADR-25):
 
 | Agent | Model | Reason |
 |-------|-------|--------|
-| `executor.md` | opus | Complex implementation work requiring full capability |
-| `code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, `changes-manifest.md` | haiku | Structured evidence evaluation with constrained output |
-| `security-reviewer.md` | sonnet | Security reasoning requires more capability than haiku |
+| `executor.md` | sonnet | Complex implementation work; sonnet balances capability and cost for the highest-volume agent |
+| `code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, `changes-manifest.md` | opus | Judgment-heavy structured evidence evaluation; wrong verdicts cascade into rework, so accuracy outweighs the inference-cost savings of a smaller model |
+| `security-reviewer.md` | opus | Security reasoning for a highly regulated environment requires full capability |
+| `review-supervisor.md` | sonnet | Non-spawning aggregator (ADR-33): reads the four judges' already-persisted verdicts and reports a consolidated result; no spawning and no independent judgment call |
+| `manifest-amender.md`, `blocker-resolver.md`, `task-factory.md` | opus | Judgment-heavy, fire only on unhappy paths; a wrong amendment/proposal decision costs more than the inference savings of a smaller model |
+
+**Haiku is rejected at config-load time for every work agent
+(`caylent-solutions/devbench#198`).** The Claude Agent SDK was repeatedly
+observed silently dropping the `Agent` tool from Haiku's tool list mid-session,
+breaking parallel sub-agent dispatch and forcing the orchestrator to classify
+the work unit as `RUNTIME_DEGRADATION`. `validate_agent_model_value()` in
+`src/devbench/config_loader.py` hard-rejects any `agents:` override value
+containing `haiku` -- short name, full Anthropic API id, or Bedrock ARN --
+at config-load, with no operator-facing override path. This ban is
+unconditional and is not softened by cost-optimization goals; see
+[ADR-25](adr/25-per-agent-model-overrides.md) for the full rationale and
+reproduction evidence.
 
 ---
 
@@ -216,7 +231,8 @@ Agents never know how repo paths are resolved. Multi-repo routing is invisible t
 | `devbench run-tests <id>` | Run test suite in correct repo cwd, return output |
 | `devbench log-verdict <judge> <id> <pass\|fail> [msg]` | Append structured verdict to work unit Comments |
 | `devbench log-comment <agent> <id> <message>` | Append agent comment to work unit Comments |
-| `devbench log-tdd <id> <RED\|GREEN\|REFACTOR> <message>` | Append TDD phase entry to work unit |
+| `devbench log-tdd <id> <RED\|GREEN\|REFACTOR> <message>` | Append TDD phase entry to work unit. `VALID_TDD_PHASES` has two orchestrator-only phases: `RED_OBSERVED` (written by `write_red_observed_entry`) and `GREEN_GREEN_OBSERVED` (written by `devbench green-green-check`); an agent-facing invocation naming either is rejected with exit 1 |
+| `devbench green-green-check <id> <test_node_id> [...]` | Orchestrator-only: machine-observe that the named test(s) PASS before and after a `refactor` task's production change; writes `GREEN_GREEN_OBSERVED` on success |
 | `devbench mark-done <id>` | Done-gate verification + status update |
 | `devbench git-ops <id>` | Deterministic: branch → commit → push → PR → CI wait → merge |
 | `devbench validate-backlog` | Check backlog integrity before each cycle |

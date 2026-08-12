@@ -204,13 +204,13 @@ if [ -n "$FILE_PATH" ] && [ -f "${WORKSPACE_ROOT}/${FILE_PATH}" ]; then
 
     if echo "$LAST_COMMENT" | grep -q "executor" 2>/dev/null; then
         LAST_ACTION="executor completed"
-        NEXT_STEP="Dispatch the 4 review_team judges for ${TASK_ID} DIRECTLY as first-level sub-agents in a single response (devbench-orchestrate:review_team:code-reviewer, :test-reviewer, :doc-reviewer, :changes-manifest). Do NOT invoke review-supervisor -- it is a deprecated non-dispatching stub (ADR-33)."
+        NEXT_STEP="Invoke the 4 review_team judges (code-reviewer, test-reviewer, doc-reviewer, changes-manifest) directly for ${TASK_ID} as first-level sub-agents, then invoke review-supervisor to aggregate their verdicts."
     elif echo "$LAST_COMMENT" | grep -q "REVIEW_PASS.*code_review\|REVIEW_PASS.*test_review\|REVIEW_PASS.*doc_review\|REVIEW_PASS.*changes_manifest" 2>/dev/null; then
         LAST_ACTION="review pass"
-        NEXT_STEP="Check if all 4 reviewers passed. If yes, invoke security-reviewer for ${TASK_ID}. If not, run remaining reviewers."
+        NEXT_STEP="Check if all 4 reviewers passed. If yes, invoke security-reviewer for ${TASK_ID}. If not, re-invoke the remaining review_team judges directly as first-level sub-agents."
     elif echo "$LAST_COMMENT" | grep -q "REVIEW_FAIL" 2>/dev/null; then
         LAST_ACTION="review fail"
-        NEXT_STEP="Re-run executor for ${TASK_ID} with prior feedback, then re-dispatch the 4 review_team judges directly as first-level sub-agents (never review-supervisor)."
+        NEXT_STEP="Re-run executor for ${TASK_ID} with prior feedback, then re-invoke the 4 review_team judges directly as first-level sub-agents, then review-supervisor to aggregate."
     elif echo "$LAST_COMMENT" | grep -q "security_review.*REVIEW_PASS" 2>/dev/null; then
         LAST_ACTION="security pass"
         NEXT_STEP="Run uv run devbench git-ops ${TASK_ID} then uv run devbench mark-done ${TASK_ID}."

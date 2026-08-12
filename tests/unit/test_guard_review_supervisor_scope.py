@@ -85,7 +85,13 @@ class TestNonSupervisorAgentTypeIsNoOp:
 
 
 class TestAgentToolAlwaysBlocked:
-    """Post-ADR-33: review-supervisor dispatches nothing, so every Agent call is blocked.
+    """ADR-33 flatten (AC-E4-F1-S1-T2-9): review-supervisor is a
+    non-spawning aggregator with no Agent-tool spawn capability at all.
+    Every subagent_type -- including the four review_team judges the
+    pre-flatten hook used to allowlist -- must now be blocked
+    unconditionally. Spawning the judges directly is now the orchestrate
+    skill's own first-level responsibility (SKILL.md step 5), never
+    review-supervisor's.
 
     Issue #118 originally allow-listed the four ``review_team`` subagents because
     the supervisor fanned out to them itself. The flatten moved that fan-out to
@@ -97,14 +103,17 @@ class TestAgentToolAlwaysBlocked:
     @pytest.mark.parametrize(
         "subagent_type",
         [
-            # Former allowlist entries -- must now be blocked like any other.
+            # Former allowlist entries (namespaced review_team form used by
+            # the flattened skill) -- must now be blocked like any other.
+            "devbench-orchestrate:review_team:code-reviewer",
+            "devbench-orchestrate:review_team:test-reviewer",
+            "devbench-orchestrate:review_team:doc-reviewer",
+            "devbench-orchestrate:review_team:changes-manifest",
+            # Former allowlist entries (bare canonical-name form).
             "devbench-orchestrate:code_review",
             "devbench-orchestrate:test_review",
             "devbench-orchestrate:doc_review",
             "devbench-orchestrate:changes_manifest",
-            # Namespaced review_team form used by the flattened skill.
-            "devbench-orchestrate:review_team:code-reviewer",
-            "devbench-orchestrate:review_team:changes-manifest",
             # Never-allowed agents.
             "devbench-orchestrate:executor",
             "devbench-orchestrate:blocker_resolver",
@@ -116,10 +125,12 @@ class TestAgentToolAlwaysBlocked:
             "",
         ],
     )
-    def test_every_subagent_spawn_is_blocked(self, subagent_type: str) -> None:
+    def test_every_subagent_type_blocked(self, subagent_type: str) -> None:
         result = _run_hook(_agent_payload(subagent_type))
         assert result.returncode == 2, (
-            f"expected supervisor->{subagent_type!r} to be blocked; got rc={result.returncode} stderr: {result.stderr}"
+            f"expected supervisor->{subagent_type} to be blocked (review-supervisor has no "
+            f"Agent-tool spawn capability post-flatten); got returncode={result.returncode}, "
+            f"stderr: {result.stderr}"
         )
         assert "review-supervisor attempted to spawn subagent_type" in result.stderr
         assert subagent_type in result.stderr

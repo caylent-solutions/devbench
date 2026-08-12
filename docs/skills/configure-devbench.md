@@ -9,9 +9,47 @@ parser's error message and the operator is re-prompted.
 
 - `backlog/config/devbench.yaml` -- a complete, validated devbench configuration
   file covering every `RuntimeConfig` section.
-- A `[CONFIGURE_DEVBENCH_DONE]` summary message listing the configured values.
+- A `[CONFIGURE_DEVBENCH_DONE]` summary message listing the configured values,
+  including the `report` section.
 
 The produced file loads without `ConfigLoader` errors.
+
+### Full-default emission (issue #260, spec FR-3.6)
+
+The final-write step does not merely dump the values you entered: it emits
+every `RuntimeConfig` tuning section at its resolved built-in default, with
+the annotated comment copied verbatim from `sample-config.yaml`, even for
+sections you left untouched -- `timeouts`, `limits`, `stop_hook`, `hook_tail`,
+`orchestrate`, `report` (including `models`, `default_model`, and every cost
+multiplier), `backlog`, `validate`, `skills`, `max_executor_retries`,
+`max_executor_retries_per_judge`, and `log_file`. This makes the written
+config self-documenting: an operator who later wants to tune a knob sees it
+in the file with its default value and comment already present, instead of
+discovering the knob only by reading `config_loader.py`.
+
+A few inert blocks are still trimmed rather than emitted: `bedrock_region`
+when `use_bedrock` is `false`, `agents` entries that are identical to their
+frontmatter defaults, and disabled sub-blocks.
+
+Every emitted default is sourced from the shipped config surface
+(`sample-config.yaml` and the `DEFAULT_*` constants in
+`src/devbench/constants.py`) -- never restated from memory -- so an emitted
+value that differs from the built-in default is treated as a defect.
+
+### Round-trip equivalence check (FR-3.6 error handling)
+
+`load_runtime_config` alone is not enough for this check: it only parses
+literal YAML, so an absent field stays `None` on the raw `RuntimeConfig`
+object and comparing two raw `RuntimeConfig` values with `!=` would always
+report a spurious difference between an explicit full-default config and a
+minimal one. Instead, before writing the file, the skill spawns one
+subprocess per candidate config (via `DEVBENCH_CONFIG_PATH`) so
+`devbench.config` is imported fresh and performs its real env-var-over-YAML-
+over-built-in-default resolution in each subprocess, dumps the resolved
+constants backing every FR-3.6 tuning section to JSON, and diffs the two
+JSON blobs. Any difference fails the walkthrough loudly, naming the
+differing field, so the full-default emission can never silently change
+runtime behaviour relative to a minimal config.
 
 ## Prerequisites
 
@@ -50,7 +88,7 @@ defaults for every question. Enter a blank line to accept the shown default.
 
 ## What the skill does (step by step)
 
-The skill walks through 16 sections, validating each before moving to the next:
+The skill walks through 17 sections, validating each before moving to the next:
 
 1. **Read existing config** -- pre-populates defaults if `devbench.yaml` exists.
 2. **repos section** -- target repositories. Required fields per entry:
@@ -76,8 +114,16 @@ The skill walks through 16 sections, validating each before moving to the next:
 14. **backlog section** -- `default_status_for_new_work_units` (`in-queue` or `draft`).
 15. **notifications section** -- per-event Slack toggles under `notifications.events.*`
     plus the `notifications.slack` endpoint (PR #202).
-16. **Final validation and write** -- assembles the YAML, runs the full
-    `RuntimeConfig` round-trip, then writes `backlog/config/devbench.yaml`.
+16. **report section** -- the `report.models` per-model pricing table, `default_model`
+    (fallback rate for unknown/missing model ids), and the cost multipliers
+    (`cache_read_multiplier`, `cache_write_5min_multiplier`,
+    `cache_write_1hr_multiplier`, `data_residency_multiplier`,
+    `fast_mode_multiplier`, `recent_pace_tasks`). Every rate defaults to the
+    cited value in `sample-config.yaml` (issue #260, spec FR-3.6).
+17. **Final validation and write** -- assembles the YAML (emitting every
+    remaining `RuntimeConfig` section at its built-in default, see
+    "Full-default emission" above), runs the full `RuntimeConfig` round-trip
+    equivalence check, then writes `backlog/config/devbench.yaml`.
 
 ## Validation protocol
 
@@ -128,7 +174,7 @@ rejects absolute paths and `..` traversals immediately.
 
 | Artefact | Location | Condition |
 |----------|----------|-----------|
-| Config file | `backlog/config/devbench.yaml` | Written after all 16 sections validate |
+| Config file | `backlog/config/devbench.yaml` | Written after all 17 sections validate |
 | Summary message | stdout | `[CONFIGURE_DEVBENCH_DONE]` with a section summary |
 
 ## Cross-references

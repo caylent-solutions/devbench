@@ -136,7 +136,7 @@ scope.
 
 ```bash
 export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
-export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
+export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-5-v1
 export DEVBENCH_SESSION_NAME=early
 
 uv run devbench start --include "E1-E10"
@@ -146,7 +146,7 @@ uv run devbench start --include "E1-E10"
 
 ```bash
 export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
-export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
+export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-5-v1
 export DEVBENCH_SESSION_NAME=mid
 
 uv run devbench start --include "E11-E20"
@@ -156,7 +156,7 @@ uv run devbench start --include "E11-E20"
 
 ```bash
 export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
-export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
+export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-5-v1
 export DEVBENCH_SESSION_NAME=late
 
 uv run devbench start --include "E21-E30"

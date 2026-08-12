@@ -52,69 +52,199 @@ class TestReviewSupervisorFrontmatter:
         assert self._SUPERVISOR_PATH.exists(), f"review-supervisor.md not found at {self._SUPERVISOR_PATH}"
 
     def test_review_supervisor_frontmatter_valid(self) -> None:
-        """ADR-28: frontmatter names review-supervisor with tools: Bash and NO Agent tool.
-
-        The review pipeline was flattened: the orchestrate skill dispatches the
-        four review_team reviewers directly (first-level). A sub-agent cannot
-        spawn sub-agents -- a nested ``Agent(...)`` declaration silently no-ops,
-        which stalled every task as an unclearable runtime degradation.
+        """AC-E4-F1-S1-T2-6: Frontmatter must contain name: review-supervisor
+        and tools: Bash only -- post-flatten (ADR-33) review-supervisor is a
+        non-spawning aggregator and must declare NO Agent(...) spawn capability.
         """
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        frontmatter = content.split("---")[1]
-        assert "name: review-supervisor" in frontmatter
-        assert re.search(r"^tools:\s*Bash\s*$", frontmatter, re.MULTILINE), (
-            f"review-supervisor tools must be exactly 'Bash'. Got:\n{frontmatter}"
+        content = self._SUPERVISOR_PATH.read_text()
+
+        # Extract frontmatter block between --- delimiters
+        lines = content.splitlines()
+        assert lines[0].strip() == "---", "review-supervisor.md must start with --- frontmatter delimiter"
+
+        end_idx = next(
+            (i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+            None,
         )
+        assert end_idx is not None, "review-supervisor.md frontmatter closing --- not found"
+
+        frontmatter = "\n".join(lines[1:end_idx])
+
+        assert "name: review-supervisor" in frontmatter, (
+            f"Frontmatter must contain 'name: review-supervisor'. Got:\n{frontmatter}"
+        )
+        assert "tools:" in frontmatter, f"Frontmatter must contain a tools: field. Got:\n{frontmatter}"
+        assert "Bash" in frontmatter, f"Frontmatter tools must include Bash. Got:\n{frontmatter}"
         assert "Agent(" not in frontmatter, (
-            "review-supervisor MUST NOT declare the Agent tool: a sub-agent cannot spawn sub-agents (ADR-28)."
+            f"Frontmatter tools must NOT declare Agent(...) -- review-supervisor is a "
+            f"non-spawning aggregator post-flatten (ADR-33). Got:\n{frontmatter}"
         )
 
 
 @pytest.mark.unit
-class TestReviewSupervisorHasNoPipelineRole:
-    """ADR-33: review-supervisor.md carries no pipeline role and is never invoked.
-
-    The Step-0 Agent-tool self-check (issue #183) and the entire dispatch /
-    aggregation body are removed: the orchestrate skill dispatches the four
-    review_team reviewers directly and aggregates their verdicts itself, so the
-    supervisor no longer spawns anything, self-checks anything, or logs
-    verdicts. The file survives only because ``plugin_shadow`` maps the
-    ``agents.review_supervisor`` config key to this path and fails fast when it
-    is absent, so deleting it would break every workspace that pins a model for
-    this agent.
+class TestReviewSupervisorNonSpawningAggregation:
+    """AC-E4-F1-S1-T2-6: review-supervisor.md is reduced to a non-spawning
+    aggregation role per ADR-33. Post-flatten it never had Agent-tool spawn
+    capability in the first place, so the pre-flatten Step 0 self-check
+    (which existed to detect that capability silently dropping out of the
+    session) is dead prose and must be removed. Instead the agent reads the
+    four review_team judges' independently-persisted verdicts and treats
+    any absent required verdict as a hard failure naming the absent judge.
     """
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    def test_supervisor_states_it_has_no_pipeline_role(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "NOT INVOKED" in content, "review-supervisor.md must declare it is not invoked (ADR-33)"
+    def test_supervisor_no_step_0_self_check_payload(self) -> None:
+        """The pre-flatten 'agent-tool-unavailable' self-check payload must
+        not survive -- it described detecting a capability review-supervisor
+        no longer ever has, so a healthy run must never emit it again (AC-67).
+        """
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "agent-tool-unavailable" not in content, (
+            "review-supervisor.md must not retain the pre-flatten Step 0 "
+            "'agent-tool-unavailable' self-check payload; post-flatten the "
+            "agent never has Agent-tool spawn capability to lose."
+        )
 
-    def test_supervisor_states_it_must_not_be_invoked(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "MUST NOT be invoked" in content or "do not invoke" in content.lower()
+    def test_supervisor_reads_persisted_verdicts_not_invoking_judges(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "persisted" in content, (
+            "review-supervisor.md must describe reading the judges' already-persisted "
+            "verdicts rather than invoking the judges itself."
+        )
 
-    def test_supervisor_no_longer_dispatches_reviewers(self) -> None:
-        """The stub must not carry dispatch instructions for the review team."""
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "Step 0" not in content, "the Step-0 self-check must be removed (ADR-33)"
-        assert "invoke them in parallel" not in content
+    def test_supervisor_treats_missing_verdict_as_hard_failure(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "missing" in content and "hard failure" in content, (
+            "review-supervisor.md must state that a missing verdict from any required "
+            "judge is a hard failure, never an implicit pass (AC-65)."
+        )
+
+    def test_supervisor_names_the_absent_judge(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "naming every absent judge" in content or "naming the absent judge" in content, (
+            "review-supervisor.md must instruct naming the absent judge(s) by canonical "
+            "name, not reporting a generic unattributed failure."
+        )
+
+    def test_supervisor_boundary_scan_does_not_claim_discarding(self) -> None:
+        """The Step 1 boundary description must not claim the scan discards
+        everything already collected the moment it hits ``[REVIEW_REJECTED]``.
+
+        ``BacklogManager._last_round_all_passed`` walks reversed(lines) and
+        KEEPS everything collected below the boundary (the current round);
+        it only stops collecting further, it does not discard what it
+        already gathered. A prompt that instructs "discarding everything
+        already collected" would make the aggregator report all four judges
+        absent on every work unit that has any prior [REVIEW_REJECTED]
+        boundary -- the common retry case -- producing a false hard failure.
+        """
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "discarding everything already collected" not in content, (
+            "review-supervisor.md Step 1 must not claim the scan discards everything "
+            "already collected when it hits [REVIEW_REJECTED]; the manager keeps "
+            "everything collected below that boundary (the current round)."
+        )
+
+    def test_supervisor_boundary_scan_states_correct_keep_semantics(self) -> None:
+        """The corrected Step 1 wording must state that verdicts collected
+        below the [REVIEW_REJECTED] boundary (the current round) count, and
+        that only entries above it (a prior round) are excluded.
+        """
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "belong" in content and "prior round" in content, (
+            "review-supervisor.md Step 1 must state that entries above the "
+            "[REVIEW_REJECTED] boundary belong to a prior round and are never collected, "
+            "while entries below it (the current round) count."
+        )
+
+
+@pytest.mark.unit
+class TestReviewSupervisorRetainedContractDetails:
+    """Regression pins carried over from origin/main commit 9c462f2 (issue #288).
+
+    That commit deprecated review-supervisor to a never-invoked stub (ADR-33's
+    original framing); this merge instead keeps the feat/updates topology where
+    review-supervisor IS invoked, but only as a non-spawning aggregator. Three
+    of that commit's assertions describe properties that hold regardless of
+    which topology wins -- both ADRs must stay cited, the file must never
+    regain its pre-flatten parallel-dispatch instructions, and the
+    ``model:`` frontmatter line plugin_shadow rewrites must survive -- so they
+    are restored here verbatim rather than dropped.
+    """
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
     def test_supervisor_references_the_governing_adrs(self) -> None:
         content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
         assert "ADR-33" in content, "the flatten decision (ADR-33) must be cited"
         assert "ADR-28" in content, "the original root-cause analysis (ADR-28) must remain cited"
 
-    def test_supervisor_explains_why_the_file_is_retained(self) -> None:
-        """A reader must learn why an unused file is still here, not guess."""
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "plugin_shadow" in content, "the file must name the config coupling that keeps it alive"
-
     def test_supervisor_retains_the_model_frontmatter_line(self) -> None:
         """plugin_shadow._rewrite_agent_model raises when this line is missing."""
         content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
         assert re.search(r"^model:[ \t]+\S", content, re.MULTILINE), (
             "per-agent model overrides rewrite this line; without it the override is a hard error"
+        )
+
+    def test_supervisor_no_pre_flatten_parallel_dispatch_instructions(self) -> None:
+        """The pre-flatten Step-0 self-check and parallel-dispatch instructions
+        must not reappear -- the non-spawning aggregator contract (ADR-33)
+        forbids review-supervisor from ever invoking the judges itself, in
+        either topology.
+        """
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "Step 0" not in content, "the pre-flatten Step-0 self-check must not reappear (ADR-33)"
+        assert "invoke them in parallel" not in content, (
+            "review-supervisor must not carry pre-flatten parallel-dispatch instructions"
+        )
+
+
+@pytest.mark.unit
+class TestReviewSupervisorNeverSelfLogsJudgeVerdicts:
+    """Adapted from origin/main's TestReviewSupervisorVerdictFormat::test_supervisor_logs_no_verdicts
+    and TestReviewSupervisorEmitsNoJudgeNames::test_supervisor_declares_no_log_verdict_calls
+    (commit 9c462f2, issue #288).
+
+    Those two tests asserted the literal substring ``log-verdict`` never
+    appears in review-supervisor.md at all -- true only under the never-
+    invoked-stub topology. Under the feat/updates aggregator topology the
+    file legitimately quotes ``log-verdict`` lines as illustrative examples
+    of what the judges themselves already logged. The invariant both parents
+    actually agree on is narrower: review-supervisor itself must never be
+    the one calling ``log-verdict`` for the four review_team judges -- it
+    only confirms their already-persisted calls and reports its own findings
+    via ``log-comment``. This class pins that narrower, topology-correct
+    invariant instead of the literal (and now false) substring-absence check.
+    """
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    def test_supervisor_declares_it_never_logs_verdicts_for_the_judges(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        normalized = re.sub(r"\s+", " ", content)
+        assert "never call `log-verdict` yourself for the review_team judges" in normalized, (
+            "review-supervisor.md must explicitly state it never calls log-verdict "
+            "itself for the review_team judges -- only the judges self-log."
+        )
+
+    def test_supervisor_confirms_rather_than_re_emits_judge_verdicts(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        normalized = re.sub(r"\s+", " ", content)
+        assert "confirm their presence, do not re-emit them" in normalized, (
+            "review-supervisor.md must instruct confirming the judges' already-logged "
+            "verdicts rather than re-emitting log-verdict calls for them."
+        )
+
+    def test_supervisor_reports_its_own_findings_via_log_comment(self) -> None:
+        """review-supervisor's own reporting channel is log-comment, never
+        log-verdict -- it has no canonical judge name of its own to log a
+        verdict under.
+        """
+        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
+        assert "log-comment review-supervisor" in content, (
+            "review-supervisor.md must report its own findings and summaries via "
+            "'log-comment review-supervisor', not via 'log-verdict'."
         )
 
 
@@ -190,21 +320,41 @@ class TestReviewTeamModelDefault:
 
 @pytest.mark.unit
 class TestReviewSupervisorVerdictFormat:
-    """ADR-28: the deprecated supervisor emits no verdicts at all."""
+    """AC-4, AC-5: review-supervisor must use lowercase pass/fail in log-verdict calls."""
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
     def test_supervisor_no_review_fail_token(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "REVIEW_FAIL" not in content
+        """AC-4: review-supervisor must not use REVIEW_FAIL as a verdict token."""
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "REVIEW_FAIL" not in content, (
+            "review-supervisor.md must not use 'REVIEW_FAIL' as a verdict token. "
+            "Use lowercase 'fail' in log-verdict calls."
+        )
 
     def test_supervisor_no_review_pass_token(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "REVIEW_PASS" not in content
+        """AC-5: review-supervisor must not use REVIEW_PASS as a verdict token."""
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "REVIEW_PASS" not in content, (
+            "review-supervisor.md must not use 'REVIEW_PASS' as a verdict token. "
+            "Use lowercase 'pass' in log-verdict calls."
+        )
 
-    def test_supervisor_logs_no_verdicts(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "log-verdict" not in content
+    def test_supervisor_fail_branch_uses_lowercase_fail(self) -> None:
+        """AC-4: log-verdict calls in review-supervisor must use lowercase 'fail'."""
+        content = self._SUPERVISOR_PATH.read_text()
+        # Should have at least one log-verdict call with lowercase 'fail'
+        assert re.search(r"log-verdict\s+\S+\s+\S+\s+fail\b", content), (
+            "review-supervisor.md must contain log-verdict calls using lowercase 'fail'."
+        )
+
+    def test_supervisor_pass_branch_uses_lowercase_pass(self) -> None:
+        """AC-5: log-verdict calls in review-supervisor must use lowercase 'pass'."""
+        content = self._SUPERVISOR_PATH.read_text()
+        # Should have at least one log-verdict call with lowercase 'pass'
+        assert re.search(r"log-verdict\s+\S+\s+\S+\s+pass\b", content), (
+            "review-supervisor.md must contain log-verdict calls using lowercase 'pass'."
+        )
 
 
 @pytest.mark.unit
@@ -258,6 +408,42 @@ class TestReviewerJsonEnvelope:
             content,
             re.IGNORECASE,
         ), f"{agent_filename} must instruct the agent that the JSON envelope is the last thing output in the response."
+
+
+@pytest.mark.unit
+class TestReviewSupervisorUsesJsonEnvelope:
+    """AC-6, AC-9: review-supervisor must use reviewer JSON envelope data, not hardcoded strings."""
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    def test_supervisor_no_hardcoded_passed_strings(self) -> None:
+        """AC-9: Supervisor must not hardcode 'X passed' strings in log-verdict calls."""
+        content = self._SUPERVISOR_PATH.read_text()
+        hardcoded_patterns = [
+            "code-reviewer passed",
+            "test-reviewer passed",
+            "doc-reviewer passed",
+            "changes-manifest passed",
+        ]
+        for pattern in hardcoded_patterns:
+            assert pattern not in content, (
+                f"review-supervisor.md must not hardcode '{pattern}' in log-verdict calls. "
+                "Use the actual reviewer JSON summary from the envelope."
+            )
+
+    def test_supervisor_references_json_envelope(self) -> None:
+        """AC-6, AC-9: Supervisor must instruct parsing of reviewer JSON envelope."""
+        content = self._SUPERVISOR_PATH.read_text()
+        assert re.search(r"\bjson\b", content, re.IGNORECASE), (
+            "review-supervisor.md must instruct parsing the reviewer JSON envelope to extract verdicts and summaries."
+        )
+
+    def test_supervisor_fail_branch_logs_findings_as_comments(self) -> None:
+        """AC-6: Supervisor FAIL branch must relay individual findings via log-comment."""
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "log-comment" in content, (
+            "review-supervisor.md must use log-comment to relay reviewer findings in the FAIL branch."
+        )
 
 
 @pytest.mark.unit
@@ -449,19 +635,52 @@ class TestExecutorCommentLanguageDiscipline:
 
 
 @pytest.mark.unit
-class TestReviewSupervisorEmitsNoJudgeNames:
-    """ADR-28: the deprecated stub emits no verdicts, so it carries no judge names.
-
-    Canonical judge-name coverage now lives with the reviewers themselves and
-    with the orchestrate skill, which owns the fan-out and the fail-closed
-    verdict check.
-    """
+class TestReviewSupervisorCanonicalJudgeNames:
+    """ADR-08 slice G: supervisor must use underscored canonical judge names in log-verdict."""
 
     _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
 
-    def test_supervisor_declares_no_log_verdict_calls(self) -> None:
-        content = self._SUPERVISOR_PATH.read_text(encoding="utf-8")
-        assert "devbench log-verdict" not in content
+    _CANONICAL_JUDGE_NAMES = (
+        "code_review",
+        "test_review",
+        "doc_review",
+        "changes_manifest",
+        "security_review",
+    )
+
+    _HYPHENATED_REVIEWER_NAMES = (
+        "code-reviewer",
+        "test-reviewer",
+        "doc-reviewer",
+    )
+
+    def test_supervisor_contains_all_canonical_judge_names(self) -> None:
+        """Each underscored name must appear in the supervisor's log-verdict examples."""
+        content = self._SUPERVISOR_PATH.read_text()
+        for name in self._CANONICAL_JUDGE_NAMES:
+            assert name in content, (
+                f"review-supervisor.md must reference canonical judge name '{name}' "
+                "so the supervisor emits the exact string the done-gate parser looks for."
+            )
+
+    def test_supervisor_has_no_hyphenated_log_verdict_calls(self) -> None:
+        """Regression pin: no ``log-verdict <hyphenated-name>`` examples in supervisor."""
+        content = self._SUPERVISOR_PATH.read_text()
+        for name in self._HYPHENATED_REVIEWER_NAMES:
+            bad = f"log-verdict {name}"
+            assert bad not in content, (
+                f"review-supervisor.md must not contain '{bad}'. "
+                "Hyphenated reviewer frontmatter names do not match the done-gate parser's "
+                "canonical underscored set. Use e.g. 'log-verdict code_review' instead."
+            )
+
+    def test_supervisor_has_mapping_or_warning(self) -> None:
+        """Prompt must explicitly warn against deriving the judge name from frontmatter."""
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "frontmatter" in content or "canonical" in content, (
+            "review-supervisor.md must contain a caution or mapping that steers the agent "
+            "away from the reviewer's frontmatter name toward the canonical underscored form."
+        )
 
 
 @pytest.mark.unit
@@ -707,3 +926,316 @@ class TestNoAgentFrontmatterPinsHaiku:
             "operator's YAML explicitly selects it, and risks SDK Agent-tool "
             "drops under load. Change to 'sonnet' or 'opus'."
         )
+
+
+@pytest.mark.unit
+class TestNoSubAgentDeclaresSpawningCapability:
+    """AC-E4-F1-S1-T2-1 / spec AC-63: no sub-agent definition under
+    plugin/devbench-orchestrate/agents/ may declare 'Agent(' anywhere in
+    its content. This is the systematic, file-by-file regression pin for
+    the grep proof the work unit's Definition of Done requires:
+    ``grep -rn "Agent(" plugin/devbench-orchestrate/agents/`` must return
+    zero hits.
+    """
+
+    @pytest.mark.parametrize(
+        "agent_path",
+        _ALL_AGENT_MD_FILES,
+        ids=lambda p: str(p.relative_to(AGENTS_DIR)),
+    )
+    def test_agent_md_has_no_agent_tool_spawn_declaration(self, agent_path: Path) -> None:
+        content = agent_path.read_text(encoding="utf-8")
+        assert "Agent(" not in content, (
+            f"{agent_path.relative_to(AGENTS_DIR)} must not contain the literal 'Agent(' "
+            "substring anywhere -- no sub-agent may declare second-level Agent-tool spawn "
+            "capability post-flatten (AC-63)."
+        )
+
+
+@pytest.mark.unit
+class TestSkillInvokesReviewJudgesDirectly:
+    """AC-E4-F1-S1-T2-2: the orchestrate skill invokes the four review_team
+    judges directly as first-level sub-agents (ADR-33's flatten design),
+    and states the missing-verdict hard-failure rule explicitly.
+    """
+
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
+
+    @pytest.mark.parametrize(
+        "judge_slug",
+        ["code-reviewer", "test-reviewer", "doc-reviewer", "changes-manifest"],
+    )
+    def test_skill_invokes_judge_directly(self, judge_slug: str) -> None:
+        content = self._SKILL_PATH.read_text()
+        invocation = f"devbench-orchestrate:review_team:{judge_slug}"
+        assert invocation in content, (
+            f"SKILL.md must invoke {invocation!r} directly as a first-level sub-agent "
+            "(ADR-33 flatten); the orchestrate skill must not rely on review-supervisor "
+            "spawning the judges as second-level sub-agents."
+        )
+
+    def test_skill_states_missing_verdict_is_hard_failure(self) -> None:
+        content = self._SKILL_PATH.read_text().lower()
+        assert "missing verdict" in content and "hard failure" in content, (
+            "SKILL.md must state that a missing verdict from any required judge is a "
+            "hard failure (AC-65), never an implicit pass."
+        )
+
+    def test_skill_describes_judges_as_first_level_subagents(self) -> None:
+        content = self._SKILL_PATH.read_text().lower()
+        assert "first-level" in content, (
+            "SKILL.md must describe the review_team judges as first-level sub-agents "
+            "invoked directly by the skill, not second-level spawns from review-supervisor."
+        )
+
+
+# ---------------------------------------------------------------------------
+# E4-F4-S1-T1 -- Judge-side detection (spec FR-4.4, AC-56/AC-57/AC-58)
+# ---------------------------------------------------------------------------
+
+_FR44_EXACT_NO_GENUINE_RED_MESSAGE = "no genuine RED; fix may be absent or the test does not reproduce the failure"
+
+_FR44_JUDGE_PATHS = [
+    REVIEW_TEAM_DIR / "changes-manifest.md",
+    REVIEW_TEAM_DIR / "test-reviewer.md",
+]
+
+
+@pytest.mark.unit
+class TestChangesManifestTypeContradictionDetection:
+    """AC-E4-F4-S1-T1-1 / spec AC-56: the changes_manifest judge prompt must
+    instruct REVIEW_FAIL when a task's declared type contradicts its FR-4.1
+    Changes Manifest invariant, including the docs-task-touching-src example.
+    """
+
+    _PATH = REVIEW_TEAM_DIR / "changes-manifest.md"
+
+    def test_carries_fr41_invariant_table_for_every_task_type(self) -> None:
+        """The FR-4.1 invariant table (all six types) must be present so the
+        judge can look up which manifest rows each declared type permits."""
+        content = self._PATH.read_text(encoding="utf-8")
+        for type_name in ("behavior-fix", "feature", "test-only", "refactor", "docs", "chore"):
+            assert f"`{type_name}`" in content, (
+                f"changes-manifest.md must list task type `{type_name}` in its FR-4.1 "
+                "manifest invariant table so the judge can check declared type against "
+                "the actual Changes Manifest rows."
+            )
+
+    def test_carries_docs_touching_src_example(self) -> None:
+        """FR-4.4 names the docs-task-touching-src/ case explicitly as the
+        canonical type-contradiction example."""
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "docs" in content and "src/" in content, (
+            "changes-manifest.md must carry the docs-task-touching-src/ type-contradiction "
+            "example named in spec FR-4.4 / AC-56."
+        )
+
+    def test_instructs_review_fail_on_type_contradiction(self) -> None:
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "REVIEW_FAIL" in content and "contradict" in content.lower(), (
+            "changes-manifest.md must instruct REVIEW_FAIL when the declared task type "
+            "contradicts its FR-4.1 manifest invariant."
+        )
+
+    def test_refactor_row_has_no_per_row_manifest_invariant(self) -> None:
+        """docs/backlog-contract.md 'Task-Type Taxonomy Rule (FR-4.1, rule 21)' records
+        `refactor` as having no per-row Manifest invariant; green-green is a TDD Cycle
+        Log concern (deferred to E4-F4-S1-T2), not a static shape the manifest judge can
+        verdict on from a diff alone."""
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "no per-row Manifest invariant" in content, (
+            "changes-manifest.md's FR-4.1 table must state `refactor` has no per-row "
+            "Manifest invariant, matching docs/backlog-contract.md rule 21."
+        )
+        assert "E4-F4-S1-T2" in content, (
+            "changes-manifest.md must note that green-green enforcement for `refactor` "
+            "is deferred to E4-F4-S1-T2, not enforced by this judge from Manifest shape."
+        )
+
+    def test_cites_correct_classifier_symbols(self) -> None:
+        """The prompt must cite the real production/test classifiers
+        (`_is_production_source` / `_is_test_source_path`) and the real
+        documentation/chore classifiers (`_is_documentation_path` /
+        `_is_chore_path`), not `_check_source_test_pairs` (which is Rule 14's
+        source-test atomicity check, not a path classifier)."""
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "_is_production_source" in content, (
+            "changes-manifest.md must cite `_is_production_source` as the production-source "
+            "classifier (docs/backlog-contract.md 'Classification reuse (AC-47)')."
+        )
+        assert "_is_test_source_path" in content, (
+            "changes-manifest.md must cite `_is_test_source_path` as the test-path classifier."
+        )
+        assert "_is_documentation_path" in content, (
+            "changes-manifest.md must cite `_is_documentation_path` as the docs-row classifier."
+        )
+        assert "_is_chore_path" in content, (
+            "changes-manifest.md must cite `_is_chore_path` as the chore-row classifier."
+        )
+        assert "_check_source_test_pairs" not in content, (
+            "changes-manifest.md must NOT cite `_check_source_test_pairs` (Rule 14's source-test "
+            "atomicity RULE) as a path classifier -- it is a rule, not a classifier."
+        )
+
+
+@pytest.mark.unit
+class TestZeroProdCheckScopedToGatedTypes:
+    """Doc-review regression pin: rules 29 (changes-manifest.md) and 52
+    (test-reviewer.md) must scope the zero-production-source-plus-immediately-
+    passing-test REVIEW_FAIL to gated task types only (behavior-fix, feature),
+    matching SKILL.md step 4d.b and docs/backlog-contract.md rule 21, which
+    exempt test-only/refactor/docs/chore tasks from the RED gate entirely."""
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_zero_prod_rule_names_gated_types_explicitly(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "does not apply to" in lowered, (
+            f"{judge_path.name}'s zero-production-source-plus-passing-test rule must state "
+            "explicitly which types it does NOT apply to, so test-only, refactor, docs, and "
+            "chore tasks are not falsely REVIEW_FAILed for legitimately having zero "
+            "production-source rows and no RED_OBSERVED record."
+        )
+        assert "(gated types only)" in content or "for a gated task" in lowered, (
+            f"{judge_path.name} must scope the zero-production-source-plus-passing-test "
+            "REVIEW_FAIL to gated tasks (behavior-fix, feature) explicitly."
+        )
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_zero_prod_rule_excludes_exempt_types(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        for exempt_type in ("test-only", "refactor", "docs", "chore"):
+            assert f"`{exempt_type}`" in content, (
+                f"{judge_path.name} must name `{exempt_type}` as an exempt type not subject "
+                "to the zero-production-source-plus-passing-test REVIEW_FAIL."
+            )
+
+
+@pytest.mark.unit
+class TestTestReviewerRedObservedAndWeakTestDetection:
+    """AC-E4-F4-S1-T1-2 / spec AC-57: the test_review judge prompt must
+    REVIEW_FAIL a gated task with no RED_OBSERVED record, and carry the
+    weak-test check tying the recorded failure output to the AC path.
+    """
+
+    _PATH = REVIEW_TEAM_DIR / "test-reviewer.md"
+
+    def test_instructs_review_fail_on_missing_red_observed_record(self) -> None:
+        content = self._PATH.read_text(encoding="utf-8")
+        assert "RED_OBSERVED" in content, "test-reviewer.md must reference the RED_OBSERVED evidence record."
+        assert "no RED_OBSERVED" in content or "no `RED_OBSERVED`" in content, (
+            "test-reviewer.md must instruct REVIEW_FAIL for a gated task with no RED_OBSERVED record (spec AC-57)."
+        )
+        assert "REVIEW_FAIL" in content
+
+    def test_carries_weak_test_check(self) -> None:
+        content = self._PATH.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "weak-test check" in lowered, "test-reviewer.md must name the weak-test check explicitly (spec FR-4.4)."
+        assert "failure-output digest" in lowered or "failure digest" in lowered, (
+            "test-reviewer.md must tie the weak-test check to the recorded failure-output digest."
+        )
+        assert "ac path" in lowered, (
+            "test-reviewer.md must state the weak-test check compares the recorded RED "
+            "output against the AC path the task exists to fix."
+        )
+
+    def test_weak_test_check_names_actual_record_fields_not_summary(self) -> None:
+        """Rule 51 must describe the RED_OBSERVED record's real three fields
+        (exit_code, test_node_id, failure_digest -- see
+        devbench.constants.RED_OBSERVED_RECORD_FIELDS) and must not claim the
+        record carries a 'failure summary' or readable 'failure output', since
+        the record is a fixed three-field message and failure_digest is a
+        hash-shaped identity token, not free text (doc_review FAIL, attempt 3).
+        """
+        content = self._PATH.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "failure summary" not in lowered, (
+            "test-reviewer.md rule 51 must not claim the RED_OBSERVED record carries a "
+            "'failure summary' -- the record has no such field."
+        )
+        assert "recorded `red_observed` failure output" not in lowered, (
+            "test-reviewer.md rule 51 must not describe the RED_OBSERVED record itself as "
+            "'failure output' -- the record is a fixed exit_code/test_node_id/failure_digest "
+            "message, not readable failure text."
+        )
+        assert "`test_node_id`" in content, (
+            "test-reviewer.md rule 51 must name the `test_node_id` field explicitly as the "
+            "human-readable field the AC-path comparison is based on."
+        )
+        assert "`failure_digest`" in content, (
+            "test-reviewer.md rule 51 must name the `failure_digest` field explicitly."
+        )
+        assert "human-readable" in lowered, (
+            "test-reviewer.md rule 51 must state that `test_node_id` is the only "
+            "human-readable field of the RED_OBSERVED record."
+        )
+        assert "hash-shaped" in lowered or "identity token" in lowered, (
+            "test-reviewer.md rule 51 must describe `failure_digest` as a hash-shaped "
+            "identity token computed over the failure output, not the failure output itself."
+        )
+
+
+@pytest.mark.unit
+class TestJudgePromptsCarryZeroProdExactMessage:
+    """AC-E4-F4-S1-T1-3 / spec AC-58: both changes_manifest and test_review
+    prompts must carry the FR-4.4 zero-production-source-plus-immediately-
+    passing-test message character-for-character."""
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_prompt_carries_exact_message(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        assert _FR44_EXACT_NO_GENUINE_RED_MESSAGE in content, (
+            f"{judge_path.name} must carry the exact spec FR-4.4 message "
+            f"{_FR44_EXACT_NO_GENUINE_RED_MESSAGE!r} character-for-character."
+        )
+
+
+@pytest.mark.unit
+class TestJudgePromptsNeverPassByDefaultWhenUnevaluable:
+    """AC-E4-F4-S1-T1-4: both prompts must state that a judge unable to
+    evaluate (RED_OBSERVED unreadable, diff unavailable) returns REVIEW_FAIL
+    with the cause, never a pass-by-default."""
+
+    @pytest.mark.parametrize("judge_path", _FR44_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_prompt_states_unevaluable_review_fails_with_cause(self, judge_path: Path) -> None:
+        content = judge_path.read_text(encoding="utf-8")
+        lowered = content.lower()
+        assert "unable to evaluate" in lowered, (
+            f"{judge_path.name} must describe the unable-to-evaluate case (RED_OBSERVED unreadable, diff unavailable)."
+        )
+        assert "pass-by-default" in lowered, (
+            f"{judge_path.name} must state that an unevaluable review REVIEW_FAILs with "
+            "the cause, never a pass-by-default."
+        )
+
+
+@pytest.mark.unit
+class TestSkillRoutesJudgeEvidenceInputs:
+    """AC-E4-F4-S1-T1-5: the orchestrate skill documents that the review leg
+    supplies each judge its evidence inputs -- declared type, Changes
+    Manifest, diff, and RED_OBSERVED record location -- so no judge is asked
+    to verdict without the material to falsify it.
+    """
+
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
+
+    def test_skill_documents_judge_evidence_inputs(self) -> None:
+        content = self._SKILL_PATH.read_text(encoding="utf-8")
+        for term in ("declared type", "Changes Manifest", "RED_OBSERVED"):
+            assert term in content, (
+                f"SKILL.md must document that the review leg supplies judges the "
+                f"evidence input {term!r} (spec FR-4.4 / AC-E4-F4-S1-T1-5)."
+            )
+        assert "diff" in content.lower()
+
+    def test_skill_states_unevaluable_judge_fails_with_cause(self) -> None:
+        content = self._SKILL_PATH.read_text(encoding="utf-8").lower()
+        assert "unable to evaluate" in content or "unevaluable" in content, (
+            "SKILL.md must state that a judge unable to evaluate REVIEW_FAILs with the cause, never a pass-by-default."
+        )
+        assert "pass-by-default" in content

@@ -87,7 +87,7 @@ Idle for 30s.  (Ctrl+C to stop; `devbench watch --watch N` for live tail.)
 | `Phase: idle` + high `Idle for Ns` (minutes) | Orchestrator is between tasks or genuinely hung. Check `devbench status` for actionable work. |
 | `Phase: executor subagent active` but no recent tool calls and `last activity > 60s` | LLM is reasoning. Normal for large context windows; wait a minute before intervening. |
 | `Pending amendment request: yes` + `Phase: manifest-amender running` | The amender is reviewing a TDD GREEN production-fix request. Outcome lands as a verdict on the task in the next few seconds. |
-| Repo has staged files but `Phase: review-supervisor running` | Executor finished, judges are running. Normal pre-merge state. |
+| Repo has staged files but `Phase: review-supervisor running` | Post-flatten (ADR-33), the four review_team judges are invoked directly as first-level sub-agents and self-log their verdicts before review-supervisor runs, so `review-supervisor running` means the judges have already finished and persisted their verdicts and the aggregation-only step is in progress. Normal pre-merge state. |
 | `Active task: (none)` + `Phase: idle` | No task is currently claimed. Either the backlog is done or `devbench next` returned `NO_ACTIONABLE`. |
 
 ## What the dashboard intentionally omits
@@ -95,7 +95,7 @@ Idle for 30s.  (Ctrl+C to stop; `devbench watch --watch N` for live tail.)
 - **Full JSONL dumps.** Use `tail -f <workspace>/hook-logs.jsonl` or the subagent transcript for raw bytes.
 - **Every PreToolUse / PostToolUse pair.** One row per tool call is enough; the pairs are implicit.
 - **Historical analytics.** Use `devbench report` for cross-session velocity, cost, and cache stats.
-- **Full judge verdicts.** When review-supervisor runs, the phase label and the recent CLI panel show progress; open the work-unit `.md` for full verdict evidence.
+- **Full judge verdicts.** The four review_team judges self-log their verdicts as they run (before review-supervisor aggregates); the phase label and the recent CLI panel show progress, but open the work-unit `.md` for full verdict evidence.
 - **Token / cost metrics.** Covered by `devbench report`.
 
 ## Safety guarantees

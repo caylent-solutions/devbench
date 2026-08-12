@@ -78,6 +78,13 @@ EVENT_CI_FAILURE = "ci_failure"
 EVENT_CI_PASS = "ci_pass"
 EVENT_ORCHESTRATOR_STOP = "orchestrator_stop"
 EVENT_ORCHESTRATOR_AUTO_RESTART = "orchestrator_auto_restart"
+# Quota wait-and-resume lifecycle (E2-F3-S1-T1, spec FR-2.10, ADR-24; ported
+# from pre-strip commit 58048b3 per D-16 so the design rationale survives the
+# port).  ``quota_waiting`` fires the moment the orchestrator hits a quota and
+# begins waiting; ``quota_resumed`` fires when the quota recovers and the run
+# resumes.  Both default OFF (opt-in), mirroring every other event toggle.
+EVENT_QUOTA_WAITING = "quota_waiting"
+EVENT_QUOTA_RESUMED = "quota_resumed"
 
 ALL_EVENTS: tuple[str, ...] = (
     EVENT_WORK_UNIT_DONE,
@@ -96,6 +103,8 @@ ALL_EVENTS: tuple[str, ...] = (
     EVENT_CI_PASS,
     EVENT_ORCHESTRATOR_STOP,
     EVENT_ORCHESTRATOR_AUTO_RESTART,
+    EVENT_QUOTA_WAITING,
+    EVENT_QUOTA_RESUMED,
 )
 
 
@@ -108,6 +117,91 @@ ALL_EVENTS: tuple[str, ...] = (
 # get a personal push; operators routing to a shared team channel notify the
 # whole online team.  Single payload works for both.
 SLACK_HERE_MENTION: str = "<!here>"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator stop-class taxonomy (E2-F3-S1-T1, spec FR-2.10, ADR-24)
+# ---------------------------------------------------------------------------
+#
+# A single-sourced enumeration of orchestrator stop-reason classes, keyed by
+# a stable token so a future mention-level mapping (which stop classes get a
+# ``<!here>`` push vs. a silent post) can be declared once and consumed by
+# both the notify dispatch path and config validation.  This task introduces
+# the two classes its own quota notifications need: ``crash`` is the
+# fail-visible fallback bucket every unrecognised stop reason lands in
+# (never silently dropped), and ``quota-exhausted`` is the new class for the
+# quota wait-and-resume lifecycle.  Ported from the pre-strip commit 58048b3
+# per D-16; ``ALL_STOP_CLASSES`` is deliberately left open for a later task
+# to extend with the remaining orchestrator-stop classes (premature-turn-end,
+# completion, drain, operator-interrupt) without renaming anything here.
+
+STOP_CLASS_CRASH: str = "crash"
+STOP_CLASS_QUOTA_EXHAUSTED: str = "quota-exhausted"
+
+ALL_STOP_CLASSES: tuple[str, ...] = (
+    STOP_CLASS_CRASH,
+    STOP_CLASS_QUOTA_EXHAUSTED,
+)
+
+# Allowed value for the per-stop-class mention level.  ``here`` emits
+# ``<!here>`` so Slack pushes a notification to every online channel member
+# -- the existing behaviour for every dispatch in this module today.
+MENTION_LEVEL_HERE: str = "here"
+
+# Default stop-class -> mention-level mapping.  Both classes currently
+# defined are attention-worthy (an unrecognised crash and a quota exhaustion
+# both warrant a push), so both default to ``here``.
+DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP: dict[str, str] = {
+    STOP_CLASS_CRASH: MENTION_LEVEL_HERE,
+    STOP_CLASS_QUOTA_EXHAUSTED: MENTION_LEVEL_HERE,
+}
+
+
+def validate_stop_mention_map(candidate: dict[str, str]) -> None:
+    """Validate a stop-class -> mention-level mapping.
+
+    Raises ``ValueError`` when any key is not a recognised stop-class.
+    Intended to be called at config-load time once a future task exposes
+    this mapping as operator config; today only tests call it, so an
+    invalid mapping is still caught before any dispatch path relies on it.
+
+    Args:
+        candidate: Mapping from stop-class token to mention-level token to
+            validate.
+
+    Raises:
+        ValueError: When an unknown stop-class key is found.  The error
+            message names the offending key and the allowed set so the
+            caller can fix the mapping without reading source.
+    """
+    for stop_class in candidate:
+        if stop_class not in ALL_STOP_CLASSES:
+            raise ValueError(
+                f"unknown stop-class key {stop_class!r} in mention map; "
+                f"allowed stop-class keys: {sorted(ALL_STOP_CLASSES)}"
+            )
+
+
+def classify_stop_class(reason: str) -> str:
+    """Map a stop-reason string to the canonical stop-class token.
+
+    Classification is prefix-based.  Any reason starting with ``quota``
+    (e.g. ``QuotaExhaustedError``-derived reason strings such as
+    ``"quota-exhausted"`` or ``"quota exceeded: anthropic-api"``) classifies
+    to :data:`STOP_CLASS_QUOTA_EXHAUSTED`.
+
+    Args:
+        reason: The stop-reason string.
+
+    Returns:
+        One of the ``STOP_CLASS_*`` constants.  Unrecognised reasons fall
+        through to :data:`STOP_CLASS_CRASH` (fail-visible, never silent) --
+        this fallback branch also covers reasons any future task may add
+        prefix-based arms for ahead of it.
+    """
+    if reason.startswith("quota"):
+        return STOP_CLASS_QUOTA_EXHAUSTED
+    return STOP_CLASS_CRASH
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +904,80 @@ def notify_orchestrator_auto_restart(blocked_task_ids: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Quota wait-and-resume dispatchers (E2-F3-S1-T1, spec FR-2.10 / AC-27, ADR-24)
+# ---------------------------------------------------------------------------
+
+
+def _notify_quota_event_best_effort(
+    event_kind: str,
+    slack_summary: str,
+    slack_fields: list[tuple[str, str]],
+) -> None:
+    """Dispatch a quota-lifecycle event with an extra never-break-the-wait guard.
+
+    Both quota notify calls fire from inside the orchestrator's in-process
+    quota wait loop (spec AC-27): a Slack delivery failure must never break
+    or delay that loop.  :func:`_dispatch` already wraps its own
+    network / config-read failures in an inner try/except and logs them, but
+    this wrapper adds a second, unconditional guard around the *entire*
+    dispatch call -- including any defect inside ``_dispatch`` itself -- so
+    a notification bug can never propagate into the quota-recovery path.
+    On failure this logs a single ``[WARN]`` line and returns immediately:
+    no retry, no sleep, no re-raise.  This is the same notification-wrapper
+    pattern FR-2.12 reuses for the audit-comment toggles.
+    """
+    try:
+        _dispatch(event_kind, slack_summary=slack_summary, slack_fields=slack_fields, slack_context=None)
+    except Exception as exc:
+        print(
+            f"[WARN] notifications: quota event {event_kind!r} dispatch failed; "
+            f"continuing without blocking the quota wait: {exc!r}",
+            file=sys.stderr,
+        )
+
+
+def notify_quota_waiting(reason: str, reset_at: str) -> None:
+    """The orchestrator hit a quota and started waiting for it to reset.
+
+    Fired at the point the ``[QUOTA_WAITING]`` audit line is logged, so the
+    operator learns the run has paused without watching the log.
+
+    Args:
+        reason: The quota source / reason string (``QuotaExhaustedError.source``,
+            e.g. ``"anthropic-api"``, ``"bedrock"``, ``"claude-code-cli"``).
+        reset_at: The provider-stated reset time as an ISO 8601 string, or the
+            literal ``"unknown"`` when no reset time was supplied.
+    """
+    _notify_quota_event_best_effort(
+        EVENT_QUOTA_WAITING,
+        slack_summary=":hourglass_flowing_sand: Quota hit -- waiting for reset",
+        slack_fields=[
+            ("Reason", reason),
+            ("Resets at", reset_at),
+        ],
+    )
+
+
+def notify_quota_resumed(waited_seconds: int) -> None:
+    """The quota recovered and the orchestrator resumed the run.
+
+    Fired at the point the ``[QUOTA_RESUMED]`` audit line is logged on the
+    recovered path.
+
+    Args:
+        waited_seconds: Total seconds spent waiting before recovery was
+            confirmed.
+    """
+    _notify_quota_event_best_effort(
+        EVENT_QUOTA_RESUMED,
+        slack_summary=":white_check_mark: Quota recovered -- run resumed",
+        slack_fields=[
+            ("Waited", f"{waited_seconds}s"),
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Self-test driver (used by ``devbench notify-test``)
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1060,10 @@ def _fire_sample(event_kind: str) -> None:
         notify_orchestrator_stop("notify-test sample", "E0-F1-S1-T1")
     elif event_kind == EVENT_ORCHESTRATOR_AUTO_RESTART:
         notify_orchestrator_auto_restart(["E0-F1-S1-T2", "E0-F1-S1-T3"])
+    elif event_kind == EVENT_QUOTA_WAITING:
+        notify_quota_waiting("anthropic-api", "2026-01-01T16:10:00+00:00")
+    elif event_kind == EVENT_QUOTA_RESUMED:
+        notify_quota_resumed(1234)
     else:
         # ALL_EVENTS guard above keeps us off this branch in practice;
         # the explicit raise is defensive only for future-event additions

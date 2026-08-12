@@ -77,6 +77,7 @@ def _build_task_draft_workspace(tmp_path: Path) -> Path:
     task_file.write_text(
         f"# EX-F1-S1-T1\n\n"
         f"## Status: {STATUS_DRAFT}\n\n"
+        "## Task Type: docs\n\n"
         "## Target Repository\n\n"
         "- **Repo:** `example-org/example-repo`\n\n"
         "## Description\n\nFunctional-test task.\n\n"

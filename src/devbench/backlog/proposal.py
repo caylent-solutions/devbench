@@ -207,10 +207,15 @@ class BlockedTaskState(Enum):
     HELD = "held"
     BLOCKED_ON_HELD = "blocked-on-held"
     OPERATOR_ACTION_REQUIRED = "operator-action-required"
-    # Issue #183(d): orchestrator runtime degraded (review-supervisor
-    # lost Agent-tool access). Distinct from OPERATOR_ACTION_REQUIRED
-    # so the operator sees that a ``make start`` restart -- not a code
-    # fix -- is what resolves the task.
+    # Issue #183(d), post-flatten (ADR-33): review-supervisor is a
+    # non-spawning aggregator with no Agent-tool spawn capability and
+    # no Step 0 self-check to emit this payload from, so in a healthy
+    # run this pattern must never fire again. Distinct from
+    # OPERATOR_ACTION_REQUIRED because a match now signals a topology
+    # REGRESSION (a review-supervisor or SKILL.md change that
+    # reintroduced second-level spawning, or a pre-flatten audit row
+    # already on disk) that a ``make start`` restart cannot resolve --
+    # not a transient runtime condition.
     RUNTIME_DEGRADATION = "runtime-degradation"
 
 
@@ -271,12 +276,19 @@ _RETRY_EXHAUSTED_TAG_RE: re.Pattern[str] = re.compile(r"\[RETRY_BUDGET_EXHAUSTED
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
-# Issue #183(d): structured payloads emitted by review-supervisor's
-# Step 0 self-check when the Agent tool drops out of the session. The
-# orchestrator's runtime is degraded; only an operator-driven
-# ``make start`` restart can recover. Matching the exact phrasing the
-# agent emits keeps the classifier honest -- unrelated [BLOCKED] rows
-# from other agents must not trigger this bucket.
+# Issue #183(d): structured payloads that used to be emitted by
+# review-supervisor's Step 0 self-check when the Agent tool dropped out
+# of the session. Post-flatten (ADR-33), review-supervisor is a
+# non-spawning aggregator with no Agent-tool spawn capability and no
+# Step 0 self-check to emit this payload from -- so in a healthy run
+# this pattern must never fire again. A match now signals a topology
+# REGRESSION (a review-supervisor or SKILL.md change that reintroduced
+# second-level spawning, or an old audit row from before the flatten),
+# not a transient condition an operator restart routinely clears.
+# Matching the exact historical phrasing keeps the classifier honest --
+# unrelated [BLOCKED] rows from other agents must not trigger this
+# bucket -- and lets pre-flatten audit rows already on disk still
+# classify correctly.
 _RUNTIME_DEGRADATION_BODY_RE: re.Pattern[str] = re.compile(
     r"agent-tool-unavailable|review-supervisor[^\n]*only\s+Bash",
     re.IGNORECASE,
@@ -374,8 +386,15 @@ def _has_runtime_degradation_signal(
     since: datetime | None = None,
 ) -> bool:
     """Issue #183(d): True iff the work-unit's Comments section carries a
-    recent ``[BLOCKED]`` audit naming the agent-tool degradation
-    payload that review-supervisor's Step 0 self-check emits.
+    recent ``[BLOCKED]`` audit naming the historical agent-tool
+    degradation payload review-supervisor's (now-removed, ADR-33)
+    Step 0 self-check used to emit.
+
+    Post-flatten, review-supervisor no longer has a Step 0 self-check
+    or Agent-tool spawn capability, so a healthy run never emits this
+    payload. A match is therefore treated as a topology REGRESSION
+    signal, not a transient degradation an operator restart routinely
+    clears.
 
     "Recent" means within ``_RUNTIME_DEGRADATION_WINDOW_SECONDS`` (24h)
     of ``now``. A stale payload past the window is treated as already-
@@ -479,8 +498,12 @@ def classify_blocked_task(
 
     0. ``RUNTIME_DEGRADATION`` -- a recent ``[BLOCKED]`` audit comment
        (within 24h) names ``agent-tool-unavailable`` /
-       ``review-supervisor ... only Bash``. The orchestrator runtime is
-       degraded; only ``make start`` restart recovers (issue #183).
+       ``review-supervisor ... only Bash``. Post-flatten (ADR-33) this
+       is a topology REGRESSION signal, not a transient runtime
+       condition: review-supervisor no longer has Agent-tool spawn
+       capability, so a match means second-level spawning was
+       reintroduced (or a pre-flatten audit row is still on disk), and
+       a ``make start`` restart cannot resolve it (issue #183).
     1. ``HELD`` -- the task's own status in the backlog index is ``hold``.
     2. ``BLOCKED_ON_HELD`` -- the task carries a ``[BLOCKED_PENDING_PROPOSAL]``
        marker whose target is in ``hold``.

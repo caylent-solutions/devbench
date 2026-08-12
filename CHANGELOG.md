@@ -3,6 +3,429 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] -- 2026-08-12
+
+### Changed (model defaults)
+
+- **Shipped model rate table refreshed to the current lineup; default
+  fallback model moves to Opus 5** (issue #233). `DEFAULT_MODEL_RATES`
+  (`src/devbench/constants.py`) gains four entries, all LIST rates
+  verified against the official Anthropic pricing page
+  (https://platform.claude.com/docs/en/about-claude/pricing), captured
+  2026-07-28:
+  - `claude-fable-5`: $10 / $50 per million input / output tokens.
+  - `claude-opus-5`: $5 / $25 -- the new shipped default (see
+    `DEFAULT_FALLBACK_MODEL_RATES`).
+  - `claude-opus-4-8`: $5 / $25 -- selectable, no longer the default.
+  - `claude-sonnet-5`: $3 / $15 LIST rate (spec S5.3). An introductory rate
+    of $2 / $10 runs through 2026-08-31; that promotional rate is **not**
+    shipped as the default -- workspaces wanting invoice-accurate
+    introductory pricing during the promo window override locally via
+    `report.models`.
+
+  Every pre-existing entry is retained, including the three Haiku pricing
+  rows (Haiku remains priced for reporting even though it is banned for
+  work agents, issue #198).
+
+  **`DEFAULT_FALLBACK_MODEL_RATES`** moves from an Opus-4.7-list-rates
+  label to an Opus-5-list-rates label (value unchanged at $5/$25 since
+  Opus 5 and Opus 4.7 share the same list rate); no hard-coded Opus 4.7
+  default reference remains in `constants.py`, `config_loader.py`,
+  `config.py`, or `config-schema.json`.
+
+  **`DEFAULT_FAST_MODE_MULTIPLIER`** corrects from `6.0` (stale Opus
+  4.6-era value) to `2.0`: fast mode today runs $10/$50 on a $5/$25 base
+  for Opus 5 and Opus 4.8, verified against the same pricing-page capture.
+
+  **`fable` short name added.** `ALLOWED_AGENT_MODEL_SHORT_NAMES` now
+  includes `fable` alongside `opus` and `sonnet`, aliasing `claude-fable-5`
+  for `agents.*` YAML overrides when `use_bedrock: false`. `haiku` remains
+  absent (issue #198); the `config-schema.json` `agents` description no
+  longer advertises `haiku` as an accepted short name.
+
+  **Issue #254 superseded.** #254 asked for Opus 4.8 as the new default;
+  Opus 5 shipped after #254 was filed, so per Decision D-2 this work moves
+  the default to Opus 5 instead and keeps Opus 4.8 as a selectable,
+  non-default model. #254 closes with this note recording the honest
+  supersede rather than the literal request.
+
+  Mirrored comments updated in the same commit:
+  `src/devbench/config_loader.py` (`ReportConfig.fast_mode_multiplier`
+  docstring, `_parse_default_model_rates` docstring),
+  `src/devbench/config.py` (`REPORT_DEFAULT_MODEL_RATES` comment), and
+  `src/devbench/config-schema.json` (`default_model`,
+  `fast_mode_multiplier`, `agents` descriptions). The `docs/model-pricing.md`
+  and `sample-config.yaml` mirrors are updated by the follow-up task
+  E3-F2-S1-T1.
+
+### Changed
+
+- **Flattened the review leg: the four review-team judges are now
+  invoked directly by the orchestrate skill as first-level
+  sub-agents; `review-supervisor` is reduced to a non-spawning
+  aggregator** (ADR-33). A live reproduction (session
+  `32862e10-7ede-4265-8892-e0637684bb3e`, `claude-agent-sdk 0.2.128`,
+  recorded in `docs/adr/33-flatten-review-topology.md`) showed a
+  second-level Agent-tool spawn from a sub-agent succeeding
+  completely and reliably under that configuration -- it did **not**
+  reproduce a hard SDK restriction on sub-agent-spawns-sub-agent. The
+  flatten is adopted anyway, per spec S0 B-9a, as defense-in-depth
+  against model-tier-dependent Agent-tool spawn reliability -- the
+  same class of risk ADR-25's haiku-rejection guard already
+  mitigates by pinning. Before this flatten, review-supervisor was
+  invoked as a first-level sub-agent and itself declared
+  `Agent(code-reviewer, test-reviewer, doc-reviewer, changes-manifest)`
+  to fan out to the four judges; whenever that second-level spawn
+  failed to run -- for whatever reason, model-tier-dependent or
+  otherwise -- the fan-out silently no-opped, the work unit stalled as
+  `RUNTIME_DEGRADATION`, and no restart could clear it, because the
+  classifier could not distinguish a genuinely blocked spawn from a
+  transient one. Removing the second-level spawn removes that whole
+  failure class; `review-supervisor` is still invoked, but only
+  afterward, to read the four judges' already-persisted verdicts and
+  aggregate them -- it is never the one dispatching them.
+  - `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` step 5
+    now invokes `devbench-orchestrate:review_team:code-reviewer`,
+    `test-reviewer`, `doc-reviewer`, and `changes-manifest` directly,
+    in a single response, as first-level sub-agents. Each judge
+    self-logs its own verdict before returning.
+  - `plugin/devbench-orchestrate/agents/review-supervisor.md` no
+    longer declares Agent-tool spawn capability in its frontmatter
+    `tools:` field. It reads the four judges' already-persisted
+    verdicts from the work unit's Comments section and reports a
+    consolidated result.
+  - **Missing-verdict hard failure**: SKILL.md step 5a documents
+    that if any of the four required judges has no verdict logged in
+    the current round, that is a hard failure naming the absent
+    judge -- never an implicit pass. A judge that never logged is
+    indistinguishable from a judge that never ran. (The underlying
+    enforcement in `BacklogManager._last_round_all_passed` already
+    treated a missing verdict as a hard failure; this change aligns
+    the prompts with that existing contract.)
+  - `plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`
+    now blocks every Agent-tool invocation from review-supervisor
+    unconditionally -- the prior review_team allowlist branch is
+    removed, since review-supervisor never spawns any subagent
+    post-flatten.
+  - `src/devbench/backlog/proposal.py`'s `_RUNTIME_DEGRADATION_BODY_RE`
+    comment and `_has_runtime_degradation_signal` docstring now
+    describe a match as a topology **regression** signal (a match
+    should never occur in a healthy post-flatten run), not a
+    transient degradation an operator restart routinely clears. The
+    regex pattern itself is unchanged.
+  - `docs/architecture.md`, `docs/plugin-architecture.md`,
+    `docs/execution-modes.md`, `docs/faq.md`, `docs/cli-reference.md`,
+    and `README.md` updated to describe the four judges as
+    first-level sub-agents invoked directly by the orchestrate skill,
+    with review-supervisor as a non-spawning aggregator.
+  - Remaining consumers of the superseded second-level-spawn contract
+    updated to match: `continue-orchestration.sh`'s Stop-hook
+    `NEXT_STEP` guidance now names the four `review_team` judges as
+    first-level invocations before review-supervisor aggregates;
+    `docs/zero-to-ready.md`, `docs/llm-authentication.md`, and
+    `plugin-authoring/devbench-authoring/skills/configure-devbench/
+    SKILL.md` no longer call review-supervisor a "fan-out
+    coordinator"; and `docs/watch-activity.md`'s troubleshooting
+    table row and omitted-content bullet now describe
+    `review-supervisor running` as meaning the four judges have
+    already finished and self-logged, not that they are concurrently
+    running.
+- **`claude-agent-sdk` lock advanced 0.1.48 -> 0.2.128** (issue #231; epic
+  driver #255). `pyproject.toml:18` already declared
+  `claude-agent-sdk>=0.1.48` with no upper bound -- `uv.lock` was simply
+  pinned to a stale 0.1.48 resolution. `uv lock --upgrade-package
+  claude-agent-sdk` resolved cleanly to 0.2.128 with no `pyproject.toml`
+  edit required. The nine sites in `tests/test_cli.py` that construct real
+  `claude_agent_sdk.types` objects (`AssistantMessage`, `ToolUseBlock`,
+  `ResultMessage`) pass unchanged against the upgraded SDK -- no
+  constructor signature change was observed. A live probe (`query()`
+  against a minimal prompt, run outside the orchestrator's own SDK
+  session via `env -u CLAUDECODE`) shows the 0.2.x iterator now
+  **terminates naturally** after a single `ResultMessage`
+  (`ITERATOR TERMINATED NATURALLY` printed within ~4s total), in contrast
+  to the 0.1.x behaviour documented above (#218) where the iterator never
+  terminated on its own and re-emitted paid `ResultMessage` turns every
+  ~5s. This is a cadence improvement, not a regression -- the
+  `_TERMINAL_ORCHESTRATE_MARKERS` early-break workaround remains in place
+  pending its own removal task. `make validate` passes unchanged after the
+  advance (98.01% coverage, 5084 passed, 8 skipped -- identical to the
+  pre-upgrade baseline).
+
+- **`actionability_line` gains two active-run outcomes instead of collapsing
+  to the stuck-state message while work is executing** (issue #309, spec
+  Section 4 FR-1, E9-F1-S1-T1). `get_parallel_candidates` deliberately
+  includes `IN_PROGRESS` units (issue #185, resume support) and the function
+  then subtracted `active_ids`, so when the only candidate was the unit
+  already running, the list emptied and `No actionable units. N blocked.`
+  printed while work was actively executing -- in a serially-ordered backlog
+  that is the steady state, so the operator-facing line cried wolf for the
+  whole run and camouflaged the genuine deadlock case (issue #253). The
+  three-outcome contract in `src/devbench/backlog/actionability.py` is now
+  five: `Next actionable: <id> -- <title>` and `All work units are DONE.`
+  keep their byte-identical strings; a new third branch renders `<id>
+  active; nothing else can start yet. <tail>` for exactly one active id and
+  `<N> units active; nothing else can start yet. <tail>` for several; the
+  fall-through re-bases to `No actionable units. <tail>`; and `<tail>` is
+  now `<B> blocked` or `<B> blocked, <H> on hold` when `H` (units with
+  status `HOLD`) is greater than zero, computed directly from `units` via
+  `WorkUnitStatus.HOLD` with no parser change. Both callers (`cli.py`
+  `status`, `reporting/report.py` `report`) inherit the change untouched;
+  `devbench next`'s own machine-token output is not modified.
+
+### Added
+
+- **Honest completion paths for the machine-observed RED gate: three
+  named remedies, a cited already-satisfied decline, and a refactor
+  green-green check** (FR-4.5/FR-4.6, E4-F4-S1-T2). The RED gate
+  (`devbench.tdd_gate._build_rejection_message`, shipped by
+  E4-F3-S1-T2) already named all three legitimate ways forward --
+  produce a genuine RED, re-type the task, or decline it as
+  already-satisfied -- in every rejection it raises. This task adds two
+  new surfaces that reuse the same `tdd_gate.REMEDY_1`/`REMEDY_2`/
+  `REMEDY_3` constants via a new
+  `devbench.backlog.manager._build_remedies_rejection_message` helper so
+  the same three remedies are named consistently there too: the
+  gated-task-type block enforced by `BacklogManager.mark_done` (below),
+  and `devbench decline`'s citation requirement. `devbench decline`
+  gained a `--citation
+  <commit-hash-or-task-id>` flag: declining a task with a reason naming
+  "already-satisfied" now requires a valid citation (a 7-40 character
+  lowercase hex commit hash or a task id, checked by the new
+  `BacklogManager.is_valid_citation`); an uncited already-satisfied
+  decline is rejected as unfalsifiable, and `validate-backlog` gained a
+  matching static check (check 22) that flags any already-satisfied
+  `[DECLINED]` comment persisted without one. The FR-4.5/FR-4.6
+  task-type completion invariant now lives in
+  `BacklogManager.mark_done` itself
+  (`_check_task_type_done_invariant`), not in a CLI-layer wrapper, so
+  every caller inherits it identically: both `devbench mark-done` and
+  `devbench check-merge` (on a merged PR) now refuse a gated task
+  (`behavior-fix` / `feature`, including the default when `## Task
+  Type:` is omitted) that carries no `[RED_OBSERVED]` record in its TDD
+  Cycle Log, so a behavior-fix whose test already passed before any
+  change is routed to decline rather than silently claimed as done via
+  either surface. A new `devbench green-green-check <id>
+  <test_node_id> [...]` command gives `refactor` tasks -- exempt from
+  the RED gate but not from their own invariant -- a way to prove the
+  change is behavior-preserving: it confirms the named tests pass in
+  the current ("after") tree, path-scoped stashes the Changes
+  Manifest's production-source rows to reconstruct the pre-change
+  ("before") state, confirms the same tests pass there too, and
+  restores the stash unconditionally (including when the before-state
+  run itself raises). If the stash push finds no uncommitted
+  production-source change to save, the check rejects rather than
+  silently comparing the tree to itself, so a refactor with nothing
+  actually changed cannot false-pass. A collection failure on either
+  side fails closed, never reported as a pass. On success, the check
+  appends a machine-observed `[GREEN_GREEN_OBSERVED]` entry to the work
+  unit's TDD Cycle Log naming the confirmed test node ids.
+  `GREEN_GREEN_OBSERVED` is registered in `constants.VALID_TDD_PHASES`
+  as orchestrator-only (not in `AGENT_WRITABLE_TDD_PHASES`), mirroring
+  the `RED_OBSERVED` control: an agent cannot write it via `log-tdd`,
+  and `cli._reject_bracketed_phase_tag`'s bracketed-phase-tag forgery
+  check now also rejects a forged `[GREEN_GREEN_OBSERVED]` tag in
+  `log-tdd`/`log-comment`/`log-verdict` free text. Because the
+  same `BacklogManager.mark_done` invariant check backs both surfaces,
+  both `devbench mark-done` and `devbench check-merge` now refuse a
+  `refactor` task carrying no such record, so `green-green-check` is a
+  gate a refactor task must pass through, not an optional, unconsumed
+  command. Three end-to-end journeys in the new
+  `tests/test_integration/test_tdd_red_gate_e2e.py` script the
+  operator-facing scenarios against real git repositories: a false-fix
+  attempt is judged REVIEW_FAIL with the exact FR-4.4 message pulled
+  verbatim from the judge prompts; an honest behavior-fix (real RED
+  observed, real fix applied, real GREEN) reaches done with the
+  `[RED_OBSERVED]` record present; and all five required judge verdicts
+  are independently attributable, with any one of the four review-team
+  judges missing blocking done.
+
+- **Quota wait-and-resume** (ADR-24, issue #236). `devbench start`
+  detects Anthropic subscription rate-limit exhaustion mid-session
+  (HTTP 429, the CLI's verbatim "You've hit your limit" text, or an
+  `AssistantMessage.error == "rate_limit"` field) and pauses the
+  orchestrate loop instead of exiting non-zero: it checkpoints the
+  pause to `.devbench/quota_pause.json`, waits for the provider's
+  `reset_at` (or polls a recovery probe when `reset_at` is unknown),
+  then opens a fresh in-process SDK session and continues the backlog
+  automatically once quota recovers. Configurable via the new
+  `quota_handling` block in `backlog/config/devbench.yaml`
+  (`enabled`, `on_exhaustion`, `poll_interval_seconds`,
+  `max_wait_seconds`, `on_exhaustion_timeout`, `resume_strategy`,
+  `audit_comment_on_wait`, `audit_comment_on_resume`,
+  `log_structured_events`) -- default-on, waits on exhaustion, drains
+  on timeout. The wait never uses `asyncio.shield`, so
+  `devbench stop --session <name>` (or a direct SIGTERM) still
+  interrupts a paused session promptly, force-blocking the in-flight
+  work unit rather than leaving it in an ambiguous state. The new
+  `devbench quota-watcher` command reports the current pause state
+  (`reason`, `reset_at`) from the on-disk checkpoint without
+  disturbing the running orchestrator; `devbench status` continues to
+  show the paused work unit under "Active work units:" for the
+  duration of the wait. In-process resumes are bounded by
+  `DEVBENCH_MAX_QUOTA_RESUMES` (default 1000) so an unattended
+  overnight run can survive multiple quota windows without exceeding
+  a fail-safe cap. See `docs/quota-handling.md` and
+  `docs/adr/24-quota-wait-and-resume.md`.
+
+### Removed
+
+- **`sdk_teardown_filter` workaround module removed** (issues #232, #231).
+  The 185-line `src/devbench/sdk_teardown_filter.py` asyncio exception
+  handler that downgraded the known `claude-agent-sdk` `Query.close()`
+  cancel-scope `RuntimeError` teardown race to a `WARNING` is deleted,
+  along with its 347-line test file `tests/test_sdk_teardown_filter.py`.
+  `cmd_start`'s `_run` coroutine in `src/devbench/cli.py` no longer wraps
+  the SDK `query()` loop in `async with _sdk_teardown_guard():`; the
+  `async for` loop body is unchanged, only unindented one level. The
+  operator-facing paragraph describing the workaround was removed from
+  `docs/cli-reference.md`. The workaround is no longer needed now that
+  `uv.lock` resolves `claude-agent-sdk` to `0.2.128`, above the `>=0.2.87`
+  floor at which the cancel-scope teardown race is resolved upstream
+  (verified in E1-F1-S1-T1); `pyproject.toml`'s declared floor remains
+  unchanged at `>=0.1.48`, so a fresh resolve against the manifest alone
+  is not guaranteed to select a fixed version -- the lock file is the
+  operative evidence, not the manifest floor. Issue #232 (this workaround)
+  and issue #231 (the upstream lock-advance tracking issue) are both
+  closed as a result.
+
+### Dependencies
+
+- **Eight open dependabot PRs reconciled against the resolved lock; six
+  closed unmerged, two bumped explicitly** (spec FR-6.1, FR-6.2, FR-6.3,
+  D-14; AC-78, AC-79, AC-80, AC-81, AC-82, AC-83). Per decision D-14, E6
+  reconciles the dependabot backlog against
+  what `uv.lock` actually resolves rather than blind-merging every open
+  branch, which would guarantee lock conflicts. `tools/check_dependabot_targets.py`
+  is added as the reconciliation checker: it parses `uv.lock` with stdlib
+  `tomllib`, compares each of the eight targets below against the locked
+  version with a numeric version-tuple comparison, and prints one line per
+  target in spec G-6's worked-example format. Resolved-version matrix after
+  both E6-F1-S1-T3's mcp-family lock advance (commit
+  `6ec06c7a02deeb1714fd5c8bb45230971f65b603`) and this task's idna/urllib3
+  bump:
+
+  | PR | Package | Locked | Target | Verdict |
+  |---|---|---|---|---|
+  | #287 | mcp | 1.29.0 | 1.28.1 | SATISFIED |
+  | #278 | pydantic-settings | 2.14.2 | 2.14.2 | SATISFIED |
+  | #277 | starlette | 1.3.1 | 1.3.1 | SATISFIED |
+  | #276 | cryptography | 50.0.0 | 48.0.1 | SATISFIED |
+  | #275 | python-multipart | 0.0.32 | 0.0.31 | SATISFIED |
+  | #274 | pyjwt | 2.13.0 | 2.13.0 | SATISFIED |
+  | #216 | idna | 3.18 | 3.15 | SATISFIED (E6-F1-S1-T2) |
+  | #179 | urllib3 | 2.7.0 | 2.7.0 | SATISFIED (E6-F1-S1-T2) |
+
+  **Starlette major-jump evidence (FR-6.2).** #277 moves starlette from
+  `0.52.1` to `1.3.1`, a major-version jump reached transitively via `mcp`
+  and `sse-starlette`; devbench imports no starlette symbol directly, so
+  this is recorded evidence rather than an assumed zero blast radius.
+  `mcp==1.29.0`'s own package metadata declares `starlette>=0.27` for
+  `python_version < '3.14'` and `starlette>=0.48.0` for
+  `python_version >= '3.14'`; `sse-starlette==3.3.2` (the lock's only other
+  starlette parent) declares `starlette>=0.49.1`. The resolved `starlette
+  1.3.1` satisfies every one of those lower bounds, confirming `mcp` accepts
+  the resolved starlette rather than rejecting it -- the FR-6.2 BLOCK path
+  (close #277 not-applicable with resolver evidence, never force-merge) was
+  not triggered.
+
+  **Six PRs closed unmerged with satisfying-commit evidence (AC-79).** Each
+  of #287, #278, #277, #276, #275, and #274 is closed via `gh pr close`
+  with a comment naming commit `6ec06c7a02deeb1714fd5c8bb45230971f65b603`
+  as the satisfying lock advance; `gh pr view` confirms all six show
+  `state=CLOSED`, `mergedAt=null`. None is merged, per FR-6.1's error
+  handling: a dependabot branch whose target is already satisfied by the
+  resolved lock is never merged.
+
+  **Two targets bumped, independent of the mcp cascade (FR-6.3, AC-81,
+  AC-82).** #216 (idna) and #179 (urllib3) needed an explicit bump because
+  the mcp-family advance had no reason to move them, not because they sit
+  outside the dependency graph the advance touched. `idna` in fact sits
+  beneath `mcp` twice over: `mcp==1.29.0` depends on both `anyio` and
+  `httpx`, and both of those depend on `idna`; `starlette` (one of the six
+  targets moved by the mcp-family advance) also depends on `anyio` and so
+  also reaches `idna`. `urllib3` reaches devbench only via `botocore`, which
+  is not beneath `mcp`. In both cases the locked `idna 3.11` and
+  `urllib3 2.6.3` already satisfied every lower bound declared anywhere in
+  the resolved graph, so `uv lock --upgrade-package <mcp-family-target>`
+  had no unsatisfied constraint to pull a newer `idna` or `urllib3` in; a
+  targeted per-package upgrade of the mcp family simply never touches a
+  transitive dependency whose currently-locked version already clears every
+  floor. E6-F1-S1-T1's checker run captured both as
+  `idna 3.11 < 3.15 NEEDS BUMP` and `urllib3 2.6.3 < 2.7.0 NEEDS BUMP`,
+  reflecting the FR-6.3 target floor rather than a graph-resolution
+  constraint. This task closes both with a single resolution:
+  `uv lock --upgrade-package idna
+  --upgrade-package urllib3` resolved cleanly on the first attempt (no
+  per-target isolation was needed), moving `idna 3.11 -> 3.18` and `urllib3
+  2.6.3 -> 2.7.0`. The `uv.lock` diff is exactly the two packages' version,
+  sdist and wheel hash blocks -- no unrelated drift. The re-run checker shows
+  all eight targets `SATISFIED`, closing the reconciliation E6-F1-S1-T1
+  started, and `uv sync && make validate` exits 0 (6226 passed, 98.24%
+  coverage), closing the dependency wave (AC-82). `.github/BATCH_PR_BODY.md`
+  is added carrying the closing-keyword list for every issue this run
+  resolves plus non-closing references to the six superseded dependabot PRs
+  and the two bumped ones (#216, #179), for the operator to paste into the
+  deferred single batch PR (spec S9, AC-83).
+
+### Fixed
+
+- **`devbench instances` still reported no running orchestrator for a daemon
+  whose workspace lived outside `$HOME`** (`spec/devbench-observability-hardening.md`
+  FR-D2/OAC-3, issue #270's companion defect D2, E7-F2-S1-T1).
+  `_resolve_search_roots` (`src/devbench/instances.py:140-168`) defaulted to
+  `[Path.home()]` alone whenever `DEVBENCH_INSTANCE_SEARCH_ROOTS` was unset, so
+  a daemon started under a workspace outside `$HOME` (for example one checked
+  out under `/workspaces`) was invisible to `devbench instances` unless the
+  operator remembered to export the search-roots override by hand. The
+  default now also includes the current `DEVBENCH_WORKSPACE_ROOT` (when set
+  and not already under `$HOME`), so a workspace's own daemon is discoverable
+  with no configuration; a workspace that already relies on
+  `DEVBENCH_INSTANCE_SEARCH_ROOTS` sees byte-identical behavior, since that
+  override still wins first and is returned verbatim. `docs/cli-reference.md`'s
+  "Instances (per-host discovery)" section documents the three-tier
+  resolution order.
+
+- **`quota_handling.log_structured_events: false` had no effect: every
+  `[QUOTA_*]` structured marker still emitted unconditionally** (spec
+  Section 4 FR-2, AC-16, E9-F1-S2-T1). The config key was parsed, schema
+  documented, and docstring-promised but consumed by zero call sites. A new
+  `_quota_structured_events_enabled()` helper in `src/devbench/cli.py` reads
+  `RUNTIME_CONFIG.quota_handling.log_structured_events` and now gates every
+  structured-marker emission across `_handle_quota_pause`,
+  `_dispatch_quota_detection`, `_dispatch_quota_timeout`, and the resume
+  loop; `wait_for_reset` / `_wait_toward_reset` in `src/devbench/quota.py`
+  gain a keyword-only `emit_structured_events: bool = True` gating the
+  `[QUOTA_POLLING]` heartbeat, threaded from config at the `cli.py` call
+  sites (`quota.py` still imports no config module). Slack notifications,
+  audit comments, non-marker log lines, and checkpoint writes are explicitly
+  NOT gated (decision D-10: markers only). Default `true` preserves
+  byte-identical behavior for every workspace that has not set the flag.
+  `docs/quota-handling.md` documents which markers are gated.
+
+- **`Recent pace (last N tasks)`, `Average time per task`, and the ETA
+  projection they feed sampled claim-to-done idle wall time as if it were
+  execution time** (issue #326). A completion whose only `in-progress`
+  anchor sat idle across an orchestrator session gap -- for example an
+  operator `set-status <id> done` against a claim made in an earlier
+  session -- was timed from that stale claim through to `done`, so the
+  pace and average estimators (and the ETA/cost projections derived from
+  them) could be skewed by wall-clock idle time that was never execution
+  time. `_recent_pace_minutes` and `_compute_window_stats`
+  (`src/devbench/reporting/report.py`) now accept a completion as a valid
+  sample only when its `in-progress` anchor exists AND falls in the same
+  orchestrator session as `done` (`_same_session`, session boundaries
+  derived from the log's own non-noise timestamps): pace, average, and ETA
+  no longer sample claim-to-done idle wall time. Both estimators now
+  compute the MEDIAN of the resulting same-session execution-time samples
+  instead of the arithmetic mean, so a single cross-session or outlier
+  completion can no longer dominate the estimate. Completions dropped for
+  having no execution window are no longer silently narrowed out of the
+  sample count: the `Average time per task` and `Recent pace (last N
+  tasks)` cells, and the trailing summary line when it drives the
+  sentence, append `(<k> excluded: no execution window)` naming how many
+  were dropped. `docs/cli-reference.md`'s ETA-formula note documents the
+  median estimator and the exclusion suffix.
+
 ## [0.3.0] -- 2026-07-31
 
 ### Fixed
@@ -32,7 +455,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   creates one.
 
 - **An unscoped session wrote a `scope.json` its own readers reject** (issue
-  #270). Session startup wrote a bare JSON array of IDs while
+  #270; `spec/devbench-observability-hardening.md` FR-D1/OAC-1/OAC-2, defect
+  D1). Session startup wrote a bare JSON array of IDs while
   `ScopeFilter.from_file` and `_read_scope_payload` require the canonical
   object. The two writers target the same path, because `resolve_scope_file_path`
   routes there whenever `DEVBENCH_SESSION_NAME` is set, so the array overwrote
@@ -40,8 +464,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `scope.json top-level payload must be an object, got 'list'`. Scoped
   sessions now write the canonical payload; unscoped sessions write no file,
   since absent is how every reader already expresses "no scope", and an empty
-  scope would assert a filter matching nothing. A stale array file left by an
-  earlier version is cleared on the next start.
+  scope would assert a filter matching nothing; a stale array file present at
+  an unscoped session's start is still cleared at that point. Separately
+  (E7-F1-S1-T1), a stale list-shaped file encountered at ANY other read --
+  `ScopeFilter.from_file` and `_read_scope_banner_data` alike, so both
+  `devbench next` and `devbench status` are covered -- is now migrated to the
+  canonical object form in place (atomic rewrite, one INFO line naming the
+  file) instead of raising; a second read of the same file proves the
+  migration does not recur. Any other non-object shape still raises the
+  pre-existing `ValueError` with its message text byte-preserved.
 
 - **`devbench status` crashed with a traceback where `report` diagnosed**
   (issue #305). A missing work-unit file or a malformed index escaped `status`
@@ -53,21 +484,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (run `validate-backlog`).
 
 - **The test suite wrote into the live workspace and orchestrator log**
-  (issue #292). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
-  `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH` with `os.environ.setdefault`,
-  so it INHERITED whatever the ambient shell already had. devbench is
-  developed with devbench, so the executor runs the suite from inside a live
-  workspace with those exported: fixture work-unit state landed in the real
-  `.devbench/ci-failures/` and `.devbench/pr-bot-feedback/` under IDs that
-  exist only in `tests/`, and fabricated lifecycle records were appended to
-  the live log -- `[ORCHESTRATOR_TERMINAL_EXIT]`, `[QUOTA_WAITING]`,
+  (issue #292; `spec/devbench-observability-hardening.md` FR-D4/OAC-5,
+  defect D4). `tests/conftest.py` set `DEVBENCH_WORKSPACE_ROOT`,
+  `DEVBENCH_PROJECT_ROOT`, `DEVBENCH_LOG_FILE` and `DEVBENCH_CONFIG_PATH`
+  with `os.environ.setdefault`, so it INHERITED whatever the ambient shell
+  already had. devbench is developed with devbench, so the executor runs the
+  suite from inside a live workspace with those exported: fixture work-unit
+  state landed in the real `.devbench/ci-failures/` and
+  `.devbench/pr-bot-feedback/` under IDs that exist only in `tests/`, and
+  fabricated lifecycle records were appended to the live log --
+  `[ORCHESTRATOR_TERMINAL_EXIT]`, `[QUOTA_WAITING]`,
   `[ORCHESTRATOR_AUTO_RESTART]`, `Merged PR #42` -- for events that never
   happened. Those are exactly the markers the reporting layer parses, so a
   test run could drive an operator's `status` and `report` output. Assignment
-  is now unconditional, to a fresh per-run temporary workspace; an ambient
-  value is the hazard, not a configuration to honour. Verified against a live
-  workspace: the suite leaves a 180 MB orchestrator log byte-identical and
-  the 197-file `.devbench/` tree unchanged.
+  is now unconditional (force-assign, not `setdefault`), to a fresh per-run
+  temporary workspace; an ambient value is the hazard, not a configuration to
+  honour. Verified against a live workspace: the suite leaves a 180 MB
+  orchestrator log byte-identical and the 197-file `.devbench/` tree
+  unchanged. `tests/test_workspace_isolation.py` pins the isolation itself:
+  a child pytest subprocess launched with a decoy live-like workspace
+  exported proves the decoy log gains zero bytes and its `.devbench/`
+  directory stays empty.
 
 - **A spent executor retry budget was reported as "operator does nothing"**
   (issue #248). The orchestrate skill writes its retry-exhaustion `[BLOCKED]`
@@ -113,7 +550,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   contract consumed by the orchestrate skill.
 
 - **The orchestrator-alive banner reported ALIVE with no orchestrator
-  running** (issue #250). Liveness was derived from log-activity recency
+  running** (issue #250; `spec/devbench-observability-hardening.md`
+  FR-D3/OAC-4, defect D3). Liveness was derived from log-activity recency
   alone, but a recent log line proves only that something wrote to the log,
   not that the writer still exists: a crashed or killed daemon read as ALIVE
   for the whole quiet window, and any other writer kept it ALIVE indefinitely.
@@ -121,7 +559,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and reports five states (ALIVE, with an idle variant; STOPPED; STARTING;
   NOT RUNNING; UNKNOWN). `stop_hook.window_seconds` no longer decides
   liveness; it distinguishes a busy live orchestrator from an idle one, so a
-  running-but-quiet orchestrator is never reported STOPPED.
+  running-but-quiet orchestrator is never reported STOPPED. Per obs-spec
+  decision OD-3, this fix owns the verdict only; the "last activity" recency
+  line still reads whichever log `devbench report` resolved for the
+  invocation -- the workspace's aggregate `logs/orchestrator.log` by
+  default, or the named session's log when `--session <name>` is passed
+  (E7-F3-S1-T1, declined as superseded: PR #295 already carried this fix
+  before the task reached the queue).
 
 - **`devbench start --help` omitted the scope-filter flags** (issue #249).
   `--include`, `--exclude`, `--name` and `--allow-overlap` were accepted by the
@@ -199,19 +643,6 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
-- **The review leg could never dispatch (ADR-33).** The orchestrate skill invoked
-  `review-supervisor` as a first-level sub-agent, which then declared
-  `Agent(code-reviewer, test-reviewer, doc-reviewer, changes-manifest)` to fan out
-  to the four judges. The Claude Agent SDK forbids a sub-agent from spawning
-  sub-agents, so that declaration silently no-opped: the fan-out never ran, the
-  work unit stalled as `RUNTIME_DEGRADATION`, and no restart could clear it. The
-  skill now dispatches all four `review_team` judges directly as first-level
-  sub-agents and determines pass/fail solely from their canonical verdict lines,
-  fail-closed -- a missing verdict is a `REVIEW_FAIL`, never an implicit pass.
-  `review-supervisor` is now a non-dispatching deprecation stub, retained only so
-  existing `agents:` config, plugin-shadow, and activity references keep
-  resolving. The `continue-orchestration.sh` Stop hook no longer tells the
-  orchestrator to invoke it.
 - **Recovery tasks were materialised but never wired.** The `write-proposal`
   auto-cascade skipped `promote_proposal` for any draft not in `proposed` state.
   Under `backlog.default_status_for_new_work_units: in-queue` every fresh draft is
@@ -243,8 +674,29 @@ since the last release. PR #119 carries every change.
   - `validate.check_orphan_path_tokens` now defaults **true** (was `false`) --
     `validate-backlog` runs Rule 20 (AC/DoD path-coherence) by default. Set `false`
     to opt out if a pre-existing backlog is not yet compatible.
-  - `task_factory.auto_accept_proposals` now defaults **true** (was `false`); only
-    takes effect when `task_factory.enabled` is `true`.
+  - `task_factory.enabled` now defaults **true** (was `false`) and
+    `task_factory.auto_accept_proposals` now defaults **false** (was `true`
+    as shipped in released tag `0.1.0` via PR #202) -- both flipped together
+    in the same commit per D-11 (issue #259, ADR-32) so the on-by-default
+    loop never grants an unreviewed orphan-auto-promote path. Relative to
+    `0.1.0` the user-visible change is that the loop now runs for every
+    backlog by default; a freshly materialised draft's initial status was,
+    and remains, `backlog.default_status_for_new_work_units` (default
+    `in-queue`, AC-189-8) regardless of `auto_accept_proposals` -- that flag
+    instead governs two auto-promote paths: `write-proposal` itself no
+    longer synchronously materialises-and-promotes the proposal it just
+    wrote inside the same invocation by default (that cascade only fires
+    when `auto_accept_proposals` is explicitly `true`), so a freshly
+    written proposal now waits for the next `sweep-proposals` tick to
+    become actionable; and `sweep-proposals` no longer auto-promotes a
+    draft explicitly left at `## Status: proposed` (a legacy/hand-edited-
+    draft case, not something the normal materialise path produces) unless
+    the flag is set. Existing backlogs that explicitly disabled
+    `manifest_amendment` and never mentioned `task_factory` are unaffected:
+    the defaulted-on `task_factory.enabled` downgrades to disabled rather
+    than failing config-load in that combination (see ADR-32's interaction
+    contract). See the migration note below for the exact keys to restore
+    each pre-flip behavior.
   - `merge_strategy` default is now explicitly `squash` at the config layer.
   - `timeouts.executor` and `timeouts.executor_max_turns` were **removed** -- they
     were parsed but never consumed (dead config); removing them changes no behaviour.
@@ -1908,21 +2360,57 @@ Operators upgrading from before this release:
    (`git_ops.pause_before_merge`) in this release; the runtime
    implementation ships in a follow-up commit on this branch (or in
    the next release if the follow-up is deferred).
+6. **Issue #259 (task-factory on by default, ADR-32)**: if your backlog
+   omits `task_factory` from `backlog/config/devbench.yaml`, the loop now
+   runs and materialises draft work-unit `.md` files after amendment
+   rejects, where before it produced none. A freshly materialised
+   draft's initial status is, and has always been, governed by
+   `backlog.default_status_for_new_work_units` (default `in-queue`,
+   AC-189-8) -- unaffected by this change -- so drafts remain immediately
+   actionable unless you also set that key to `draft` for an explicit
+   human-review gate. Relative to released tag `0.1.0`, TWO defaults
+   changed: `task_factory.enabled` flipped `false` -> `true`, and
+   `task_factory.auto_accept_proposals` flipped `true` -> `false`. To
+   restore the pre-flip `enabled` behavior (loop off unless explicitly
+   turned on), add `task_factory.enabled: false`. `auto_accept_proposals`
+   going `true` -> `false` has two concrete effects an upgrading operator
+   will notice: (a) `write-proposal` no longer synchronously
+   materialises-and-promotes the proposal it just wrote inside the same
+   invocation (`auto_cascade` in its output JSON now reads `"disabled"`),
+   so a freshly written proposal now waits for the next `sweep-proposals`
+   tick instead of being actionable immediately; and (b)
+   `sweep-proposals` no longer auto-promotes a draft explicitly left at
+   `## Status: proposed` (a legacy/hand-edited-draft case, not something
+   the normal materialise path produces). To restore the
+   `0.1.0`-released `auto_accept_proposals: true` behavior (both effects
+   together), add `task_factory.auto_accept_proposals: true` (alongside
+   `enabled: true`, its default) -- **warning:** this reintroduces the
+   orphan-auto-promote path that `0.1.0` shipped and that D-11
+   deliberately turns off by default; it was never a general
+   auto-promote-everything behavior even at `0.1.0`, since freshly
+   materialised drafts have always bypassed `proposed` status entirely.
+   Only set it if you have already confirmed that skipping review of
+   orphaned `proposed` drafts is acceptable. See
+   `docs/adr/32-task-factory-default-on.md` for the full decision record
+   and the `manifest_amendment`-interaction contract.
 
-6. **Review topology changed (ADR-33).** The orchestrate skill now
+7. **Review topology changed (ADR-33).** The orchestrate skill now
    dispatches the four `review_team` judges directly as first-level
-   sub-agents; `review-supervisor` no longer dispatches anything and is
-   never invoked. No action is required for standard workspaces -- the
-   `agents.review_supervisor` config key still parses and still accepts a
-   model, it simply has no effect. If you maintain a **custom orchestrate
-   skill or a forked plugin** that invokes `review-supervisor` to run the
-   review fan-out, that path is now blocked by
-   `guard-review-supervisor-scope.sh` (exit 2) and must be updated to
-   dispatch the judges directly. A missing verdict from any required judge
-   is now a hard review failure rather than an implicit pass, so a work
-   unit that previously slipped through on a partial round will now fail
-   review until every judge reports.
-7. **Optional: isolate stop-hook state.** The Stop hook's state file
+   sub-agents; `review-supervisor` is retained and is still invoked, but
+   only afterward, as a non-spawning aggregator that reads the four
+   judges' already-persisted verdicts and reports a consolidated result --
+   it never dispatches them itself. No action is required for standard
+   workspaces -- the `agents.review_supervisor` config key still parses
+   and still selects the model used for that aggregation pass. If you
+   maintain a **custom orchestrate skill or a forked plugin** that invokes
+   `review-supervisor` expecting it to run the review fan-out itself, that
+   path is now blocked by `guard-review-supervisor-scope.sh` (exit 2) and
+   must be updated to dispatch the judges directly, letting
+   `review-supervisor` aggregate afterward. A missing verdict from any
+   required judge is now a hard review failure rather than an implicit
+   pass, so a work unit that previously slipped through on a partial round
+   will now fail review until every judge reports.
+8. **Optional: isolate stop-hook state.** The Stop hook's state file
    defaults to `/tmp`, which is shared machine-wide. If you run the test
    suite on a host that also runs a live orchestrator, set
    `DEVBENCH_STOP_HOOK_STATE_DIR` to a private directory in the test

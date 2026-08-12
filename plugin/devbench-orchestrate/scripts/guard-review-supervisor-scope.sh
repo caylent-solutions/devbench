@@ -6,13 +6,14 @@
 #   { "tool_name": "Bash", "tool_input": { "command": "..." },
 #     "agent_type": "devbench-orchestrate:review-supervisor", ... }
 #
-# This agent has no pipeline role post-ADR-33: the orchestrate skill
-# dispatches the four review_team judges directly and aggregates their
-# verdicts itself, so review-supervisor neither delegates nor reviews.
-# It MUST NOT spawn subagents and MUST NOT mutate worktree, index, or
-# filesystem state. Any Agent-tool invocation, and any state-changing
-# Bash command (file deletion, git mutation, redirection to disk), is
-# out of scope and is rejected here.
+# Post-flatten (ADR-33), review-supervisor's job is to AUDIT the four
+# review_team judges' already-persisted verdicts and report a
+# consolidated result. It MUST NOT mutate worktree, index, or
+# filesystem state, and it MUST NOT spawn any subagent at all -- the
+# review-supervisor.md prompt instructs only `uv run devbench
+# log-comment` / `log-verdict` calls. Any state-changing Bash command
+# (file deletion, git mutation, redirection to disk) or any Agent-tool
+# invocation whatsoever is out of scope and is rejected here.
 #
 # This hook is a no-op for any agent_type other than
 # "devbench-orchestrate:review-supervisor"; main-session and other-agent Bash calls
@@ -41,13 +42,21 @@ if [[ "$AGENT_TYPE" != "devbench-orchestrate:review-supervisor" ]]; then
   exit 0
 fi
 
+# ADR-33 flatten: review-supervisor is reduced to a non-spawning
+# aggregator with no Agent-tool spawn capability at all. Block every
+# Agent-tool invocation unconditionally -- there is no allowlist. The
+# four review_team judges are invoked directly by the orchestrate skill
+# as first-level sub-agents (SKILL.md step 5); review-supervisor never
+# invokes them, and spawning any subagent (judge or otherwise) from
+# review-supervisor bypasses the documented pipeline. The override env
+# var still applies operator-wide.
+#
 # Issue #118: the prior Bash-only guard let the supervisor escalate by
-# spawning subagents (executor / git-ops) via the Agent tool. Block EVERY
-# Agent-tool invocation. Issue #118 allow-listed the four review_team
-# subagents because the supervisor fanned out to them itself; ADR-33 moved
-# that fan-out to the orchestrate skill as a first-level dispatch, so the
-# supervisor now dispatches nothing and the allowlist described a contract
-# that no longer exists. The override env var still applies operator-wide.
+# spawning subagents (executor / git-ops) via the Agent tool. Issue #118
+# allow-listed the four review_team subagents because the supervisor
+# fanned out to them itself; ADR-33 moved that fan-out to the orchestrate
+# skill as a first-level dispatch, so the allowlist described a contract
+# that no longer exists.
 TOOL_NAME=$(extract_field "$INPUT" "tool_name")
 if [[ "$TOOL_NAME" == "Agent" ]]; then
   # Claude Code's PreToolUse Agent payload puts subagent_type under
@@ -64,8 +73,8 @@ if [[ "$TOOL_NAME" == "Agent" ]]; then
   fi
   {
     printf 'guard-review-supervisor-scope: BLOCKED -- review-supervisor attempted to spawn subagent_type %s.\n' "$SUBAGENT"
-    printf 'Reason: review-supervisor has no pipeline role (ADR-33) and may not spawn any subagent. The four review_team judges are dispatched directly by the orchestrate skill as first-level sub-agents; the documented pipeline is executor -> the 4 review_team judges -> security-reviewer -> git-ops -> mark-done.\n'
-    printf 'Override: only an operator may set DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1 in the env to permit a one-off non-review-team subagent.\n'
+    printf 'Reason: review-supervisor has no Agent-tool spawn capability post-flatten (ADR-33). The four review_team judges are invoked directly by the orchestrate skill as first-level sub-agents, never by review-supervisor. Spawning any agent (a review_team judge, executor, git-ops, blocker_resolver, etc.) bypasses the documented pipeline (skill invokes judges directly -> review-supervisor aggregates -> security-reviewer -> git-ops -> mark-done).\n'
+    printf 'Override: only an operator may set DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1 in the env to permit a one-off subagent spawn.\n'
   } >&2
   exit 2
 fi

@@ -244,7 +244,163 @@ COMMENT_AGENT_TEMPLATE: str = "[{timestamp}] [agent/{name}] {message}\n"
 # ---------------------------------------------------------------------------
 TDD_CYCLE_LOG_SECTION_HEADER: str = "## TDD Cycle Log"
 TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} -- {message}\n"
-VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
+
+TDD_PHASE_RED: str = "RED"
+TDD_PHASE_GREEN: str = "GREEN"
+TDD_PHASE_REFACTOR: str = "REFACTOR"
+
+# RED_OBSERVED (FR-4.3 / E4-F3-S1-T1, issue #257) is a fourth TDD Cycle Log
+# phase written exclusively by the orchestrator after it has independently
+# run the test suite and observed a nonzero exit code. It is a *valid* phase
+# (accepted by ``_append_tdd_entry``/parsed by ``red_gate_satisfied``) but it
+# is not agent-writable -- ``cmd_log_tdd`` (the CLI verb agents call) must
+# reject it outright. ``AGENT_WRITABLE_TDD_PHASES`` and
+# ``ORCHESTRATOR_ONLY_TDD_PHASES`` partition ``VALID_TDD_PHASES`` as data
+# (frozenset set-difference) rather than as scattered ``if phase == ...``
+# conditionals, so the authorization boundary has one definition.
+TDD_PHASE_RED_OBSERVED: str = "RED_OBSERVED"
+
+# GREEN_GREEN_OBSERVED (FR-4.6 / E4-F4-S1-T2, issue #257) is a fifth TDD
+# Cycle Log phase, mirroring RED_OBSERVED: written exclusively by the
+# orchestrator (``devbench green-green-check``) after it has independently
+# run a refactor task's named tests both before and after the change and
+# observed both sides pass. It is a *valid* phase but not agent-writable.
+# Registering it here (rather than as a private literal local to
+# ``devbench.backlog.manager``, as it was through round 3 -- code_review
+# FAIL round 4, SOLID/OCP) is load-bearing, not cosmetic:
+# ``cli._reject_bracketed_phase_tag``'s bracketed-phase-tag security control
+# (HIGH finding, E4-F3-S1-T1) is built directly from ``VALID_TDD_PHASES``, so
+# a phase absent from this set is a phase agent free text can forge
+# unrejected. Adding it here, and only here, closes that gap for every
+# consumer of ``VALID_TDD_PHASES``/``ORCHESTRATOR_ONLY_TDD_PHASES`` at once.
+TDD_PHASE_GREEN_GREEN_OBSERVED: str = "GREEN_GREEN_OBSERVED"
+
+VALID_TDD_PHASES: frozenset[str] = frozenset(
+    {
+        TDD_PHASE_RED,
+        TDD_PHASE_GREEN,
+        TDD_PHASE_REFACTOR,
+        TDD_PHASE_RED_OBSERVED,
+        TDD_PHASE_GREEN_GREEN_OBSERVED,
+    }
+)
+AGENT_WRITABLE_TDD_PHASES: frozenset[str] = frozenset({TDD_PHASE_RED, TDD_PHASE_GREEN, TDD_PHASE_REFACTOR})
+ORCHESTRATOR_ONLY_TDD_PHASES: frozenset[str] = VALID_TDD_PHASES - AGENT_WRITABLE_TDD_PHASES
+
+TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE: str = (
+    "ERROR: TDD phase '{phase}' is orchestrator-only and cannot be written via "
+    "log-tdd; agent-writable phases are: {agent_phases}."
+)
+
+# ---------------------------------------------------------------------------
+# RED_OBSERVED record fields (E4-F3-S1-T1).
+#
+# A RED_OBSERVED entry's message body is not free text -- it is a fixed
+# three-field record (``exit_code``, ``test_node_id``, ``failure_digest``)
+# built by ``devbench.cli.build_red_observed_message`` and re-validated by
+# ``devbench.cli.red_gate_satisfied`` on read. ``failure_digest`` is
+# constrained to a hash-shaped value (never raw free text) so a failure
+# message cannot leak secrets or filesystem paths into git history (LOW
+# finding, E4-F3-S1-T1 security review).
+# ---------------------------------------------------------------------------
+RED_OBSERVED_FIELD_EXIT_CODE: str = "exit_code"
+RED_OBSERVED_FIELD_TEST_NODE_ID: str = "test_node_id"
+RED_OBSERVED_FIELD_FAILURE_DIGEST: str = "failure_digest"
+RED_OBSERVED_RECORD_FIELDS: tuple[str, str, str] = (
+    RED_OBSERVED_FIELD_EXIT_CODE,
+    RED_OBSERVED_FIELD_TEST_NODE_ID,
+    RED_OBSERVED_FIELD_FAILURE_DIGEST,
+)
+
+RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE: str = "RED_OBSERVED record is missing required field '{field}'."
+RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE: str = (
+    "RED_OBSERVED requires a nonzero exit_code (a RED phase is, by definition, an observed failure); got exit_code=0."
+)
+RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE: str = (
+    "RED_OBSERVED test_node_id must not contain whitespace (the read-side parser "
+    "RED_OBSERVED_MESSAGE_FIELDS_RE requires a single non-whitespace token, so a "
+    "space, tab or newline would build a record the gate can never match); got {test_node_id!r}."
+)
+RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE: str = (
+    "RED_OBSERVED failure_digest must be a lowercase hex string of {min}-{max} characters; got {digest!r}."
+)
+
+FAILURE_DIGEST_MIN_LENGTH: int = 8
+FAILURE_DIGEST_MAX_LENGTH: int = 64
+FAILURE_DIGEST_RE = re.compile(rf"^[0-9a-f]{{{FAILURE_DIGEST_MIN_LENGTH},{FAILURE_DIGEST_MAX_LENGTH}}}$")
+
+RED_OBSERVED_MESSAGE_TEMPLATE: str = "exit_code={exit_code} test_node_id={test_node_id} failure_digest={failure_digest}"
+
+# Anchored (line-start) match for a RED_OBSERVED entry -- deliberately does
+# NOT use a bare substring/"in" check. A phase tag embedded mid-message
+# (e.g. an agent-written ``[RED]`` entry whose message body contains the
+# literal text ``[RED_OBSERVED]``) must never satisfy this pattern, since
+# that would let agent-controlled free text forge the gate (HIGH finding,
+# E4-F3-S1-T1 security review).
+RED_OBSERVED_ENTRY_LINE_RE = re.compile(
+    r"^-\s+\[RED_OBSERVED\]\s+\S+\s+--\s+(?P<message>.+)$",
+    re.MULTILINE,
+)
+
+# Parses the three RED_OBSERVED record fields out of an entry's message body.
+# Requires all three fields, in the fixed order emitted by
+# ``RED_OBSERVED_MESSAGE_TEMPLATE`` -- a message missing any field never
+# matches (no partial-record fallback). ``failure_digest`` is captured
+# permissively here (``\S+``); ``FAILURE_DIGEST_RE`` is the single source of
+# truth for the hash-shape validation applied on top of this parse.
+RED_OBSERVED_MESSAGE_FIELDS_RE = re.compile(
+    r"^exit_code=(?P<exit_code>-?\d+)\s+"
+    r"test_node_id=(?P<test_node_id>\S+)\s+"
+    r"failure_digest=(?P<failure_digest>\S+)$"
+)
+
+# Captures the body of the ``## TDD Cycle Log`` section only -- from the
+# header up to (but not including) the next ``## `` heading or end of
+# string. Mirrors ``STRIP_SUMMARY_RE`` above. ``red_gate_satisfied`` scopes
+# its search to this capture group so a RED_OBSERVED-shaped line planted in
+# any other section (e.g. ``## Comments``) can never satisfy the gate (HIGH
+# finding, E4-F3-S1-T1 security review).
+TDD_CYCLE_LOG_SECTION_BODY_RE = re.compile(
+    r"^## TDD Cycle Log\n(.*?)(?=^## |\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# ---------------------------------------------------------------------------
+# Six-type task taxonomy (FR-4.1 / E4-F2-S1-T1).
+#
+# ``## Task Type:`` is an optional work-unit section. When present it must
+# name exactly one of the six values below; when absent, ``validate-backlog``
+# defaults the task to the strictest type (``behavior-fix``) so that a task
+# with no declared type is never accidentally exempted from the RED gate or
+# the production-source Manifest invariant.
+#
+# ``GATED_TASK_TYPES`` are the types that require a RED-gated TDD cycle and
+# at least one production-source row in the Changes Manifest.
+# ---------------------------------------------------------------------------
+TASK_TYPE_BEHAVIOR_FIX: str = "behavior-fix"
+TASK_TYPE_FEATURE: str = "feature"
+TASK_TYPE_TEST_ONLY: str = "test-only"
+TASK_TYPE_REFACTOR: str = "refactor"
+TASK_TYPE_DOCS: str = "docs"
+TASK_TYPE_CHORE: str = "chore"
+
+VALID_TASK_TYPES: frozenset[str] = frozenset(
+    {
+        TASK_TYPE_BEHAVIOR_FIX,
+        TASK_TYPE_FEATURE,
+        TASK_TYPE_TEST_ONLY,
+        TASK_TYPE_REFACTOR,
+        TASK_TYPE_DOCS,
+        TASK_TYPE_CHORE,
+    }
+)
+
+DEFAULT_TASK_TYPE: str = TASK_TYPE_BEHAVIOR_FIX
+
+GATED_TASK_TYPES: frozenset[str] = frozenset({TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_FEATURE})
+
+TASK_TYPE_SECTION_PREFIX: str = "## Task Type:"
+TASK_TYPE_LINE_RE = re.compile(r"^(##\s*Task Type:\s*)(.+)$", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
 # Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
@@ -496,6 +652,13 @@ class ModelRates:
 # Keys match the literal ``model`` strings emitted by Claude Code in the
 # transcript ``message.model`` field (e.g. ``claude-opus-4-7``, NOT
 # ``us.anthropic.claude-opus-4-7-v1``).
+#
+# Current-lineup entries (issue #233, spec FR-3.1, section 5.3) added below
+# the legacy rows. Source: https://platform.claude.com/docs/en/about-claude/pricing,
+# captured 2026-07-28. All four are LIST rates per spec S5.3 -- workspaces
+# wanting invoice-accurate introductory pricing override locally via
+# ``report.models`` rather than getting a promotional rate baked into the
+# shipped default.
 DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
     "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
     "claude-opus-4-6": ModelRates(input=5.0, output=25.0),
@@ -508,13 +671,33 @@ DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
     "claude-haiku-4-5": ModelRates(input=1.0, output=5.0),
     "claude-haiku-3-5": ModelRates(input=0.80, output=4.0),
     "claude-haiku-3": ModelRates(input=0.25, output=1.25),
+    # Fable 5 list rate. Source: https://platform.claude.com/docs/en/about-claude/pricing,
+    # captured 2026-07-28.
+    "claude-fable-5": ModelRates(input=10.0, output=50.0),
+    # Opus 5 list rate; current shipped default (issue #233 supersedes the
+    # literal #254 request for Opus 4.8, per Decision D-2 -- Opus 5 shipped
+    # after #254 was filed). Source:
+    # https://platform.claude.com/docs/en/about-claude/pricing, captured 2026-07-28.
+    "claude-opus-5": ModelRates(input=5.0, output=25.0),
+    # Opus 4.8 list rate; selectable but no longer the default (see
+    # claude-opus-5 above). Source:
+    # https://platform.claude.com/docs/en/about-claude/pricing, captured 2026-07-28.
+    "claude-opus-4-8": ModelRates(input=5.0, output=25.0),
+    # Sonnet 5 LIST rate per spec S5.3 ($3/$15). NOTE: an introductory rate
+    # of $2/$10 runs through 2026-08-31; that promotional rate is NOT the
+    # shipped default -- workspaces wanting invoice-accurate introductory
+    # pricing during the promo window override locally via `report.models`.
+    # Source: https://platform.claude.com/docs/en/about-claude/pricing,
+    # captured 2026-07-28.
+    "claude-sonnet-5": ModelRates(input=3.0, output=15.0),
 }
 
 # Rates applied to the ``"<unknown>"`` aggregation bucket: any transcript
 # message whose ``model`` field is missing, or any model id that does not
-# appear in the loaded ``report.models`` table. Default mirrors Opus 4.7 list
-# so devbench errs on the conservative (over-report) side -- under-reporting
-# is the operator-pain failure mode #223 is filed against.
+# appear in the loaded ``report.models`` table. Default mirrors Opus 5 list
+# (issue #233; supersedes the prior Opus 4.7-list default) so devbench errs
+# on the conservative (over-report) side -- under-reporting is the
+# operator-pain failure mode #223 is filed against.
 DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)
 
 # Em-dash (U+2014). Prohibited in work-unit markdown files by the
@@ -606,6 +789,27 @@ ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
 # reason=runtime_degradation tasks=<id1,id2,...>``.
 ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
 
+# Bound on the number of consecutive in-process quota-recovery resumes
+# ``_drive_orchestrate_with_quota_resume`` performs before stopping the
+# orchestrator (spec FR-2.8, AC-22). Overridable via
+# ``DEVBENCH_MAX_QUOTA_RESUMES``; resolved through
+# ``_resolve_max_quota_resumes``'s fail-safe parse (non-integer or <= 0
+# falls back to this default rather than raising or disabling resume, so a
+# typo can never silently turn a single quota window into a run-ending
+# event). Configuration precedence: env > yaml > built-in default
+# (Section 7.3).
+DEFAULT_MAX_QUOTA_RESUMES: int = 1000
+
+# Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
+# permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]
+# resume=<n> max=<cap>`` (spec FR-2.10).
+ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX: str = "[ORCHESTRATOR_QUOTA_RESUME]"
+
+# Audit marker emitted by ``_should_resume_after_quota_recovery`` when the
+# in-process quota-resume cap above is reached:
+# ``[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>`` (spec FR-2.10).
+ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED]"
+
 # ---------------------------------------------------------------------------
 # Token arithmetic
 # ---------------------------------------------------------------------------
@@ -654,9 +858,13 @@ DEFAULT_CACHE_WRITE_1HR_MULTIPLIER: float = 2.0
 # Data-residency premium when usage.inference_geo is set (US-only inference;
 # applies to Opus 4.7, Opus 4.6, Sonnet 4.6+).
 DEFAULT_DATA_RESIDENCY_MULTIPLIER: float = 1.10
-# Fast-mode premium when usage.speed == "fast" (Opus 4.6 only at the time of
-# this snapshot). Counted but not applied per-call in v1.
-DEFAULT_FAST_MODE_MULTIPLIER: float = 6.0
+# Fast-mode premium when usage.speed == "fast" (Opus 5 and Opus 4.8 only at
+# the time of this snapshot, issue #233). Source:
+# https://platform.claude.com/docs/en/about-claude/pricing, captured 2026-07-28:
+# fast mode runs $10/$50 on a $5/$25 base, i.e. a 2.0x multiplier. Applied
+# per-call to the fast_* token subset (issue #124); see
+# reporting.report._compute_cost_by_model.
+DEFAULT_FAST_MODE_MULTIPLIER: float = 2.0
 
 # ---------------------------------------------------------------------------
 # Report table render widths (characters)
@@ -704,18 +912,49 @@ SHADOW_PID_SENTINEL_FILENAME: str = ".pid"
 
 # Short-name model aliases accepted in ``agents.*`` YAML values when
 # ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic
-# SDK accepts.
-ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet"})
+# SDK accepts. ``fable`` added by issue #233 (E3 model refresh) to alias
+# ``claude-fable-5``.
+ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet", "fable"})
 
-# Full Anthropic model id pattern (``claude-opus-4-7``, ``claude-sonnet-4-6``,
-# ``claude-sonnet-4-6-20250514``). Accepted when ``use_bedrock: false``.
-# Note: ids containing ``haiku`` are rejected by ``validate_agent_model_value()``
-# even though they would otherwise match this pattern.
+# Full Anthropic model id pattern (``claude-opus-5``, ``claude-sonnet-5``,
+# ``claude-fable-5``, ``claude-sonnet-4-6-20250514``). Accepted when
+# ``use_bedrock: false``. Note: ids containing ``haiku`` are rejected by
+# ``validate_agent_model_value()`` even though they would otherwise match
+# this pattern. Verified (spec S1.7) to already match every current-lineup
+# id added by issue #233 with zero pattern changes.
 ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(-[a-z0-9]+)+$")
 
 # AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted
 # only when ``use_bedrock: true``; rejected otherwise.
 BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$")
+
+# ---------------------------------------------------------------------------
+# Quota recovery probe (FR-2.5, issue #236, E2-F1-S2-T2)
+# ---------------------------------------------------------------------------
+# Model id targeted by ``devbench.quota.recovery_probe``'s 1-token
+# ``messages.create`` call used to confirm whether an exhausted quota has
+# cleared. DELIBERATE DIVERGENCE from the source branch
+# (``origin/feat/flatten-review-pipeline:constants.py:711``), which pinned
+# ``"claude-opus-4-8"``: spec decision D-2 moves the default model lineup to
+# Opus 5, so this constant lands as ``"claude-opus-5"`` instead of copying
+# the branch value. Do not "fix" this back to ``claude-opus-4-8`` -- that
+# would silently un-do D-2.
+RECOVERY_PROBE_MODEL: str = "claude-opus-5"
+
+# HTTP timeout, in seconds, for ``devbench.quota.recovery_probe``'s
+# ``messages.create`` call (FR-2.5, issue #236). Consumed by the
+# ``functools.partial(recovery_probe, ...)`` call built in
+# ``_handle_quota_pause`` (``src/devbench/cli.py``) so the probe's timeout
+# is not a hardcoded literal at the call site. Must be > 0 -- enforced by
+# ``recovery_probe``'s own argument guard.
+RECOVERY_PROBE_TIMEOUT_SECONDS: float = 30.0
+
+# Input token count for the 1-token probe prompt sent by
+# ``devbench.quota.recovery_probe`` (FR-2.5, issue #236). Consumed by the
+# same ``functools.partial(recovery_probe, ...)`` call in
+# ``_handle_quota_pause`` (``src/devbench/cli.py``). Must be >= 1 --
+# enforced by ``recovery_probe``'s own argument guard.
+RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
 
 # ---------------------------------------------------------------------------
 # Session-management constants (spec 4.4.1 named sessions, issue #192)

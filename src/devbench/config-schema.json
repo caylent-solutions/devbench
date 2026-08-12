@@ -356,7 +356,7 @@
         },
         "default_model": {
           "type": "object",
-          "description": "Rates applied to the `<unknown>` bucket: any transcript message whose `model` field is missing OR a model id not present in `report.models`. When absent, falls back to the Opus 4.7 list rates so unknown models err toward over-reporting cost.",
+          "description": "Rates applied to the `<unknown>` bucket: any transcript message whose `model` field is missing OR a model id not present in `report.models`. When absent, falls back to the Opus 5 list rates (issue #233) so unknown models err toward over-reporting cost.",
           "additionalProperties": false,
           "required": ["input", "output"],
           "properties": {
@@ -390,7 +390,7 @@
         },
         "fast_mode_multiplier": {
           "type": "number",
-          "description": "Cost multiplier applied per-call to usage.speed=='fast' tokens (issue #124). Defaults to 6.0 (Opus 4.6 fast-mode premium). Composes with cache + base-rate multipliers and applies before token_cost_discount."
+          "description": "Cost multiplier applied per-call to usage.speed=='fast' tokens (issue #124). Defaults to 2.0 (Opus 5 / Opus 4.8 fast-mode premium, captured 2026-07-28, issue #233). Composes with cache + base-rate multipliers and applies before token_cost_discount."
         },
         "recent_pace_tasks": {
           "type": "integer",
@@ -458,16 +458,16 @@
     },
     "task_factory": {
       "type": "object",
-      "description": "Opt-in configuration for the task-factory loop. When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to generate new `proposed` work units for the out-of-scope production fixes the amender surfaced. Requires manifest_amendment.enabled: true.",
+      "description": "Configuration for the task-factory loop, on by default (ADR-32, superseding the PR #202 shipped auto-promote-by-default posture, not ADR-11). When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to materialise new draft work-unit files for the out-of-scope production fixes the amender surfaced; a draft's initial status is governed by backlog.default_status_for_new_work_units (default in-queue), unrelated to auto_accept_proposals. Requires manifest_amendment.enabled: true (a config that omits this block while explicitly disabling manifest_amendment.enabled downgrades silently to disabled rather than failing config-load; an explicit enabled: true against a disabled amendment workflow still fails fast).",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Whether the task-factory loop runs after amendment rejects. Default false (opt-in). Requires manifest_amendment.enabled: true."
+          "description": "Whether the task-factory loop runs after amendment rejects. Default true (on by default, ADR-32). Requires manifest_amendment.enabled: true. Set false to opt out."
         },
         "auto_accept_proposals": {
           "type": "boolean",
-          "description": "When true (the default), devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Set false to require operator review. Only takes effect when task_factory.enabled is true. ADR-11."
+          "description": "Governs two auto-promote paths. (1) write-proposal: when true, write-proposal synchronously also calls materialise-proposal (and promote-proposal for any just-written id already sitting at legacy status `proposed`) in the same invocation, so drafts land immediately instead of waiting for the next sweep-proposals tick; when false (the default), write-proposal only persists the JSON and materialisation happens later via sweep-proposals or a manual materialise-proposal call. (2) sweep-proposals: when true, it also auto-promotes any draft explicitly sitting at status `proposed` (a legacy/hand-edited-draft case; the normal materialise path never writes that status -- it always uses backlog.default_status_for_new_work_units). Neither path changes the initial status of a freshly materialised draft. Default false (ADR-32). Only takes effect when task_factory.enabled is true."
         }
       }
     },
@@ -541,7 +541,9 @@
             "ci_failure": {"type": "boolean", "description": "Fire when CI checks on a WU PR fail. Default: false."},
             "ci_pass": {"type": "boolean", "description": "Fire when CI checks on the finalize-path batch PR turn green (PR ready for manual merge under auto_merge: false). Issue #219. Default: false."},
             "orchestrator_stop": {"type": "boolean", "description": "Fire when the orchestrator loop exits (clean, drain, SIGTERM, or crash). Default: false."},
-            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."}
+            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."},
+            "quota_waiting": {"type": "boolean", "description": "Fire when the orchestrator hits a quota and starts waiting for it to reset (payload carries the quota source/reason and the provider-stated reset time). Wired by E2-F3-S1-T1; the key is inert until then. Default: false."},
+            "quota_resumed": {"type": "boolean", "description": "Fire when the quota recovers and the run resumes (payload carries the total seconds waited). Wired by E2-F3-S1-T1; the key is inert until then. Default: false."}
           }
         },
         "slack": {
@@ -563,7 +565,7 @@
     },
     "agents": {
       "type": "object",
-      "description": "Per-agent model overrides (ADR-25). Each field defaults to null; the agent then runs on the model declared in its .md frontmatter. Set a field to override for this workspace -- devbench materialises a workspace-local shadow plugin tree under <workspace>/.devbench/plugin-shadow/devbench/ and rewrites the matching frontmatter line. JUDGE_AGENT_MODEL_<NAME> env vars override these YAML values. Use short names (opus|sonnet|haiku) or full Anthropic model ids (claude-opus-4-7) when use_bedrock: false; use the matching Bedrock id (us.anthropic.claude-opus-4-7-v1) when use_bedrock: true.",
+      "description": "Per-agent model overrides (ADR-25). Each field defaults to null; the agent then runs on the model declared in its .md frontmatter. Set a field to override for this workspace -- devbench materialises a workspace-local shadow plugin tree under <workspace>/.devbench/plugin-shadow/devbench/ and rewrites the matching frontmatter line. JUDGE_AGENT_MODEL_<NAME> env vars override these YAML values. Use short names (opus|sonnet|fable) or full Anthropic model ids (claude-opus-5) when use_bedrock: false; use the matching Bedrock id (us.anthropic.claude-opus-5-v1) when use_bedrock: true. Note: 'haiku' is not an accepted short name -- haiku is rejected for every work agent at config-load time (caylent-solutions/devbench#198).",
       "additionalProperties": false,
       "properties": {
         "executor": {
@@ -612,6 +614,55 @@
               "description": "Model for plugin/devbench-orchestrate/agents/review_team/changes-manifest.md."
             }
           }
+        }
+      }
+    },
+    "quota_handling": {
+      "type": "object",
+      "description": "Quota wait-and-resume configuration (issue #236, spec S5.2). Default: enabled=true.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master toggle. true (default) enables wait-and-resume. false restores the legacy non-zero exit (#193 AC-4, spec AC-24)."
+        },
+        "on_exhaustion": {
+          "type": "string",
+          "enum": ["wait", "fail", "drain"],
+          "description": "Action when a quota signal is detected. Default: 'wait'."
+        },
+        "poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600,
+          "description": "Recovery probe cadence in seconds. Default: 60."
+        },
+        "max_wait_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum total wait in seconds before on_exhaustion_timeout fires. Default: 18000 (5 hours)."
+        },
+        "on_exhaustion_timeout": {
+          "type": "string",
+          "enum": ["drain", "fail", "keep_waiting"],
+          "description": "Action when max_wait_seconds elapses without recovery. Default: 'drain'."
+        },
+        "resume_strategy": {
+          "type": "string",
+          "enum": ["continue_current_wu", "restart_wu", "drain_and_resume"],
+          "description": "How to resume after successful recovery. Default: 'continue_current_wu'."
+        },
+        "audit_comment_on_wait": {
+          "type": "boolean",
+          "description": "Append [QUOTA_WAITING] audit comment to the in-progress WU. Default: true."
+        },
+        "audit_comment_on_resume": {
+          "type": "boolean",
+          "description": "Append [QUOTA_RESUMED] audit comment after recovery. Default: true."
+        },
+        "log_structured_events": {
+          "type": "boolean",
+          "description": "Emit structured log events on quota transitions. Default: true."
         }
       }
     }

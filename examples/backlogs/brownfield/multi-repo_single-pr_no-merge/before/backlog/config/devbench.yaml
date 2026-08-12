@@ -81,8 +81,6 @@ timeouts:
   security_fetch: 120                   # (built-in default)
   llm: 300                              # (built-in default)
   command: 120                          # (built-in default)
-  executor: 600                         # (built-in default)
-  executor_max_turns: 100               # (built-in default)
   orchestrator_poll_interval: 10        # (built-in default)
   github_check: 600                     # (built-in default)
 
@@ -209,16 +207,21 @@ orchestrate:
 # Report / cost estimation
 # ---------------------------------------------------------------------------
 report:
-  # Defaults below match Opus 4.7 list pricing. Override these if you run on
-  # a different model contract.
-  token_cost_per_million_input: 5.0     # (built-in default for the current sample)
-  token_cost_per_million_output: 25.0   # (built-in default for the current sample)
-  token_cost_discount: 0.0              # (built-in default; no contract discount applied)
+  # Defaults below match Opus 5 list pricing. Override these if you run on
+  # a different model contract. See docs/model-pricing.md for the full
+  # per-model rate table (issue #233).
+  models:
+    claude-opus-5:
+      input: 5.0                        # (built-in default for the current sample)
+      output: 25.0                      # (built-in default for the current sample)
+  default_model:                        # rates for any model id not listed above
+    input: 5.0                          # (built-in default; Opus 5 list rate fallback)
+    output: 25.0                        # (built-in default; Opus 5 list rate fallback)
   cache_read_multiplier: 0.10           # (built-in default)
   cache_write_5min_multiplier: 1.25     # (built-in default)
   cache_write_1hr_multiplier: 2.0       # (built-in default)
   data_residency_multiplier: 1.10       # (built-in default)
-  fast_mode_multiplier: 6.0             # (built-in default)
+  fast_mode_multiplier: 2.0             # (built-in default)
   recent_pace_tasks: 10                 # (built-in default)
   display_timezone: America/New_York   # (unset; falls through to OS local)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -72,27 +73,38 @@ class TestGenerateReport:
 
     def test_report_uses_session_start_for_tasks_started_before_since(self, tmp_path: Path) -> None:
         """When a task was set to 'in-progress' before --since but done after, the
-        duration should be measured from session_start, not from the original
+        duration should be measured from the window start, not from the original
         in-progress time. Uses 3 completed tasks so the pace metric clears the
-        MIN_PACE_SAMPLES threshold."""
+        MIN_PACE_SAMPLES threshold.
+
+        Issue #326: every claim-to-done pair stays within 30 minutes of real
+        elapsed time (and of its neighbours) so the whole log is one
+        orchestrator session -- the same-session gate does not drop any of
+        the three samples. T2/T3 use distinct (non-tied) durations so the
+        window-clamped value for T1 lands in the middle of the sorted
+        3-sample set: if the implementation ever regressed to using T1's raw
+        (unclamped) claim-to-done span instead of the window-clamped span,
+        the reported median would shift to 25.0, not the expected 15.0.
+        """
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
                 [
-                    "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:30:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                    "2026-03-05T10:30:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
-                    "2026-03-05T11:30:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
+                    "2026-03-05T09:50:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:15:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T10:45:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
 
         since = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
-        # Three tasks done at 30 min each -> avg 30 min per task in window
-        assert "30.0 min" in report
+        # T1 clamped to the window start: 10:15 - 10:00 = 15 min (not its
+        # real 25-min claim-to-done span). Median of [15, 5, 25] = 15.0.
+        assert "15.0 min" in report
 
     def test_report_keeps_latest_in_progress_timestamp(self, tmp_path: Path) -> None:
         """When a task is set to 'in-progress' multiple times, the latest
@@ -4135,11 +4147,19 @@ class TestPerModelHelpersCoverage:
         """Known model id pulls from REPORT_MODEL_RATES with the cache
         multipliers falling back to the top-level defaults when the
         per-model entry leaves them unset.
+
+        AC-E3-F1-S1-T1-10 (spec FR-3.2 error handling, designed tripwire):
+        this test previously pinned only the retained ``claude-opus-4-7``
+        row. It now also exercises the current default ``claude-opus-5``
+        ($5/$25 list, issue #233) alongside the retained row so the same
+        test that hard-pinned the Opus 4.7-era table catches any future
+        regression on either id.
         """
         from devbench.reporting.report import (
             REPORT_CACHE_READ_MULTIPLIER,
             REPORT_CACHE_WRITE_1HR_MULTIPLIER,
             REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+            REPORT_MODEL_RATES,
             _resolve_rates_for_model,
         )
 
@@ -4150,6 +4170,23 @@ class TestPerModelHelpersCoverage:
         assert c_5m == REPORT_CACHE_WRITE_5MIN_MULTIPLIER
         assert c_1h == REPORT_CACHE_WRITE_1HR_MULTIPLIER
         assert corr == 1.0
+
+        # Opus 5 is the current default lineup entry (issue #233); same
+        # list rate ($5/$25) as the retained Opus 4.7 row above. Assert it
+        # is an explicit REPORT_MODEL_RATES entry (not merely a value that
+        # happens to match the "<unknown>" fallback rate) so this tripwire
+        # actually catches the entry being dropped from the table.
+        assert "claude-opus-5" in REPORT_MODEL_RATES, (
+            "claude-opus-5 must be an explicit REPORT_MODEL_RATES entry, not just "
+            "coincidentally matching the fallback rate (issue #233)."
+        )
+        in_r5, out_r5, c_read5, c_5m5, c_1h5, corr5 = _resolve_rates_for_model("claude-opus-5")
+        assert in_r5 == 5.0
+        assert out_r5 == 25.0
+        assert c_read5 == REPORT_CACHE_READ_MULTIPLIER
+        assert c_5m5 == REPORT_CACHE_WRITE_5MIN_MULTIPLIER
+        assert c_1h5 == REPORT_CACHE_WRITE_1HR_MULTIPLIER
+        assert corr5 == 1.0
 
     def test_resolve_rates_for_model_per_model_cache_overrides_win(self) -> None:
         from devbench.constants import ModelRates
@@ -4336,3 +4373,551 @@ class TestReadLastLogTimestampFailurePaths:
             patch.object(Path, "stat", side_effect=OSError("permission denied")),
         ):
             assert _read_last_log_timestamp(log) is None
+
+
+# --------------------------------------------------------------------------
+# Issue #326: session-gate pace and average into medians, surface excluded
+# completions that have no execution window (a stale ``in-progress`` claim
+# separated from a later ``done`` by an orchestrator-session gap).
+# --------------------------------------------------------------------------
+
+
+class TestSessionSegmentationHelpers:
+    """FR-1: full session segmentation and the same-session validity gate."""
+
+    def test_session_start_boundaries_empty_returns_empty(self) -> None:
+        from devbench.reporting.report import _session_start_boundaries
+
+        assert _session_start_boundaries([]) == []
+
+    def test_session_start_boundaries_single_event_returns_that_event(self) -> None:
+        from devbench.reporting.report import _session_start_boundaries
+
+        t0 = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        assert _session_start_boundaries([t0]) == [t0]
+
+    def test_session_start_boundaries_gap_over_threshold_returns_two_boundaries(self) -> None:
+        from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
+        from devbench.reporting.report import _session_start_boundaries
+
+        t0 = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        t1 = t0 + timedelta(minutes=DEFAULT_SESSION_GAP_MINUTES + 1)
+        assert _session_start_boundaries([t0, t1]) == [t0, t1]
+
+    def test_session_start_boundaries_gap_at_threshold_stays_one_boundary(self) -> None:
+        """A gap exactly equal to the threshold does not open a new session
+        (the rule is strictly-greater-than, matching the pre-#326 walk)."""
+        from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
+        from devbench.reporting.report import _session_start_boundaries
+
+        t0 = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        t1 = t0 + timedelta(minutes=DEFAULT_SESSION_GAP_MINUTES)
+        assert _session_start_boundaries([t0, t1]) == [t0]
+
+    def test_walk_for_session_boundary_returns_last_boundary(self) -> None:
+        """Regression: re-expressed in terms of _session_start_boundaries, but
+        the returned value (the LAST boundary) is byte-identical to the
+        pre-#326 implementation."""
+        from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
+        from devbench.reporting.report import _walk_for_session_boundary
+
+        t0 = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        t1 = t0 + timedelta(minutes=DEFAULT_SESSION_GAP_MINUTES + 1)
+        t2 = t1 + timedelta(minutes=5)
+        assert _walk_for_session_boundary([t0, t1, t2], DEFAULT_SESSION_GAP_MINUTES) == t1
+
+    def test_walk_for_session_boundary_empty_returns_none(self) -> None:
+        from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
+        from devbench.reporting.report import _walk_for_session_boundary
+
+        assert _walk_for_session_boundary([], DEFAULT_SESSION_GAP_MINUTES) is None
+
+    def test_same_session_true_within_segment(self) -> None:
+        from devbench.reporting.report import _same_session
+
+        boundaries = [datetime(2026, 8, 10, 8, 0, tzinfo=UTC), datetime(2026, 8, 10, 12, 0, tzinfo=UTC)]
+        a = datetime(2026, 8, 10, 12, 5, tzinfo=UTC)
+        b = datetime(2026, 8, 10, 12, 45, tzinfo=UTC)
+        assert _same_session(a, b, boundaries) is True
+
+    def test_same_session_false_across_boundary(self) -> None:
+        from devbench.reporting.report import _same_session
+
+        boundaries = [datetime(2026, 8, 10, 8, 0, tzinfo=UTC), datetime(2026, 8, 10, 12, 0, tzinfo=UTC)]
+        a = datetime(2026, 8, 10, 8, 5, tzinfo=UTC)
+        b = datetime(2026, 8, 10, 12, 45, tzinfo=UTC)
+        assert _same_session(a, b, boundaries) is False
+
+    def test_same_session_true_for_any_pair_with_no_boundaries(self) -> None:
+        from devbench.reporting.report import _same_session
+
+        a = datetime(2020, 1, 1, tzinfo=UTC)
+        b = datetime(2030, 1, 1, tzinfo=UTC)
+        assert _same_session(a, b, []) is True
+
+    def test_session_index_for_clamps_timestamp_before_first_boundary(self) -> None:
+        """A timestamp older than every known boundary resolves to index 0
+        (clamped), never raises (raise-free contract, spec Section 4 FR-1)."""
+        from devbench.reporting.report import _session_index_for
+
+        boundaries = [datetime(2026, 8, 10, 8, 0, tzinfo=UTC), datetime(2026, 8, 10, 12, 0, tzinfo=UTC)]
+        before_all = datetime(2020, 1, 1, tzinfo=UTC)
+        assert _session_index_for(before_all, boundaries) == 0
+
+    def test_session_index_for_empty_boundaries_returns_zero(self) -> None:
+        from devbench.reporting.report import _session_index_for
+
+        assert _session_index_for(datetime(2026, 8, 10, 8, 0, tzinfo=UTC), []) == 0
+
+
+def _pace_case_stale_claim() -> tuple[dict[str, datetime], dict[str, datetime], list[datetime]]:
+    """Case (a): an operator ``set-status done`` on a stale claim from an
+    earlier orchestrator session. Three normal same-session samples
+    (20/25/30 min) plus one newest completion whose only claim sits in an
+    earlier session (excluded, no execution window)."""
+    session_starts = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+    base = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+    done: dict[str, datetime] = {}
+    prog: dict[str, datetime] = {}
+    for i, dur in enumerate((20, 25, 30)):
+        tid = f"E0-F1-S1-T{i + 1}"
+        prog[tid] = base + timedelta(hours=i)
+        done[tid] = prog[tid] + timedelta(minutes=dur)
+    poison_tid = "E0-F1-S9-T1"
+    prog[poison_tid] = datetime(2026, 8, 1, 8, 30, tzinfo=UTC)
+    done[poison_tid] = base + timedelta(hours=3, minutes=30)  # newest done, but stale (cross-session) claim
+    return done, prog, session_starts
+
+
+def _pace_case_same_session_outlier() -> tuple[dict[str, datetime], dict[str, datetime], list[datetime]]:
+    """Case (d): three uniform 20-min same-session samples plus one
+    same-session 600-min outlier. The outlier passes the session gate (it is
+    NOT excluded) but must not move the reported value the way it would move
+    an arithmetic mean (Goal 4 robustness)."""
+    base = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+    done: dict[str, datetime] = {}
+    prog: dict[str, datetime] = {}
+    for i, dur in enumerate((20, 20, 20)):
+        tid = f"E0-F1-S1-T{i + 1}"
+        prog[tid] = base + timedelta(hours=i)
+        done[tid] = prog[tid] + timedelta(minutes=dur)
+    outlier_tid = "E0-F1-S9-T1"
+    prog[outlier_tid] = base + timedelta(hours=3)
+    done[outlier_tid] = prog[outlier_tid] + timedelta(minutes=600)
+    return done, prog, []
+
+
+def _pace_case_live_repro_326() -> tuple[dict[str, datetime], dict[str, datetime], list[datetime]]:
+    """Reconstruct the #326 live-repro numbers: nine same-session 39-75 min
+    completions plus the operator-closed E2-F6-S1-T1, claimed 2026-07-29 and
+    closed 2026-08-10 (~17,713 idle minutes across a session gap)."""
+    session_starts = [datetime(2026, 7, 29, 11, 0, tzinfo=UTC), datetime(2026, 8, 10, 5, 0, tzinfo=UTC)]
+    done: dict[str, datetime] = {}
+    prog: dict[str, datetime] = {}
+    cursor = datetime(2026, 8, 10, 6, 0, tzinfo=UTC)
+    for i, dur in enumerate((39, 45, 50, 55, 60, 65, 70, 72, 75)):
+        tid = f"E0-F1-S1-T{i + 1}"
+        prog[tid] = cursor
+        done[tid] = cursor + timedelta(minutes=dur)
+        cursor = done[tid]
+    poison_tid = "E2-F6-S1-T1"
+    prog[poison_tid] = datetime(2026, 7, 29, 11, 19, 28, tzinfo=UTC)
+    done[poison_tid] = datetime(2026, 8, 10, 18, 32, 33, tzinfo=UTC)
+    return done, prog, session_starts
+
+
+def _pace_default_window(
+    done_times: dict[str, datetime], progress_times: dict[str, datetime]
+) -> tuple[datetime, datetime]:
+    """A window wide enough to include every sample without window-clamping any of them."""
+    return (
+        min(progress_times.values()) - timedelta(minutes=1),
+        max(done_times.values()) + timedelta(minutes=1),
+    )
+
+
+_PACE_GATE_CASES = [
+    pytest.param(*_pace_case_stale_claim(), 3, 25.0, 1, id="case_a_stale_claim"),
+    pytest.param(*_pace_case_same_session_outlier(), 4, 20.0, 0, id="case_d_same_session_outlier"),
+    pytest.param(*_pace_case_live_repro_326(), 9, 60.0, 1, id="live_repro_326"),
+]
+
+
+class TestRecentPaceAndWindowStatsSessionGate:
+    """FR-2 + FR-3: both the log-wide and per-window estimators gate on the
+    same-session rule and report a median instead of a poisoned mean."""
+
+    @pytest.mark.parametrize(
+        ("done_times", "progress_times", "session_starts", "n", "expected_median", "expected_excluded"),
+        _PACE_GATE_CASES,
+    )
+    def test_recent_pace_minutes_returns_median_and_excluded_count(
+        self,
+        done_times: dict[str, datetime],
+        progress_times: dict[str, datetime],
+        session_starts: list[datetime],
+        n: int,
+        expected_median: float,
+        expected_excluded: int,
+    ) -> None:
+        from devbench.reporting.report import _recent_pace_minutes
+
+        median, excluded = _recent_pace_minutes(done_times, progress_times, session_starts, n)
+        assert median == pytest.approx(expected_median)
+        assert excluded == expected_excluded
+
+    @pytest.mark.parametrize(
+        ("done_times", "progress_times", "session_starts", "n", "expected_median", "expected_excluded"),
+        _PACE_GATE_CASES,
+    )
+    def test_compute_window_stats_returns_median_and_excluded_count(
+        self,
+        done_times: dict[str, datetime],
+        progress_times: dict[str, datetime],
+        session_starts: list[datetime],
+        n: int,
+        expected_median: float,
+        expected_excluded: int,
+        tmp_path: Path,
+    ) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        del n  # _compute_window_stats scores every task in-window, not the most-recent N.
+        window_start, window_end = _pace_default_window(done_times, progress_times)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+        stats = _compute_window_stats(
+            log_path,
+            window_start,
+            window_end,
+            done_times,
+            progress_times,
+            tasks_active=0,
+            session_starts=session_starts,
+        )
+        assert stats.avg_minutes == pytest.approx(expected_median)
+        assert stats.pace_excluded_count == expected_excluded
+        assert stats.pace_sample_count == len(done_times) - expected_excluded
+
+
+class TestCaseDMedianRobustness:
+    """AC-12: with N-1 normal samples plus one same-session outlier, the
+    reported value is the median (unmoved by the outlier) while the
+    arithmetic mean of the same data diverges -- proof this assertion fails
+    against the pre-#326 mean-only code."""
+
+    def test_recent_pace_median_unmoved_by_outlier_while_mean_diverges(self) -> None:
+        from devbench.reporting.report import _recent_pace_minutes
+
+        done, prog, session_starts = _pace_case_same_session_outlier()
+        median, excluded = _recent_pace_minutes(done, prog, session_starts, n=4)
+        raw_durations = [(done[tid] - prog[tid]).total_seconds() / 60 for tid in done]
+        assert excluded == 0
+        assert median == pytest.approx(statistics.median(raw_durations))
+        assert median != pytest.approx(statistics.mean(raw_durations))
+
+    def test_compute_window_stats_median_unmoved_by_outlier_while_mean_diverges(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        done, prog, session_starts = _pace_case_same_session_outlier()
+        window_start, window_end = _pace_default_window(done, prog)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+        stats = _compute_window_stats(
+            log_path, window_start, window_end, done, prog, tasks_active=0, session_starts=session_starts
+        )
+        raw_durations = [(done[tid] - prog[tid]).total_seconds() / 60 for tid in done]
+        assert stats.pace_excluded_count == 0
+        assert stats.avg_minutes == pytest.approx(statistics.median(raw_durations))
+        assert stats.avg_minutes != pytest.approx(statistics.mean(raw_durations))
+
+
+class TestRecentPaceReclaimAcrossRestart:
+    """Case (b): the LAST (post-restart) claim is same-session as done ->
+    accepted, and it does not count toward ``excluded``."""
+
+    def test_reclaimed_task_uses_last_claim_and_is_not_excluded(self) -> None:
+        from devbench.reporting.report import _recent_pace_minutes
+
+        session_starts = [datetime(2026, 8, 10, 8, 0, tzinfo=UTC), datetime(2026, 8, 10, 12, 0, tzinfo=UTC)]
+        tid = "E0-F1-S1-T1"
+        # progress_times holds only the LAST (post-restart) claim -- the
+        # report never sees an earlier pre-restart claim (upstream MAX(ts)
+        # semantics collapse a task to a single in-progress timestamp).
+        prog = {tid: datetime(2026, 8, 10, 12, 5, tzinfo=UTC)}
+        done = {tid: datetime(2026, 8, 10, 12, 45, tzinfo=UTC)}
+
+        median, excluded = _recent_pace_minutes(done, prog, session_starts, n=1)
+        assert median == pytest.approx(40.0)
+        assert excluded == 0
+
+
+class TestUniformSamplesByteIdentical:
+    """Case (c): N uniform same-session executions render the pre-#326
+    number with no suffix and ``excluded == 0`` (median == mean when every
+    sample is identical)."""
+
+    def test_uniform_samples_render_without_suffix(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats, _stats_to_value_list
+
+        base = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        done: dict[str, datetime] = {}
+        prog: dict[str, datetime] = {}
+        for i in range(10):
+            tid = f"E0-F1-S1-T{i + 1}"
+            prog[tid] = base + timedelta(hours=i)
+            done[tid] = prog[tid] + timedelta(minutes=40)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+        stats = _compute_window_stats(
+            log_path,
+            base,
+            base + timedelta(hours=11),
+            done,
+            prog,
+            tasks_active=0,
+        )
+        assert stats.avg_minutes == pytest.approx(40.0)
+        assert stats.pace_excluded_count == 0
+        values = _stats_to_value_list(stats)
+        assert "40.0 min" in values
+        assert "excluded" not in " ".join(values)
+
+
+class TestNoExecutionWindowSuffix:
+    """FR-4: the exclusion count renders as a suffix on both value cells."""
+
+    @pytest.mark.parametrize(
+        ("excluded", "expected"),
+        [
+            (0, ""),
+            (1, " (1 excluded: no execution window)"),
+            (2, " (2 excluded: no execution window)"),
+        ],
+    )
+    def test_suffix_text(self, excluded: int, expected: str) -> None:
+        from devbench.reporting.report import _no_execution_window_suffix
+
+        assert _no_execution_window_suffix(excluded) == expected
+
+    @staticmethod
+    def _make_stats(
+        avg_minutes: float,
+        pace_sample_count: int,
+        pace_excluded_count: int,
+        recent_pace_minutes: float | None,
+        recent_pace_excluded_count: int,
+    ) -> WindowStats:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        return WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=4,
+            avg_minutes=avg_minutes,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            pace_sample_count=pace_sample_count,
+            pace_excluded_count=pace_excluded_count,
+            recent_pace_minutes=recent_pace_minutes,
+            recent_pace_excluded_count=recent_pace_excluded_count,
+        )
+
+    def test_avg_minutes_cell_carries_exclusion_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 3, 1, None, 0)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min (1 excluded: no execution window)" in values
+
+    def test_avg_minutes_cell_has_no_suffix_when_nothing_excluded(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 3, 0, None, 0)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min" in values
+        assert "excluded" not in " ".join(values)
+
+    def test_recent_pace_cell_carries_exclusion_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 3, 0, 47.0, 1)
+        values = _stats_to_value_list(stats)
+        assert "47.0 min (1 excluded: no execution window)" in values
+
+    def test_recent_pace_cell_na_carries_exclusion_suffix(self) -> None:
+        """AC-7: the recent-pace cell renders 'n/a' *plus* the same suffix
+        when samples were dropped but fewer than N valid ones remain."""
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 3, 0, None, 2)
+        values = _stats_to_value_list(stats)
+        assert "n/a (2 excluded: no execution window)" in values
+
+    def test_recent_pace_spanning_collapse_preserved_with_suffix(self) -> None:
+        """AC-8: the log-wide recent-pace value (suffix included) is
+        identical across window columns and still collapses via
+        _merge_spanning_values."""
+        from devbench.config import RECENT_PACE_TASKS
+        from devbench.reporting.report import _merge_spanning_values, _stats_to_value_list
+
+        stats_a = self._make_stats(20.0, 3, 0, 47.0, 1)
+        stats_b = self._make_stats(55.0, 5, 2, 47.0, 1)
+        values_a = _stats_to_value_list(stats_a)
+        values_b = _stats_to_value_list(stats_b)
+        recent_pace_index = 3  # "Recent pace" is the 4th value; see _stats_to_value_list order.
+        merged = _merge_spanning_values(
+            f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
+            [values_a[recent_pace_index], values_b[recent_pace_index]],
+        )
+        assert merged == "47.0 min (1 excluded: no execution window)"
+
+
+class TestWindowStatsExclusionFieldsDefault:
+    """AC-6: the two new fields default to 0 and every existing direct
+    ``WindowStats(...)`` construction (owned and non-owned) keeps working."""
+
+    def test_new_fields_default_to_zero_and_existing_construction_still_works(self) -> None:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        stats = WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+        )
+        assert stats.pace_excluded_count == 0
+        assert stats.recent_pace_excluded_count == 0
+
+
+class TestSummaryLineExclusionSuffix:
+    """FR-6: the trailing projection names dropped completions on the
+    chosen pace path; the zero-drop sentence stays byte-identical."""
+
+    @staticmethod
+    def _make_stats(
+        avg_minutes: float,
+        pace_excluded_count: int,
+        recent_pace_minutes: float | None,
+        recent_pace_excluded_count: int,
+        est_hours: float,
+    ) -> WindowStats:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        return WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=9,
+            avg_minutes=avg_minutes,
+            est_hours=est_hours,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            pace_sample_count=9,
+            pace_excluded_count=pace_excluded_count,
+            recent_pace_minutes=recent_pace_minutes,
+            recent_pace_excluded_count=recent_pace_excluded_count,
+        )
+
+    def test_recent_path_appends_suffix_when_excluded(self) -> None:
+        from devbench.reporting.report import _summary_line
+
+        stats = self._make_stats(33.4, 0, 47.0, 1, 5.5)
+        line = _summary_line(stats, tasks_active=7, tasks_blocked=0)
+        assert line == (
+            "At the Recent pace of ~47.0 minutes per task (1 excluded: no execution window), "
+            "the remaining 7 active task(s) should take roughly 5.5 more hours of continuous execution."
+        )
+
+    def test_recent_path_byte_identical_when_nothing_excluded(self) -> None:
+        from devbench.reporting.report import _summary_line
+
+        stats = self._make_stats(33.4, 0, 47.0, 0, 5.5)
+        line = _summary_line(stats, tasks_active=7, tasks_blocked=0)
+        assert line == (
+            "At the Recent pace of ~47.0 minutes per task, "
+            "the remaining 7 active task(s) should take roughly 5.5 more hours of continuous execution."
+        )
+
+    def test_all_time_path_appends_suffix_when_excluded(self) -> None:
+        from devbench.reporting.report import _summary_line
+
+        stats = self._make_stats(25.0, 1, None, 0, 0.83)
+        line = _summary_line(stats, tasks_active=2, tasks_blocked=0)
+        assert "At the All-time pace of ~25.0 minutes per task (1 excluded: no execution window)" in line
+
+    def test_all_time_path_byte_identical_when_nothing_excluded(self) -> None:
+        from devbench.reporting.report import _summary_line
+
+        stats = self._make_stats(25.0, 0, None, 0, 0.83)
+        line = _summary_line(stats, tasks_active=2, tasks_blocked=0)
+        assert "At the All-time pace of ~25.0 minutes per task, " in line
+        assert "excluded" not in line
+
+
+class TestGenerateReportThreadsSessionStarts:
+    """FR-5: generate_report computes session_starts once and threads it
+    into every _compute_window_stats call site so an operator-closed stale
+    claim (the #326 shape) is excluded end-to-end, and the ETA no longer
+    multiplies a poisoned rate.
+
+    Issue #326's own repro numbers (39-75 min per task) are exercised
+    directly against ``_recent_pace_minutes`` / ``_compute_window_stats`` in
+    ``TestRecentPaceAndWindowStatsSessionGate`` with a hand-built
+    ``session_starts`` list. Here, the boundaries must come from the FULL
+    log timestamp walk ``generate_report`` performs (FR-5), so every normal
+    task's own claim-to-done span is kept under
+    ``DEFAULT_SESSION_GAP_MINUTES`` and the tasks run back-to-back --
+    otherwise the gap-walk itself would (correctly) treat the idle time
+    between two ordinary tasks as a session boundary, which is a
+    log-topology artifact of this synthetic log, not part of what FR-5 is
+    proving here.
+    """
+
+    def test_stale_claim_operator_close_does_not_poison_report(self, tmp_path: Path) -> None:
+        from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
+
+        log_file = tmp_path / "test.log"
+        entries = ["2026-07-29T11:19:28Z [judges.cli] INFO Set E2-F6-S1-T1 to 'in-progress'"]
+        cursor = datetime(2026, 8, 10, 6, 0, 0, tzinfo=UTC)
+        durations = (18, 19, 20, 21, 22, 23, 24, 25, 26)
+        assert all(d < DEFAULT_SESSION_GAP_MINUTES for d in durations)
+        for i, dur in enumerate(durations):
+            tid = f"E0-F1-S1-T{i + 1}"
+            start = cursor
+            end = cursor + timedelta(minutes=dur)
+            entries.append(f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z [judges.cli] INFO Set {tid} to 'in-progress'")
+            entries.append(f"{end.strftime('%Y-%m-%dT%H:%M:%S')}Z [judges.cli] INFO Set {tid} to 'done'")
+            cursor = end
+        entries.append("2026-08-10T18:32:33Z [judges.cli] INFO Set E2-F6-S1-T1 to 'done'")
+        log_file.write_text(_make_log(entries))
+
+        report = generate_report(log_path=log_file)
+
+        # The poisoned pair (12+ idle days across a session gap) must not
+        # reach the pre-#326 mean-poisoned numbers from the live repro.
+        assert "1789.9 min" not in report
+        assert "443.1 min" not in report
+        assert "208.8 h" not in report
+        # The correct median of the nine same-session samples (22.0 min) and
+        # the exclusion count must appear.
+        assert "22.0 min" in report
+        assert "(1 excluded: no execution window)" in report

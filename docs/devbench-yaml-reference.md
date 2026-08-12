@@ -183,6 +183,14 @@ stop_hook:
   stale_task_minutes: 120
 ```
 
+**`DEVBENCH_STOP_HOOK_STATE_DIR`** (env var only, default `/tmp`) -- the
+directory `continue-orchestration.sh` uses for its Stop-hook state file.
+`/tmp` is shared machine-wide, so a test suite running alongside a live
+orchestrator on the same host can collide on that file; set this env var to a
+private directory in the test environment to isolate the two. Leaving it
+unset preserves the previous `/tmp` behaviour exactly -- this is an optional
+knob, not a required migration step.
+
 ---
 
 ## `hook_tail:` -- column caps for `devbench hook-tail`
@@ -210,9 +218,13 @@ orchestrate:
 
 ```yaml
 report:
-  token_cost_per_million_input: 5.0
-  token_cost_per_million_output: 25.0
-  token_cost_discount: 0.0
+  models:
+    claude-opus-5:
+      input: 5.0
+      output: 25.0
+  default_model:
+    input: 5.0
+    output: 25.0
   cache_read_multiplier: 0.10
   cache_write_5min_multiplier: 1.25
   cache_write_1hr_multiplier: 2.0
@@ -222,7 +234,10 @@ report:
   # display_timezone: America/New_York
 ```
 
-See [docs/model-pricing.md](model-pricing.md) for per-model pricing blocks and the cost formula.
+The legacy scalar fields `token_cost_per_million_input`, `token_cost_per_million_output`, and
+`token_cost_discount` were retired in issue #223; workspaces that still set them fail-fast at
+config-load time. See [docs/model-pricing.md](model-pricing.md) for the full per-model pricing
+table, the cost formula, and migration guidance.
 
 ---
 
@@ -238,12 +253,12 @@ manifest_amendment:
 
 ---
 
-## `task_factory:` -- opt-in task-factory loop
+## `task_factory:` -- task-factory loop (on by default, ADR-32)
 
 ```yaml
 task_factory:
-  enabled: false                   # opt-in; requires manifest_amendment.enabled: true
-  auto_accept_proposals: true      # default; only applies when enabled: true
+  enabled: true                    # default; set false to opt out; requires manifest_amendment.enabled: true
+  auto_accept_proposals: false     # default; governs two auto-promote paths (write-proposal's synchronous materialise+promote cascade, and sweep-proposals' orphan-`proposed`-draft promote); new drafts always use backlog.default_status_for_new_work_units regardless; only applies when enabled: true
 ```
 
 ---
@@ -276,6 +291,69 @@ agents:
 
 All fields default to `null` (agent's `.md` frontmatter default). See
 [docs/adr/25-per-agent-model-overrides.md](adr/25-per-agent-model-overrides.md).
+
+---
+
+## `quota_handling:` -- quota wait-and-resume configuration (issue #236, spec S5.2)
+
+**Status: parsed, validated, and live.** This block is parsed, schema-checked and
+range-checked at config-load time, `RuntimeConfig.quota_handling` is populated exactly as
+documented below, and `cmd_start` reads `enabled` / `on_exhaustion` / `on_exhaustion_timeout` /
+`resume_strategy` / `audit_comment_on_wait` / `audit_comment_on_resume` at runtime via
+`_drive_orchestrate_with_quota_resume` -> `_dispatch_quota_detection` -> `_handle_quota_pause`
+(`src/devbench/cli.py`; landed by E2-F4-S3-T1) -- see the per-field table below for exactly
+when each is read. `log_structured_events` is read too: `_quota_structured_events_enabled()`
+gates every one of the seven structured `[QUOTA_*]` markers on it (`src/devbench/cli.py`,
+`src/devbench/quota.py`; landed by E9-F1-S2-T1) -- see its table row. `enabled: true`
+(the default) makes the orchestrator pause and poll for reset instead of exiting non-zero;
+`enabled: false` restores the legacy non-zero exit.
+
+This block governs what the orchestrator does when the Claude CLI reports a quota-exhaustion
+signal (HTTP 429 / CLI "You've hit your limit" message). The whole block is optional; omitting
+it entirely yields the full default set below -- never a partial or `None` config object.
+
+```yaml
+quota_handling:
+  enabled: true
+  on_exhaustion: wait
+  poll_interval_seconds: 60
+  max_wait_seconds: 18000
+  on_exhaustion_timeout: drain
+  resume_strategy: continue_current_wu
+  audit_comment_on_wait: true
+  audit_comment_on_resume: true
+  log_structured_events: true
+```
+
+| Field | Type | Accepted values / range | Default | What it controls |
+|---|---|---|---|---|
+| `enabled` | boolean | `true`, `false` | `true` | Master toggle. `false` restores the legacy non-zero exit on quota exhaustion (`#193` AC-4, spec AC-24) -- the escape hatch for operators who prefer the pre-#236 behaviour. |
+| `on_exhaustion` | string (enum) | `wait`, `fail`, `drain` | `wait` | Action taken when a quota signal is detected. `wait` pauses and polls until reset; `fail` re-raises immediately (non-zero exit, same as `enabled: false`); `drain` triggers a graceful drain then exits. |
+| `poll_interval_seconds` | integer | `[30, 3600]` | `60` | Cadence in seconds between recovery probes while waiting. |
+| `max_wait_seconds` | integer | `>= 1` | `18000` (5 hours) | Cap on total wait time in seconds before `on_exhaustion_timeout` fires. |
+| `on_exhaustion_timeout` | string (enum) | `drain`, `fail`, `keep_waiting` | `drain` | Action taken when `max_wait_seconds` elapses without recovery. `drain` triggers a graceful drain; `fail` re-raises the quota error; `keep_waiting` is terminal -- it logs `[QUOTA_TIMEOUT_KEEP_WAITING]` and ends the run (no drain request, no re-raise; see `_dispatch_quota_timeout` in `src/devbench/cli.py`). |
+| `resume_strategy` | string (enum) | `continue_current_wu`, `restart_wu`, `drain_and_resume` | `continue_current_wu` | How the orchestrator re-enters the loop after recovery. `continue_current_wu` resumes where it left off; `restart_wu` forces the current work unit back to `in-queue`; `drain_and_resume` removes the quota checkpoint and requests a graceful drain -- the run stops and must be restarted manually, since the Makefile auto-restart loop (`Makefile:117-123`) only fires on exit code 42, which a graceful drain does not produce. |
+| `audit_comment_on_wait` | boolean | `true`, `false` | `true` | Append a `[QUOTA_WAITING]` audit comment to the in-progress work unit when pausing. |
+| `audit_comment_on_resume` | boolean | `true`, `false` | `true` | Append a `[QUOTA_RESUMED]` audit comment after recovery. |
+| `log_structured_events` | boolean | `true`, `false` | `true` | Gates the seven structured `[QUOTA_*]` markers (`[QUOTA_WAITING]`, `[QUOTA_POLLING]`, `[QUOTA_RESUMED]`, `[QUOTA_PROBE_UNAVAILABLE]`, `[QUOTA_FAIL_FAST]`, `[QUOTA_DRAIN_REQUESTED]`, `[QUOTA_TIMEOUT_KEEP_WAITING]`); `false` suppresses all seven. Does not affect Slack notifications, the `audit_comment_on_wait`/`audit_comment_on_resume` comments, the on-disk checkpoint, or the `[ORCHESTRATOR_QUOTA_*]` markers -- see docs/quota-handling.md for the full breakdown. |
+
+**Enum and range enforcement happens at config-load time, never at dispatch time** (spec FR-2.9):
+an invalid `on_exhaustion` / `on_exhaustion_timeout` / `resume_strategy` value, or a
+`poll_interval_seconds` / `max_wait_seconds` value outside its documented range, raises a
+`ValueError` naming the config file path and the offending field before the orchestrator starts.
+Unknown keys inside the block are rejected the same way (`additionalProperties: false`).
+
+**What `enabled: false` restores.** The quota core (E2-F1), this config surface, and the
+E2-F4 dispatcher that acts on it are all live: `quota_handling.enabled: false` is the
+config-level equivalent of the pre-#236 behaviour -- the orchestrator propagates the quota
+error and exits non-zero instead of pausing and polling. `enabled: true` (the default) makes
+the orchestrator pause and poll for reset instead.
+
+**The `notifications.events` keys `quota_waiting` and `quota_resumed` are live.** They are
+declared in the `notifications.events` schema block below (single ownership of
+`config-schema.json` avoids two tasks writing the same file) and are read on every
+quota-exhaustion pause/recovery by `_handle_quota_pause` (`src/devbench/cli.py`); see
+[`docs/slack-notifications.md`](slack-notifications.md) for the payload shape.
 
 ---
 
@@ -312,6 +390,8 @@ notifications:
                                          # manual merge.  Default false on upgrade.
     orchestrator_stop: false
     orchestrator_auto_restart: false
+    quota_waiting: false                 # orchestrator hit a quota and started waiting; see `quota_handling:` above.
+    quota_resumed: false                 # quota recovered and the run resumed; see `quota_handling:` above.
 ```
 
 ---

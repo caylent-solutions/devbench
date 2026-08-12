@@ -67,28 +67,21 @@ class TestOrchestratePluginSelfContained:
         assert each one's .md file exists under agents/.
         """
         skill_text = (ORCHESTRATE_PLUGIN_ROOT / "skills" / "orchestrate" / "SKILL.md").read_text(encoding="utf-8")
-        # Match every Skill("devbench-orchestrate:<agent>", ...) invocation.
+        # Match every devbench-orchestrate:<agent> invocation. Post-flatten
+        # (ADR-33) the four review_team judges are invoked directly with a
+        # colon-namespaced subdirectory form (devbench-orchestrate:review_team:
+        # code-reviewer), so the character class includes ':' alongside the
+        # kebab/underscore charset every other agent invocation already uses.
         invocations = set(re.findall(r"devbench-orchestrate:([a-z][a-z_:-]+)", skill_text))
-        # Map review-team underscored shortnames to their actual file
-        # locations (review_team subdir + hyphenated filename).
-        review_team_map = {
-            "code_review": "review_team/code-reviewer.md",
-            "review_team:code-reviewer": "review_team/code-reviewer.md",
-            "review_team:test-reviewer": "review_team/test-reviewer.md",
-            "review_team:doc-reviewer": "review_team/doc-reviewer.md",
-            "review_team:changes-manifest": "review_team/changes-manifest.md",
-            "test_review": "review_team/test-reviewer.md",
-            "doc_review": "review_team/doc-reviewer.md",
-            "changes_manifest": "review_team/changes-manifest.md",
-        }
         for invocation in invocations:
             if invocation == "orchestrate":
                 continue  # the skill itself, not an agent
-            if invocation in review_team_map:
-                agent_path = ORCHESTRATE_PLUGIN_ROOT / "agents" / review_team_map[invocation]
-            else:
-                # Direct mapping: kebab-case agent name -> agents/<name>.md
-                agent_path = ORCHESTRATE_PLUGIN_ROOT / "agents" / f"{invocation}.md"
+            # Generic path derivation: a colon in the captured invocation
+            # marks a subdirectory boundary (review_team:code-reviewer ->
+            # review_team/code-reviewer.md). Agents with no colon resolve
+            # directly to agents/<name>.md. No hardcoded lookup table --
+            # any future subdirectory-namespaced agent resolves the same way.
+            agent_path = ORCHESTRATE_PLUGIN_ROOT / "agents" / f"{invocation.replace(':', '/')}.md"
             assert agent_path.is_file(), (
                 f"orchestrate plugin must contain agent file for invocation {invocation!r} at {agent_path}"
             )

@@ -38,7 +38,7 @@ The guard and the amendment workflow together preserve `AC-FINAL-015` (the manif
 
 ### What judges run on every task?
 
-Four review-team judges are dispatched directly by the orchestrate skill as first-level sub-agents, in parallel, after the executor stages its files: `code_review`, `test_review`, `doc_review`, and `changes_manifest`. If they all pass, `security_review` runs sequentially. The `manifest-amender` judge runs conditionally before `review-supervisor` when an amendment request file is pending; if the backlog has not opted in, it is never invoked. The done-gate (`mark-done`) requires the four review judges plus security to have all passed in the most recent round.
+Four review-team judges are invoked directly by the orchestrate skill as first-level sub-agents after the executor stages its files: `code_review`, `test_review`, `doc_review`, and `changes_manifest` (ADR-33). Each judge self-logs its own verdict, and `review-supervisor` then aggregates the four persisted verdicts -- it does not invoke or spawn the judges itself. If they all pass, `security_review` runs sequentially. The `manifest-amender` judge runs conditionally before the review-team judges when an amendment request file is pending; if the backlog has not opted in, it is never invoked. The done-gate (`mark-done`) requires the four review judges plus security to have all passed in the most recent round.
 
 ### Why does my task keep failing with the same judge finding?
 
@@ -89,7 +89,7 @@ Three possible causes:
 
 1. **The amender never executed `reject-amendment`.** The old prompt treated the CLI block as reference; the current prompt requires the amender to run it AND verify the archive file exists before logging the verdict. If you see a rejection comment on the work unit but no file at `<workspace>/.devbench/rejected-requests/<id>-*.json`, the amender hit this pre-tightening bug. Manually recreate the archive from the rejection comment's content, then re-run `devbench:blocker-resolver` for that task.
 2. **The blocker-resolver classified the issue as `escalated` instead of `proposed`.** Step 4c in the orchestrate SKILL now branches on `.devbench/proposals/<id>.json` FILE EXISTENCE (not the verdict word), and the blocker-resolver prompt mandates emitting a proposal JSON whenever a rejected-requests archive exists. If the proposal file is missing, task-factory doesn't fire -- by design. Check whether an archive existed when the resolver ran.
-3. **`task_factory.enabled` is false.** The whole loop is opt-in. Confirm `backlog/config/devbench.yaml` has `task_factory.enabled: true` AND `manifest_amendment.enabled: true`.
+3. **`task_factory.enabled` was explicitly set to `false`.** The loop is on by default (ADR-32); if it isn't firing, check whether `backlog/config/devbench.yaml` explicitly opted out with `task_factory.enabled: false`, or explicitly disabled the prerequisite with `manifest_amendment.enabled: false`.
 
 ### Why did the orchestrator halt instead of continuing?
 

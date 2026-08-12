@@ -169,7 +169,7 @@ Validate each provided value is a positive integer.
 
 ## Step 6 -- agents section: judge_model and executor_model overrides
 
-The `agents:` section (mapped to `agent_models` in `RuntimeConfig`) lets operators pin each devbench agent to a specific model. When `use_bedrock: true`, values must be Bedrock ARNs; otherwise use short names (`opus`, `sonnet`, `haiku`) or full Anthropic API IDs (e.g. `claude-opus-4-7`).
+The `agents:` section (mapped to `agent_models` in `RuntimeConfig`) lets operators pin each devbench agent to a specific model. When `use_bedrock: true`, values must be Bedrock model ids of the form `us.anthropic.claude-<name>-<ver>-v<N>`; otherwise use short names (`opus`, `sonnet`, `fable`) or full Anthropic API IDs (e.g. `claude-opus-5`).
 
 Ask the operator:
 
@@ -180,7 +180,7 @@ Ask the operator:
 >   manifest_amender   -- Reviews amendment requests [frontmatter default: opus]
 >   security_reviewer  -- Security audit [frontmatter default: opus]
 >   task_factory       -- Materialises proposed tasks [frontmatter default: opus]
->   review_supervisor  -- Fan-out coordinator for review team [frontmatter default: sonnet]
+>   review_supervisor  -- Aggregates already-persisted review_team verdicts (post-flatten, ADR-33; does not spawn) [frontmatter default: sonnet]
 >
 > Per-judge model overrides (review_team):
 >   review_team.code_reviewer   [frontmatter default: opus]
@@ -188,9 +188,9 @@ Ask the operator:
 >   review_team.doc_reviewer    [frontmatter default: opus]
 >   review_team.changes_manifest [frontmatter default: opus]"
 
-After collecting values, validate the executor_model and judge_model choices against the resolved `use_bedrock` flag. If `use_bedrock: true`, Bedrock ARN format is required (`arn:aws:bedrock:...`). Reject mismatches with:
+After collecting values, validate the executor_model and judge_model choices against the resolved `use_bedrock` flag. If `use_bedrock: true`, the Bedrock model id format `us.anthropic.claude-<name>-<ver>-v<N>` is required (e.g. `us.anthropic.claude-opus-4-7-v1`). Reject mismatches with:
 
-> "[INVALID] When use_bedrock is true, model values must be Bedrock ARNs (arn:aws:bedrock:...). Re-enter."
+> "[INVALID] When use_bedrock is true, model values must be Bedrock model ids of the form us.anthropic.claude-<name>-<ver>-v<N> (e.g. us.anthropic.claude-opus-4-7-v1). Re-enter."
 
 ---
 
@@ -236,13 +236,20 @@ Validate incompatible combinations:
 
 Ask the operator:
 
-> "Section: task_factory
+> "Section: task_factory (on by default, ADR-32)
 >
 >   enabled               -- Run the blocker-resolver + task-factory loop after amendment rejects.
->                            Requires manifest_amendment.enabled: true. [true/false, default: false]
->   auto_accept_proposals -- Auto-promote task-factory drafts to in-queue without operator review.
->                            [true/false, default: true]; set false for the 'proposed' draft review step.
->                            Only takes effect when enabled: true."
+>                            Requires manifest_amendment.enabled: true. [true/false, default: true]
+>   auto_accept_proposals -- Two auto-promote paths. (1) write-proposal: synchronously
+>                            materialises (and promotes any legacy 'proposed'-status draft)
+>                            in the same call, instead of waiting for the next sweep-proposals
+>                            tick. (2) sweep-proposals: also auto-promotes any orphaned draft
+>                            explicitly left at status 'proposed' (legacy/hand-edited drafts
+>                            only -- freshly materialised drafts always use
+>                            backlog.default_status_for_new_work_units, default 'in-queue',
+>                            regardless of this flag). [true/false, default: false]; false
+>                            defers both to an explicit promote-proposal/reject-proposal
+>                            decision. Only takes effect when enabled: true."
 
 ---
 
@@ -387,9 +394,58 @@ Validate `slack.webhook_url` (when present) starts with `https://`. Validate eve
 
 ---
 
-## Step 16 -- Final validation and write
+## Step 16 -- report section
 
-Assemble the complete YAML from all collected sections. Run the full validation round-trip:
+The `report:` section controls per-model token pricing for `devbench report`'s cost estimation and pace projections (issue #260, spec FR-3.6, S5.3). Every rate carries a source URL and capture-date citation in `sample-config.yaml` (ref); this step copies those cited values verbatim and never guesses a new rate.
+
+Ask the operator:
+
+> "Section: report (cost-estimation pricing; leave blank to keep every shipped default)
+>
+> report.models -- per-model token pricing table (USD per 1M tokens). Each key is a Claude
+>   model id (the literal message.model value Claude Code records on every assistant message
+>   envelope, e.g. claude-opus-4-7). The full current lineup and its source-plus-capture-date
+>   citation live in sample-config.yaml's report.models block; copy that block verbatim into
+>   the assembled config unless the operator wants to override a specific model's rate.
+>
+> default_model -- fallback rate applied to any transcript message whose model field is
+>   missing OR not present in report.models above. [default: Opus 5 list rate,
+>   input: 5.0, output: 25.0]
+>
+> Cost multipliers (Anthropic's published cache / fast-mode / data-residency pricing):
+>   cache_read_multiplier         -- cache-read token discount off the base input rate
+>                                     [default: 0.10]
+>   cache_write_5min_multiplier   -- 5-minute prompt-cache write premium [default: 1.25]
+>   cache_write_1hr_multiplier    -- 1-hour prompt-cache write premium [default: 2.0]
+>   data_residency_multiplier     -- applied when usage.inference_geo is set (US-only
+>                                     inference) [default: 1.10]
+>   fast_mode_multiplier          -- Opus 5 / Opus 4.8 fast-mode premium [default: 2.0]
+>   recent_pace_tasks             -- number of most-recently completed tasks averaged for
+>                                     the 'Recent pace' cost projection [default: 10]
+>
+> Optional per-model override fields (set only when one model's actual invoice drifts from
+> its list rate): cache_read_multiplier, cache_write_5min_multiplier,
+> cache_write_1hr_multiplier, correction_factor. Use `devbench cost-calibrate <actual-usd>`
+> to compute and write correction_factor instead of hand-editing this file."
+
+Validate each provided `report.models.<id>` entry requires both `input` and `output` as positive numbers (USD per 1M tokens). Validate every multiplier field is a positive number. Reject with:
+
+> "[INVALID] report.models.<id> requires both 'input' and 'output' as positive numbers (USD per 1M tokens). Re-enter."
+
+---
+
+## Step 17 -- Final validation and write
+
+Assemble the complete YAML from all collected sections. In addition to the operator-supplied sections above, the assembled YAML must also emit every remaining FR-3.6 tuning section at its resolved built-in default, so a freshly configured workspace is self-documenting (issue #260, spec FR-3.6, AC-40, Journey J-7): `timeouts`, `limits`, `stop_hook`, `hook_tail`, `orchestrate`, `report` (including `models`, `default_model`, and every multiplier field), `backlog`, `validate`, `skills`, `max_executor_retries`, `max_executor_retries_per_judge`, and `log_file`. An operator who later wants to tune a knob sees it in the file with its default value and annotated comment already present, instead of discovering the knob only by reading `config_loader.py`.
+
+Source every emitted default value and its comment from `sample-config.yaml` (ref) -- copy the value and comment verbatim; never restate a number by hand from memory. Written values must equal built-in defaults exactly; any drift between an emitted value and the corresponding built-in default in `src/devbench/constants.py` / `config_loader.py` is a defect (FR-3.6 error handling).
+
+Trim the following inert blocks from the emission even though they are technically part of the full-default surface:
+- `bedrock_region` -- trim when `use_bedrock` is `false` (the field has no effect while Bedrock routing is off).
+- `agents:` entries -- trim any entry whose value equals that agent's frontmatter default; keep only entries the operator actually overrode away from frontmatter.
+- Disabled sub-block trim: trim any sub-block whose own `enabled` toggle (or equivalent master switch) resolves to `false` -- for example `git_ops.pr_review_resolution` when `pr_review_resolution.enabled: false`, and `notifications` entirely when `notifications.enabled: false`. A sub-block that defaults to enabled (e.g. `quota_handling`) is NOT trimmed by this rule.
+
+Run the full validation round-trip:
 
 ```bash
 python -c "
@@ -413,7 +469,108 @@ except Exception as e:
 
 If the validation exits non-zero, identify the section responsible, show the error message verbatim, and return the operator to the relevant step.
 
-On `VALID`, write the assembled config to `backlog/config/devbench.yaml`:
+**Round-trip equivalence check** (FR-3.6 error handling, spec AC-44, Journey J-7). `load_runtime_config` only parses literal YAML; it leaves an absent field as `None` on the raw `RuntimeConfig` dataclass and does NOT apply the env-var-over-YAML-over-built-in-default resolution chain -- that resolution happens downstream, in `src/devbench/config.py`'s module-level constants (e.g. `REPORT_FAST_MODE_MULTIPLIER`, `STOP_HOOK_MAX_BLOCKS`, `MAX_RETRY_ATTEMPTS`). Comparing two raw `RuntimeConfig` objects with `!=` therefore ALWAYS reports a spurious difference between an explicit full-default config and a minimal one, even when both resolve to identical runtime behavior -- do not use that comparison. Instead, spawn one subprocess per candidate config with `DEVBENCH_CONFIG_PATH` pointed at that config's temp file so `devbench.config` is imported fresh and performs real resolution in each subprocess, dump the resolved constants that back every FR-3.6 tuning section to JSON, and diff the two JSON blobs in the parent process. `max_executor_retries_per_judge` is the one FR-3.6 field the dump does NOT compare as a raw dict: its built-in default is `{}` on `RuntimeConfig`, so a full-default config that names every judge explicitly will always differ from a minimal config's empty dict at the raw level even though both behave identically once the documented per-judge fallback to `max_executor_retries` (`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`) is applied; the dump script reproduces that fallback itself and compares the RESOLVED per-judge effective retry budget instead. When substituting `<assembled full-default config dict>` / `<minimal config dict>`, write dict keys and string values with single quotes -- the surrounding `python -c "..."` wrapper is itself a double-quoted shell string, so unescaped double quotes inside the substituted dict literal terminate that string early and corrupt the command:
+
+```bash
+python -c "
+import json, os, subprocess, sys, tempfile, yaml
+from pathlib import Path
+
+full_default_data = <assembled full-default config dict>
+minimal_data = <minimal config dict: only operator-changed values, plus repos>
+
+def _write(data):
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        return f.name
+
+DUMP_SCRIPT = r'''
+import json, sys
+from devbench import config
+from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+# One constant per FR-3.6-resolved section (timeouts, limits, stop_hook,
+# hook_tail, orchestrate, report, max_executor_retries). backlog, validate
+# and skills carry concrete (non-None) defaults directly on RuntimeConfig
+# with no downstream config.py resolution layer, so they are compared
+# directly off RUNTIME_CONFIG below. log_file is compared via the same
+# _resolve_log_file() helper setup_logging/report use.
+#
+# max_executor_retries_per_judge is deliberately NOT compared as a raw
+# dict: its built-in RuntimeConfig default is {} (config_loader.py's
+# max_executor_retries_per_judge field(default_factory=dict)), while a
+# full-default emission writes every judge name explicitly, so the raw
+# dicts always differ between a full-default and a minimal config even
+# when both resolve to identical effective behavior. The per-judge
+# fallback to max_executor_retries when a judge is absent is documented
+# in plugin/devbench-orchestrate/skills/orchestrate/SKILL.md and applied
+# at consumption time, not inside devbench/config.py, so this check
+# reproduces that same fallback and compares the RESOLVED per-judge
+# effective retry budget instead of the raw dict.
+_MODULE_CONSTANTS = [
+    \"GH_API_TIMEOUT\", \"TEST_TIMEOUT\", \"SECURITY_FETCH_TIMEOUT\", \"LLM_TIMEOUT\",
+    \"COMMAND_TIMEOUT\", \"ORCHESTRATOR_POLL_INTERVAL\", \"GITHUB_CHECK_TIMEOUT_SECONDS\",
+    \"ALERT_SUMMARY_LIMIT\", \"OUTPUT_TRUNCATION_LIMIT\", \"LLM_EVIDENCE_TRUNCATION\",
+    \"LLM_FILE_CONTEXT_LIMIT\", \"LLM_FILE_PREVIEW_CHARS\", \"CI_FAILURE_LOG_BYTES\",
+    \"STOP_HOOK_MAX_BLOCKS\", \"STOP_HOOK_WINDOW_SECONDS\", \"STOP_HOOK_STALE_TASK_MINUTES\",
+    \"HOOK_TAIL_AGENT_WIDTH\", \"HOOK_TAIL_TOOL_WIDTH\", \"HOOK_TAIL_DESCRIPTION_MAX\",
+    \"HOOK_TAIL_STDOUT_PREVIEW_MAX\", \"MAX_CASCADE_DEPTH\",
+    \"REPORT_MODEL_RATES\", \"REPORT_DEFAULT_MODEL_RATES\", \"REPORT_CACHE_READ_MULTIPLIER\",
+    \"REPORT_CACHE_WRITE_5MIN_MULTIPLIER\", \"REPORT_CACHE_WRITE_1HR_MULTIPLIER\",
+    \"REPORT_DATA_RESIDENCY_MULTIPLIER\", \"REPORT_FAST_MODE_MULTIPLIER\",
+    \"RECENT_PACE_TASKS\", \"MAX_RETRY_ATTEMPTS\",
+]
+
+def _ser(obj):
+    if hasattr(obj, \"__dataclass_fields__\"):
+        return {k: _ser(getattr(obj, k)) for k in obj.__dataclass_fields__}
+    if isinstance(obj, dict):
+        return {str(k): _ser(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, frozenset, set)):
+        return sorted(_ser(v) for v in obj) if isinstance(obj, (frozenset, set)) else [_ser(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return repr(obj)
+
+out = {name: _ser(getattr(config, name)) for name in _MODULE_CONSTANTS}
+for name in (\"backlog\", \"validate\", \"skills\"):
+    out[f\"RUNTIME_CONFIG.{name}\"] = _ser(getattr(config.RUNTIME_CONFIG, name))
+per_judge = config.RUNTIME_CONFIG.max_executor_retries_per_judge
+for judge in sorted(ALL_REQUIRED_JUDGE_NAMES):
+    out[f\"RESOLVED_MAX_RETRIES.{judge}\"] = per_judge.get(judge, config.MAX_RETRY_ATTEMPTS)
+from devbench.log_setup import _resolve_log_file
+out[\"RESOLVED_LOG_FILE\"] = str(_resolve_log_file())
+json.dump(out, sys.stdout)
+'''
+
+def _dump(config_path):
+    env = dict(os.environ)
+    env['DEVBENCH_CONFIG_PATH'] = config_path
+    result = subprocess.run([sys.executable, '-c', DUMP_SCRIPT], env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+    return json.loads(result.stdout)
+
+full_dump = _dump(_write(full_default_data))
+minimal_dump = _dump(_write(minimal_data))
+
+mismatches = [
+    (k, full_dump.get(k, '<MISSING>'), minimal_dump.get(k, '<MISSING>'))
+    for k in sorted(set(full_dump) | set(minimal_dump))
+    if full_dump.get(k, '<MISSING>') != minimal_dump.get(k, '<MISSING>')
+]
+if mismatches:
+    for k, a, b in mismatches:
+        print(f'MISMATCH: differing field {k!r}: full-default={a!r} minimal={b!r}', file=sys.stderr)
+    sys.exit(1)
+print('EQUIVALENT')
+"
+```
+
+If this exits non-zero, the emitted full-default config resolves to different runtime behavior than a minimal config -- this is a defect, never an acceptable output. Fail loudly, report every `MISMATCH: differing field ...` line verbatim to the operator, fix the emission instructions for that field's default value, and re-run this check before writing the file.
+
+On `VALID` and `EQUIVALENT`, write the assembled config to `backlog/config/devbench.yaml`:
 
 ```
 Write backlog/config/devbench.yaml
@@ -433,6 +590,9 @@ Report:
 >   backlog:            default_status_for_new_work_units=<value>
 >   notifications:      enabled=<value>, events=<comma-separated list of enabled events>
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>
+>   report:             default_model=input <value>/output <value>, N models priced, fast_mode_multiplier=<value>
+>
+> Every tuning section not listed above (timeouts, limits, hook_tail, orchestrate, validate, skills, max_executor_retries, max_executor_retries_per_judge, log_file) was also written at its resolved built-in default; see backlog/config/devbench.yaml directly for its value.
 >
 > Next step: run 'claude run devbench-authoring:bootstrap-environment' to clone target repos and verify make validate baselines."
 
@@ -446,8 +606,9 @@ sessions because it frees the terminal and supports targeted
 
 The lifecycle commands all read `<workspace>/.devbench/orchestrator.pid`
 (written by daemon-mode start) plus walk PID files under
-`DEVBENCH_INSTANCE_SEARCH_ROOTS` (default `~`), so they work without
-the operator needing to `cd` into the target workspace.
+`DEVBENCH_INSTANCE_SEARCH_ROOTS` (default: `$HOME` plus the current
+`DEVBENCH_WORKSPACE_ROOT`), so they work without the operator needing to
+`cd` into the target workspace.
 
 Template (substitute `/path/to/devbench` + `/path/to/kanon-deps-work`):
 

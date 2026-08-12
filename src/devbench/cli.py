@@ -29,7 +29,8 @@ Commands::
     git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
-    start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive)
+    start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive);
+                            --daemon, -d detaches to the background and returns immediately (#209)
     scope set/clear/show    Persistent scope management without starting the orchestrator
     watch [--watch N]       Show a live dashboard of the active orchestration
 
@@ -38,9 +39,18 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     read-unit <id>                          Return work unit content and repo path as JSON
     get-diff <id>                           Return combined git diff for the work unit's repo
     run-tests <id>                          Run test suite for the work unit's repo
+    tdd-gate <id>                           Run the machine-observed RED gate for a gated task;
+                                             on a genuine RED, records the orchestrator-only
+                                             RED_OBSERVED entry (FR-4.2, exits 1 on any rejection)
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
-    log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log
+    log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log;
+                                             RED_OBSERVED is orchestrator-only and always rejected here
+
+    log-verdict/log-comment/log-tdd free-text fields (feedback/message) must be a single
+    line with no control characters (e.g. no embedded newline) and no bracketed TDD phase
+    tag such as '[RED_OBSERVED]'; a violation exits 1 and writes nothing to the work unit.
+
     request-amendment <id>                  Register amendment request (JSON payload on stdin)
     apply-amendment <id>                    Apply approved amendment with Layer 3 post-check
     reject-amendment <id> <reason>          Reject amendment and block the task
@@ -57,6 +67,7 @@ for easy parsing by Claude Code or other automation.
 
 import asyncio
 import contextlib
+import functools
 import getpass
 import json
 import logging
@@ -66,11 +77,11 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NamedTuple
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -104,8 +115,35 @@ from devbench.backlog.amendment import (
     reject_amendment,
     write_request,
 )
+
+# Re-export from manager.py so existing ``cli.red_gate_satisfied`` /
+# ``cli.green_green_observed_satisfied`` callers and tests resolve unchanged
+# after the predicates moved to manager.py (code_review FAIL round 3 --
+# check-merge's ``_check_merge_handle_merged`` -> ``BacklogManager.mark_done``
+# path previously bypassed the done-gate entirely because the checks lived
+# only in cli.py's ``cmd_mark_done``-only wrapper). Single source of truth
+# now lives in manager.py because every ``mark_done()`` caller must inherit
+# it, and manager.py cannot depend on cli.py without a circular import.
+#
+# code_review FAIL round 4 (non-blocking) observed that the module-level
+# ``__all__`` below -- which marks these as intentional re-exports so
+# ruff does not flag them F401 -- reads as if it declared cli.py's
+# entire public surface, misleading for a CLI module with dozens of
+# ``cmd_*`` entry points. The self-aliased ``import x as x`` idiom (PEP
+# 484's usual alternative for exactly this situation) was evaluated and
+# rejected: this repo's ruff configuration enables ``PLC0414`` ("import
+# alias does not rename original package"), which flags that idiom as an
+# error, so ``__all__`` remains the only lint-clean mechanism available
+# here. Read it as "these names are deliberately re-exported", not as
+# "this is the whole module".
 from devbench.backlog.index_errors import exit_with_index_error
-from devbench.backlog.manager import BacklogManager
+from devbench.backlog.manager import (
+    _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE,
+    BacklogManager,
+    _build_remedies_rejection_message,
+    green_green_observed_satisfied,
+    red_gate_satisfied,
+)
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
     BlockedTaskState,
@@ -155,6 +193,7 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import (
+    QuotaHandlingConfig,
     RepoConfig,
     format_branch_name,
     format_single_branch_name,
@@ -162,6 +201,7 @@ from devbench.config_loader import (
     get_effective_branch_prefix,
 )
 from devbench.constants import (
+    AGENT_WRITABLE_TDD_PHASES,
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
     BACKLOG_STATUS_RE,
@@ -171,14 +211,31 @@ from devbench.constants import (
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
+    FAILURE_DIGEST_MAX_LENGTH,
+    FAILURE_DIGEST_MIN_LENGTH,
+    FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_ONLY_TDD_PHASES,
+    ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+    ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+    RECOVERY_PROBE_TIMEOUT_SECONDS,
+    RED_OBSERVED_FIELD_EXIT_CODE,
+    RED_OBSERVED_FIELD_FAILURE_DIGEST,
+    RED_OBSERVED_FIELD_TEST_NODE_ID,
+    RED_OBSERVED_MESSAGE_TEMPLATE,
+    RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE,
+    RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE,
+    RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE,
+    RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -193,6 +250,9 @@ from devbench.constants import (
     STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
     STATUS_SUMMARY_LABEL_WIDTH,
+    TDD_PHASE_GREEN_GREEN_OBSERVED,
+    TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE,
+    TDD_PHASE_RED_OBSERVED,
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
@@ -205,18 +265,39 @@ from devbench.plugin_shadow import (
     shadow_plugin_path,
     write_pid_sentinel,
 )
+from devbench.quota import (
+    BackoffConfig,
+    QuotaCheckpoint,
+    QuotaExhaustedError,
+    RecoveryProbeUnavailableError,
+    _apply_resume_strategy,
+    detect_quota_error,
+    load_checkpoint,
+    recovery_probe,
+    save_checkpoint,
+    wait_for_reset,
+)
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
 # resolve unchanged after the function moved to report.py for the issue #161
 # orchestrator-alive banner. Single source of truth lives in report.py because
-# the banner is implemented there and reporting must not depend on cli.py.
+# the banner is implemented there and reporting must not depend on cli.py. See
+# the ``__all__``-vs-self-aliased-``as`` rationale above the
+# ``devbench.backlog.manager`` re-export block.
 from devbench.reporting.report import _format_duration
-from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
+from devbench.scope import (
+    InvalidScopeError,
+    ScopeFilter,
+    _expand_prefix,
+    _read_and_migrate_scope_payload,
+    _scope_file_path,
+    _tokenise,
+)
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
-__all__ = ["_format_duration"]
+__all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
 
 logger = logging.getLogger("devbench.cli")
 
@@ -293,34 +374,30 @@ def _parse_status_argv(argv: tuple[str, ...]) -> _StatusArgs:
 def _read_scope_banner_data(workspace_root: Path) -> dict[str, object] | None:
     """Return the raw scope.json payload when scope.json exists, else ``None``.
 
-    Reads scope.json directly to surface ``started_at`` / ``started_by``
-    metadata that :meth:`ScopeFilter.from_file` omits from the dataclass.
-    The file is read and parsed once; ``None`` is returned only when the
-    file is absent.
+    Reads scope.json to surface ``started_at`` / ``started_by`` metadata that
+    :meth:`ScopeFilter.from_file` omits from the dataclass. Delegates to
+    :func:`devbench.scope._read_and_migrate_scope_payload` so a legacy
+    list-shaped scope.json (issue #270) self-heals on this path exactly as it
+    does for ``ScopeFilter.from_file`` -- both ``devbench next`` and
+    ``devbench status`` reach this function, so neither crashes on a stale
+    array file. ``None`` is returned only when the file is absent.
 
     Args:
         workspace_root: Path to the workspace root directory.
 
     Returns:
-        The decoded JSON payload dict, or ``None`` if scope.json does not exist.
+        The decoded (and, for the legacy list shape, migrated) JSON payload
+        dict, or ``None`` if scope.json does not exist.
 
     Raises:
         json.JSONDecodeError: If the file exists but contains invalid JSON.
         KeyError: If required keys are missing from the JSON payload.
-        TypeError: If field types in the payload are invalid.
+        TypeError: If the top-level payload is neither an object nor the
+            legacy list shape, or if a legacy list element is invalid.
+        OSError: If migrating a legacy list payload fails to write.
     """
     scope_path = _scope_file_path(workspace_root)
-    if not scope_path.exists():
-        return None
-    payload = json.loads(scope_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(
-            f"scope.json top-level payload must be an object, "
-            f"got {type(payload).__name__!r}. "
-            f"The file at '{scope_path}' may be corrupt -- "
-            f"remove it and re-run 'devbench start --include ...' to recreate it."
-        )
-    return payload
+    return _read_and_migrate_scope_payload(scope_path)
 
 
 def _render_scope_banner(include: list[str], exclude: list[str], started_at: str) -> None:
@@ -1769,9 +1846,35 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
 def cmd_mark_done(unit_id: str) -> int:
     """Mark a work unit as Done, enforcing the done-gate check.
 
-    Calls ``BacklogManager.mark_done()`` which verifies that all required
-    review judges passed in the most recent round before allowing the transition.
-    Raises ``RuntimeError`` if the gate check fails.
+    Calls :meth:`BacklogManager.mark_done`, which itself enforces two
+    invariants before writing ``STATUS_DONE`` anywhere (E4-F4-S1-T2 round
+    3 moved both out of this CLI-layer wrapper and into ``mark_done``
+    directly, via ``_check_task_type_done_invariant``, so every caller --
+    this command and ``devbench check-merge``'s merged-PR path alike --
+    inherits them identically; this docstring described the pre-round-3
+    architecture, where the checks ran here before delegating, until
+    doc_review FAIL round 4 flagged the staleness):
+
+    - **Done-gate** (FR-4.4): all required review judges must have passed
+      in the most recent review round.
+    - **FR-4.5/FR-4.6 task-type completion invariant** (AC-60 /
+      AC-E4-F4-S1-T2-4): a gated task (``## Task Type:`` absent --
+      defaults to ``DEFAULT_TASK_TYPE``, the strictest type, per the same
+      fail-closed precedent as ``BacklogManager._check_task_type_taxonomy``
+      -- or explicitly ``behavior-fix``/``feature``) must carry a
+      machine-observed ``RED_OBSERVED`` record (``red_gate_satisfied``);
+      a ``refactor`` task is exempt from the RED gate but not from its
+      own invariant and must instead carry a machine-observed
+      ``GREEN_GREEN_OBSERVED`` record (``green_green_observed_satisfied``),
+      written only by a passing ``devbench green-green-check`` run.
+      Without the applicable record, ``mark_done`` raises ``RuntimeError``
+      rather than claiming a fix or a behavior-preservation guarantee
+      never actually proved: honest exits are a genuine RED, a re-type,
+      an already-satisfied decline, or (for ``refactor``) a passing
+      ``green-green-check`` run -- never a silent done.
+
+    This function catches that ``RuntimeError`` and reports it on stderr
+    with exit code 1; it performs no invariant checking of its own.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -1827,16 +1930,66 @@ def cmd_decline(*argv: str) -> int:
 
     Usage::
 
-        decline <id> --reason "<message>"
+        decline <id> --reason "<message>" [--citation <commit-hash-or-task-id>]
 
     Declined is a deliberate final-decision status, distinct from Blocked
     (waiting on something) and Done (completed). Declined children count
     as terminal-complete for parent rollup. The ``--reason`` is REQUIRED
     because the decision must leave an audit trail; em-dashes are
     rejected at the input boundary for backlog hygiene.
+
+    FR-4.5 (AC-E4-F4-S1-T2-2/3): when *reason* names remedy 3
+    (``already-satisfied``), the decline is an unfalsifiable claim without
+    proof it was checked, so ``--citation`` (the closing commit hash or
+    task id, validated by ``BacklogManager.is_valid_citation``) is
+    REQUIRED too. On success the citation is folded into the persisted
+    reason (``"... (citing <value>)"``) so ``BacklogManager``'s
+    comment-format check (which re-reads the persisted ``[DECLINED]``
+    comment, not this command's argv) can verify it independently.
+    """
+    parsed = _parse_decline_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason, citation = parsed
+
+    rc = _reject_em_dash("reason", reason)
+    if rc is not None:
+        return rc
+
+    persisted_reason = _resolve_decline_persisted_reason(task_id, reason, citation)
+    if persisted_reason is None:
+        return 1
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().mark_declined(wu_file, BACKLOG_INDEX, task_id, persisted_reason)
+    logger.info("Declined %s: %s", task_id, persisted_reason)
+    print(json.dumps({"task_id": task_id, "status": "declined", "reason": persisted_reason}))
+    return 0
+
+
+def _parse_decline_argv(argv: tuple[str, ...] | list[str]) -> tuple[str, str, str] | int:
+    """Parse ``decline`` argv into ``(task_id, reason, citation)``.
+
+    Returns the parsed triple when ``<id>`` and ``--reason`` are both
+    present, or an integer non-zero exit code when parsing failed (the
+    error message is already on stderr). Mirrors the ``_parse_new_task_argv``
+    idiom so the many single-purpose validation branches live in a
+    dedicated parser rather than inflating ``cmd_decline``'s own
+    return/branch count.
     """
     task_id = ""
     reason = ""
+    citation = ""
     args = list(argv)
     i = 0
     while i < len(args):
@@ -1851,31 +2004,48 @@ def cmd_decline(*argv: str) -> int:
             reason = args[i + 1]
             i += 2
             continue
+        if arg == "--citation":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --citation requires a value", file=sys.stderr)
+                return 1
+            citation = args[i + 1]
+            i += 2
+            continue
         if not task_id:
             task_id = arg
         i += 1
     if not task_id or not reason:
         print("ERROR: decline requires <id> --reason <message>", file=sys.stderr)
         return 1
-    rc = _reject_em_dash("reason", reason)
-    if rc is not None:
-        return rc
+    return task_id, reason, citation
 
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    target = _find_unit(units, task_id)
-    if target is None:
-        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
-        return 1
-    wu_file = _resolve_unit_file(target)
-    if wu_file is None:
-        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
-        return 1
 
-    BacklogManager().mark_declined(wu_file, BACKLOG_INDEX, task_id, reason)
-    logger.info("Declined %s: %s", task_id, reason)
-    print(json.dumps({"task_id": task_id, "status": "declined", "reason": reason}))
-    return 0
+def _resolve_decline_persisted_reason(task_id: str, reason: str, citation: str) -> str | None:
+    """Return the reason text to persist, or ``None`` when an already-satisfied decline lacks a citation.
+
+    FR-4.5 (AC-E4-F4-S1-T2-2/3): when *reason* names remedy 3
+    (``already-satisfied``), the decline is an unfalsifiable claim without
+    proof it was checked, so a valid ``citation`` (the closing commit hash
+    or task id, validated by ``BacklogManager.is_valid_citation``) is
+    REQUIRED too. On success the citation is folded into the returned
+    reason (``"... (citing <value>)"``) so ``BacklogManager``'s
+    comment-format check (which re-reads the persisted ``[DECLINED]``
+    comment, not this command's argv) can verify it independently. On
+    failure the three-remedy rejection message is already printed to
+    stderr before ``None`` is returned.
+    """
+    if BacklogManager._ALREADY_SATISFIED_TOKEN not in reason.lower():
+        return reason
+    if not citation or not BacklogManager.is_valid_citation(citation):
+        message = _build_remedies_rejection_message(
+            f"ERROR: Cannot decline {task_id} as already-satisfied without a valid citation.",
+            "FR-4.5 requires an already-satisfied decline to cite the closing commit hash "
+            "(7-40 lowercase hex characters) or task id via --citation <value>; an uncited "
+            "already-satisfied decline is as unfalsifiable as a fabricated RED.",
+        )
+        print(message, file=sys.stderr)
+        return None
+    return f"{reason} (citing {citation})"
 
 
 _TEMPLATE_KIND_BY_ID_SHAPE: dict[str, str] = {
@@ -3737,6 +3907,91 @@ def _reject_em_dash(field_name: str, text: str) -> int | None:
     return None
 
 
+def _reject_control_characters(field_name: str, text: str) -> int | None:
+    """Reject any ASCII control character (including newlines) in agent-supplied text.
+
+    A newline in an agent-controlled free-text field can inject an
+    attacker-chosen extra bulleted line into the work-unit markdown file --
+    including a forged ``- [RED_OBSERVED] ...`` entry that would otherwise
+    resemble a legitimate structural line (HIGH finding, E4-F3-S1-T1 security
+    review). Rejecting every control character at the input boundary (not
+    just newline) closes the same injection class via carriage return, tab,
+    or other C0 control codes.
+
+    Returns:
+        ``1`` (non-zero exit code) with stderr populated when a control
+        character is found; ``None`` when the text is clean.
+    """
+    if any(ord(ch) < 0x20 for ch in text):
+        print(
+            f"ERROR: {field_name} contains a control character (e.g. a newline); "
+            "agent-supplied text must be a single line with no control characters.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+# Matches a bracketed TDD phase tag anywhere in a string -- used to stop an
+# agent from embedding a structural-looking ``[RED_OBSERVED]``/``[RED]``/etc.
+# tag inside a message body (HIGH finding, E4-F3-S1-T1 security review).
+_BRACKETED_TDD_PHASE_TAG_RE = re.compile(
+    r"\[(?:" + "|".join(re.escape(phase) for phase in sorted(VALID_TDD_PHASES)) + r")\]"
+)
+
+
+def _reject_bracketed_phase_tag(field_name: str, text: str) -> int | None:
+    """Reject agent-supplied text embedding a bracketed TDD phase tag.
+
+    Prevents an agent from writing a message such as
+    ``"observed failure [RED_OBSERVED] exit_code=1"`` to a legitimate
+    ``RED`` entry -- the tag has no structural meaning inside a message body,
+    but leaving it unrejected would let free text visually mimic a
+    RED_OBSERVED entry line (HIGH finding, E4-F3-S1-T1 security review).
+
+    Returns:
+        ``1`` (non-zero exit code) with stderr populated when a bracketed
+        phase tag is found; ``None`` when the text is clean.
+    """
+    if _BRACKETED_TDD_PHASE_TAG_RE.search(text):
+        print(
+            f"ERROR: {field_name} contains a bracketed phase tag (e.g. '[RED_OBSERVED]'); "
+            "agent-supplied text cannot embed TDD phase markers.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _validate_agent_free_text(field_name: str, text: str) -> int | None:
+    """Validate an agent-supplied free-text field before it reaches the backlog.
+
+    Composes, in order: em-dash rejection (validate-backlog Check 10),
+    control-character rejection (blocks newline-injection forgery of a
+    structural line), and bracketed-TDD-phase-tag rejection (blocks a
+    message body visually mimicking a phase-tagged entry). This is the
+    single validation point shared by the three agent-facing verbs whose
+    free-text field feeds directly into a structured, judge-consulted
+    record: ``cmd_log_tdd``, ``cmd_log_comment`` and ``cmd_log_verdict``
+    (DRY; HIGH finding, E4-F3-S1-T1 security review: "validate ALL agent
+    free-text fields, not just log-tdd's"). Other reason-bearing verbs
+    (``cmd_decline``, ``_parse_id_and_reason`` feeding the hold/block
+    verbs, ``cmd_reject_amendment``, ``cmd_add_dep``, ``cmd_reject_proposal``)
+    are NOT wired into this function and still apply em-dash rejection
+    only via ``_reject_em_dash``; widening their input boundary is tracked
+    as separate follow-up work, not implied by this docstring.
+
+    Returns:
+        The first non-``None`` rejection code, or ``None`` when the text
+        passes every check.
+    """
+    return (
+        _reject_em_dash(field_name, text)
+        or _reject_control_characters(field_name, text)
+        or _reject_bracketed_phase_tag(field_name, text)
+    )
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -3744,7 +3999,11 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         judge_name:  Judge identifier, e.g. ``code_review`` (matches REVIEW_JUDGE_NAMES).
         unit_id:     Work unit ID, e.g. ``E0-F1-S1-T1``.
         verdict:     ``pass`` or ``fail``.
-        feedback:    One-line summary of the verdict (required for ``fail``).
+        feedback:    One-line summary of the verdict (required for ``fail``). Validated by
+                     ``_validate_agent_free_text``: must contain no em-dash, no control
+                     character (including newline), and no bracketed TDD phase tag such as
+                     ``[RED_OBSERVED]``; a violation exits 1 and writes nothing (HIGH
+                     finding, E4-F3-S1-T1 security review).
 
     The entry written to the work unit uses the same format as the orchestrator:
     ``[judge/<name>] [REVIEW_PASS|REVIEW_FAIL] <feedback>``
@@ -3783,7 +4042,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         )
         return 1
 
-    rc = _reject_em_dash("feedback", feedback)
+    rc = _validate_agent_free_text("feedback", feedback)
     if rc is not None:
         return rc
 
@@ -3794,9 +4053,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
+    wu_file = _resolve_work_unit_file(unit)
 
     action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
     agent_id = f"judge/{judge_name}"
@@ -3830,8 +4087,15 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
 
     Use for non-judge actors (executor, blocker-resolver, review-supervisor summary)
     that need to log progress without emitting a REVIEW_PASS/REVIEW_FAIL token.
+
+    Arguments:
+        message: Validated by ``_validate_agent_free_text``: must contain no
+            em-dash, no control character (including newline), and no
+            bracketed TDD phase tag such as ``[RED_OBSERVED]``; a violation
+            exits 1 and writes nothing (HIGH finding, E4-F3-S1-T1 security
+            review).
     """
-    rc = _reject_em_dash("message", message)
+    rc = _validate_agent_free_text("message", message)
     if rc is not None:
         return rc
 
@@ -3842,9 +4106,7 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
+    wu_file = _resolve_work_unit_file(unit)
 
     timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_AGENT_TEMPLATE.format(
@@ -3873,7 +4135,14 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
     Arguments:
         unit_id:  Work unit ID, e.g. ``E0-F1-S1-T1``.
         phase:    TDD phase, one of ``RED``, ``GREEN``, ``REFACTOR`` (case-insensitive).
-        message:  Description of the TDD phase outcome.
+                  ``RED_OBSERVED`` is a valid phase overall but is
+                  orchestrator-only (see ``write_red_observed_entry``); this
+                  agent-facing command always rejects it.
+        message:  Description of the TDD phase outcome. Validated by
+                  ``_validate_agent_free_text``: must contain no em-dash, no
+                  control character (including newline), and no bracketed
+                  TDD phase tag such as ``[RED_OBSERVED]``; a violation
+                  exits 1 and writes nothing.
 
     Exits 0 on success, non-zero on any error.  The ``## TDD Cycle Log``
     section must already exist in the work unit file; this command fails fast
@@ -3887,7 +4156,17 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
         )
         return 1
 
-    rc = _reject_em_dash("message", message)
+    if phase_upper in ORCHESTRATOR_ONLY_TDD_PHASES:
+        print(
+            TDD_PHASE_ORCHESTRATOR_ONLY_MESSAGE_TEMPLATE.format(
+                phase=phase_upper,
+                agent_phases=", ".join(sorted(AGENT_WRITABLE_TDD_PHASES)),
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    rc = _validate_agent_free_text("message", message)
     if rc is not None:
         return rc
 
@@ -3898,9 +4177,7 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
+    wu_file = _resolve_work_unit_file(unit)
 
     mgr = BacklogManager()
     try:
@@ -3911,6 +4188,500 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
 
     logger.info("TDD %s entry logged for %s", phase_upper, unit_id)
     print(json.dumps({"unit_id": unit_id, "phase": phase_upper}))
+    return 0
+
+
+def _resolve_work_unit_file(unit: WorkUnit) -> Path:
+    """Resolve the work-unit markdown file path for the log-* CLI commands.
+
+    Tries ``BACKLOG_ROOT / unit.file_path`` first, then falls back to
+    ``WORKSPACE_ROOT / unit.file_path`` when the first candidate does not
+    exist. Shared by ``cmd_log_verdict``, ``cmd_log_comment``, ``cmd_log_tdd``,
+    and ``write_red_observed_entry`` so the two-location resolution logic has
+    one definition instead of being duplicated per command (DRY).
+
+    Args:
+        unit: WorkUnit whose file_path must be resolved.
+
+    Returns:
+        The resolved :class:`pathlib.Path`. Tries the ``BACKLOG_ROOT``
+        candidate first and falls back to the ``WORKSPACE_ROOT`` candidate
+        when the first does not exist; neither candidate's existence is
+        re-verified after this fallback, so the returned path may still not
+        exist. Callers that read or write the file must surface a clear
+        error on a missing path themselves.
+    """
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+    return wu_file
+
+
+def build_red_observed_message(exit_code: int | None, test_node_id: str, failure_digest: str) -> str:
+    """Build and validate the three-field RED_OBSERVED record message.
+
+    Enforces the field-level constraints ``red_gate_satisfied`` re-validates
+    on read, so a record that passes this builder always parses on read too:
+    a present, non-whitespace ``test_node_id`` (the read-side
+    ``RED_OBSERVED_MESSAGE_FIELDS_RE`` captures it as a single non-whitespace
+    token, so a space, tab or newline would build a record the gate can never
+    match), a nonzero ``exit_code``, and a hash-shaped ``failure_digest``
+    (MEDIUM/LOW findings inherited on E4-F3-S1-T1). Raising ``ValueError``
+    naming the offending field lets the orchestrator fail fast on a malformed
+    record instead of writing one that silently never satisfies the gate.
+
+    Args:
+        exit_code: The observed test-run exit code. Must be present and nonzero
+            -- a RED phase is, by definition, an observed failure.
+        test_node_id: The pytest node ID of the failing test. Must be
+            non-empty and contain no whitespace character.
+        failure_digest: A lowercase hex digest of the failure output. Must
+            match ``FAILURE_DIGEST_RE`` (8-64 lowercase hex characters) --
+            never raw free text, which could otherwise leak paths or secrets
+            into git history.
+
+    Returns:
+        The space-joined ``exit_code=<n> test_node_id=<id> failure_digest=<digest>``
+        message body (without the ``[RED_OBSERVED]`` tag or timestamp).
+
+    Raises:
+        ValueError: If any field is missing/empty, ``test_node_id`` contains
+            whitespace, ``exit_code`` is zero, or ``failure_digest`` is not
+            hash-shaped.
+    """
+    if exit_code is None:
+        raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_EXIT_CODE))
+    if not test_node_id:
+        raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_TEST_NODE_ID))
+    if any(character.isspace() for character in test_node_id):
+        raise ValueError(RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE.format(test_node_id=test_node_id))
+    if not failure_digest:
+        raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_FAILURE_DIGEST))
+    if exit_code == 0:
+        raise ValueError(RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE)
+    if not FAILURE_DIGEST_RE.match(failure_digest):
+        raise ValueError(
+            RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE.format(
+                min=FAILURE_DIGEST_MIN_LENGTH,
+                max=FAILURE_DIGEST_MAX_LENGTH,
+                digest=failure_digest,
+            )
+        )
+    return RED_OBSERVED_MESSAGE_TEMPLATE.format(
+        exit_code=exit_code,
+        test_node_id=test_node_id,
+        failure_digest=failure_digest,
+    )
+
+
+def write_red_observed_entry(unit_id: str, exit_code: int | None, test_node_id: str, failure_digest: str) -> None:
+    """Write the orchestrator-only RED_OBSERVED TDD Cycle Log entry (FR-4.3).
+
+    Unlike ``cmd_log_tdd`` -- the agent-facing CLI verb, which rejects
+    ``RED_OBSERVED`` outright -- this function is called directly by the
+    orchestrator after it has independently run the test suite and observed
+    a nonzero exit code. It is deliberately not registered in ``_COMMANDS``:
+    there is no ``log-tdd-red-observed`` subcommand an agent could invoke.
+
+    Args:
+        unit_id: Work unit ID, e.g. ``E0-F1-S1-T1``.
+        exit_code: The observed nonzero exit code from the orchestrator's own
+            test run.
+        test_node_id: The pytest node ID of the observed failing test.
+        failure_digest: A hash-shaped digest of the failure output.
+
+    Raises:
+        ValueError: If the unit is not found in the backlog, or if any
+            RED_OBSERVED field is invalid (propagated from
+            ``build_red_observed_message``).
+    """
+    message = build_red_observed_message(exit_code, test_node_id, failure_digest)
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        raise ValueError(f"Work unit '{unit_id}' not found in backlog")
+
+    wu_file = _resolve_work_unit_file(unit)
+
+    mgr = BacklogManager()
+    mgr._append_tdd_entry(wu_file, TDD_PHASE_RED_OBSERVED, message)
+
+    logger.info("TDD %s entry logged for %s", TDD_PHASE_RED_OBSERVED, unit_id)
+
+
+def cmd_tdd_gate(unit_id: str) -> int:
+    """Run the machine-observed RED gate for a gated task (FR-4.2, issue #257).
+
+    Orchestrator-facing entry point for :func:`devbench.tdd_gate.observe_red`:
+    resolves the work unit and its repo, parses the Changes Manifest, runs the
+    gate, and on a genuine RED writes the orchestrator-only ``RED_OBSERVED``
+    entry via :func:`write_red_observed_entry` -- the same machinery
+    ``red_gate_satisfied`` re-validates on read (E4-F3-S1-T1). This function
+    performs no observation logic itself (single responsibility); all
+    stash/pytest/classification behavior lives in ``devbench.tdd_gate``.
+
+    Usage::
+
+        tdd-gate <id>
+
+    Exits 0 and prints a one-line success message (including the observed
+    test node id and exit code) when a genuine RED is observed and recorded.
+    Exits 1 and prints the gate's standardized rejection message to stderr on
+    every fail-closed rejection path (dirty tree outside the manifest, no
+    production-source rows, no named test, a stash failure, or a false/no
+    RED) -- see ``devbench.tdd_gate.observe_red`` for the full rejection
+    taxonomy.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+    from devbench.tdd_gate import TddGateRejectionError, observe_red
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        print(f"ERROR: Work unit file for '{unit_id}' not found on disk", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    content = wu_file.read_text(encoding="utf-8")
+    try:
+        manifest_paths = [row.file for row in parse_manifest(content)]
+    except ManifestParseError as exc:
+        print(f"ERROR: Changes Manifest could not be parsed for '{unit_id}': {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        observation = observe_red(unit_id, repo_path, manifest_paths, content)
+    except TddGateRejectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    write_red_observed_entry(
+        unit_id,
+        observation.exit_code,
+        observation.test_node_id,
+        observation.failure_digest,
+    )
+    print(
+        f"RED gate satisfied for {unit_id}: test_node_id={observation.test_node_id} "
+        f"exit_code={observation.exit_code} failure_digest={observation.failure_digest}"
+    )
+    return 0
+
+
+# DRY (E4-F4-S1-T2, code_review FAIL round 4): the scoped stash push/pop
+# green-green-check needs for its "before"/"after" reconstruction is
+# identical to `devbench.tdd_gate`'s own RED-gate stash helpers. Those
+# helpers (`stash_push_scoped`, `stash_pop`, `STASH_NO_LOCAL_CHANGES_MARKER`)
+# were promoted from module-private to public in tdd_gate.py specifically so
+# this module can import and reuse them instead of duplicating the git
+# invocations a second time; see the module-level note above
+# `STASH_NO_LOCAL_CHANGES_MARKER` in tdd_gate.py for the full history.
+
+
+def _gg_clear_pycache(repo_path: Path) -> None:
+    """Remove every ``__pycache__`` directory under *repo_path*.
+
+    A green-green check runs the named tests twice in the same repository
+    checkout, once per side, with a ``git stash`` round-trip of the
+    production source in between. On filesystems with coarse mtime
+    resolution, that round-trip can leave a compiled ``.pyc`` that Python's
+    import machinery still considers valid for the different on-disk source
+    now in its place, which would make the before-state run silently
+    execute stale after-state bytecode instead of the actual before-state
+    content -- reporting a pass that never happened. Clearing the cache
+    before every run removes that risk at negligible cost.
+
+    Skips any ``__pycache__`` found under a ``.venv`` directory
+    (code_review FAIL round 4, non-blocking note): a target repository's
+    virtualenv can contain thousands of installed packages' compiled
+    bytecode, none of which the stash round-trip above touches or
+    invalidates, so walking and deleting it on every one of the two
+    per-side runs is pure wasted work with no correctness benefit.
+    """
+    for cache_dir in repo_path.rglob("__pycache__"):
+        if ".venv" in cache_dir.relative_to(repo_path).parts:
+            continue
+        shutil.rmtree(cache_dir, ignore_errors=False)
+
+
+def _gg_run_named_tests(unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+    """Run every node id in *test_node_ids* on one *side* of a green-green check.
+
+    Reuses :func:`devbench.tdd_gate.default_pytest_runner` -- the identical
+    runner the RED gate itself uses -- so the pytest-invocation behavior
+    (file-scoped, ``-rA``) is defined exactly once (DRY), never duplicated.
+    Clears the bytecode cache first (see ``_gg_clear_pycache``).
+
+    Args:
+        unit_id: The work unit id, named in every rejection message.
+        side: ``"before"`` or ``"after"``, named in every rejection message
+            so an operator can tell which state failed.
+        test_node_ids: The pytest node ids to run.
+        repo_path: The target repository's working tree.
+
+    Returns:
+        ``None`` when every named test PASSED with exit code
+        ``PYTEST_EXIT_OK``. Otherwise a fully-formed rejection message
+        (fail-closed): a node whose outcome could not be determined at all
+        (``node_outcome is None``) is reported as a collection failure --
+        never silently as a pass -- mirroring FR-4.2's exit-2 semantics.
+    """
+    from devbench.tdd_gate import PYTEST_EXIT_OK, default_pytest_runner
+
+    _gg_clear_pycache(repo_path)
+    for test_node_id in test_node_ids:
+        observation = default_pytest_runner(test_node_id, repo_path)
+        if observation.node_outcome is None:
+            return (
+                f"ERROR: green-green check rejected task '{unit_id}': the {side}-state run could "
+                f"not collect test '{test_node_id}' (exit code {observation.exit_code}); a "
+                "collection failure is reported as a failure, never as a pass, per FR-4.6's "
+                "fail-closed semantics."
+            )
+        if observation.exit_code != PYTEST_EXIT_OK or observation.node_outcome != "PASSED":
+            return (
+                f"ERROR: green-green check rejected task '{unit_id}': the {side}-state run of "
+                f"'{test_node_id}' did not pass (exit code {observation.exit_code}, outcome "
+                f"{observation.node_outcome})."
+            )
+    return None
+
+
+def cmd_green_green_check(*argv: str) -> int:
+    """Run the refactor green-green check: named tests pass before and after (FR-4.6).
+
+    Usage::
+
+        green-green-check <id> <test_node_id> [<test_node_id> ...]
+
+    A ``refactor`` task is exempt from the RED gate but not from its own
+    invariant: the change must be behavior-preserving, proven by the same
+    named tests passing both before and after it. The change is already
+    applied in the working tree when this command runs (the "after"
+    state), so this command:
+
+    1. Confirms every named test passes in the current ("after") tree.
+    2. Path-scoped stashes the Changes Manifest's production-source rows
+       (the same stash discipline as ``devbench.tdd_gate.observe_red``) to
+       reconstruct the pre-change ("before") state, and confirms the same
+       tests pass there too.
+    3. Restores the stash unconditionally, even when the before-state test
+       run itself raises, mirroring ``observe_red``'s fail-closed restore
+       guarantee.
+
+    A collection failure (a named test whose outcome cannot be determined
+    at all) on either side fails closed, naming the side and the collection
+    error -- "could not run" is never reported as "passed" (FR-4.6).
+
+    On success, appends a machine-observed ``GREEN_GREEN_OBSERVED`` entry to
+    the work unit's TDD Cycle Log (``green_green_observed_satisfied``
+    re-validates it on read) so ``cmd_mark_done`` can refuse a ``refactor``
+    task that never actually ran this check (AC-E4-F4-S1-T2-4). A rejection
+    writes nothing -- the record is proof-of-success only, never
+    proof-of-attempt.
+
+    Exits 0 only when every named test PASSED on both sides. Exits 1 on
+    every rejection path: a dirty tree outside the Manifest, no
+    production-source rows to reconstruct a "before" state from, no
+    uncommitted production-source change to stash (nothing to reconstruct
+    the "before" state from), a stash push/pop failure, or any test
+    failing/not-collecting on either side.
+    """
+    args = list(argv)
+    if len(args) < 2:
+        print("ERROR: green-green-check requires <id> <test_node_id> [<test_node_id> ...]", file=sys.stderr)
+        return 1
+    unit_id, test_node_ids = args[0], args[1:]
+
+    resolved = _gg_resolve_target(unit_id)
+    if isinstance(resolved, int):
+        return resolved
+    repo_path, manifest_paths, wu_file = resolved
+
+    prod_paths = _gg_preflight(unit_id, repo_path, manifest_paths)
+    if isinstance(prod_paths, int):
+        return prod_paths
+
+    result = _gg_run_before_after(unit_id, repo_path, prod_paths, test_node_ids)
+    if result != 0:
+        return result
+
+    mgr = BacklogManager()
+    mgr._append_tdd_entry(
+        wu_file,
+        TDD_PHASE_GREEN_GREEN_OBSERVED,
+        _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE.format(test_node_ids=",".join(test_node_ids)),
+    )
+
+    print(f"green-green check passed for {unit_id}: {', '.join(test_node_ids)} PASSED before and after.")
+    return 0
+
+
+def _gg_resolve_target(unit_id: str) -> tuple[Path, list[str], Path] | int:
+    """Resolve the target repo path, Changes Manifest paths, and work-unit file
+    for green-green-check.
+
+    Returns ``(repo_path, manifest_paths, wu_file)`` on success, or an
+    integer non-zero exit code (error already printed) on any resolution
+    failure. Consolidates the work-unit/repo/manifest lookups that would
+    otherwise be four separate early-return branches directly in
+    ``cmd_green_green_check``. ``wu_file`` is returned (not just consumed
+    here) so the caller can append the GREEN_GREEN_OBSERVED record to the
+    same file on success without re-resolving it.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        print(f"ERROR: Work unit file for '{unit_id}' not found on disk", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    content = wu_file.read_text(encoding="utf-8")
+    try:
+        manifest_paths = [row.file for row in parse_manifest(content)]
+    except ManifestParseError as exc:
+        print(f"ERROR: Changes Manifest could not be parsed for '{unit_id}': {exc}", file=sys.stderr)
+        return 1
+
+    return repo_path, manifest_paths, wu_file
+
+
+def _gg_preflight(unit_id: str, repo_path: Path, manifest_paths: Sequence[str]) -> list[str] | int:
+    """Return the classified production-source paths, or an int error code.
+
+    Rejects a working tree carrying changes outside the Changes Manifest
+    (the check never stashes work it does not own) and a Manifest with no
+    production-source rows (Rule 14 classifier) to reconstruct a "before"
+    state from.
+    """
+    from devbench.tdd_gate import classify_production_paths, find_paths_outside_manifest
+
+    outside_paths = find_paths_outside_manifest(repo_path, manifest_paths)
+    if outside_paths:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': the working tree carries "
+            f"changes outside the Changes Manifest: {', '.join(outside_paths)}. The check never "
+            "stashes work it does not own; clear or commit these paths before retrying.",
+            file=sys.stderr,
+        )
+        return 1
+
+    prod_paths = classify_production_paths(manifest_paths)
+    if not prod_paths:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': the Changes Manifest contains "
+            "no production-source rows (Rule 14 classifier); a refactor task must ship at least "
+            "one production file to demonstrate green-green.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return prod_paths
+
+
+def _gg_run_before_after(unit_id: str, repo_path: Path, prod_paths: Sequence[str], test_node_ids: Sequence[str]) -> int:
+    """Run the after/stash/before/pop sequence for green-green-check.
+
+    Prints its own rejection messages and returns 0 when every named test
+    PASSED on both sides, 1 on any rejection. Re-raises whatever the
+    before-state test run itself raises, after the stash has been popped
+    (fail-closed restore, mirroring ``observe_red``) -- the pop-failure
+    message is printed before the re-raise so it is never silently lost.
+
+    A ``git stash push`` that reports "no local changes to save"
+    (``devbench.tdd_gate.stash_push_scoped`` returning ``pushed=False`` with
+    no error) is itself a rejection, not a pass: it means the working tree
+    has no uncommitted production-source change to reconstruct a "before"
+    state from, so running the before-state check would silently re-run the
+    same ("after") tree twice and report a guaranteed, meaningless pass --
+    the exact "could not run reported as passed" hole FR-4.6 forbids
+    (code_review FAIL, round 2).
+    """
+    from devbench.tdd_gate import stash_pop, stash_push_scoped
+
+    after_rejection = _gg_run_named_tests(unit_id, "after", test_node_ids, repo_path)
+    if after_rejection is not None:
+        print(after_rejection, file=sys.stderr)
+        return 1
+
+    pushed, push_error = stash_push_scoped(repo_path, prod_paths)
+    if push_error is not None:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': "
+            f"'git stash push -u -- {' '.join(prod_paths)}' failed: {push_error}",
+            file=sys.stderr,
+        )
+        return 1
+    if not pushed:
+        print(
+            f"ERROR: green-green check rejected task '{unit_id}': "
+            f"'git stash push -u -- {' '.join(prod_paths)}' found no uncommitted production-source "
+            f"change from the Changes Manifest ({', '.join(prod_paths)}); the pre-change ('before') "
+            "state could not be reconstructed. A refactor's change must still be uncommitted in the "
+            "working tree when this check runs.",
+            file=sys.stderr,
+        )
+        return 1
+
+    check_exception: BaseException | None = None
+    before_rejection: str | None = None
+    pop_error: str | None = None
+    try:
+        before_rejection = _gg_run_named_tests(unit_id, "before", test_node_ids, repo_path)
+    except BaseException as caught:
+        # Broad and intentional, mirroring observe_red: the pop in the
+        # finally block below MUST still run when the before-state test
+        # step raises -- including KeyboardInterrupt and SystemExit -- so
+        # the exception is captured here and re-raised only after the
+        # stash has been popped (fail-closed restore).
+        check_exception = caught
+    finally:
+        pop_error = stash_pop(repo_path)
+
+    if pop_error is not None:
+        detail = f"'git stash pop' failed after the before-state run: {pop_error}."
+        if check_exception is not None:
+            detail += f" The test step also raised {check_exception!r}; both failures are reported together."
+        print(f"ERROR: green-green check rejected task '{unit_id}': {detail}", file=sys.stderr)
+        if check_exception is not None:
+            raise check_exception
+        return 1
+
+    if check_exception is not None:
+        raise check_exception
+
+    if before_rejection is not None:
+        print(before_rejection, file=sys.stderr)
+        return 1
+
     return 0
 
 
@@ -5170,8 +5941,19 @@ def cmd_check_merge(unit_id: str) -> int:
     Issue #101 reconciliation step. Queries the PR for *unit_id* via
     ``gh pr list --head <branch> --json number,state,mergedAt``:
 
-    - **merged** (``mergedAt`` non-null) -> transition to ``done`` via :meth:`BacklogManager.mark_done`
-      (enforces the done-gate: every required judge must have passed).
+    - **merged** (``mergedAt`` non-null) -> transition to ``done`` via
+      :meth:`BacklogManager.mark_done`, which enforces two things before
+      any status write happens: the done-gate (every required judge must
+      have passed in the most recent review round) *and* the task's own
+      FR-4.5/FR-4.6 task-type completion invariant
+      (:meth:`BacklogManager._check_task_type_done_invariant` -- a
+      machine-observed ``RED_OBSERVED`` record for gated task types, or a
+      machine-observed ``GREEN_GREEN_OBSERVED`` record for ``refactor``).
+      This surface is not a thinner variant of ``devbench mark-done``'s
+      checks: both refuse identically because both call the same
+      ``mark_done`` method (doc_review FAIL, E4-F4-S1-T2 round 4 -- prior
+      wording here named only the judge gate, which undersold the FR-4.5/
+      FR-4.6 refusal ``check-merge`` also performs).
     - **closed without merge** -> transition to ``blocked`` with an audit
       comment naming the PR.
     - **still open** -> log + return 0; orchestrator picks it up next loop.
@@ -6042,6 +6824,31 @@ class _DrainRequested(BaseException):
         self.reason = reason
 
 
+class _QuotaDetected(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when a quota error is detected per-message.
+
+    Raised as a :class:`BaseException` subclass (not :class:`Exception`) so that
+    ``asyncio.run`` propagates it through the event loop without it being caught
+    by broad ``except Exception`` handlers between the message loop and
+    ``asyncio.run`` (spec AC-20, decision D-4). This lets the SDK session tear
+    down BEFORE any quota wait begins, running the wait in a fresh event loop
+    rather than shielding a task inside the SDK's own loop -- sidestepping the
+    anyio cancel-scope defect (issue #235) architecturally instead of guarding
+    against it.
+
+    Args:
+        quota_exc: The :class:`~devbench.quota.QuotaExhaustedError` produced by
+            :func:`~devbench.quota.detect_quota_error`.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, quota_exc: QuotaExhaustedError) -> None:
+        super().__init__(str(quota_exc))
+        self.quota_exc = quota_exc
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -6082,6 +6889,667 @@ def _is_claim_tool_use(message: object) -> bool:
         if isinstance(command, str) and "devbench claim" in command:
             return True
     return False
+
+
+def _check_quota_and_drain(message: object) -> None:
+    """Per-message quota + drain-on-claim short-circuit for the ``_run`` message loop.
+
+    Raises :class:`_QuotaDetected` when *message* carries a quota / rate-limit
+    signal recognized by :func:`~devbench.quota.detect_quota_error` (issue
+    #236), or raises :class:`_DrainRequested` when *message* is a claim
+    tool-use observed while a drain signal is pending (issues #188/#212).
+    Returns ``None`` (no-op) in every other case.
+
+    Extracted out of ``_run`` so the per-message branching lives in exactly
+    one place (DRY) and ``_run`` itself stays under ruff's PLR0912 12-branch
+    cap. :func:`~devbench.quota.detect_quota_error` guarantees it never
+    raises, so a malformed or unrelated *message* falls through both checks
+    and this function raises nothing (spec Section 7.1 sanctioned swallow 1).
+
+    Args:
+        message: Any object emitted by the :func:`claude_agent_sdk.query`
+            async generator.
+
+    Raises:
+        _QuotaDetected: *message* carries a quota / rate-limit signal.
+        _DrainRequested: *message* is a claim tool-use and a drain signal is
+            currently pending for this session.
+    """
+    quota_exc = detect_quota_error(message)
+    if quota_exc is not None:
+        raise _QuotaDetected(quota_exc)
+    if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
+        raise _DrainRequested(drain_state.reason)
+
+
+_QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
+_QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
+_QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX: str = "[QUOTA_PROBE_UNAVAILABLE]"
+_QUOTA_FAIL_FAST_AUDIT_PREFIX: str = "[QUOTA_FAIL_FAST]"
+_QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX: str = "[QUOTA_DRAIN_REQUESTED]"
+_QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX: str = "[QUOTA_TIMEOUT_KEEP_WAITING]"
+
+
+def _quota_structured_events_enabled() -> bool:
+    """Return whether structured ``[QUOTA_*]`` log markers should be emitted (FR-2, spec AC-7/AC-8).
+
+    Reads ``RUNTIME_CONFIG.quota_handling.log_structured_events`` directly.
+    Performs no I/O and catches nothing: the config loader has already
+    validated the field as a boolean, so a try/except-default wrapper here
+    would be fallback logic (BLOCKED by this unit's error-handling contract).
+
+    Gates every ``[QUOTA_*]`` structured marker emission in this module
+    (``[QUOTA_WAITING]``, ``[QUOTA_RESUMED]``, ``[QUOTA_PROBE_UNAVAILABLE]``,
+    ``[QUOTA_FAIL_FAST]``, ``[QUOTA_DRAIN_REQUESTED]``,
+    ``[QUOTA_TIMEOUT_KEEP_WAITING]``) plus ``[QUOTA_POLLING]`` in
+    ``devbench.quota`` (threaded in as a parameter, since that module
+    imports no config). Explicitly NOT gated (decision D-10): Slack
+    notifications (``notifications.events.*``), audit comments
+    (``audit_comment_on_wait`` / ``audit_comment_on_resume``), ordinary
+    non-marker log lines, and checkpoint writes -- each has its own,
+    independently-tested toggle.
+
+    Returns:
+        ``True`` (the default) when structured quota markers should be
+        logged; ``False`` when the operator has disabled them.
+    """
+    return RUNTIME_CONFIG.quota_handling.log_structured_events
+
+
+_QUOTA_STOP_REASON_DRAIN_DETECTION: str = "quota-drain-requested"
+_QUOTA_STOP_REASON_DRAIN_TIMEOUT: str = "quota-wait-timeout-drain"
+#: Non-recovering quota stop reasons whose disposition is a drain request
+#: (as opposed to a fail-fast re-raise or a keep-waiting terminal stop).
+#: :func:`_drive_orchestrate_with_quota_resume` consults this set to decide
+#: whether the returned :class:`_OrchestrateLoopResult.quota_drain_requested`
+#: must survive ``cmd_start``'s exit-path drain cleanup (spec AC-25).
+_QUOTA_DRAIN_STOP_REASONS: frozenset[str] = frozenset(
+    {_QUOTA_STOP_REASON_DRAIN_DETECTION, _QUOTA_STOP_REASON_DRAIN_TIMEOUT}
+)
+_QUOTA_STOP_REASON_WAIT_RECOVERED: str = "quota-wait-recovered"
+_QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING: str = "quota-wait-timeout-keep-waiting"
+
+#: Allowed ``on_exhaustion_timeout`` values (FR-2.9). Single source of truth
+#: for both the ``_dispatch_quota_timeout`` membership guard and its
+#: ``ValueError`` message, mirroring the ``_RESUME_STRATEGIES`` idiom in
+#: ``devbench.quota``.
+_QUOTA_TIMEOUT_ACTIONS: frozenset[str] = frozenset({"drain", "fail", "keep_waiting"})
+
+
+def _run_quota_side_effect_best_effort(operation: str, fn: Callable[[], None]) -> None:
+    """Run a best-effort quota side effect and never let it break or delay a wait.
+
+    Section 7.1 sanctioned swallows 2 and 3: a Slack notification failure and
+    a work-unit audit-comment append failure must NEVER break or delay a
+    quota wait. Catches ``Exception`` (not ``BaseException``, so a genuine
+    interrupt such as ``KeyboardInterrupt`` still propagates), logs a single
+    WARNING naming the failed *operation* and the exception, and returns.
+    Shared by both notification wrappers and the audit-comment appender so
+    the catch-log-continue shape exists in exactly one place (DRY).
+
+    Args:
+        operation: Short human-readable operation name used in the WARNING.
+        fn: Zero-argument callable performing the side effect.
+    """
+    try:
+        fn()
+    except Exception as exc:
+        logger.warning("[WARN] %s failed (ignored): %r", operation, exc)
+
+
+def _fire_quota_waiting_notification(reason: str, reset_at: str) -> None:
+    """Best-effort ``quota_waiting`` Slack ping at the start of a quota wait.
+
+    Wraps :func:`devbench.notifications.notify_quota_waiting` via
+    :func:`_run_quota_side_effect_best_effort` so a notify/IO failure can
+    NEVER break or delay the quota wait (spec AC-27, Section 7.1 sanctioned
+    swallow 3).
+
+    Args:
+        reason: The quota source/reason (``QuotaExhaustedError.source``).
+        reset_at: The provider-stated reset time as ISO 8601, or ``"unknown"``.
+    """
+
+    def _notify() -> None:
+        from devbench.notifications import notify_quota_waiting
+
+        notify_quota_waiting(reason, reset_at)
+
+    _run_quota_side_effect_best_effort("notify_quota_waiting", _notify)
+
+
+def _fire_quota_resumed_notification(waited_seconds: int) -> None:
+    """Best-effort ``quota_resumed`` Slack ping on the quota-recovered path.
+
+    Wraps :func:`devbench.notifications.notify_quota_resumed` via
+    :func:`_run_quota_side_effect_best_effort` so a notify/IO failure can
+    NEVER break or delay the resume (spec AC-27, Section 7.1 sanctioned
+    swallow 3).
+
+    Args:
+        waited_seconds: Total seconds spent waiting before recovery.
+    """
+
+    def _notify() -> None:
+        from devbench.notifications import notify_quota_resumed
+
+        notify_quota_resumed(waited_seconds)
+
+    _run_quota_side_effect_best_effort("notify_quota_resumed", _notify)
+
+
+def _append_quota_audit_comment(message: str) -> None:
+    """Best-effort append of *message* to the in-flight work unit's Comments section.
+
+    FR-2.12 / decision D-10: ``audit_comment_on_wait`` and
+    ``audit_comment_on_resume`` are parsed-but-DEAD on the source branch;
+    this function is the fresh implementation this task ships. Resolves the
+    single in-progress work unit via :func:`_find_in_flight_wu` and appends
+    *message* through :meth:`~devbench.backlog.manager.BacklogManager._append_agent_comment`.
+    A no-op (nothing appended, nothing logged) when no work unit is
+    in-progress. Wrapped via :func:`_run_quota_side_effect_best_effort` so a
+    comment-append failure logs a WARNING and never breaks the wait (spec
+    AC-29, Section 7.1 sanctioned swallow 3).
+
+    Args:
+        message: The full audit-comment text to append (e.g.
+            ``"[QUOTA_WAITING] reason=anthropic-api reset_at=unknown"``).
+    """
+
+    def _append() -> None:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+        wu = _find_in_flight_wu(units)
+        if wu is None:
+            return
+        BacklogManager()._append_agent_comment(wu.file_path, "orchestrator", message)
+
+    _run_quota_side_effect_best_effort("quota audit comment append", _append)
+
+
+def _format_checkpoint_reset_at(reset_at: datetime | None) -> str:
+    """Format a checkpoint's ``reset_at`` as ISO 8601, or the literal ``"unknown"`` when absent.
+
+    Shared by :func:`_handle_quota_pause` (the ``[QUOTA_WAITING]`` marker
+    emitted at pause time) and :func:`cmd_quota_watcher` (the same marker
+    read back from the on-disk checkpoint) so the ISO-or-unknown format
+    exists in exactly one place (DRY).
+
+    Args:
+        reset_at: The checkpoint's expected reset time, or ``None`` when
+            the provider did not supply one.
+
+    Returns:
+        ``reset_at.isoformat()`` when set, otherwise ``"unknown"``.
+    """
+    return reset_at.isoformat() if reset_at is not None else "unknown"
+
+
+async def _handle_quota_pause(
+    *,
+    exc: QuotaExhaustedError,
+    qh_cfg: QuotaHandlingConfig,
+    workspace_root: Path,
+    session_name: str,
+) -> bool:
+    """Handle a quota exhaustion signal with wait-and-resume (FR-2.9/FR-2.10, spec AC-26).
+
+    Fixed sequence:
+
+    1. Saves a checkpoint so SIGTERM does not lose pause state.
+    2. When :func:`_quota_structured_events_enabled` is true (FR-2, spec
+       AC-7/AC-8), emits ``[QUOTA_WAITING] reason=<r> reset_at=<ISO|unknown>``.
+       Fires the wrapped Slack notification, then (when ``audit_comment_on_wait``
+       is true) appends the same marker text to the in-flight work unit's
+       Comments section -- Slack and the audit comment are UNCONDITIONAL on
+       their own toggles regardless of the structured-events flag (FR-2.12,
+       D-10).
+    3. Awaits ``wait_for_reset`` with no cancellation-shielding primitive
+       (D-9): a SIGTERM must propagate naturally so ``devbench stop`` stays
+       responsive. Threads the same structured-events decision through as
+       ``emit_structured_events`` so the ``[QUOTA_POLLING]`` heartbeat
+       (quota.py:526) obeys the same flag.
+    4. On recovery: when structured events are enabled, emits
+       ``[QUOTA_RESUMED] waited_seconds=<N>``; fires the resumed
+       notification, appends the audit comment when
+       ``audit_comment_on_resume`` is true, applies the configured resume
+       strategy, and returns ``True``.
+    5. On timeout: returns ``False`` (caller applies ``on_exhaustion_timeout``
+       via :func:`_dispatch_quota_timeout`).
+    6. When the recovery probe is permanently unavailable: when structured
+       events are enabled, emits ``[QUOTA_PROBE_UNAVAILABLE] reason=<r>
+       detail=<msg>``, then returns ``False`` immediately instead of polling
+       out the full window.
+
+    Args:
+        exc: The detected ``QuotaExhaustedError``.
+        qh_cfg: Quota handling configuration.
+        workspace_root: Workspace root for checkpoint storage.
+        session_name: Current session name (stored in checkpoint).
+
+    Returns:
+        ``True`` when recovery was confirmed; ``False`` when timed out or the
+        recovery probe was permanently unavailable.
+    """
+    now = datetime.now(tz=UTC)
+    checkpoint = QuotaCheckpoint(
+        reason=exc.source,
+        reset_at=exc.reset_at,
+        saved_at=now,
+        session_name=session_name,
+    )
+    save_checkpoint(checkpoint, workspace_root)
+
+    emit_structured_events = _quota_structured_events_enabled()
+    reset_at_str = _format_checkpoint_reset_at(exc.reset_at)
+    if emit_structured_events:
+        logger.info(
+            "%s reason=%s reset_at=%s",
+            _QUOTA_WAITING_AUDIT_PREFIX,
+            exc.source,
+            reset_at_str,
+        )
+    _fire_quota_waiting_notification(exc.source, reset_at_str)
+    if qh_cfg.audit_comment_on_wait:
+        _append_quota_audit_comment(f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={exc.source} reset_at={reset_at_str}")
+
+    wait_start = datetime.now(tz=UTC)
+    backoff = BackoffConfig(initial_seconds=qh_cfg.poll_interval_seconds)
+
+    try:
+        recovered = await wait_for_reset(
+            reset_at=exc.reset_at,
+            poll_interval_seconds=qh_cfg.poll_interval_seconds,
+            max_wait_seconds=qh_cfg.max_wait_seconds,
+            probe_fn=functools.partial(
+                recovery_probe,
+                timeout_seconds=RECOVERY_PROBE_TIMEOUT_SECONDS,
+                request_size_tokens=RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+            ),
+            backoff_config=backoff,
+            emit_structured_events=emit_structured_events,
+        )
+    except RecoveryProbeUnavailableError as probe_exc:
+        if emit_structured_events:
+            logger.info(
+                "%s reason=%s detail=%s",
+                _QUOTA_PROBE_UNAVAILABLE_AUDIT_PREFIX,
+                exc.source,
+                probe_exc,
+            )
+        return False
+
+    if not recovered:
+        return False
+
+    waited_seconds = int((datetime.now(tz=UTC) - wait_start).total_seconds())
+    if emit_structured_events:
+        logger.info(
+            "%s waited_seconds=%d",
+            _QUOTA_RESUMED_AUDIT_PREFIX,
+            waited_seconds,
+        )
+    _fire_quota_resumed_notification(waited_seconds)
+    if qh_cfg.audit_comment_on_resume:
+        _append_quota_audit_comment(f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}")
+    _apply_resume_strategy(qh_cfg.resume_strategy, workspace_root)
+    return True
+
+
+def cmd_quota_watcher() -> int:
+    """Inspect the quota pause checkpoint (FR-2.11, spec AC-28, Section 14).
+
+    Usage::
+
+        devbench quota-watcher
+
+    No flags -- the plain invocation is the entire command surface. The
+    ``--daemon`` background-monitor mode from earlier design drafts was
+    removed in commit ``9883d13``; this is a fresh port, not a copy of the
+    source branch's leftover ``--once``-required guard.
+
+    Reads ``<workspace>/.devbench/quota_pause.json`` via
+    :func:`devbench.quota.load_checkpoint` and prints
+    ``[QUOTA_WAITING] reason=<source> reset_at=<ISO|unknown>`` to stdout
+    when a checkpoint is present. The watcher is advisory: when a running
+    orchestrator owns the session, its in-loop wait (:func:`_handle_quota_pause`)
+    is authoritative -- this command only surfaces the same on-disk
+    checkpoint for operator visibility (S10.4 journey J-3).
+
+    Error handling is fail-fast without leaking a traceback: an unreadable
+    workspace path (verified via :func:`os.access` before any read attempt)
+    and a checkpoint file that raises ``OSError`` mid-read both print a
+    one-line ``ERROR:`` message naming the path and return 1; a corrupt
+    checkpoint surfaces ``load_checkpoint``'s ``ValueError`` message
+    (which already names the path) and returns 1.
+
+    Returns:
+        0 when a checkpoint exists (the orchestrator is paused); the pause
+        details are printed to stdout.
+        1 when no checkpoint exists (not paused), when the checkpoint is
+        corrupt, when reading it fails with an ``OSError``, or when the
+        workspace path itself is not readable.
+    """
+    workspace_root = WORKSPACE_ROOT
+    if not os.access(workspace_root, os.R_OK | os.X_OK):
+        print(f"ERROR: workspace path is not readable: {workspace_root}", file=sys.stderr)
+        return 1
+
+    try:
+        checkpoint = load_checkpoint(workspace_root)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: cannot read quota checkpoint: {exc}", file=sys.stderr)
+        return 1
+
+    if checkpoint is None:
+        return 1
+
+    reset_at_str = _format_checkpoint_reset_at(checkpoint.reset_at)
+    print(f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={checkpoint.reason} reset_at={reset_at_str}")
+    return 0
+
+
+def _cancel_drain_unless_requested(workspace_root: Path, quota_drain_requested: bool) -> None:
+    """Best-effort cancel of a pending drain signal on ``cmd_start`` exit (spec AC-25).
+
+    Skips the cancel when the quota dispatch deliberately requested a drain
+    (``on_exhaustion``/``on_exhaustion_timeout`` == ``"drain"``): that signal
+    MUST survive process exit so the Makefile restart loop / a peer session
+    acts on it. Otherwise cancels any stale drain so the next start does not
+    inherit it. Idempotent; suppresses filesystem errors the same way the
+    existing unconditional ``cancel_drain`` call sites in ``cmd_start`` do.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        quota_drain_requested: ``True`` when the quota dispatch requested a
+            drain.
+    """
+    if quota_drain_requested:
+        return
+    with contextlib.suppress(OSError):
+        cancel_drain(workspace_root)
+
+
+def _dispatch_quota_detection(detected: "_QuotaDetected", session_name: str) -> str:
+    """Handle a detected quota signal from ``cmd_start``'s ``_run`` loop (FR-2.9, spec AC-24/AC-25).
+
+    Applies the configured ``quota_handling`` policy:
+
+    - ``enabled: false`` -- re-raise the wrapped
+      :class:`~devbench.quota.QuotaExhaustedError` so the legacy non-zero
+      exit of issue #193 AC-4 is reproduced byte-for-byte (spec AC-24).
+    - ``on_exhaustion`` (detection-time): ``"fail"`` logs
+      ``[QUOTA_FAIL_FAST]`` and re-raises immediately; ``"drain"`` logs
+      ``[QUOTA_DRAIN_REQUESTED] phase=detection``, requests a drain, and
+      stops without waiting; ``"wait"`` (default) enters
+      :func:`_handle_quota_pause`. Both marker logs are gated on
+      :func:`_quota_structured_events_enabled` (FR-2, spec AC-7); the drain
+      request itself is never gated.
+    - On a wait timeout (or an unrecoverable probe), ``on_exhaustion_timeout``
+      is applied via :func:`_dispatch_quota_timeout`.
+
+    Extracted from ``cmd_start`` to keep that function under ruff's PLR0912
+    12-branch limit.
+
+    Args:
+        detected: The :class:`_QuotaDetected` sentinel raised by ``_run``.
+        session_name: Current session name (passed to
+            :func:`_handle_quota_pause`).
+
+    Returns:
+        A descriptive stop-reason string for the ``cmd_start`` audit trail.
+
+    Raises:
+        ~devbench.quota.QuotaExhaustedError: When ``enabled`` is false, or
+            when ``on_exhaustion``/``on_exhaustion_timeout`` is ``"fail"``.
+    """
+    qh_cfg = RUNTIME_CONFIG.quota_handling
+    if not qh_cfg.enabled:
+        raise detected.quota_exc from detected
+
+    if qh_cfg.on_exhaustion == "fail":
+        if _quota_structured_events_enabled():
+            logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        raise detected.quota_exc from detected
+    if qh_cfg.on_exhaustion == "drain":
+        if _quota_structured_events_enabled():
+            logger.info(
+                "%s reason=%s phase=detection",
+                _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+                detected.quota_exc.source,
+            )
+        request_drain(WORKSPACE_ROOT, reason=f"quota-exhaustion:{detected.quota_exc.source}")
+        return _QUOTA_STOP_REASON_DRAIN_DETECTION
+
+    recovered = asyncio.run(
+        _handle_quota_pause(
+            exc=detected.quota_exc,
+            qh_cfg=qh_cfg,
+            workspace_root=WORKSPACE_ROOT,
+            session_name=session_name,
+        )
+    )
+    if recovered:
+        return _QUOTA_STOP_REASON_WAIT_RECOVERED
+
+    return _dispatch_quota_timeout(detected, qh_cfg.on_exhaustion_timeout)
+
+
+def _dispatch_quota_timeout(detected: "_QuotaDetected", action: str) -> str:
+    """Apply ``on_exhaustion_timeout`` after the wait cap elapses or the probe is unavailable.
+
+    Every ``[QUOTA_FAIL_FAST]`` / ``[QUOTA_TIMEOUT_KEEP_WAITING]`` /
+    ``[QUOTA_DRAIN_REQUESTED] phase=timeout`` marker log is gated on
+    :func:`_quota_structured_events_enabled` (FR-2, spec AC-7); the
+    re-raise, the returned stop-reason, and the drain request itself are
+    never gated.
+
+    Args:
+        detected: The original quota sentinel (holds ``quota_exc`` for
+            re-raise).
+        action: ``on_exhaustion_timeout`` value -- one of
+            :data:`_QUOTA_TIMEOUT_ACTIONS` (``"drain"`` default, ``"fail"``,
+            ``"keep_waiting"``).
+
+    Returns:
+        A descriptive stop-reason string for ``"drain"`` / ``"keep_waiting"``.
+
+    Raises:
+        ValueError: When *action* is not a member of
+            :data:`_QUOTA_TIMEOUT_ACTIONS` (defense in depth against
+            config-schema drift; the loader already validates the enum).
+        ~devbench.quota.QuotaExhaustedError: When ``action == "fail"``
+            (legacy non-zero exit).
+    """
+    if action not in _QUOTA_TIMEOUT_ACTIONS:
+        raise ValueError(
+            f"unknown on_exhaustion_timeout action {action!r}. Allowed values: {sorted(_QUOTA_TIMEOUT_ACTIONS)}."
+        )
+    if action == "fail":
+        if _quota_structured_events_enabled():
+            logger.info("%s reason=%s", _QUOTA_FAIL_FAST_AUDIT_PREFIX, detected.quota_exc.source)
+        raise detected.quota_exc from detected
+    if action == "keep_waiting":
+        if _quota_structured_events_enabled():
+            logger.info(
+                "%s reason=%s",
+                _QUOTA_TIMEOUT_KEEP_WAITING_AUDIT_PREFIX,
+                detected.quota_exc.source,
+            )
+        return _QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING
+    if _quota_structured_events_enabled():
+        logger.info(
+            "%s reason=%s phase=timeout",
+            _QUOTA_DRAIN_REQUESTED_AUDIT_PREFIX,
+            detected.quota_exc.source,
+        )
+    request_drain(WORKSPACE_ROOT, reason=f"quota-timeout:{detected.quota_exc.source}")
+    return _QUOTA_STOP_REASON_DRAIN_TIMEOUT
+
+
+def _resolve_max_quota_resumes() -> int:
+    """Return the effective in-process quota-resume cap (env > default).
+
+    Reads ``DEVBENCH_MAX_QUOTA_RESUMES`` from the process environment. When the
+    variable is absent, empty, or not a parseable positive integer, the constant
+    :data:`~devbench.constants.DEFAULT_MAX_QUOTA_RESUMES` is returned so the
+    caller is never left without a bound (unset-safe).
+
+    A value <= 0 is treated as invalid and falls back to the default rather than
+    disabling the resume loop, so a typo can never silently turn a single quota
+    window back into a run-ending event (fail-safe, not fail-open; spec AC-22).
+
+    Returns:
+        The maximum number of consecutive in-process quota resumes ``cmd_start``
+        will perform before stopping with
+        :data:`~devbench.constants.ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX`.
+    """
+    raw = os.environ.get("DEVBENCH_MAX_QUOTA_RESUMES", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return DEFAULT_MAX_QUOTA_RESUMES
+        if parsed > 0:
+            return parsed
+    return DEFAULT_MAX_QUOTA_RESUMES
+
+
+def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> bool:
+    """Decide whether ``cmd_start`` may resume the orchestrate skill in-process.
+
+    Called after :func:`_dispatch_quota_detection` reports a recovered quota
+    wait (``_stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED``). A recovered
+    wait is NOT terminal: the orchestrator opens a FRESH SDK session and
+    re-runs ``_run`` on the remaining backlog so a single quota window cannot
+    permanently end an unattended ``--daemon`` run (which has no external
+    ``make start`` restart wrapper).
+
+    Bounds the resume count by *max_resumes* so a pathological quota loop can
+    never spin forever:
+
+    - When *resumes_used* (resumes already performed, BEFORE this one) is below
+      *max_resumes*, emits ``[ORCHESTRATOR_QUOTA_RESUME] resume=<n> max=<cap>``
+      and returns ``True`` (caller re-runs ``_run``).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED] max=<cap>`` and returns ``False``
+      so the caller falls through to the normal terminal classification.
+
+    Args:
+        resumes_used: Number of in-process resumes already performed during this
+            ``cmd_start`` invocation (0 on the first recovery).
+        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+
+    Returns:
+        ``True`` when another in-process resume is permitted; ``False`` when the
+        cap is exhausted and the run must stop.
+    """
+    if resumes_used >= max_resumes:
+        logger.info("%s max=%d", ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+        return False
+    logger.info(
+        "%s resume=%d max=%d",
+        ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
+        resumes_used + 1,
+        max_resumes,
+    )
+    return True
+
+
+class _OrchestrateLoopResult(NamedTuple):
+    """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
+
+    Attributes:
+        terminal_rc: The exit code when the loop ended via an early-return
+            terminal path (drain enforced, a non-recovering quota disposition,
+            or the resume cap exhausted) -- always ``0`` for those paths.
+            ``None`` means ``_run`` returned normally and ``cmd_start`` must run
+            its usual post-loop terminal classification (continuation-exhausted /
+            normal-exit) instead of returning ``terminal_rc``.
+        stop_reason: The audit/Slack stop-reason label for the always-fire
+            notification. Meaningful only when ``terminal_rc`` is not ``None``;
+            on the fall-through path ``cmd_start`` overwrites it.
+        quota_drain_requested: ``True`` when the quota disposition requested a
+            graceful drain that MUST survive process exit, so ``cmd_start``'s
+            exit-path drain cleanups skip their otherwise-unconditional
+            ``cancel_drain`` call (spec AC-25).
+    """
+
+    terminal_rc: int | None
+    stop_reason: str
+    quota_drain_requested: bool
+
+
+def _drive_orchestrate_with_quota_resume(
+    run: Callable[[], Coroutine[Any, Any, None]],
+    session_name: str,
+) -> _OrchestrateLoopResult:
+    """Drive the orchestrate session loop with in-process quota resume.
+
+    Each iteration runs ONE SDK session via ``asyncio.run(run())`` (*run* opens
+    a fresh session on every call -- decision D-6: the SDK conversation is
+    never resumed; context is preserved entirely through the backlog on disk).
+    The loop re-enters ONLY when a quota wait recovered: the orchestrator
+    resumes the orchestrate skill on the remaining backlog with a brand-new
+    session rather than exiting, so a single quota window cannot permanently
+    end an unattended ``--daemon`` run that has no external ``make start``
+    restart wrapper. The number of consecutive resumes is bounded by
+    :func:`_resolve_max_quota_resumes`.
+
+    Terminal dispositions (each leaves the loop and is returned to ``cmd_start``):
+
+    - ``run`` returns normally -> ``terminal_rc=None`` (caller runs its normal
+      continuation-exhausted / clean-exit classification).
+    - :class:`_DrainRequested` -> consume the marker, audit, ``terminal_rc=0``.
+    - :class:`_QuotaDetected` with a non-recovering disposition (fail re-raises;
+      drain/keep-waiting return a terminal stop reason) -> ``terminal_rc=0``.
+    - A recovered wait whose resume cap is exhausted -> ``terminal_rc=0`` with the
+      ``"quota-resume-cap-exhausted"`` stop reason (the exhausted audit line was
+      emitted by :func:`_should_resume_after_quota_recovery`).
+
+    Extracted from ``cmd_start`` so the added resume loop does not push that
+    function over ruff PLR0912's 12-branch ceiling.
+
+    Args:
+        run: The ``cmd_start._run`` closure; a no-arg coroutine factory awaited
+            fresh on every iteration. No conversation handle, transcript, or
+            other session state is threaded between iterations (D-6).
+        session_name: Current session name, forwarded to
+            :func:`_dispatch_quota_detection` for the quota checkpoint.
+
+    Returns:
+        An :class:`_OrchestrateLoopResult` describing how the loop ended.
+
+    Raises:
+        :class:`~devbench.quota.QuotaExhaustedError`: Propagated from
+            :func:`_dispatch_quota_detection` when ``quota_handling`` is disabled
+            or the configured disposition is ``fail`` (legacy non-zero exit).
+        ValueError: Propagated from :func:`~devbench.quota._apply_resume_strategy`
+            (via :func:`_handle_quota_pause`) when a recovered wait's configured
+            ``resume_strategy`` is not one of the three recognised values.
+    """
+    resumes_used = 0
+    max_resumes = _resolve_max_quota_resumes()
+    while True:
+        try:
+            asyncio.run(run())
+        except _DrainRequested as exc:
+            drained = consume_drain(WORKSPACE_ROOT)
+            reason_text = drained.reason if drained is not None else exc.reason
+            logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
+            return _OrchestrateLoopResult(0, f"drain enforced: {reason_text}", False)
+        except _QuotaDetected as exc:
+            stop_reason = _dispatch_quota_detection(exc, session_name)
+            if stop_reason == _QUOTA_STOP_REASON_WAIT_RECOVERED:
+                if _should_resume_after_quota_recovery(resumes_used, max_resumes):
+                    resumes_used += 1
+                    continue
+                return _OrchestrateLoopResult(0, "quota-resume-cap-exhausted", False)
+            return _OrchestrateLoopResult(0, stop_reason, stop_reason in _QUOTA_DRAIN_STOP_REASONS)
+        return _OrchestrateLoopResult(None, "clean", False)
 
 
 @dataclass(frozen=True)
@@ -6599,11 +8067,32 @@ def cmd_start(*argv: str) -> int:
     ``DEVBENCH_MAX_AUTO_RESTARTS`` cap. Any other exit returns 0.
 
     **Drain enforcement (spec section 4.3.3, AC-188-4/5/8):** Between SDK
-    messages, the inner ``_run`` coroutine checks whether a ``devbench claim``
-    Bash tool-use is being requested.  When one is detected AND the drain
-    signal file is present, ``_run`` raises :class:`_DrainRequested`.
-    ``cmd_start`` catches this sentinel, consumes the drain marker, logs a
+    messages, the inner ``_run`` coroutine calls :func:`_check_quota_and_drain`
+    once per message, which checks whether a ``devbench claim`` Bash tool-use
+    is being requested.  When one is detected AND the drain signal file is
+    present, it raises :class:`_DrainRequested`. ``cmd_start`` catches this
+    sentinel, consumes the drain marker, logs a
     ``[ORCHESTRATOR_DRAIN_ENFORCED]`` audit entry, and returns 0.
+
+    **Quota detection and in-process resume (spec AC-20, AC-21, AC-22,
+    FR-2.7-2.10, decisions D-4/D-6, issue #236):** The same per-message call
+    also raises :class:`_QuotaDetected` -- a :class:`BaseException`
+    subclass, not :class:`Exception` -- the moment a quota / rate-limit
+    signal is recognized in the SDK message stream. ``cmd_start`` drives the
+    whole SDK run through :func:`_drive_orchestrate_with_quota_resume`,
+    which wraps ``asyncio.run(_run())`` in a loop: on ``_QuotaDetected`` it
+    dispatches via :func:`_dispatch_quota_detection`, runs
+    :func:`_handle_quota_pause` while waiting, and -- when the quota window
+    recovers before ``on_exhaustion_timeout`` -- re-enters a **fresh** SDK
+    session (decision D-6: no stateful-client conversation resume; context
+    flows only through the on-disk backlog, never through SDK session
+    state) up to ``DEVBENCH_MAX_QUOTA_RESUMES`` (default
+    :data:`DEFAULT_MAX_QUOTA_RESUMES`) consecutive resumes before stopping.
+    Non-recovering dispositions (timeout, drain-requested) and drain
+    enforcement (:class:`_DrainRequested`) both terminate the loop; when the
+    disposition requested a drain, that intent survives this function's
+    exit-path cleanup via :func:`_cancel_drain_unless_requested` so the next
+    ``devbench start`` invocation still honours it.
 
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
@@ -6613,14 +8102,27 @@ def cmd_start(*argv: str) -> int:
             ``--allow-overlap``).
 
     Returns:
-        0 on success (including drain-enforced stop), 1 on argument-parse
-        error, invalid scope token, or scope overlap without ``--allow-overlap``,
-        :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42) when auto-restart is triggered.
+        0 on success (including drain-enforced stop and quota-driven stops),
+        1 on argument-parse error, invalid scope token, or scope overlap
+        without ``--allow-overlap``, :data:`ORCHESTRATOR_RESTART_EXIT_CODE`
+        (42) when auto-restart is triggered.
 
     Raises:
-        Nothing from this function's own scope -- all SDK exceptions propagate
-        as-is through the asyncio boundary; :class:`_DrainRequested` is
-        caught here and handled as a clean exit.
+        :class:`~devbench.quota.QuotaExhaustedError`: Propagates from
+            :func:`_drive_orchestrate_with_quota_resume` (via
+            :func:`_dispatch_quota_detection`) when ``quota_handling`` is
+            disabled or the configured ``on_exhaustion`` /
+            ``on_exhaustion_timeout`` disposition is ``fail`` -- the
+            documented operator escape hatch back to the legacy non-zero
+            exit.
+        ValueError: Propagates from :func:`_drive_orchestrate_with_quota_resume`
+            (via :func:`~devbench.quota._apply_resume_strategy`) when a
+            recovered wait's configured ``resume_strategy`` is not one of the
+            three recognised values.
+        Nothing else from this function's own scope for quota / drain
+        signals -- both dispositions are otherwise fully handled by
+        :func:`_drive_orchestrate_with_quota_resume`. Any other SDK
+        exception propagates as-is through the asyncio boundary.
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -6734,51 +8236,40 @@ def cmd_start(*argv: str) -> int:
     _sdk_result_text: str | None = None
 
     async def _run() -> None:
-        """Iterate SDK messages with drain enforcement.
+        """Iterate SDK messages with quota detection and drain enforcement.
 
-        Processes SDK messages and raises :class:`_DrainRequested` when a
-        ``devbench claim`` tool-use is detected while a drain is pending.
+        Processes SDK messages and calls :func:`_check_quota_and_drain` once
+        per message, which raises :class:`_QuotaDetected` when a quota /
+        rate-limit signal is observed (issue #236) or :class:`_DrainRequested`
+        when a ``devbench claim`` tool-use is detected while a drain is
+        pending (issues #188/#212). Both sentinels are :class:`BaseException`
+        subclasses (spec AC-20, decision D-4) so they propagate through
+        ``asyncio.run`` without being caught by any broad ``except Exception``
+        handler in between.
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
         Raises:
+            _QuotaDetected: A quota / rate-limit signal is observed in an SDK
+                message.
             _DrainRequested: A drain signal is present when a ``cmd_claim``
                 tool-use is observed.
         """
         nonlocal _sdk_result_text
-        # Issue #232: install the SDK-teardown exception filter so the
-        # known cross-task cancel-scope RuntimeError raised by
-        # claude-agent-sdk Query.close() during session shutdown is
-        # downgraded to a WARNING (with a link to the upstream tracking
-        # issue #231) instead of surfacing as
-        # ``[asyncio] ERROR Task exception was never retrieved`` AFTER
-        # the orchestrator has already exited successfully. The context
-        # manager installs the filter on enter and uninstalls on exit;
-        # the single ``async with`` keeps this function's branch count
-        # flat (no extra ``try / finally`` branches in this scope, so
-        # the existing ruff PLR0912 12-branch cap is preserved).
-        from devbench.sdk_teardown_filter import guard as _sdk_teardown_guard
-
-        async with _sdk_teardown_guard():
-            async for message in query(
-                prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-                options=ClaudeAgentOptions(
-                    plugins=[{"type": "local", "path": str(plugin_path)}],
-                    permission_mode="bypassPermissions",
-                ),
-            ):
-                logger.info("sdk message: %s", message)
-                _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                if _log_terminal_exit_if_applicable(_sdk_result_text):
-                    return
-                # Issue #188 + #212: drain-on-claim short-circuit. Combined
-                # condition (rather than nested ifs) keeps ``_run`` under
-                # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
-                # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
-                if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
-                    raise _DrainRequested(drain_state.reason)
-            # Clean exit from the SDK loop -- done.
-            return
+        async for message in query(
+            prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
+            options=ClaudeAgentOptions(
+                plugins=[{"type": "local", "path": str(plugin_path)}],
+                permission_mode="bypassPermissions",
+            ),
+        ):
+            logger.info("sdk message: %s", message)
+            _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+            if _log_terminal_exit_if_applicable(_sdk_result_text):
+                return
+            _check_quota_and_drain(message)
+        # Clean exit from the SDK loop -- done.
+        return
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop
@@ -6787,28 +8278,27 @@ def cmd_start(*argv: str) -> int:
     # helper is best-effort so a failure here cannot mask the original
     # exit reason.
     _stop_reason: str = "clean"
+    _quota_drain_requested: bool = False
     try:
         try:
-            try:
-                asyncio.run(_run())
-            except _DrainRequested as exc:
-                # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
-                # consume the marker so the next run starts unscoped, then record the audit.
-                drained = consume_drain(WORKSPACE_ROOT)
-                reason_text = drained.reason if drained is not None else exc.reason
-                logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
-                _stop_reason = f"drain enforced: {reason_text}"
-                return 0
+            _loop_result = _drive_orchestrate_with_quota_resume(_run, parsed.name)
+            _quota_drain_requested = _loop_result.quota_drain_requested
+            if _loop_result.terminal_rc is not None:
+                _stop_reason = _loop_result.stop_reason
+                return _loop_result.terminal_rc
         finally:
             # Issue #212: drop the drain signal on any exit from the SDK run so
             # the next start does not inherit a stale request.  Run while
             # DEVBENCH_SESSION_NAME is still set (before the restore below) so
             # cancel_drain scans both the per-session and workspace-root
-            # candidate paths.  Idempotent on already-clean state.
+            # candidate paths.  Idempotent on already-clean state.  When the
+            # loop's disposition asked for a drain (spec AC-25), the request
+            # must survive so the next ``devbench start`` still honours it --
+            # see :func:`_cancel_drain_unless_requested`.
             import contextlib as _contextlib
 
             with _contextlib.suppress(OSError):
-                cancel_drain(WORKSPACE_ROOT)
+                _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
             # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
             # maintained when cmd_start is invoked multiple times in the same process.
             if _prev_session_name is None:
@@ -6852,13 +8342,16 @@ def cmd_start(*argv: str) -> int:
         with contextlib.suppress(OSError, NameError):
             remove_pid_file(_orchestrator_pid_workspace)
         # Issue #212: drop the drain signal on any exit so the next start
-        # does not inherit a stale request.  cancel_drain scans both the
-        # per-session and workspace-root candidate paths and is idempotent
-        # on already-clean state.  Best-effort: NameError guards a very
-        # early exit before WORKSPACE_ROOT was set; OSError covers
-        # permission-denied during unlink.
+        # does not inherit a stale request -- unless the quota-resume loop's
+        # disposition asked for a drain (spec AC-25), in which case that
+        # request must survive so the next ``devbench start`` still honours
+        # it.  cancel_drain scans both the per-session and workspace-root
+        # candidate paths and is idempotent on already-clean state.
+        # Best-effort: NameError guards a very early exit before
+        # WORKSPACE_ROOT (or ``_quota_drain_requested``) was set; OSError
+        # covers permission-denied during unlink.
         with contextlib.suppress(OSError, NameError):
-            cancel_drain(WORKSPACE_ROOT)
+            _cancel_drain_unless_requested(WORKSPACE_ROOT, _quota_drain_requested)
 
 
 def cmd_prepare_plugin_shadow() -> int:
@@ -6986,8 +8479,15 @@ def _scope_show(workspace_root: Path) -> int:
     """Print the active scope state or ``no scope pending``.
 
     Displays the include list, exclude list, expanded ID count, started_at,
-    and started_by metadata from scope.json.  Exits 0 in both cases (file
-    absent and file present).
+    and started_by metadata from scope.json.  Exits 0 when no scope.json is
+    present (prints ``no scope pending``); see the Returns section below for
+    the failure contract when scope.json exists but cannot be read.
+
+    Delegates to :func:`devbench.scope._read_and_migrate_scope_payload` so a
+    legacy list-shaped scope.json (issue #270) self-heals on this path
+    exactly as it does for :meth:`devbench.scope.ScopeFilter.from_file` and
+    :func:`_read_scope_banner_data` -- ``devbench scope show`` no longer
+    raises a raw ``TypeError`` on a stale array file.
 
     Uses ``[]`` key access (not ``.get()`` with defaults) so a corrupt
     scope.json with missing required fields raises ``KeyError`` immediately
@@ -6997,27 +8497,33 @@ def _scope_show(workspace_root: Path) -> int:
         workspace_root: The workspace root path.
 
     Returns:
-        Always 0.
+        0 on success or when no scope is pending; 1 when scope.json cannot
+        be resolved, read, migrated, or parsed (session name resolution
+        failure, OSError, JSON decode error, missing key, or a legacy
+        list-shaped payload whose elements fail migration validation).
 
     Raises:
-        Nothing -- all errors are caught and written to stderr.
+        Nothing -- ``ValueError`` from session-name resolution and
+        ``OSError``, ``json.JSONDecodeError``, ``KeyError``, and
+        ``TypeError`` from the read/migrate path are all caught here and
+        reported to stderr with a non-zero return instead of propagating.
     """
     try:
         target_path = _session_scope_file_path(workspace_root)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    if not target_path.exists():
-        print("no scope pending")
-        return 0
     try:
-        data = json.loads(target_path.read_text(encoding="utf-8"))
+        data = _read_and_migrate_scope_payload(target_path)
+        if data is None:
+            print("no scope pending")
+            return 0
         include = data["include"]
         exclude = data["exclude"]
         expanded_ids = data["expanded_ids"]
         started_at = data["started_at"]
         started_by = data["started_by"]
-    except (OSError, json.JSONDecodeError, KeyError) as exc:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
         print(f"ERROR: cannot read scope.json at {target_path}: {exc}", file=sys.stderr)
         return 1
     print(f"include:      {include}")
@@ -7336,9 +8842,11 @@ def cmd_instances(*argv: str) -> int:
     """List every live devbench orchestrator instance on this host (#209).
 
     Walks every ``<root>/**/.devbench/orchestrator.pid`` under the operator's
-    reachable search roots (override via ``DEVBENCH_INSTANCE_SEARCH_ROOTS``,
-    default home directory), filters to live PIDs, and prints either a
-    human-readable table (TTY default) or a JSON array (``--json``).
+    reachable search roots: ``DEVBENCH_INSTANCE_SEARCH_ROOTS`` (colon-separated)
+    when set; otherwise ``$HOME`` plus the current ``DEVBENCH_WORKSPACE_ROOT``
+    (deduplicated when the workspace already lives under ``$HOME``). Filters
+    to live PIDs, and prints either a human-readable table (default) or a
+    JSON array (``--json``).
 
     Args:
         *argv: Optional ``--json`` flag.
@@ -9666,7 +11174,8 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "decline": (
         cmd_decline,
         2,
-        "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message>",
+        "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message> "
+        "[--citation <commit-hash-or-task-id>] (--citation required when reason names already-satisfied)",
     ),
     "hold": (
         cmd_hold,
@@ -9830,6 +11339,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "                      the same work unit."
         ),
     ),
+    "quota-watcher": (
+        cmd_quota_watcher,
+        0,
+        "Print the current quota-pause checkpoint, if any: quota-watcher (spec FR-2.11, Section 14; no flags)",
+    ),
     "instances": (cmd_instances, 0, "List every live devbench orchestrator on this host (#209). Flag: --json"),
     "stop-instance": (
         cmd_stop_instance,
@@ -9892,9 +11406,35 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
-    "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
-    "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),
-    "log-tdd": (cmd_log_tdd, 3, "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message>"),
+    "tdd-gate": (
+        cmd_tdd_gate,
+        1,
+        "Run the machine-observed RED gate for a gated task and record RED_OBSERVED on success: tdd-gate <id>",
+    ),
+    "green-green-check": (
+        cmd_green_green_check,
+        2,
+        "Run the refactor green-green check, named tests pass before and after the change: "
+        "green-green-check <id> <test_node_id> [<test_node_id> ...]",
+    ),
+    "log-verdict": (
+        cmd_log_verdict,
+        3,
+        "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback] "
+        "(feedback: single-line, no control chars, no bracketed phase tags)",
+    ),
+    "log-comment": (
+        cmd_log_comment,
+        3,
+        "Log agent comment: log-comment <agent> <id> <message> "
+        "(message: single-line, no control chars, no bracketed phase tags)",
+    ),
+    "log-tdd": (
+        cmd_log_tdd,
+        3,
+        "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message> (RED_OBSERVED is orchestrator-only; "
+        "rejected here; message: single-line, no control chars, no bracketed phase tags)",
+    ),
     "request-amendment": (
         cmd_request_amendment,
         1,
@@ -9973,6 +11513,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "notify-test",
         "add-dep",
         "decline",
+        # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
+        "green-green-check",
         "hold",
         "unhold",
         "status",

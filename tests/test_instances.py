@@ -8,15 +8,18 @@ test process itself.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
 
 import pytest
 
+from devbench import instances
 from devbench.instances import (
     INSTANCE_SEARCH_ROOTS_ENV,
     ORCHESTRATOR_PID_FILENAME,
+    _resolve_search_roots,
     discover_instances,
     is_pid_alive,
     make_instance_id,
@@ -26,6 +29,12 @@ from devbench.instances import (
     resolve_instance,
     write_pid_file,
 )
+
+REPO_ROOT = Path(__file__).parent.parent
+CONFIGURE_DEVBENCH_SKILL = (
+    REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / "configure-devbench" / "SKILL.md"
+)
+CLI_REFERENCE_DOC = REPO_ROOT / "docs" / "cli-reference.md"
 
 
 @pytest.mark.unit
@@ -144,6 +153,67 @@ class TestDiscoverInstances:
         out = discover_instances()  # no explicit roots
         assert len(out) == 1
 
+    def test_discover_finds_daemon_outside_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """obs-spec G-2 worked example: no env var, workspace outside $HOME."""
+        home_dir = tmp_path / "home"
+        workspace_dir = tmp_path / "workspace"
+        home_dir.mkdir()
+        workspace_dir.mkdir()
+        write_pid_file(workspace_dir, os.getpid(), session="default", mode="daemon", model="x")
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(workspace_dir))
+        monkeypatch.delenv(INSTANCE_SEARCH_ROOTS_ENV, raising=False)
+        out = discover_instances()  # no explicit roots -- exercises default resolution
+        assert len(out) == 1
+        assert out[0].pid == os.getpid()
+        assert out[0].workspace == str(workspace_dir)
+
+
+@pytest.mark.unit
+class TestResolveSearchRoots:
+    """Covers obs-spec FR-D2 / OD-2: the default branch of _resolve_search_roots."""
+
+    def test_default_roots_include_workspace_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        home_dir = tmp_path / "home"
+        workspace_dir = tmp_path / "workspace"
+        home_dir.mkdir()
+        workspace_dir.mkdir()
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(workspace_dir))
+        monkeypatch.delenv(INSTANCE_SEARCH_ROOTS_ENV, raising=False)
+        roots = _resolve_search_roots(None)
+        assert Path(home_dir) in roots
+        assert Path(workspace_dir) in roots
+
+    def test_env_var_precedence_unchanged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        home_dir = tmp_path / "home"
+        workspace_dir = tmp_path / "workspace"
+        env_root = tmp_path / "configured"
+        home_dir.mkdir()
+        workspace_dir.mkdir()
+        env_root.mkdir()
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(workspace_dir))
+        monkeypatch.setenv(INSTANCE_SEARCH_ROOTS_ENV, str(env_root))
+        roots = _resolve_search_roots(None)
+        assert roots == [Path(env_root)]
+        assert Path(workspace_dir) not in roots
+
+    def test_workspace_under_home_not_duplicated(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        home_dir = tmp_path / "home"
+        workspace_dir = home_dir / "projects" / "ws"
+        home_dir.mkdir()
+        workspace_dir.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home_dir))
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(workspace_dir))
+        monkeypatch.delenv(INSTANCE_SEARCH_ROOTS_ENV, raising=False)
+        roots = _resolve_search_roots(None)
+        assert roots == [Path(home_dir)]
+
+    def test_explicit_roots_bypass_env_and_workspace(self, tmp_path: Path) -> None:
+        explicit = [tmp_path / "explicit"]
+        assert _resolve_search_roots(explicit) == explicit
+
 
 @pytest.mark.unit
 class TestResolveInstance:
@@ -171,6 +241,81 @@ class TestResolveInstance:
 
 
 @pytest.mark.unit
+class TestConfigureDevbenchSkillDefaultText:
+    """Pins the configure-devbench SKILL.md launcher-command description to
+    the three-tier default (obs-spec OD-2).
+
+    doc_review round-2 finding: the skill template still said the lifecycle
+    commands walk PID files under DEVBENCH_INSTANCE_SEARCH_ROOTS "(default
+    `~`)" after the default changed to $HOME plus DEVBENCH_WORKSPACE_ROOT.
+    """
+
+    def test_skill_exists(self) -> None:
+        assert CONFIGURE_DEVBENCH_SKILL.is_file(), f"configure-devbench SKILL.md missing at {CONFIGURE_DEVBENCH_SKILL}"
+
+    def test_skill_does_not_claim_home_tilde_default(self) -> None:
+        text = CONFIGURE_DEVBENCH_SKILL.read_text(encoding="utf-8")
+        assert "(default `~`)" not in text, (
+            "configure-devbench SKILL.md must not claim the "
+            "DEVBENCH_INSTANCE_SEARCH_ROOTS default is '~'; the default is now "
+            "$HOME plus DEVBENCH_WORKSPACE_ROOT (obs-spec OD-2)."
+        )
+
+    def test_skill_names_workspace_root_in_default(self) -> None:
+        text = CONFIGURE_DEVBENCH_SKILL.read_text(encoding="utf-8")
+        assert "DEVBENCH_WORKSPACE_ROOT" in text.split("DEVBENCH_INSTANCE_SEARCH_ROOTS", 1)[1][:120], (
+            "configure-devbench SKILL.md must name DEVBENCH_WORKSPACE_ROOT as "
+            "part of the default search-root resolution, immediately after "
+            "naming DEVBENCH_INSTANCE_SEARCH_ROOTS (obs-spec OD-2)."
+        )
+
+
+@pytest.mark.unit
+class TestCliReferenceInstancesDocAccuracy:
+    """Pins docs/cli-reference.md's Instances section to what cmd_instances
+    actually does (doc_review round-2 findings).
+
+    Finding 1 (FAIL): the section claimed table output is "the TTY default",
+    but cmd_instances performs no isatty() check -- the table is the
+    unconditional default and only --json changes the format.
+
+    Finding 2 (WARN): the section enumerated only the 6 table columns for
+    --json, omitting the 2 additional keys (workspace_name, model) that the
+    --json payload actually carries.
+    """
+
+    def _instances_section(self) -> str:
+        text = CLI_REFERENCE_DOC.read_text(encoding="utf-8")
+        marker = "## Instances (per-host discovery)"
+        start = text.index(marker)
+        end = text.index("\n---\n", start + len(marker))
+        return text[start:end]
+
+    def test_does_not_claim_tty_conditional_default(self) -> None:
+        section = self._instances_section()
+        assert "TTY default" not in section, (
+            "docs/cli-reference.md Instances section must not claim table "
+            "output is 'the TTY default': cmd_instances performs no "
+            "isatty() check, so table output is the unconditional default "
+            "and only --json changes the format."
+        )
+
+    def test_json_payload_keys_all_enumerated(self) -> None:
+        section = self._instances_section()
+        # The full --json payload (src/devbench/cli.py cmd_instances) carries
+        # 8 keys; workspace_name and model are not among the 6 table columns
+        # and must be explicitly enumerated so a reader building a consumer
+        # against the doc does not miss them.
+        for key in ("workspace_name", "model"):
+            assert key in section, (
+                f"docs/cli-reference.md Instances section must enumerate the "
+                f"--json payload key {key!r}; the current text only lists "
+                f"the 6 table columns, which omits fields the --json payload "
+                f"actually carries."
+            )
+
+
+@pytest.mark.unit
 class TestRemovePidFile:
     def test_removes_existing(self, tmp_path: Path) -> None:
         ws = tmp_path / "alpha"
@@ -183,3 +328,22 @@ class TestRemovePidFile:
     def test_noop_when_missing(self, tmp_path: Path) -> None:
         # Should not raise.
         remove_pid_file(tmp_path / "no-such-workspace")
+
+
+@pytest.mark.unit
+class TestNoEmDashInInstancesModule:
+    """Pins the em-dash source-hygiene fix (workspace CLAUDE.md; spec AC-19).
+
+    A post-run review (spec Section 1 G9) found two U+2014 characters
+    surviving in instances.py docstrings: the branch's em-dash gate only
+    scans work-unit ``.md`` files, so this pair of source em-dashes went
+    undetected. This test fails loudly if either em-dash -- or any future
+    one -- returns to the module.
+    """
+
+    def test_no_em_dash_in_instances_module(self) -> None:
+        source = inspect.getsource(instances)
+        assert "\u2014" not in source, (
+            "src/devbench/instances.py must not contain the em-dash character "
+            "(U+2014); use '--' (double hyphen) instead."
+        )

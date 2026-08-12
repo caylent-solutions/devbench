@@ -30,6 +30,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 - [Backlog write](#backlog-write)
 - [Drain (graceful orchestrator stop)](#drain-graceful-orchestrator-stop)
 - [Named sessions](#named-sessions)
+- [Instances (per-host discovery)](#instances-per-host-discovery)
 - [Scope selectors (printer-pages syntax)](#scope-selectors-printer-pages-syntax)
 - [Orchestration and reporting](#orchestration-and-reporting)
 - [Orchestrator helpers (invoked by agents)](#orchestrator-helpers-invoked-by-agents)
@@ -63,7 +64,7 @@ The summary includes a `Draft N` row rendered between the `TOTAL` line and the `
 
 - `--session <name>` -- filter the output to the work units claimed by the named session. Only events emitted under `session=<name>` are counted; the status counts and active-task list reflect that session's view only. Without `--session`, the command aggregates across all active sessions and renders the unified backlog state. See [Named sessions](#named-sessions) for the full session reference.
 
-When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. The file is a JSON object with `include`, `exclude`, `expanded_ids`, `started_at` and `started_by`; a scope file in any other shape is rejected rather than guessed at. A session that runs unscoped writes no `scope.json` at all, since absent is how every reader expresses "no scope". When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
+When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. The file is a JSON object with `include`, `exclude`, `expanded_ids`, `started_at` and `started_by`. A legacy list-shaped payload (issue #270) is migrated in place to this canonical object form -- see [Legacy list-shape migration (issue #270)](#legacy-list-shape-migration-issue-270) below -- while every OTHER non-object shape still raises with the pre-existing message text naming the file path. A session that runs unscoped writes no `scope.json` at all, since absent is how every reader expresses "no scope". When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
 
 ```
 SCOPE: include=[E1-E3, E5] exclude=[] (started 2026-05-14T13:42Z)
@@ -156,17 +157,23 @@ When NONE of (1)/(2)/(3) yields a path -- i.e. `DEVBENCH_LOG_FILE` unset, `log_f
 
 Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS=<seconds>`) lets operators with slower iteration cadences extend the audit-comment window.
 
-**ETA formula (issue #157):** the `Est. time to complete remaining` cell now multiplies the recent-pace minutes by `tasks_active + tasks_blocked_recovery + tasks_blocked_auto`. Both blocked buckets resolve on devbench's own (proposal cascade or auto-recovery loop), so excluding them produced an unrealistically optimistic ETA. The `needs operator attention` bucket stays excluded -- those are genuine halts with unbounded ETA. The cell carries a comment-suffix naming the bucket counts and pace, e.g. `~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)`. The cost projection uses the same denominator. ETA falls back to `n/a` when fewer than the required pace samples have completed in the recent window (the metric is fragile and a single completion would project meaningless numbers).
+**ETA formula (issue #157):** the `Est. time to complete remaining` cell now multiplies the recent-pace minutes by `tasks_active + tasks_blocked_recovery + tasks_blocked_auto`. Both blocked buckets resolve on devbench's own (proposal cascade or auto-recovery loop), so excluding them produced an unrealistically optimistic ETA. The `needs operator attention` bucket stays excluded -- those are genuine halts with unbounded ETA. The cell carries a comment-suffix naming the bucket counts and pace, e.g. `~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)`. The cost projection uses the same denominator. ETA falls back to `n/a` when fewer than the required pace samples have completed in the recent window (the metric is fragile and a single completion would project meaningless numbers). `Recent pace (last N tasks)` and `Average time per task` are medians of same-session execution-time samples (issue #326): a completion counts only when its `in-progress` claim and its `done` transition fall in the same orchestrator session, so a stale claim from an earlier session (for example an operator `set-status ... done`) no longer skews the pace or the ETA it drives. Completions dropped for having no execution window are named rather than silently excluded: both cells, and the trailing summary line when it drives the sentence, append `(<k> excluded: no execution window)` when any were dropped.
 
 **In-progress duration (issue #158):** the `In-progress tasks:` panel suffixes every row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). Multiple in-progress transitions for the same task (blocked-then-resumed) resolve to the most recent one. When neither the structured log nor the work-unit's audit comments yield a parseable timestamp the row renders `(in-progress, timer unavailable)` -- never silently omitted. The same suffix appears on `devbench status` and `devbench status --detail` Active rows.
 
 The duration is anchored to the transition record written by `devbench.backlog_manager`, matched on the full record shape rather than on the phrase alone (issue #293). The orchestrator logs whole SDK messages, so a tool result that read a work unit's `[WU_CLAIMED]` audit comment reproduces the text `Set <id> to 'in-progress'` inside a line stamped with the time of the *dump*. Matching the phrase anywhere in a line made those echoes win, under-reporting a unit's age by the gap between the claim and the echo, and the error grew with every further echo.
 
-**Actionability line (issue #251):** both `devbench status` and `devbench report` end with the same one-line answer to "can the run proceed?", produced by a single shared helper so the two commands cannot disagree:
+**Actionability line (issues #251, #309):** both `devbench status` and `devbench report` end with the same one-line answer to "can the run proceed?", produced by a single shared helper so the two commands cannot disagree. Exactly one of five statements prints, in priority order:
 
 - `Next actionable: <id> -- <title>` -- at least one unit is claimable.
 - `All work units are DONE.` -- nothing remains.
-- `No actionable units. <N> blocked.` -- work remains but none of it can start.
+- `<id> active; nothing else can start yet. <tail>` -- exactly one unit is already running (`in-progress` / `in-review`) and nothing else is claimable.
+- `<N> units active; nothing else can start yet. <tail>` -- two or more units are already running and nothing else is claimable.
+- `No actionable units. <tail>` -- work remains, nothing is running, and none of it can start.
+
+`<tail>` is `<B> blocked` when no unit is on hold, or `<B> blocked, <H> on hold` when `H` (units with status `HOLD`) is greater than zero.
+
+Issue #309: a serially-ordered backlog's steady state is exactly one unit `in-progress` and everything else `blocked` on it. `get_parallel_candidates` deliberately includes `in-progress` units (issue #185, resume support), so once the active ids are subtracted from the candidate list the result was always empty in that steady state, and the old stuck-state line (`No actionable units. <N> blocked.`) printed while work was actively executing -- camouflaging the genuine deadlock case that same line is meant to flag. The dedicated active-unit outcomes above name the running unit(s) instead, and the tail now counts `HOLD` units alongside `BLOCKED` ones so they no longer vanish from the total.
 
 The per-status counts do not answer this on their own: a backlog can hold many `in-queue` units and still have nothing actionable, because only leaf Tasks execute and every one of them may be waiting on a dependency. `devbench next` deliberately keeps its machine tokens (`ALL_DONE` / `NO_ACTIONABLE` / `NO_ACTIONABLE_IN_SCOPE`) instead; those are a contract consumed by the orchestrate skill's loop-continuation check.
 
@@ -468,13 +475,22 @@ uv run devbench mark-done <id>
 
 Mark the unit as `done`. Enforces the done-gate: all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) must have logged `[REVIEW_PASS]` in the most recent round (after any intervening `[REVIEW_REJECTED]`). Security review must also have passed. Exits 1 with a clear error naming the missing judge(s) when the gate fails.
 
+**Task-type completion invariant (FR-4.5/FR-4.6, E4-F4-S1-T2).** Before either the review-judge check above or the status write, `cmd_mark_done` delegates to `BacklogManager.mark_done`, which calls `_check_task_type_done_invariant` and refuses (rc=1, `RuntimeError` message naming all three FR-4.5 remedies) unless the task's own declared `## Task Type:` invariant is machine-provably satisfied:
+
+- **Gated types** (`behavior-fix`, `feature`, and the default when `## Task Type:` is omitted): requires a machine-observed `RED_OBSERVED` entry in the TDD Cycle Log, written only by `uv run devbench tdd-gate <id>`.
+- **`refactor`**: requires a machine-observed `GREEN_GREEN_OBSERVED` entry in the TDD Cycle Log, written only by `uv run devbench green-green-check <id> <test_node_id> [...]`.
+
+This invariant check is deliberately implemented once in `BacklogManager.mark_done` -- not in a CLI-layer wrapper -- so every caller inherits it identically; see `check-merge` below.
+
 ### `decline`
 
 ```
-uv run devbench decline <id> --reason "<message>"
+uv run devbench decline <id> --reason "<message>" [--citation <commit-hash-or-task-id>]
 ```
 
 Mark a work unit `declined`: it will never be done. Used when the operator decides the unit's scope is being removed, the functionality is being deleted instead, or a different task delivered the same outcome. Declined children count as terminal-complete for parent rollup. See [ADR-05](adr/05-declined-status.md).
+
+**`--citation` (FR-4.5, E4-F4-S1-T2).** When `--reason` contains the routing keyword `already-satisfied` (case-insensitive), an already-satisfied decline is an unfalsifiable claim without proof it was checked, so `--citation <value>` is REQUIRED too. `<value>` must be either a 7-40 character lowercase hex commit hash or a canonical work-unit id (validated by `BacklogManager.is_valid_citation`); an uncited already-satisfied decline is rejected (rc=1) with a message naming all three FR-4.5 remedies. On success the citation is folded into the persisted `[DECLINED]` comment as `"... (citing <value>)"`, which `validate-backlog` check 22 re-verifies independently on read (see [backlog-contract.md](backlog-contract.md)).
 
 ### `hold`
 
@@ -588,7 +604,7 @@ Persistent scope management without starting the orchestrator (spec section 4.2.
 
 - **`scope clear`** -- delete `<workspace>/.devbench/scope.json`. Idempotent: exits 0 with the message `no scope pending` when no file is present.
 
-- **`scope show`** -- print the active scope state (include list, exclude list, expanded ID count, `started_at`, `started_by`) or `no scope pending` when no scope file exists. Exits 0 in both cases.
+- **`scope show`** -- print the active scope state (include list, exclude list, expanded ID count, `started_at`, `started_by`) or `no scope pending` when no scope file exists. Exits 0 in both cases. A legacy list-shaped `scope.json` (issue #270) is migrated in place on this read path too, exactly as it is for `devbench status` -- see [Legacy list-shape migration (issue #270)](#legacy-list-shape-migration-issue-270); this makes `scope show` write to disk on that one legacy code path even though it is otherwise a pure display command.
 
 **scope.json schema:**
 
@@ -624,12 +640,14 @@ See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token 
 ### `start`
 
 ```
-uv run devbench start [--include "<tokens>"] [--exclude "<tokens>"] [--name <name>] [--allow-overlap]
+uv run devbench start [--daemon] [--include "<tokens>"] [--exclude "<tokens>"] [--name <name>] [--allow-overlap]
 ```
 
 Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin.
 
-**SDK teardown warning (issue #232):** successful orchestrator runs may emit a single `WARNING` line on the `devbench.sdk` logger during session teardown that references [devbench#231](https://github.com/caylent-solutions/devbench/issues/231). This is a known upstream race in `claude-agent-sdk`'s `Query.close()` -- the orchestrator's outcome is unaffected. The filter downgrades what would otherwise be an `[asyncio] ERROR Task exception was never retrieved` trace to a single WARNING so remote execution environments that classify stderr ERROR lines as failures still see the run as successful. The workaround is removed once the upstream SDK fix lands; see devbench#231 for the tracking status and [anthropics/claude-agent-sdk-python#983](https://github.com/anthropics/claude-agent-sdk-python/issues/983) for the upstream bug.
+**Daemon flag:**
+
+- `--daemon, -d` -- detach the orchestrator into the background and return immediately (issue #209). `start` double-forks: the invoking shell prints `started devbench orchestrator in daemon mode (parent pid <pid>); follow logs with: devbench tail <instance_id> --follow` and exits at once. The intermediate first-fork child calls `setsid()` to become a session leader detached from the controlling terminal, then exits once the second fork completes; the resulting grandchild is deliberately not a session leader, which prevents it from reacquiring a controlling terminal. The grandchild redirects stdin from `/dev/null` and appends stdout/stderr to `<workspace>/logs/orchestrator.log`, then writes the same PID file a foreground run writes, at `<workspace>/.devbench/orchestrator.pid`, recording its PID, session name, mode (`"daemon"`), and start time; this is the file `devbench instances` walks to discover and list the running instance. `--daemon` requires POSIX (`fork()`); on a non-POSIX platform it fails fast with an actionable error before any daemonisation begins.
 
 **Scope filter flags:**
 
@@ -670,6 +688,31 @@ uv run devbench start --name beta --include "E4-E6"
 
 To pre-arm scope.json without immediately launching the orchestrator, use `devbench scope set` instead.
 
+### `quota-watcher`
+
+```
+uv run devbench quota-watcher
+```
+
+Print the current quota-pause checkpoint, if any (spec FR-2.11, AC-28). No flags -- the plain invocation is the entire command surface. There is deliberately no `--daemon` background-monitor mode; that design was removed upstream in commit `9883d13`.
+
+Reads `<workspace>/.devbench/quota_pause.json`, the checkpoint [`devbench start`](#start) writes when it enters a quota wait, and prints the pause details. The watcher is advisory: when a running orchestrator owns the session, its in-loop wait is authoritative -- this command only surfaces the same on-disk checkpoint for operator visibility (journey J-3: quota fires, operator runs `quota-watcher`, then `devbench status`).
+
+**Exit codes:**
+
+- **0** -- a checkpoint exists (the orchestrator is paused); details printed.
+- **1** -- no checkpoint (not paused).
+
+**Output when paused:**
+
+```
+[QUOTA_WAITING] reason=claude-code-cli reset_at=2026-05-23T16:10:00+00:00
+```
+
+`reset_at` prints `unknown` when the provider did not supply a reset time.
+
+**Error handling:** a corrupt checkpoint (invalid JSON, a missing required field, or an unparseable timestamp) prints `load_checkpoint`'s `ValueError` message -- which names the checkpoint path -- to stderr and returns 1, never a Python traceback. An unreadable workspace path is checked before any read attempt and also exits 1 with the path named.
+
 ### `prepare-plugin-shadow`
 
 ```
@@ -684,7 +727,7 @@ claude --plugin-dir "$(uv run devbench prepare-plugin-shadow)"
 
 When the workspace has no `agents:` overrides configured, prints the canonical plugin path; otherwise rewrites every overridden agent `.md` and symlinks the rest. Shares its implementation with `start`'s pre-flight so the two modes always produce identical plugin trees.
 
-The YAML schema for the override block is shown below with each field set to the **current frontmatter default**. The defaults are tuned by the role each agent plays: `executor` (writes code under TDD) on `sonnet` for a fast happy path; the five judges (`code-reviewer`, `test-reviewer`, `doc-reviewer`, `changes-manifest`, `security-reviewer`) on `opus` because a bad verdict costs more than the inference savings; `blocker-resolver`, `manifest-amender`, `task-factory` on `opus` because they fire only on unhappy paths and a wrong call spins the recovery cascade; `review-supervisor` on `sonnet` because it is not invoked at all (ADR-33) and is retained only for config back-compatibility. `haiku` is rejected at config-load for all per-agent fields (caylent-solutions/devbench#198). Setting a field to its frontmatter default value is a no-op; flip individual fields when you need to retarget an agent (e.g., drop the judges to `sonnet` when opus quota is exhausted):
+The YAML schema for the override block is shown below with each field set to the **current frontmatter default**. The defaults are tuned by the role each agent plays: `executor` (writes code under TDD) on `sonnet` for a fast happy path; the five judges (`code-reviewer`, `test-reviewer`, `doc-reviewer`, `changes-manifest`, `security-reviewer`) on `opus` because a bad verdict costs more than the inference savings; `blocker-resolver`, `manifest-amender`, `task-factory` on `opus` because they fire only on unhappy paths and a wrong call spins the recovery cascade; `review-supervisor` on `sonnet` because its post-flatten (ADR-33) role is read-only aggregation of already-persisted verdicts, not spawning -- a lighter model is sufficient for that task. `haiku` is rejected at config-load for all per-agent fields (caylent-solutions/devbench#198). Setting a field to its frontmatter default value is a no-op; flip individual fields when you need to retarget an agent (e.g., drop the judges to `sonnet` when opus quota is exhausted):
 
 ```yaml
 agents:
@@ -888,6 +931,51 @@ uv run devbench sessions --cleanup
 
 ---
 
+## Instances (per-host discovery)
+
+`devbench instances` discovers every live devbench orchestrator process on the current host by walking a set of search roots for `.devbench/orchestrator.pid` files (issue #209). Discovery is scoped to the current host only (it never contacts other hosts); unlike [Named sessions](#named-sessions) (which enumerate sessions registered against ONE workspace), `instances` finds every orchestrator process reachable from the search roots on this host, regardless of which workspace started it.
+
+### `instances`
+
+```
+uv run devbench instances [--json]
+```
+
+List every live devbench orchestrator instance on this host, one row per instance (`instance_id`, `pid`, `mode`, `session`, `workspace`, `started_at`). In table mode (the default), prints `no devbench orchestrator instances running` when the walk finds none; in `--json` mode an empty result prints `[]` instead of that message. Always exits 0 -- an empty result is not an error.
+
+**Search roots (resolution order):** `DEVBENCH_INSTANCE_SEARCH_ROOTS` (colon-separated) when set; otherwise `$HOME` plus the current `DEVBENCH_WORKSPACE_ROOT`. When `DEVBENCH_WORKSPACE_ROOT` is already under `$HOME` it is not duplicated in the returned roots. This default keeps a workspace outside `$HOME` (for example, one checked out under `/workspaces`) discoverable with no configuration, while a workspace that already has `DEVBENCH_INSTANCE_SEARCH_ROOTS` configured sees identical behavior to before (obs-spec FR-D2 / OD-2).
+
+**Flags:**
+
+- `--json` -- print a JSON array of instance objects instead of the human-readable table. Each object carries `instance_id`, `pid`, `workspace`, `workspace_name`, `session`, `mode`, `started_at`, and `model` (the full workspace path is available only here; the table's WORKSPACE column shows `workspace_name`, the basename).
+
+**Exit codes:**
+
+| Scenario | rc |
+|----------|----|
+| Zero or more instances listed (table or `--json`). | 0 |
+| Unknown flag supplied. | 2 |
+
+**Worked example:**
+
+```bash
+# With DEVBENCH_INSTANCE_SEARCH_ROOTS unset, from a workspace outside $HOME:
+DEVBENCH_WORKSPACE_ROOT=/workspaces/anywhere/workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run devbench start --daemon
+
+DEVBENCH_WORKSPACE_ROOT=/workspaces/anywhere/workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run devbench instances
+# INSTANCE_ID                     PID  MODE        SESSION         WORKSPACE                STARTED
+# ----------------------------------------------------------------------------------------------
+# workspace-3458                233458  daemon      default         workspace                 2026-07-28T18:40:38Z
+# The WORKSPACE column shows the workspace basename (workspace_name); the full
+# absolute path is available only in --json output.
+```
+
+---
+
 ## Scope selectors (printer-pages syntax)
 
 The `--include` and `--exclude` flags on `devbench start`, `devbench status`, `devbench report`, and `devbench next` all accept the same printer-pages-style token syntax described here. `devbench scope set` uses the same parser.
@@ -976,6 +1064,15 @@ When `devbench start --include "..."` or `devbench scope set --include "..."` ru
 - `devbench status`, `devbench report`, and `devbench next` consult the file automatically when no per-command `--include`/`--exclude` flags are supplied. Per-command flags override the file for that invocation only.
 - `devbench validate-backlog` ignores `scope.json` entirely -- it always validates the whole backlog regardless of active scope.
 
+#### Legacy list-shape migration (issue #270)
+
+An older format wrote a bare JSON array of work-unit IDs directly to `scope.json` instead of the canonical object above. Rather than crashing on that shape forever, every scope.json read path migrates it in place to the canonical object form (empty `include`/`exclude`, the array as `expanded_ids`) with an atomic rewrite. The read paths that perform this migration are `ScopeFilter.from_file` (the scope-filtering path), the CLI scope-banner reader used by `devbench status`, `devbench report` and `devbench next`, and `devbench scope show`; all three delegate to the same shared migration routine, so no reader rejects the legacy list shape. A second read of the now-migrated file takes the ordinary object path -- the migration does not recur.
+
+- **Operator-visible signal:** migration emits exactly one INFO line naming the migrated file. A write failure during the atomic rewrite is never swallowed: it propagates as an `OSError` on the `ScopeFilter.from_file` and scope-banner (`devbench status` / `devbench report` / `devbench next`) paths, while `devbench scope show` catches it and reports `ERROR: cannot read scope.json at <path>: <exc>` on stderr with exit code 1 instead of letting it propagate.
+- **Provenance sourcing:** the migrated file's `started_at` and `started_by` are read from the sibling session-state files (the same `started_at` / `started_by` files a named session writes) when present. When either sibling file is absent, both fields are recorded as the explicit `"unknown"` sentinel. These values are never fabricated from the migration's own clock or the current OS user.
+- **Empty-list reconciliation:** a migrated file whose array is empty (`[]`) is not a counter-example to the [multi-session-runs.md](multi-session-runs.md) invariant "An unscoped session writes no `scope.json`: absent is the unscoped signal every reader honours." Migration only repairs an already-present, corrupt legacy file -- it never creates a `scope.json` for an unscoped session. A migrated empty array leaves the file present on disk with an active (if empty) scope; that is a repaired-corruption case, not an unscoped-session write.
+- Every other non-object top-level shape (string, number, null, bool) still raises the pre-existing `TypeError` naming the file path; the migration applies to the documented list shape only.
+
 ---
 
 ## Orchestration and reporting
@@ -1031,13 +1128,13 @@ Record a judge verdict as an audit comment on the work-unit file. Writes `[REVIE
 
 `<judge>` must be one of the names in the allowlist defined by `devbench.constants.KNOWN_JUDGE_NAMES`. The allowlist is split into two tiers:
 
-- **Canonical reviewers (5)** -- `code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`. Only these names satisfy the done-gate's `BacklogManager._last_round_all_passed` check. They are written by `review-supervisor` and `security-reviewer`.
+- **Canonical reviewers (5)** -- `code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`. Only these names satisfy the done-gate's `BacklogManager._last_round_all_passed` check. Each of the four review-team judges self-logs its own verdict (`code_review`/`test_review`/`doc_review`/`changes_manifest`), and `security-reviewer` writes `security_review`; `review-supervisor` does not write any of the five, it only reads them back to aggregate.
 - **Audit-only workflow agents (4)** -- `executor`, `blocker_resolver`, `manifest_amender`, `task_factory`. Their verdicts land in the work-unit Comments section as audit metadata but do NOT count toward the done-gate. Workflow agents use these to record progress (for example, the executor logging `executor` verdicts during AC enforcement, or task-factory recording `task_factory` after a successful materialise).
 
 Two enforcement layers prevent malformed audit rows:
 
 1. **CLI layer** (`cmd_log_verdict`): refuses any `<judge>` outside `KNOWN_JUDGE_NAMES` with a clear error naming the valid choices. Catches typos like `judge` (literal) or hyphenated forms like `code-reviewer`.
-2. **Hook layer** (`guard-verdict-format.sh`, PreToolUse): mirrors the same allowlist, plus an additional **executor scope** rule -- when the calling agent's `agent_type == "devbench:executor"` AND the judge is one of the canonical 5 reviewers, the hook blocks. The executor is an authoring agent, not a reviewer; the audit-only `executor` judge name remains allowed (records progress without satisfying the gate). Other agents (review-supervisor, security-reviewer, main session) can still write canonical reviewer verdicts.
+2. **Hook layer** (`guard-verdict-format.sh`, PreToolUse): mirrors the same allowlist, plus an additional **executor scope** rule -- when the calling agent's `agent_type == "devbench:executor"` AND the judge is one of the canonical 5 reviewers, the hook blocks. The executor is an authoring agent, not a reviewer; the audit-only `executor` judge name remains allowed (records progress without satisfying the gate). The four review-team judges and security-reviewer can still write their own canonical reviewer verdicts.
 
 Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
 
@@ -1055,7 +1152,47 @@ Append a non-verdict agent comment to the work-unit file's `## Comments` section
 uv run devbench log-tdd <id> <RED|GREEN|REFACTOR> <message>
 ```
 
-Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. Enforces the phase token (must be `RED`, `GREEN`, or `REFACTOR`, case-insensitive).
+Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. `devbench.constants.VALID_TDD_PHASES` names five phases -- `RED`, `GREEN`, `REFACTOR`, `RED_OBSERVED`, `GREEN_GREEN_OBSERVED` -- but this agent-facing verb accepts only the agent-writable subset (`devbench.constants.AGENT_WRITABLE_TDD_PHASES`): `RED`, `GREEN`, `REFACTOR` (case-insensitive). The other two are `devbench.constants.ORCHESTRATOR_ONLY_TDD_PHASES`.
+
+`RED_OBSERVED` is orchestrator-only. An agent invocation naming `RED_OBSERVED` -- for example `uv run devbench log-tdd <id> RED_OBSERVED <message>` -- is always rejected: `cmd_log_tdd` exits 1 and writes nothing to the `## TDD Cycle Log` section, printing:
+
+```
+ERROR: TDD phase 'RED_OBSERVED' is orchestrator-only and cannot be written via log-tdd; agent-writable phases are: GREEN, RED, REFACTOR.
+```
+
+The `RED_OBSERVED` entry itself is written exclusively by the orchestrator's internal `write_red_observed_entry` function after it independently runs the test suite and observes a nonzero exit code; there is no `log-tdd-red-observed` CLI subcommand an agent could invoke. The record is a fixed three-field message, not free text -- every field in `devbench.constants.RED_OBSERVED_RECORD_FIELDS` is required: `exit_code` (the test-runner's observed exit code), `test_node_id` (the failing pytest node ID), and `failure_digest` (a hash-shaped digest of the failure output). A record missing any field is rejected before it is written, naming the missing field:
+
+```
+RED_OBSERVED record is missing required field '<field>'.
+```
+
+`GREEN_GREEN_OBSERVED` (FR-4.6, E4-F4-S1-T2) is the second orchestrator-only phase and is subject to the identical rejection path when an agent names it via `log-tdd`:
+
+```
+ERROR: TDD phase 'GREEN_GREEN_OBSERVED' is orchestrator-only and cannot be written via log-tdd; agent-writable phases are: GREEN, RED, REFACTOR.
+```
+
+The `GREEN_GREEN_OBSERVED` entry is written exclusively by `uv run devbench green-green-check` (see below) after it independently reconstructs the pre-change ("before") state and confirms the named tests pass on both sides; there is no `log-tdd-green-green-observed` CLI subcommand an agent could invoke.
+
+### `green-green-check`
+
+```
+uv run devbench green-green-check <id> <test_node_id> [<test_node_id> ...]
+```
+
+Each `<test_node_id>` must be a fully-qualified pytest node id -- there is no single fixed shape, since the shape depends on how the test is defined. Accepted forms:
+
+- `<path>.py::<test_name>` (a module-level test function, e.g. `tests/test_foo.py::test_bar`).
+- `<path>.py::<Class>::<test_name>` (a test method nested in a class -- the common case in this repo, since most files under `tests/` define their tests inside a `class Test*`, e.g. `tests/test_foo.py::TestFoo::test_bar`).
+- `<path>.py::<Class>::<test_name>[<param>]` (a parametrized test method, with its `pytest.mark.parametrize` id suffix, e.g. `tests/test_foo.py::TestFoo::test_bar[case-1]`).
+
+A bare test *file* path is not accepted, and neither is a two-segment id for a class-nested test (it is missing the class segment): `devbench.tdd_gate.default_pytest_runner` scopes the run to the file but then matches the exact node id against the `-rA` outcome line via `_parse_node_outcome`, so anything short of the exact node id pytest itself would print on that `PASSED` line yields `node_outcome=None` and the check fails closed with "could not collect test". The authoritative source for a given test's node id is what pytest reports for it -- run `pytest <path>.py --collect-only -q` (or `-rA`) and copy the emitted id verbatim rather than hand-deriving it from the file's source.
+
+Orchestrator-only helper that machine-observes the FR-4.6 done-gate precondition for `refactor`-type work units: the named test(s) must PASS in the current ("after") working tree state AND PASS again in a reconstructed "before" state (the production-source `## Changes Manifest` rows stashed out, path-scoped, so only the refactor's own production edits are reverted -- test files and unrelated files are left as-is). This proves the refactor changed implementation without changing observable behavior for the tests that pin it.
+
+On success, appends an orchestrator-only `GREEN_GREEN_OBSERVED` entry to the work unit's `## TDD Cycle Log` section and exits 0. `BacklogManager.mark_done`'s `_check_task_type_done_invariant` requires this record before a `refactor` task can reach `done` (see `mark-done` above).
+
+Exits 1 (writing nothing) when: the tree is dirty outside the declared Changes Manifest; the Manifest contains no production-source rows to reconstruct a "before" state from; the stash push finds no uncommitted production-source change to reconstruct a "before" state from (a refactor's change must still be uncommitted in the working tree when this check runs); the stash operation fails; or any named test fails or fails to collect on either the "after" or the reconstructed "before" side (the check fails closed on collection failure rather than treating a missing test as vacuously passing). The stash is always restored, success or failure.
 
 ---
 
@@ -1080,7 +1217,7 @@ uv run devbench git-ops <id>
 Commit, push, create PR, wait for CI, merge. The full git-ops sequence runs after every review judge passes and before `mark-done`. In single-branch + `defer_pr: true` mode, commits locally only (no push, no PR); the shared branch is pushed by `git-ops-finalize` after every unit is done. Under `git_ops.local_only: true` (which requires `defer_pr: true`), git-ops also commits locally only -- and `git-ops-finalize` is **never** run, since there is no remote to push to.
 
 Enforces three deterministic safety rails:
-- **Manifest-scope:** staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015).
+- **Manifest-scope:** staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015). `git-ops` stages only the paths the work unit's own Changes Manifest declares -- it no longer runs a whole-tree `git add -A`. A caller that cannot resolve a Manifest for the unit, or whose Manifest holds only execution-time sentinels, is refused (exit 1) rather than silently given a whole-tree commit; previously this case warned and committed anyway. `git-ops-finalize`, which batches many units and legitimately has no single Manifest, opts into whole-tree staging explicitly via its `stage_all` behaviour -- this is the one intentional exception to Manifest-scoped staging.
 - **Branch-anchor:** HEAD must be on the expected branch (prevents orphan-branch commits).
 - **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state, terragrunt cache, Python pycache, coverage artefacts, `node_modules`, `.DS_Store`). The default behaviour (Phase 1 of the orphan-cascade fix) is **inline cleanup**: git-ops runs `cleanup_tracked_orphans` programmatically, commits the result as a devbench-authored chore commit (canonical message `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore`), then continues with the original task's commit on the same invocation. Two commits land on the task's branch; the executor's staging is preserved (filtered to exclude orphan paths). When the operator sets `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`, git-ops falls back to the legacy proposal flow (cleanup-as-task) with cross-task de-duplication so two parents detecting the same orphan set wire to the SAME cleanup task. Override the active pattern list per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs).
 
@@ -1155,12 +1292,14 @@ uv run devbench check-merge <id>
 
 Issue #101 reconciliation step for `pause_before_merge: true` workspaces. Queries `gh pr list --head <branch> --json number,state,merged,url` for the PR associated with the work unit's branch and dispatches:
 
-- **PR merged externally**: promote the work unit to `done` via the existing done-gate (every required judge must have passed in the most recent round). Logs `[PR_MERGED]` audit comment.
+- **PR merged externally**: promote the work unit to `done` via the existing done-gate (every required judge must have passed in the most recent round, AND the task's own `## Task Type:` completion invariant is satisfied). Logs `[PR_MERGED]` audit comment.
 - **PR closed without merge**: transition the work unit to `blocked` with a `[BLOCKED]` audit comment naming the PR.
 - **PR still open**: no-op; the orchestrator's loop picks the work unit up again on the next iteration.
 - **No PR found for branch**: prints `{"pr_state": "no-pr-found"}` and returns 0; the orchestrator treats it the same as "still open".
 
 Returns rc=0 in every normal case; rc=1 only on hard failure (gh API failure, malformed JSON, done-gate refusal). Output is a single JSON line so the orchestrator skill's step 1b reconciliation can parse it.
+
+**Same task-type invariant as `mark-done` (FR-4.5/FR-4.6, E4-F4-S1-T2).** The merged-PR path promotes through the identical `BacklogManager.mark_done` call `cmd_mark_done` uses -- not a separate, possibly-divergent status write -- so a gated task (`behavior-fix` / `feature`) merged externally with no `RED_OBSERVED` record, or a `refactor` task merged with no `GREEN_GREEN_OBSERVED` record, is refused (rc=1) exactly as `mark-done` would refuse it. See `mark-done` above for the full invariant.
 
 The orchestrator skill (`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`) calls this command on every `in-review` work unit at the top of each loop iteration when `git_ops.pause_before_merge: true` is set in the YAML. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full pause-before-merge mode reference and [ADR-13](adr/13-pause-before-merge.md) for the design rationale.
 

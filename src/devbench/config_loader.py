@@ -97,6 +97,16 @@ _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
 _SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
 _SKILLS_DEFAULT_MAX_ITERATIONS: int = 5
 
+# Quota wait-and-resume configuration (issue #236, spec S5.2, FR-2.9).
+_QUOTA_HANDLING_VALID_ON_EXHAUSTION: frozenset[str] = frozenset({"wait", "fail", "drain"})
+_QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT: frozenset[str] = frozenset({"drain", "fail", "keep_waiting"})
+_QUOTA_HANDLING_VALID_RESUME_STRATEGY: frozenset[str] = frozenset(
+    {"continue_current_wu", "restart_wu", "drain_and_resume"}
+)
+_QUOTA_HANDLING_POLL_INTERVAL_MIN: int = 30
+_QUOTA_HANDLING_POLL_INTERVAL_MAX: int = 3600
+_QUOTA_HANDLING_MAX_WAIT_MIN: int = 1
+
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
 # Pinned here so SKILL.md prose and tests reference the same literals.
@@ -367,7 +377,8 @@ class ReportConfig:
         data_residency_multiplier: Cost multiplier when usage.inference_geo
             is set (US-only inference). Applied per-call (issue #124).
         fast_mode_multiplier: Cost multiplier when usage.speed == 'fast'
-            (Opus 4.6 fast-mode premium). Applied per-call (issue #124).
+            (Opus 5 / Opus 4.8 fast-mode premium, issue #233). Applied
+            per-call (issue #124).
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
@@ -411,23 +422,46 @@ class TaskFactoryConfig:
     """Per-backlog task-factory configuration.
 
     Controls whether the orchestrator invokes blocker-resolver + task-factory
-    after an amendment reject to generate `proposed` work units for the
-    out-of-scope production fixes the amender surfaced.
+    after an amendment reject to materialise draft work-unit files for the
+    out-of-scope production fixes the amender surfaced. A materialised
+    draft's initial ``## Status:`` is always governed by
+    ``BacklogConfig.default_status_for_new_work_units`` (default
+    ``in-queue``), independent of both fields below.
 
     Attributes:
-        enabled: Whether the task-factory loop runs. Defaults to ``False``
-            so existing backlogs see no behavior change. Requires
+        enabled: Whether the task-factory loop runs. Defaults to ``True``
+            (D-11, ADR-32, superseding the PR #202 shipped auto-promote-by-
+            default posture, not ADR-11): the loop is on for every backlog
+            unless explicitly disabled. Requires
             ``manifest_amendment.enabled: true`` (task-factory runs from
-            the amendment-reject path).
-        auto_accept_proposals: When ``True``, ``devbench sweep-proposals``
-            auto-promotes every task-factory-produced draft to ``in-queue``
-            immediately, skipping the human review step. Default ``True``
-            (set ``false`` to make drafts land at ``proposed`` and wait for
-            the operator). Only takes effect when ``enabled`` is true. See ADR-11.
+            the amendment-reject path); see ``load_runtime_config`` for the
+            defaults-versus-amendment interaction contract when
+            ``manifest_amendment.enabled`` is explicitly ``false``.
+        auto_accept_proposals: Governs two independent auto-promote paths.
+            (1) ``devbench write-proposal`` itself: when ``True``, it
+            synchronously also calls ``materialise-proposal`` (and
+            ``promote-proposal`` for any of the just-written ids that
+            happen to already sit at legacy status ``proposed``) inside the
+            same invocation, so drafts land immediately instead of waiting
+            for the next ``sweep-proposals`` tick; when ``False`` (the
+            default), ``write-proposal`` only persists the JSON and
+            materialisation happens later via ``sweep-proposals`` or a
+            manual ``materialise-proposal`` call. (2) ``devbench
+            sweep-proposals``: when ``True``, it also auto-promotes any
+            draft explicitly sitting at status ``proposed`` (a
+            legacy/hand-edited-draft case -- the normal materialise path
+            has not written that status since AC-189-8 shipped); when
+            ``False``, such orphaned ``proposed`` drafts wait for an
+            explicit ``promote-proposal``/``reject-proposal`` decision.
+            Neither path affects the initial ``## Status:`` value written
+            into a freshly materialised draft -- that is always
+            ``BacklogConfig.default_status_for_new_work_units``. Default
+            ``False`` (D-11, ADR-32). Only takes effect when ``enabled`` is
+            true.
     """
 
-    enabled: bool = False
-    auto_accept_proposals: bool = True
+    enabled: bool = True
+    auto_accept_proposals: bool = False
 
 
 @dataclass(frozen=True)
@@ -580,6 +614,52 @@ class SkillsConfig:
     max_iterations: int = _SKILLS_DEFAULT_MAX_ITERATIONS
 
 
+@dataclass
+class QuotaHandlingConfig:
+    """Quota wait-and-resume configuration (issue #236, spec S5.2).
+
+    Loaded from the ``quota_handling:`` YAML section. Default is ON per
+    spec S5.2. Operators opt out via ``quota_handling: {enabled: false}``
+    to restore the legacy non-zero exit behaviour (#193 AC-4, spec AC-24).
+    The quota core (detection, wait, probe, checkpoint, resume strategies)
+    is delivered separately; this dataclass is the config surface the
+    dispatcher reads to decide what that core does on each quota signal.
+
+    Attributes:
+        enabled: Master toggle. ``True`` (the default) enables
+            wait-and-resume. ``False`` restores the legacy non-zero exit.
+        on_exhaustion: What to do when a quota signal is detected. One of
+            ``"wait"`` (default), ``"fail"`` (non-zero exit), ``"drain"``
+            (request a drain and return).
+        poll_interval_seconds: Polling cadence between recovery probes.
+            Must be in ``[30, 3600]``. Default 60.
+        max_wait_seconds: Maximum total wait in seconds. Must be >= 1.
+            Default 18000 (5 hours).
+        on_exhaustion_timeout: Action when ``max_wait_seconds`` elapses
+            without recovery. One of ``"drain"`` (default), ``"fail"``,
+            ``"keep_waiting"``.
+        resume_strategy: How to resume after recovery. One of
+            ``"continue_current_wu"`` (default), ``"restart_wu"``,
+            ``"drain_and_resume"``.
+        audit_comment_on_wait: When ``True`` (default), appends a
+            ``[QUOTA_WAITING]`` comment to the in-progress work unit.
+        audit_comment_on_resume: When ``True`` (default), appends a
+            ``[QUOTA_RESUMED]`` comment after recovery.
+        log_structured_events: When ``True`` (default), emits structured
+            log events on quota transitions.
+    """
+
+    enabled: bool = True
+    on_exhaustion: str = "wait"
+    poll_interval_seconds: int = 60
+    max_wait_seconds: int = 18000
+    on_exhaustion_timeout: str = "drain"
+    resume_strategy: str = "continue_current_wu"
+    audit_comment_on_wait: bool = True
+    audit_comment_on_resume: bool = True
+    log_structured_events: bool = True
+
+
 def _parse_model_rates(model_id: str, raw: object, source: str) -> ModelRates:
     """Parse one ``report.models.<id>`` entry into a ``ModelRates``.
 
@@ -646,8 +726,8 @@ def _parse_default_model_rates(raw: object, source: str) -> ModelRates:
 
     Falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` when absent.  Operators
     on standard Anthropic pricing typically leave this unset; the default
-    matches Opus 4.7 list pricing so an unknown-model bucket errs toward
-    over-reporting cost rather than under-reporting.
+    matches Opus 5 list pricing (issue #233) so an unknown-model bucket errs
+    toward over-reporting cost rather than under-reporting.
     """
     if raw is None:
         return DEFAULT_FALLBACK_MODEL_RATES
@@ -686,6 +766,123 @@ def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
         exemplar_spec_path=str(exemplar_spec) if exemplar_spec else None,
         fan_out_threshold=fan_out,
         max_iterations=max_iter,
+    )
+
+
+def _parse_quota_handling_config(path: Path, raw: dict) -> QuotaHandlingConfig:
+    """Parse and validate the ``quota_handling:`` YAML section.
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw ``quota_handling`` dict from YAML (already schema-validated
+            for unknown keys and enum membership). May be an empty dict when
+            the section is absent -- an absent block yields the full S5.2
+            default set, never a partial or ``None`` object.
+
+    Returns:
+        ``QuotaHandlingConfig`` populated from *raw*.
+
+    Raises:
+        ValueError: When an enum field has an invalid value or a range
+            field is out of bounds. Rejection happens here, at config-load
+            time, never deferred to dispatch time (FR-2.9).
+    """
+    defaults = QuotaHandlingConfig()
+
+    on_exhaustion = raw.get("on_exhaustion", defaults.on_exhaustion)
+    if on_exhaustion not in _QUOTA_HANDLING_VALID_ON_EXHAUSTION:
+        valid = ", ".join(sorted(_QUOTA_HANDLING_VALID_ON_EXHAUSTION))
+        raise ValueError(
+            f"Config file '{path}': quota_handling.on_exhaustion {on_exhaustion!r} is not one of [{valid}]."
+        )
+
+    on_exhaustion_timeout = raw.get("on_exhaustion_timeout", defaults.on_exhaustion_timeout)
+    if on_exhaustion_timeout not in _QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT:
+        valid = ", ".join(sorted(_QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT))
+        raise ValueError(
+            f"Config file '{path}': quota_handling.on_exhaustion_timeout {on_exhaustion_timeout!r} "
+            f"is not one of [{valid}]."
+        )
+
+    resume_strategy = raw.get("resume_strategy", defaults.resume_strategy)
+    if resume_strategy not in _QUOTA_HANDLING_VALID_RESUME_STRATEGY:
+        valid = ", ".join(sorted(_QUOTA_HANDLING_VALID_RESUME_STRATEGY))
+        raise ValueError(
+            f"Config file '{path}': quota_handling.resume_strategy {resume_strategy!r} is not one of [{valid}]."
+        )
+
+    poll_interval_seconds = int(raw.get("poll_interval_seconds", defaults.poll_interval_seconds))
+    if not (_QUOTA_HANDLING_POLL_INTERVAL_MIN <= poll_interval_seconds <= _QUOTA_HANDLING_POLL_INTERVAL_MAX):
+        raise ValueError(
+            f"Config file '{path}': quota_handling.poll_interval_seconds {poll_interval_seconds!r} "
+            f"must be in [{_QUOTA_HANDLING_POLL_INTERVAL_MIN}, {_QUOTA_HANDLING_POLL_INTERVAL_MAX}]."
+        )
+
+    max_wait_seconds = int(raw.get("max_wait_seconds", defaults.max_wait_seconds))
+    if max_wait_seconds < _QUOTA_HANDLING_MAX_WAIT_MIN:
+        raise ValueError(
+            f"Config file '{path}': quota_handling.max_wait_seconds {max_wait_seconds!r} "
+            f"must be >= {_QUOTA_HANDLING_MAX_WAIT_MIN}."
+        )
+
+    return QuotaHandlingConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        on_exhaustion=on_exhaustion,
+        poll_interval_seconds=poll_interval_seconds,
+        max_wait_seconds=max_wait_seconds,
+        on_exhaustion_timeout=on_exhaustion_timeout,
+        resume_strategy=resume_strategy,
+        audit_comment_on_wait=bool(raw.get("audit_comment_on_wait", defaults.audit_comment_on_wait)),
+        audit_comment_on_resume=bool(raw.get("audit_comment_on_resume", defaults.audit_comment_on_resume)),
+        log_structured_events=bool(raw.get("log_structured_events", defaults.log_structured_events)),
+    )
+
+
+def _parse_task_factory_config(
+    path: Path, task_factory_raw: dict, manifest_amendment: AmendmentConfig
+) -> TaskFactoryConfig:
+    """Parse and validate the ``task_factory:`` YAML section (ADR-32, D-11).
+
+    Args:
+        path: Config file path (used in error messages).
+        task_factory_raw: Raw ``task_factory`` dict from YAML (already
+            schema-validated for unknown keys and value types). May be an
+            empty dict when the section is absent -- an absent block yields
+            the on-by-default ``TaskFactoryConfig()`` defaults.
+        manifest_amendment: The already-resolved ``AmendmentConfig`` for this
+            load, needed for the cross-field interaction check below.
+
+    Returns:
+        ``TaskFactoryConfig`` populated from *task_factory_raw*.
+
+    Raises:
+        ValueError: When ``task_factory.enabled`` is EXPLICITLY ``true`` in
+            the YAML while ``manifest_amendment.enabled`` resolves ``false``.
+            Task-factory runs from the amendment-reject path, so this is a
+            real contradiction the operator must fix.
+
+    Interaction contract (ADR-32): a DEFAULTED-on ``enabled`` (the key was
+    omitted from *task_factory_raw*) against an explicitly disabled
+    ``manifest_amendment.enabled: false`` is NOT a contradiction -- it is the
+    spec Section 0 B-8 migration case, an existing backlog that predates the
+    D-11 defaults flip and never mentions ``task_factory``. That combination
+    downgrades ``enabled`` to ``False`` silently instead of bricking
+    config-load; the loop has nothing to do without the amendment workflow it
+    runs from either way.
+    """
+    defaults = TaskFactoryConfig()
+    enabled_explicit = "enabled" in task_factory_raw
+    enabled = bool(task_factory_raw.get("enabled", defaults.enabled))
+    if enabled and not manifest_amendment.enabled:
+        if enabled_explicit:
+            raise ValueError(
+                f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
+                "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
+            )
+        enabled = False
+    return TaskFactoryConfig(
+        enabled=enabled,
+        auto_accept_proposals=bool(task_factory_raw.get("auto_accept_proposals", defaults.auto_accept_proposals)),
     )
 
 
@@ -797,6 +994,11 @@ class NotificationsEventsConfig:
     ci_pass: bool = False
     orchestrator_stop: bool = False
     orchestrator_auto_restart: bool = False
+    # Quota wait-and-resume lifecycle (spec FR-2.10, ADR-24).  Schema keys
+    # landed in E2-F2-S1-T1; these fields close the gap so the dispatcher
+    # can actually observe them via NotificationsConfig.events.
+    quota_waiting: bool = False
+    quota_resumed: bool = False
 
 
 @dataclass
@@ -904,6 +1106,8 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
         orchestrator_auto_restart=bool(
             events_raw.get("orchestrator_auto_restart", defaults.events.orchestrator_auto_restart)
         ),
+        quota_waiting=bool(events_raw.get("quota_waiting", defaults.events.quota_waiting)),
+        quota_resumed=bool(events_raw.get("quota_resumed", defaults.events.quota_resumed)),
     )
 
     return NotificationsConfig(
@@ -1146,6 +1350,8 @@ class RuntimeConfig:
         report: Report and cost estimation settings.
         stop_hook: Stop hook circuit breaker settings.
         backlog: Backlog lifecycle settings (default status for new WUs).
+        quota_handling: Quota wait-and-resume configuration (issue #236,
+            spec S5.2). Absent YAML block yields the full default set.
         allowed_orgs: List of permitted GitHub organisations.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
@@ -1178,6 +1384,7 @@ class RuntimeConfig:
     hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
     orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
     backlog: BacklogConfig = field(default_factory=BacklogConfig)
+    quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
@@ -1622,23 +1829,10 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate TaskFactory config from YAML task_factory block. Requires
-    # manifest_amendment.enabled when task_factory.enabled is true -- the
-    # loop runs after an amendment reject, so it has nothing to do when the
-    # amendment workflow itself is off.
-    task_factory_raw = raw.get("task_factory") or {}
-    default_task_factory = TaskFactoryConfig()
-    task_factory = TaskFactoryConfig(
-        enabled=bool(task_factory_raw.get("enabled", default_task_factory.enabled)),
-        auto_accept_proposals=bool(
-            task_factory_raw.get("auto_accept_proposals", default_task_factory.auto_accept_proposals)
-        ),
-    )
-    if task_factory.enabled and not manifest_amendment.enabled:
-        raise ValueError(
-            f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
-            "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
-        )
+    # Populate TaskFactory config from YAML task_factory block (ADR-32, D-11).
+    # See _parse_task_factory_config for the defaults-versus-amendment
+    # interaction contract.
+    task_factory = _parse_task_factory_config(path, raw.get("task_factory") or {}, manifest_amendment)
 
     # Populate AgentModelsConfig from YAML agents block (ADR-25). Cross-
     # validates each non-None value against the top-level use_bedrock flag so
@@ -1701,6 +1895,14 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     backlog_raw = raw.get("backlog") or {}
     backlog = _parse_backlog_config(path, backlog_raw)
 
+    # Populate QuotaHandlingConfig from YAML quota_handling block (issue
+    # #236, spec S5.2). Schema enforces enum membership, range bounds, and
+    # additionalProperties: false; _parse_quota_handling_config re-validates
+    # at runtime so a bypassed schema layer still fails fast with a message
+    # naming the field. An absent block yields the full default set.
+    quota_handling_raw = raw.get("quota_handling") or {}
+    quota_handling = _parse_quota_handling_config(path, quota_handling_raw)
+
     # Populate SkillsConfig from YAML skills block (issue #221 E1-E10).
     # JSON Schema validates types + minimums; _parse_skills_config
     # re-validates at runtime to emit clearer messages naming the field.
@@ -1723,6 +1925,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         hook_tail=hook_tail,
         orchestrate=orchestrate,
         backlog=backlog,
+        quota_handling=quota_handling,
         skills=skills,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,

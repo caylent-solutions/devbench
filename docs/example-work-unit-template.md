@@ -11,6 +11,7 @@ Placeholder legend:
   {downstream_id}            ID of a work unit that depends on this one (delete row if none)
   {test_file}, {source_file} File paths inside the target repo
   {function/class}, {doc_file} Names referenced in the Approach section
+  {type}                     One of behavior-fix / feature / test-only / refactor / docs / chore
 -->
 
 # {ID}: {Title}
@@ -27,6 +28,8 @@ Valid status values: in-queue, in-progress, in-review, done, blocked, proposed, 
 See docs/faq.md and docs/adr/05-declined-status.md for the full semantics.
 -->
 ## Status: in-queue
+
+## Task Type: {type}    <!-- optional; absent defaults to behavior-fix under validate-backlog rule 21. See docs/backlog-contract.md 'Task-Type Taxonomy'. -->
 
 ## Target Repository
 

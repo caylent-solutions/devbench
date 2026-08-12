@@ -54,7 +54,7 @@ What devbench does today, grouped by theme:
 - Recursive work-unit hierarchy (Epic → Feature → Story → Task) with automatic status rollup of parents when children complete.
 
 ### Multi-judge review
-- Four review judges (code, test, doc, changes-manifest) are dispatched directly by the orchestrate skill as first-level sub-agents, in parallel (ADR-33). `review-supervisor` is a deprecated non-dispatching stub and MUST NOT be invoked; a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) enforces that it is read-only: a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
+- Four review judges (code, test, doc, changes-manifest) are invoked directly by the orchestrate skill as first-level sub-agents, then `review-supervisor` aggregates their independently-persisted verdicts (ADR-33 flatten). The supervisor is **read-only** and **non-spawning**: a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND every Agent-tool invocation unconditionally -- there is no allowlist. This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118), and removes any dependency on second-level sub-agent spawning working reliably across model tiers.
 - A separate security judge runs sequentially after the review tier passes.
 - Done-gate enforces all four review judges must REVIEW_PASS before a unit can be marked done.
 - Review failures inject prior feedback into the next executor attempt to prevent loops.
@@ -88,7 +88,7 @@ What devbench does today, grouped by theme:
 - `--watch N` flag refreshes the report every N seconds (replaces the external `watch` command pattern).
 - `devbench watch` prints a one-screen live dashboard of the currently-active orchestration (mode, active task, phase, latest agent thinking, recent tool calls, repo state, pending amendment). Read-only. Also supports `--watch N` for live refresh. See [watch-activity.md](watch-activity.md) and [ADR-04](adr/04-watch-dashboard.md).
 - `devbench hook-tail` pretty-tails the plugin's `hook-logs.jsonl` event stream in real time -- every PreToolUse / PostToolUse / subagent / stop event appears as a one-line colorized summary. Complements `devbench watch` (snapshot of current state) by providing the append-only event log. Timestamps resolve via: `--tz <zoneinfo-name>` CLI flag > top-level `display_timezone:` yaml or `DEVBENCH_DISPLAY_TIMEZONE` env > OS local. Read-only. See [hook-activity.md](hook-activity.md).
-- **Task factory**: the orchestrator invokes `task-factory` to generate draft work units with status `proposed` whenever a proposal JSON lands at `<workspace>/.devbench/proposals/<source-id>.json`. Two independent triggers write that file: (1) an amendment-rejected path where `blocker-resolver` decomposes the rejection, and (2) a validation-gate bug-escalation path where the executor itself emits the proposal via `uv run devbench write-proposal` because the task's Approach forbids production fixes. The human reviews, edits, and promotes or rejects each draft. See [task-factory.md](task-factory.md), [ADR-03](adr/03-task-factory.md), and [ADR-06](adr/06-validation-gate-bug-escalation.md). Opt-in per backlog via `task_factory.enabled: true`. An additional opt-in toggle `task_factory.auto_accept_proposals: true` (ADR-11) auto-promotes every produced draft at sweep time; default is false so the "human reviews every proposal" posture is preserved.
+- **Task factory**: the orchestrator invokes `task-factory` to generate draft work units whenever a proposal JSON lands at `<workspace>/.devbench/proposals/<source-id>.json`. Each draft's initial status is `backlog.default_status_for_new_work_units` (default `in-queue`; `draft` when opted in via AC-189-8) -- not `proposed`. Two independent triggers write that proposal file: (1) an amendment-rejected path where `blocker-resolver` decomposes the rejection, and (2) a validation-gate bug-escalation path where the executor itself emits the proposal via `uv run devbench write-proposal` because the task's Approach forbids production fixes. The human reviews, edits, and promotes or rejects each draft. See [task-factory.md](task-factory.md), [ADR-03](adr/03-task-factory.md), [ADR-06](adr/06-validation-gate-bug-escalation.md), and [ADR-32](adr/32-task-factory-default-on.md). On by default per backlog (ADR-32); set `task_factory.enabled: false` to opt out. A separate toggle `task_factory.auto_accept_proposals: true` (ADR-11, ADR-32; default `false`) governs two auto-promote paths: `write-proposal` itself synchronously materialises (and promotes any legacy `proposed`-status draft) in the same call instead of waiting for the next `sweep-proposals` tick, and `sweep-proposals` separately auto-promotes any orphaned draft explicitly left at status `proposed` (a legacy/hand-edited-draft case) -- neither path changes a freshly materialised draft's initial status.
 - **Multi-target proposal wiring (ADR-10)**: the proposal JSON carries an optional `affected_task_ids: list[str]` field. When an operator runs `promote-proposal`, the `[BLOCKED_PENDING_PROPOSAL]` marker + Dependencies row is written on `[source_task_id] + affected_task_ids`, so a single fix can unblock multiple sibling tasks via the ADR-07 cascade. The `devbench add-dep <blocked-id> <blocker-id>` CLI covers post-promote corrections + hand-authored cross-task dep wiring. See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md).
 - **Declined status**: `devbench decline <id> --reason "<msg>"` marks a work unit terminal-closed when the operator decides it will never be done (spec rewritten, scope removed, etc.). Declined children roll up as terminal-complete. Declined tasks are excluded from `tasks_remaining` and projection ETAs but are visible in a `Declined (N):` panel in `devbench report`. See [ADR-05](adr/05-declined-status.md).
 - **Git-ops safety rails (universal)**: every commit path asserts HEAD is on the expected branch before committing (rejects orphan-branch commits) and every staged file is in the work unit's Changes Manifest (rejects scope-violation pollution). Both are deterministic fail-fast checks, no LLM involved. See `GitOpsService.assert_on_branch` and `devbench.backlog.manifest.assert_staged_matches_manifest`.
@@ -111,7 +111,7 @@ What devbench does today, grouped by theme:
   - `<workspace>/logs/<YYYY-MM>/<task-id>.jsonl` (+ `orchestrator-meta.jsonl`) -- optional sharded layout for advanced operators (write the shards manually; the live writer continues writing flat). Reversible via `rm -rf logs/<YYYY-MM>/`. Phase 3. ADR-18. (The bundled `devbench migrate-log-shards` command was removed in the v1.0 cleanup -- see ADR-22 for the historical rationale.)
   - `<workspace>/logs/legacy/<session-id>.parquet` -- optional Parquet cold archive for ended sessions. Opt-in via `uv sync --extra archive` (from the local devbench checkout; the package is not published to PyPI). Phase 7. ADR-21.
 - **Proposal-lifecycle observability (universal)**: un-materialised proposal JSONs (drafts not yet written) are surfaced in `devbench status` (persistent `Un-materialised` count row), `devbench report` (a `Proposal JSONs pending materialisation` panel), and `devbench list-proposals` (per-entry `[state]` labels: `[unmaterialised]` / `[proposed]` / `[promoted]` / `[done]` / `[declined]` / `[rejected]`). Un-materialised JSONs can be discarded via `reject-proposal --unmaterialised <source-id>`. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
-- **Orchestration hygiene (universal)**: each orchestrate loop iteration begins with `uv run devbench sweep-proposals` (best-effort materialise any pending un-materialised JSONs) and the executor prompt's pre-flight step 0 (restore / delete any target-repo working-tree pollution not in the current task's Changes Manifest). The review-supervisor prompt uses the five canonical underscored judge names (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) that the done-gate parser expects, pinned by a regression test. Together these close the observed gaps that left tasks blocked or reviewed against polluted trees. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
+- **Orchestration hygiene (universal)**: each orchestrate loop iteration begins with `uv run devbench sweep-proposals` (best-effort materialise any pending un-materialised JSONs) and the executor prompt's pre-flight step 0 (restore / delete any target-repo working-tree pollution not in the current task's Changes Manifest). Each judge self-logs its own verdict under the five canonical underscored judge names (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) that the done-gate parser expects, and the review-supervisor prompt reads those same canonical names when aggregating, pinned by a regression test. Together these close the observed gaps that left tasks blocked or reviewed against polluted trees. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
 - **Loop-control isolation (universal)**: the orchestrator's loop is driven exclusively by `uv run devbench next` return values and the stop-hook circuit breaker exit code -- never by subagent prose. The `guard-comment-format.sh` PreToolUse hook rejects `uv run devbench log-comment` calls whose message body contains control-language imperatives (`halt orchestration`, `stop the loop`, `operator action required`, etc.). Together with the SKILL halt-discipline rule and the executor prompt's `COMMENT LANGUAGE DISCIPLINE` section, the hook forms a three-layer defense against prompt-injection of halt directives from downstream agents.
 - Token cost configurable per-model -- see [model-pricing.md](model-pricing.md).
 - Rollup metrics: stories / features / epics auto-rolled to done (including `declined` children as terminal-complete).
@@ -197,8 +197,8 @@ sequenceDiagram
   participant Skill as orchestrate skill
   participant CLI as devbench CLI
   participant Exec as executor agent
-  participant RS as review-supervisor
-  participant Judges as 4 review judges<br/>(parallel)
+  participant Judges as 4 review judges<br/>(first-level, direct)
+  participant RS as review-supervisor<br/>(aggregator only)
   participant Sec as security-reviewer
   participant Git as git + GitHub
 
@@ -210,10 +210,12 @@ sequenceDiagram
   Skill->>Exec: invoke with <id>
   Exec->>CLI: read-unit, log-tdd, ...
   Exec-->>Skill: implementation staged
+  Skill->>Judges: invoke all 4 directly<br/>(first-level, ADR-33)
+  Judges->>CLI: log-verdict (each judge<br/>self-logs its own verdict)
+  Judges-->>Skill: 4 verdicts persisted
   Skill->>RS: invoke with <id>
-  RS->>Judges: 4 parallel Agent calls
-  Judges-->>RS: 4 verdicts (PASS/FAIL)
-  RS-->>Skill: aggregate REVIEW_PASS or REVIEW_FAIL
+  RS->>CLI: read-unit (reads the<br/>4 persisted verdicts)
+  RS-->>Skill: aggregate result;<br/>missing verdict = hard failure
   alt all 4 pass
     Skill->>Sec: invoke with <id>
     Sec-->>Skill: SECURITY_PASS or SECURITY_FAIL
@@ -362,31 +364,40 @@ DevBench has a two-tier judge system.
 
 ```mermaid
 graph TD
-  Exec[executor PASS] --> RS[review-supervisor]
-  RS --> CR[code-reviewer]
-  RS --> TR[test-reviewer]
-  RS --> DR[doc-reviewer]
-  RS --> CM[changes-manifest]
-  CR --> Gate{All 4 PASS?}
-  TR --> Gate
-  DR --> Gate
-  CM --> Gate
+  Exec[executor PASS] --> Skill[orchestrate skill]
+  Skill --> CR[code-reviewer]
+  Skill --> TR[test-reviewer]
+  Skill --> DR[doc-reviewer]
+  Skill --> CM[changes-manifest]
+  CR --> RS[review-supervisor<br/>aggregates persisted verdicts]
+  TR --> RS
+  DR --> RS
+  CM --> RS
+  RS --> Gate{All 4 present<br/>and PASS?}
   Gate -- No --> Retry[retry executor<br/>with feedback]
   Gate -- Yes --> SR[security-reviewer]
   SR -- PASS --> GitOps[git-ops]
   SR -- FAIL --> Block["mark blocked +<br/>[REVIEW_REJECTED]"]
 ```
 
-### Tier 1 -- Review tier (parallel, gated)
+### Tier 1 -- Review tier (first-level, gated)
 
-Four judges in `plugin/devbench-orchestrate/agents/review_team/`:
+Four judges in `plugin/devbench-orchestrate/agents/review_team/`, invoked
+directly by the orchestrate skill as first-level sub-agents (ADR-33):
 
 - `code-reviewer.md` -- SOLID, DRY, fail-fast, evidence-based communication, security smells
 - `test-reviewer.md` -- TDD discipline, real tests not stubs, test framework discipline
 - `doc-reviewer.md` -- documentation accuracy, sync with code, no stale docs
 - `changes-manifest.md` -- declared changes match staged changes, no out-of-scope edits
 
-The orchestrate skill invokes all four directly as first-level sub-agents (single response with multiple `Agent` tool calls). Each judge self-logs its own canonical verdict, and the skill determines pass/fail solely from those verdict lines, fail-closed: a missing verdict is a REVIEW_FAIL, never an implicit pass.
+Each judge self-logs its own verdict via `log-verdict` before returning.
+`review-supervisor.md` is a **non-spawning aggregator**: it does not
+invoke, discover, or fan out to the judges. It reads the four judges'
+already-persisted verdicts from the work unit's Comments section and
+reports a consolidated result, determining pass/fail solely from those
+canonical verdict lines, fail-closed. A missing verdict from any required
+judge is a hard failure, never an implicit pass (AC-65) -- a judge
+that never logged is indistinguishable from a judge that never ran.
 
 ### Tier 2 -- Security gate (sequential, separate)
 
@@ -416,10 +427,12 @@ Walkthrough adding a hypothetical `api-contract` judge that verifies API changes
 
 1. Create `plugin/devbench-orchestrate/agents/review_team/api-contract.md` with the standard agent frontmatter (`name`, `description`, `model`, `tools`, `disallowedTools`) and the review logic body. Use one of the existing judges as a template -- the `name:` field becomes the judge's identifier in the verdict log.
 2. Add `"api_contract"` to `REVIEW_JUDGE_NAMES` in `constants.py`.
-3. (Optional) If `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` hard-codes the allowed judge names rather than importing from constants, update it to include the new name.
-4. Mention the new judge in `docs/example-work-unit-template.md` so backlog authors know it exists.
-5. Run `make validate` to confirm tests still pass.
-6. Test end-to-end on a sample work unit.
+3. Add a direct first-level invocation of `devbench-orchestrate:review_team:api-contract` to the orchestrate skill's judge-invocation step (`SKILL.md` step 5) -- post-flatten (ADR-33), judge invocation is hardcoded there, not discovered at runtime.
+4. Add `api_contract` to review-supervisor.md's canonical-name mapping table (Step 3) so the aggregator recognises the new judge's persisted verdicts.
+5. (Optional) If `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` hard-codes the allowed judge names rather than importing from constants, update it to include the new name.
+6. Mention the new judge in `docs/example-work-unit-template.md` so backlog authors know it exists.
+7. Run `make validate` to confirm tests still pass.
+8. Test end-to-end on a sample work unit.
 
 The orchestrate skill names each judge explicitly by its registered agent type (`devbench-orchestrate:review_team:<name>`), so adding a judge also requires adding it to the skill's review step and to the required-verdict set.
 
@@ -427,7 +440,8 @@ The orchestrate skill names each judge explicitly by its registered agent type (
 
 1. Delete the agent markdown file from `plugin/devbench-orchestrate/agents/review_team/`.
 2. Remove the name from `REVIEW_JUDGE_NAMES` in `constants.py`.
-3. Existing work units that have stale REVIEW_PASS entries from the removed judge in their Comments are still valid -- the done-gate just ignores extra entries.
+3. Remove its direct invocation from `SKILL.md` step 5 and its row from review-supervisor.md's canonical-name mapping table.
+4. Existing work units that have stale REVIEW_PASS entries from the removed judge in their Comments are still valid -- the done-gate just ignores extra entries.
 
 ### Swapping a judge's logic
 
@@ -437,8 +451,8 @@ Edit the agent markdown body. Keep the `name:` field unchanged so the verdict pi
 
 Move the judge's name out of `REVIEW_JUDGE_NAMES`. The done-gate no longer requires it. You then choose whether to:
 
-- Keep it in `review-supervisor`'s parallel invocation so its verdicts are logged for human review but don't block merging (advisory mode), or
-- Remove it from `review-supervisor` too so it doesn't run at all.
+- Keep its direct invocation in `SKILL.md` step 5 so its verdicts are logged for human review but don't block merging (advisory mode), or
+- Remove its invocation from `SKILL.md` step 5 too so it doesn't run at all.
 
 ---
 
@@ -499,8 +513,13 @@ git_ops:
 
 # Cost reporting (see docs/model-pricing.md)
 report:
-  token_cost_per_million_input: 5.0    # Opus 4.7 default
-  token_cost_per_million_output: 25.0
+  models:
+    claude-opus-5:                     # Opus 5 default (issue #233)
+      input: 5.0
+      output: 25.0
+  default_model:                       # rates for any model id not listed above
+    input: 5.0
+    output: 25.0
   display_timezone: America/Denver     # IANA name; defaults to system local TZ
   # Cache multipliers -- override only on non-Anthropic platforms.
   # cache_read_multiplier: 0.10
@@ -586,7 +605,7 @@ What `continue-orchestration.sh` does:
    - Detects whether the work-unit file has transitioned to `blocked` (mismatch with BACKLOG.md) and instructs `devbench next` if so.
    - Detects whether the in-progress task is older than `stop_hook.stale_task_minutes` (default 120) and adds a stale-task warning.
    - Reads the most recent agent / judge comment from the work-unit file to determine the last action.
-   - Suggests the specific next step based on the last action (run review-supervisor, run security-reviewer, run git-ops, etc.).
+   - Suggests the specific next step based on the last action (invoke the 4 review_team judges directly as first-level sub-agents then review-supervisor to aggregate, run security-reviewer, run git-ops, etc.).
    - Increments the block counter in the circuit-breaker state file. When `DEVBENCH_SESSION_NAME` is set, the state file is `/tmp/devbench-stop-hook-state-<session>.json` (where `<session>` is the value of `DEVBENCH_SESSION_NAME`); when `DEVBENCH_SESSION_NAME` is unset, the state file is `/tmp/devbench-stop-hook-state.json`. Using a per-session path isolates concurrent orchestrator invocations so their block counters do not interfere.
    - If the counter has reached `stop_hook.max_blocks` within `stop_hook.window_seconds` (default 5 / 180s), trips the circuit breaker: allows the stop, logs a `[CIRCUIT_BREAKER]` comment to the work unit so a human can investigate, and clears the state file.
    - Otherwise blocks the stop with a JSON `{"decision": "block", "reason": "..."}` envelope that injects the continuation instruction into Claude's next turn.

@@ -286,7 +286,7 @@ manifest_amendment:
   enabled: true    # default; set false to stop executors requesting Manifest changes mid-task
 
 task_factory:
-  enabled: false   # set true to let the orchestrator auto-generate follow-up tasks
+  enabled: true    # default (ADR-32); set false to stop the orchestrator auto-generating follow-up tasks
 
 validate:
   check_orphan_path_tokens: true    # Rule 20 (default on); set false to opt out of the AC / DoD path-coherence check
@@ -301,7 +301,8 @@ agents:                              # ADR-25: per-agent model overrides
   #   - blocker-resolver, manifest-amender, task-factory (workflow /
   #     recovery): opus -- judgment-heavy and fire only on unhappy
   #     paths, so cost is bounded.
-  #   - review-supervisor: sonnet -- not invoked (ADR-33); retained for config back-compat.
+  #   - review-supervisor: sonnet -- post-flatten (ADR-33) it only
+  #     aggregates already-persisted verdicts, it does not spawn.
   # Writing the same value as the frontmatter default is a no-op; flip an
   # individual field when your per-model quota is uneven (e.g. sonnet left,
   # opus exhausted). Omit the agents: block entirely (or set a field to
@@ -774,7 +775,7 @@ file. Common patterns:
 
 Iterate: fix the reported error, re-run `validate-backlog`, repeat until exit 0.
 
-For the complete rule list (20 rules as of v-next), see
+For the complete rule list (22 rules as of v-next), see
 [`docs/backlog-contract.md`](backlog-contract.md) (ref).
 
 ---
@@ -888,7 +889,7 @@ edit prose; Claude does. Typical content edits:
 | Fix an em-dash / orphan-path / manifest-conflict that `validate-backlog` flagged | Edit the offending file per the rule; re-run `devbench validate-backlog` |
 
 After any content edit, run `devbench validate-backlog` to confirm the file still
-satisfies the 20 backlog-contract rules, then move state with the `devbench` CLI table
+satisfies the 21 backlog-contract rules, then move state with the `devbench` CLI table
 above. Restart with `make start` once the changes are in place. A worked example of
 this two-track workflow is described in
 [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/README.md`](../examples/backlogs/brownfield/multi-repo_single-pr_no-merge/README.md).
@@ -969,7 +970,14 @@ default; set `false` to opt out.
 ### task_factory.enabled (Step 7)
 
 When enabled, the orchestrator can auto-generate new backlog tasks from proposals emitted
-by blocked executors. Requires `manifest_amendment.enabled: true`. Disabled by default.
+by blocked executors. Requires `manifest_amendment.enabled: true`. Enabled by default
+(ADR-32); set `false` to opt out. A draft's initial status is always
+`backlog.default_status_for_new_work_units` (default `in-queue`), unaffected by
+`task_factory.auto_accept_proposals` -- that flag (default `false`) instead governs two
+auto-promote paths: `write-proposal` synchronously materialises (and promotes any legacy
+`proposed`-status draft) in the same call rather than waiting for the next
+`sweep-proposals` tick, and `sweep-proposals` separately auto-promotes any orphaned draft
+explicitly left at `## Status: proposed`.
 
 ### Manual blockers vs regular deps (Step 8)
 

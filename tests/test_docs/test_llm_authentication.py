@@ -94,3 +94,24 @@ class TestPerAgentModelOverridesSection:
         text = _read_doc()
         per_agent_section = _extract_section(text, "## Per-agent model overrides")
         assert per_agent_section, "docs/llm-authentication.md must have a 'Per-agent model overrides' section."
+
+    def test_review_supervisor_is_not_described_as_fan_out_coordinator(self) -> None:
+        """Post-flatten (ADR-33), review-supervisor is a non-spawning aggregator.
+
+        review-supervisor no longer declares an Agent tool and cannot spawn the
+        four review_team judges, so describing it as a 'fan-out coordinator'
+        (a role requiring Agent-tool reliability) is stale and misleading to
+        an operator tuning the per-agent model overrides.
+        """
+        text = _read_doc()
+        per_agent_section = _extract_section(text, "## Per-agent model overrides")
+        assert "fan-out coordinator" not in per_agent_section, (
+            "docs/llm-authentication.md must not describe review-supervisor as a "
+            "'fan-out coordinator' -- post-flatten (ADR-33) it is a non-spawning "
+            "aggregator with no Agent tool."
+        )
+        assert "aggregat" in per_agent_section.lower(), (
+            "docs/llm-authentication.md's per-agent model overrides section must "
+            "describe review-supervisor's post-flatten role as read-only "
+            "aggregation of already-persisted verdicts."
+        )

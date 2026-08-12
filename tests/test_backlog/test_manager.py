@@ -223,8 +223,14 @@ class TestMarkDone:
     """Test mark_done delegates to set_status and updates both files."""
 
     def test_mark_done_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
-        # Append required judge pass entries so the done-gate check passes
+        # Append required judge pass entries so the done-gate check passes.
+        # Declare an exempt Task Type (E4-F4-S1-T2 round 3: mark_done() now
+        # enforces the FR-4.5/FR-4.6 task-type invariant directly, so an
+        # undeclared type would default to the strictest gated type and
+        # this test -- which is about the judges-pass gate, not the
+        # task-type gate -- would fail for an unrelated reason).
         content = tmp_work_unit_file.read_text(encoding="utf-8")
+        content = content.replace("## Status: in-queue\n", "## Status: in-queue\n\n## Task Type: chore\n", 1)
         tmp_work_unit_file.write_text(content + _ALL_JUDGES_PASSED_COMMENTS, encoding="utf-8")
 
         judge = BacklogManager()
@@ -246,7 +252,10 @@ class TestMarkDone:
 
     def test_mark_done_raises_when_no_status_line(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         bad_file = tmp_path / "bad.md"
-        bad_file.write_text("# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS)
+        # Declare an exempt Task Type so this test exercises only the
+        # missing-status-line ValueError, not the task-type invariant that
+        # mark_done() now also enforces (E4-F4-S1-T2 round 3).
+        bad_file.write_text("# No status here\n\n## Task Type: chore\n\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS)
 
         judge = BacklogManager()
         with pytest.raises(ValueError, match="Could not find"):
@@ -581,10 +590,24 @@ class TestSecurityGate:
 class TestMarkDoneGate:
     """Test that mark_done enforces the done-gate check."""
 
-    def _make_wu(self, tmp_path: Path, comments: str = "") -> Path:
+    def _make_wu(
+        self,
+        tmp_path: Path,
+        comments: str = "",
+        *,
+        task_type: str | None = "chore",
+        tdd_cycle_log: str = "",
+    ) -> Path:
+        # Defaults to an exempt Task Type ("chore") so these judges-gate
+        # tests exercise only the judges-passed check, not the FR-4.5/FR-4.6
+        # task-type invariant mark_done() now also enforces directly
+        # (E4-F4-S1-T2 round 3). Tests targeting the task-type invariant
+        # itself pass ``task_type`` explicitly.
+        task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
         wu = tmp_path / "E0-F1-S1-T1.md"
         wu.write_text(
-            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n{task_type_section}"
+            f"## TDD Cycle Log\n\n{tdd_cycle_log}\n## Comments\n\n{comments}",
             encoding="utf-8",
         )
         return wu
@@ -609,6 +632,66 @@ class TestMarkDoneGate:
 
     def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
         wu = self._make_wu(tmp_path, _all_five_judges_pass_block())
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_raises_when_gated_default_type_missing_red_observed(self, tmp_path: Path) -> None:
+        """code_review FAIL round 3 regression: BacklogManager.mark_done() itself
+        must enforce the RED_OBSERVED invariant for a gated task, not merely
+        cli.py's cmd_mark_done wrapper -- so every caller (including
+        _check_merge_handle_merged / check-merge) inherits the block."""
+        # No ``## Task Type:`` section declared at all -> defaults to the
+        # strictest gated type (DEFAULT_TASK_TYPE), same fail-closed
+        # precedent as _check_task_type_taxonomy.
+        wu = self._make_wu(tmp_path, _all_five_judges_pass_block(), task_type=None)
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        with pytest.raises(RuntimeError, match="no RED_OBSERVED record found"):
+            judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: in-review" in wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_succeeds_when_gated_type_has_red_observed(self, tmp_path: Path) -> None:
+        red_observed = (
+            "- [RED_OBSERVED] 2026-01-01T00:00:00+00:00 -- exit_code=1 "
+            "test_node_id=tests/test_x.py::test_y "
+            f"failure_digest={'a' * 64}\n"
+        )
+        wu = self._make_wu(
+            tmp_path,
+            _all_five_judges_pass_block(),
+            task_type="behavior-fix",
+            tdd_cycle_log=red_observed,
+        )
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_raises_when_refactor_missing_green_green_observed(self, tmp_path: Path) -> None:
+        """code_review FAIL round 3 regression: a refactor task with all judges
+        passed but no machine-observed GREEN_GREEN_OBSERVED record must be
+        blocked by BacklogManager.mark_done() itself."""
+        wu = self._make_wu(tmp_path, _all_five_judges_pass_block(), task_type="refactor")
+        idx = self._make_index(tmp_path)
+        judge = BacklogManager()
+        with pytest.raises(RuntimeError, match="no GREEN_GREEN_OBSERVED record found"):
+            judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: in-review" in wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in wu.read_text(encoding="utf-8")
+
+    def test_mark_done_succeeds_when_refactor_has_green_green_observed(self, tmp_path: Path) -> None:
+        green_green_observed = (
+            "- [GREEN_GREEN_OBSERVED] 2026-01-01T00:00:00+00:00 -- test_node_ids=tests/test_x.py::test_y\n"
+        )
+        wu = self._make_wu(
+            tmp_path,
+            _all_five_judges_pass_block(),
+            task_type="refactor",
+            tdd_cycle_log=green_green_observed,
+        )
         idx = self._make_index(tmp_path)
         judge = BacklogManager()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")
@@ -656,6 +739,9 @@ class TestValidate:
     def _make_wu(self, backlog_dir: Path, unit_id: str, status: str = "in-queue") -> Path:
         wu = backlog_dir / f"{unit_id}.md"
         # Include all required sections so content validation passes for task IDs.
+        # Manifest carries a production-source row paired with its test entry so
+        # the default ("behavior-fix") task type's production-source invariant
+        # (FR-4.1) and Rule 14 (source-test atomicity) both pass.
         content = (
             f"# {unit_id}\n\n"
             f"## Status: {status}\n\n"
@@ -663,7 +749,8 @@ class TestValidate:
             "## Description\n\nTest work unit.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
-            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `src/f.py` | New |\n| `tests/unit/test_f.py` | New |\n\n"
             "## Definition of Done\n\n- [ ] All ACs checked\n\n"
             "## TDD Cycle Log\n\n## Comments\n"
         )
@@ -908,7 +995,8 @@ class TestValidateContent:
             "- **Repo:** `org/repo`\n\n## Description\n\nDo something real.\n\n"
             "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Something testable\n\n"
-            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `src/f.py` | New |\n| `tests/unit/test_f.py` | New |\n\n"
             "## Definition of Done\n\n- [ ] All ACs checked\n\n"
             "## TDD Cycle Log\n\n## Comments\n",
         )
@@ -2028,7 +2116,8 @@ class TestAppendTddEntry:
             "|----|-------|--------|\n"
             "| none | | |\n\n"
             "## Acceptance Criteria\n\n- [ ] AC-TEST-001 fixture\n\n"
-            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | fixture |\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `src/f.py` | fixture |\n| `tests/unit/test_f.py` | fixture |\n\n"
             "## Definition of Done\n\n- [ ] All ACs checked\n\n"
             "## TDD Cycle Log\n\n"
             "<!-- entries go here -->\n\n"
@@ -2305,7 +2394,14 @@ class TestParseSummaryTableEdgeCases:
 # ---------------------------------------------------------------------------
 
 
-def _unit_body(unit_id: str, status: str, *, deps: list[str] | None = None, comments: str = "") -> str:
+def _unit_body(
+    unit_id: str,
+    status: str,
+    *,
+    deps: list[str] | None = None,
+    comments: str = "",
+    task_type: str | None = None,
+) -> str:
     """Build a minimal well-formed work-unit file body for the scan tests.
 
     Produces the sections the parser and scan require (``Status``, ``Dependencies``,
@@ -2313,11 +2409,20 @@ def _unit_body(unit_id: str, status: str, *, deps: list[str] | None = None, comm
     task-level files (``Description``, ``Acceptance Criteria``, ``Changes Manifest``,
     ``Definition of Done``). Keeps every fixture self-contained so a test
     failure points at the scan logic rather than a malformed fixture.
+
+    ``task_type``, when provided, inserts a ``## Task Type:`` section so
+    callers that drive a real ``BacklogManager.mark_done()`` can declare an
+    exempt type (e.g. ``"chore"``) and avoid tripping the FR-4.5/FR-4.6
+    task-type invariant mark_done() enforces directly (E4-F4-S1-T2 round 3)
+    when the fixture's concern is unrelated (status transitions, auto-requeue
+    cascades).
     """
     dep_rows = "| none | | |" if not deps else "\n".join(f"| {d} | (auto) | proposed |" for d in deps)
+    task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
     return (
         f"# {unit_id}: Test Task\n\n"
         f"## Status: {status}\n\n"
+        f"{task_type_section}"
         "## Description\n\nAuto-requeue test fixture.\n\n"
         "## Dependencies\n\n"
         "| ID | Title | Status |\n"
@@ -2701,7 +2806,7 @@ class TestAutoRequeueMarkerDependents:
         # completed review round. Dep starts as in-review so mark_done is
         # the transition under test.
         review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
-        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n", task_type="chore")
         index = _write_workspace(
             tmp_path,
             rows=[
@@ -2740,7 +2845,7 @@ class TestAutoRequeueMarkerDependents:
             comments=markers,
         )
         review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
-        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n", task_type="chore")
 
         # Use a richer BACKLOG.md that includes the Story parent so rollup
         # has something to consider.
@@ -3020,7 +3125,7 @@ class TestAutoRequeueRegularDepDependents:
             comments=sync_blocked_audit,
         )
         review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
-        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n", task_type="chore")
         index = _write_workspace(
             tmp_path,
             rows=[
@@ -3310,11 +3415,14 @@ class _ValidateRuleHarness:
         ac_block: str = "- [ ] AC-TEST-001",
         deps_rows: str = "| none | | |",
         status: str = "in-queue",
+        task_type: str | None = None,
     ) -> Path:
         wu = backlog_dir / f"{unit_id}.md"
+        task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
         wu.write_text(
             f"# {unit_id}\n\n"
             f"## Status: {status}\n\n"
+            f"{task_type_section}"
             f"## Target Repository\n\n"
             f"- **Repo:** `{repo}`\n\n"
             f"## Description\n\nTest task.\n\n"
@@ -3664,6 +3772,470 @@ class TestValidateSourceTestPairs:
         )
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("no matching test in the same Manifest" in e for e in errors)
+
+
+class TestIsTestSourcePath:
+    """Direct tests for the shared test-path predicate (FR-4.1 / AC-47).
+
+    ``_is_test_source_path`` is extracted out of ``_is_production_source``
+    so the FR-4.1 task-type row classifier and the Rule 14 source-test
+    pairing check share a single test/production boundary decision.
+    """
+
+    def test_python_under_tests_dir_is_test(self) -> None:
+        assert BacklogManager._is_test_source_path("tests/unit/test_foo.py") is True
+
+    def test_python_nested_tests_dir_is_test(self) -> None:
+        assert BacklogManager._is_test_source_path("services/api/tests/unit/test_foo.py") is True
+
+    def test_python_outside_tests_dir_is_not_test(self) -> None:
+        assert BacklogManager._is_test_source_path("src/foo/bar.py") is False
+
+    def test_non_python_under_tests_dir_is_not_test(self) -> None:
+        # The predicate is Python-scoped, matching Rule 14's own scope.
+        assert BacklogManager._is_test_source_path("tests/fixtures/data.json") is False
+
+    def test_is_production_source_still_excludes_test_paths(self) -> None:
+        """Regression: extracting the helper must not change _is_production_source's behavior."""
+        assert BacklogManager._is_production_source("tests/unit/test_foo.py") is False
+        assert BacklogManager._is_production_source("services/api/tests/unit/test_foo.py") is False
+        assert BacklogManager._is_production_source("src/foo/bar.py") is True
+
+
+class TestIsDocumentationPath:
+    """Direct boundary tests for the ``docs`` task-type predicate (FR-4.1).
+
+    Mirrors ``TestIsTestSourcePath``: ``_is_documentation_path`` is
+    deliberately extension-based (``.md`` only), so these cases pin the
+    exact boundary rather than inferring it indirectly through
+    ``validate()`` scenarios.
+    """
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("docs/architecture.md", True),
+            ("README.md", True),
+            ("docs/guide.MD", True),
+            ("docs/guide.rst", False),
+            ("docs/guide.txt", False),
+            ("src/foo.py", False),
+            ("pyproject.toml", False),
+        ],
+    )
+    def test_documentation_path_boundary(self, path: str, expected: bool) -> None:
+        assert BacklogManager._is_documentation_path(path) is expected
+
+
+class TestIsChorePath:
+    """Direct boundary tests for the ``chore`` task-type predicate (FR-4.1).
+
+    Mirrors ``TestIsTestSourcePath``: ``_is_chore_path`` unions the
+    non-Markdown ``_NON_PY_EXTS_TO_TIER`` tiers with the chore-only
+    lockfile/legacy-config extensions in ``_CHORE_EXTRA_EXTS``. These
+    cases pin the exact boundary, including the deliberate Markdown
+    exclusion (Markdown belongs to the ``docs`` type, not ``chore``).
+    """
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("pyproject.toml", True),
+            ("uv.lock", True),
+            ("setup.cfg", True),
+            ("tox.ini", True),
+            ("requirements.txt", True),
+            ("config.yaml", True),
+            ("config.yml", True),
+            ("package.json", True),
+            ("infra/main.tf", True),
+            ("docs/guide.md", False),
+            ("README.md", False),
+            ("src/foo.py", False),
+        ],
+    )
+    def test_chore_path_boundary(self, path: str, expected: bool) -> None:
+        assert BacklogManager._is_chore_path(path) is expected
+
+
+class TestExtractTaskType:
+    """Direct tests for the ``## Task Type:`` line extractor (FR-4.1 / AC-45)."""
+
+    def test_missing_section_returns_none(self) -> None:
+        content = "# EX-F1-S1-T1\n\n## Status: in-queue\n\n## Description\n\nbody\n"
+        assert BacklogManager._extract_task_type(content) is None
+
+    @pytest.mark.parametrize(
+        "task_type",
+        ["behavior-fix", "feature", "test-only", "refactor", "docs", "chore"],
+    )
+    def test_present_section_returns_lowercased_value(self, task_type: str) -> None:
+        content = f"# EX-F1-S1-T1\n\n## Status: in-queue\n\n## Task Type: {task_type}\n\n## Description\n\nbody\n"
+        assert BacklogManager._extract_task_type(content) == task_type
+
+    def test_present_section_is_case_and_whitespace_normalized(self) -> None:
+        content = "# EX-F1-S1-T1\n\n## Status: in-queue\n\n##  Task Type:   Test-Only  \n\n## Description\n\nx\n"
+        assert BacklogManager._extract_task_type(content) == "test-only"
+
+
+class TestValidateTaskTypeTaxonomy:
+    """FR-4.1 (AC-45, AC-46, AC-47): six-type taxonomy parsing and per-type
+    Changes Manifest invariants enforced by ``validate-backlog``."""
+
+    H = _ValidateRuleHarness
+
+    @pytest.mark.parametrize(
+        "task_type,manifest_rows",
+        [
+            ("behavior-fix", "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n"),
+            ("feature", "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n"),
+            ("test-only", "| `tests/unit/test_foo.py` | new |\n"),
+            ("refactor", "| `src/foo.py` | modify |\n| `tests/unit/test_foo.py` | modify |\n"),
+            ("docs", "| `docs/architecture.md` | new |\n"),
+            ("chore", "| `pyproject.toml` | modify |\n"),
+        ],
+    )
+    def test_all_six_types_parse_without_unrecognized_error(
+        self, tmp_path: Path, backlog_dir: Path, task_type: str, manifest_rows: str
+    ) -> None:
+        """AC-45: each of the six declared types is recognized (no unrecognized-type error)."""
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", manifest_rows, task_type=task_type)
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("unrecognized '## Task Type:'" in e for e in errors), (
+            f"Type {task_type!r} should be recognized; got errors: {errors}"
+        )
+
+    def test_unknown_type_fails_naming_allowed_set(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-45: an unrecognized type fails validate-backlog naming the full allowed set."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            task_type="performance-tuning",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "performance-tuning" in e]
+        assert matching, f"Expected an unrecognized-type error; got: {errors}"
+        for allowed in ("behavior-fix", "feature", "test-only", "refactor", "docs", "chore"):
+            assert allowed in matching[0], f"Allowed-set message missing {allowed!r}: {matching[0]}"
+
+    def test_missing_task_type_defaults_to_behavior_fix(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A missing '## Task Type:' section defaults to behavior-fix (the strictest
+        type), never to an exempt type. Proven by the fact that a manifest with zero
+        production-source rows, which WOULD be rejected for an explicit behavior-fix
+        declaration, is ALSO rejected when the section is absent."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `tests/unit/test_foo.py` | new |\n",
+            task_type=None,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "behavior-fix" in e and "production-source" in e]
+        assert matching, f"Expected a behavior-fix zero-production-source error by default; got: {errors}"
+
+    def test_docs_task_touching_src_is_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-46: a docs task touching src/ is rejected."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/foo.py" in e and "docs" in e]
+        assert matching, f"Expected a docs-invariant violation naming src/foo.py; got: {errors}"
+
+    def test_docs_task_with_only_markdown_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `README.md` | modify |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    def test_test_only_task_touching_production_is_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-46: a test-only task touching production source is rejected."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            task_type="test-only",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/foo.py" in e and "test-only" in e]
+        assert matching, f"Expected a test-only-invariant violation naming src/foo.py; got: {errors}"
+
+    def test_test_only_task_with_only_test_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `tests/unit/test_foo.py` | new |\n",
+            task_type="test-only",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    def test_chore_task_touching_src_is_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-46: a chore task touching src/ is rejected."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `pyproject.toml` | modify |\n| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            task_type="chore",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/foo.py" in e and "chore" in e]
+        assert matching, f"Expected a chore-invariant violation naming src/foo.py; got: {errors}"
+
+    def test_chore_task_with_only_lockfile_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `pyproject.toml` | modify |\n| `uv.lock` | modify |\n",
+            task_type="chore",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    @pytest.mark.parametrize("task_type", ["behavior-fix", "feature"])
+    def test_gated_task_with_zero_production_rows_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path, task_type: str
+    ) -> None:
+        """AC-46: a gated task (behavior-fix or feature) with zero production-source rows is rejected."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `tests/unit/test_foo.py` | new |\n",
+            task_type=task_type,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and task_type in e and "production-source" in e]
+        assert matching, f"Expected a zero-production-source error for {task_type}; got: {errors}"
+
+    @pytest.mark.parametrize("task_type", ["behavior-fix", "feature"])
+    def test_gated_task_with_production_row_no_error(self, tmp_path: Path, backlog_dir: Path, task_type: str) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            task_type=task_type,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("production-source" in e and "EX-F1-S1-T1" in e for e in errors), (
+            f"Unexpected zero-production-source error: {errors}"
+        )
+
+    def test_refactor_task_manifest_rows_not_invariant_checked(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Approach step 6: refactor's manifest rows validate here (type parses); the
+        green-green runtime check is delivered separately by E4-F4-S1-T2, so no
+        per-row invariant fires for a refactor task regardless of row shape."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | modify |\n| `docs/guide.md` | modify |\n| `pyproject.toml` | modify |\n",
+            task_type="refactor",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e or "production-source" in e for e in errors), (
+            f"Unexpected task-type error for refactor: {errors}"
+        )
+
+    def test_rejection_message_names_row_type_and_invariant(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-E4-F2-S1-T1-5: every invariant rejection names the offending manifest
+        row, the declared type, and the violated invariant."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/foo.py" in e]
+        assert matching, f"Expected an invariant error; got: {errors}"
+        message = matching[0]
+        assert "EX-F1-S1-T1" in message  # the row
+        assert "docs" in message  # the declared type
+        assert "task-type invariant" in message  # the violated invariant is named
+
+    @pytest.mark.parametrize(
+        "status,expect_error",
+        [
+            ("done", False),
+            ("declined", False),
+            ("in-queue", True),
+        ],
+    )
+    def test_terminal_status_skip_is_scoped_not_a_blanket_bypass(
+        self, tmp_path: Path, backlog_dir: Path, status: str, expect_error: bool
+    ) -> None:
+        """The terminal-status skip (manager.py:2427 'if row_status in
+        _TERMINAL_CHILD_STATUSES: continue') exempts only done/declined
+        Tasks from rule 21, not every Task. A done or declined Task with no
+        '## Task Type:' section and zero production-source rows produces NO
+        rule-21 error, while an otherwise identical in-queue Task DOES --
+        proving the skip is scoped to terminal status rather than being a
+        universal escape hatch (mutation-verified: deleting the skip
+        condition must flip the done/declined cases below from pass to
+        fail)."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `tests/unit/test_foo.py` | new |\n",
+            task_type=None,
+            status=status,
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | {status} | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "behavior-fix" in e and "production-source" in e]
+        if expect_error:
+            assert matching, (
+                f"Expected a behavior-fix zero-production-source error for "
+                f"non-terminal status={status!r}; got: {errors}"
+            )
+        else:
+            assert not matching, (
+                f"Terminal status={status!r} should be skipped by rule 21 entirely; got matching errors: {matching}"
+            )
+
+    def test_malformed_manifest_skips_taxonomy_check_without_crashing(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The ManifestParseError swallow (manager.py 'except
+        ManifestParseError: continue' inside ``_check_task_type_taxonomy``)
+        mirrors the established pattern used by every other
+        Manifest-consuming validate rule (the manifest-conflict check, the
+        AC-language-tier check, the no-glob check and the Rule 14
+        source-test pair check): when a Task's '## Changes Manifest' table
+        cannot be parsed -- here a row with 3 columns instead of the
+        required 2 -- rule 21 skips enforcement for that Task instead of
+        crashing validate() or deriving a task-type-invariant error from a
+        partially/incorrectly parsed Manifest. The malformed row is not
+        silently accepted as valid: ``parse_manifest`` genuinely raises
+        ``ManifestParseError`` for it (verified directly below).
+
+        This test does NOT claim some other rule catches the malformed
+        table on the author's behalf -- it doesn't, for a repo with no
+        configured ``checkout_directory`` (verified below: the full
+        validate() pipeline returns zero errors for this row_id). That is
+        a pre-existing gap shared by all six ManifestParseError call sites
+        in manager.py, predating this task; fixing it repo-wide is out of
+        this task's scope (AC-E4-F2-S1-T1-1..6 concern only the taxonomy).
+        What this test pins is narrower and genuinely rule-21-specific:
+        rule 21 does not crash and does not manufacture a task-type
+        diagnostic out of a table it could not fully parse.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        malformed_content = (
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | new | extra column |\n"
+        )
+        with pytest.raises(ManifestParseError):
+            parse_manifest(malformed_content)
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new | extra column |\n",
+            task_type="behavior-fix",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        taxonomy_errors = [
+            e for e in errors if "EX-F1-S1-T1" in e and ("task-type invariant" in e or "production-source" in e)
+        ]
+        assert not taxonomy_errors, (
+            f"A malformed Changes Manifest must not surface a rule-21 "
+            f"error derived from a partially parsed table; got: {taxonomy_errors}"
+        )
+        # Documents (does not merely assume) that no OTHER rule catches this
+        # malformed row for a repo without a configured checkout_directory
+        # either: the whole pipeline is silent on it today. This is the
+        # pre-existing, repo-wide gap named in the docstring above, pinned
+        # here so a future fix to any of the six sites is a deliberate,
+        # visible change to this assertion rather than an unnoticed drift.
+        all_errors_for_row = [e for e in errors if "EX-F1-S1-T1" in e]
+        assert not all_errors_for_row, (
+            f"Known pre-existing gap: no validate() rule currently surfaces "
+            f"a malformed Changes Manifest table for a repo with no "
+            f"configured checkout_directory. If this assertion starts "
+            f"failing, some rule now catches it -- update this test's "
+            f"docstring to name that rule rather than reintroducing the "
+            f"'not it, but something else' claim this test replaced; "
+            f"got: {all_errors_for_row}"
+        )
 
 
 class TestValidateRequiredSections:
@@ -4579,6 +5151,145 @@ class TestValidateNoOrphanPathTokens:
         # error for the same Task, but that error does not start with
         # the orphan-rule prefix.
         assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+
+class TestIsValidCitation:
+    """BacklogManager.is_valid_citation (FR-4.5): commit hash or task id shape.
+
+    A citation is either a git commit hash (7-40 lowercase hex characters,
+    covering both abbreviated and full SHA forms) or a canonical work-unit
+    ID matching the same shape enforced by Check 17's dependency-ID format
+    rule. Free text is never a valid citation -- it must be independently
+    verifiable.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "abc1234",
+            "0123456789abcdef0123456789abcdef01234567",
+            "deadbeef",
+            "E4-F4-S1-T2",
+            "E4",
+            "E4-F4",
+            "E4-F4-S1",
+        ],
+        ids=[
+            "commit-min-length",
+            "commit-40-char",
+            "commit-hex-word",
+            "task-id-full",
+            "task-id-epic-only",
+            "task-id-epic-feature",
+            "task-id-epic-feature-story",
+        ],
+    )
+    def test_valid_citations_accepted(self, value: str) -> None:
+        assert BacklogManager.is_valid_citation(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "   ",
+            "abc12",  # too short for a commit hash
+            "not-a-commit-hash-or-task-id",
+            "ABCDEF1",  # uppercase hex is never a git-reported hash
+            "closed by a prior task",
+            "1234567890abcdef1234567890abcdef123456789",  # 43 chars, too long
+        ],
+        ids=[
+            "empty",
+            "whitespace-only",
+            "too-short-hash",
+            "free-text",
+            "uppercase-hex",
+            "prose-sentence",
+            "too-long-hash",
+        ],
+    )
+    def test_invalid_citations_rejected(self, value: str) -> None:
+        assert BacklogManager.is_valid_citation(value) is False
+
+    def test_citation_with_surrounding_whitespace_is_trimmed(self) -> None:
+        assert BacklogManager.is_valid_citation("  abc1234  ") is True
+
+
+class TestValidateAlreadySatisfiedDeclineCitation:
+    """Check 22: an already-satisfied decline must cite a commit or task id (FR-4.5).
+
+    An uncited already-satisfied decline is rejected by validate-backlog's
+    comment-format checks; a cited decline is accepted and the citation is
+    preserved verbatim in the Comments section.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _append_declined_comment(wu_path: Path, message: str) -> None:
+        content = wu_path.read_text(encoding="utf-8")
+        entry = f"[2026-01-01 00:00 UTC] [backlog_manager] [DECLINED] {message}\n"
+        content += ("\n## Comments\n\n" + entry) if "## Comments" not in content else ("\n" + entry)
+        wu_path.write_text(content, encoding="utf-8")
+
+    def _errors_for(self, tmp_path: Path, backlog_dir: Path, row_id: str, declined_message: str) -> list[str]:
+        wu = self.H.make_task(
+            backlog_dir,
+            row_id,
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            status="declined",
+        )
+        self._append_declined_comment(wu, declined_message)
+        idx = self.H.make_index(
+            tmp_path,
+            f"| {row_id} | T | Task | declined | none | ex/foo | `backlog/{row_id}.md` |\n",
+        )
+        return BacklogManager().validate(idx, tmp_path)
+
+    def test_uncited_already_satisfied_decline_is_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T1", "already-satisfied")
+        matches = [e for e in errors if "EX-F1-S1-T1" in e and "already-satisfied" in e]
+        assert len(matches) == 1
+        assert "citation" in matches[0]
+
+    def test_cited_already_satisfied_decline_with_commit_hash_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T2", "already-satisfied (citing abc1234)")
+        assert not any("EX-F1-S1-T2" in e and "already-satisfied" in e for e in errors)
+
+    def test_cited_already_satisfied_decline_with_task_id_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T3", "already-satisfied (citing E1-F1-S1-T9)")
+        assert not any("EX-F1-S1-T3" in e and "already-satisfied" in e for e in errors)
+
+    def test_declined_for_unrelated_reason_without_citation_unaffected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, "EX-F1-S1-T4", "duplicate of E1-F1-S1-T2")
+        assert not any("EX-F1-S1-T4" in e and "citation" in e for e in errors)
+
+    def test_non_declined_task_unaffected_even_with_already_satisfied_text(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        wu = self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T5",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            status="in-queue",
+        )
+        self._append_declined_comment(wu, "already-satisfied")
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T5 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T5.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("EX-F1-S1-T5" in e and "citation" in e for e in errors)
+
+    def test_missing_file_path_row_skipped(self, tmp_path: Path) -> None:
+        """Defensive guard: rows with empty file_path should not crash the rule."""
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "declined", "")]
+        manager._check_already_satisfied_decline_citation(rows, tmp_path, errors)
+        assert errors == []
 
 
 class TestAutoRequeueOnDeclineTransition:

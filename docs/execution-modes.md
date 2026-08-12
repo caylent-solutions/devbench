@@ -59,12 +59,13 @@ Both modes execute the same logical steps in the same order.
    ├── Stage changed files (git add -- NO commit)
    └── Update work-unit status to in-review
 
-5. Judge review  [devbench:review-supervisor AGENT RESPONSIBILITY]
+5. Judge review  [orchestrate skill invokes the four judges directly, first-level (ADR-33)]
    ├── code-reviewer    -- SOLID, DRY, fail-fast, 12-factor
    ├── test-reviewer    -- TDD discipline, test quality, coverage
    ├── doc-reviewer     -- accuracy, completeness, sync with code
    └── changes-manifest -- actual changes vs. declared manifest
-   (the orchestrate skill dispatches all four judge agents directly, in parallel)
+   (each judge self-logs its own verdict; devbench:review-supervisor then
+   aggregates the four persisted verdicts -- it does not invoke the judges)
 
 6. If any judge FAILs → inject feedback, return to step 4 (max max_executor_retries)
 
@@ -129,7 +130,7 @@ The executor **must not**:
 
 The orchestrate skill is responsible for:
 
-- Dispatching the four `review_team` judges directly as first-level sub-agents, in parallel
+- Invoking the four judge agents directly, as first-level sub-agents (ADR-33), then invoking `devbench:review-supervisor` to aggregate their persisted verdicts
 - Injecting review feedback into retry attempts
 - Invoking `devbench:security-reviewer` after the four judges pass
 - Delegating git operations to the executor agent (`devbench git-ops`)
@@ -155,8 +156,11 @@ uv run devbench start
             │
             ├── invokes devbench:executor agent to implement each work unit
             │
-            ├── dispatches the 4 review_team judges directly (first-level)
-            │       └── code-reviewer, test-reviewer, doc-reviewer, changes-manifest (parallel)
+            ├── invokes the 4 judge agents directly, first-level (ADR-33)
+            │       └── each judge self-logs its own verdict
+            │
+            ├── invokes devbench:review-supervisor agent to aggregate the
+            │       4 persisted verdicts (does not invoke the judges)
             │
             ├── invokes devbench:security-reviewer agent
             │
@@ -176,8 +180,11 @@ Claude Code session (with devbench plugin active)
     │
     ├── Claude invokes devbench:executor agent for implementation
     │
-    ├── Claude dispatches the 4 review_team judges directly for judge review
-    │       └── code-reviewer, test-reviewer, doc-reviewer, changes-manifest (parallel)
+    ├── Claude invokes the 4 judge agents directly, first-level (ADR-33)
+    │       └── each judge self-logs its own verdict
+    │
+    ├── Claude invokes devbench:review-supervisor to aggregate the
+    │       4 persisted verdicts (does not invoke the judges)
     │
     ├── Claude invokes devbench:security-reviewer for security gate
     │
@@ -219,7 +226,7 @@ The orchestrator registers a Claude Code **Stop hook** (`continue-orchestration.
 
 - **Task ID and file path** extracted from the `BACKLOG.md` in-progress row
 - **Last action** parsed from the most recent `[judge/...]` or `[agent/...]` comment in the work-unit file
-- **Specific next step** based on the last action (e.g. "run review-supervisor" after executor, "run git-ops" after security pass)
+- **Specific next step** based on the last action (e.g. "invoke the 4 review_team judges (code-reviewer, test-reviewer, doc-reviewer, changes-manifest) directly as first-level sub-agents, then invoke review-supervisor to aggregate their verdicts" after executor, "run git-ops" after security pass)
 
 ### Circuit breaker
 

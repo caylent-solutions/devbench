@@ -68,11 +68,16 @@ If pre-existing index entries from a prior blocked task pollute your staging are
 
 1. Read the work unit content completely before starting any work.
 2. Check all dependencies are done -- do not proceed if dependencies are incomplete.
-3. Follow the TDD cycle strictly:
+3. Follow the TDD cycle strictly. Every message passed to `log-tdd`, `log-comment`,
+   and `log-verdict` must be a single line: no control character (including a literal
+   newline) and no bracketed TDD phase tag such as `[RED_OBSERVED]` may appear anywhere
+   in the text, or the command exits 1 and writes nothing (E4-F3-S1-T1). Collapse any
+   multi-line command output onto one line (e.g. join with `; ` or a single `--` separator)
+   before passing it as a message argument.
    - RED: Write a failing test first. Run the test suite (use `make test-unit` or equivalent
      in repo_path). Confirm the test fails for the right reason, then log:
      ```bash
-     uv run devbench log-tdd $ARGUMENTS RED "Tests: <comma-separated test file paths created>. Command: <test command>. Exit: <exit code>. Failures: <N failed, M passed>. Output snippet: <first meaningful failure line(s)>"
+     uv run devbench log-tdd $ARGUMENTS RED "Tests: <comma-separated test file paths created>. Command: <test command>. Exit: <exit code>. Failures: <N failed, M passed>. Output snippet (single line, no embedded newline): <first meaningful failure line, truncated to one line>"
      ```
      Do not proceed to GREEN until the test is confirmed failing for the right reason.
    - GREEN: Write the minimal implementation to make the failing test pass. Re-run the

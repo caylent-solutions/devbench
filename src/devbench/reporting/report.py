@@ -45,8 +45,9 @@ import json as _json
 import logging
 import os
 import re
+import statistics
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
@@ -129,8 +130,9 @@ class HookLogTotals:
     us_only_cache_write_5m_tokens: int = 0
     us_only_cache_write_1h_tokens: int = 0
     # Token volumes from entries with ``usage.speed == 'fast'`` (fast-mode
-    # premium, issue #124). Same per-subset accounting; multiplied by
-    # ``report.fast_mode_multiplier`` (default 6.0).
+    # premium, issue #124). Same per-subset accounting; the fast-token
+    # subset is multiplied by ``report.fast_mode_multiplier``, whose
+    # default is DEFAULT_FAST_MODE_MULTIPLIER in src/devbench/constants.py.
     fast_input_tokens: int = 0
     fast_output_tokens: int = 0
     fast_cache_read_tokens: int = 0
@@ -171,12 +173,21 @@ class WindowStats:
     # sample (e.g. a freshly-restarted Session window with one completion)
     # cannot drive a multi-task projection.
     pace_sample_count: int = 0
+    # Issue #326: number of in-window completions dropped from ``avg_minutes``
+    # for having no execution window (no ``in-progress`` anchor, or the anchor
+    # is in a different orchestrator session -- see ``_same_session``). Kept
+    # in-memory only; no serialised report payload changes (spec D-8).
+    pace_excluded_count: int = 0
     # Average minutes per task across the most-recently-completed N tasks
     # (N = RECENT_PACE_TASKS), regardless of window. None when fewer than N
     # task completions exist log-wide. Used in preference to ``avg_minutes``
     # for projections so the rate metric reflects current orchestrator pace
     # rather than being anchored by historical completions.
     recent_pace_minutes: float | None = None
+    # Issue #326: log-wide equivalent of ``pace_excluded_count`` -- the
+    # number of the most-recent completions dropped from ``recent_pace_minutes``
+    # for having no execution window.
+    recent_pace_excluded_count: int = 0
     # Wall-clock completion moment = now() + est_hours. None when est_hours is
     # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
     # to the resolved display timezone.
@@ -294,20 +305,74 @@ def _find_current_session_start_from_index(
     return _walk_for_session_boundary(events, gap_minutes)
 
 
+def _session_start_boundaries(events: list[datetime], gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES) -> list[datetime]:
+    """Return every session-start boundary in ``events`` (ascending, sorted input assumed).
+
+    Issue #326 (FR-1): generalises the single-boundary gap-walk that used to
+    live only in ``_walk_for_session_boundary`` into the FULL segmentation, so
+    the same-session validity gate (``_same_session``) can classify any pair
+    of timestamps, not just "am I in the current session". ``[]`` for an
+    empty input (no events -> no sessions); ``[events[0]]`` when no gap
+    exceeds ``gap_minutes`` (one session spanning the whole history);
+    otherwise ``events[0]`` plus every ``curr`` where the gap to the previous
+    event exceeds ``gap_minutes``.
+
+    Pure and raise-free: no exception path exists for any input shape.
+    """
+    if not events:
+        return []
+    threshold = timedelta(minutes=gap_minutes)
+    boundaries = [events[0]]
+    for prev, curr in pairwise(events):
+        if curr - prev > threshold:
+            boundaries.append(curr)
+    return boundaries
+
+
+def _session_index_for(ts: datetime, boundaries: Sequence[datetime]) -> int:
+    """Return the index of the session in ``boundaries`` that contains ``ts``.
+
+    Issue #326 (FR-1): sessions are the half-open intervals implied by the
+    ascending ``boundaries`` list -- session ``i`` spans
+    ``[boundaries[i], boundaries[i + 1])``. Returns the index of the greatest
+    boundary ``<= ts``, clamped to ``0`` so a timestamp older than every known
+    boundary (or an empty ``boundaries`` list -- "one implicit session",
+    spec D-7) still resolves to a valid index instead of raising.
+    """
+    if not boundaries:
+        return 0
+    index = 0
+    for i, boundary in enumerate(boundaries):
+        if ts >= boundary:
+            index = i
+        else:
+            break
+    return index
+
+
+def _same_session(a: datetime, b: datetime, boundaries: Sequence[datetime]) -> bool:
+    """Return True when ``a`` and ``b`` fall in the same orchestrator session.
+
+    Issue #326 (FR-1): the sample-validity gate for pace/average estimation.
+    Two timestamps are in the same session when they resolve to the same
+    ``_session_index_for`` index. An empty ``boundaries`` list means every
+    pair is same-session (one implicit session, spec D-7) -- this is the
+    default for direct callers that have no log to segment.
+    """
+    return _session_index_for(a, boundaries) == _session_index_for(b, boundaries)
+
+
 def _walk_for_session_boundary(events: list[datetime], gap_minutes: int) -> datetime | None:
     """Run the gap-walk used by both the parser and indexed session detectors.
 
     Centralised so the two callers cannot drift; the gap rule and the
-    "no events -> None" semantic live in exactly one place.
+    "no events -> None" semantic live in exactly one place. Issue #326
+    (FR-1): re-expressed in terms of ``_session_start_boundaries`` (the last
+    boundary IS the current session's start) so the gap rule is defined in
+    exactly one place; the return value is byte-identical to the pre-spec
+    implementation.
     """
-    if not events:
-        return None
-    threshold = timedelta(minutes=gap_minutes)
-    session_start = events[0]
-    for prev, curr in pairwise(events):
-        if curr - prev > threshold:
-            session_start = curr
-    return session_start
+    return b[-1] if (b := _session_start_boundaries(events, gap_minutes)) else None
 
 
 def _empty_totals_acc() -> dict[str, int]:
@@ -738,28 +803,49 @@ def _compute_cost(
 def _recent_pace_minutes(
     done_times: dict[str, datetime],
     progress_times: dict[str, datetime],
+    session_starts: Sequence[datetime],
     n: int,
-) -> float | None:
-    """Average minutes per task across the most-recent ``n`` task completions.
+) -> tuple[float | None, int]:
+    """Median minutes per task across the most-recent ``n`` valid task completions.
 
     Looks log-wide (not window-bounded) so the metric reflects current
     orchestrator pace rather than being anchored by historical completions.
-    Returns None when fewer than ``n`` task completions have valid durations.
+
+    Issue #326 (FR-2): a completion is a valid sample iff it has an
+    ``in-progress`` anchor (``tid in progress_times``) AND that anchor is in
+    the same orchestrator session as ``done`` (``_same_session``, boundaries
+    from ``session_starts``) AND the resulting duration is positive. The
+    first two failure modes mean the completion has no execution window at
+    all -- it is counted in the returned ``excluded`` total instead of
+    contributing a duration. Walking stops once ``n`` valid samples are
+    gathered. Returns ``(None, excluded)`` when fewer than ``n`` valid
+    samples exist log-wide; otherwise returns ``(statistics.median(durations),
+    excluded)`` -- the median replaces the pre-#326 arithmetic mean so a
+    single stale-claim completion cannot dominate the estimate.
+
+    Pure and raise-free: ``statistics.median`` is only reached once
+    ``len(durations) == n >= 1``, so it never sees an empty sequence.
     """
     task_done = [(tid, ts) for tid, ts in done_times.items() if "-T" in tid]
     task_done.sort(key=lambda kv: kv[1], reverse=True)
     durations: list[float] = []
+    excluded = 0
     for tid, dt in task_done:
         if tid not in progress_times:
+            excluded += 1
             continue
-        dur = (dt - progress_times[tid]).total_seconds() / SECONDS_PER_MINUTE
+        claim_time = progress_times[tid]
+        if not _same_session(claim_time, dt, session_starts):
+            excluded += 1
+            continue
+        dur = (dt - claim_time).total_seconds() / SECONDS_PER_MINUTE
         if dur > 0:
             durations.append(dur)
         if len(durations) >= n:
             break
     if len(durations) < n:
-        return None
-    return sum(durations) / len(durations)
+        return None, excluded
+    return statistics.median(durations), excluded
 
 
 def _resolve_rates_for_model(model_id: str) -> tuple[float, float, float, float, float, float]:
@@ -970,6 +1056,7 @@ def _compute_window_stats(
     event_index: EventIndex | None = None,
     recent_per_task_cost: float | None = None,
     lifetime_total_cost: float | None = None,
+    session_starts: Sequence[datetime] = (),
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
@@ -993,6 +1080,19 @@ def _compute_window_stats(
     behaviour. Both paths produce identical output for the same input
     -- the parity is asserted by the regression tests in
     ``test_event_index.py::TestParityAgainstParserPath``.
+
+    Issue #326 (FR-3): ``avg_minutes`` and ``recent_pace_minutes`` are now
+    medians of same-session, positive-duration samples (see ``_same_session``)
+    instead of arithmetic means, so a completion whose only ``in-progress``
+    anchor sits idle across a session gap (e.g. an operator ``set-status
+    done`` on a stale claim) cannot poison the pace, the ETA, or the cost
+    projection. ``session_starts`` defaults to ``()`` -- one implicit
+    session -- so every direct caller that has no log to segment (the
+    existing test suite, the non-owned parity test) keeps its previous
+    behaviour unchanged (spec D-7). Completions dropped for having no
+    execution window are counted in ``pace_excluded_count`` /
+    ``recent_pace_excluded_count`` and surfaced in the rendered cells
+    instead of silently narrowing the sample set.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -1000,16 +1100,21 @@ def _compute_window_stats(
     tasks_in_window = len(task_ids_done)
 
     task_durations: list[float] = []
+    pace_excluded_count = 0
     for tid in task_ids_done:
-        if tid in progress_times:
-            effective_start = max(progress_times[tid], window_start)
-            dur = (done_times[tid] - effective_start).total_seconds() / SECONDS_PER_MINUTE
-            if dur > 0:
-                task_durations.append(dur)
+        if tid not in progress_times or not _same_session(progress_times[tid], done_times[tid], session_starts):
+            pace_excluded_count += 1
+            continue
+        effective_start = max(progress_times[tid], window_start)
+        dur = (done_times[tid] - effective_start).total_seconds() / SECONDS_PER_MINUTE
+        if dur > 0:
+            task_durations.append(dur)
     pace_sample_count = len(task_durations)
-    avg_minutes = sum(task_durations) / pace_sample_count if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
+    avg_minutes = statistics.median(task_durations) if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
 
-    recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
+    recent_pace_minutes, recent_pace_excluded_count = _recent_pace_minutes(
+        done_times, progress_times, session_starts, RECENT_PACE_TASKS
+    )
 
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
     eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto + tasks_blocked_runtime_degradation
@@ -1122,7 +1227,9 @@ def _compute_window_stats(
         api_hours=api_hours,
         api_efficiency=api_efficiency,
         pace_sample_count=pace_sample_count,
+        pace_excluded_count=pace_excluded_count,
         recent_pace_minutes=recent_pace_minutes,
+        recent_pace_excluded_count=recent_pace_excluded_count,
         est_completion_at=est_completion_at,
         eta_active=tasks_active,
         eta_blocked_recovery=tasks_blocked_recovery,
@@ -1809,11 +1916,30 @@ def _format_est_hours_display(stats: WindowStats) -> str:
     return "n/a"
 
 
+def _no_execution_window_suffix(excluded: int) -> str:
+    """Return the value-cell suffix naming completions dropped for having no execution window.
+
+    Issue #326 (FR-4): ``""`` when nothing was dropped -- keeps the rendered
+    cell byte-identical to the pre-#326 form. Otherwise
+    ``" (<excluded> excluded: no execution window)"``. The suffix interpolates
+    only an ``int``, so no formatting call in this helper can raise.
+    """
+    if excluded == 0:
+        return ""
+    return f" ({excluded} excluded: no execution window)"
+
+
 def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS.
 
     ``display_tz`` is used to render the estimated-completion datetime in the
     operator's configured timezone. When ``None``, the OS local zone applies.
+
+    Issue #326 (FR-4): the ``Average time per task`` and ``Recent pace``
+    cells append ``_no_execution_window_suffix(...)`` naming any completions
+    dropped for having no execution window. The suffix is empty when nothing
+    was dropped, so the zero-drop cells stay byte-identical to the pre-#326
+    form.
     """
     # API utilization > 100% means API time exceeds wall time -- concurrent
     # subagent calls (legitimate parallelism) or two orchestrators writing to
@@ -1839,9 +1965,16 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
         avg_min_display = f"n/a (N={stats.pace_sample_count} sample{'s' if stats.pace_sample_count != 1 else ''})"
     else:
         avg_min_display = "n/a"
+    # Issue #326 (FR-4): name the completions dropped for having no execution
+    # window (no in-progress anchor, or the anchor is in a different
+    # orchestrator session) so the reader can see the sample was pruned
+    # rather than being silently narrowed.
+    avg_min_display += _no_execution_window_suffix(stats.pace_excluded_count)
     # Recent pace is log-wide; same value across all window columns. None
     # when fewer than RECENT_PACE_TASKS completions exist.
-    recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
+    recent_pace_display = (
+        "n/a" if stats.recent_pace_minutes is None else f"{stats.recent_pace_minutes:.1f} min"
+    ) + _no_execution_window_suffix(stats.recent_pace_excluded_count)
     est_hours_display = _format_est_hours_display(stats)
     # Wall-clock completion datetime rendered in the resolved display TZ.
     # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
@@ -1973,6 +2106,12 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
     excluded (genuine halt -> unbounded ETA). The pace prefers
     ``recent_pace_minutes`` when available; falls back to
     ``avg_minutes`` otherwise.
+
+    Issue #326 (FR-6): the chosen pace is now a median of same-session
+    execution-time samples (see ``_compute_window_stats``); when the chosen
+    path dropped completions for having no execution window, the exclusion
+    count is named in the sentence via ``_no_execution_window_suffix``. With
+    zero drops the sentence is byte-identical to the pre-#326 form.
     """
     eta_total = (
         tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto + stats.eta_blocked_runtime_degradation
@@ -1989,15 +2128,16 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
                 "need external action before the orchestrator can proceed."
             )
         return "All tasks complete."
-    pace_label, pace_minutes = (
-        ("Recent", stats.recent_pace_minutes)
+    pace_label, pace_minutes, pace_excluded = (
+        ("Recent", stats.recent_pace_minutes, stats.recent_pace_excluded_count)
         if stats.recent_pace_minutes is not None
-        else ("All-time", stats.avg_minutes)
+        else ("All-time", stats.avg_minutes, stats.pace_excluded_count)
     )
     if not pace_minutes:
         return f"{eta_total} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
+    exclusion_clause = _no_execution_window_suffix(pace_excluded)
     return (
-        f"At the {pace_label} pace of ~{pace_minutes:.1f} minutes per task, "
+        f"At the {pace_label} pace of ~{pace_minutes:.1f} minutes per task{exclusion_clause}, "
         f"the remaining {eta_total} active task(s){blocked_note} should take roughly "
         f"{stats.est_hours:.1f} more hours of continuous execution."
     )
@@ -2721,7 +2861,7 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
         # individually -- the role aggregator collapses across models.
         # Pricing against the "<unknown>" bucket (-> REPORT_DEFAULT_MODEL_RATES)
         # produces the same total an operator would compute by hand from the
-        # canonical Opus 4.7 list rates.  Issue #223's per-model panel
+        # canonical Opus 5 list rates (issue #233).  Issue #223's per-model panel
         # remains the more accurate axis for cost; #206 is per-role view.
         cost = _compute_cost_by_model({"<unknown>": totals})
         cache_write = totals.cache_write_5m_tokens + totals.cache_write_1h_tokens
@@ -2883,6 +3023,17 @@ def generate_report(
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
+    # Issue #326 (FR-5): compute the full session segmentation ONCE, from the
+    # same non-noise timestamp source the current-session detector already
+    # reads, and thread it into every ``_compute_window_stats`` call below.
+    # This is the ONLY place the boundary list is computed; the pure pace
+    # functions receive it as data (dependency inversion), which keeps them
+    # unit-testable without a log file.
+    session_starts = _session_start_boundaries(
+        event_index.non_noise_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path, LOG_NOISE_LOGGER_NAME),
+        DEFAULT_SESSION_GAP_MINUTES,
+    )
+
     # Precedence: report-specific (env DEVBENCH_REPORT_TIMEZONE > yaml
     # report.display_timezone) > top-level (env DEVBENCH_DISPLAY_TIMEZONE >
     # yaml display_timezone) > OS local. REPORT_DISPLAY_TIMEZONE already
@@ -2919,6 +3070,7 @@ def generate_report(
             backlog.tasks_blocked_runtime_degradation,
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
+            session_starts=session_starts,
         )
         if log_started is not None
         else None
@@ -2951,6 +3103,7 @@ def generate_report(
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
             lifetime_total_cost=lifetime_total_cost,
+            session_starts=session_starts,
         )
         lines.extend(backlog_state_block)
         lines.append("")
@@ -2996,6 +3149,7 @@ def generate_report(
                         event_index=event_index,
                         recent_per_task_cost=recent_per_task_cost,
                         lifetime_total_cost=lifetime_total_cost,
+                        session_starts=session_starts,
                     )
                 )
 

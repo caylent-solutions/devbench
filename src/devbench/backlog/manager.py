@@ -51,9 +51,14 @@ from devbench.constants import (
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
     EM_DASH,
     EPIC_ID_RE,
+    FAILURE_DIGEST_RE,
+    GATED_TASK_TYPES,
+    RED_OBSERVED_ENTRY_LINE_RE,
+    RED_OBSERVED_MESSAGE_FIELDS_RE,
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
@@ -66,10 +71,17 @@ from devbench.constants import (
     STATUS_SUMMARY_TABLE_HEADER,
     STRIP_SUMMARY_RE,
     TABLE_STATUS_VALUES,
+    TASK_TYPE_CHORE,
+    TASK_TYPE_DOCS,
+    TASK_TYPE_LINE_RE,
+    TASK_TYPE_REFACTOR,
+    TASK_TYPE_TEST_ONLY,
+    TDD_CYCLE_LOG_SECTION_BODY_RE,
     TDD_CYCLE_LOG_SECTION_HEADER,
     TDD_ENTRY_TEMPLATE,
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
+    VALID_TASK_TYPES,
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
@@ -137,6 +149,195 @@ def _extract_wu_title(work_unit_path: Path, fallback: str) -> str:
     return match.group(1)
 
 
+# ---------------------------------------------------------------------------
+# FR-4.5/FR-4.6 honest-completion-path invariants (AC-59 / AC-E4-F4-S1-T2-1..5,
+# issue #257). These were originally implemented only in devbench.cli's
+# cmd_mark_done wrapper (E4-F4-S1-T2 rounds 1-2). code_review (round 3) found
+# a second, unguarded caller of BacklogManager.mark_done --
+# _check_merge_handle_merged (devbench check-merge), reached whenever a PR
+# merges externally -- through which a refactor task with no
+# GREEN_GREEN_OBSERVED record, or a gated behavior-fix/feature task with no
+# RED_OBSERVED record, could still reach done: empirically reproduced by the
+# reviewer against this working tree. Defining the predicates and the
+# rejection-message builder here, and enforcing them directly inside
+# ``BacklogManager.mark_done`` (below), closes that bypass for every current
+# and future caller, not just ``cmd_mark_done``. ``devbench.cli`` re-imports
+# these names (mirroring its existing cross-module private-import pattern for
+# e.g. ``devbench.drain._current_user``, ``devbench.scope._tokenise``) so
+# every pre-existing call site and test keeps working unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _build_remedies_rejection_message(headline: str, detail: str) -> str:
+    """Build a fail-closed rejection message naming all three FR-4.5 remedies.
+
+    Mirrors the shape of ``devbench.tdd_gate._build_rejection_message`` so
+    every rejection surface in the system (the RED gate itself, the
+    mark-done gated-task/refactor block, the decline-citation check)
+    presents an identical, three-remedy structure (AC-59 /
+    AC-E4-F4-S1-T2-1): produce a genuine RED, re-type the task, or decline
+    as already-satisfied. Imports ``REMEDY_1``/``REMEDY_2``/``REMEDY_3``
+    locally from ``devbench.tdd_gate`` -- deferred so the existing
+    module-level ``devbench.tdd_gate -> devbench.backlog.manager`` import
+    never becomes circular -- rather than re-defining the remedy text a
+    second time, which would let the two copies drift.
+
+    Args:
+        headline: The one-line summary of what was rejected (no ``ERROR:``
+            prefix; a caller that raises this as a ``RuntimeError`` lets
+            its own caller's ``print(f"ERROR: {exc}")`` supply it, and a
+            caller that prints directly adds its own prefix).
+        detail: A rejection-specific explanation of why.
+
+    Returns:
+        The full multi-line rejection message, headline first, then the
+        detail, then all three remedies enumerated.
+    """
+    from devbench.tdd_gate import REMEDY_1, REMEDY_2, REMEDY_3
+
+    lines = [
+        headline,
+        f"  Detail: {detail}",
+        "  Remedies:",
+        f"    1. {REMEDY_1}",
+        f"    2. {REMEDY_2}",
+        f"    3. {REMEDY_3}",
+    ]
+    return "\n".join(lines)
+
+
+def _red_observed_message_has_all_required_fields(message: str) -> bool:
+    """Return True iff *message* parses into a well-formed RED_OBSERVED record.
+
+    Re-validates all three fields independently of whatever validation ran
+    at write time (MEDIUM/LOW findings inherited on E4-F3-S1-T1): the parsed
+    ``exit_code`` must not be ``"0"`` and the parsed ``failure_digest`` must
+    match ``FAILURE_DIGEST_RE``.
+
+    Args:
+        message: The message body captured from a RED_OBSERVED entry line.
+
+    Returns:
+        ``True`` only when all three fields are present, ``exit_code`` is
+        nonzero, and ``failure_digest`` is hash-shaped.
+    """
+    fields_match = RED_OBSERVED_MESSAGE_FIELDS_RE.search(message)
+    if fields_match is None:
+        return False
+    if fields_match.group("exit_code") == "0":
+        return False
+    return bool(FAILURE_DIGEST_RE.match(fields_match.group("failure_digest")))
+
+
+def red_gate_satisfied(content: str) -> bool:
+    """Return True iff the work unit's TDD Cycle Log contains a RED_OBSERVED entry.
+
+    Security-critical predicate (E4-F3-S1-T1 inherited findings): an
+    agent-written ``[RED]`` entry must never be able to satisfy this gate on
+    its own. Three defenses combine to close the forgery vectors identified
+    in review:
+
+    1. Section-scoping: only text inside the ``## TDD Cycle Log`` section is
+       considered (``TDD_CYCLE_LOG_SECTION_BODY_RE``) -- a RED_OBSERVED-shaped
+       line anywhere else (e.g. an agent's ``## Comments`` entry) never counts.
+       When the section header is absent, this returns ``False`` outright --
+       no fallback scan of the whole document.
+    2. Anchored line matching: ``RED_OBSERVED_ENTRY_LINE_RE`` only matches a
+       ``[RED_OBSERVED]`` tag at an entry line's structural start position, so
+       an agent cannot forge the tag by embedding it mid-message inside a
+       legitimate ``[RED]`` entry.
+    3. Full record re-validation: the matched entry's message must parse via
+       ``RED_OBSERVED_MESSAGE_FIELDS_RE`` into all three required fields, with
+       a nonzero ``exit_code`` and a hash-shaped ``failure_digest``.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+
+    Returns:
+        ``True`` only when a structurally well-formed, fully-populated
+        RED_OBSERVED record is present inside the TDD Cycle Log section;
+        ``False`` in every other case.
+    """
+    section_match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+    if section_match is None:
+        return False
+    section_body = section_match.group(1)
+    return any(
+        _red_observed_message_has_all_required_fields(line_match.group("message"))
+        for line_match in RED_OBSERVED_ENTRY_LINE_RE.finditer(section_body)
+    )
+
+
+# The machine-observed green-green record's phase tag (FR-4.6 /
+# AC-E4-F4-S1-T2-4, code_review FAIL round 2: "cmd_green_green_check is a
+# standalone command that writes no record to the work unit and is consumed
+# by no gate") is ``devbench.constants.TDD_PHASE_GREEN_GREEN_OBSERVED``,
+# imported above -- registered in ``VALID_TDD_PHASES`` (code_review FAIL
+# round 4, SOLID/OCP: a private local literal here left it invisible to
+# ``cli._reject_bracketed_phase_tag``'s bracketed-phase-tag security control,
+# which is built from ``VALID_TDD_PHASES``, so ``[GREEN_GREEN_OBSERVED]``
+# went unrejected in agent free text -- unlike ``[RED_OBSERVED]``). Only
+# ``devbench.cli.cmd_green_green_check`` (an orchestrator-facing command,
+# mirroring ``write_red_observed_entry``'s RED_OBSERVED discipline) ever
+# writes it: ``cmd_log_tdd`` (the only agent-facing writer of TDD Cycle Log
+# entries) rejects any phase not in ``AGENT_WRITABLE_TDD_PHASES`` before
+# ever reaching ``BacklogManager._append_tdd_entry``.
+
+# Anchored (line-start) match for a GREEN_GREEN_OBSERVED entry, mirroring
+# RED_OBSERVED_ENTRY_LINE_RE: a bare substring/"in" check would let a
+# REFACTOR entry's agent-written free-text message body forge the tag (the
+# same HIGH finding class E4-F3-S1-T1 closed for RED_OBSERVED); anchoring to
+# the entry's structural start position closes it here too.
+_GREEN_GREEN_OBSERVED_ENTRY_LINE_RE = re.compile(
+    r"^-\s+\[GREEN_GREEN_OBSERVED\]\s+\S+\s+--\s+(?P<message>.+)$",
+    re.MULTILINE,
+)
+
+_GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE: str = "test_node_ids={test_node_ids}"
+
+# Re-validates the matched entry's message body independently of whatever
+# validation ran at write time (mirroring RED_OBSERVED_MESSAGE_FIELDS_RE):
+# requires the single ``test_node_ids=`` field, a comma-joined run of
+# non-whitespace node ids, with no partial-record fallback.
+_GREEN_GREEN_OBSERVED_MESSAGE_FIELDS_RE = re.compile(r"^test_node_ids=(?P<test_node_ids>\S+)$")
+
+
+def green_green_observed_satisfied(content: str) -> bool:
+    """Return True iff the work unit's TDD Cycle Log contains a well-formed
+    ``GREEN_GREEN_OBSERVED`` entry (FR-4.6 / AC-E4-F4-S1-T2-4).
+
+    Mirrors ``red_gate_satisfied``'s three defenses so a ``refactor`` task's
+    own invariant is verifiable end to end, not merely runnable:
+
+    1. Section-scoping: only text inside the ``## TDD Cycle Log`` section is
+       considered (``TDD_CYCLE_LOG_SECTION_BODY_RE``) -- a
+       GREEN_GREEN_OBSERVED-shaped line anywhere else never counts.
+    2. Anchored line matching: ``_GREEN_GREEN_OBSERVED_ENTRY_LINE_RE`` only
+       matches a ``[GREEN_GREEN_OBSERVED]`` tag at an entry line's
+       structural start position, so an agent cannot forge the tag by
+       embedding it mid-message inside a legitimate ``[REFACTOR]`` entry.
+    3. Full record re-validation: the matched entry's message must parse
+       via ``_GREEN_GREEN_OBSERVED_MESSAGE_FIELDS_RE`` into the required
+       ``test_node_ids`` field.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+
+    Returns:
+        ``True`` only when a structurally well-formed GREEN_GREEN_OBSERVED
+        record is present inside the TDD Cycle Log section; ``False`` in
+        every other case.
+    """
+    section_match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+    if section_match is None:
+        return False
+    section_body = section_match.group(1)
+    return any(
+        _GREEN_GREEN_OBSERVED_MESSAGE_FIELDS_RE.match(line_match.group("message")) is not None
+        for line_match in _GREEN_GREEN_OBSERVED_ENTRY_LINE_RE.finditer(section_body)
+    )
+
+
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
@@ -191,11 +392,66 @@ class BacklogManager:
         """
         self._set_status(work_unit_path, backlog_index, unit_id, new_status, session_name=session_name)
 
+    def _check_task_type_done_invariant(self, unit_id: str, content: str) -> None:
+        """Raise ``RuntimeError`` when *content*'s own FR-4.5/FR-4.6 task-type
+        completion invariant is unmet.
+
+        Consolidates the two task-type-specific done-gate checks -- a
+        machine-observed ``RED_OBSERVED`` record for ``GATED_TASK_TYPES``
+        (behavior-fix/feature) and a machine-observed ``GREEN_GREEN_OBSERVED``
+        record for ``refactor`` -- into a single check called directly by
+        :meth:`mark_done`, so every caller of ``mark_done`` inherits it
+        (code_review FAIL, E4-F4-S1-T2 round 3: this logic previously lived
+        only in ``devbench.cli.cmd_mark_done``'s wrapper, so the second
+        ``mark_done`` caller, ``devbench.cli._check_merge_handle_merged``
+        [reached by ``devbench check-merge``], bypassed both checks
+        entirely -- empirically reproduced by the reviewer). A task with no
+        ``## Task Type:`` section defaults to ``DEFAULT_TASK_TYPE``
+        (``behavior-fix``, the strictest type), matching
+        ``_check_task_type_taxonomy``'s fail-closed precedent, so omitting
+        the section is never an escape hatch from the RED gate.
+
+        Args:
+            unit_id: Work unit ID, named in the rejection message.
+            content: The full text of the work-unit markdown file.
+
+        Raises:
+            RuntimeError: *task_type*'s own invariant is unmet; the message
+                names all three FR-4.5 remedies (AC-59 / AC-E4-F4-S1-T2-1).
+        """
+        declared = self._extract_task_type(content)
+        task_type = declared if declared is not None else DEFAULT_TASK_TYPE
+
+        if task_type in GATED_TASK_TYPES and not red_gate_satisfied(content):
+            raise RuntimeError(
+                _build_remedies_rejection_message(
+                    f"Cannot mark {unit_id} done: no RED_OBSERVED record found.",
+                    f"Task type is {task_type!r} (gated); FR-4.6 requires a machine-observed "
+                    "RED_OBSERVED entry in the TDD Cycle Log before a gated task can reach done.",
+                )
+            )
+
+        if task_type == TASK_TYPE_REFACTOR and not green_green_observed_satisfied(content):
+            raise RuntimeError(
+                _build_remedies_rejection_message(
+                    f"Cannot mark {unit_id} done: no GREEN_GREEN_OBSERVED record found.",
+                    "Task type is 'refactor'; FR-4.6 requires a machine-observed GREEN_GREEN_OBSERVED "
+                    "entry in the TDD Cycle Log -- run 'devbench green-green-check <id> <test_node_id> "
+                    "[...]' and let it pass -- before a refactor task can reach done.",
+                )
+            )
+
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
 
-        Raises ``RuntimeError`` if not all required review judges have passed
-        in the most recent review round (done-gate enforcement).
+        Raises ``RuntimeError`` if the task's own FR-4.5/FR-4.6 task-type
+        completion invariant is unmet (``_check_task_type_done_invariant``),
+        or if not all required review judges have passed in the most recent
+        review round (done-gate enforcement). Both checks are enforced here
+        -- not in a CLI-layer wrapper -- so every caller (``cmd_mark_done``,
+        ``_check_merge_handle_merged``, and any future caller) inherits them
+        identically; there is no second done-transition path that can skip
+        either check (E4-F4-S1-T2 round 3).
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -203,10 +459,13 @@ class BacklogManager:
             unit_id: The work-unit identifier.
 
         Raises:
-            RuntimeError: If not all required judges passed in the last round.
+            RuntimeError: If the task-type invariant is unmet, or if not all
+                required judges passed in the last round.
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
+        content = work_unit_path.read_text(encoding="utf-8")
+        self._check_task_type_done_invariant(unit_id, content)
         if not self._last_round_all_passed(work_unit_path):
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
@@ -435,6 +694,17 @@ class BacklogManager:
             ``## Definition of Done`` must appear in the Task's Changes Manifest after
             normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
         21. Unique work-unit IDs: no ID appears on more than one index row.
+        22. Six-type task taxonomy (FR-4.1): the optional ``## Task Type:`` section
+            (defaulting to ``behavior-fix`` when absent) must name one of the six
+            allowed types, and each type's Changes Manifest rows must satisfy its
+            per-type invariant (production-source presence for gated types;
+            test-only / docs / chore row-shape restrictions for exempt types).
+            Terminal Tasks (``done`` / ``declined``) are skipped.
+        23. Already-satisfied decline citation (FR-4.5): a ``declined`` Task whose
+            ``[DECLINED]`` comment reason contains ``already-satisfied`` must cite
+            the closing commit hash or task id somewhere in that reason; an
+            uncited already-satisfied decline is an unfalsifiable claim and is
+            rejected.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -470,12 +740,14 @@ class BacklogManager:
         self._check_manifest_conflicts(rows, workspace_root, errors)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
+        self._check_task_type_taxonomy(rows, workspace_root, errors)
         self._check_required_sections(rows, workspace_root, errors)
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
+        self._check_already_satisfied_decline_citation(rows, workspace_root, errors)
         return errors
 
     _CANONICAL_FULL_INDEX_HEADER_CELLS: tuple[str, ...] = (
@@ -1627,8 +1899,15 @@ class BacklogManager:
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
-            phase: TDD phase -- must be one of ``RED``, ``GREEN``, or ``REFACTOR``
-                (caller must pass normalized uppercase value).
+            phase: TDD phase -- any member of ``devbench.constants.VALID_TDD_PHASES``
+                (``RED``, ``GREEN``, ``REFACTOR``, ``RED_OBSERVED``,
+                ``GREEN_GREEN_OBSERVED``; caller must pass normalized
+                uppercase value). This helper performs no phase validation
+                itself: the agent-writable versus orchestrator-only boundary
+                (``AGENT_WRITABLE_TDD_PHASES`` vs. ``RED_OBSERVED``/
+                ``GREEN_GREEN_OBSERVED``) is enforced by the caller --
+                ``cmd_log_tdd`` rejects phases outside
+                ``AGENT_WRITABLE_TDD_PHASES`` before this method is ever reached.
             message: Description of the TDD phase outcome.
 
         Raises:
@@ -1992,6 +2271,12 @@ class BacklogManager:
         "infra/scripts/",
     )
     _PROD_SRC_NESTED_PATTERNS: ClassVar[tuple[str, ...]] = ("/src/",)
+    # Extensions consumed by the ``chore`` task-type invariant that are not
+    # already covered by ``_NON_PY_EXTS_TO_TIER`` (which is reused below for
+    # the config/dependency tiers it already tracks -- HCL, YAML, JSON, XML,
+    # TOML). Lockfiles and legacy setup/config formats have no dedicated
+    # tier entry, so they are listed explicitly here.
+    _CHORE_EXTRA_EXTS: ClassVar[tuple[str, ...]] = (".lock", ".cfg", ".ini", ".txt")
     _AC_FINAL_LANGUAGE_TIER_IDS: ClassVar[frozenset[str]] = frozenset(
         {
             "AC-FINAL-002",
@@ -2031,19 +2316,34 @@ class BacklogManager:
         return ""
 
     @classmethod
+    def _is_test_source_path(cls, path: str) -> bool:
+        """Return True if the path is a Python file located under a ``tests/`` dir.
+
+        This is the single shared authority for "is this path a Python test
+        file" used both by ``_is_production_source`` (Rule 14, source-test
+        atomicity) and by the task-type taxonomy invariants (FR-4.1 /
+        E4-F2-S1-T1, AC-47). Introducing a second, independent test-path
+        classifier is prohibited -- both call sites must reuse this method
+        so the production/test boundary can never drift out of sync.
+        """
+        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+            return False
+        return path.startswith("tests/") or "/tests/" in path
+
+    @classmethod
     def _is_production_source(cls, path: str) -> bool:
         """Return True if the path looks like production Python source.
 
         Used by the source-test pair rule to distinguish source files (which
         require a matching test entry) from one-off scripts in
         configuration-only directories. Test files themselves (paths under
-        any ``tests/`` segment) are excluded -- they are not production source
-        even when their extension is ``.py``.
+        any ``tests/`` segment, per ``_is_test_source_path``) are excluded --
+        they are not production source even when their extension is ``.py``.
         """
         if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
             return False
         # Exclude test files
-        if path.startswith("tests/") or "/tests/" in path:
+        if cls._is_test_source_path(path):
             return False
         # Exclude package marker files
         from pathlib import PurePosixPath
@@ -2053,6 +2353,32 @@ class BacklogManager:
         return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
             seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
         )
+
+    @staticmethod
+    def _is_documentation_path(path: str) -> bool:
+        """Return True if the path is a documentation/markdown file.
+
+        Used by the ``docs`` task-type invariant (FR-4.1). Deliberately
+        extension-based only (``.md``) -- documentation-only tasks author
+        markdown, never other file types.
+        """
+        return path.lower().endswith(".md")
+
+    @classmethod
+    def _is_chore_path(cls, path: str) -> bool:
+        """Return True if the path is a dependency/config/lockfile entry.
+
+        Used by the ``chore`` task-type invariant (FR-4.1). Reuses the
+        existing config/dependency tiers already tracked by
+        ``_NON_PY_EXTS_TO_TIER`` (HCL, YAML, JSON, XML, TOML) -- excluding
+        Markdown, which the ``docs`` task type owns instead -- plus a small
+        set of lockfile/legacy-config extensions with no dedicated tier
+        entry.
+        """
+        lower = path.lower()
+        if any(lower.endswith(ext) for ext in cls._CHORE_EXTRA_EXTS):
+            return True
+        return any(lower.endswith(ext) for ext, tier in cls._NON_PY_EXTS_TO_TIER.items() if tier != "Markdown")
 
     @staticmethod
     def _is_real_manifest_path(path: str) -> bool:
@@ -2375,6 +2701,165 @@ class BacklogManager:
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
 
+    def _check_task_type_taxonomy(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 21: six-type task taxonomy and per-type Manifest invariants (FR-4.1).
+
+        Parses the optional ``## Task Type:`` section. A task with no
+        ``## Task Type:`` section defaults to ``behavior-fix`` -- the
+        strictest type -- so that a missing declaration is never an escape
+        hatch from the RED gate or the production-source Manifest
+        invariant (AC-45). Terminal Tasks (``done`` / ``declined``) are
+        skipped entirely: they predate the taxonomy and cannot be
+        retroactively failed for a missing section. Non-terminal Tasks
+        have the per-type Changes Manifest invariant from the FR-4.1
+        taxonomy table enforced:
+
+        - ``behavior-fix`` / ``feature`` (RED-gated, ``GATED_TASK_TYPES``):
+          the Manifest must contain at least one production-source row.
+        - ``test-only``: every Manifest row must be a test path.
+        - ``docs``: every Manifest row must be a documentation/markdown path.
+        - ``chore``: every Manifest row must be a dependency/config/lockfile
+          path.
+        - ``refactor``: exempt from the per-row invariants enforced here --
+          its green-green runtime requirement is a TDD-cycle-log concern,
+          out of scope for this static Manifest check.
+
+        An unrecognized ``## Task Type:`` value fails naming the full
+        allowed set (AC-45). Every invariant rejection names the offending
+        row_id, the declared type, and the violated invariant (AC-E4-F2-S1-T1-5).
+
+        Production/test classification reuses ``_is_production_source`` /
+        ``_is_test_source_path`` (Rule 14) exclusively -- no independent
+        classifier exists for that boundary (AC-47).
+
+        A Task whose ``## Changes Manifest`` table cannot be parsed (e.g. a
+        row with the wrong column count) is skipped by this rule rather
+        than crashing validate() or deriving a diagnostic from a partially
+        parsed table. This mirrors the ``except ManifestParseError:
+        continue`` pattern already used by every other Manifest-consuming
+        validate rule; it does NOT imply another rule catches the malformed
+        table on the author's behalf -- for a repo with no configured
+        ``checkout_directory`` none currently does. That gap predates this
+        check and is shared by all six ManifestParseError call sites in
+        this module, so closing it is out of scope here.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        for row_id, row_status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            # Skip terminal tasks: they predate the taxonomy and cannot be
+            # retroactively failed for a missing ## Task Type: section.
+            if row_status in _TERMINAL_CHILD_STATUSES:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            declared = self._extract_task_type(content)
+            # A Task with no explicit ## Task Type: section defaults to
+            # the strictest type (behavior-fix) rather than being exempt,
+            # so omitting the section is never a way to dodge the RED gate
+            # or the production-source Manifest invariant (AC-45).
+            task_type = declared if declared is not None else DEFAULT_TASK_TYPE
+
+            if task_type not in VALID_TASK_TYPES:
+                errors.append(
+                    f"{row_id}: unrecognized '## Task Type:' value {task_type!r}. "
+                    f"Allowed values: {', '.join(sorted(VALID_TASK_TYPES))}. "
+                    f"See docs/backlog-contract.md 'Task-Type Taxonomy'."
+                )
+                continue
+
+            if task_type == TASK_TYPE_REFACTOR:
+                continue
+
+            try:
+                manifest_paths = [m.file for m in parse_manifest(content)]
+            except ManifestParseError:
+                # Rule 21 mirrors the ManifestParseError swallow already used
+                # by every other Manifest-consuming validate rule (the
+                # manifest-conflict, AC-language-tier, no-glob and Rule 14
+                # source-test-pair checks at lines 2115, 2245, 2307 and 2358).
+                # That established pattern does NOT currently guarantee any
+                # OTHER rule surfaces the malformed Manifest either -- for a
+                # repo with no configured checkout_directory, a malformed
+                # Manifest row today produces zero validate() errors from
+                # any rule, a pre-existing gap that predates this task and
+                # spans all six ManifestParseError call sites. Rule 21
+                # deliberately follows the established (imperfect) swallow
+                # convention rather than being the one rule that either (a)
+                # crashes validate() on an already-broken table or (b)
+                # derives a task-type-invariant diagnostic from a partially
+                # parsed Manifest. Closing the underlying gap requires
+                # auditing all six sites together and is out of this task's
+                # scope (AC-E4-F2-S1-T1-1..6 concern only the taxonomy).
+                continue
+            paths = [p for p in manifest_paths if self._is_real_manifest_path(p)]
+            self._check_task_type_manifest_invariant(row_id, task_type, paths, errors)
+
+    # Per-type Manifest invariant: type -> (row classifier, human description).
+    # ``behavior-fix`` / ``feature`` are handled separately in
+    # ``_check_task_type_manifest_invariant`` (an aggregate "at least one"
+    # check, not a per-row classifier). ``refactor`` never reaches the
+    # dispatcher -- the caller filters it out before parsing the Manifest.
+    _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[str, str]]] = {
+        TASK_TYPE_TEST_ONLY: ("_is_test_source_path", "test"),
+        TASK_TYPE_DOCS: ("_is_documentation_path", "documentation/markdown"),
+        TASK_TYPE_CHORE: ("_is_chore_path", "dependency/config/lockfile"),
+    }
+
+    def _check_task_type_manifest_invariant(
+        self,
+        row_id: str,
+        task_type: str,
+        paths: list[str],
+        errors: list[str],
+    ) -> None:
+        """Dispatch to the per-type Changes Manifest invariant for ``task_type``.
+
+        ``behavior-fix`` / ``feature`` (``GATED_TASK_TYPES``) require an
+        aggregate check -- at least one production-source row anywhere in
+        the Manifest. ``test-only`` / ``docs`` / ``chore`` require a
+        per-row check via ``_TASK_TYPE_ROW_INVARIANTS`` -- every row must
+        classify as that type's allowed path shape.
+        """
+        if task_type in GATED_TASK_TYPES:
+            if not any(self._is_production_source(p) for p in paths):
+                errors.append(
+                    f"{row_id}: task type {task_type!r} requires at least "
+                    f"one production-source row in the Changes Manifest, "
+                    f"but none was found -- task-type invariant violated. "
+                    f"See docs/backlog-contract.md 'Task-Type Taxonomy'."
+                )
+            return
+
+        # Every VALID_TASK_TYPES member partitions into exactly one of
+        # GATED_TASK_TYPES (handled above), TASK_TYPE_REFACTOR (filtered
+        # by the caller before this method is reached), or a key in
+        # _TASK_TYPE_ROW_INVARIANTS -- direct indexing (not .get()) so a
+        # future type added to VALID_TASK_TYPES without a matching entry
+        # here raises immediately (fail-fast) instead of silently
+        # skipping its invariant.
+        classifier_name, description = self._TASK_TYPE_ROW_INVARIANTS[task_type]
+        classifier = getattr(self, classifier_name)
+        for path in paths:
+            if not classifier(path):
+                errors.append(
+                    f"{row_id}: task type {task_type!r} allows only "
+                    f"{description} rows in the Changes Manifest, but "
+                    f"{path!r} is not a {description} path -- task-type "
+                    f"invariant violated. See docs/backlog-contract.md "
+                    f"'Task-Type Taxonomy'."
+                )
+
     # ------------------------------------------------------------------
     # E209: Backlog-Contract Alignment hardening rules
     # ------------------------------------------------------------------
@@ -2385,6 +2870,39 @@ class BacklogManager:
     # the rule. Mirrors the ``EPIC_ID_RE`` shape in constants.py while
     # adding the optional Feature/Story/Task suffixes.
     _DEP_ID_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?$")
+
+    # A lowercase hex commit hash, abbreviated (7 chars, git's default short
+    # form) through full-length (40 chars, a SHA-1 object id). Uppercase hex
+    # is deliberately excluded -- git's own output is always lowercase, so an
+    # uppercase token is a hand-typed guess, not a citation of a real commit.
+    _CITATION_COMMIT_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[0-9a-f]{7,40}$")
+
+    @classmethod
+    def is_valid_citation(cls, value: str) -> bool:
+        """Return True iff *value* is shaped like a commit hash or a task id (FR-4.5).
+
+        An already-satisfied decline must cite the closing commit or task id
+        (FR-4.5's error-handling contract: "an uncited decline is rejected").
+        Two shapes are accepted: a lowercase hex commit hash (``_CITATION_COMMIT_RE``,
+        7-40 characters -- git's abbreviated-to-full range) or a canonical
+        work-unit id matching ``_DEP_ID_PATTERN``, the same single-source-of-truth
+        pattern the Dependencies-table format check (Rule 17) already uses,
+        rather than a second, possibly-divergent "what a task id looks like"
+        regex.
+
+        Args:
+            value: The candidate citation token. Leading/trailing whitespace
+                is stripped before matching.
+
+        Returns:
+            ``True`` when the trimmed *value* matches either shape;
+            ``False`` for an empty string, a whitespace-only string, or any
+            other free text.
+        """
+        trimmed = value.strip()
+        if not trimmed:
+            return False
+        return bool(cls._CITATION_COMMIT_RE.match(trimmed)) or bool(cls._DEP_ID_PATTERN.match(trimmed))
 
     def _check_required_sections(
         self,
@@ -2820,6 +3338,83 @@ class BacklogManager:
                     f"'No Orphan Path Tokens Rule'."
                 )
 
+    # Matches a ``[DECLINED]`` audit line as written by ``_append_comment``
+    # (``COMMENT_ENTRY_TEMPLATE``): ``[<timestamp>] [backlog_manager] [DECLINED] <message>``.
+    # Anchored to the exact agent id the mark_declined() write path uses, so a
+    # free-text ``## Comments`` line an agent writes elsewhere (e.g. quoting
+    # "declined" in prose) can never be mistaken for the structural entry.
+    _DECLINED_COMMENT_LINE_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"^\[.+?\] \[backlog_manager\] \[DECLINED\] (?P<message>.+)$", re.MULTILINE
+    )
+    # FR-4.5 remedy 3's routing keyword. Matched case-insensitively against
+    # the persisted decline reason so ``already-satisfied``, ``Already-Satisfied``,
+    # etc. are all recognised as the same routing decision.
+    _ALREADY_SATISFIED_TOKEN: str = "already-satisfied"
+    # A citation token embedded in free text is typically wrapped or
+    # punctuated, e.g. "already-satisfied (citing abc1234)" or
+    # "already-satisfied, see E1-F1-S1-T9.". Stripping these characters
+    # before tokenising on whitespace lets ``is_valid_citation`` match the
+    # bare hash/id inside such wrapping without a bespoke extraction regex.
+    _CITATION_WRAPPING_CHARS: str = "(),.;:\"'"
+
+    def _check_already_satisfied_decline_citation(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 22: an already-satisfied decline must cite a commit or task id (FR-4.5).
+
+        FR-4.5 remedy 3 lets an orchestrator decline a behavior-fix task
+        whose test already passes because a prior task genuinely closed the
+        behavior -- but only when the decline names the commit or task that
+        closed it. An uncited "already-satisfied" claim is exactly as
+        unfalsifiable as a fabricated RED (the failure mode FR-4.5 exists to
+        close), so this rule scans every ``declined`` Task's ``[DECLINED]``
+        comment entries and rejects any whose reason contains the
+        ``already-satisfied`` routing keyword but no token that
+        :meth:`is_valid_citation` accepts.
+
+        Only ``declined``-status rows are scanned (Rule 22 is a no-op for
+        every other status); a Task in any other state cannot yet carry a
+        ``[DECLINED]`` comment written by ``mark_declined()``.
+
+        Args:
+            rows: Parsed ``(row_id, status, file_path)`` tuples from the
+                backlog index.
+            workspace_root: Workspace root the row's ``file_path`` is
+                relative to.
+            errors: Shared error accumulator; violations are appended here.
+        """
+        for row_id, row_status, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if row_status != STATUS_DECLINED:
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            for match in self._DECLINED_COMMENT_LINE_RE.finditer(content):
+                message = match.group("message")
+                if self._ALREADY_SATISFIED_TOKEN not in message.lower():
+                    continue
+                stripped_message = message
+                for char in self._CITATION_WRAPPING_CHARS:
+                    stripped_message = stripped_message.replace(char, " ")
+                tokens = stripped_message.split()
+                if any(self.is_valid_citation(token) for token in tokens):
+                    continue
+                errors.append(
+                    f"{row_id}: declined with reason containing "
+                    f"'{self._ALREADY_SATISFIED_TOKEN}' but no citation (commit hash or "
+                    f"task id) was found in the message {message!r}. FR-4.5 requires an "
+                    f"already-satisfied decline to cite the closing commit or task, e.g. "
+                    f"'already-satisfied (citing abc1234)'."
+                )
+
     @staticmethod
     def _derive_branch_for_row(
         unit_id: str, file_path_str: str, workspace_root: Path, branch_prefix: str | None = None
@@ -2916,6 +3511,22 @@ class BacklogManager:
         """
         m = re.search(r"\*\*Repo:\*\*\s*`([^`]+)`", content)
         return m.group(1) if m else None
+
+    @staticmethod
+    def _extract_task_type(content: str) -> str | None:
+        """Extract the declared ``## Task Type:`` value from a work-unit body.
+
+        Returns the lowercased, whitespace-trimmed value, or ``None`` if the
+        section is absent. Callers (``_check_task_type_taxonomy``) resolve a
+        ``None`` result to ``DEFAULT_TASK_TYPE`` (``behavior-fix``), never
+        to an exemption. Value casing/whitespace is normalized here so
+        authors may write ``Test-Only`` or ``  docs  `` without tripping
+        the taxonomy check.
+        """
+        m = TASK_TYPE_LINE_RE.search(content)
+        if not m:
+            return None
+        return m.group(2).strip().lower()
 
     @staticmethod
     def _is_task_id(unit_id: str) -> bool:

@@ -225,6 +225,24 @@ report:
   # in issue #223 in favour of this block.  Workspaces that still set
   # them get a fail-fast error at config-load time.
   models:
+    # Current lineup (issue #233, spec FR-3.1, S5.3). Source:
+    # https://platform.claude.com/docs/en/about-claude/pricing, captured
+    # 2026-07-29.
+    claude-fable-5:
+      input: 10.0
+      output: 50.0
+    claude-opus-5:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-8:
+      input: 5.0
+      output: 25.0
+    # LIST rate is the shipped default (spec S5.3). An introductory rate of
+    # $2/$10 runs through 2026-08-31; that is a local `report.models`
+    # override only, never the shipped default.
+    claude-sonnet-5:
+      input: 3.0
+      output: 15.0
     claude-opus-4-7:
       input: 5.0
       output: 25.0
@@ -260,7 +278,7 @@ report:
       output: 1.25
   # Rates applied to any transcript message whose `model` field is missing
   # OR a model id not present in `report.models` above.  Defaults to Opus
-  # 4.7 list rates so unknown models err toward over-reporting.
+  # 5 list rates so unknown models err toward over-reporting.
   default_model:
     input: 5.0
     output: 25.0
@@ -270,7 +288,11 @@ report:
   cache_write_5min_multiplier: 1.25
   cache_write_1hr_multiplier: 2.0
   data_residency_multiplier: 1.10
-  fast_mode_multiplier: 6.0
+  # Fast-mode premium (Opus 5 / Opus 4.8 only at capture time): $10/$50 on a
+  # $5/$25 base, i.e. 2.0x. Source:
+  # https://platform.claude.com/docs/en/about-claude/pricing, captured
+  # 2026-07-29.
+  fast_mode_multiplier: 2.0
   recent_pace_tasks: 10
   # Report-specific timezone override. Falls back to the top-level
   # display_timezone (and ultimately to OS local).
@@ -286,14 +308,23 @@ manifest_amendment:
   max_requests_per_execution: 1
 
 # ---------------------------------------------------------------------------
-# Task factory loop (requires manifest_amendment.enabled: true)
+# Task factory loop (on by default, ADR-32; requires manifest_amendment.enabled:
+# true). Set enabled: false to opt out of the loop entirely.
 # ---------------------------------------------------------------------------
 task_factory:
-  enabled: false
-  # When true (the default), sweep-proposals auto-promotes every produced
-  # draft at the next loop tick. Set false to make a human review every
-  # proposal. Only takes effect when task_factory.enabled is true.
-  auto_accept_proposals: true
+  enabled: true
+  # Two independent auto-promote paths. (1) write-proposal: true makes
+  # write-proposal itself synchronously materialise (and, for legacy
+  # `proposed`-status ids, promote) drafts in the same call instead of
+  # waiting for the next sweep-proposals tick; false (the default) means
+  # write-proposal only persists the JSON. (2) sweep-proposals: true makes
+  # it also auto-promote any orphaned draft explicitly left at status
+  # `proposed` (a legacy/hand-edited-draft case); false leaves such drafts
+  # for an explicit `promote-proposal`/`reject-proposal` decision. Neither
+  # path changes a freshly materialised draft's initial status, which is
+  # always backlog.default_status_for_new_work_units (default `in-queue`).
+  # Only takes effect when task_factory.enabled is true.
+  auto_accept_proposals: false
 
 # ---------------------------------------------------------------------------
 # Backlog lifecycle settings (issue #189)
@@ -413,6 +444,69 @@ skills:
 #     changes_manifest: opus
 
 # ---------------------------------------------------------------------------
+# Quota wait-and-resume (issue #236, spec S5.2).
+#
+# STATUS: this block is parsed and validated at config-load time (schema
+# enum/range checks, additionalProperties:false). Most fields are consumed at
+# runtime by the quota dispatcher (`cmd_start` via
+# `_drive_orchestrate_with_quota_resume` / `_dispatch_quota_detection` /
+# `_handle_quota_pause` in `src/devbench/cli.py`, landed by E2-F4-S3-T1):
+# enabled / on_exhaustion are read on every quota-exhaustion signal,
+# on_exhaustion_timeout is read only when the wait cap elapses, and
+# resume_strategy only after a confirmed recovery. log_structured_events is
+# read too: it gates the seven structured [QUOTA_*] markers (see its own
+# comment below).
+#
+# This block governs what the orchestrator does when the Claude CLI reports
+# a quota-exhaustion signal (HTTP 429 / CLI "You've hit your limit" message).
+#
+# enabled: true (default) -- the orchestrator pauses and waits for the
+#   quota window to reset rather than exiting with a non-zero code. Set to
+#   false to restore the pre-#236 behaviour (propagate the error, non-zero
+#   exit; #193 AC-4, spec AC-24).
+# on_exhaustion: what to do when a quota signal is detected.
+#   "wait"  -- pause and poll until reset_at (default).
+#   "fail"  -- re-raise immediately (non-zero exit, same as enabled:false).
+#   "drain" -- trigger a graceful drain then exit.
+# poll_interval_seconds: base cadence for the recovery probe loop (30-3600).
+# max_wait_seconds: cap on total wait time in seconds; on_exhaustion_timeout
+#   fires if exceeded.
+# on_exhaustion_timeout: what to do when max_wait_seconds is exceeded.
+#   "drain"        -- trigger a graceful drain (default).
+#   "fail"         -- re-raise the quota error.
+#   "keep_waiting" -- terminal: logs [QUOTA_TIMEOUT_KEEP_WAITING] and ends
+#     the run (no drain, no re-raise).
+# resume_strategy: how to re-enter the orchestrate loop after recovery.
+#   "continue_current_wu" -- resume where we left off (default).
+#   "restart_wu"          -- force the current WU back to in-queue.
+#   "drain_and_resume"    -- remove the quota checkpoint and request a
+#     graceful drain; the run stops and must be restarted manually, since
+#     the Makefile auto-restart loop (Makefile:117-123) fires only on exit
+#     code 42, which a graceful drain does not produce.
+# audit_comment_on_wait: write a [QUOTA_WAITING] audit comment to the active
+#   work unit when pausing. Defaults to true.
+# audit_comment_on_resume: write a [QUOTA_RESUMED] audit comment when the
+#   wait ends. Defaults to true.
+# log_structured_events: gates the seven structured [QUOTA_*] markers
+#   ([QUOTA_WAITING], [QUOTA_POLLING], [QUOTA_RESUMED],
+#   [QUOTA_PROBE_UNAVAILABLE], [QUOTA_FAIL_FAST], [QUOTA_DRAIN_REQUESTED],
+#   [QUOTA_TIMEOUT_KEEP_WAITING]); false suppresses all seven. Does not
+#   affect Slack notifications, audit_comment_on_wait /
+#   audit_comment_on_resume, the on-disk checkpoint, or the
+#   [ORCHESTRATOR_QUOTA_*] markers. Defaults to true.
+# ---------------------------------------------------------------------------
+# quota_handling:
+#   enabled: true
+#   on_exhaustion: wait
+#   poll_interval_seconds: 60
+#   max_wait_seconds: 18000
+#   on_exhaustion_timeout: drain
+#   resume_strategy: continue_current_wu
+#   audit_comment_on_wait: true
+#   audit_comment_on_resume: true
+#   log_structured_events: true
+
+# ---------------------------------------------------------------------------
 # Operator-facing notifications (PR #202).
 # ---------------------------------------------------------------------------
 # Per-event toggles for lifecycle pings.  Each notification endpoint
@@ -448,6 +542,8 @@ skills:
 #     ci_failure: false                    # CI run on a WU PR failed
 #     orchestrator_stop: false             # orchestrator loop exited (clean / drain / SIGTERM / crash)
 #     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
+#     quota_waiting: false                 # orchestrator hit a quota and started waiting (see quota_handling: above)
+#     quota_resumed: false                 # quota recovered and the run resumed (see quota_handling: above)
 #   slack:
 #     enabled: false                       # endpoint-level toggle; flip to true to enable Slack POSTs
 #     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)

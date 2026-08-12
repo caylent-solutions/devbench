@@ -11,7 +11,7 @@ Instance ID format: ``<workspace_basename>-<pid-suffix>`` (e.g.
 ``kanon-deps-work-2281``).  Operators can also pass the raw PID to any
 lifecycle command; ``resolve_instance`` handles both forms.
 
-PID files are best-effort metadata — a missing / corrupt / non-object
+PID files are best-effort metadata -- a missing / corrupt / non-object
 payload is treated as no instance; a stale entry (PID dead) is filtered
 out by the liveness check.  No correctness gate depends on the PID
 file being present.
@@ -122,7 +122,7 @@ def read_pid_file(pid_path: Path) -> Instance | None:
 def is_pid_alive(pid: int) -> bool:
     """Return True iff *pid* refers to a live process.
 
-    Uses ``os.kill(pid, 0)`` — sends no signal, only checks the kernel's
+    Uses ``os.kill(pid, 0)`` -- sends no signal, only checks the kernel's
     process table.  ``PermissionError`` means the process exists but
     signaling is denied (still alive).  Any other error means dead.
     """
@@ -138,12 +138,34 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def _resolve_search_roots(roots: list[Path] | None) -> list[Path]:
+    """Resolve the effective search roots for instance discovery (obs-spec FR-D2).
+
+    Three-tier resolution:
+
+    1. Explicit *roots* (caller-supplied) always wins, unchanged.
+    2. ``DEVBENCH_INSTANCE_SEARCH_ROOTS`` (colon-separated), when set, is
+       returned verbatim -- this precedence is byte-identical to the
+       pre-existing behavior and MUST NOT change (obs-spec OAC-3).
+    3. Otherwise the default is ``$HOME`` plus the current
+       ``DEVBENCH_WORKSPACE_ROOT`` (when set and not already under
+       ``$HOME``), so `devbench instances` finds a workspace's own daemon
+       without requiring the env-var override (obs-spec B-2 / OD-2).
+
+    A workspace root that does not exist on disk is not special-cased
+    here; it falls through the existing ``root.is_dir()`` guard in
+    :func:`discover_instances` exactly as any other nonexistent root does.
+    """
     if roots is not None:
         return roots
     env = os.environ.get(INSTANCE_SEARCH_ROOTS_ENV, "")
     if env:
         return [Path(p).expanduser() for p in env.split(":") if p]
-    return [Path.home()]
+    home = Path.home()
+    default_roots = [home]
+    workspace_root = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "")
+    if workspace_root and not Path(workspace_root).is_relative_to(home):
+        default_roots.append(Path(workspace_root))
+    return default_roots
 
 
 def discover_instances(search_roots: list[Path] | None = None) -> list[Instance]:

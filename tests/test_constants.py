@@ -944,3 +944,34 @@ class TestGreenGreenObservedTddPhaseConstant:
 
         content = "## Comments\n\n- [RED_OBSERVED] ts -- exit_code=1 test_node_id=t failure_digest=deadbeef01\n"
         assert TDD_CYCLE_LOG_SECTION_BODY_RE.search(content) is None
+
+
+class TestMinutesPerHourConstant:
+    """#329 FR-5 (E13-F2-S2-T1): ``MINUTES_PER_HOUR`` names the divisor a
+    minutes-valued quantity uses to become hours, distinct from
+    ``SECONDS_PER_MINUTE`` (the divisor a seconds-valued quantity uses to
+    become minutes). Both happen to equal 60 today, so introducing this
+    constant changes no rendered output -- it only gives the ETA conversion
+    in report.py a name that matches what it actually divides."""
+
+    @pytest.mark.unit
+    def test_minutes_per_hour_equals_60(self) -> None:
+        from devbench.constants import MINUTES_PER_HOUR
+
+        assert MINUTES_PER_HOUR == 60
+
+    @pytest.mark.unit
+    def test_minutes_per_hour_is_int(self) -> None:
+        from devbench.constants import MINUTES_PER_HOUR
+
+        assert isinstance(MINUTES_PER_HOUR, int)
+
+    @pytest.mark.unit
+    def test_minutes_per_hour_is_own_module_level_name_not_an_import_alias(self) -> None:
+        """``MINUTES_PER_HOUR`` must be a real module-level binding in
+        constants.py (not merely re-exported from elsewhere), so a future
+        edit to one conversion constant cannot silently change the other."""
+        import devbench.constants as constants_module
+
+        assert "MINUTES_PER_HOUR" in vars(constants_module)
+        assert constants_module.MINUTES_PER_HOUR == constants_module.SECONDS_PER_MINUTE == 60

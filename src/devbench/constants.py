@@ -887,6 +887,11 @@ REPORT_VALUE_COLUMN_WIDTH: int = 16
 MS_PER_SECOND: int = 1000
 SECONDS_PER_MINUTE: int = 60
 SECONDS_PER_HOUR: int = 3600
+# Divisor for a minutes-valued quantity becoming hours -- distinct from
+# SECONDS_PER_MINUTE (the divisor for a seconds-valued quantity becoming
+# minutes). Both equal 60; using the wrong one is a latent semantic trap
+# even though today's rendered output is unaffected (#329 FR-5).
+MINUTES_PER_HOUR: int = 60
 PERCENT_MULTIPLIER: int = 100
 
 # ---------------------------------------------------------------------------

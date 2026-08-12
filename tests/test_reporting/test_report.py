@@ -3276,6 +3276,54 @@ class TestEtaCommentSuffixWhenBlockedDominates:
         assert "5.6 min/task" in out
 
 
+class TestEtaMinutesPerHourRenameIsValuePreserving:
+    """#329 FR-5 (E13-F2-S2-T1): report.py's ETA-hours conversion divides
+    ``pace_for_projection`` (a minutes-valued quantity) by ``MINUTES_PER_HOUR``
+    instead of the semantically-wrong ``SECONDS_PER_MINUTE``. Both constants
+    equal 60 today, so this test pins the exact rendered ETA cell for a fully
+    deterministic window: it must pass identically whether the conversion
+    divides by ``SECONDS_PER_MINUTE`` or ``MINUTES_PER_HOUR``, proving the
+    rename introduces no output defect."""
+
+    def test_rendered_eta_is_byte_identical_across_the_rename(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from devbench.reporting.report import _compute_window_stats, _format_est_hours_display
+
+        # Pin RECENT_PACE_TASKS so the sample count needed to resolve
+        # recent_pace_minutes does not depend on the ambient environment.
+        monkeypatch.setattr("devbench.reporting.report.RECENT_PACE_TASKS", 3)
+
+        now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+        done_times: dict[str, datetime] = {}
+        progress_times: dict[str, datetime] = {}
+        for i in range(3):
+            tid = f"E0-F1-S1-T{i + 1}"
+            done_times[tid] = now - timedelta(minutes=i)
+            progress_times[tid] = done_times[tid] - timedelta(minutes=30)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            now - timedelta(hours=1),
+            now,
+            done_times,
+            _as_claims(progress_times),
+            tasks_active=2,
+            tasks_blocked_recovery=0,
+            tasks_blocked_auto=0,
+            tasks_blocked_runtime_degradation=0,
+        )
+
+        # Every sample is exactly 30 minutes, so the median pace is exactly
+        # 30.0 -- a value chosen so the est_hours division lands on an exact
+        # round number regardless of which 60-valued constant is the divisor.
+        assert stats.recent_pace_minutes == 30.0
+        assert stats.est_hours == 1.0
+        assert _format_est_hours_display(stats) == "~1.0 h (active 2 at 30.0 min/task)"
+
+
 class TestReportInProgressDurationSuffix:
     """Issue #158: the report's in-progress panel renders the duration suffix."""
 

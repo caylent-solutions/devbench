@@ -78,6 +78,7 @@ from devbench.constants import (
     DEFAULT_SESSION_GAP_MINUTES,
     LOG_NOISE_LOGGER_NAME,
     MIN_PACE_SAMPLES,
+    MINUTES_PER_HOUR,
     MS_PER_SECOND,
     PERCENT_MULTIPLIER,
     SECONDS_PER_HOUR,
@@ -1161,7 +1162,11 @@ def _compute_window_stats(
 
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
     eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto + tasks_blocked_runtime_degradation
-    est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
+    # pace_for_projection is minutes/task (avg_minutes or recent_pace_minutes,
+    # both derived from total_seconds() / SECONDS_PER_MINUTE elsewhere in this
+    # function), so the correct divisor here is MINUTES_PER_HOUR, not
+    # SECONDS_PER_MINUTE -- see constants.py (#329 FR-5).
+    est_hours = (eta_task_count * pace_for_projection) / MINUTES_PER_HOUR if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
     #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs

@@ -120,40 +120,61 @@ SLACK_HERE_MENTION: str = "<!here>"
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator stop-class taxonomy (E2-F3-S1-T1, spec FR-2.10, ADR-24)
+# Orchestrator stop-class taxonomy (E2-F3-S1-T1, spec FR-2.10, ADR-24;
+# extended db-271 spec FR-18 Part B)
 # ---------------------------------------------------------------------------
 #
 # A single-sourced enumeration of orchestrator stop-reason classes, keyed by
-# a stable token so a future mention-level mapping (which stop classes get a
-# ``<!here>`` push vs. a silent post) can be declared once and consumed by
-# both the notify dispatch path and config validation.  This task introduces
-# the two classes its own quota notifications need: ``crash`` is the
+# a stable token so the mention-level mapping (which stop classes get a
+# ``<!here>`` push vs. a silent post) is declared once and consumed by both
+# the notify dispatch path and config validation.  ``crash`` is the
 # fail-visible fallback bucket every unrecognised stop reason lands in
-# (never silently dropped), and ``quota-exhausted`` is the new class for the
-# quota wait-and-resume lifecycle.  Ported from the pre-strip commit 58048b3
-# per D-16; ``ALL_STOP_CLASSES`` is deliberately left open for a later task
-# to extend with the remaining orchestrator-stop classes (premature-turn-end,
-# completion, drain, operator-interrupt) without renaming anything here.
+# (never silently dropped); ``quota-exhausted`` covers the quota
+# wait-and-resume lifecycle.  Ported from the pre-strip commit 58048b3 per
+# D-16.  db-271 (spec FR-18 Part B) adds the remaining four classes the
+# scaffold's docstring had left open: ``premature-turn-end`` (a clean SDK
+# loop exit that captured no terminal sentinel), ``completion`` (a genuine
+# finished run), ``drain`` (operator-requested drain honoured), and
+# ``operator-interrupt`` (Ctrl+C / SIGINT).  ``ALL_STOP_CLASSES`` is now the
+# complete set.
 
 STOP_CLASS_CRASH: str = "crash"
 STOP_CLASS_QUOTA_EXHAUSTED: str = "quota-exhausted"
+STOP_CLASS_PREMATURE_TURN_END: str = "premature-turn-end"
+STOP_CLASS_COMPLETION: str = "completion"
+STOP_CLASS_DRAIN: str = "drain"
+STOP_CLASS_OPERATOR_INTERRUPT: str = "operator-interrupt"
 
 ALL_STOP_CLASSES: tuple[str, ...] = (
     STOP_CLASS_CRASH,
     STOP_CLASS_QUOTA_EXHAUSTED,
+    STOP_CLASS_PREMATURE_TURN_END,
+    STOP_CLASS_COMPLETION,
+    STOP_CLASS_DRAIN,
+    STOP_CLASS_OPERATOR_INTERRUPT,
 )
 
-# Allowed value for the per-stop-class mention level.  ``here`` emits
+# Allowed values for the per-stop-class mention level.  ``here`` emits
 # ``<!here>`` so Slack pushes a notification to every online channel member
-# -- the existing behaviour for every dispatch in this module today.
+# -- the existing behaviour for every dispatch in this module.  ``none``
+# omits the mention entirely so an expected stop posts a silent status
+# update instead of paging the operator (db-271).
 MENTION_LEVEL_HERE: str = "here"
+MENTION_LEVEL_NONE: str = "none"
 
-# Default stop-class -> mention-level mapping.  Both classes currently
-# defined are attention-worthy (an unrecognised crash and a quota exhaustion
-# both warrant a push), so both default to ``here``.
+# Default stop-class -> mention-level mapping (db-271, OD-1=A): the three
+# attention-worthy classes -- an unrecognised crash, a quota exhaustion, and
+# a premature turn end (a stalled/aborted run masquerading as clean) -- page
+# the operator.  The three expected-stop classes -- a genuine completion, an
+# operator-requested drain, and an operator-initiated interrupt -- post
+# silently since the operator already knows the run stopped.
 DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP: dict[str, str] = {
     STOP_CLASS_CRASH: MENTION_LEVEL_HERE,
     STOP_CLASS_QUOTA_EXHAUSTED: MENTION_LEVEL_HERE,
+    STOP_CLASS_PREMATURE_TURN_END: MENTION_LEVEL_HERE,
+    STOP_CLASS_COMPLETION: MENTION_LEVEL_NONE,
+    STOP_CLASS_DRAIN: MENTION_LEVEL_NONE,
+    STOP_CLASS_OPERATOR_INTERRUPT: MENTION_LEVEL_NONE,
 }
 
 
@@ -185,10 +206,21 @@ def validate_stop_mention_map(candidate: dict[str, str]) -> None:
 def classify_stop_class(reason: str) -> str:
     """Map a stop-reason string to the canonical stop-class token.
 
-    Classification is prefix-based.  Any reason starting with ``quota``
-    (e.g. ``QuotaExhaustedError``-derived reason strings such as
-    ``"quota-exhausted"`` or ``"quota exceeded: anthropic-api"``) classifies
-    to :data:`STOP_CLASS_QUOTA_EXHAUSTED`.
+    Classification is prefix-based, matching the reason shapes ``cmd_start``
+    (:mod:`devbench.cli`) assigns to ``_stop_reason`` (db-271, spec FR-18
+    Part B):
+
+    - ``"quota"`` (e.g. ``"quota-exhausted"``, ``"quota exceeded: ..."``,
+      any ``QuotaExhaustedError``-derived reason) -> :data:`STOP_CLASS_QUOTA_EXHAUSTED`.
+    - ``"premature turn end"`` (``cli._PREMATURE_TURN_END_REASON``) ->
+      :data:`STOP_CLASS_PREMATURE_TURN_END`.
+    - ``"clean exit"`` (both ``"clean exit: <sdk result text>"`` and
+      ``_label_stop_reason``'s ``"clean exit (SystemExit 0)"``) ->
+      :data:`STOP_CLASS_COMPLETION`.
+    - ``"drain enforced"`` (``_drive_orchestrate_with_quota_resume``'s drain
+      disposition) -> :data:`STOP_CLASS_DRAIN`.
+    - ``"interrupted by operator"`` (``_label_stop_reason``'s
+      ``KeyboardInterrupt`` label) -> :data:`STOP_CLASS_OPERATOR_INTERRUPT`.
 
     Args:
         reason: The stop-reason string.
@@ -201,6 +233,14 @@ def classify_stop_class(reason: str) -> str:
     """
     if reason.startswith("quota"):
         return STOP_CLASS_QUOTA_EXHAUSTED
+    if reason.startswith("premature turn end"):
+        return STOP_CLASS_PREMATURE_TURN_END
+    if reason.startswith("clean exit"):
+        return STOP_CLASS_COMPLETION
+    if reason.startswith("drain enforced"):
+        return STOP_CLASS_DRAIN
+    if reason.startswith("interrupted by operator"):
+        return STOP_CLASS_OPERATOR_INTERRUPT
     return STOP_CLASS_CRASH
 
 
@@ -327,15 +367,20 @@ def _build_slack_payload(
     summary: str,
     fields: list[tuple[str, str]],
     context: str | None,
+    mention: str = MENTION_LEVEL_HERE,
 ) -> dict[str, Any]:
     """Build a Slack block-kit payload.
 
-    Every payload is prefixed with the literal ``<!here>`` mention so the
-    message triggers a desktop + mobile push for every online member of
-    the channel the webhook posts to.  In a one-person private channel
-    (the recommended DM-yourself pattern) that's just the operator; in
-    a shared channel the whole online team gets pinged.  Single payload,
-    both routings.
+    By default every payload is prefixed with the literal ``<!here>``
+    mention so the message triggers a desktop + mobile push for every
+    online member of the channel the webhook posts to.  In a one-person
+    private channel (the recommended DM-yourself pattern) that's just the
+    operator; in a shared channel the whole online team gets pinged.
+    Single payload, both routings.  Passing ``mention=MENTION_LEVEL_NONE``
+    (db-271) omits the prefix entirely for an expected stop that does not
+    warrant paging the operator; every caller except
+    :func:`notify_orchestrator_stop` keeps the ``MENTION_LEVEL_HERE``
+    default, so this stays byte-identical for every other event.
 
     Every payload also carries a ``Backlog`` field as the first row of
     the fields block so operators monitoring multiple workspaces can
@@ -353,8 +398,11 @@ def _build_slack_payload(
             ``Backlog`` row is prepended automatically.
         context: Optional muted footer line (block-kit ``context``
             element).  ``None`` skips the footer block.
+        mention: One of the ``MENTION_LEVEL_*`` constants.
+            ``MENTION_LEVEL_HERE`` (default) prefixes ``<!here> ``;
+            ``MENTION_LEVEL_NONE`` omits the mention prefix.
     """
-    prefix = f"{SLACK_HERE_MENTION} "
+    prefix = f"{SLACK_HERE_MENTION} " if mention == MENTION_LEVEL_HERE else ""
     text_line = f"{prefix}{summary}"
     enriched_fields: list[tuple[str, str]] = [("Backlog", _resolve_backlog_label())] + list(fields)
     blocks: list[dict[str, Any]] = [
@@ -513,6 +561,7 @@ def _dispatch(
     slack_summary: str,
     slack_fields: list[tuple[str, str]],
     slack_context: str | None,
+    mention: str = MENTION_LEVEL_HERE,
 ) -> None:
     """POST the payload to every enabled endpoint; never raise.
 
@@ -527,6 +576,20 @@ def _dispatch(
     (config-read errors, payload-build bugs) so a notification bug
     cannot crash the orchestrator.  Inner per-endpoint try / except
     keeps one endpoint's failure from blocking the others.
+
+    Args:
+        event_kind: One of the ``EVENT_*`` tokens; gates dispatch via
+            :func:`is_event_enabled`.
+        slack_summary: Headline passed through to
+            :func:`_build_slack_payload`.
+        slack_fields: Structured fields passed through to
+            :func:`_build_slack_payload`.
+        slack_context: Optional footer passed through to
+            :func:`_build_slack_payload`.
+        mention: Passed through to :func:`_build_slack_payload`.  Defaults
+            to ``MENTION_LEVEL_HERE`` so every existing caller stays
+            byte-identical; only :func:`notify_orchestrator_stop` (db-271)
+            computes and passes a non-default level.
     """
     if not is_event_enabled(event_kind):
         return
@@ -538,7 +601,7 @@ def _dispatch(
         slack_url = cfg.slack.webhook_url if (cfg.slack is not None and cfg.slack.enabled) else None
 
         if slack_url:
-            slack_payload = _build_slack_payload(slack_summary, slack_fields, slack_context)
+            slack_payload = _build_slack_payload(slack_summary, slack_fields, slack_context, mention=mention)
             try:
                 post_webhook(slack_url, slack_payload, timeout)
             except Exception as exc:
@@ -874,16 +937,48 @@ def notify_ci_pass(unit_id: str, repo: str, pr_url: str) -> None:
     )
 
 
-def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None:
-    """The orchestrator loop is exiting (clean, drain, or SIGTERM)."""
+def notify_orchestrator_stop(
+    reason: str,
+    in_flight_unit_id: str | None,
+    progress: tuple[int, int] | None = None,
+) -> None:
+    """The orchestrator loop is exiting (completion, drain, quota, crash, ...).
+
+    db-271 (spec FR-18 Parts B/C): the mention level is computed from
+    :func:`classify_stop_class` via :data:`DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP`
+    so an expected stop (completion / drain / operator-interrupt) posts
+    silently while an attention-worthy stop (crash / quota-exhausted /
+    premature-turn-end, plus any future unmapped class -- fail-visible via
+    the ``.get(..., MENTION_LEVEL_HERE)`` fallback) still pings ``<!here>``.
+    This is the only caller in the module that computes a non-default
+    mention level; every other dispatcher keeps ``_dispatch``'s
+    ``MENTION_LEVEL_HERE`` default so its payload stays byte-identical.
+
+    Args:
+        reason: Human-readable stop reason (also classified for the
+            mention level).
+        in_flight_unit_id: The work-unit id that was in progress when the
+            orchestrator stopped, or ``None`` when none was in flight.
+        progress: Optional ``(done, total)`` pair counting every work unit
+            in the backlog index.  Rendered as a ``Progress`` field reading
+            ``"<done>/<total> done"``.  ``None`` (default) omits the field
+            entirely -- the caller degrades to ``None`` on a backlog parse
+            failure so a progress-computation bug can never mask the real
+            exit reason.
+    """
     fields: list[tuple[str, str]] = [("Reason", reason)]
     if in_flight_unit_id:
         fields.append(("In-flight", f"`{in_flight_unit_id}`"))
+    if progress is not None:
+        done, total = progress
+        fields.append(("Progress", f"{done}/{total} done"))
+    mention = DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP.get(classify_stop_class(reason), MENTION_LEVEL_HERE)
     _dispatch(
         EVENT_ORCHESTRATOR_STOP,
         slack_summary=f":octagonal_sign: Orchestrator stopped: {reason}",
         slack_fields=fields,
         slack_context=None,
+        mention=mention,
     )
 
 

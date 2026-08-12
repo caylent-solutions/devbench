@@ -7436,6 +7436,110 @@ class TestLabelStopReason:
         assert _label_stop_reason(ValueError("")) == "crash: ValueError: "
 
 
+class TestResolveCleanStopReason:
+    """db-271 (spec FR-18 Part A): the pure three-way resolution extracted
+    from ``cmd_start`` so its branch count stays under ruff's PLR0912
+    ceiling -- exercised directly here."""
+
+    def test_sdk_result_text_present_wins(self) -> None:
+        from devbench.cli import _resolve_clean_stop_reason
+
+        assert (
+            _resolve_clean_stop_reason("clean", "NO_ACTIONABLE -- 1/1 done") == "clean exit: NO_ACTIONABLE -- 1/1 done"
+        )
+
+    def test_no_result_text_and_still_clean_seed_is_premature(self) -> None:
+        from devbench.cli import _PREMATURE_TURN_END_REASON, _resolve_clean_stop_reason
+
+        assert _resolve_clean_stop_reason("clean", None) == _PREMATURE_TURN_END_REASON
+        assert _resolve_clean_stop_reason("clean", "") == _PREMATURE_TURN_END_REASON
+
+    def test_loop_provided_reason_is_preserved_unchanged(self) -> None:
+        """When the loop already set a drain/quota disposition (not the
+        ``"clean"`` seed) and no SDK text arrived, the reason passes through
+        untouched -- branch 3 of the three-way."""
+        from devbench.cli import _resolve_clean_stop_reason
+
+        assert (
+            _resolve_clean_stop_reason("drain enforced: operator requested", None)
+            == "drain enforced: operator requested"
+        )
+
+
+class TestFireOrchestratorStopNotificationProgress:
+    """db-271 (spec FR-18 Part C, AC-E12-F3-S1-T1-3): ``_fire_orchestrator_stop_notification``
+    computes ``(done, total)`` progress over every work unit in the backlog
+    index and degrades to ``None`` -- logged, not silently swallowed -- on a
+    backlog parse failure."""
+
+    @staticmethod
+    def _build_backlog(tmp_path: Path) -> Path:
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir()
+        rows = [
+            ("E0-F1-S1-T1", "Task", "done"),
+            ("E0-F1-S1-T2", "Task", "done"),
+            ("E0-F1-S1-T3", "Task", "in-queue"),
+        ]
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        for unit_id, unit_type, status in rows:
+            file_path = f"backlog/{unit_id}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | None | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            (wu_dir / f"{unit_id}.md").write_text(f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n")
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    @pytest.mark.unit
+    def test_progress_computed_from_all_work_units(self, tmp_path: Path) -> None:
+        index_path = self._build_backlog(tmp_path)
+
+        captured: list[tuple[Any, ...]] = []
+
+        def _capture(reason: str, in_flight_id: str | None, progress: tuple[int, int] | None = None) -> None:
+            captured.append((reason, in_flight_id, progress))
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.notifications.notify_orchestrator_stop", _capture),
+        ):
+            cli._fire_orchestrator_stop_notification("clean exit: ALL_DONE")
+
+        assert captured == [("clean exit: ALL_DONE", None, (2, 3))]
+
+    @pytest.mark.unit
+    def test_progress_degrades_to_none_on_backlog_parse_failure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        missing_index = tmp_path / "does-not-exist" / "BACKLOG.md"
+
+        captured: list[tuple[Any, ...]] = []
+
+        def _capture(reason: str, in_flight_id: str | None, progress: tuple[int, int] | None = None) -> None:
+            captured.append((reason, in_flight_id, progress))
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", missing_index),
+            patch("devbench.notifications.notify_orchestrator_stop", _capture),
+        ):
+            cli._fire_orchestrator_stop_notification("crash: boom")
+
+        assert captured == [("crash: boom", None, None)]
+        err = capsys.readouterr().err
+        assert "[WARN]" in err
+        assert "orchestrator-stop progress lookup failed" in err
+
+
 class TestCmdStart:
     """Test cmd_start command by mocking claude_agent_sdk."""
 
@@ -20234,13 +20338,21 @@ class TestCmdStartSlackPingResultText:
         assert reason != "clean", "Slack reason 'clean' alone is insufficient -- must carry the SDK result text (#217)"
 
     @pytest.mark.unit
-    def test_slack_ping_falls_back_to_clean_when_no_result_message(self, tmp_path: Path) -> None:
-        """When the SDK never emits a ResultMessage (degenerate / mock test
-        scenario), the legacy ``"clean"`` reason is preserved so existing
-        behaviour is a strict superset of the pre-fix implementation.
+    def test_premature_turn_end_labeled_distinctly(self, tmp_path: Path) -> None:
+        """db-271 (spec AC-42, FR-18 Part A): when the SDK loop exits cleanly
+        (``StopAsyncIteration``, no drain/quota) but never captured a
+        terminal-sentinel ``ResultMessage`` (empty ``_sdk_result_text``), the
+        stop reason must be the distinct ``_PREMATURE_TURN_END_REASON`` --
+        never the bare legacy ``"clean"`` literal that hid a stalled-mid-cascade
+        run behind the same label as a finished one.
+
+        Rewritten in place (Complete Replacement) from the pre-db-271 test
+        that pinned the old ``"clean"``-preserving behaviour this task fixes.
         """
         import sys
         import types
+
+        from devbench.cli import _PREMATURE_TURN_END_REASON
 
         mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_sdk.ClaudeAgentOptions = MagicMock()
@@ -20268,9 +20380,111 @@ class TestCmdStartSlackPingResultText:
 
         assert rc == 0
         assert captured_reason
-        assert captured_reason[-1] == "clean", (
-            f"With no ResultMessage emitted, reason must remain 'clean'; got {captured_reason[-1]!r}"
+        assert captured_reason[-1] == _PREMATURE_TURN_END_REASON, (
+            f"Premature turn end must be labeled distinctly; got {captured_reason[-1]!r}"
         )
+        assert captured_reason[-1] != "clean", "premature turn end must never surface as the bare 'clean' literal"
+        assert captured_reason[-1].startswith("premature turn end")
+
+
+class TestCmdStartPrematureTurnEndSlackPing:
+    """db-271 (spec AC-42/AC-43/AC-44, FR-18 Parts A/B/C) end-to-end: a fake
+    SDK stream that yields a terminal ``ResultMessage(result='')`` (present,
+    but empty -- the exact premature-turn-end shape) then exhausts must
+    produce a Slack payload that is: (1) labeled with the distinct premature
+    reason, (2) classified into ``STOP_CLASS_PREMATURE_TURN_END`` so it pings
+    ``<!here>``, and (3) carries the ``Progress`` field computed over every
+    work unit in the backlog index.
+    """
+
+    @staticmethod
+    def _build_backlog(tmp_path: Path) -> Path:
+        """Two ``done`` tasks + one ``draft`` task -> ``Progress: 2/3 done``."""
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        rows = [
+            ("E0-F1-S1-T1", "Task", "done"),
+            ("E0-F1-S1-T2", "Task", "done"),
+            ("E0-F1-S1-T3", "Task", "draft"),
+        ]
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        for unit_id, unit_type, status in rows:
+            file_path = f"backlog/{unit_id}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | None | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+            (wu_dir / f"{unit_id}.md").write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    @pytest.mark.unit
+    def test_premature_turn_end_pings_here_with_progress(self, tmp_path: Path) -> None:
+        import sys
+        import types
+
+        from devbench.config_loader import (
+            NotificationsConfig,
+            NotificationsEventsConfig,
+            NotificationsSlackConfig,
+        )
+
+        index_path = self._build_backlog(tmp_path)
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        class _EmptyResultMessage:
+            subtype = "success"
+            result = ""  # present but empty -- carries no terminal sentinel
+
+        async def mock_query(**kwargs: object) -> object:
+            yield _EmptyResultMessage()
+
+        mock_sdk.query = mock_query
+
+        notify_cfg = NotificationsConfig(
+            enabled=True,
+            timeout_seconds=10.0,
+            events=NotificationsEventsConfig(orchestrator_stop=True),
+            slack=NotificationsSlackConfig(enabled=True, webhook_url="https://hooks.slack.com/services/T/B/X"),
+        )
+
+        captured_payloads: list[dict[str, Any]] = []
+
+        def _grab(_url: str, payload: dict[str, Any], _timeout: float) -> None:
+            captured_payloads.append(payload)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            patch("devbench.notifications._load_notifications_config", return_value=notify_cfg),
+            patch("devbench.notifications.post_webhook", side_effect=_grab),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_payloads, "orchestrator_stop Slack payload was never dispatched"
+        payload = captured_payloads[-1]
+        assert payload["text"].startswith("<!here> "), (
+            f"premature turn end must classify to a here-mention stop class; got {payload['text']!r}"
+        )
+        assert "premature turn end" in payload["text"]
+        field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "2/3 done" in field_blob, f"Progress field must count all work units; fields were {field_blob!r}"
 
 
 class TestCmdStartCancelDrainOnExit:

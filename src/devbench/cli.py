@@ -8323,6 +8323,21 @@ def _log_terminal_exit_if_applicable(text: str | None) -> bool:
     return True
 
 
+#: db-271 (spec FR-18 Part A): the distinct label for a premature turn end
+#: -- a clean SDK loop exit (``StopAsyncIteration``, no drain/quota/inactivity
+#: exhaustion) that captured no terminal-sentinel ``ResultMessage``
+#: (``_sdk_result_text`` stayed empty).  Previously this bucket kept the bare
+#: ``"clean"`` seed all the way to the Slack ping, indistinguishable from a
+#: finished run.  Coordinate wording changes with the FR-17
+#: inactivity-timeout owner: this string is assigned to ``_stop_reason``
+#: only after the SDK loop has already exited, so it is never fed back
+#: through :func:`_is_terminal_orchestrate_result` as if it were a second
+#: SDK turn -- keep it that way.
+_PREMATURE_TURN_END_REASON: str = (
+    "premature turn end -- SDK loop exhausted with no terminal sentinel (ALL_DONE / NO_ACTIONABLE)"
+)
+
+
 def _label_stop_reason(exc: BaseException) -> str:
     """Return a human-readable label for the orchestrator's exit (#213).
 
@@ -8349,6 +8364,40 @@ def _label_stop_reason(exc: BaseException) -> str:
     return f"crash: {type(exc).__name__}: {exc}"
 
 
+def _resolve_clean_stop_reason(current_reason: str, sdk_result_text: str | None) -> str:
+    """Resolve the final stop-reason label after a clean SDK loop exit.
+
+    Three-way resolution (issue #217 / db-271 spec FR-18 Part A), extracted
+    from ``cmd_start`` so its branch count stays under ruff's PLR0912
+    ceiling:
+
+    1. ``sdk_result_text`` is present -> ``"clean exit: <text>"`` (issue
+       #217: surfaces the orchestrate skill's ``ALL_DONE`` /
+       ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` end-of-run summary).
+    2. No result text AND ``current_reason`` is still the ``"clean"`` seed
+       -> the distinct :data:`_PREMATURE_TURN_END_REASON` (db-271): the SDK
+       loop exited cleanly (``StopAsyncIteration``, no drain/quota) but
+       never captured a terminal sentinel, so keeping the bare ``"clean"``
+       label would hide a stalled/aborted mid-cascade run behind the same
+       wording as a genuinely finished one.
+    3. Otherwise, ``current_reason`` already carries the loop-provided
+       drain / quota disposition -- returned unchanged.
+
+    Args:
+        current_reason: The ``_stop_reason`` value accumulated so far.
+        sdk_result_text: The last captured ``ResultMessage.result`` text, or
+            ``None`` / empty when the SDK never emitted one.
+
+    Returns:
+        The resolved stop-reason label.
+    """
+    if sdk_result_text:
+        return f"clean exit: {sdk_result_text}"
+    if current_reason == "clean":
+        return _PREMATURE_TURN_END_REASON
+    return current_reason
+
+
 def _fire_orchestrator_stop_notification(reason: str) -> None:
     """Best-effort always-fire of the ``orchestrator_stop`` notification.
 
@@ -8357,19 +8406,38 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
     cmd_start's outer try/finally cannot mask the real exit reason.
     Extracted from ``cmd_start`` body so the branch-count of that
     function stays under the project's ruff PLR0912 ceiling (12).
+
+    db-271 (spec FR-18 Part C): also computes a ``(done, total)`` progress
+    tuple over every work unit in the backlog index and passes it through so
+    the Slack ping's ``Progress`` field reads ``X/Y done``.  On a backlog
+    parse failure the progress computation degrades to ``None`` (the
+    ``Progress`` field is omitted from the payload) and the failure is
+    logged to stderr -- never silently swallowed -- while the in-flight
+    lookup keeps its existing best-effort fallback so a parse failure never
+    masks the real exit reason.
     """
     try:
         from devbench.notifications import notify_orchestrator_stop
 
         in_flight_id: str | None = None
+        progress: tuple[int, int] | None = None
         try:
             stop_parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
             stop_units = stop_parser.parse_index()
             stop_wu = _find_in_flight_wu(stop_units)
             in_flight_id = stop_wu.id if stop_wu is not None else None
-        except (OSError, ValueError):
+            progress = (
+                sum(unit.status is WorkUnitStatus.DONE for unit in stop_units),
+                len(stop_units),
+            )
+        except (OSError, ValueError) as exc:
             in_flight_id = None
-        notify_orchestrator_stop(reason, in_flight_id)
+            progress = None
+            print(
+                f"[WARN] orchestrator-stop progress lookup failed: {exc!r}",
+                file=sys.stderr,
+            )
+        notify_orchestrator_stop(reason, in_flight_id, progress=progress)
     except Exception as exc:  # broad guard: notification must never mask real exit
         print(
             f"[WARN] orchestrator-stop notification failed: {exc!r}",
@@ -8784,14 +8852,11 @@ def cmd_start(*argv: str) -> int:
         # operator inspection.
         ScopeFilter.clear(WORKSPACE_ROOT)
 
-        # Issue #217: bubble the SDK's final ResultMessage text into the
-        # Slack reason so ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` and
-        # similar end-of-run summaries reach the operator.  Without this,
-        # the reason stayed at the literal ``"clean"`` initial value,
-        # masking whether the backlog actually finished or just ran out of
-        # actionable work mid-cascade.  Ternary form (rather than an
-        # ``if`` block) keeps the branch count under ruff's PLR0912 cap.
-        _stop_reason = f"clean exit: {_sdk_result_text}" if _sdk_result_text else _stop_reason
+        # Issue #217 / db-271: resolve the final stop-reason label after a
+        # clean SDK loop exit.  Delegated to ``_resolve_clean_stop_reason``
+        # (rather than an inline ``if``/``elif`` chain) so ``cmd_start``'s
+        # branch count stays under ruff's PLR0912 cap.
+        _stop_reason = _resolve_clean_stop_reason(_stop_reason, _sdk_result_text)
 
         restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
         return restart_rc

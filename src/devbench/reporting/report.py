@@ -1649,6 +1649,74 @@ def install_parity_line() -> str | None:
     )
 
 
+# Issue #331 FR-4. Mirrors cli.py's own restart-arm marker
+# (``_ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX = "[ORCHESTRATOR_TRANSPORT_RESTART]"``,
+# logged by ``_should_restart_after_transport_error`` via
+# ``logger.info("%s attempt=%d max=%d", ...)``) by literal text, not by
+# import: ``devbench report`` runs in a separate process from
+# ``devbench start`` and only ever sees the persisted log, and importing
+# from ``cli`` here would be circular (``cli.py`` imports this module for
+# ``cmd_report``). The line is anchored start-to-end (timestamp, logger,
+# level, marker, and the ``attempt=<n> max=<cap>`` suffix cli.py's
+# ``logger.info`` call actually emits under ``LOG_FORMAT`` /
+# ``LOG_DATE_FORMAT``) so a restart marker merely quoted inside an
+# unrelated SDK message -- the same echoed-text hazard
+# ``event_index.py``'s ``_TASK_TRANSITION_RE`` already guards against for
+# task transitions -- cannot inflate the count.
+_TRANSPORT_RESTART_LOG_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[[^\]]+\] \w+ \[ORCHESTRATOR_TRANSPORT_RESTART\] attempt=\d+ max=\d+$",
+    re.MULTILINE,
+)
+
+
+def _count_transport_restarts(log_text: str) -> int:
+    """Count genuine ``[ORCHESTRATOR_TRANSPORT_RESTART]`` audit lines in raw log text.
+
+    Pure function over already-read log text so ``transport_restarts_line``'s
+    file I/O and this counting logic stay independently testable.
+
+    Returns:
+        The number of matching lines (``len`` of a match list, which the
+        ``len`` builtin itself guarantees is never negative).
+    """
+    return len(_TRANSPORT_RESTART_LOG_LINE_RE.findall(log_text))
+
+
+def transport_restarts_line(log_path: Path) -> str | None:
+    """Render the transport-restart-count row for ``devbench report`` (#331 FR-4).
+
+    Reads the orchestrator log directly (a fresh, uncached read, mirroring
+    ``install_parity_line()``'s own independent I/O) and counts every
+    ``[ORCHESTRATOR_TRANSPORT_RESTART]`` line cli.py's restart arm
+    (``_should_restart_after_transport_error``) has logged. Returns ``None``
+    when the log does not exist yet or contains no restarts, so a clean
+    run's report stays byte-identical to today (spec D-6, AC-11) -- the same
+    "no row when it wouldn't say anything" contract ``install_parity_line()``
+    already established.
+
+    A negative count is impossible by construction (``_count_transport_restarts``
+    is a match-list length) but is asserted rather than defensively clamped
+    at this rendering boundary, per this task's fail-fast contract: a defect
+    that somehow produced a negative count must crash loudly here rather than
+    silently render a nonsensical row.
+
+    Args:
+        log_path: Path to the orchestrator log (``generate_report``'s own
+            ``log_path`` parameter).
+
+    Returns:
+        ``"Transport restarts        <n>"`` when at least one restart has
+        been logged; ``None`` otherwise.
+    """
+    if not log_path.is_file():
+        return None
+    count = _count_transport_restarts(log_path.read_text(encoding="utf-8"))
+    assert count >= 0, f"transport restart count is negative: {count} -- impossible by construction"
+    if count == 0:
+        return None
+    return f"Transport restarts        {count}"
+
+
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
     """Render a single bordered two-column table (metric | value).
 
@@ -3195,6 +3263,11 @@ def generate_report(
     # pre-parity-row layout.
     install_parity_row = install_parity_line()
 
+    # Transport-restart count row (issue #331 FR-4). Rendered only when
+    # non-None so a clean run (no in-process SDK-transport restarts logged)
+    # stays byte-identical to today (spec D-6, AC-11).
+    transport_restarts_row = transport_restarts_line(log_path)
+
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
     # cost-rate config (``REPORT_MODEL_RATES``, the cache + residency +
@@ -3326,9 +3399,12 @@ def generate_report(
         else None
     )
 
+    # Both header rows follow the same "append only when non-None" contract
+    # (install_parity_line() / transport_restarts_line()); folded into one
+    # generator expression rather than two separate `if` statements so this
+    # function's branch count stays under ruff's PLR0912 ceiling.
     lines: list[str] = [banner_line]
-    if install_parity_row is not None:
-        lines.append(install_parity_row)
+    lines.extend(row for row in (install_parity_row, transport_restarts_row) if row is not None)
     lines.append("")
 
     # Spanning-row follow-up: thread the All-time cost (already paid in

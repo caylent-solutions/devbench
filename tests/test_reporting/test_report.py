@@ -6053,3 +6053,154 @@ class TestGenerateReportInstallParityRow:
         assert "BEHIND by 2 commit(s) touching src/devbench/" in report
         assert "Tasks completed" in report
         assert "Tasks remaining" in report
+
+
+def _transport_restart_log_line(attempt: int, cap: int = 5) -> str:
+    """Build one raw ``[ORCHESTRATOR_TRANSPORT_RESTART]`` audit line, matching
+    the exact literal shape ``cli.py``'s ``_should_restart_after_transport_error``
+    logs via ``logger.info("%s attempt=%d max=%d", ...)`` under the
+    ``"%(asctime)s [%(name)s] %(levelname)s %(message)s"`` formatter
+    (``LOG_FORMAT`` / ``LOG_DATE_FORMAT`` in ``devbench.constants``)."""
+    return (
+        f"2026-08-12T18:38:0{attempt}Z [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] attempt={attempt} max={cap}"
+    )
+
+
+class TestTransportRestartsLine:
+    """Tests for ``transport_restarts_line()`` (#331 FR-4, AC-11).
+
+    Mirrors ``TestInstallParityLine``'s shape: a standalone row-rendering
+    function that returns ``None`` when there is nothing to say.
+    """
+
+    def test_returns_none_when_log_missing(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        assert transport_restarts_line(tmp_path / "does-not-exist.log") is None
+
+    def test_returns_none_when_zero_restarts(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) is None
+
+    def test_renders_row_for_single_restart(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([_transport_restart_log_line(1)]))
+
+        line = transport_restarts_line(log_file)
+
+        assert line == "Transport restarts        1"
+
+    @pytest.mark.parametrize("restart_count", [2, 3, 5])
+    def test_renders_row_for_multiple_restarts(self, tmp_path: Path, restart_count: int) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        attempts = range(1, restart_count + 1)
+        restart_lines = [_transport_restart_log_line(attempt, cap=restart_count) for attempt in attempts]
+        log_file.write_text(_make_log(restart_lines))
+
+        line = transport_restarts_line(log_file)
+
+        assert line == f"Transport restarts        {restart_count}"
+
+    def test_ignores_marker_text_echoed_mid_line(self, tmp_path: Path) -> None:
+        """A restart marker quoted inside an unrelated SDK payload line (not
+        the logger's own line-initial record) must not inflate the count --
+        the same echoed-text hazard ``event_index.py``'s ``_TASK_TRANSITION_RE``
+        already guards against for task transitions."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-08-12T18:40:00Z [devbench.cli] INFO sdk message: "
+                    "text='previously logged: [ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=5'"
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) is None
+
+    def test_transport_restarts_line_asserts_on_impossible_negative_count(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Task-specific error path: a negative count is impossible by
+        construction (``_count_transport_restarts`` is a match-list length,
+        which the ``len`` builtin itself guarantees is never negative) and is
+        documented by an assertion at the rendering boundary rather than a
+        defensive clamp. ``_count_transport_restarts`` is monkeypatched
+        (a legitimate, mockable seam) rather than trying to coerce ``len``
+        itself to return a negative number, which the interpreter refuses."""
+        from devbench.reporting import report as report_module
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(["irrelevant"]))
+        monkeypatch.setattr(report_module, "_count_transport_restarts", lambda log_text: -1)
+
+        with pytest.raises(AssertionError, match="negative"):
+            report_module.transport_restarts_line(log_file)
+
+
+class TestGenerateReportTransportRestartsRow:
+    """Tests for the ``transport_restarts_line()`` row wired into
+    ``generate_report()`` (#331 FR-4, AC-11, spec D-6)."""
+
+    @staticmethod
+    def _write_log(tmp_path: Path, extra_entries: list[str] | None = None) -> Path:
+        log_file = tmp_path / "test.log"
+        entries = [
+            "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+        ]
+        if extra_entries:
+            entries = extra_entries + entries
+        log_file.write_text(_make_log(entries))
+        return log_file
+
+    def test_row_renders_when_restarts_present(self, tmp_path: Path) -> None:
+        restarts = [_transport_restart_log_line(1), _transport_restart_log_line(2)]
+        log_file = self._write_log(tmp_path, extra_entries=restarts)
+
+        report = generate_report(log_path=log_file)
+        report_lines = report.split("\n")
+
+        # Install-parity row is absent (not self-hosting, per the module's
+        # autouse mock), so the transport-restarts row is the first line
+        # after the banner.
+        assert report_lines[1] == "Transport restarts        2"
+        assert report_lines[2] == ""
+
+    def test_row_omitted_when_no_restarts_byte_identical(self, tmp_path: Path) -> None:
+        """Spec D-6 / AC-11: a clean run (zero restarts) renders nothing for
+        this row, so the report stays byte-identical to the pre-FR-4 layout
+        -- banner line, then blank."""
+        log_file = self._write_log(tmp_path)
+
+        report = generate_report(log_path=log_file)
+        report_lines = report.split("\n")
+
+        assert "Transport restarts" not in report
+        assert report_lines[1] == ""
+
+    def test_rest_of_report_still_renders_with_restarts_row(self, tmp_path: Path) -> None:
+        log_file = self._write_log(tmp_path, extra_entries=[_transport_restart_log_line(1)])
+
+        report = generate_report(log_path=log_file)
+
+        assert "Transport restarts        1" in report
+        assert "Tasks completed" in report
+        assert "Tasks remaining" in report

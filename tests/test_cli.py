@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -7435,6 +7436,15 @@ class TestLabelStopReason:
 
         assert _label_stop_reason(ValueError("")) == "crash: ValueError: "
 
+    def test_transport_error_exhausted_is_labelled_distinctly(self) -> None:
+        """AC-E16-F1-S1-T1-10 / spec FR-3, AC-10: the cap-exhausted transport
+        path gets its own label instead of falling through to the generic
+        ``crash: <type>: <msg>`` bucket."""
+        from devbench.cli import _label_stop_reason, _OrchestrateTransportError
+
+        exc = _OrchestrateTransportError(Exception("Claude Code returned an error result: success"))
+        assert _label_stop_reason(exc) == "transport-error-restart-cap-exhausted"
+
 
 class TestResolveCleanStopReason:
     """db-271 (spec FR-18 Part A): the pure three-way resolution extracted
@@ -7571,6 +7581,434 @@ class TestCmdStart:
             result = cli.cmd_start()
 
         assert result == 0
+
+
+class TestOrchestrateTransportErrorSentinel:
+    """AC-E16-F1-S1-T1-1 (spec AC-1, FR-1, #331): the sentinel itself carries
+    the original exception verbatim and preserves it as ``__cause__`` when
+    raised with ``from``."""
+
+    @pytest.mark.unit
+    def test_message_is_verbatim_and_original_is_retained(self) -> None:
+        from devbench.cli import _OrchestrateTransportError
+
+        original = RuntimeError("Claude Code returned an error result: success")
+        exc = _OrchestrateTransportError(original)
+
+        assert str(exc) == "Claude Code returned an error result: success"
+        assert exc.original is original
+
+    @pytest.mark.unit
+    def test_cause_preserved_when_raised_with_from(self) -> None:
+        from devbench.cli import _OrchestrateTransportError
+
+        original = ValueError("boom")
+        try:
+            raise _OrchestrateTransportError(original) from original
+        except _OrchestrateTransportError as exc:
+            assert exc.__cause__ is original
+        else:
+            pytest.fail("expected _OrchestrateTransportError to be raised")
+
+    @pytest.mark.unit
+    def test_is_a_base_exception_not_caught_by_except_exception(self) -> None:
+        """Mirrors :class:`~devbench.cli._QuotaDetected` and
+        :class:`~devbench.cli._OrchestrateInactivityTimeout`: a
+        ``BaseException`` subclass so it is never accidentally swallowed by a
+        broad ``except Exception`` between the raise site and
+        ``_drive_orchestrate_with_quota_resume``."""
+        from devbench.cli import _OrchestrateTransportError
+
+        assert issubclass(_OrchestrateTransportError, BaseException)
+        assert not issubclass(_OrchestrateTransportError, Exception)
+
+
+class TestShouldRestartAfterTransportError:
+    """Direct unit tests for ``_should_restart_after_transport_error``
+    (spec FR-2: mirrors ``_should_restart_after_inactivity_timeout``'s
+    bounded-restart shape, AC-E16-F1-S1-T1-8)."""
+
+    @pytest.mark.unit
+    def test_permitted_restart_emits_marker_and_returns_true(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            result = cli._should_restart_after_transport_error(0, 3)
+
+        assert result is True
+        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=3" in caplog.text
+
+    @pytest.mark.unit
+    def test_second_permitted_restart_increments_the_attempt_number(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            result = cli._should_restart_after_transport_error(1, 3)
+
+        assert result is True
+        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=2 max=3" in caplog.text
+
+    @pytest.mark.unit
+    def test_bound_exhausted_emits_marker_and_returns_false(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            result = cli._should_restart_after_transport_error(3, 3)
+
+        assert result is False
+        assert "[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED] max=3" in caplog.text
+
+    @pytest.mark.unit
+    def test_bound_already_exceeded_still_refuses(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            result = cli._should_restart_after_transport_error(5, 3)
+
+        assert result is False
+
+
+class TestTransportErrorClassificationAndRestart:
+    """End-to-end ``cmd_start`` coverage for #331 FR-1/FR-2/FR-3
+    (AC-E16-F1-S1-T1-1 through -10, spec AC-1 through AC-10).
+
+    Drives the real SDK generator boundary (``await
+    asyncio.wait_for(agen.__anext__(), ...)`` inside ``cmd_start``'s inner
+    ``_run``) through a stubbed ``claude_agent_sdk.query`` async generator,
+    exactly like ``TestInactivityNetAndCooperativeTeardown`` in
+    ``tests/test_cli_quota_inprocess_resume.py`` does for the sibling
+    inactivity-timeout restart path.
+    """
+
+    @staticmethod
+    def _install_fake_sdk(mock_query: Any) -> Any:
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+        mock_sdk.query = mock_query
+        return mock_sdk
+
+    @pytest.mark.unit
+    def test_stop_async_iteration_still_ends_the_loop_cleanly(self, tmp_path: Path) -> None:
+        """AC-2: a generator that ends normally (StopAsyncIteration) still
+        breaks the loop with rc=0 -- unaffected by the new transport-error
+        classification added alongside it."""
+        import sys
+
+        async def mock_query(**kwargs: object) -> object:
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_timeout_error_still_raises_inactivity_timeout_not_transport_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-2: a ``TimeoutError`` from the SAME try/except block that now
+        also classifies transport errors keeps raising
+        ``_OrchestrateInactivityTimeout``, never ``_OrchestrateTransportError``."""
+        import sys
+
+        monkeypatch.setattr(cli, "_ORCH_INACTIVITY_TIMEOUT", 0.02)
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            call_count["n"] += 1
+            yield types.SimpleNamespace(result="")
+            await asyncio.Event().wait()
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(cli._OrchestrateInactivityTimeout):
+                cli.cmd_start()
+
+        assert call_count["n"] == 2
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("sentinel_exc", [SystemExit(3), KeyboardInterrupt()])
+    def test_systemexit_and_keyboard_interrupt_are_never_wrapped(
+        self, tmp_path: Path, sentinel_exc: BaseException
+    ) -> None:
+        """AC-3: ``BaseException`` subclasses that are not ``Exception`` --
+        here ``SystemExit`` and ``KeyboardInterrupt`` -- propagate with their
+        original type, never as ``_OrchestrateTransportError``."""
+        import sys
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            call_count["n"] += 1
+            raise sentinel_exc
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(type(sentinel_exc)):
+                cli.cmd_start()
+
+        # No restart is attempted for a non-Exception BaseException: it is
+        # never caught by the transport classifier's `except Exception`.
+        assert call_count["n"] == 1
+
+    @pytest.mark.unit
+    def test_cancelled_error_is_never_wrapped(self, tmp_path: Path) -> None:
+        """AC-3: ``asyncio.CancelledError`` propagates unwrapped."""
+        import sys
+
+        async def mock_query(**kwargs: object) -> object:
+            raise asyncio.CancelledError("cancelled")
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                cli.cmd_start()
+
+    @pytest.mark.unit
+    def test_devbench_originated_exception_in_loop_body_is_not_wrapped(self, tmp_path: Path) -> None:
+        """AC-4 / D-5: an exception raised by devbench's own code inside the
+        loop body -- AFTER the generator-boundary await, e.g. inside
+        ``_check_quota_and_drain`` -- is outside the narrow wrapped boundary
+        and propagates unwrapped, so a genuine devbench defect still fails
+        loudly instead of being retried."""
+        import sys
+
+        async def mock_query(**kwargs: object) -> object:
+            yield types.SimpleNamespace(result="turn-in-progress")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        def _boom(message: object) -> None:
+            raise RuntimeError("devbench bug: malformed message")
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._check_quota_and_drain", side_effect=_boom),
+        ):
+            with pytest.raises(RuntimeError, match="devbench bug"):
+                cli.cmd_start()
+
+    @pytest.mark.unit
+    def test_sdk_generator_exception_wrapped_with_cause_preserved_on_exhaustion(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-1: an exception raised from the SDK generator boundary is
+        re-raised as ``_OrchestrateTransportError`` with the original
+        preserved as ``__cause__``. Uses a cap of 1 so the permanent failure
+        exhausts quickly and the wrapped exception is observable at the top."""
+        import sys
+
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
+        transport_exc = RuntimeError("Claude Code returned an error result: success")
+
+        async def mock_query(**kwargs: object) -> object:
+            raise transport_exc
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(cli._OrchestrateTransportError) as exc_info:
+                cli.cmd_start()
+
+        assert exc_info.value.__cause__ is transport_exc
+        assert str(exc_info.value) == "Claude Code returned an error result: success"
+
+    @pytest.mark.unit
+    def test_single_transient_error_restarts_a_fresh_session_and_continues(self, tmp_path: Path) -> None:
+        """AC-5/AC-9: a transient transport error on the first session
+        restarts a genuinely fresh session (a second ``query()`` call) and
+        the run finishes cleanly, rather than ending the daemon."""
+        import sys
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert call_count["n"] == 2, "expected exactly one bounded fresh-session restart"
+
+    @pytest.mark.unit
+    def test_restart_logs_verbatim_exception_with_ordinal_and_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-6: each restart logs the verbatim upstream exception at ERROR,
+        including the restart ordinal and the cap."""
+        import sys
+
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "3")
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            caplog.at_level(logging.ERROR, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        message = error_records[0].getMessage()
+        assert "restart=1" in message
+        assert "max=3" in message
+        assert "Claude Code returned an error result: success" in message
+
+    @pytest.mark.unit
+    def test_permanent_error_exhausts_the_cap_and_restart_count_equals_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-7: a permanent transport error exhausts the cap and re-raises;
+        the restart count equals the cap -- no infinite loop."""
+        import sys
+
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "2")
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            call_count["n"] += 1
+            raise RuntimeError("Claude Code returned an error result: success")
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(cli._OrchestrateTransportError):
+                cli.cmd_start()
+
+        # 1 initial attempt + 2 permitted restarts = 3 sessions opened before
+        # the cap refuses a 4th (restart count equals the cap).
+        assert call_count["n"] == 3
+
+    @pytest.mark.unit
+    def test_transport_counter_independent_of_inactivity_counter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-8: the transport restart counter is tracked independently of
+        the inactivity-restart counter, even though both are bounded by the
+        SAME ``_resolve_max_quota_resumes()`` cap. With cap=1, an inactivity
+        restart followed by a transport restart must both be permitted (a
+        shared counter would refuse the second one)."""
+        import sys
+
+        monkeypatch.setattr(cli, "_ORCH_INACTIVITY_TIMEOUT", 0.02)
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                # First session hangs after one message -> inactivity timeout.
+                yield types.SimpleNamespace(result="")
+                await asyncio.Event().wait()
+            elif idx == 1:
+                # Second session (the inactivity restart) hits a transient
+                # transport error.
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            else:
+                # Third session (the transport restart) finishes cleanly.
+                yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert call_count["n"] == 3, "both the inactivity and transport restarts must be permitted independently"
+
+    @pytest.mark.unit
+    def test_exhausted_cap_labels_transport_error_and_still_notifies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-10: the exhausted path labels
+        ``transport-error-restart-cap-exhausted`` and
+        ``_fire_orchestrator_stop_notification`` still fires (no db-271
+        regression -- the always-fire notification is unchanged)."""
+        import sys
+
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
+        transport_exc = RuntimeError("Claude Code returned an error result: success")
+
+        async def mock_query(**kwargs: object) -> object:
+            raise transport_exc
+            yield  # unreachable -- required so this stays an async generator function
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+        captured: list[tuple[Any, ...]] = []
+
+        def _capture(reason: str, in_flight_id: str | None, progress: tuple[int, int] | None = None) -> None:
+            captured.append((reason, in_flight_id, progress))
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.notifications.notify_orchestrator_stop", _capture),
+        ):
+            with pytest.raises(cli._OrchestrateTransportError):
+                cli.cmd_start()
+
+        assert len(captured) == 1
+        assert captured[0][0] == "transport-error-restart-cap-exhausted"
 
 
 class _FakeSdkModule(types.ModuleType):
@@ -17417,9 +17855,18 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
         assert rc == 0
         assert not scope_path.exists(), "pre-existing scope.json must be deleted on clean cmd_start exit (AC-190-13)"
 
-    def test_sdk_crash_preserves_scope_json(self, tmp_path: Path) -> None:
-        """AC-190-13: scope.json must persist when the SDK raises (crash path)."""
+    def test_sdk_crash_preserves_scope_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-190-13: scope.json must persist when the SDK raises (crash path).
+
+        #331 FR-1/FR-2: the SDK-boundary exception is now classified as
+        ``_OrchestrateTransportError`` and retried up to the resume cap before
+        propagating, so the cap is bounded to 1 here to keep the crash path
+        fast and deterministic while still exercising the "still a crash"
+        scope.json-preservation behavior once the cap is exhausted.
+        """
         import types
+
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
 
         class _SDKError(RuntimeError):
             pass
@@ -17434,8 +17881,10 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
         crash_sdk.query = _crash_query
 
         with self._patch_cli(tmp_path, mock_sdk=crash_sdk):
-            with pytest.raises(_SDKError):
+            with pytest.raises(cli._OrchestrateTransportError) as exc_info:
                 cli.cmd_start("--include", "E1")
+
+        assert isinstance(exc_info.value.__cause__, _SDKError)
 
         scope_path = tmp_path / ".devbench" / "scope.json"
         assert scope_path.exists(), (

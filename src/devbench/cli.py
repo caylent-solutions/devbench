@@ -7239,6 +7239,50 @@ class _OrchestrateInactivityTimeout(BaseException):
         self.timeout_seconds = timeout_seconds
 
 
+class _OrchestrateTransportError(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when the SDK generator boundary raises (#331).
+
+    Sibling of :class:`_QuotaDetected` and :class:`_OrchestrateInactivityTimeout`: a
+    :class:`BaseException` subclass (not :class:`Exception`) so that ``asyncio.run``
+    propagates it through the event loop without being caught by any broad
+    ``except Exception`` handler between the SDK generator boundary and
+    ``asyncio.run`` (spec FR-1).
+
+    Wraps ONLY an exception raised by ``await
+    asyncio.wait_for(agen.__anext__(), ...)`` -- the SDK generator boundary itself
+    (spec section 1.1, decision D-5). ``StopAsyncIteration`` and ``TimeoutError``
+    keep their existing handling and are never wrapped. ``SystemExit``,
+    ``KeyboardInterrupt``, and :class:`asyncio.CancelledError` are
+    :class:`BaseException` subclasses that are not :class:`Exception`, so the
+    ``except Exception`` clause that raises this sentinel never matches them
+    either -- they are never wrapped (spec AC-3). A devbench-originated exception
+    raised elsewhere in the loop body (e.g. by :func:`_check_quota_and_drain`) is
+    outside this narrow boundary and is never wrapped (decision D-5): wrapping the
+    whole loop body would turn a genuine devbench defect into a silent restart
+    loop.
+
+    Classification is structural (which call raised, not what the message says,
+    decision D-4): upstream may raise a bare ``Exception`` with arbitrary text --
+    as observed, ``Exception: Claude Code returned an error result: success`` --
+    so branching on the message string is explicitly forbidden.
+
+    Args:
+        original: The exception raised from the SDK generator boundary. Callers
+            preserve it verbatim as ``__cause__`` via ``raise ... from original``
+            at the raise site; its ``str()`` becomes this sentinel's own message
+            so the ERROR log line :func:`_drive_orchestrate_with_quota_resume`
+            emits on each restart carries the upstream text unmodified (spec
+            AC-6, "verbatim").
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -7897,6 +7941,63 @@ def _should_restart_after_inactivity_timeout(restarts_used: int, max_resumes: in
     return True
 
 
+#: Audit markers for the transport-error bounded-restart disposition (#331 spec
+#: FR-2). Distinct from the ``[ORCHESTRATOR_QUOTA_RESUME*]`` and
+#: ``[ORCHESTRATOR_INACTIVITY_RESTART*]`` markers so operators can tell a
+#: transport-boundary restart apart from a quota-driven resume or an
+#: inactivity-timeout restart in the log. ``_ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX``
+#: tags the single combined ERROR line (verbatim exception + ordinal + cap,
+#: spec AC-6) that :func:`_drive_orchestrate_with_quota_resume` emits BEFORE
+#: consulting :func:`_should_restart_after_transport_error`, which in turn
+#: emits its own INFO-level restart/exhausted markers below.
+_ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_ERROR]"
+_ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_RESTART]"
+_ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED]"
+
+
+def _should_restart_after_transport_error(restarts_used: int, max_resumes: int) -> bool:
+    """Decide whether ``cmd_start`` may reopen a fresh SDK session after a transport error.
+
+    Mirrors :func:`_should_restart_after_inactivity_timeout`'s bounded-restart
+    shape but for :class:`_OrchestrateTransportError` instead of an inactivity
+    timeout (spec FR-2, decision D-3): reuses the SAME
+    :func:`_resolve_max_quota_resumes` cap so a flapping SDK transport boundary
+    is bounded by the same operator-tunable ceiling, while counting its own
+    restarts independently of quota resumes and inactivity restarts (a
+    transport restart never consumes quota-resume or inactivity-restart budget
+    and vice versa).
+
+    - When *restarts_used* (restarts already performed, BEFORE this one) is
+      below *max_resumes*, emits
+      ``[ORCHESTRATOR_TRANSPORT_RESTART] attempt=<n> max=<cap>`` and returns
+      ``True`` (caller re-runs ``_run`` in a fresh session).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED] max=<cap>`` and returns
+      ``False`` so the caller fails fast (re-raises the sentinel), preserving
+      the verbatim final exception as ``__cause__`` (spec AC-7).
+
+    Args:
+        restarts_used: Number of in-process transport restarts already
+            performed during this ``cmd_start`` invocation (0 on the first
+            transport error).
+        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+
+    Returns:
+        ``True`` when another in-process restart is permitted; ``False`` when
+        the cap is exhausted and the run must fail fast.
+    """
+    if restarts_used >= max_resumes:
+        logger.info("%s max=%d", _ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+        return False
+    logger.info(
+        "%s attempt=%d max=%d",
+        _ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX,
+        restarts_used + 1,
+        max_resumes,
+    )
+    return True
+
+
 class _OrchestrateLoopResult(NamedTuple):
     """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
 
@@ -7952,6 +8053,14 @@ def _drive_orchestrate_with_quota_resume(
       by the SAME :func:`_resolve_max_quota_resumes` cap, tracked
       independently of quota resumes via :func:`_should_restart_after_inactivity_timeout`)
       or re-raises to fail fast once that cap is exhausted.
+    - :class:`_OrchestrateTransportError` (#331 spec FR-1/FR-2) -> logs the
+      verbatim SDK-boundary exception at ERROR with its restart ordinal and
+      the cap, then either restarts a fresh session (bounded by the SAME
+      :func:`_resolve_max_quota_resumes` cap, tracked independently of quota
+      resumes and inactivity restarts via
+      :func:`_should_restart_after_transport_error`) or re-raises -- preserving
+      the original exception as ``__cause__`` -- to fail fast once that cap is
+      exhausted.
 
     Extracted from ``cmd_start`` so the added resume loop does not push that
     function over ruff PLR0912's 12-branch ceiling.
@@ -7959,7 +8068,7 @@ def _drive_orchestrate_with_quota_resume(
     Args:
         run: The ``cmd_start._run`` closure; a no-arg coroutine factory awaited
             fresh on every iteration. No conversation handle, transcript, or
-            other session state is threaded between iterations (D-6).
+            other session state is threaded between iterations (D-6, D-2).
         session_name: Current session name, forwarded to
             :func:`_dispatch_quota_detection` for the quota checkpoint.
 
@@ -7976,9 +8085,14 @@ def _drive_orchestrate_with_quota_resume(
         :class:`_OrchestrateInactivityTimeout`: Re-raised (legacy non-zero
             exit, mirroring the quota ``fail`` disposition above) once the
             bounded-restart cap is exhausted.
+        :class:`_OrchestrateTransportError`: Re-raised (legacy non-zero exit,
+            mirroring the inactivity-timeout cap-exhaustion above), carrying
+            the original SDK-boundary exception as ``__cause__``, once the
+            bounded transport-restart cap is exhausted (#331 spec FR-2, AC-7).
     """
     resumes_used = 0
     inactivity_restarts_used = 0
+    transport_restarts_used = 0
     max_resumes = _resolve_max_quota_resumes()
     while True:
         try:
@@ -8000,6 +8114,18 @@ def _drive_orchestrate_with_quota_resume(
             logger.error(str(exc))
             if _should_restart_after_inactivity_timeout(inactivity_restarts_used, max_resumes):
                 inactivity_restarts_used += 1
+                continue
+            raise
+        except _OrchestrateTransportError as exc:
+            logger.error(
+                "%s restart=%d max=%d: %s",
+                _ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX,
+                transport_restarts_used + 1,
+                max_resumes,
+                exc,
+            )
+            if _should_restart_after_transport_error(transport_restarts_used, max_resumes):
+                transport_restarts_used += 1
                 continue
             raise
         return _OrchestrateLoopResult(None, "clean", False)
@@ -8403,6 +8529,10 @@ def _label_stop_reason(exc: BaseException) -> str:
       cleanly.
     - ``KeyboardInterrupt`` -> operator interrupt (Ctrl+C / SIGINT).  Not a
       crash; the operator chose to stop the run.
+    - :class:`_OrchestrateTransportError` -> ``"transport-error-restart-cap-exhausted"``
+      (#331 spec FR-3, AC-10). Reaches this helper only after
+      :func:`_drive_orchestrate_with_quota_resume` has exhausted the bounded
+      transport-restart cap and re-raised, so this label is unambiguous.
     - Anything else (including ``SystemExit`` with non-zero code, unhandled
       exceptions) -> crash with the exception type + message.
 
@@ -8414,6 +8544,8 @@ def _label_stop_reason(exc: BaseException) -> str:
         return "clean exit (SystemExit 0)"
     if isinstance(exc, KeyboardInterrupt):
         return "interrupted by operator (Ctrl+C / SIGINT)"
+    if isinstance(exc, _OrchestrateTransportError):
+        return "transport-error-restart-cap-exhausted"
     return f"crash: {type(exc).__name__}: {exc}"
 
 
@@ -8631,6 +8763,28 @@ def cmd_start(*argv: str) -> int:
     :func:`_should_restart_after_inactivity_timeout`); fail-fast (legacy
     non-zero exit) once that cap is exhausted.
 
+    **Transport-error boundary and bounded restart (#331 spec FR-1/FR-2/FR-3):**
+    Any OTHER exception raised by ``agen.__anext__()`` -- one that is neither
+    ``StopAsyncIteration`` nor ``TimeoutError`` -- is re-raised by ``_run`` as
+    :class:`_OrchestrateTransportError`, carrying the original exception as
+    ``__cause__``. Classification is structural, never message-based (decision
+    D-4): an upstream frame that is simultaneously ``is_error=True`` and
+    ``subtype="success"`` with an empty ``errors`` list previously surfaced as
+    the literal string ``"success"``, which no sensible pattern would match.
+    Only the ``agen.__anext__()`` boundary itself is wrapped -- never the rest
+    of the loop body -- so a genuine devbench defect still fails loudly
+    instead of being silently retried (decision D-5).
+    ``_drive_orchestrate_with_quota_resume`` disposes this sentinel exactly
+    like the inactivity timeout above: it logs the verbatim exception at
+    ERROR with its restart ordinal and the cap, then either restarts a fresh
+    session (bounded by the SAME ``DEVBENCH_MAX_QUOTA_RESUMES`` cap, tracked
+    independently of quota resumes and inactivity restarts via
+    :func:`_should_restart_after_transport_error`) or re-raises -- preserving
+    the original exception as ``__cause__`` -- once that cap is exhausted.
+    On exhaustion, :func:`_label_stop_reason` labels the exit
+    ``"transport-error-restart-cap-exhausted"`` (spec FR-3) and the
+    always-fire ``orchestrator_stop`` notification below still fires.
+
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
 
@@ -8660,10 +8814,16 @@ def cmd_start(*argv: str) -> int:
             :func:`_drive_orchestrate_with_quota_resume` once the bounded
             inactivity-restart cap is exhausted (legacy non-zero exit,
             mirroring the quota ``fail`` disposition above).
+        :class:`_OrchestrateTransportError`: Propagates from
+            :func:`_drive_orchestrate_with_quota_resume` once the bounded
+            transport-restart cap is exhausted (#331 spec FR-1/FR-2, legacy
+            non-zero exit, carrying the original SDK-boundary exception as
+            ``__cause__``).
         Nothing else from this function's own scope for quota / drain /
-        inactivity signals -- all three dispositions are otherwise fully
-        handled by :func:`_drive_orchestrate_with_quota_resume`. Any other
-        SDK exception propagates as-is through the asyncio boundary.
+        inactivity / transport signals -- all four dispositions are otherwise
+        fully handled by :func:`_drive_orchestrate_with_quota_resume`.
+        ``SystemExit``, ``KeyboardInterrupt``, and :class:`asyncio.CancelledError`
+        propagate as-is (spec AC-3).
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -8795,14 +8955,28 @@ def cmd_start(*argv: str) -> int:
         otherwise hit the generator mid-flight. The sentinel re-raises after
         teardown, preserving the :class:`BaseException` contract.
 
+        Any OTHER exception raised by ``agen.__anext__()`` -- an
+        :class:`Exception` that is neither ``StopAsyncIteration`` nor
+        ``TimeoutError`` -- is re-raised as :class:`_OrchestrateTransportError`
+        with the original preserved as ``__cause__`` (#331 spec FR-1). This is
+        deliberately narrow: ONLY the ``agen.__anext__()`` boundary is wrapped,
+        never the rest of the loop body, so a genuine devbench defect (e.g. a
+        bug in :func:`_check_quota_and_drain`) still propagates unwrapped and
+        fails loudly instead of being silently retried (decision D-5).
+        ``SystemExit``, ``KeyboardInterrupt``, and :class:`asyncio.CancelledError`
+        are :class:`BaseException` subclasses that are not :class:`Exception`,
+        so the ``except Exception`` clause that raises this sentinel never
+        matches them -- they are never wrapped (spec AC-3).
+
         Per-message, calls :func:`_check_quota_and_drain` once, which raises
         :class:`_QuotaDetected` when a quota / rate-limit signal is observed
         (issue #236) or :class:`_DrainRequested` when a ``devbench claim``
         tool-use is detected while a drain is pending (issues #188/#212).
-        Both sentinels -- and :class:`_OrchestrateInactivityTimeout` -- are
-        :class:`BaseException` subclasses (spec AC-20, decision D-4) so they
-        propagate through ``asyncio.run`` without being caught by any broad
-        ``except Exception`` handler in between.
+        Both sentinels -- and :class:`_OrchestrateInactivityTimeout` and
+        :class:`_OrchestrateTransportError` -- are :class:`BaseException`
+        subclasses (spec AC-20, decision D-4) so they propagate through
+        ``asyncio.run`` without being caught by any broad ``except Exception``
+        handler in between.
 
         Does NOT break on any ``ResultMessage``: the orchestrate skill emits
         one per turn across a single long ``query()`` (num_turns ~185); only
@@ -8819,6 +8993,8 @@ def cmd_start(*argv: str) -> int:
                 tool-use is observed.
             _OrchestrateInactivityTimeout: No SDK message arrived within
                 ``_ORCH_INACTIVITY_TIMEOUT`` seconds of the previous one.
+            _OrchestrateTransportError: ``agen.__anext__()`` raised any other
+                exception (#331 spec FR-1).
         """
         nonlocal _sdk_result_text
         # The SDK's `query()` return-type annotation is the narrower
@@ -8844,6 +9020,13 @@ def cmd_start(*argv: str) -> int:
                     break
                 except TimeoutError:
                     raise _OrchestrateInactivityTimeout(_ORCH_INACTIVITY_TIMEOUT) from None
+                except Exception as exc:
+                    # #331 FR-1: only the SDK generator boundary itself is
+                    # classified as a transport error (decision D-5). Any
+                    # BaseException that is not an Exception -- SystemExit,
+                    # KeyboardInterrupt, asyncio.CancelledError -- does not
+                    # match this clause and propagates unchanged (spec AC-3).
+                    raise _OrchestrateTransportError(exc) from exc
                 logger.info("sdk message: %s", message)
                 _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
                 if _log_terminal_exit_if_applicable(_sdk_result_text):

@@ -71,15 +71,18 @@ from devbench.config import (
     REPORT_DISPLAY_TIMEZONE,
     REPORT_FAST_MODE_MULTIPLIER,
     REPORT_MODEL_RATES,
+    RUNTIME_CONFIG,
     STOP_HOOK_WINDOW_SECONDS,
     WORKSPACE_ROOT,
 )
 from devbench.constants import (
     DEFAULT_SESSION_GAP_MINUTES,
+    INSTALL_PARITY_SHORT_REVISION_CHARS,
     LOG_NOISE_LOGGER_NAME,
     MIN_PACE_SAMPLES,
     MINUTES_PER_HOUR,
     MS_PER_SECOND,
+    ORCHESTRATOR_SOURCE_PREFIX,
     PERCENT_MULTIPLIER,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
@@ -93,6 +96,7 @@ from devbench.drain import (
     DrainState,
     _parse_drain_signal,
 )
+from devbench.install_parity import InstallParityError, resolve_install_parity
 from devbench.instances import pid_file_path
 from devbench.reporting.event_index import EventIndex
 from devbench.scope import ScopeFilter
@@ -1590,6 +1594,58 @@ def _liveness_body_not_running(
         f"[ORCHESTRATOR UNKNOWN] no pid file; log last wrote {_format_duration(delta)} ago "
         f"(last seen {seen}) but no process is claiming this workspace",
         _COLOR_YELLOW,
+    )
+
+
+def install_parity_line() -> str | None:
+    """Render the harness/target install-parity row for ``devbench report`` (issue #301 FR-4).
+
+    Reuses :func:`devbench.install_parity.resolve_install_parity` -- the
+    same resolver ``devbench start``'s pre-flight gate (``cli._check_install_parity``)
+    calls -- so this row and that gate can never disagree about whether the
+    harness install is behind. This is the single row-rendering path;
+    ``devbench status`` (spec FR-4) reuses this function rather than
+    duplicating the string formatting.
+
+    Returns ``None`` when the configured workspace is not self-hosting
+    (spec AC-10 negative case): most workspaces are not self-hosted devbench
+    checkouts, and a row that always reads "not applicable" would be worse
+    than no row. Also defensively returns ``None`` if the resolver ever
+    reports ``self_hosting`` True without a resolved ``target`` -- an
+    invariant the resolver itself guarantees, but this rendering function
+    does not assume it.
+
+    A resolver failure degrades to a single-line ``unavailable: <reason>``
+    row rather than raising (spec AC-11 / D-3): this is a read-only
+    observability surface, not a required operation, so surfacing a
+    degraded row here is not the fallback-masking pattern CLAUDE.md
+    prohibits -- it is the documented fail-soft behaviour for this
+    specific read-only surface.
+
+    Returns:
+        The formatted row, or ``None`` when not self-hosting.
+    """
+    try:
+        parity = resolve_install_parity(RUNTIME_CONFIG)
+    except InstallParityError as exc:
+        reason = " ".join(str(exc).split())
+        return f"Install parity   unavailable: {reason}"
+
+    if not parity.self_hosting or parity.target is None or parity.harness is None:
+        return None
+
+    harness = parity.harness
+    target = parity.target
+    harness_branch = harness.branch or "detached HEAD"
+    harness_short = harness.revision[:INSTALL_PARITY_SHORT_REVISION_CHARS]
+    target_short = target.revision[:INSTALL_PARITY_SHORT_REVISION_CHARS]
+
+    if parity.in_sync:
+        return f"Install parity   harness {harness_short} ({harness_branch}) == target {target_short}   IN SYNC"
+
+    return (
+        f"Install parity   harness {harness_short} ({harness_branch}) != target {target_short}   "
+        f"BEHIND by {parity.behind_count} commit(s) touching {ORCHESTRATOR_SOURCE_PREFIX}"
     )
 
 
@@ -3132,6 +3188,13 @@ def generate_report(
         display_tz=banner_display_tz,
     )
 
+    # Harness/target install-parity row (issue #301 FR-4). Computed
+    # immediately alongside the banner so the two "is this run trustworthy"
+    # signals stay adjacent; rendered only when non-None (AC-T3-4) so a
+    # non-self-hosted workspace's report stays byte-identical to the
+    # pre-parity-row layout.
+    install_parity_row = install_parity_line()
+
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
     # cost-rate config (``REPORT_MODEL_RATES``, the cache + residency +
@@ -3263,7 +3326,10 @@ def generate_report(
         else None
     )
 
-    lines: list[str] = [banner_line, ""]
+    lines: list[str] = [banner_line]
+    if install_parity_row is not None:
+        lines.append(install_parity_row)
+    lines.append("")
 
     # Spanning-row follow-up: thread the All-time cost (already paid in
     # lifetime_stats above) as the additive base for every narrower

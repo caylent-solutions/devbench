@@ -16,6 +16,7 @@ import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
+from devbench.install_parity import InstallIdentity, InstallParityError, ParityResult
 from devbench.reporting.report import HookLogTotals, WindowStats, generate_report, read_all_drain_states
 
 
@@ -30,6 +31,42 @@ def _mock_backlog_parser(mock_backlog_index):
 
 def _make_log(entries: list[str]) -> str:
     return "\n".join(entries) + "\n"
+
+
+def _identity(revision: str, branch: str | None = "main") -> InstallIdentity:
+    """Build an ``InstallIdentity`` for install-parity tests without touching real git state."""
+    return InstallIdentity(
+        path=Path("/fake/checkout"),
+        revision=revision,
+        branch=branch,
+        origin_url="https://example.invalid/devbench.git",
+    )
+
+
+def _not_self_hosting_result() -> ParityResult:
+    return ParityResult(self_hosting=False, harness=None, target=None, behind_count=0, in_sync=True)
+
+
+@pytest.fixture(autouse=True)
+def _mock_install_parity():
+    """Pin ``resolve_install_parity`` to a not-self-hosting default (issue #301 FR-4).
+
+    Every test in this module calls ``generate_report``, which -- once
+    ``install_parity_line()`` is wired in -- calls the real
+    ``devbench.install_parity.resolve_install_parity`` against this
+    workspace's own git checkouts. Patched here to a deterministic
+    not-self-hosting default so the pre-existing tests in this module stay
+    hermetic; ``TestInstallParityLine`` and
+    ``TestGenerateReportInstallParityRow`` override the mock's
+    ``return_value`` / ``side_effect`` per test to exercise the other
+    branches. ``create=True``: pre-change, ``devbench.reporting.report``
+    has not yet imported ``resolve_install_parity``, so the patch target
+    does not exist yet -- ``create=True`` keeps this fixture (and every
+    unrelated test in the module) collectible and passing at RED.
+    """
+    with patch("devbench.reporting.report.resolve_install_parity", create=True) as mock_resolve:
+        mock_resolve.return_value = _not_self_hosting_result()
+        yield mock_resolve
 
 
 class TestGenerateReport:
@@ -5832,3 +5869,187 @@ class TestReadAllDrainStates:
 
         with pytest.raises(KeyError):
             read_all_drain_states(tmp_path)
+
+
+class TestInstallParityLine:
+    """Tests for ``install_parity_line()`` (issue #301 FR-4, AC-10, AC-11).
+
+    T2's blocked ``cmd_status`` change calls ``report.install_parity_line()``;
+    this row is the single rendering path both ``devbench report`` and
+    ``devbench status`` are meant to reuse (spec Section 4, FR-4).
+    """
+
+    _HARNESS_REV = "aaaaaaa1111111111111111111111111111111"
+    _TARGET_REV = "bbbbbbb2222222222222222222222222222222"
+
+    def test_returns_none_when_not_self_hosting(self, _mock_install_parity: Any) -> None:
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.return_value = _not_self_hosting_result()
+
+        assert install_parity_line() is None
+
+    def test_returns_none_when_target_missing_defensive(self, _mock_install_parity: Any) -> None:
+        """The real resolver always resolves ``target`` before setting
+        ``self_hosting`` True (see ``install_parity.resolve_install_parity``),
+        but ``install_parity_line()`` must not assume that invariant holds --
+        a mismatched result degrades to no row rather than raising."""
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.return_value = ParityResult(
+            self_hosting=True,
+            harness=_identity(self._HARNESS_REV),
+            target=None,
+            behind_count=0,
+            in_sync=True,
+        )
+
+        assert install_parity_line() is None
+
+    def test_in_sync_row(self, _mock_install_parity: Any) -> None:
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.return_value = ParityResult(
+            self_hosting=True,
+            harness=_identity(self._HARNESS_REV, branch="main"),
+            target=_identity(self._TARGET_REV, branch="main"),
+            behind_count=0,
+            in_sync=True,
+        )
+
+        line = install_parity_line()
+
+        assert line == "Install parity   harness aaaaaaa (main) == target bbbbbbb   IN SYNC"
+
+    def test_behind_row(self, _mock_install_parity: Any) -> None:
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.return_value = ParityResult(
+            self_hosting=True,
+            harness=_identity(self._HARNESS_REV, branch="main"),
+            target=_identity(self._TARGET_REV, branch="main"),
+            behind_count=3,
+            in_sync=False,
+        )
+
+        line = install_parity_line()
+
+        assert line == (
+            "Install parity   harness aaaaaaa (main) != target bbbbbbb   BEHIND by 3 commit(s) touching src/devbench/"
+        )
+
+    def test_detached_head_branch_label(self, _mock_install_parity: Any) -> None:
+        """A harness on a detached HEAD renders ``(detached HEAD)``, matching
+        ``cli.py``'s own ``_check_install_parity`` convention."""
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.return_value = ParityResult(
+            self_hosting=True,
+            harness=_identity(self._HARNESS_REV, branch=None),
+            target=_identity(self._TARGET_REV, branch="main"),
+            behind_count=0,
+            in_sync=True,
+        )
+
+        line = install_parity_line()
+
+        assert line == "Install parity   harness aaaaaaa (detached HEAD) == target bbbbbbb   IN SYNC"
+
+    def test_unavailable_single_line_reason(self, _mock_install_parity: Any) -> None:
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.side_effect = InstallParityError("git rev-parse failed for checkout '/tmp/x'")
+
+        line = install_parity_line()
+
+        assert line == "Install parity   unavailable: git rev-parse failed for checkout '/tmp/x'"
+
+    def test_unavailable_multi_line_reason_collapsed(self, _mock_install_parity: Any) -> None:
+        """Never re-raises, and a multi-line resolver error collapses to a
+        single line (spec AC-11 / D-3) -- required so the log-tdd / log-comment
+        single-line contract this task itself runs under is never violated by
+        a resolver error propagating verbatim into a report row."""
+        from devbench.reporting.report import install_parity_line
+
+        _mock_install_parity.side_effect = InstallParityError(
+            "ERROR: git rev-parse HEAD failed for checkout '/tmp/x' (exit 128).\n"
+            "  fatal: not a git repository\n"
+            "  Confirm the path is a valid git checkout with a readable HEAD revision."
+        )
+
+        line = install_parity_line()
+
+        assert line is not None
+        assert "\n" not in line
+        assert line.startswith("Install parity   unavailable: ERROR: git rev-parse HEAD failed")
+        assert "fatal: not a git repository" in line
+
+
+class TestGenerateReportInstallParityRow:
+    """Tests for the ``install_parity_line()`` row wired into ``generate_report()``
+    (issue #301 FR-4, AC-T3-4)."""
+
+    _HARNESS_REV = "aaaaaaa1111111111111111111111111111111"
+    _TARGET_REV = "bbbbbbb2222222222222222222222222222222"
+
+    @staticmethod
+    def _write_log(tmp_path: Path) -> Path:
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        return log_file
+
+    def test_row_renders_when_self_hosting(self, tmp_path: Path, _mock_install_parity: Any) -> None:
+        _mock_install_parity.return_value = ParityResult(
+            self_hosting=True,
+            harness=_identity(self._HARNESS_REV, branch="main"),
+            target=_identity(self._TARGET_REV, branch="main"),
+            behind_count=0,
+            in_sync=True,
+        )
+
+        report = generate_report(log_path=self._write_log(tmp_path))
+        report_lines = report.split("\n")
+
+        assert report_lines[1] == "Install parity   harness aaaaaaa (main) == target bbbbbbb   IN SYNC"
+        assert report_lines[2] == ""
+
+    def test_row_omitted_when_not_self_hosting(self, tmp_path: Path, _mock_install_parity: Any) -> None:
+        _mock_install_parity.return_value = _not_self_hosting_result()
+
+        report = generate_report(log_path=self._write_log(tmp_path))
+        report_lines = report.split("\n")
+
+        assert "Install parity" not in report
+        # Byte-identical to the pre-change layout: banner line, then blank.
+        assert report_lines[1] == ""
+
+    def test_row_degrades_to_unavailable_on_resolver_failure(self, tmp_path: Path, _mock_install_parity: Any) -> None:
+        _mock_install_parity.side_effect = InstallParityError("checkout '/tmp/x' is not a git repository")
+
+        report = generate_report(log_path=self._write_log(tmp_path))
+        report_lines = report.split("\n")
+
+        assert report_lines[1] == "Install parity   unavailable: checkout '/tmp/x' is not a git repository"
+        assert report_lines[2] == ""
+
+    def test_rest_of_report_still_renders_with_parity_row(self, tmp_path: Path, _mock_install_parity: Any) -> None:
+        _mock_install_parity.return_value = ParityResult(
+            self_hosting=True,
+            harness=_identity(self._HARNESS_REV, branch="main"),
+            target=_identity(self._TARGET_REV, branch="main"),
+            behind_count=2,
+            in_sync=False,
+        )
+
+        report = generate_report(log_path=self._write_log(tmp_path))
+
+        assert "BEHIND by 2 commit(s) touching src/devbench/" in report
+        assert "Tasks completed" in report
+        assert "Tasks remaining" in report

@@ -885,6 +885,44 @@ class TestParseIndexEdgeCases:
         with pytest.raises(ValueError, match="has no file path"):
             parser.parse_index()
 
+    def test_parse_index_skips_file_less_non_task_row(self, tmp_path: Path) -> None:
+        """db-279 (spec AC-47): a file-less Epic/Feature/Story row is tolerated.
+
+        ``parse_index`` must not raise on a file-less non-Task row; it should
+        skip that row and still return the Task unit from the same index.
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1 | Feature One | Feature | in-queue | None | git-repo |  |\n"
+            "| E0-F1-S1-T1 | Valid Task | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        (backlog_dir / "E0-F1-S1-T1.md").write_text("# E0-F1-S1-T1: Valid Task\n\n## Status: in-queue\n")
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index_path)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].id == "E0-F1-S1-T1"
+
+    def test_parse_index_raises_on_file_less_task_row(self, tmp_path: Path) -> None:
+        """db-279 (spec AC-47): a file-less Task row raises with the Task-qualified message."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1-S1-T1 | No Path | Task | in-queue | None | git-repo |  |\n"
+        )
+
+        parser = BacklogParser(backlog_root=tmp_path / "backlog", backlog_index=index_path)
+        with pytest.raises(ValueError, match=r"Task work unit 'E0-F1-S1-T1' has no file path in BACKLOG\.md"):
+            parser.parse_index()
+
     def test_raises_when_no_work_unit_rows(self, tmp_path: Path) -> None:
         """Lines 200-205: raises ValueError when index has no parseable rows."""
         index_path = tmp_path / "BACKLOG.md"

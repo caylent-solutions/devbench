@@ -821,6 +821,11 @@ class BacklogManager:
             Task's marker referencing a WU-ID absent from the index is an error,
             surfaced here instead of silently surviving until ``reconcile-cascade``
             trips on it.
+        26. File-path contract for Task rows (FR-20, db-279): a Task row with an
+            empty ``File Path`` cell is an error. Epic/Feature/Story rows may be
+            file-less; this converges the validator with ``parse_index``, which
+            raises on the same file-less Task row and tolerates a file-less
+            non-Task row.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -845,6 +850,7 @@ class BacklogManager:
         self._check_full_index_has_rows(backlog_index, errors)
         self._check_unique_ids(rows, errors)
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
+        self._check_task_rows_have_files(rows, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
         self._check_dep_cycles(backlog_index, rows, workspace_root, errors)
@@ -1202,6 +1208,37 @@ class BacklogManager:
             else:
                 errors.append(f"{row_id}: work unit file missing '## Status:' line")
         return indexed_files
+
+    def _check_task_rows_have_files(
+        self,
+        rows: list[tuple[str, str, str]],
+        errors: list[str],
+    ) -> None:
+        """Check 26: every Task row names a file path (FR-20, db-279, OD-3=A).
+
+        ``_check_files_and_statuses`` tolerates a file-less row of any type
+        (its file-existence/status checks simply have nothing to check). That
+        silent tolerance is correct for Epic/Feature/Story rows -- their
+        bodies are scaffolding -- but wrong for Task rows: ``parse_index``
+        (:mod:`devbench.backlog.parser`) hard-raises on a file-less Task row,
+        so a Task row that passes ``validate()`` while missing a file would
+        crash the orchestrator's ``set-status``/``start`` path. This rule
+        closes that gap by flagging the same file-less Task row here, using
+        the same :meth:`_is_task_id` idiom other rules use to scope Task-only
+        checks. Status-Summary Epic rows and the ``**TOTAL**`` row are never
+        Task IDs, so they are skipped without any special-casing.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if file_path_str:
+                continue
+            errors.append(
+                f"{row_id}: Task-level work unit has no file path in BACKLOG.md "
+                "-- every Task row must name a materialised work-unit file"
+            )
 
     def _check_orphans(self, workspace_root: Path, indexed_files: set[Path], errors: list[str]) -> None:
         """Check 3: no orphaned work unit files."""

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.manager import BacklogManager
+from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
 from devbench.constants import (
@@ -961,6 +962,71 @@ class TestValidate:
         judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
+
+    def test_validate_flags_file_less_task_row(self, tmp_path: Path) -> None:
+        """db-279 (spec AC-48): a file-less Task row is flagged by validate()."""
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | No File Task | Task | in-queue | none | repo |  |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert (
+            "E0-F1-S1-T1: Task-level work unit has no file path in BACKLOG.md "
+            "-- every Task row must name a materialised work-unit file"
+        ) in errors
+
+    def test_validate_tolerates_file_less_non_task_row(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """db-279 (spec AC-48): a file-less Epic/Feature/Story row is tolerated by validate()."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1 | Feature One | Feature | in-queue | none | repo |  |\n"
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert not any(e.startswith("E0-F1:") and "has no file path" in e for e in errors)
+
+    @pytest.mark.parametrize(
+        ("row_id", "row_type", "should_reject"),
+        [
+            ("E0-F1", "Feature", False),
+            ("E0-F1-S1-T1", "Task", True),
+        ],
+    )
+    def test_validate_and_parse_index_agree(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        row_id: str,
+        row_type: str,
+        should_reject: bool,
+    ) -> None:
+        """db-279 (spec AC-47, AC-48): validate() and parse_index() converge on the same verdict."""
+        anchor = self._make_wu(backlog_dir, "E0-F1-S1-T9", "in-queue")
+        # parse_work_unit_file requires an "ID: Title" heading; _make_wu's
+        # bare "# <id>" heading satisfies validate() (which never parses the
+        # heading) but not the parser used for the convergence check below.
+        anchor.write_text(anchor.read_text(encoding="utf-8").replace("# E0-F1-S1-T9\n", "# E0-F1-S1-T9: Anchor Task\n"))
+        idx = self._make_index(
+            tmp_path,
+            f"| {row_id} | No File | {row_type} | in-queue | none | repo |  |\n"
+            "| E0-F1-S1-T9 | Anchor Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T9.md` |\n",
+        )
+
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        validator_rejects = any(e.startswith(f"{row_id}:") and "has no file path" in e for e in errors)
+        assert validator_rejects is should_reject
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=idx)
+        if should_reject:
+            with pytest.raises(ValueError, match="has no file path"):
+                parser.parse_index()
+        else:
+            units = parser.parse_index()
+            assert not any(u.id == row_id for u in units)
 
 
 # ---------------------------------------------------------------------------

@@ -86,13 +86,14 @@ The summary's `Blocked` row is split into three lines (Part-1, post-issue-#118):
 - `Blocked (recovery)` -- AWAITING_AUTO_RECOVERY: no marker yet, but devbench's recovery loop has an artefact on disk (a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS` -- default 1800s / 30min). The orchestrator's next sweep cycle will advance the task into the auto-clearing bucket. Operator does nothing.
 - `Blocked (attn)` -- the true halt list: manual gates (`DO NOT CLAIM`), unknown marker targets, cascade-stuck states. Operator must act.
 
-**Drain banner (issue #188):** when a `drain.signal` file is present in `<workspace>/.devbench/`, `devbench status` prepends a one-line banner above the Status Summary:
+**Drain banner (issue #188, db-306):** `devbench status` prepends one `DRAIN REQUESTED` line above the Status Summary for EVERY pending drain signal found under `<workspace>/.devbench/` -- the workspace-root `drain.signal` (if present) AND every per-session `<workspace>/.devbench/sessions/<name>/drain.signal` (if present). The scan is read-only and unconditional, independent of the caller's `DEVBENCH_SESSION_NAME` environment, so a drain requested against a named session is visible even from a shell that never exported that variable. The workspace-root signal (when present) renders first, followed by per-session signals sorted by session directory name:
 
 ```
-DRAIN REQUESTED: at 2026-05-14T13:55:01Z by matt (reason: nightly cutover)
+DRAIN REQUESTED: at 2026-05-14T13:55:01+00:00 by matt (reason: nightly cutover)
+DRAIN REQUESTED [session=alpha]: at 2026-05-14T13:56:12+00:00 by matt (reason: pausing alpha only)
 ```
 
-The banner names the requester, the UTC timestamp, and the reason (or `(none)` when no reason was supplied). When no drain marker is present the banner is suppressed. See [`### drain`](#drain-graceful-orchestrator-stop) for the full drain subcommand reference.
+The workspace-root line omits the session qualifier; each per-session line inserts `[session=<name>]` immediately after `DRAIN REQUESTED` so an operator scanning the output can tell at a glance which signal(s) are pending and where each one came from. Every line names the requester, the UTC timestamp, and the reason (or `(none)` when no reason was supplied). When no drain signal is present anywhere, the banner is suppressed entirely. See [`### drain`](#drain-graceful-orchestrator-stop) for the full drain subcommand reference, including the identical listing produced by `devbench drain --status`.
 
 ### `next`
 
@@ -119,6 +120,8 @@ Print the progress report with velocity, token consumption, and estimated cost. 
 The Status Summary per-epic table (also written to `BACKLOG.md` by `validate-backlog`) includes a `Draft` column alongside the existing status columns. The column count reflects the number of draft-status work units under each epic. Epics with no draft work units show `0` in the `Draft` column.
 
 **Issue #163: streaming default on TTY.** `devbench report` (no flags) opens an always-on streaming view that polls cache stats every ~100ms and re-renders the report whenever any source file advances. The screen never goes blank between refreshes -- the new frame is rendered to memory first, then emitted with the clear sequence in a single buffered write so the terminal flips OLD frame -> NEW frame in one redraw cycle. Ctrl+C exits cleanly. A `[refresh] cold X.Xs / warm Y.YYs / last refresh Z.ZZs` footer at the bottom of every frame exposes the loop's pace.
+
+**Drain banner (issue #188, db-306):** like `devbench status`, `devbench report` prepends one `DRAIN REQUESTED` line above the report body for every pending drain signal -- the workspace-root `drain.signal` (if present) AND every per-session `<workspace>/.devbench/sessions/<name>/drain.signal` (if present), regardless of `DEVBENCH_SESSION_NAME`. The line format, ordering, and session-qualifier rules (`[session=<name>]` on per-session lines, omitted on the workspace-root line) are identical to the `status` banner -- see [`status`](#status) for the exact wording and worked format. The banner is rendered LIVE, immediately before the report body, on all three of `report`'s emit paths: the cached-snapshot fast-path (a `read_snapshot` hit), the one-shot live path (`generate_report` invoked directly), and every frame of the streaming loop. In every case the banner text is produced by a fresh scan of the drain signals and is never baked into the cached snapshot string or memoised inside a streamed frame's report body, so a drain requested after a snapshot was written -- or between two streaming redraws -- is never hidden behind stale output.
 
 **Required environment variables (issue #221 B7):** every `devbench` subcommand -- including `report` -- requires both `DEVBENCH_WORKSPACE_ROOT` and `DEVBENCH_CLAUDE_MODEL` to be set before invocation. The check fires at module-import time (`src/devbench/config.py::_require_env`); when either variable is missing devbench prints a single actionable line to stderr (`devbench: DEVBENCH_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root.`) and exits with code 2. Before the issue #221 B7 fix this path raised a Python traceback to stderr instead, which stdout-only consumers (`devbench report > out.txt`) saw as "rc=0, empty output" -- the symptom that the issue is filed against. The current behaviour is fail-fast (CLAUDE.md): non-zero exit, no traceback, no silent fallback.
 
@@ -786,13 +789,15 @@ Request, withdraw, or inspect the drain signal. The bare form and `--reason` var
 
 - **`devbench drain`** -- request a graceful stop with no reason. Writes `<workspace>/.devbench/drain.signal` with a JSON payload containing `requested_at` (UTC ISO 8601), `requested_by` (current `USER` / `USERNAME` env var, or `"unknown"`), and `reason` (empty string). The write is atomic (temp-then-rename) so readers never observe a partial file. Overwrites any existing signal. Exits 0 on success; filesystem failures propagate as unhandled exceptions (Python traceback to stderr).
 
-- **`devbench drain --reason "<text>"`** -- same as the bare form, with a non-empty reason string embedded in the payload. The reason is stored verbatim and surfaced by `devbench status` and `devbench drain --status`.
+- **`devbench drain --reason "<text>"`** -- same as the bare form, with a non-empty reason string embedded in the payload. The reason is stored verbatim and surfaced by `devbench status`, `devbench report`, and `devbench drain --status`.
 
 - **`devbench drain --cancel`** -- withdraw the drain request. Deletes the drain signal from both the per-session path (when `DEVBENCH_SESSION_NAME` is set) and the workspace-root path so a writer at either location is cleared in one call (issue #212). Idempotent: exits 0 silently whether or not a signal file was present at either path. Cancelling while the orchestrator is mid-WU prevents the orchestrator from exiting at the next WU boundary -- it continues as if no drain was requested (AC-188-10). Filesystem failures propagate as unhandled exceptions.
 
-- **`devbench drain --status`** -- print the current drain state and exit rc=0 in both cases:
-  - Signal present: prints a one-line summary of the form `drain pending: requested_by=<user> at=<ISO-8601> reason=<reason-or-none>`.
-  - No signal: prints `no drain pending`.
+- **`devbench drain --status`** -- print every pending drain signal and exit rc=0 in all cases (db-306):
+  - No signal anywhere: prints `no drain pending`.
+  - One or more signals present: prints one `DRAIN REQUESTED` line per pending signal -- the workspace-root signal first (if present), then per-session signals sorted by session directory name. This is the SAME resolver and line format rendered by the `status` and `report` banners: the workspace-root line reads `DRAIN REQUESTED: at <ISO-8601> by <user> (reason: <reason-or-none>)`, and each per-session line inserts the qualifier: `DRAIN REQUESTED [session=<name>]: at <ISO-8601> by <user> (reason: <reason-or-none>)`.
+
+  The listing is unconditional and independent of `DEVBENCH_SESSION_NAME` -- it always reports every signal actually on disk (root plus every session directory), so an operator running `--status` from a shell with no session env var still sees a drain requested against a named session.
 
   The orchestrate skill calls `devbench drain --status` between Step 9 (mark-done) and Step 10 (loop back) so it can exit cleanly without a special sentinel file. rc=0 in both states lets the skill use the printed output as the discriminator rather than the exit code.
 
@@ -824,10 +829,12 @@ The next `devbench start` runs without any drain restriction because the marker 
 # Request graceful stop with a reason:
 uv run devbench drain --reason "nightly cutover"
 
-# Check current drain state (rc=0 either way):
+# Check current drain state (rc=0 either way; one DRAIN REQUESTED line per pending signal):
 uv run devbench drain --status
-# -> drain pending: requested_by=matt at=2026-05-14T13:55:01+00:00 reason=nightly cutover
-# -- or --
+# -> DRAIN REQUESTED: at 2026-05-14T13:55:01+00:00 by matt (reason: nightly cutover)
+# -- or, with a named session also draining --
+# -> DRAIN REQUESTED [session=alpha]: at 2026-05-14T13:56:12+00:00 by matt (reason: pausing alpha only)
+# -- or, with nothing pending --
 # -> no drain pending
 
 # Withdraw the request before the orchestrator picks it up:
@@ -840,7 +847,7 @@ uv run devbench start --include "E1-F2-S3-T4"
 # -> orchestrator claims E1-F2-S3-T4, completes it, detects drain, exits rc=0
 ```
 
-**Status banner:** when a drain signal is present, `devbench status` prepends a `DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner above the Status Summary so the operator can see the pending drain at a glance. See the [`status`](#status) section for the full banner format.
+**Status and report banners:** when one or more drain signals are pending, `devbench status` and `devbench report` each prepend one `DRAIN REQUESTED` line per pending signal (root plus every draining session) above their respective output, using the same format `devbench drain --status` prints above. See the [`status`](#status) and [`report`](#report) sections for the full banner format and per-command rendering details.
 
 ---
 

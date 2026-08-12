@@ -675,17 +675,26 @@ DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain --reason "upgrading devbench to v1.2"
 ```
 
-Once the drain marker is written, `devbench status` prepends a
+Once the drain marker is written, `devbench status` and `devbench report` each prepend a
 `DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner so you can confirm the
-signal is pending.
+signal is pending. The scan covers the workspace-root marker AND every named session's
+marker, so this works whether or not your shell has `DEVBENCH_SESSION_NAME` set; a
+per-session drain renders with a `[session=<name>]` qualifier right after
+`DRAIN REQUESTED` (db-306).
 
 ### Checking drain state
 
 ```bash
-# Print marker contents (requested_by, at, reason) if pending; "no drain pending" otherwise.
+# Print one DRAIN REQUESTED line per pending signal (root plus every draining
+# session); "no drain pending" when nothing is pending.
 # Exit code is rc=0 in both states -- safe to use in scripts.
 DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain --status
+# -> DRAIN REQUESTED: at 2026-05-14T13:55:01+00:00 by matt (reason: upgrading devbench to v1.2)
+# -- or, with a named session also draining --
+# -> DRAIN REQUESTED [session=alpha]: at 2026-05-14T13:56:12+00:00 by matt (reason: pausing alpha only)
+# -- or, with nothing pending --
+# -> no drain pending
 ```
 
 ### Cancelling a drain request

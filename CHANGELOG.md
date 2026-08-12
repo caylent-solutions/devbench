@@ -54,6 +54,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
   the anchor contract and both suffixes.
 
+### Fixed
+
+- **`add-dep` reported `"wired": true` and exited 0 even when the printed
+  Manifest-conflict remedy stayed inert** (issue #330 FR-1, FR-2). The
+  Manifest Conflict Rule's dep-chain scan reads the `## Dependencies`
+  table, but `add-dep` wrote only the `[BLOCKED_PENDING_PROPOSAL]`
+  marker, whose ADR-07 cascade fires solely on `blocked` units -- for a
+  non-blocked unit the two never met, yet the command still reported
+  success. `cmd_add_dep` (`src/devbench/cli.py`) now writes a canonical
+  `## Dependencies` row for the blocked task alongside the existing
+  marker, with the Title and Status cells carrying the blocker's real,
+  current values (not a placeholder), idempotently and under
+  `flock_backlog`. `"wired": true` now means the blocked task's
+  `## Dependencies` table carries a validator-visible row for the
+  blocker as of that call (true whether newly written or already
+  present on a repeat call); a request that cannot produce such a row
+  reports `"wired": false`, exits non-zero, and populates `reason`,
+  leaving no partial write. The status warning now names the
+  consequence (the ADR-07 cascade will not fire until the blocked task
+  is itself `blocked`) rather than implying the marker is merely
+  deferred. `docs/cli-reference.md`, `docs/manual-blockers.md`, and
+  `docs/cross-backlog-dependencies.md` document the corrected contract.
 
 ## [0.4.0] -- 2026-08-12
 

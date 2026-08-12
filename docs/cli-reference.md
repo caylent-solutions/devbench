@@ -1551,7 +1551,7 @@ Output JSON:
 uv run devbench add-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
 ```
 
-Wire a `[BLOCKED_PENDING_PROPOSAL] <blocker-task-id>` marker and a Dependencies-table row on `<blocked-task-id>`'s work-unit file. The ADR-07 cascade then auto-unblocks `<blocked-task-id>` when `<blocker-task-id>` reaches `done` or `declined`. See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md).
+Wire a canonical `## Dependencies` row -- the form `validate-backlog`'s Manifest Conflict Rule reads -- alongside the existing `[BLOCKED_PENDING_PROPOSAL] <blocker-task-id>` audit marker on `<blocked-task-id>`'s work-unit file (#330 FR-1). The row's Title and Status cells carry `<blocker-task-id>`'s real, current values as of this call, not a placeholder. The ADR-07 auto-requeue cascade still only auto-unblocks `<blocked-task-id>` when `<blocker-task-id>` reaches `done` / `declined` AND `<blocked-task-id>`'s own status is `blocked`; the `## Dependencies` row has no such restriction, so it is what satisfies the validator now, independent of `<blocked-task-id>`'s current status. See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md).
 
 Use this when the `promote-proposal` flow does not cover your case:
 
@@ -1559,17 +1559,20 @@ Use this when the `promote-proposal` flow does not cover your case:
 - You hand-authored a work unit (not via task-factory) that unblocks another task.
 - You are correcting a proposal authored without `affected_task_ids`.
 
-Fail-fast:
+Fail-fast (#330 FR-1 error handling): every path below exits non-zero, prints a message naming the file (when one is implicated) and the reason, and leaves no partial write behind.
 
 - Both IDs must match the `E<N>-F<N>-S<N>-T<N>` task-ID format.
+- `<blocked-task-id>` must exist in the backlog index.
 - `<blocker-task-id>` must exist in the backlog index.
 - `<blocker-task-id>` must NOT be in a terminal state (`done` / `declined`); wiring a dep on terminal work is a no-op and almost always a mistake.
-- `<blocked-task-id>` must exist in the backlog index.
 - `<blocked-task-id>` and `<blocker-task-id>` cannot be the same.
+- `<blocked-task-id>`'s work-unit file must be readable (valid UTF-8) and contain a `## Dependencies` section.
 
-Warns (does not refuse) when `<blocked-task-id>` is not currently in `blocked` status -- the ADR-07 cascade only fires on blocked tasks, so wiring a marker on an in-queue task is harmless metadata; the operator almost certainly meant to flip to blocked first.
+A request that cannot produce a validator-visible edge reports `wired: false` and exits non-zero with a `reason`, leaving no partial write.
 
-Idempotent: if either the Dependencies row or the marker is already present, the corresponding write is skipped. `wired: false` in the output JSON means the call was a complete no-op.
+Warns (does not refuse) when `<blocked-task-id>` is not currently in `blocked` status: the ADR-07 cascade will not fire until the task is blocked -- but the `## Dependencies` row this call writes to `<blocked-task-id>`'s work-unit file satisfies the Manifest Conflict Rule now, independent of that status.
+
+Idempotent: calling `add-dep` twice for the same pair leaves exactly one Dependencies row and one marker. `wired: true` in the output JSON means `<blocked-task-id>`'s `## Dependencies` table carries a validator-visible row for `<blocker-task-id>` as of THIS call -- true whether the row was newly written or already present. `wired: false` means no such row could be produced; the exit code is non-zero in that case and `reason` explains why.
 
 Output JSON:
 

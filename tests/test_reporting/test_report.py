@@ -91,12 +91,12 @@ class TestGenerateReport:
         log_file.write_text(
             _make_log(
                 [
-                    "2026-03-05T09:50:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:15:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                    "2026-03-05T10:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
-                    "2026-03-05T10:45:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
+                    "2026-03-05T09:50:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T10:45:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
@@ -115,13 +115,13 @@ class TestGenerateReport:
         log_file.write_text(
             _make_log(
                 [
-                    "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                    "2026-03-05T10:40:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                    "2026-03-05T10:40:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
-                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
+                    "2026-03-05T08:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:40:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:40:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T11:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
@@ -2441,8 +2441,8 @@ class TestSpanningRows:
         for i in range(10):
             start = f"2026-03-05T10:{i * 5:02d}:00Z"
             done = f"2026-03-05T10:{i * 5 + 4:02d}:30Z"
-            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
-            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+            log_lines.append(f"{start} [devbench.backlog_manager] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [devbench.backlog_manager] INFO Set E0-F1-S1-T{i + 1} to 'done'")
         log_file = tmp_path / "test.log"
         log_file.write_text(_make_log(log_lines))
 
@@ -4897,7 +4897,7 @@ class TestGenerateReportThreadsSessionStarts:
         from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
 
         log_file = tmp_path / "test.log"
-        entries = ["2026-07-29T11:19:28Z [judges.cli] INFO Set E2-F6-S1-T1 to 'in-progress'"]
+        entries = ["2026-07-29T11:19:28Z [devbench.backlog_manager] INFO Set E2-F6-S1-T1 to 'in-progress'"]
         cursor = datetime(2026, 8, 10, 6, 0, 0, tzinfo=UTC)
         durations = (18, 19, 20, 21, 22, 23, 24, 25, 26)
         assert all(d < DEFAULT_SESSION_GAP_MINUTES for d in durations)
@@ -4905,10 +4905,12 @@ class TestGenerateReportThreadsSessionStarts:
             tid = f"E0-F1-S1-T{i + 1}"
             start = cursor
             end = cursor + timedelta(minutes=dur)
-            entries.append(f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z [judges.cli] INFO Set {tid} to 'in-progress'")
-            entries.append(f"{end.strftime('%Y-%m-%dT%H:%M:%S')}Z [judges.cli] INFO Set {tid} to 'done'")
+            entries.append(
+                f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] INFO Set {tid} to 'in-progress'"
+            )
+            entries.append(f"{end.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] INFO Set {tid} to 'done'")
             cursor = end
-        entries.append("2026-08-10T18:32:33Z [judges.cli] INFO Set E2-F6-S1-T1 to 'done'")
+        entries.append("2026-08-10T18:32:33Z [devbench.backlog_manager] INFO Set E2-F6-S1-T1 to 'done'")
         log_file.write_text(_make_log(entries))
 
         report = generate_report(log_path=log_file)

@@ -5,6 +5,58 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Orchestrator inactivity net and cooperative SDK teardown** (FR-17,
+  issues db-262 / db-325). `devbench start`'s `_run` SDK message loop
+  no longer idles forever on a wound-down turn with no terminal
+  sentinel (an observed hang ran 2h24m before this fix): the loop now
+  awaits `agen.__anext__()` under a bounded `asyncio.wait_for`, and a
+  stall raises a new `_OrchestrateInactivityTimeout` sentinel that
+  `_drive_orchestrate_with_quota_resume` disposes as a bounded
+  fresh-session restart, reusing the same cap as
+  `DEVBENCH_MAX_QUOTA_RESUMES` -- never a stateful `ClaudeSDKClient`
+  continuation. The wait window is configurable via the new
+  `timeouts.orchestrator_inactivity` key in
+  `backlog/config/devbench.yaml` and the
+  `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT` environment variable,
+  defaulting to the new `DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS`
+  constant (1800 seconds). A `finally: await agen.aclose()` around the
+  loop (db-325) guarantees cooperative teardown before a quota or
+  inactivity sentinel unwinds, so `aclose()` is never invoked while
+  the generator is still running and the CLI subprocess is never
+  orphaned.
+
+- **`Recent pace (last N tasks)` and `Average time per task` still
+  understated the real execution window by roughly an order of magnitude
+  even after issue #326's same-session gate** (issue #329). Two compounding
+  defects. Defect A: the unanchored transition regex scanned the entire log
+  line rather than requiring the emitting logger, so a `devbench.cli` line
+  that echoed a prior transition -- for example inside an SDK
+  `ToolResultBlock` payload reproducing an earlier audit comment -- was
+  ingested as a genuine transition; on the reproduction log 85% of
+  `in-progress` matches and 47% of `done` matches were echoes, not
+  transitions. Defect B: even with Defect A fixed, a genuinely re-claimed
+  task (claimed, bounced by review, re-claimed in the same session) was
+  anchored to its LAST claim (`MAX(ts_epoch_us)`) rather than its first,
+  discarding the review-bounce time as if it were idle. On the
+  reproduction log (`logs/orchestrator.log`) the combined effect
+  understated the median execution window by ~10.6x (32.1 min true median
+  vs 3.0 min as sampled) and projected the remaining ETA at 0.5 h where the
+  corrected figure is 5.3 h. `event_index.py`'s transition queries now bind
+  `logger = 'devbench.backlog_manager'` -- the sole in-tree emitter of the
+  quoted `Set <id> to '<status>'` record -- as a SQL predicate so an
+  echoed line can never match, and `_execution_anchor` (`report.py`) now
+  selects the EARLIEST same-session claim rather than the latest.
+  Candidate `in-progress` rows rejected for failing the logger predicate
+  are surfaced rather than silently dropped: the `Average time per task`
+  and `Recent pace (last N tasks)` cells append a
+  `(<k> non-transition rows rejected)` suffix, composed AFTER the #326
+  `(<k> excluded: no execution window)` suffix, naming how many candidate
+  rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
+  the anchor contract and both suffixes.
+
+
+## [0.4.0] -- 2026-08-12
+
 ### Changed (model defaults)
 
 - **Shipped model rate table refreshed to the current lineup; default
@@ -267,26 +319,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a fail-safe cap. See `docs/quota-handling.md` and
   `docs/adr/24-quota-wait-and-resume.md`.
 
-- **Orchestrator inactivity net and cooperative SDK teardown** (FR-17,
-  issues db-262 / db-325). `devbench start`'s `_run` SDK message loop
-  no longer idles forever on a wound-down turn with no terminal
-  sentinel (an observed hang ran 2h24m before this fix): the loop now
-  awaits `agen.__anext__()` under a bounded `asyncio.wait_for`, and a
-  stall raises a new `_OrchestrateInactivityTimeout` sentinel that
-  `_drive_orchestrate_with_quota_resume` disposes as a bounded
-  fresh-session restart, reusing the same cap as
-  `DEVBENCH_MAX_QUOTA_RESUMES` -- never a stateful `ClaudeSDKClient`
-  continuation. The wait window is configurable via the new
-  `timeouts.orchestrator_inactivity` key in
-  `backlog/config/devbench.yaml` and the
-  `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT` environment variable,
-  defaulting to the new `DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS`
-  constant (1800 seconds). A `finally: await agen.aclose()` around the
-  loop (db-325) guarantees cooperative teardown before a quota or
-  inactivity sentinel unwinds, so `aclose()` is never invoked while
-  the generator is still running and the CLI subprocess is never
-  orphaned.
-
 ### Removed
 
 - **`sdk_teardown_filter` workaround module removed** (issues #232, #231).
@@ -445,35 +477,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sentence, append `(<k> excluded: no execution window)` naming how many
   were dropped. `docs/cli-reference.md`'s ETA-formula note documents the
   median estimator and the exclusion suffix.
-
-- **`Recent pace (last N tasks)` and `Average time per task` still
-  understated the real execution window by roughly an order of magnitude
-  even after issue #326's same-session gate** (issue #329). Two compounding
-  defects. Defect A: the unanchored transition regex scanned the entire log
-  line rather than requiring the emitting logger, so a `devbench.cli` line
-  that echoed a prior transition -- for example inside an SDK
-  `ToolResultBlock` payload reproducing an earlier audit comment -- was
-  ingested as a genuine transition; on the reproduction log 85% of
-  `in-progress` matches and 47% of `done` matches were echoes, not
-  transitions. Defect B: even with Defect A fixed, a genuinely re-claimed
-  task (claimed, bounced by review, re-claimed in the same session) was
-  anchored to its LAST claim (`MAX(ts_epoch_us)`) rather than its first,
-  discarding the review-bounce time as if it were idle. On the
-  reproduction log (`logs/orchestrator.log`) the combined effect
-  understated the median execution window by ~10.6x (32.1 min true median
-  vs 3.0 min as sampled) and projected the remaining ETA at 0.5 h where the
-  corrected figure is 5.3 h. `event_index.py`'s transition queries now bind
-  `logger = 'devbench.backlog_manager'` -- the sole in-tree emitter of the
-  quoted `Set <id> to '<status>'` record -- as a SQL predicate so an
-  echoed line can never match, and `_execution_anchor` (`report.py`) now
-  selects the EARLIEST same-session claim rather than the latest.
-  Candidate `in-progress` rows rejected for failing the logger predicate
-  are surfaced rather than silently dropped: the `Average time per task`
-  and `Recent pace (last N tasks)` cells append a
-  `(<k> non-transition rows rejected)` suffix, composed AFTER the #326
-  `(<k> excluded: no execution window)` suffix, naming how many candidate
-  rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
-  the anchor contract and both suffixes.
 
 ## [0.3.0] -- 2026-07-31
 

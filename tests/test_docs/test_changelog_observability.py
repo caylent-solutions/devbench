@@ -5,7 +5,7 @@ AC-13, AC-14, AC-22).
 
 Two things must remain true:
 
-1. Under the existing ``## [Unreleased]`` -> ``### Fixed`` block, an entry for
+1. Under the newest ``## [...]`` -> ``### Fixed`` block, an entry for
    the FR-D2 instances fix exists -- daemons outside ``$HOME`` are
    discoverable because ``_resolve_search_roots`` now also joins
    ``DEVBENCH_WORKSPACE_ROOT`` into the default search roots
@@ -29,6 +29,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 CHANGELOG_PATH = REPO_ROOT / "CHANGELOG.md"
 
 _HEADING_PREFIX_RE = re.compile(r"^(#{1,6}) ")
+_VERSION_HEADING_RE = re.compile(r"^## \[[^\]]+\].*$", re.MULTILINE)
 _HEADING_LINE_RE = re.compile(r"^(#{1,6}) ", re.MULTILINE)
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -74,6 +75,46 @@ def _extract_section(text: str, heading: str) -> str:
     return section_text
 
 
+def _current_release_section(text: str) -> str:
+    """Return the newest ``## [...]`` version section of the CHANGELOG.
+
+    That heading is ``## [Unreleased] -- v-next`` between releases and
+    ``## [<version>] -- <date>`` on a release commit, because cutting a release
+    renames the heading in place rather than adding a new one.
+
+    Resolving the heading is what keeps the entry pins below satisfiable.
+    Hard-coding the literal ``"## [Unreleased] -- v-next"`` made them
+    structurally unsatisfiable on any release commit: the release rename
+    removed the very heading they required, so every release broke this
+    module. The invariant these checks actually encode is "the entry lives in
+    the newest section", which survives the rename.
+    """
+    match = _VERSION_HEADING_RE.search(text)
+    if match is None:
+        return ""
+    return _extract_section(text, match.group(0))
+
+
+def _section_containing(text: str, phrase: str) -> str:
+    """Return the ``## [...]`` version section that contains *phrase*.
+
+    Pinning the FR-D2 entry to the *newest* section was still over-specified:
+    cutting a release renames the section the entry sits in, and opening a new
+    ``## [Unreleased] -- v-next`` above it moves the entry out of "newest"
+    again. The durable invariant is that the entry is recorded under a
+    ``### Fixed`` block somewhere in the changelog, not that it sits in
+    whichever section happens to be first. Resolve the owning section instead.
+    """
+    match = _VERSION_HEADING_RE.search(text)
+    while match is not None:
+        section = _extract_section(text, match.group(0))
+        if phrase in section:
+            return section
+        nxt = _VERSION_HEADING_RE.search(text, match.end())
+        match = nxt
+    return ""
+
+
 def _extract_bullet(text: str, start_phrase: str) -> str:
     """Return one CHANGELOG bullet's full text, from *start_phrase* to the
     next bullet or heading boundary.
@@ -101,38 +142,38 @@ def _normalize_whitespace(text: str) -> str:
 
 
 @pytest.mark.unit
-class TestUnreleasedFixedSectionExists:
-    """Sanity precondition for the FR-D2 entry check below: the '## [Unreleased]'
-    -> '### Fixed' nesting must exist, or that check would pass vacuously
-    against an empty string."""
+class TestCurrentSectionFixedSubsectionExists:
+    """Sanity precondition for the FR-D2 entry check below: the newest
+    ``## [...]`` -> ``### Fixed`` nesting must exist, or that check would pass
+    vacuously against an empty string."""
 
-    def test_unreleased_section_exists(self) -> None:
+    def test_current_section_exists(self) -> None:
         text = _read_doc()
-        section = _extract_section(text, "## [Unreleased] -- v-next")
-        assert section, "CHANGELOG.md must contain a '## [Unreleased] -- v-next' section."
+        section = _current_release_section(text)
+        assert section, "CHANGELOG.md must contain a '## [<version>]' or '## [Unreleased]' section."
 
-    def test_unreleased_fixed_subsection_exists(self) -> None:
+    def test_current_section_fixed_subsection_exists(self) -> None:
         text = _read_doc()
-        unreleased = _extract_section(text, "## [Unreleased] -- v-next")
-        assert unreleased, "CHANGELOG.md must contain a '## [Unreleased] -- v-next' section."
-        fixed_section = _extract_section(unreleased, "### Fixed")
-        assert fixed_section, "The '## [Unreleased]' section must contain a '### Fixed' subsection."
+        owning = _section_containing(text, _D2_START_PHRASE)
+        assert owning, f"No '## [...]' section contains {_D2_START_PHRASE!r}."
+        fixed_section = _extract_section(owning, "### Fixed")
+        assert fixed_section, "The section carrying the FR-D2 entry must contain a '### Fixed' subsection."
 
 
 @pytest.mark.unit
 class TestFrD2InstancesEntry:
     """AC-13 / AC-E9-F3-S2-T1-3: the FR-D2 instances Fixed entry (spec Section 4
-    FR-5(a)) lives under '## [Unreleased]' -> '### Fixed'."""
+    FR-5(a)) lives under the newest ``## [...]`` section's '### Fixed'."""
 
-    def test_entry_exists_under_unreleased_fixed(self) -> None:
+    def test_entry_exists_under_current_fixed(self) -> None:
         text = _read_doc()
-        unreleased = _extract_section(text, "## [Unreleased] -- v-next")
-        assert unreleased, "CHANGELOG.md must contain a '## [Unreleased] -- v-next' section."
-        fixed_section = _extract_section(unreleased, "### Fixed")
-        assert fixed_section, "The '## [Unreleased]' section must contain a '### Fixed' subsection."
+        owning = _section_containing(text, _D2_START_PHRASE)
+        assert owning, f"No '## [...]' section contains {_D2_START_PHRASE!r}."
+        fixed_section = _extract_section(owning, "### Fixed")
+        assert fixed_section, "The section carrying the FR-D2 entry must contain a '### Fixed' subsection."
         assert _D2_START_PHRASE in fixed_section, (
-            "The '## [Unreleased]' -> '### Fixed' subsection must carry the FR-D2 "
-            f"instances entry starting {_D2_START_PHRASE!r} (spec Section 4 FR-5(a), AC-13)."
+            "The FR-D2 instances entry must sit under a '### Fixed' subsection of its own "
+            f"'## [...]' section, starting {_D2_START_PHRASE!r} (spec Section 4 FR-5(a), AC-13)."
         )
 
     def test_entry_names_the_workspace_root_join_and_source_lines(self) -> None:

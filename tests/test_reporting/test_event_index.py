@@ -936,6 +936,66 @@ class TestParityAgainstParserPath:
         finally:
             idx.close()
 
+    def test_indexed_and_parser_paths_match_with_cli_echo_noise(self, workspace: Path) -> None:
+        """AC-15 (issue #329 FR-3): a ``devbench.cli`` echo line (Defect A
+        shape -- a ``ToolResultBlock`` payload that quotes a prior
+        ``[WU_CLAIMED]`` audit comment inside a later log line) must not
+        perturb parity between the indexed and parser ``_compute_window_stats``
+        paths, now that ``report.py`` no longer carries its own
+        ``_DONE_RE`` / ``_PROGRESS_RE`` copy of the transition contract.
+
+        ``done_times`` / ``progress_claims`` are built once, from
+        ``EventIndex``'s logger-anchored queries (``_TRANSITION_LOGGER``
+        predicate), and handed unchanged to both ``_compute_window_stats``
+        calls -- so the echo's later timestamp must never win over the
+        genuine ``devbench.backlog_manager`` 'done' timestamp, and both
+        paths must still agree given that corrected input.
+        """
+        from devbench.reporting.report import _compute_window_stats
+
+        log, _hook, idx = self._seed(workspace)
+        try:
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "2026-05-04T10:20:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                    "[WU_CLAIMED] Set E0-F1-S1-T1 to 'done' session=default\n"
+                )
+            idx.refresh_orchestrator_log(log)
+
+            done_times = idx.task_transition_times(log, "done")
+            progress_times = idx.task_transition_times(log, "in-progress")
+            progress_claims = {tid: [ts] for tid, ts in progress_times.items()}
+            # The echo's later timestamp (10:20) must never win over the
+            # genuine backlog_manager 'done' timestamp (10:05).
+            assert done_times["E0-F1-S1-T1"] == datetime(2026, 5, 4, 10, 5, tzinfo=UTC)
+
+            window_start = datetime(2026, 5, 4, 10, 0, tzinfo=UTC)
+            window_end = datetime(2026, 5, 4, 10, 21, tzinfo=UTC)
+            indexed = _compute_window_stats(
+                log_path=log,
+                window_start=window_start,
+                window_end=window_end,
+                done_times=done_times,
+                progress_claims=progress_claims,
+                tasks_active=0,
+                event_index=idx,
+            )
+            parsed = _compute_window_stats(
+                log_path=log,
+                window_start=window_start,
+                window_end=window_end,
+                done_times=done_times,
+                progress_claims=progress_claims,
+                tasks_active=0,
+                event_index=None,
+            )
+            assert indexed.totals == parsed.totals
+            assert indexed.cost.total_cost == pytest.approx(parsed.cost.total_cost)
+            assert indexed.api_hours == pytest.approx(parsed.api_hours)
+            assert indexed.tasks_in_window == parsed.tasks_in_window
+        finally:
+            idx.close()
+
 
 class TestRefreshOrchLogSourcesShardAware:
     """Issue #168: ``refresh_orch_log_sources`` + workspace-aware queries

@@ -103,10 +103,13 @@ _KIND_TRANSCRIPT = "transcript"
 # Same regex shape as the existing one in report.py; kept private here so
 # the index can advance one line at a time during incremental reads.
 _LOG_LINE_RE = re.compile(rb"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z \[([^\]]+)\]")
-# Issue #329 FR-1b (ingestion-side hardening). Mirrors the existing
-# ``_DONE_RE`` / ``_PROGRESS_RE`` regexes in report.py: task IDs must start
-# with ``E`` (the backlog work-unit-ID convention) to be counted as
-# transition events.
+# Issue #329 FR-1b (ingestion-side hardening). Task IDs must start with
+# ``E`` (the backlog work-unit-ID convention) to be counted as transition
+# events. Issue #329 FR-3: report.py used to carry its own pair of
+# module-level transition regexes restating this same shape; they were
+# deleted as dead code once every consumer read through this indexed
+# query instead, so this pattern is now the single place the transition
+# shape is expressed as a regex.
 #
 # The leading `` [A-Z]+ `` matches the level token (e.g. ``INFO``) that
 # ``_LOG_LINE_RE`` does not itself capture. This pattern is applied with
@@ -886,12 +889,13 @@ class EventIndex:
     def task_transition_times(self, log_path: Path, transition: str) -> dict[str, datetime]:
         """Return the most-recent timestamp per task_id for the given transition in ``log_path``.
 
-        Equivalent to the existing ``_DONE_RE.finditer`` /
-        ``_PROGRESS_RE.finditer`` loops in report.py: each task
-        contributes its newest matching line within the named log file.
-        The ``MAX(ts_epoch_us) GROUP BY task_id`` matches the
-        assignment-overwrites-earlier semantic of the original
-        dict-build.
+        Each task contributes its newest matching line within the named
+        log file (issue #329 FR-3: report.py's earlier, module-level
+        finditer-based equivalent of this query was deleted as dead code
+        once every consumer moved to this indexed path). The
+        ``MAX(ts_epoch_us) GROUP BY task_id`` matches the
+        assignment-overwrites-earlier semantic of a per-task dict build
+        where a later assignment overwrites an earlier one.
 
         Issue #329 FR-1a: see ``task_transition_times_for_workspace`` for the
         ``logger = _TRANSITION_LOGGER`` predicate rationale; the same

@@ -653,6 +653,46 @@ class TestJsonSchemaValidation:
         with pytest.raises(ValueError, match="unknown_key"):
             load_runtime_config(cfg, {})
 
+    def test_schema_accepts_orchestrator_inactivity_timeout(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML timeouts block with an orchestrator_inactivity integer
+        When: load_runtime_config is called
+        Then: no ValueError is raised and the value is loaded (spec FR-17, db-262)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity: 900
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.timeouts.orchestrator_inactivity == 900, (
+            f"Expected orchestrator_inactivity=900, got {result.timeouts.orchestrator_inactivity!r}"
+        )
+
+    def test_schema_rejects_zero_orchestrator_inactivity_timeout(self, tmp_path: Path) -> None:
+        """
+        Given: an orchestrator_inactivity value of zero (below minimum: 1)
+        When: load_runtime_config is called
+        Then: ValueError is raised (spec FR-17, db-262, mirrors AC-4 for gh_api)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
 
 # ---------------------------------------------------------------------------
 # TimeoutConfig / LimitConfig dataclasses -- AC-9
@@ -679,6 +719,9 @@ class TestTimeoutConfigDefaults:
             f"Expected orchestrator_poll_interval=None, got {tc.orchestrator_poll_interval!r}"
         )
         assert tc.github_check is None, f"Expected github_check=None, got {tc.github_check!r}"
+        assert tc.orchestrator_inactivity is None, (
+            f"Expected orchestrator_inactivity=None, got {tc.orchestrator_inactivity!r}"
+        )
 
 
 @pytest.mark.unit
@@ -738,6 +781,27 @@ class TestRuntimeConfigPopulation:
         assert result.timeouts.gh_api == 45, f"Expected gh_api=45, got {result.timeouts.gh_api!r}"
         assert result.timeouts.test == 600, f"Expected test=600, got {result.timeouts.test!r}"
         assert result.timeouts.llm is None, f"Expected unspecified field llm=None, got {result.timeouts.llm!r}"
+
+    def test_runtime_config_populates_orchestrator_inactivity_from_yaml(self, tmp_path: Path) -> None:
+        """
+        Given: YAML with timeouts.orchestrator_inactivity set
+        When: load_runtime_config is called
+        Then: RuntimeConfig.timeouts.orchestrator_inactivity reflects the YAML value (spec FR-17, db-262)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity: 1200
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.timeouts.orchestrator_inactivity == 1200, (
+            f"Expected orchestrator_inactivity=1200, got {result.timeouts.orchestrator_inactivity!r}"
+        )
 
     def test_runtime_config_populates_limits_from_yaml(self, tmp_path: Path) -> None:
         """

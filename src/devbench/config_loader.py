@@ -38,6 +38,7 @@ YAML schema::
       command: <integer>
       orchestrator_poll_interval: <integer>
       github_check: <integer>
+      orchestrator_inactivity: <integer>
 
     limits:                              # optional -- threshold values; env var overrides applied by config.py
       alert_summary: <integer>
@@ -167,6 +168,9 @@ class TimeoutConfig:
         command: Shell command execution timeout.
         orchestrator_poll_interval: Orchestrator polling interval.
         github_check: GitHub check status polling timeout.
+        orchestrator_inactivity: Orchestrator SDK message inactivity timeout
+            (spec FR-17, db-262) -- bounds how long ``cmd_start._run`` waits
+            for the next SDK message before disposing the turn as hung.
     """
 
     gh_api: int | None = None
@@ -176,6 +180,7 @@ class TimeoutConfig:
     command: int | None = None
     orchestrator_poll_interval: int | None = None
     github_check: int | None = None
+    orchestrator_inactivity: int | None = None
 
 
 @dataclass
@@ -1683,6 +1688,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         command=timeouts_raw.get("command"),
         orchestrator_poll_interval=timeouts_raw.get("orchestrator_poll_interval"),
         github_check=timeouts_raw.get("github_check"),
+        orchestrator_inactivity=timeouts_raw.get("orchestrator_inactivity"),
     )
 
     # Populate LimitConfig from YAML limits block (absent keys yield None).

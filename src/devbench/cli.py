@@ -80,11 +80,11 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Coroutine, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, NamedTuple
+from typing import IO, Any, NamedTuple, cast
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -194,6 +194,9 @@ from devbench.config import (
     _read_env,
     resolve_repo,
     validate_repo,
+)
+from devbench.config import (
+    ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS as _ORCH_INACTIVITY_TIMEOUT,
 )
 from devbench.config_loader import (
     QuotaHandlingConfig,
@@ -7094,6 +7097,49 @@ class _QuotaDetected(BaseException):
         self.quota_exc = quota_exc
 
 
+#: Verbatim inactivity diagnostic (spec FR-17, db-262). ``{timeout}`` is the
+#: configured ``DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT`` value (seconds)
+#: that was exceeded. Single source of truth for both the logged ERROR and
+#: :class:`_OrchestrateInactivityTimeout`'s message so the two can never
+#: drift apart.
+_INACTIVITY_TIMEOUT_ERROR_TEMPLATE: str = (
+    "ERROR: orchestrator inactivity timeout: no SDK message for {timeout}s "
+    "(DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT).\n"
+    "The SDK ended a turn without a terminal sentinel and produced no follow-up. "
+    "Investigate the last\n"
+    "'[ORCHESTRATOR ...]' audit line; the backlog on disk is intact and a fresh "
+    "'devbench start' resumes it."
+)
+
+
+class _OrchestrateInactivityTimeout(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when no SDK message arrives in time.
+
+    Sibling of :class:`_QuotaDetected`: a :class:`BaseException` subclass (not
+    :class:`Exception`) so that ``asyncio.run`` propagates it through the
+    event loop without being caught by any broad ``except Exception`` handler
+    between the message loop and ``asyncio.run`` (spec FR-17, db-262).
+    Raised when ``asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)``
+    times out -- the SDK ended a turn without a terminal sentinel and produced
+    no follow-up message, which previously left the orchestrator idling
+    forever (observed 2h24m). Unwinds through ``_run``'s
+    ``finally: await agen.aclose()`` exactly like a quota sentinel (db-325)
+    before :func:`_drive_orchestrate_with_quota_resume` disposes it as a
+    bounded fresh-session restart.
+
+    Args:
+        timeout_seconds: The configured inactivity timeout (seconds) that was
+            exceeded without a follow-up SDK message.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, timeout_seconds: int) -> None:
+        super().__init__(_INACTIVITY_TIMEOUT_ERROR_TEMPLATE.format(timeout=timeout_seconds))
+        self.timeout_seconds = timeout_seconds
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -7704,6 +7750,54 @@ def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> 
     return True
 
 
+#: Audit markers for the inactivity-timeout bounded-restart disposition
+#: (spec FR-17, db-262). Distinct from the ``[ORCHESTRATOR_QUOTA_RESUME*]``
+#: markers so operators can tell a hung-turn restart apart from a
+#: quota-driven resume in the log.
+_ORCHESTRATOR_INACTIVITY_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_INACTIVITY_RESTART]"
+_ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED]"
+
+
+def _should_restart_after_inactivity_timeout(restarts_used: int, max_resumes: int) -> bool:
+    """Decide whether ``cmd_start`` may reopen a fresh SDK session after an inactivity timeout.
+
+    Mirrors :func:`_should_resume_after_quota_recovery`'s bounded-restart
+    shape but for :class:`_OrchestrateInactivityTimeout` instead of a quota
+    signal (spec FR-17, db-262): reuses the SAME :func:`_resolve_max_quota_resumes`
+    cap so a hung-turn recovery loop is bounded by the same operator-tunable
+    ceiling, while counting its own restarts independently of quota resumes
+    (a quota resume never consumes inactivity-restart budget and vice versa).
+
+    - When *restarts_used* (restarts already performed, BEFORE this one) is
+      below *max_resumes*, emits
+      ``[ORCHESTRATOR_INACTIVITY_RESTART] attempt=<n> max=<cap>`` and returns
+      ``True`` (caller re-runs ``_run`` in a fresh session).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED] max=<cap>`` and returns
+      ``False`` so the caller fails fast (re-raises the sentinel).
+
+    Args:
+        restarts_used: Number of in-process inactivity restarts already
+            performed during this ``cmd_start`` invocation (0 on the first
+            timeout).
+        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+
+    Returns:
+        ``True`` when another in-process restart is permitted; ``False`` when
+        the cap is exhausted and the run must fail fast.
+    """
+    if restarts_used >= max_resumes:
+        logger.info("%s max=%d", _ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+        return False
+    logger.info(
+        "%s attempt=%d max=%d",
+        _ORCHESTRATOR_INACTIVITY_RESTART_AUDIT_PREFIX,
+        restarts_used + 1,
+        max_resumes,
+    )
+    return True
+
+
 class _OrchestrateLoopResult(NamedTuple):
     """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
 
@@ -7754,6 +7848,11 @@ def _drive_orchestrate_with_quota_resume(
     - A recovered wait whose resume cap is exhausted -> ``terminal_rc=0`` with the
       ``"quota-resume-cap-exhausted"`` stop reason (the exhausted audit line was
       emitted by :func:`_should_resume_after_quota_recovery`).
+    - :class:`_OrchestrateInactivityTimeout` (spec FR-17, db-262) -> logs the
+      verbatim inactivity ERROR, then either restarts a fresh session (bounded
+      by the SAME :func:`_resolve_max_quota_resumes` cap, tracked
+      independently of quota resumes via :func:`_should_restart_after_inactivity_timeout`)
+      or re-raises to fail fast once that cap is exhausted.
 
     Extracted from ``cmd_start`` so the added resume loop does not push that
     function over ruff PLR0912's 12-branch ceiling.
@@ -7775,8 +7874,12 @@ def _drive_orchestrate_with_quota_resume(
         ValueError: Propagated from :func:`~devbench.quota._apply_resume_strategy`
             (via :func:`_handle_quota_pause`) when a recovered wait's configured
             ``resume_strategy`` is not one of the three recognised values.
+        :class:`_OrchestrateInactivityTimeout`: Re-raised (legacy non-zero
+            exit, mirroring the quota ``fail`` disposition above) once the
+            bounded-restart cap is exhausted.
     """
     resumes_used = 0
+    inactivity_restarts_used = 0
     max_resumes = _resolve_max_quota_resumes()
     while True:
         try:
@@ -7794,6 +7897,12 @@ def _drive_orchestrate_with_quota_resume(
                     continue
                 return _OrchestrateLoopResult(0, "quota-resume-cap-exhausted", False)
             return _OrchestrateLoopResult(0, stop_reason, stop_reason in _QUOTA_DRAIN_STOP_REASONS)
+        except _OrchestrateInactivityTimeout as exc:
+            logger.error(str(exc))
+            if _should_restart_after_inactivity_timeout(inactivity_restarts_used, max_resumes):
+                inactivity_restarts_used += 1
+                continue
+            raise
         return _OrchestrateLoopResult(None, "clean", False)
 
 
@@ -8339,6 +8448,22 @@ def cmd_start(*argv: str) -> int:
     exit-path cleanup via :func:`_cancel_drain_unless_requested` so the next
     ``devbench start`` invocation still honours it.
 
+    **Inactivity net and cooperative teardown (spec FR-17, db-262 + db-325):**
+    ``_run`` awaits ``asyncio.wait_for(agen.__anext__(),
+    timeout=_ORCH_INACTIVITY_TIMEOUT)`` per message instead of a bare
+    ``async for`` -- when a turn ends without a terminal sentinel and
+    produces no follow-up message, the wait times out and ``_run`` raises
+    :class:`_OrchestrateInactivityTimeout` (previously this idled the
+    orchestrator forever). ``_run``'s ``finally: await agen.aclose()`` always
+    runs first, so both this sentinel and :class:`_QuotaDetected` unwind
+    through cooperative teardown -- driving the SDK's own subprocess
+    teardown -- before ``_drive_orchestrate_with_quota_resume`` disposes
+    them. On inactivity, that disposition is a bounded fresh-session restart
+    reusing the SAME ``DEVBENCH_MAX_QUOTA_RESUMES`` cap (tracked
+    independently of quota resumes via
+    :func:`_should_restart_after_inactivity_timeout`); fail-fast (legacy
+    non-zero exit) once that cap is exhausted.
+
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
 
@@ -8364,10 +8489,14 @@ def cmd_start(*argv: str) -> int:
             (via :func:`~devbench.quota._apply_resume_strategy`) when a
             recovered wait's configured ``resume_strategy`` is not one of the
             three recognised values.
-        Nothing else from this function's own scope for quota / drain
-        signals -- both dispositions are otherwise fully handled by
-        :func:`_drive_orchestrate_with_quota_resume`. Any other SDK
-        exception propagates as-is through the asyncio boundary.
+        :class:`_OrchestrateInactivityTimeout`: Propagates from
+            :func:`_drive_orchestrate_with_quota_resume` once the bounded
+            inactivity-restart cap is exhausted (legacy non-zero exit,
+            mirroring the quota ``fail`` disposition above).
+        Nothing else from this function's own scope for quota / drain /
+        inactivity signals -- all three dispositions are otherwise fully
+        handled by :func:`_drive_orchestrate_with_quota_resume`. Any other
+        SDK exception propagates as-is through the asyncio boundary.
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -8481,16 +8610,38 @@ def cmd_start(*argv: str) -> int:
     _sdk_result_text: str | None = None
 
     async def _run() -> None:
-        """Iterate SDK messages with quota detection and drain enforcement.
+        """Iterate SDK messages with an inactivity net and cooperative teardown.
 
-        Processes SDK messages and calls :func:`_check_quota_and_drain` once
-        per message, which raises :class:`_QuotaDetected` when a quota /
-        rate-limit signal is observed (issue #236) or :class:`_DrainRequested`
-        when a ``devbench claim`` tool-use is detected while a drain is
-        pending (issues #188/#212). Both sentinels are :class:`BaseException`
-        subclasses (spec AC-20, decision D-4) so they propagate through
-        ``asyncio.run`` without being caught by any broad ``except Exception``
-        handler in between.
+        FR-17 (db-262 + db-325): rewritten as a ``try/finally`` around
+        ``agen = query(...)``, awaiting
+        ``asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)``
+        per message instead of a bare ``async for``. Breaks the loop cleanly
+        on ``StopAsyncIteration``; a timed-out wait raises
+        :class:`_OrchestrateInactivityTimeout` (db-262 -- the SDK ended a turn
+        without a terminal sentinel and produced no follow-up, which
+        previously left the orchestrator idling forever). The ``finally``
+        ALWAYS awaits ``agen.aclose()`` (suppressing aclose's own exceptions)
+        so a quota or inactivity sentinel unwinds through cooperative teardown
+        while the generator is suspended -- not running -- before it escapes
+        this coroutine (db-325): this drives the SDK's own subprocess
+        teardown before ``asyncio.run``'s ``shutdown_asyncgens()`` would
+        otherwise hit the generator mid-flight. The sentinel re-raises after
+        teardown, preserving the :class:`BaseException` contract.
+
+        Per-message, calls :func:`_check_quota_and_drain` once, which raises
+        :class:`_QuotaDetected` when a quota / rate-limit signal is observed
+        (issue #236) or :class:`_DrainRequested` when a ``devbench claim``
+        tool-use is detected while a drain is pending (issues #188/#212).
+        Both sentinels -- and :class:`_OrchestrateInactivityTimeout` -- are
+        :class:`BaseException` subclasses (spec AC-20, decision D-4) so they
+        propagate through ``asyncio.run`` without being caught by any broad
+        ``except Exception`` handler in between.
+
+        Does NOT break on any ``ResultMessage``: the orchestrate skill emits
+        one per turn across a single long ``query()`` (num_turns ~185); only
+        the two ``_TERMINAL_ORCHESTRATE_MARKERS`` end the loop early, and the
+        inactivity timeout -- not result-classification -- is the liveness
+        lever (spec AC-40).
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
@@ -8499,22 +8650,50 @@ def cmd_start(*argv: str) -> int:
                 message.
             _DrainRequested: A drain signal is present when a ``cmd_claim``
                 tool-use is observed.
+            _OrchestrateInactivityTimeout: No SDK message arrived within
+                ``_ORCH_INACTIVITY_TIMEOUT`` seconds of the previous one.
         """
         nonlocal _sdk_result_text
-        async for message in query(
-            prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-            options=ClaudeAgentOptions(
-                plugins=[{"type": "local", "path": str(plugin_path)}],
-                permission_mode="bypassPermissions",
+        # The SDK's `query()` return-type annotation is the narrower
+        # `AsyncIterator[...]` (no `aclose()`), but its actual runtime type is
+        # always an async generator (the SDK implements it with `yield`).
+        # Cast to `AsyncGenerator` so `agen.aclose()` below type-checks
+        # without a bypass annotation.
+        agen = cast(
+            "AsyncGenerator[object, None]",
+            query(
+                prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
+                options=ClaudeAgentOptions(
+                    plugins=[{"type": "local", "path": str(plugin_path)}],
+                    permission_mode="bypassPermissions",
+                ),
             ),
-        ):
-            logger.info("sdk message: %s", message)
-            _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-            if _log_terminal_exit_if_applicable(_sdk_result_text):
-                return
-            _check_quota_and_drain(message)
-        # Clean exit from the SDK loop -- done.
-        return
+        )
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                except TimeoutError:
+                    raise _OrchestrateInactivityTimeout(_ORCH_INACTIVITY_TIMEOUT) from None
+                logger.info("sdk message: %s", message)
+                _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+                if _log_terminal_exit_if_applicable(_sdk_result_text):
+                    return
+                _check_quota_and_drain(message)
+        finally:
+            # db-325: cooperative teardown -- always close the generator, but
+            # never let aclose's OWN failure (e.g. a mid-flight SDK teardown
+            # error) mask the sentinel that is unwinding through this frame.
+            # Local aliased import (mirrors the outer `finally` blocks below):
+            # `cmd_start` binds an unaliased `contextlib` local later in its
+            # own body, which would otherwise shadow the module-level import
+            # for this nested closure's free-variable lookup.
+            import contextlib as _run_contextlib
+
+            with _run_contextlib.suppress(Exception):
+                await agen.aclose()
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop

@@ -413,6 +413,15 @@ EPIC_ID_RE = re.compile(r"^E\d+$")
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_RETRY_ATTEMPTS: int = 10
 DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS: int = 600
+# Orchestrator inactivity net (issue db-262, FR-17). Bounds how long the
+# `cmd_start._run` SDK message loop may wait for the NEXT SDK message
+# (`asyncio.wait_for(agen.__anext__(), timeout=...)`) before treating the
+# turn as hung and disposing it as a bounded fresh-session restart (see
+# `_resolve_max_quota_resumes`). Conservative multi-minute default: it must
+# exceed the longest legitimate turn, since a Task subagent invoked by the
+# orchestrate skill can run many minutes without emitting an intermediate
+# SDK message.
+DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS: int = 1800
 DEFAULT_STOP_HOOK_MAX_BLOCKS: int = 5
 DEFAULT_STOP_HOOK_WINDOW_SECONDS: int = 180
 DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120

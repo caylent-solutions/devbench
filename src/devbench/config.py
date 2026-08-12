@@ -57,6 +57,7 @@ from devbench.constants import (
     DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_MODEL_RATES,
+    DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
     DEFAULT_PAUSE_BEFORE_MERGE,
@@ -246,6 +247,16 @@ GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
     "DEVBENCH_GH_TIMEOUT",
     RUNTIME_CONFIG.timeouts.github_check,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
+)
+# db-262 / FR-17: orchestrator SDK message inactivity net. `cmd_start._run`
+# resolves this once at import time and awaits
+# `asyncio.wait_for(agen.__anext__(), timeout=ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS)`
+# per message; expiry raises `_OrchestrateInactivityTimeout` and is disposed
+# as a bounded fresh-session restart reusing `_resolve_max_quota_resumes`.
+ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS: int = _resolve_int(
+    "DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT",
+    RUNTIME_CONFIG.timeouts.orchestrator_inactivity,
+    DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
 )
 # Issue #114: workflow-registration race defence. The retry loop runs
 # `gh pr checks` up to CHECK_REGISTRATION_RETRIES times when the local

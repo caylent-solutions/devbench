@@ -122,6 +122,11 @@
           "type": "integer",
           "minimum": 1,
           "description": "GitHub check status polling timeout in seconds."
+        },
+        "orchestrator_inactivity": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Orchestrator SDK message inactivity timeout in seconds -- bounds how long the cmd_start message loop waits for the next SDK message before treating the turn as hung (spec FR-17, db-262)."
         }
       }
     },

@@ -17,9 +17,11 @@ Also covers ``cmd_start`` wiring: the entry point drives
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import sys
+import time
 import types
 from datetime import datetime
 from pathlib import Path
@@ -512,6 +514,164 @@ class TestCmdStartUsesResumeLoop:
         rc, sessions_opened = self._drive_cmd_start_with_batches(tmp_path, [[terminal_message]])
         assert rc == 0
         assert sessions_opened == 1
+
+
+#: Wall-clock ceiling for the "does not hang" assertions below. Chosen to be
+#: comfortably larger than the tiny monkeypatched ``_ORCH_INACTIVITY_TIMEOUT``
+#: values used in these tests (so real scheduling jitter never flakes the
+#: test) while still being orders of magnitude smaller than the observed
+#: db-262 defect (2h24m idle) it regression-guards against.
+_BOUNDED_WALL_CLOCK_SECONDS: float = 5.0
+
+
+class TestInactivityNetAndCooperativeTeardown:
+    """FR-17 (db-262 + db-325): the restructured ``_run`` loop replaces the
+    bare ``async for message in query(...)`` with a per-message
+    ``asyncio.wait_for(agen.__anext__(), ...)`` inactivity net plus a
+    ``finally: await agen.aclose()`` cooperative teardown."""
+
+    @staticmethod
+    def _install_fake_sdk(mock_query: Any) -> Any:
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+        mock_sdk.query = mock_query
+        return mock_sdk
+
+    @pytest.mark.unit
+    def test_inactivity_timeout_breaks_hung_session(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-39/AC-E11-F3-S2-T1-1: a hung SDK turn (empty ResultMessage then no
+        follow-up) triggers a bounded fresh-session restart within a bounded
+        wall-clock instead of idling forever (regression guard for the
+        observed 2h24m idle defect, db-262)."""
+        monkeypatch.setattr(cli, "_ORCH_INACTIVITY_TIMEOUT", 0.05)
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx == 0:
+                # Empty ResultMessage, then hang forever -- no follow-up.
+                yield SimpleNamespace(result="")
+                await asyncio.Event().wait()
+            else:
+                yield SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            start = time.monotonic()
+            rc = cli.cmd_start()
+            elapsed = time.monotonic() - start
+
+        assert rc == 0
+        assert call_count["n"] == 2, "expected exactly one bounded fresh-session restart"
+        assert elapsed < _BOUNDED_WALL_CLOCK_SECONDS, (
+            f"expected bounded wall-clock recovery, took {elapsed}s -- the inactivity net did not fire"
+        )
+
+    @pytest.mark.unit
+    def test_inactivity_restarts_exhaust_the_shared_resume_cap_and_fail_fast(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-E11-F3-S2-T1-5: repeated inactivity timeouts are bounded by the
+        SAME ``_resolve_max_quota_resumes`` cap; once exhausted, the sentinel
+        propagates (fail-fast, legacy non-zero exit) instead of restarting
+        forever."""
+        monkeypatch.setattr(cli, "_ORCH_INACTIVITY_TIMEOUT", 0.02)
+        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "2")
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            call_count["n"] += 1
+            yield SimpleNamespace(result="")
+            await asyncio.Event().wait()  # every session hangs after its first message
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            with pytest.raises(cli._OrchestrateInactivityTimeout):
+                cli.cmd_start()
+
+        # 1 initial attempt + 2 permitted restarts = 3 sessions opened before
+        # the cap refuses a 4th.
+        assert call_count["n"] == 3
+
+    @pytest.mark.unit
+    def test_multi_turn_result_messages_do_not_terminate_early(self, tmp_path: Path) -> None:
+        """AC-40/AC-E11-F3-S2-T1-2: multiple per-turn ResultMessages across ONE
+        long query() session do NOT terminate the loop early -- the timeout,
+        not result-classification, is the liveness lever (anti
+        "break-on-any-ResultMessage")."""
+        pulled: list[str] = []
+        turn_messages = [SimpleNamespace(result=f"turn-{i}-in-progress") for i in range(5)]
+        messages = [*turn_messages, SimpleNamespace(result="ALL_DONE")]
+
+        async def mock_query(**kwargs: object) -> object:
+            for message in messages:
+                pulled.append(message.result)
+                yield message
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        # Every message was pulled from the SAME session -- none of the five
+        # non-terminal ResultMessages ended the loop early.
+        assert pulled == [m.result for m in messages]
+
+    @pytest.mark.unit
+    def test_quota_sentinel_triggers_cooperative_aclose(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-41/AC-E11-F3-S2-T1-3: a quota sentinel unwinds through
+        ``finally: await agen.aclose()`` -- GeneratorExit/aclose is recorded
+        BEFORE the quota disposition dispatch runs, with no "already running"
+        error logged (db-325)."""
+        events: list[str] = []
+        rate_limit_message = SimpleNamespace(error="rate_limit", content=None, status_code=None, body={})
+
+        async def mock_query(**kwargs: object) -> object:
+            try:
+                yield rate_limit_message
+                await asyncio.Event().wait()
+            except GeneratorExit:
+                events.append("GeneratorExit")
+                raise
+            finally:
+                events.append("aclose_completed")
+
+        def _record_dispatch(detected: object, session_name: str) -> str:
+            events.append("dispatch")
+            return cli._QUOTA_STOP_REASON_TIMEOUT_KEEP_WAITING
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._dispatch_quota_detection", side_effect=_record_dispatch),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert events == ["GeneratorExit", "aclose_completed", "dispatch"], (
+            "aclose must complete before the quota disposition dispatch runs"
+        )
+        assert rc == 0
+        assert "already running" not in caplog.text
 
 
 class TestCmdStartCancelDrainUnlessRequested:

@@ -15,7 +15,8 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.reporting.report import HookLogTotals, WindowStats, generate_report
+from devbench.constants import SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
+from devbench.reporting.report import HookLogTotals, WindowStats, generate_report, read_all_drain_states
 
 
 @pytest.fixture(autouse=True)
@@ -4921,3 +4922,99 @@ class TestGenerateReportThreadsSessionStarts:
         # the exclusion count must appear.
         assert "22.0 min" in report
         assert "(1 excluded: no execution window)" in report
+
+
+class TestReadAllDrainStates:
+    """db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2, AC-45):
+    ``read_all_drain_states`` scans the workspace-root drain signal AND every
+    per-session signal unconditionally -- unlike
+    ``devbench.drain.read_drain_state``, whose two-candidate scan is governed
+    by ``DEVBENCH_SESSION_NAME`` so a per-session drain is invisible to a
+    caller whose shell never exported that variable.
+    """
+
+    @staticmethod
+    def _write_signal(path: Path, requested_at: str, requested_by: str, reason: str = "") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"requested_at": requested_at, "requested_by": requested_by, "reason": reason}),
+            encoding="utf-8",
+        )
+
+    def test_read_all_drain_states_finds_session_signal_without_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-session signal is found even when DEVBENCH_SESSION_NAME is unset,
+        and the workspace-root signal is returned alongside it as session None
+        (AC-45, db-306).
+        """
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        session_signal = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        self._write_signal(session_signal, "2026-08-11T09:00:00+00:00", "alice", "per-session freeze")
+        root_signal = tmp_path / ".devbench" / "drain.signal"
+        self._write_signal(root_signal, "2026-08-11T08:00:00+00:00", "bob", "root freeze")
+
+        states = read_all_drain_states(tmp_path)
+
+        assert len(states) == 2
+        root_entry = next(s for s in states if s[0] is None)
+        session_entry = next(s for s in states if s[0] == SESSION_DEFAULT_NAME)
+        assert root_entry[1].requested_by == "bob"
+        assert root_entry[1].reason == "root freeze"
+        assert session_entry[1].requested_by == "alice"
+        assert session_entry[1].reason == "per-session freeze"
+
+    def test_read_all_drain_states_returns_empty_list_when_no_signals_present(self, tmp_path: Path) -> None:
+        """No signal anywhere in the workspace yields an empty list."""
+        assert read_all_drain_states(tmp_path) == []
+
+    def test_read_all_drain_states_root_only_signal_uses_none_session(self, tmp_path: Path) -> None:
+        """A workspace-root-only signal is returned as a single (None, state) entry."""
+        self._write_signal(tmp_path / ".devbench" / "drain.signal", "2026-08-11T08:00:00+00:00", "carol")
+
+        states = read_all_drain_states(tmp_path)
+
+        assert len(states) == 1
+        assert states[0][0] is None
+        assert states[0][1].requested_by == "carol"
+
+    def test_read_all_drain_states_multiple_sessions_sorted_by_name(self, tmp_path: Path) -> None:
+        """Per-session entries are returned in deterministic, sorted-by-name order."""
+        self._write_signal(
+            tmp_path / SESSION_SESSIONS_BASE_DIR / "zeta" / "drain.signal", "2026-08-11T08:00:00+00:00", "z"
+        )
+        self._write_signal(
+            tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha" / "drain.signal", "2026-08-11T08:00:00+00:00", "a"
+        )
+
+        states = read_all_drain_states(tmp_path)
+
+        assert [s[0] for s in states] == ["alpha", "zeta"]
+
+    def test_read_all_drain_states_never_unlinks_a_signal(self, tmp_path: Path) -> None:
+        """Read-only: repeated calls never remove the signal file (AC-5, mutation not widened)."""
+        signal = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        self._write_signal(signal, "2026-08-11T08:00:00+00:00", "dana")
+
+        read_all_drain_states(tmp_path)
+        read_all_drain_states(tmp_path)
+
+        assert signal.exists()
+
+    def test_read_all_drain_states_corrupt_signal_raises_value_error(self, tmp_path: Path) -> None:
+        """Invalid JSON in a signal surfaces as ValueError, matching read_drain_state's contract."""
+        signal = tmp_path / ".devbench" / "drain.signal"
+        signal.parent.mkdir(parents=True)
+        signal.write_text("not json", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="invalid JSON"):
+            read_all_drain_states(tmp_path)
+
+    def test_read_all_drain_states_missing_field_raises_key_error(self, tmp_path: Path) -> None:
+        """A signal missing a required field surfaces as KeyError, matching read_drain_state's contract."""
+        signal = tmp_path / ".devbench" / "drain.signal"
+        signal.parent.mkdir(parents=True)
+        signal.write_text(json.dumps({"requested_by": "eve"}), encoding="utf-8")
+
+        with pytest.raises(KeyError):
+            read_all_drain_states(tmp_path)

@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import types
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -18137,6 +18137,138 @@ class TestCmdReportScopeBanner:
         assert called_with.get("exclude", "") == ""
 
 
+class TestCmdReportDrainBanner:
+    """db-306 (spec Section 0 item 7, Section 4 FR-19, AC-46): cmd_report
+    renders the drain banner LIVE on all three emit paths -- snapshot
+    fast-path, one-shot live path, streaming frame -- kept OUT of
+    ``generate_report``'s cached snapshot string so a stale snapshot never
+    shows a resolved drain (mirrors the SCOPE banner pattern).
+    """
+
+    @staticmethod
+    def _write_root_drain(tmp_path: Path, reason: str) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", reason)
+
+    @pytest.mark.unit
+    def test_report_renders_drain_banner(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report(once=True) stdout contains DRAIN REQUESTED when a signal is pending."""
+        self._write_root_drain(tmp_path, "release freeze")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report body"),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" in out
+        assert "release freeze" in out
+
+    @pytest.mark.unit
+    def test_report_renders_session_qualified_drain_banner_without_env(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-E12-F3-S1-T2-2: cmd_report(once=True) surfaces a per-session drain,
+        session-qualified as ``[session=<name>]``, even with
+        DEVBENCH_SESSION_NAME unset (db-306, AC-46).
+        """
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-08-11T09:00:00+00:00", "requested_by": "operator", '
+            '"reason": "session-scoped freeze"}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report body"),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"DRAIN REQUESTED [session={SESSION_DEFAULT_NAME}]:" in out
+        assert "session-scoped freeze" in out
+
+    @pytest.mark.unit
+    def test_report_no_drain_banner_when_signal_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No DRAIN REQUESTED banner is rendered when no signal file exists."""
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report body"),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        assert "DRAIN REQUESTED" not in capsys.readouterr().out
+
+    @pytest.mark.unit
+    def test_snapshot_fast_path_renders_live_banner_not_baked_into_cache(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-E12-F3-S1-T2-3: a cached snapshot rendered before the drain was
+        requested must never show a resolved drain on its own -- the banner
+        is rendered LIVE outside ``generate_report``'s cached snapshot string
+        on the snapshot fast-path.
+        """
+        from devbench.reporting.snapshot import SnapshotData
+
+        cached = SnapshotData(report_text="STALE CACHED REPORT (no drain)", log_mtime_ns=0, log_size=0)
+        self._write_root_drain(tmp_path, "post-cache freeze")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.snapshot.read_snapshot", return_value=cached),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" in out
+        assert "post-cache freeze" in out
+        assert "STALE CACHED REPORT (no drain)" in out
+        # The cached text itself never carries the banner -- proves the banner
+        # is rendered live and is not baked into the cached snapshot string.
+        assert "DRAIN REQUESTED" not in cached.report_text
+
+    @pytest.mark.unit
+    def test_streaming_frame_includes_live_drain_banner(self, tmp_path: Path) -> None:
+        """The streaming ``_render`` closure prepends the live drain banner to
+        every frame via a StringIO capture, so it reappears after each
+        terminal-clear redraw instead of being baked into ``generate_report``'s
+        return value.
+        """
+        self._write_root_drain(tmp_path, "streaming freeze")
+        captured: dict[str, str] = {}
+
+        def fake_stream_report(log_path: object, render_fn: Callable[..., str], **kwargs: object) -> int:
+            # Invoke render_fn synchronously, inside the patched WORKSPACE_ROOT
+            # scope, so the frame it returns reflects tmp_path's drain signal.
+            captured["frame"] = render_fn(log_path=log_path)
+            return 0
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="live report body"),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.streaming.stream_report", side_effect=fake_stream_report),
+        ):
+            rc = cli.cmd_report()
+
+        assert rc == 0
+        frame = captured["frame"]
+        assert "DRAIN REQUESTED" in frame
+        assert "streaming freeze" in frame
+        assert "live report body" in frame
+        assert frame.index("DRAIN REQUESTED") < frame.index("live report body")
+
+
 # ---------------------------------------------------------------------------
 # cmd_scope tests (AC-196-1 through AC-196-9; spec section 4.2.6)
 # ---------------------------------------------------------------------------
@@ -19085,13 +19217,18 @@ class TestCmdDrainStatus:
 
     @pytest.mark.unit
     def test_prints_drain_state_when_present(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """drain --status prints drain state when signal file exists."""
+        """drain --status prints a DRAIN REQUESTED line when a signal file exists
+        (db-306, spec Section 4 FR-19, AC-46: drain --status shares the
+        read_all_drain_states resolver and DRAIN REQUESTED format with the
+        status/report banner).
+        """
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             cli.cmd_drain("--reason", "batch closed")
             rc = cli.cmd_drain("--status")
         assert rc == 0
         out = capsys.readouterr().out
-        assert "drain pending" in out
+        assert "DRAIN REQUESTED: at" in out
+        assert "batch closed" in out
 
     @pytest.mark.unit
     def test_return_code_is_zero_when_pending(self, tmp_path: Path) -> None:
@@ -19116,6 +19253,35 @@ class TestCmdDrainStatus:
             cli.cmd_drain("--status")
         signal = tmp_path / ".devbench" / "drain.signal"
         assert signal.exists(), "drain --status must not delete drain.signal"
+
+    @pytest.mark.unit
+    def test_drain_status_lists_all_sessions(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """db-306 (spec Section 4 FR-19, AC-46): drain --status lists every pending
+        drain -- the workspace-root signal AND every per-session signal --
+        regardless of DEVBENCH_SESSION_NAME.
+        """
+        root_signal = tmp_path / ".devbench" / "drain.signal"
+        root_signal.parent.mkdir(parents=True)
+        root_signal.write_text(
+            '{"requested_at": "2026-08-11T08:00:00+00:00", "requested_by": "root-op", "reason": "root freeze"}',
+            encoding="utf-8",
+        )
+        session_signal = tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha" / "drain.signal"
+        session_signal.parent.mkdir(parents=True)
+        session_signal.write_text(
+            '{"requested_at": "2026-08-11T09:00:00+00:00", "requested_by": "sess-op", "reason": "session freeze"}',
+            encoding="utf-8",
+        )
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--status")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED: at" in out
+        assert "root freeze" in out
+        assert "DRAIN REQUESTED [session=alpha]: at" in out
+        assert "session freeze" in out
 
 
 class TestCmdDrainMutuallyExclusive:
@@ -19295,6 +19461,40 @@ class TestCmdStatusDrainBanner:
         assert "DRAIN REQUESTED" in output
         assert "file-param test" in output
 
+    @pytest.mark.unit
+    def test_status_banner_shows_session_drain_without_env(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        mock_backlog_parser: MagicMock,
+    ) -> None:
+        """db-306 (spec Section 0 item 7, Section 4 FR-19, AC-46): cmd_status
+        surfaces a per-session drain -- session-qualified as
+        ``[session=<name>]`` -- even though DEVBENCH_SESSION_NAME is unset in
+        the operator's shell. Before this fix ``_render_drain_banner`` used
+        the env-gated ``read_drain_state``, which is blind to a per-session
+        signal without the env var.
+        """
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-08-11T09:00:00+00:00", "requested_by": "operator", "reason": "per-session freeze"}',
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"[session={SESSION_DEFAULT_NAME}]" in out
+        assert "per-session freeze" in out
+
 
 class TestCmdDrainIntegration:
     """Integration tests: full cmd_drain flows against a real tmp workspace fixture (AC-188-1..3).
@@ -19361,6 +19561,32 @@ class TestCmdDrainIntegration:
         signal = tmp_path / ".devbench" / "drain.signal"
         data = _json.loads(signal.read_text())
         assert data["reason"] == "second"
+
+    @pytest.mark.unit
+    def test_consume_drain_does_not_widen_mutation_scope_to_session_signal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """db-306 AC-5: this fix is display-only.  ``consume_drain`` (ref) keeps
+        its existing env-gated, two-candidate scan -- with no
+        DEVBENCH_SESSION_NAME set, it must NOT observe (and therefore must
+        not delete) a per-session drain signal, even though the new
+        ``read_all_drain_states`` reporting resolver now surfaces that same
+        signal for display.
+        """
+        from devbench.drain import consume_drain
+
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        session_signal = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        session_signal.parent.mkdir(parents=True)
+        session_signal.write_text(
+            '{"requested_at": "2026-08-11T09:00:00+00:00", "requested_by": "operator", "reason": "freeze"}',
+            encoding="utf-8",
+        )
+
+        result = consume_drain(tmp_path)
+
+        assert result is None, "consume_drain with no env must not observe the per-session signal"
+        assert session_signal.exists(), "consume_drain must not delete a per-session signal when no env is set"
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,7 @@ import asyncio
 import contextlib
 import functools
 import getpass
+import io
 import json
 import logging
 import os
@@ -290,7 +291,7 @@ from devbench.quota import (
 # the banner is implemented there and reporting must not depend on cli.py. See
 # the ``__all__``-vs-self-aliased-``as`` rationale above the
 # ``devbench.backlog.manager`` re-export block.
-from devbench.reporting.report import _format_duration
+from devbench.reporting.report import _format_duration, read_all_drain_states
 from devbench.scope import (
     InvalidScopeError,
     ScopeFilter,
@@ -423,29 +424,57 @@ def _render_scope_banner(include: list[str], exclude: list[str], started_at: str
     print(f"SCOPE: {include_part} {exclude_part} {started_part}")
 
 
-def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
-    """Print the ``DRAIN REQUESTED: at <ts> by <user> (reason: <text>)`` banner.
+def _format_drain_status_line(session_name: str | None, state: DrainState) -> str:
+    """Format one ``DRAIN REQUESTED`` line for the banner and ``drain --status``.
 
-    Reads the drain signal file from *workspace_root* non-destructively via
-    :func:`~devbench.drain.read_drain_state`. When no signal is present this
-    function is a no-op. Output goes to *file* (default ``sys.stdout``)
-    immediately before the Status Summary header (spec section 4.3.5, AC-188-7).
+    db-306 (spec Section 4 FR-19, AC-46): the root-scope form omits the
+    session qualifier; the per-session form inserts ``[session=<name>]``
+    immediately after ``DRAIN REQUESTED`` so an operator scanning ``report``,
+    ``status``, or ``drain --status`` output can tell at a glance which
+    signal(s) are pending and where each one came from.
 
     Args:
-        workspace_root: Workspace directory from which the drain signal path is
+        session_name: ``None`` for the workspace-root signal; the session
+            directory name for a per-session signal.
+        state: The parsed drain state to render.
+
+    Returns:
+        A single formatted line with no trailing newline.
+    """
+    reason_part = state.reason if state.reason else "(none)"
+    scope_part = f" [session={session_name}]" if session_name is not None else ""
+    return (
+        f"DRAIN REQUESTED{scope_part}: at {state.requested_at.isoformat()} "
+        f"by {state.requested_by} (reason: {reason_part})"
+    )
+
+
+def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
+    """Print one ``DRAIN REQUESTED`` line per pending drain signal.
+
+    db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2): reads every
+    drain signal in *workspace_root* non-destructively via
+    :func:`~devbench.reporting.report.read_all_drain_states` -- the
+    workspace-root signal AND every per-session signal, regardless of
+    ``DEVBENCH_SESSION_NAME`` -- so a per-session drain is visible to an
+    operator whose shell never exported that variable. When no signal is
+    present this function is a no-op. Output goes to *file* (default
+    ``sys.stdout``) immediately before the Status Summary header (spec
+    section 4.3.5, AC-188-7).
+
+    Args:
+        workspace_root: Workspace directory from which drain signal paths are
             resolved.
         file: Output stream to write the banner to. Defaults to ``sys.stdout``
             when ``None``. Callers may pass an ``io.StringIO`` instance to
             capture banner text without capturing the full process stdout.
     """
-    state = read_drain_state(workspace_root)
-    if state is None:
+    states = read_all_drain_states(workspace_root)
+    if not states:
         return
-    reason_part = state.reason if state.reason else "(none)"
-    print(
-        f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})",
-        file=file if file is not None else sys.stdout,
-    )
+    out = file if file is not None else sys.stdout
+    for session_name, state in states:
+        print(_format_drain_status_line(session_name, state), file=out)
 
 
 def _print_active_units(active: list[WorkUnit]) -> None:
@@ -3574,6 +3603,14 @@ def cmd_report(
     above the report body, and the WU lists shown in the report are filtered
     to the resolved scope.
 
+    db-306 (spec Section 0 item 7, Section 4 FR-19, AC-46): a ``DRAIN
+    REQUESTED`` line is printed above the report body for every pending
+    drain signal (workspace-root and per-session).  The banner is rendered
+    LIVE on all three emit paths -- the cached-snapshot fast-path, the
+    one-shot live path, and every streamed frame -- and is never baked into
+    ``generate_report``'s cached snapshot string, so a stale snapshot never
+    hides a drain requested after it was written.
+
     Issue #163: streams continuously by default when stdout is a TTY.
     Pass ``once=True`` (or pipe / redirect stdout) to get the legacy
     one-shot behaviour suitable for scripts and CI consumers.
@@ -3660,6 +3697,10 @@ def cmd_report(
 
             cached = read_snapshot(WORKSPACE_ROOT, log_file)
             if cached is not None:
+                # db-306 (spec Section 4 FR-19, AC-46): rendered LIVE, kept OUT
+                # of the cached snapshot string, so a drain requested after the
+                # snapshot was written is never hidden behind a stale cache.
+                _render_drain_banner(WORKSPACE_ROOT)
                 print(cached.report_text)
                 return 0
         report = generate_report(
@@ -3669,6 +3710,9 @@ def cmd_report(
             session_name=session_name,
             by_role=by_role,
         )
+        # db-306 (spec Section 4 FR-19, AC-46): rendered LIVE, immediately
+        # before the report body, not baked into generate_report's return value.
+        _render_drain_banner(WORKSPACE_ROOT)
         print(report)
         return 0
 
@@ -3688,7 +3732,13 @@ def cmd_report(
     report_started_at = datetime.now(UTC)
 
     def _render(*, log_path: Path) -> str:
-        return generate_report(
+        # db-306 (spec Section 4 FR-19, AC-46): the drain banner is rendered
+        # to a StringIO and prepended to every frame so it stays LIVE across
+        # streaming redraws, rather than being baked into generate_report's
+        # cached return value.
+        banner_buf = io.StringIO()
+        _render_drain_banner(WORKSPACE_ROOT, file=banner_buf)
+        report_text = generate_report(
             log_path=log_path,
             since=since_dt,
             report_started_at=report_started_at,
@@ -3696,6 +3746,7 @@ def cmd_report(
             session_name=session_name,
             by_role=by_role,
         )
+        return banner_buf.getvalue() + report_text
 
     return stream_report(log_file, _render)
 
@@ -9687,7 +9738,7 @@ def cmd_drain(*argv: str) -> int:
         devbench drain                        -- request workspace-root drain (empty reason)
         devbench drain --reason "<text>"      -- request workspace-root drain with reason
         devbench drain --cancel               -- withdraw workspace-root drain; idempotent
-        devbench drain --status               -- print workspace-root drain state; rc=0
+        devbench drain --status               -- print every pending drain (root + per-session); rc=0
         devbench drain --session <name>       -- drain only the named session (AC-192-7)
         devbench drain --all                  -- drain every active session (AC-192-8)
 
@@ -9723,11 +9774,12 @@ def cmd_drain(*argv: str) -> int:
         return 0
 
     if mode == "status":
-        state = read_drain_state(WORKSPACE_ROOT)
-        if state is None:
+        states = read_all_drain_states(WORKSPACE_ROOT)
+        if not states:
             print("no drain pending")
         else:
-            print(str(state))
+            for session_name, state in states:
+                print(_format_drain_status_line(session_name, state))
         return 0
 
     if session_target == "__all__":

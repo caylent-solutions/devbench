@@ -85,6 +85,13 @@ from devbench.constants import (
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
+from devbench.drain import (
+    DRAIN_SIGNAL_NAME,
+    SESSION_DRAIN_SIGNAL_FILENAME,
+    SESSION_SESSIONS_BASE_DIR,
+    DrainState,
+    _parse_drain_signal,
+)
 from devbench.instances import pid_file_path
 from devbench.reporting.event_index import EventIndex
 from devbench.scope import ScopeFilter
@@ -2893,6 +2900,59 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
         f"{total_cw:>11,}  {total_msgs:>4}   ${total_cost:>7,.4f}"
     )
     return rendered
+
+
+def read_all_drain_states(workspace: Path) -> list[tuple[str | None, DrainState]]:
+    """Scan every drain signal in *workspace* without mutating any of them.
+
+    db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2): the enforcement
+    reader :func:`devbench.drain.read_drain_state` is env-gated -- its
+    two-candidate scan is governed by ``DEVBENCH_SESSION_NAME``, so a
+    per-session signal at
+    ``<workspace>/.devbench/sessions/<name>/drain.signal`` is invisible to a
+    caller whose shell never exported that variable. This reader is display-
+    only and unconditional: it always checks the workspace-root signal AND
+    every per-session signal directory, regardless of the environment, so an
+    operator scanning ``report`` / ``status`` / ``drain --status`` sees every
+    pending drain no matter which session (if any) wrote it.
+
+    Reuses :class:`~devbench.drain.DrainState` and
+    :func:`devbench.drain._parse_drain_signal` from ``devbench.drain`` by
+    read-only import. Never unlinks a signal file, so the drain mutation
+    surface (:func:`devbench.drain.read_drain_state`,
+    :func:`devbench.drain.consume_drain`, :func:`devbench.drain.cancel_drain`,
+    :func:`devbench.drain._both_signal_paths`) is untouched and keeps its
+    existing two-candidate, env-gated semantics.
+
+    Args:
+        workspace: Root directory of the devbench workspace.
+
+    Returns:
+        A list of ``(session_name, DrainState)`` tuples. ``session_name`` is
+        ``None`` for the workspace-root signal and the session directory
+        name for a per-session signal. The workspace-root entry (when
+        present) is listed first, followed by per-session entries sorted by
+        directory name for a deterministic display order.
+
+    Raises:
+        ValueError: A signal file contains invalid JSON, a non-dict JSON
+            root, or an unparseable ``requested_at`` value.
+        KeyError: A signal file is missing a required field.
+    """
+    states: list[tuple[str | None, DrainState]] = []
+
+    root_signal = workspace / DRAIN_SIGNAL_NAME
+    if root_signal.exists():
+        states.append((None, _parse_drain_signal(root_signal)))
+
+    sessions_dir = workspace / SESSION_SESSIONS_BASE_DIR
+    if sessions_dir.is_dir():
+        for session_dir in sorted((p for p in sessions_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
+            session_signal = session_dir / SESSION_DRAIN_SIGNAL_FILENAME
+            if session_signal.exists():
+                states.append((session_dir.name, _parse_drain_signal(session_signal)))
+
+    return states
 
 
 def generate_report(

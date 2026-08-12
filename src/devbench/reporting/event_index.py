@@ -788,6 +788,51 @@ class EventIndex:
         rows = self._conn.execute(sql, (*file_ids, transition, _TRANSITION_LOGGER)).fetchall()
         return {tid: _epoch_us_to_dt(int(ts)) for tid, ts in rows}
 
+    def task_transition_time_series_for_workspace(
+        self,
+        workspace_root: Path,
+        live_log_path: Path,
+        transition: str,
+    ) -> dict[str, list[datetime]]:
+        """Every matching timestamp per task_id, ascending (issue #329 FR-2).
+
+        Same file_id/transition/logger predicates as
+        ``task_transition_times_for_workspace`` (FR-1a) -- the difference is
+        that this method performs NO ``MAX(...)`` aggregation, so every row
+        that satisfies the predicate contributes its timestamp. Consumers
+        that need "the most recent transition" still have
+        ``task_transition_times_for_workspace`` for that; this method exists
+        for ``report._execution_anchor``, which needs the FULL set of
+        candidate claims to select the earliest one that is both same-session
+        with, and no later than, a task's completion.
+
+        Rows are ordered ``task_id, ts_epoch_us ASC`` so each task's list is
+        already ascending on return -- no client-side sort is required.
+        """
+        file_ids = self._orch_log_file_ids_for_workspace(workspace_root, live_log_path)
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        # SQL composed via list-join rather than an f-string so the static
+        # analyser does not misclassify the variable-arity ``IN`` clause
+        # as user-controlled input. ``placeholders`` is a comma-joined
+        # string of literal ``?`` characters; values bind through the
+        # parameter tuple below.
+        sql = "".join(
+            [
+                "SELECT task_id, ts_epoch_us FROM orch_log_events ",
+                "WHERE file_id IN (",
+                placeholders,
+                ") AND transition = ? AND logger = ? AND task_id IS NOT NULL ",
+                "ORDER BY task_id, ts_epoch_us ASC",
+            ]
+        )
+        rows = self._conn.execute(sql, (*file_ids, transition, _TRANSITION_LOGGER)).fetchall()
+        series: dict[str, list[datetime]] = {}
+        for tid, ts in rows:
+            series.setdefault(tid, []).append(_epoch_us_to_dt(int(ts)))
+        return series
+
     def all_log_timestamps_for_workspace(
         self,
         workspace_root: Path,

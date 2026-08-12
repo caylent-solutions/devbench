@@ -347,6 +347,135 @@ class TestLoggerAnchoredTransitions:
             idx.close()
 
 
+class TestTaskTransitionTimeSeriesForWorkspace:
+    """Issue #329 FR-2 (AC-6): ``task_transition_time_series_for_workspace``
+    returns EVERY matching timestamp per task_id, ascending, under the same
+    file_id/transition/logger predicates as ``task_transition_times_for_workspace``
+    (FR-1a). Unlike that method's ``MAX(ts_epoch_us) GROUP BY task_id``, no
+    aggregation happens here -- ``_execution_anchor`` (report.py) needs every
+    candidate claim, not just the most recent one, to find the earliest
+    same-session claim before a completion.
+    """
+
+    def test_returns_every_matching_timestamp_ascending(self, workspace: Path) -> None:
+        """#329 live shape: E11-F1-S1-T2 was claimed twice before being closed."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-08-10T19:50:20Z [devbench.backlog_manager] INFO Set E11-F1-S1-T2 to 'in-progress'",
+                "2026-08-10T20:34:17Z [devbench.backlog_manager] INFO Set E11-F1-S1-T2 to 'in-progress'",
+                "2026-08-10T20:54:07Z [devbench.backlog_manager] INFO Set E11-F1-S1-T2 to 'done'",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert series == {
+                "E11-F1-S1-T2": [
+                    datetime(2026, 8, 10, 19, 50, 20, tzinfo=UTC),
+                    datetime(2026, 8, 10, 20, 34, 17, tzinfo=UTC),
+                ]
+            }
+        finally:
+            idx.close()
+
+    def test_applies_the_same_logger_predicate_as_fr1a(self, workspace: Path) -> None:
+        """A ``devbench.cli`` echo of a prior claim line never contributes a
+        series entry -- same predicate as ``task_transition_times_for_workspace``."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress' "
+                "in both work-unit file and BACKLOG.md",
+                "2026-05-04T10:38:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                "[WU_CLAIMED] Set E1-F1-S1-T1 to 'in-progress' session=default",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert series == {"E1-F1-S1-T1": [datetime(2026, 5, 4, 10, 0, tzinfo=UTC)]}
+        finally:
+            idx.close()
+
+    def test_null_logger_row_is_excluded(self, workspace: Path) -> None:
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            file_id = idx._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(log),)).fetchone()[0]
+            idx._conn.execute(
+                "INSERT INTO orch_log_events "
+                "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                (file_id, 9999, 1_746_353_400_000_000, None, "E1-F1-S1-T1", "in-progress"),
+            )
+            assert idx.task_transition_time_series_for_workspace(workspace, log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_multiple_tasks_each_get_their_own_ascending_series(self, workspace: Path) -> None:
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                "2026-05-04T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert series["E0-F1-S1-T1"] == [
+                datetime(2026, 5, 4, 10, 0, tzinfo=UTC),
+                datetime(2026, 5, 4, 10, 20, tzinfo=UTC),
+            ]
+            assert series["E0-F1-S1-T2"] == [datetime(2026, 5, 4, 10, 10, tzinfo=UTC)]
+        finally:
+            idx.close()
+
+    def test_empty_workspace_returns_empty_dict(self, tmp_path: Path) -> None:
+        (tmp_path / ".devbench").mkdir()
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        idx = EventIndex.open(tmp_path)
+        try:
+            idx.refresh_orch_log_sources(tmp_path, live_log)
+            assert idx.task_transition_time_series_for_workspace(tmp_path, live_log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_merges_shards_with_live_log(self, tmp_path: Path) -> None:
+        """Same shard-union behaviour as ``task_transition_times_for_workspace`` (issue #168)."""
+        (tmp_path / ".devbench").mkdir()
+        shard = tmp_path / "logs" / "2026-04" / "E0-F1-S1-T1.jsonl"
+        shard.parent.mkdir(parents=True)
+        _write_orch_log(
+            shard,
+            ["2026-04-15T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'"],
+        )
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        _write_orch_log(
+            live_log,
+            ["2026-05-10T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'"],
+        )
+        idx = EventIndex.open(tmp_path)
+        try:
+            idx.refresh_orch_log_sources(tmp_path, live_log)
+            series = idx.task_transition_time_series_for_workspace(tmp_path, live_log, "in-progress")
+            assert series["E0-F1-S1-T1"] == [
+                datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+                datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+            ]
+        finally:
+            idx.close()
+
+
 class TestHookLogAggregation:
     """Phase 4: hook-log entries aggregate via indexed range scans."""
 
@@ -745,6 +874,10 @@ class TestParityAgainstParserPath:
         try:
             done_times = idx.task_transition_times(log, "done")
             progress_times = idx.task_transition_times(log, "in-progress")
+            # Issue #329 FR-2: `_compute_window_stats` now takes a claims
+            # time-series per task; this fixture models one claim per task,
+            # so a single-element list preserves the original parity intent.
+            progress_claims = {tid: [ts] for tid, ts in progress_times.items()}
             window_start = datetime(2026, 5, 4, 10, 0, tzinfo=UTC)
             window_end = datetime(2026, 5, 4, 10, 16, tzinfo=UTC)
             indexed = _compute_window_stats(
@@ -752,7 +885,7 @@ class TestParityAgainstParserPath:
                 window_start=window_start,
                 window_end=window_end,
                 done_times=done_times,
-                progress_times=progress_times,
+                progress_claims=progress_claims,
                 tasks_active=0,
                 event_index=idx,
             )
@@ -761,7 +894,7 @@ class TestParityAgainstParserPath:
                 window_start=window_start,
                 window_end=window_end,
                 done_times=done_times,
-                progress_times=progress_times,
+                progress_claims=progress_claims,
                 tasks_active=0,
                 event_index=None,
             )

@@ -107,10 +107,13 @@ class TestGenerateReport:
         # real 25-min claim-to-done span). Median of [15, 5, 25] = 15.0.
         assert "15.0 min" in report
 
-    def test_report_keeps_latest_in_progress_timestamp(self, tmp_path: Path) -> None:
-        """When a task is set to 'in-progress' multiple times, the latest
-        timestamp should be used for duration calculation. Padded with two
-        more completions to clear MIN_PACE_SAMPLES."""
+    def test_report_ignores_prior_session_claim_and_uses_current_session_claim(self, tmp_path: Path) -> None:
+        """Issue #329 FR-2: when a task is set to 'in-progress' multiple
+        times across a session gap, the window is anchored to the earliest
+        CURRENT-session claim, not simply the most recent claim overall --
+        here the two happen to coincide because the older claim sits in a
+        different (prior) orchestrator session and is therefore never
+        eligible. Padded with two more completions to clear MIN_PACE_SAMPLES."""
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
@@ -1273,7 +1276,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 9, 0, tzinfo=UTC),
             datetime(2026, 4, 15, 12, 0, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=1,
         )
         # 3 tasks * 20 min -> avg 20 min; only 3 completions log-wide but
@@ -1323,7 +1326,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 9, 0, tzinfo=UTC),
             datetime(2026, 4, 15, 11, 0, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=1,
         )
         assert MIN_PACE_SAMPLES >= 3
@@ -1381,7 +1384,7 @@ class TestActiveVsBlockedRemaining:
             base,
             base + timedelta(hours=n_total + 1),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=2,
         )
         # avg_minutes mixes 5- and 50-min tasks; recent_pace_minutes is exactly 50.
@@ -1429,7 +1432,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
         )
         assert stats_fallback.est_total_cost == pytest.approx(0.0)
@@ -1440,7 +1443,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
             recent_per_task_cost=50.0,
         )
@@ -1476,7 +1479,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
             recent_per_task_cost=50.0,
         )
@@ -1491,7 +1494,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
             recent_per_task_cost=50.0,
             lifetime_total_cost=1000.0,
@@ -3137,7 +3140,7 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
             now - timedelta(hours=1),
             now,
             done_times,
-            progress_times,
+            _as_claims(progress_times),
             tasks_active=4,
             tasks_blocked_recovery=60,
             tasks_blocked_auto=27,
@@ -3174,7 +3177,7 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
                 now - timedelta(hours=1),
                 now,
                 done_times,
-                progress_times,
+                _as_claims(progress_times),
                 tasks_active=4,
                 tasks_blocked_recovery=0,
                 tasks_blocked_auto=0,
@@ -4471,6 +4474,247 @@ class TestSessionSegmentationHelpers:
         assert _session_index_for(datetime(2026, 8, 10, 8, 0, tzinfo=UTC), []) == 0
 
 
+class TestExecutionAnchor:
+    """Issue #329 FR-2 (AC-E13-F1-S2-T1-2): ``_execution_anchor`` returns the
+    minimum same-session claim <= ``done_at``, else ``None``. The single
+    shared selection helper both ``_compute_window_stats`` and
+    ``_recent_pace_minutes`` delegate to (AC-11, see
+    ``TestExecutionAnchorSingleSourceOfTruth``).
+    """
+
+    def test_two_same_session_claims_anchors_to_the_earliest(self) -> None:
+        """AC-8 / #329 live shape: E11-F1-S1-T2 claimed at 19:50:20 and
+        20:34:17 (same session), done at 20:54:07 -- the anchor is the
+        FIRST claim, not the last."""
+        from devbench.reporting.report import _execution_anchor
+
+        done_at = datetime(2026, 8, 10, 20, 54, 7, tzinfo=UTC)
+        first_claim = datetime(2026, 8, 10, 19, 50, 20, tzinfo=UTC)
+        second_claim = datetime(2026, 8, 10, 20, 34, 17, tzinfo=UTC)
+        assert _execution_anchor([first_claim, second_claim], done_at, []) == first_claim
+        # Order-independence: a claims list is not required to arrive sorted.
+        assert _execution_anchor([second_claim, first_claim], done_at, []) == first_claim
+
+    def test_prior_session_only_claim_returns_none(self) -> None:
+        """AC-9: the completion's only claim sits in an earlier orchestrator
+        session -- no eligible anchor exists."""
+        from devbench.reporting.report import _execution_anchor
+
+        boundaries = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 8, 30, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        assert _execution_anchor([prior_claim], done_at, boundaries) is None
+
+    def test_mixed_prior_and_current_session_anchors_to_earliest_current(self) -> None:
+        """AC-10: one prior-session claim plus one current-session claim
+        anchors to the earliest CURRENT-session claim, never the prior one."""
+        from devbench.reporting.report import _execution_anchor
+
+        boundaries = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+        current_claim = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 30, tzinfo=UTC)
+        assert _execution_anchor([prior_claim, current_claim], done_at, boundaries) == current_claim
+
+    def test_claim_after_done_at_is_never_eligible(self) -> None:
+        """A claim later than ``done_at`` (clock anomaly) never becomes an
+        anchor, even though it is otherwise same-session."""
+        from devbench.reporting.report import _execution_anchor
+
+        done_at = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        clock_anomaly_claim = datetime(2026, 8, 10, 10, 5, tzinfo=UTC)
+        assert _execution_anchor([clock_anomaly_claim], done_at, []) is None
+
+    def test_empty_claims_returns_none(self) -> None:
+        from devbench.reporting.report import _execution_anchor
+
+        assert _execution_anchor([], datetime(2026, 8, 10, tzinfo=UTC), []) is None
+
+
+class TestExecutionAnchorSingleSourceOfTruth:
+    """AC-11 (spec AC-11 / AC-E13-F1-S2-T1-6): both anchor consumers obtain
+    the anchor from ``_execution_anchor``; neither re-implements the
+    same-session-claim-selection scan inline. ``_same_session`` is called
+    from exactly one place in the module: inside ``_execution_anchor``."""
+
+    def test_neither_consumer_reimplements_the_claim_selection(self) -> None:
+        import inspect
+
+        from devbench.reporting import report
+
+        anchor_src = inspect.getsource(report._execution_anchor)
+        window_stats_src = inspect.getsource(report._compute_window_stats)
+        recent_pace_src = inspect.getsource(report._recent_pace_minutes)
+
+        assert "_execution_anchor(" in window_stats_src
+        assert "_execution_anchor(" in recent_pace_src
+        assert "_same_session(" in anchor_src
+        assert "_same_session(" not in window_stats_src
+        assert "_same_session(" not in recent_pace_src
+
+
+class TestConsumersAnchorOnEarliestClaim:
+    """AC-8/AC-9/AC-10 (spec) via the public consumers: both
+    ``_recent_pace_minutes`` and ``_compute_window_stats`` route their claim
+    selection through ``_execution_anchor``, so the earliest-claim, prior-
+    session-exclusion, and mixed-session behaviours are visible end-to-end,
+    not just at the helper level (``TestExecutionAnchor`` above)."""
+
+    # #329 live shape: E11-F1-S1-T2 claimed twice in the same session before
+    # being closed. The true window is measured from the FIRST claim
+    # (63.8 min), not the last (19.8 min).
+    _TID = "E11-F1-S1-T2"
+    _DONE_AT = datetime(2026, 8, 10, 20, 54, 7, tzinfo=UTC)
+    _FIRST_CLAIM = datetime(2026, 8, 10, 19, 50, 20, tzinfo=UTC)
+    _SECOND_CLAIM = datetime(2026, 8, 10, 20, 34, 17, tzinfo=UTC)
+
+    def test_recent_pace_minutes_anchors_to_earliest_claim_not_last(self) -> None:
+        from devbench.reporting.report import _recent_pace_minutes
+
+        done = {self._TID: self._DONE_AT}
+        claims = {self._TID: [self._FIRST_CLAIM, self._SECOND_CLAIM]}
+
+        median, excluded = _recent_pace_minutes(done, claims, [], n=1)
+        assert median == pytest.approx(63.783333, abs=0.01)
+        assert median != pytest.approx(19.833333, abs=0.01)
+        assert median != pytest.approx(3.0, abs=0.01)
+        assert excluded == 0
+
+    def test_compute_window_stats_anchors_to_earliest_claim_not_last(self, tmp_path: Path) -> None:
+        """MIN_PACE_SAMPLES requires >= 3 in-window samples before
+        ``avg_minutes`` reports a median instead of the below-threshold
+        zero, so 2 filler tasks with the SAME target duration (single claim
+        each) pad the window without changing the expected median."""
+        from devbench.constants import MIN_PACE_SAMPLES
+        from devbench.reporting.report import _compute_window_stats
+
+        target_duration_minutes = (self._DONE_AT - self._FIRST_CLAIM).total_seconds() / 60
+        filler_base = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        done = {self._TID: self._DONE_AT}
+        claims: dict[str, list[datetime]] = {self._TID: [self._FIRST_CLAIM, self._SECOND_CLAIM]}
+        for i in range(MIN_PACE_SAMPLES - 1):
+            filler_tid = f"E0-F1-S1-T{i + 1}"
+            filler_claim = filler_base + timedelta(hours=i)
+            claims[filler_tid] = [filler_claim]
+            done[filler_tid] = filler_claim + (self._DONE_AT - self._FIRST_CLAIM)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            filler_base - timedelta(minutes=1),
+            self._DONE_AT + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+        )
+        assert stats.pace_excluded_count == 0
+        assert stats.pace_sample_count == MIN_PACE_SAMPLES
+        assert stats.avg_minutes == pytest.approx(target_duration_minutes, abs=0.01)
+        assert stats.avg_minutes != pytest.approx(19.833333, abs=0.01)
+
+    def test_compute_window_stats_excludes_prior_session_only_claim_with_byte_identical_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-9: a task whose only claim sits in an earlier orchestrator
+        session has no execution window, and the #326 suffix text is
+        byte-identical to its pre-#329 form."""
+        from devbench.reporting.report import _compute_window_stats, _no_execution_window_suffix
+
+        tid = "E0-F1-S9-T1"
+        session_starts = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 8, 30, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        done = {tid: done_at}
+        claims = {tid: [prior_claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+            done_at + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+        )
+        assert stats.pace_excluded_count == 1
+        assert stats.pace_sample_count == 0
+        assert _no_execution_window_suffix(stats.pace_excluded_count) == " (1 excluded: no execution window)"
+
+    def test_compute_window_stats_mixed_session_claims_anchor_to_earliest_current(self, tmp_path: Path) -> None:
+        """AC-10: one prior-session claim plus one current-session claim
+        anchors to the earliest CURRENT-session claim. Padded with 2
+        same-session, same-duration filler tasks to clear MIN_PACE_SAMPLES."""
+        from devbench.constants import MIN_PACE_SAMPLES
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        session_starts = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+        current_claim = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 30, tzinfo=UTC)
+        done = {tid: done_at}
+        claims: dict[str, list[datetime]] = {tid: [prior_claim, current_claim]}
+        for i in range(MIN_PACE_SAMPLES - 1):
+            filler_tid = f"E0-F1-S2-T{i + 1}"
+            filler_claim = current_claim + timedelta(hours=i + 1)
+            claims[filler_tid] = [filler_claim]
+            done[filler_tid] = filler_claim + timedelta(minutes=30)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+            done[f"E0-F1-S2-T{MIN_PACE_SAMPLES - 1}"] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+        )
+        assert stats.pace_excluded_count == 0
+        assert stats.pace_sample_count == MIN_PACE_SAMPLES
+        # 9:30 - 9:00 (current claim), not 9:30 - (8/1) 9:00 (prior session).
+        assert stats.avg_minutes == pytest.approx(30.0)
+
+    def test_generate_report_end_to_end_anchors_to_earliest_claim_via_recent_pace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-8 / #329 live shape, exercised end-to-end through the public
+        ``generate_report`` entry point rather than a private helper called
+        directly. ``RECENT_PACE_TASKS`` is patched to 1 so the single target
+        completion alone determines the rendered "Recent pace" figure -- no
+        filler samples are needed, and none can mask a wrong anchor
+        selection the way ``statistics.median`` masks a lone wrong-valued
+        sample among matching fillers (see ``TestCaseDMedianRobustness``).
+        The rendered figure must reflect the FIRST same-session claim
+        (63.8 min), never the last (19.8 min)."""
+        monkeypatch.setattr("devbench.reporting.report.RECENT_PACE_TASKS", 1)
+        # A short-lived same-session filler task splits the ~44-minute gap
+        # between the two target claims so the log-wide gap-walk never
+        # inserts a session boundary between them (session-gap threshold is
+        # DEFAULT_SESSION_GAP_MINUTES=30) -- matching the live #329 log,
+        # where other tasks' activity keeps the two claims in one session.
+        entries = [
+            f"{self._FIRST_CLAIM.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] "
+            f"INFO Set {self._TID} to 'in-progress'",
+            "2026-08-10T20:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S9-T1 to 'in-progress'",
+            "2026-08-10T20:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S9-T1 to 'done'",
+            f"{self._SECOND_CLAIM.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] "
+            f"INFO Set {self._TID} to 'in-progress'",
+            f"{self._DONE_AT.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] INFO Set {self._TID} to 'done'",
+        ]
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(entries))
+
+        report = generate_report(log_path=log_file)
+
+        assert "63.8 min" in report
+        assert "19.8 min" not in report
+
+
 def _pace_case_stale_claim() -> tuple[dict[str, datetime], dict[str, datetime], list[datetime]]:
     """Case (a): an operator ``set-status done`` on a stale claim from an
     earlier orchestrator session. Three normal same-session samples
@@ -4537,6 +4781,22 @@ def _pace_default_window(
     )
 
 
+def _as_claims(progress_times: dict[str, datetime]) -> dict[str, list[datetime]]:
+    """Issue #329 FR-2: wrap a single-claim-per-task mapping as a one-element
+    claims list.
+
+    Most pace/window-stats fixtures in this module model exactly one
+    ``in-progress`` claim per task (the common case). ``_compute_window_stats``
+    and ``_recent_pace_minutes`` now take ``dict[str, list[datetime]]`` (the
+    shape ``task_transition_time_series_for_workspace`` returns) so
+    ``_execution_anchor`` has every candidate claim to select from; this
+    helper converts the convenient single-claim fixture shape into that
+    shape at the call boundary, without duplicating literal claim data in
+    every test.
+    """
+    return {tid: [ts] for tid, ts in progress_times.items()}
+
+
 _PACE_GATE_CASES = [
     pytest.param(*_pace_case_stale_claim(), 3, 25.0, 1, id="case_a_stale_claim"),
     pytest.param(*_pace_case_same_session_outlier(), 4, 20.0, 0, id="case_d_same_session_outlier"),
@@ -4563,7 +4823,7 @@ class TestRecentPaceAndWindowStatsSessionGate:
     ) -> None:
         from devbench.reporting.report import _recent_pace_minutes
 
-        median, excluded = _recent_pace_minutes(done_times, progress_times, session_starts, n)
+        median, excluded = _recent_pace_minutes(done_times, _as_claims(progress_times), session_starts, n)
         assert median == pytest.approx(expected_median)
         assert excluded == expected_excluded
 
@@ -4592,7 +4852,7 @@ class TestRecentPaceAndWindowStatsSessionGate:
             window_start,
             window_end,
             done_times,
-            progress_times,
+            _as_claims(progress_times),
             tasks_active=0,
             session_starts=session_starts,
         )
@@ -4611,7 +4871,7 @@ class TestCaseDMedianRobustness:
         from devbench.reporting.report import _recent_pace_minutes
 
         done, prog, session_starts = _pace_case_same_session_outlier()
-        median, excluded = _recent_pace_minutes(done, prog, session_starts, n=4)
+        median, excluded = _recent_pace_minutes(done, _as_claims(prog), session_starts, n=4)
         raw_durations = [(done[tid] - prog[tid]).total_seconds() / 60 for tid in done]
         assert excluded == 0
         assert median == pytest.approx(statistics.median(raw_durations))
@@ -4625,7 +4885,7 @@ class TestCaseDMedianRobustness:
         log_path = tmp_path / "log.log"
         log_path.write_text("", encoding="utf-8")
         stats = _compute_window_stats(
-            log_path, window_start, window_end, done, prog, tasks_active=0, session_starts=session_starts
+            log_path, window_start, window_end, done, _as_claims(prog), tasks_active=0, session_starts=session_starts
         )
         raw_durations = [(done[tid] - prog[tid]).total_seconds() / 60 for tid in done]
         assert stats.pace_excluded_count == 0
@@ -4634,21 +4894,25 @@ class TestCaseDMedianRobustness:
 
 
 class TestRecentPaceReclaimAcrossRestart:
-    """Case (b): the LAST (post-restart) claim is same-session as done ->
-    accepted, and it does not count toward ``excluded``."""
+    """Case (b): a claim in the CURRENT session is same-session as done ->
+    accepted, and it does not count toward ``excluded``. Issue #329 FR-2:
+    now that ``progress_claims`` carries every claim (not just the most
+    recent), a stale PRE-restart claim in an earlier session and a genuine
+    POST-restart claim in the current session both feed the same task; the
+    anchor resolves to the current-session claim (the earliest one eligible)
+    and the prior-session claim is correctly ignored."""
 
-    def test_reclaimed_task_uses_last_claim_and_is_not_excluded(self) -> None:
+    def test_reclaimed_task_anchors_to_current_session_claim_and_is_not_excluded(self) -> None:
         from devbench.reporting.report import _recent_pace_minutes
 
         session_starts = [datetime(2026, 8, 10, 8, 0, tzinfo=UTC), datetime(2026, 8, 10, 12, 0, tzinfo=UTC)]
         tid = "E0-F1-S1-T1"
-        # progress_times holds only the LAST (post-restart) claim -- the
-        # report never sees an earlier pre-restart claim (upstream MAX(ts)
-        # semantics collapse a task to a single in-progress timestamp).
-        prog = {tid: datetime(2026, 8, 10, 12, 5, tzinfo=UTC)}
+        pre_restart_claim = datetime(2026, 8, 10, 9, 0, tzinfo=UTC)
+        post_restart_claim = datetime(2026, 8, 10, 12, 5, tzinfo=UTC)
+        claims = {tid: [pre_restart_claim, post_restart_claim]}
         done = {tid: datetime(2026, 8, 10, 12, 45, tzinfo=UTC)}
 
-        median, excluded = _recent_pace_minutes(done, prog, session_starts, n=1)
+        median, excluded = _recent_pace_minutes(done, claims, session_starts, n=1)
         assert median == pytest.approx(40.0)
         assert excluded == 0
 
@@ -4675,7 +4939,7 @@ class TestUniformSamplesByteIdentical:
             base,
             base + timedelta(hours=11),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=0,
         )
         assert stats.avg_minutes == pytest.approx(40.0)

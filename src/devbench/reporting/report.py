@@ -369,6 +369,33 @@ def _same_session(a: datetime, b: datetime, boundaries: Sequence[datetime]) -> b
     return _session_index_for(a, boundaries) == _session_index_for(b, boundaries)
 
 
+def _execution_anchor(
+    claims: Sequence[datetime],
+    done_at: datetime,
+    boundaries: Sequence[datetime],
+) -> datetime | None:
+    """Return the earliest same-session claim ``<= done_at``, or ``None``.
+
+    Issue #329 FR-2: the correct anchor for a genuinely re-claimed task's
+    execution window is its FIRST same-session claim, not the most recent
+    one -- a task claimed twice in the same session was actively worked from
+    the first claim onward, so measuring from the last claim understates the
+    elapsed time (spec D-2: review-bounce time inside a session counts as
+    elapsed, predictive of an ETA). A claim strictly later than ``done_at``
+    (clock anomaly) is never eligible, and neither is a claim in a different
+    orchestrator session (``_same_session``). Returns ``None`` when no claim
+    satisfies both conditions -- the caller counts the completion as excluded
+    rather than defaulting to a zero-length or synthetic window.
+
+    This is the SINGLE place both anchor consumers (``_compute_window_stats``
+    and ``_recent_pace_minutes``) obtain their anchor from (AC-11); neither
+    re-implements this selection. Pure and raise-free: an empty ``claims``
+    sequence simply has no eligible entries.
+    """
+    eligible = [claim for claim in claims if claim <= done_at and _same_session(claim, done_at, boundaries)]
+    return min(eligible) if eligible else None
+
+
 def _walk_for_session_boundary(events: list[datetime], gap_minutes: int) -> datetime | None:
     """Run the gap-walk used by both the parser and indexed session detectors.
 
@@ -809,7 +836,7 @@ def _compute_cost(
 
 def _recent_pace_minutes(
     done_times: dict[str, datetime],
-    progress_times: dict[str, datetime],
+    progress_claims: dict[str, list[datetime]],
     session_starts: Sequence[datetime],
     n: int,
 ) -> tuple[float | None, int]:
@@ -818,17 +845,22 @@ def _recent_pace_minutes(
     Looks log-wide (not window-bounded) so the metric reflects current
     orchestrator pace rather than being anchored by historical completions.
 
-    Issue #326 (FR-2): a completion is a valid sample iff it has an
-    ``in-progress`` anchor (``tid in progress_times``) AND that anchor is in
-    the same orchestrator session as ``done`` (``_same_session``, boundaries
-    from ``session_starts``) AND the resulting duration is positive. The
-    first two failure modes mean the completion has no execution window at
-    all -- it is counted in the returned ``excluded`` total instead of
-    contributing a duration. Walking stops once ``n`` valid samples are
-    gathered. Returns ``(None, excluded)`` when fewer than ``n`` valid
-    samples exist log-wide; otherwise returns ``(statistics.median(durations),
-    excluded)`` -- the median replaces the pre-#326 arithmetic mean so a
-    single stale-claim completion cannot dominate the estimate.
+    Issue #326 (FR-2): a completion is a valid sample iff ``_execution_anchor``
+    resolves an anchor for it (a same-session claim, from ``progress_claims[tid]``,
+    that is no later than ``done``, boundaries from ``session_starts``) AND the
+    resulting duration is positive. ``anchor is None`` means the completion has
+    no execution window at all -- it is counted in the returned ``excluded``
+    total instead of contributing a duration. Walking stops once ``n`` valid
+    samples are gathered. Returns ``(None, excluded)`` when fewer than ``n``
+    valid samples exist log-wide; otherwise returns
+    ``(statistics.median(durations), excluded)`` -- the median replaces the
+    pre-#326 arithmetic mean so a single stale-claim completion cannot
+    dominate the estimate.
+
+    Issue #329 FR-2: ``progress_claims[tid]`` is the FULL time series of a
+    task's claims (ascending), not just its most recent one, so a task
+    re-claimed twice in the same session is measured from its FIRST claim
+    (see ``_execution_anchor``).
 
     Pure and raise-free: ``statistics.median`` is only reached once
     ``len(durations) == n >= 1``, so it never sees an empty sequence.
@@ -838,14 +870,11 @@ def _recent_pace_minutes(
     durations: list[float] = []
     excluded = 0
     for tid, dt in task_done:
-        if tid not in progress_times:
+        anchor = _execution_anchor(progress_claims.get(tid, []), dt, session_starts)
+        if anchor is None:
             excluded += 1
             continue
-        claim_time = progress_times[tid]
-        if not _same_session(claim_time, dt, session_starts):
-            excluded += 1
-            continue
-        dur = (dt - claim_time).total_seconds() / SECONDS_PER_MINUTE
+        dur = (dt - anchor).total_seconds() / SECONDS_PER_MINUTE
         if dur > 0:
             durations.append(dur)
         if len(durations) >= n:
@@ -1054,7 +1083,7 @@ def _compute_window_stats(
     window_start: datetime,
     window_end: datetime,
     done_times: dict[str, datetime],
-    progress_times: dict[str, datetime],
+    progress_claims: dict[str, list[datetime]],
     tasks_active: int,
     tasks_blocked_recovery: int = 0,
     tasks_blocked_auto: int = 0,
@@ -1100,6 +1129,14 @@ def _compute_window_stats(
     execution window are counted in ``pace_excluded_count`` /
     ``recent_pace_excluded_count`` and surfaced in the rendered cells
     instead of silently narrowing the sample set.
+
+    Issue #329 FR-2: ``progress_claims[tid]`` is the FULL time series of a
+    task's claims (ascending), not just its most recent one. The anchor for
+    each in-window completion is resolved via ``_execution_anchor`` (the
+    minimum same-session claim ``<= done_at``), so a task re-claimed twice in
+    the same session is measured from its FIRST claim, not its last. The
+    ``max(anchor, window_start)`` clamp is unchanged: a claim before the
+    window start is clamped to the window boundary, not the raw claim time.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -1109,10 +1146,11 @@ def _compute_window_stats(
     task_durations: list[float] = []
     pace_excluded_count = 0
     for tid in task_ids_done:
-        if tid not in progress_times or not _same_session(progress_times[tid], done_times[tid], session_starts):
+        anchor = _execution_anchor(progress_claims.get(tid, []), done_times[tid], session_starts)
+        if anchor is None:
             pace_excluded_count += 1
             continue
-        effective_start = max(progress_times[tid], window_start)
+        effective_start = max(anchor, window_start)
         dur = (done_times[tid] - effective_start).total_seconds() / SECONDS_PER_MINUTE
         if dur > 0:
             task_durations.append(dur)
@@ -1120,7 +1158,7 @@ def _compute_window_stats(
     avg_minutes = statistics.median(task_durations) if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
 
     recent_pace_minutes, recent_pace_excluded_count = _recent_pace_minutes(
-        done_times, progress_times, session_starts, RECENT_PACE_TASKS
+        done_times, progress_claims, session_starts, RECENT_PACE_TASKS
     )
 
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
@@ -3077,7 +3115,15 @@ def generate_report(
     event_index.refresh_transcripts(transcript_dir)
 
     done_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(WORKSPACE_ROOT, log_path, "done")
+    # Issue #329 FR-2: ``progress_times`` (most-recent claim per task) still
+    # feeds ``_recent_per_task_cost`` below, unchanged. ``progress_claims``
+    # (every claim per task, ascending) feeds the two window-stats/pace
+    # consumers so ``_execution_anchor`` can select the earliest same-session
+    # claim instead of the most recent one.
     progress_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(
+        WORKSPACE_ROOT, log_path, "in-progress"
+    )
+    progress_claims: dict[str, list[datetime]] = event_index.task_transition_time_series_for_workspace(
         WORKSPACE_ROOT, log_path, "in-progress"
     )
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
@@ -3123,7 +3169,7 @@ def generate_report(
             log_start_for_window,
             window_end,
             done_times,
-            progress_times,
+            progress_claims,
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
@@ -3155,7 +3201,7 @@ def generate_report(
             since,
             window_end,
             done_times,
-            progress_times,
+            progress_claims,
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
@@ -3202,7 +3248,7 @@ def generate_report(
                         w.start,
                         window_end,
                         done_times,
-                        progress_times,
+                        progress_claims,
                         backlog.tasks_active,
                         backlog.tasks_blocked_recovery,
                         backlog.tasks_blocked_auto,

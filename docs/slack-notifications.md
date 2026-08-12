@@ -13,10 +13,13 @@ you want.
 
 ## What you get
 
-- A Slack message on every event you enable. Every payload starts
-  with a literal `<!here>` mention, so the message drives a desktop +
-  mobile push notification for every online member of the channel
-  the webhook is bound to.
+- A Slack message on every event you enable. Every payload except
+  `orchestrator_stop` starts with a literal `<!here>` mention, so the
+  message drives a desktop + mobile push notification for every
+  online member of the channel the webhook is bound to. The
+  `orchestrator_stop` payload's mention is computed per stop class
+  instead -- see "Orchestrator stop: stop classes, mention levels,
+  and progress" below.
 - The same payload works in two routings:
   - **DM-yourself pattern.** Bind the webhook to a private channel
     that has only you in it. `<!here>` notifies you only.
@@ -175,10 +178,62 @@ Every event toggle, when it fires, and what's in the payload:
 | `pr_merged` | `gh pr merge` succeeded. **Not fired from auto-finalize** because that path leaves the PR open for manual merge under `auto_merge: false` (#219). | Task id, repo, PR URL. |
 | `ci_failure` | A CI run on a WU PR is classified as failed — fires from both `cmd_git_ops` (per-WU) and `_handle_finalize_ci_result` FAILED_KNOWN_TASK / FAILED_UNKNOWN branches (#219). | Task id, repo, PR URL, attempt number (sentinel `1` on the finalize path). |
 | `ci_pass` | CI on the auto-finalize batch PR turned GREEN — explicit signal that the PR is ready for manual merge under `auto_merge: false` (#219). **Default off** so existing workspaces stay silent on upgrade. | Task id (most-recent active task or symbolic `finalize`), repo, PR URL. |
-| `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, terminal-marker (#218), or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason (post-#217 includes the SDK's `ResultMessage.result` text; post-#218 fires within seconds of the terminal marker via the `[ORCHESTRATOR_TERMINAL_EXIT]` audit), in-flight WU id (when one was active). |
+| `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, terminal-marker (#218), or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason (post-#217 includes the SDK's `ResultMessage.result` text; post-#218 fires within seconds of the terminal marker via the `[ORCHESTRATOR_TERMINAL_EXIT]` audit; db-271 a premature clean-loop exit with no terminal sentinel is labeled distinctly as `premature turn end -- ...` rather than the bare `clean` seed), in-flight WU id (when one was active), Progress field (`<done>/<total> done`, omitted on a backlog parse failure). The `<!here>` mention is conditional on the stop class -- see below, not unconditional like every other event's payload. |
 | `orchestrator_auto_restart` | The orchestrator exited with code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop is restarting. | List of blocked task ids (truncated at 5). |
 | `quota_waiting` | The orchestrator detected a quota limit and began waiting for it to reset. The call site is `_fire_quota_waiting_notification`, invoked from `_handle_quota_pause` in `src/devbench/cli.py` (added by E2-F4-S2-T1); it wraps `notify_quota_waiting`. `_handle_quota_pause` is wired into `cmd_start`'s dispatch loop (via `_drive_orchestrate_with_quota_resume` / `_dispatch_quota_detection`, landed by E2-F4-S3-T1), so this event fires on every quota pause in a real run. | `reason`, `reset_at`. |
 | `quota_resumed` | The quota recovered and the run resumed. The call site is `_fire_quota_resumed_notification`, invoked from `_handle_quota_pause` in `src/devbench/cli.py` (added by E2-F4-S2-T1); it wraps `notify_quota_resumed`. `_handle_quota_pause` is wired into `cmd_start`'s dispatch loop (via `_drive_orchestrate_with_quota_resume` / `_dispatch_quota_detection`, landed by E2-F4-S3-T1), so this event fires on every quota recovery in a real run. | `waited_seconds`. |
+
+## Orchestrator stop: stop classes, mention levels, and progress
+
+Unlike every other event in this guide, `orchestrator_stop` does not
+unconditionally prefix its payload with `<!here>` (db-271, spec FR-18
+Parts B/C, `src/devbench/notifications.py`). Every stop reason is
+classified into one of six stop classes, and each stop class maps to
+a mention level that decides whether the payload pages the operator
+or posts silently.
+
+**Stop classes.** `classify_stop_class` matches the human-readable
+stop reason against these prefixes, in order, falling back to
+`crash` (fail-visible, never silent) for anything unrecognised:
+
+| Stop class | Matches reason prefix | Meaning |
+|---|---|---|
+| `quota-exhausted` | `quota` | The run stopped because of a provider quota limit. |
+| `premature-turn-end` | `premature turn end` | The SDK loop exited cleanly but never captured a terminal sentinel (`ALL_DONE` / `NO_ACTIONABLE`) -- a possible stalled or aborted mid-cascade run rather than a genuine finish. |
+| `completion` | `clean exit` | The run finished naturally, carrying the SDK's `ALL_DONE` / `NO_ACTIONABLE` result text. |
+| `drain` | `drain enforced` | An operator-requested drain was honored. |
+| `operator-interrupt` | `interrupted by operator` | Ctrl+C / SIGINT -- the operator stopped the run deliberately. |
+| `crash` | (fallback; any other reason) | Uncaught exception or unrecognised exit. Never silent. |
+
+**Mention-level defaults.** `DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP`
+maps each stop class to `here` (prefixes the payload with `<!here>`)
+or `none` (no mention prefix -- a silent status post):
+
+| Stop class | Mention level |
+|---|---|
+| `crash` | `here` |
+| `quota-exhausted` | `here` |
+| `premature-turn-end` | `here` |
+| `completion` | `none` |
+| `drain` | `none` |
+| `operator-interrupt` | `none` |
+
+The three attention-worthy classes -- an unrecognised crash, a quota
+exhaustion, and a premature turn end that could be a stalled or
+aborted run masquerading as clean -- page the operator with
+`<!here>`. The three expected-stop classes -- a genuine completion,
+an operator-requested drain, and an operator-initiated interrupt --
+post silently, since the operator already knows the run stopped and
+a channel-wide push would be unnecessary noise. Any future stop
+reason the classifier can't match falls into `crash` and still gets
+`<!here>` (fail-visible fallback, never silently dropped).
+
+**Progress field.** The payload also carries a `Progress` field
+reading `<done>/<total> done`, counted over every work unit in the
+backlog index at the moment the orchestrator stops. If the backlog
+fails to parse at that moment, the field is omitted from the payload
+entirely rather than blocking or masking the real stop reason; the
+parse failure is logged to stderr as a `[WARN]` line.
 
 ## Authentication & secret hygiene
 

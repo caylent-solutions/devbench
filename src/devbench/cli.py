@@ -157,7 +157,9 @@ from devbench.backlog.proposal import (
     ProposalMatch,
     ProposalTaskState,
     _compute_fix_signature,
+    _dep_row_has_task,
     _extract_intent_phrase,
+    _placeholder_dep_row,
     add_dep,
     classify_blocked_task,
     classify_proposed_task,
@@ -11466,9 +11468,16 @@ def cmd_add_dep(*argv: str) -> int:
 
         add-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
 
-    Writes a Dependencies-table row and a ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>``
-    audit comment on the blocked task's file. The ADR-07 auto-requeue cascade
-    then auto-unblocks the task when the blocker reaches ``done`` / ``declined``.
+    Writes a canonical ``## Dependencies`` row -- the form
+    ``validate-backlog``'s Manifest Conflict Rule reads -- alongside the
+    existing ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>`` audit
+    marker on the blocked task's file (#330 FR-1). The row's Title and
+    Status cells carry the blocker's real, current values as of this call,
+    not a placeholder. The ADR-07 auto-requeue cascade still only
+    auto-unblocks the blocked task when the blocker reaches ``done`` /
+    ``declined`` AND the blocked task's own status is ``blocked``; the
+    Dependencies row has no such restriction, so it is what satisfies the
+    validator regardless of the blocked task's current status.
 
     Used for three scenarios the ``promote-proposal`` flow does not cover:
 
@@ -11480,22 +11489,31 @@ def cmd_add_dep(*argv: str) -> int:
     3. Operator corrects a proposal authored without ``affected_task_ids``
        retroactively.
 
-    Fail-fast:
+    Fail-fast (#330 FR-1 error handling): every path below exits non-zero,
+    prints a message naming the file (when one is implicated) and the
+    reason, and leaves no partial write behind -- validation runs to
+    completion before anything is written.
+
       - Both IDs must match the task-ID regex.
+      - Blocked must exist in the backlog index.
       - Blocker must exist in the backlog index.
       - Blocker must not be in a terminal state (``done`` / ``declined``).
-      - Blocked must exist in the backlog index.
       - Blocked and blocker cannot be the same.
+      - The blocked task's file must be readable and contain a
+        ``## Dependencies`` section.
 
     Warns (but does not refuse) when the blocked task is not currently in
-    ``blocked`` status. The cascade only fires on blocked tasks, so wiring a
-    marker on an in-queue task is harmless metadata; the operator almost
-    certainly meant to flip to blocked first.
+    ``blocked`` status: the ADR-07 cascade will not fire until it is, but
+    (#330 FR-2) the ``## Dependencies`` row this call writes satisfies the
+    validator now regardless of that status.
 
-    Idempotent: if either the dep row or the marker is already present, the
-    corresponding write is skipped. ``wired: true`` in the output JSON means
-    at least one of the two was newly written on this call; ``wired: false``
-    means the call was a complete no-op.
+    Idempotent: calling ``add-dep`` twice for the same pair leaves exactly
+    one Dependencies row and one marker. ``wired: true`` in the output JSON
+    means the blocked task's ``## Dependencies`` table carries a
+    validator-visible row for the blocker as of THIS call -- true whether
+    the row was newly written or already present. ``wired: false`` means no
+    such row could be produced; the exit code is non-zero in that case and
+    ``reason`` explains why (#330 FR-2).
     """
     blocked_task_id, blocker_task_id, reason = _parse_add_dep_argv(argv)
     if blocked_task_id is None:
@@ -11505,39 +11523,42 @@ def cmd_add_dep(*argv: str) -> int:
     if rc is not None:
         return rc
 
-    # Warn when blocked is not in `blocked` status (ADR-10 soft guidance).
     try:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
         units = parser.parse_index()
     except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
-        return 1
+        return _fail_add_dep(blocked_task_id, blocker_task_id, f"cannot read backlog index: {exc}")
+
     blocked_unit = next((u for u in units if u.id == blocked_task_id), None)
-    if blocked_unit is None:
-        print(
-            f"ERROR: add-dep: blocked task '{blocked_task_id}' not found in backlog index",
-            file=sys.stderr,
+    blocker_unit = next((u for u in units if u.id == blocker_task_id), None)
+    if blocked_unit is None or blocker_unit is None:
+        role, missing_id = ("blocked", blocked_task_id) if blocked_unit is None else ("blocker", blocker_task_id)
+        return _fail_add_dep(
+            blocked_task_id, blocker_task_id, f"add-dep: {role} task '{missing_id}' not found in backlog index"
         )
-        return 1
+
+    # Warn when blocked is not in `blocked` status (ADR-10 soft guidance).
     if blocked_unit.status != WorkUnitStatus.BLOCKED:
         print(
             f"WARNING: add-dep: {blocked_task_id} is currently '{blocked_unit.status.value}', "
-            "not 'blocked'. The ADR-07 cascade only fires on blocked tasks -- the marker "
-            "written by this call will be inert until the task is blocked.",
+            "not 'blocked'. The ADR-07 cascade will not fire until the task is blocked -- "
+            "but the '## Dependencies' row this call writes to the blocked unit's file "
+            "satisfies the Manifest Conflict Rule now, independent of that status.",
             file=sys.stderr,
         )
 
     try:
-        wired = add_dep(
+        wired = _write_add_dep_edge(
             backlog_root=BACKLOG_ROOT,
             backlog_index=BACKLOG_INDEX,
             blocked_task_id=blocked_task_id,
+            blocked_file=blocked_unit.file_path,
             blocker_task_id=blocker_task_id,
+            blocker_unit=blocker_unit,
             reason=reason,
         )
-    except ProposalError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    except (ProposalError, OSError, UnicodeDecodeError) as exc:
+        return _fail_add_dep(blocked_task_id, blocker_task_id, str(exc))
 
     logger.info(
         "add-dep: %s blocked on %s (wired=%s)",
@@ -11555,7 +11576,129 @@ def cmd_add_dep(*argv: str) -> int:
             }
         )
     )
-    return 0
+    return 0 if wired else 1
+
+
+def _fail_add_dep(blocked_task_id: str, blocker_task_id: str, message: str) -> int:
+    """Print an ``add-dep`` failure, emit ``wired: false`` JSON, and return 1.
+
+    Centralises the AC-4 / AC-5 failure contract (#330 FR-1, FR-2): every
+    path that cannot produce a validator-visible Dependencies row exits
+    non-zero, names the reason, and reports ``"wired": false`` on the same
+    JSON payload the success path uses (same keys, per AC-6) so a caller
+    parsing stdout never observes a stale ``"wired": true"``.
+    """
+    print(f"ERROR: {message}", file=sys.stderr)
+    print(
+        json.dumps(
+            {
+                "blocked": blocked_task_id,
+                "blocker": blocker_task_id,
+                "wired": False,
+                "reason": message,
+            }
+        )
+    )
+    return 1
+
+
+def _write_add_dep_edge(
+    *,
+    backlog_root: Path,
+    backlog_index: Path,
+    blocked_task_id: str,
+    blocked_file: Path,
+    blocker_task_id: str,
+    blocker_unit: WorkUnit,
+    reason: str,
+) -> bool:
+    """Write the ``add-dep`` edge and report whether it is validator-visible (#330 FR-1, FR-2).
+
+    Delegates the row + marker + BACKLOG.md index-cell writes to
+    :func:`devbench.backlog.proposal.add_dep`, which already validates
+    self-wire, blocker existence, blocker terminal status, and a readable
+    ``## Dependencies`` section on the blocked file -- raising
+    :class:`~devbench.backlog.proposal.ProposalError` (or propagating an
+    ``OSError`` / ``UnicodeDecodeError`` from a malformed file) before any
+    write happens, so a rejected call leaves no partial write. ``add_dep``
+    writes the shared placeholder row (:func:`~devbench.backlog.proposal._placeholder_dep_row`),
+    which is correct for its other caller (``promote-proposal``, wiring a
+    just-materialised draft with no better text available yet); this then
+    rewrites that placeholder to the blocker's real title and current status
+    (AC-2), already resolved by the caller from the parsed backlog index,
+    under its own ``flock_backlog`` acquisition (FR-1) so the rewrite cannot
+    lose a concurrent flocked update to the same file.
+
+    Returns ``True`` iff, after this call, the blocked file's
+    ``## Dependencies`` table carries a row for the blocker -- true whether
+    the row was newly written this call or already present from a prior
+    call, so idempotent repeats stay validator-visible / ``wired: true``.
+    """
+    add_dep(
+        backlog_root=backlog_root,
+        backlog_index=backlog_index,
+        blocked_task_id=blocked_task_id,
+        blocker_task_id=blocker_task_id,
+        reason=reason,
+    )
+    _canonicalize_add_dep_row(
+        blocked_file,
+        blocker_task_id,
+        blocker_unit.title,
+        _add_dep_raw_status_text(blocker_unit.status),
+        workspace_root=backlog_index.parent,
+    )
+    return _dep_row_has_task(blocked_file, blocker_task_id)
+
+
+def _add_dep_raw_status_text(status: WorkUnitStatus) -> str:
+    """Return the lowercase-hyphenated markdown form of a ``WorkUnitStatus``.
+
+    E.g. ``WorkUnitStatus.IN_QUEUE`` (``value == "In Queue"``) becomes
+    ``"in-queue"``, matching the ``STATUS_*`` string constants
+    (:mod:`devbench.constants`) used in ``## Status:`` lines and
+    Dependencies-table rows across the backlog -- distinct from
+    ``WorkUnitStatus.value``'s title-case display form used in BACKLOG.md's
+    Status Summary and in CLI warning text.
+    """
+    return status.value.lower().replace(" ", "-")
+
+
+def _canonicalize_add_dep_row(
+    blocked_file: Path, blocker_task_id: str, title: str, status: str, *, workspace_root: Path
+) -> None:
+    """Upgrade the placeholder Dependencies row ``add_dep()`` writes to real title/status (#330 AC-2).
+
+    :func:`devbench.backlog.proposal.add_dep` writes the shared placeholder
+    row text (:func:`devbench.backlog.proposal._placeholder_dep_row`) via its
+    ``_append_dependency_to_source`` helper -- correct for its other caller,
+    ``promote-proposal``, where the blocker is a freshly materialised draft
+    and no better text exists yet. ``add-dep``'s caller already knows the
+    blocker's real, current title and status from the parsed backlog index,
+    so this rewrites the placeholder cells to that real text. Matching the
+    placeholder text against the SAME helper ``add_dep()`` used to write it
+    (rather than a second, independently hardcoded copy) means the two can
+    never drift apart and silently defeat the match.
+
+    Idempotent: only replaces the exact placeholder row text for
+    ``blocker_task_id``. A row already carrying real text -- from a prior
+    corrected call, or authored directly -- has no placeholder to match and
+    is left untouched, so repeat calls never re-write it.
+
+    Runs the read-modify-write under ``flock_backlog(workspace_root)`` (#330
+    FR-1, DoD): ``add_dep()`` releases the backlog flock before returning, so
+    without its own lock this full-file rewrite could race a concurrent
+    flocked write to the same file and lose it. Acquiring the lock here
+    guarantees the content read at the start of this call is read fresh
+    under the same lock the write is performed under.
+    """
+    with flock_backlog(workspace_root):
+        content = blocked_file.read_text(encoding="utf-8")
+        placeholder = _placeholder_dep_row(blocker_task_id)
+        if placeholder not in content:
+            return
+        real_row = f"| {blocker_task_id} | {title} | {status} |"
+        atomic_write_text(blocked_file, content.replace(placeholder, real_row, 1))
 
 
 def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:

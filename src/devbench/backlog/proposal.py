@@ -1730,6 +1730,21 @@ def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) 
     atomic_write_text(backlog_index, "\n".join(lines) + "\n")
 
 
+def _placeholder_dep_row(dep_id: str) -> str:
+    """Return the shared placeholder ``## Dependencies`` row text for ``dep_id``.
+
+    Single source of truth for the ``| <id> | (auto) | proposed |`` row
+    written by :func:`_append_dependency_to_source` when no better title or
+    status is known yet (e.g. a just-materialised draft). Callers that later
+    learn the dependency's real title/status (such as
+    ``cli._canonicalize_add_dep_row``, #330 AC-2) match against this exact
+    text to find and replace the placeholder -- consuming this one helper
+    instead of an independently hardcoded copy means the writer and the
+    matcher can never silently drift apart.
+    """
+    return f"| {dep_id} | (auto) | {STATUS_PROPOSED} |"
+
+
 def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source_task_id: str, new_dep_id: str) -> None:
     """Append ``new_dep_id`` to ``source_task_id``'s Dependencies table."""
     source_unit = _find_source_task_file(backlog_root, backlog_index, source_task_id)
@@ -1747,10 +1762,11 @@ def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source
     # Replace a placeholder ``| none | | |`` row when the dependencies table
     # is currently empty; otherwise append a new row to the end of the table.
     none_row_re = re.compile(r"^\|\s*none\s*\|\s*\|\s*\|\s*$", re.IGNORECASE | re.MULTILINE)
+    placeholder_row = _placeholder_dep_row(new_dep_id)
     if none_row_re.search(section):
-        section = none_row_re.sub(f"| {new_dep_id} | (auto) | proposed |", section, count=1)
+        section = none_row_re.sub(placeholder_row, section, count=1)
     else:
-        section = section.rstrip("\n") + f"\n| {new_dep_id} | (auto) | proposed |\n"
+        section = section.rstrip("\n") + f"\n{placeholder_row}\n"
     atomic_write_text(source_unit, content[:idx] + section + remainder)
 
 

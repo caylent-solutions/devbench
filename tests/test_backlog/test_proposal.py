@@ -26,6 +26,7 @@ from devbench.backlog.proposal import (
     _find_originating_source_task,
     _find_source_task_file,
     _has_unresolved_proposals,
+    _placeholder_dep_row,
     _remove_backlog_row,
     _render_backlog_row,
     _rewrite_backlog_status,
@@ -44,6 +45,7 @@ from devbench.backlog.proposal import (
     scan_story_for_task_ids,
     write_proposal,
 )
+from devbench.constants import STATUS_PROPOSED
 
 # ---------------------------------------------------------------------------
 # Shared fixture builders
@@ -1786,6 +1788,18 @@ class TestFindHelpers:
         assert _find_originating_source_task(tmp_path, "E0-F1-S1-T2") is None
 
 
+class TestPlaceholderDepRow:
+    """_placeholder_dep_row is the single source of truth for the placeholder row text."""
+
+    def test_returns_id_auto_status_row(self) -> None:
+        assert _placeholder_dep_row("E0-F1-S1-T9") == "| E0-F1-S1-T9 | (auto) | proposed |"
+
+    def test_uses_status_proposed_constant(self) -> None:
+        # Coupled to constants.STATUS_PROPOSED, not an independently hardcoded
+        # "proposed" literal, so the two can never silently drift apart.
+        assert _placeholder_dep_row("E0-F1-S1-T9") == f"| E0-F1-S1-T9 | (auto) | {STATUS_PROPOSED} |"
+
+
 class TestAppendDependencyToSource:
     def test_appends_when_no_none(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
@@ -1799,6 +1813,14 @@ class TestAppendDependencyToSource:
         _append_dependency_to_source(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1", "E0-F1-S1-T9")
         updated = source.read_text()
         assert "| E0-F1-S1-T9 |" in updated
+
+    def test_writes_exact_shared_placeholder_row_text(self, tmp_path: Path) -> None:
+        """The written row is byte-identical to _placeholder_dep_row's output (#330 AC-2 coupling)."""
+        workspace = _build_workspace(tmp_path)
+        source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        _append_dependency_to_source(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1", "E0-F1-S1-T9")
+        updated = source.read_text()
+        assert _placeholder_dep_row("E0-F1-S1-T9") in updated
 
     def test_raises_without_dependencies_section(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)

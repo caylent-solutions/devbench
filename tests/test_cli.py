@@ -10246,6 +10246,211 @@ class TestCmdAddDep:
         assert "WARNING:" in err
         assert "not 'blocked'" in err
 
+    def test_add_dep_warning_names_consequence_not_deferral(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-2 / AC-7: the warning must say the row -- not the marker -- satisfies the
+        validator now, rather than merely implying the marker is deferred until later."""
+        workspace = self._build_add_dep_workspace(tmp_path, blocked_status="in-queue")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert "not 'blocked'" in err
+        # Names the consequence (cascade will not fire) ...
+        assert "cascade" in err.lower() and "will not fire" in err.lower()
+        # ... AND names what DOES satisfy the validator right now.
+        assert "Dependencies" in err
+        assert "satisfies" in err.lower()
+
+    @staticmethod
+    def _build_add_dep_workspace(
+        tmp_path: Path,
+        *,
+        blocked_status: str = "blocked",
+        blocker_status: str = "in-progress",
+        blocker_title: str = "Fix the widget loader",
+        include_dependencies_section: bool = True,
+    ) -> Path:
+        """Build a minimal two-task workspace for ``add-dep`` CLI-level tests.
+
+        ``E0-F1-S1-T1`` is the blocked task, ``E0-F1-S1-T2`` the blocker. Both
+        exist in BACKLOG.md and on disk; the blocked task's own
+        ``## Dependencies`` section is present unless
+        ``include_dependencies_section`` is ``False`` (AC-4 coverage).
+        """
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | Example | 0 | 0 | 1 | 1 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| E0-F1-S1-T1 | Source | Task | {blocked_status} | None | caylent-solutions/example | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            f"| E0-F1-S1-T2 | {blocker_title} | Task | {blocker_status} | None | caylent-solutions/example | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+        )
+        story = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story.mkdir(parents=True)
+        deps_section = (
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+            if include_dependencies_section
+            else ""
+        )
+        (story / "E0-F1-S1-T1.md").write_text(
+            f"# E0-F1-S1-T1: Source\n\n## Status: {blocked_status}\n\n## Description\n\nx\n\n{deps_section}"
+        )
+        (story / "E0-F1-S1-T2.md").write_text(
+            f"# E0-F1-S1-T2: {blocker_title}\n\n## Status: {blocker_status}\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        return tmp_path
+
+    def test_add_dep_writes_real_title_and_status_in_row(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-1 / AC-2: the row's Title/Status cells are the blocker's real, current
+        values -- not the ``(auto)`` / ``proposed`` placeholder -- and the ID cell is
+        validator-visible (readable by the Manifest Conflict Rule's dep-chain scan)."""
+        from devbench.backlog.manager import BacklogManager
+
+        workspace = self._build_add_dep_workspace(
+            tmp_path, blocked_status="blocked", blocker_status="in-progress", blocker_title="Fix the widget loader"
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert set(out.keys()) == {"blocked", "blocker", "wired", "reason"}
+        assert out["wired"] is True
+        t1_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert "| E0-F1-S1-T2 | Fix the widget loader | in-progress |" in t1_text
+        assert "(auto)" not in t1_text
+        assert "E0-F1-S1-T2" in BacklogManager._extract_dep_ids(t1_text)
+
+    def test_add_dep_idempotent_leaves_one_row_at_cli_level(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-1 / AC-3: calling ``add-dep`` twice leaves exactly one row, and both
+        calls report ``wired: true`` / exit 0 since the edge is validator-visible both times."""
+        workspace = self._build_add_dep_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc1 = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+            capsys.readouterr()
+            rc2 = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+        out2 = json.loads(capsys.readouterr().out)
+        assert rc1 == 0
+        assert rc2 == 0
+        assert out2["wired"] is True
+        t1_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert t1_text.count("| E0-F1-S1-T2 |") == 1
+
+    def test_add_dep_missing_dependencies_section_exits_nonzero_no_partial_write(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-1 / AC-4, AC-5: a blocked file with no ``## Dependencies`` section fails
+        fast, names the file, reports ``wired: false``, and leaves the file untouched."""
+        workspace = self._build_add_dep_workspace(tmp_path, include_dependencies_section=False)
+        t1_path = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        before = t1_path.read_text()
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Dependencies" in captured.err
+        assert str(t1_path) in captured.err
+        payload = json.loads(captured.out)
+        assert payload["wired"] is False
+        assert set(payload.keys()) == {"blocked", "blocker", "wired", "reason"}
+        assert t1_path.read_text() == before
+
+    def test_add_dep_unknown_blocker_exits_nonzero_no_partial_write(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-1 / AC-4, AC-5: an unknown blocker id fails fast, reports
+        ``wired: false``, and leaves the blocked file untouched."""
+        workspace = self._build_add_dep_workspace(tmp_path)
+        t1_path = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        before = t1_path.read_text()
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T9")
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "not found in backlog index" in captured.err
+        payload = json.loads(captured.out)
+        assert payload["wired"] is False
+        assert payload["blocker"] == "E0-F1-S1-T9"
+        assert t1_path.read_text() == before
+
+    def test_add_dep_malformed_blocked_file_exits_nonzero_cleanly(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-1 / AC-4: an unreadable (invalid UTF-8) blocked-task file fails fast with
+        a clear message and non-zero exit rather than an unhandled traceback."""
+        workspace = self._build_add_dep_workspace(tmp_path)
+        t1_path = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        t1_path.write_bytes(b"\xff\xfe\x00\xff not valid utf-8 \xfe")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "ERROR" in captured.err
+        payload = json.loads(captured.out)
+        assert payload["wired"] is False
+
+    def test_add_dep_canonicalize_runs_under_flock_backlog(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#330 FR-1 / DoD: the real-title/status rewrite (``_canonicalize_add_dep_row``)
+        must be serialized under ``flock_backlog``, not a bare unguarded read-modify-write --
+        ``add_dep()`` releases the backlog flock before this rewrite runs, so without its own
+        lock a concurrent flocked writer to the same blocked file could have its update lost."""
+        workspace = self._build_add_dep_workspace(tmp_path)
+        flock_calls: list[Path] = []
+
+        @contextlib.contextmanager
+        def _spy_flock_backlog(root: Path, timeout_seconds: int | None = None) -> Generator[None, None, None]:
+            flock_calls.append(root)
+            yield
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.cli.flock_backlog", _spy_flock_backlog),
+        ):
+            rc = cli.cmd_add_dep("E0-F1-S1-T1", "E0-F1-S1-T2")
+        assert rc == 0
+        assert flock_calls, "the canonicalize row rewrite must acquire flock_backlog (#330 FR-1)"
+        assert all(call == workspace for call in flock_calls)
+
 
 class TestProposalCommandsRegistered:
     def test_list_proposals_registered(self) -> None:

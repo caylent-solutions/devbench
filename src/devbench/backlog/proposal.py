@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from devbench.config_loader import RuntimeConfig
@@ -44,6 +44,7 @@ from devbench.constants import (
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
+    DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
     STATUS_DECLINED,
     STATUS_DONE,
@@ -51,6 +52,8 @@ from devbench.constants import (
     STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
+    TASK_TYPE_BEHAVIOR_FIX,
+    VALID_TASK_TYPES,
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
@@ -800,7 +803,17 @@ _BACKLOG_ROW_RE = re.compile(r"^\|\s*(\S+)\s*\|", re.MULTILINE)
 
 @dataclass(frozen=True)
 class ProposedTask:
-    """One task the blocker-resolver wants the factory to draft."""
+    """One task the blocker-resolver wants the factory to draft.
+
+    ``task_type`` (spec 4.9a) keys the newly-reachable-paths Definition-of-Done
+    auto-append in `generate_draft_md`: it defaults to
+    `constants.DEFAULT_TASK_TYPE` so every existing caller (JSON proposals
+    written before this field existed) keeps working unchanged. Full
+    Task-Type keying across the mechanism -- validating the value at
+    construction time, threading it through `Proposal.from_dict`, and the
+    file-existence registry merge -- is E8-F1-S1-T1's scope; this field is a
+    minimal shim limited to `generate_draft_md`'s auto-append decision.
+    """
 
     suggested_id: str
     title: str
@@ -808,6 +821,7 @@ class ProposedTask:
     linked_scenarios: list[str]
     suggested_acs: list[str]
     suggested_approach: str
+    task_type: str = DEFAULT_TASK_TYPE
 
 
 @dataclass(frozen=True)
@@ -1383,15 +1397,34 @@ DRAFT_TEMPLATE: str = """\
 
 ## Definition of Done
 
-- [ ] All acceptance criteria checked
-- [ ] Tests green
-- [ ] Lint and format clean
-- [ ] Only files in Changes Manifest are staged with `git add`
+{definition_of_done}
 
 ## TDD Cycle Log
 
 ## Comments
 """
+
+
+_BASE_DEFINITION_OF_DONE: Final[tuple[str, ...]] = (
+    "All acceptance criteria checked",
+    "Tests green",
+    "Lint and format clean",
+    "Only files in Changes Manifest are staged with `git add`",
+)
+
+# Bug-fix-specific Definition of Done item (newly-reachable-paths gate). See
+# docs/newly-reachable-paths.md for the full rationale: a bug-fix task's DoD is
+# not satisfied by the original repro passing alone -- it also requires the
+# executor to enumerate and live-verify the code paths the fix newly makes
+# reachable. Auto-appended below whenever the proposed task's `task_type`
+# resolves to `constants.TASK_TYPE_BEHAVIOR_FIX`, so materialised drafts carry
+# the requirement before a human ever edits them. Keyed off the `## Task
+# Type:` taxonomy `manager.py` already validates, not a title heuristic.
+_NEWLY_REACHABLE_PATHS_DOD_ITEM: Final[str] = (
+    "Newly-reachable code paths enumerated and live-verified at smoke-test "
+    "level (not just re-confirmation of the original repro), logged via "
+    "[NEWLY_REACHABLE] -- see docs/newly-reachable-paths.md"
+)
 
 
 def generate_draft_md(
@@ -1402,7 +1435,20 @@ def generate_draft_md(
     generated_at: str,
     status: str = STATUS_PROPOSED,
 ) -> str:
-    """Render the markdown content for one proposed task file."""
+    """Render the markdown content for one proposed task file.
+
+    Raises:
+        ValueError: if ``proposed.task_type`` is not one of
+            ``constants.VALID_TASK_TYPES``. Never silently falls back to the
+            default type -- an unrecognised value is a caller bug that must
+            surface loudly rather than silently exempting the drafted task
+            from the newly-reachable-paths gate.
+    """
+    if proposed.task_type not in VALID_TASK_TYPES:
+        raise ValueError(
+            f"ProposedTask.task_type={proposed.task_type!r} is not a valid task type. "
+            f"Valid values: {sorted(VALID_TASK_TYPES)}"
+        )
     from devbench.config import RUNTIME_CONFIG
     from devbench.config_loader import format_branch_name, get_effective_branch_prefix
 
@@ -1418,6 +1464,10 @@ def generate_draft_md(
         if proposed.files_to_own
         else "| `TODO` | TODO -- describe change |"
     )
+    dod_items = list(_BASE_DEFINITION_OF_DONE)
+    if proposed.task_type == TASK_TYPE_BEHAVIOR_FIX:
+        dod_items.append(_NEWLY_REACHABLE_PATHS_DOD_ITEM)
+    definition_of_done = "\n".join(f"- [ ] {item}" for item in dod_items)
     return DRAFT_TEMPLATE.format(
         task_id=proposed.suggested_id,
         title=proposed.title,
@@ -1430,6 +1480,7 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=manifest_lines,
+        definition_of_done=definition_of_done,
     )
 
 

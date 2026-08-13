@@ -45,7 +45,7 @@ from devbench.backlog.proposal import (
     scan_story_for_task_ids,
     write_proposal,
 )
-from devbench.constants import STATUS_PROPOSED
+from devbench.constants import STATUS_PROPOSED, TASK_TYPE_BEHAVIOR_FIX, TASK_TYPE_DOCS
 
 # ---------------------------------------------------------------------------
 # Shared fixture builders
@@ -475,6 +475,21 @@ class TestGenerateDraftMd:
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
         assert "- **Branch:** `backlog/e0-f1-s1-t9`" in md
 
+    def test_base_dod_items_always_present(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Fix the exporter crash",
+            files_to_own=[],
+            linked_scenarios=[],
+            suggested_acs=[],
+            suggested_approach="",
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "- [ ] All acceptance criteria checked" in md
+        assert "- [ ] Tests green" in md
+        assert "- [ ] Lint and format clean" in md
+        assert "- [ ] Only files in Changes Manifest are staged with `git add`" in md
+
     def test_branch_line_namespaced_by_configured_branch_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The generated draft's Branch: line must match the branch devbench
         will actually push to -- so it stays namespaced when git_ops.branch_prefix
@@ -500,6 +515,48 @@ class TestGenerateDraftMd:
         )
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
         assert "- **Branch:** `backlog/wg_004/e0-f1-s1-t9`" in md
+
+    def test_behavior_fix_task_type_gets_newly_reachable_paths_dod_item(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Fix the exporter crash",
+            files_to_own=["src/a.py"],
+            linked_scenarios=[],
+            suggested_acs=["AC-FIX-001 exporter no longer crashes"],
+            suggested_approach="Do the fix.",
+            task_type=TASK_TYPE_BEHAVIOR_FIX,
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "Newly-reachable code paths enumerated and live-verified" in md
+        assert "[NEWLY_REACHABLE]" in md
+        assert "docs/newly-reachable-paths.md" in md
+
+    def test_docs_task_type_omits_newly_reachable_paths_dod_item(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Document the exporter behavior",
+            files_to_own=["docs/exporter.md"],
+            linked_scenarios=[],
+            suggested_acs=["AC-DOC-001 exporter behavior documented"],
+            suggested_approach="Write the docs.",
+            task_type=TASK_TYPE_DOCS,
+        )
+        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+        assert "Newly-reachable code paths enumerated and live-verified" not in md
+        assert "[NEWLY_REACHABLE]" not in md
+
+    def test_invalid_task_type_raises_value_error_naming_value_and_valid_set(self) -> None:
+        task = ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="My Task",
+            files_to_own=[],
+            linked_scenarios=[],
+            suggested_acs=[],
+            suggested_approach="",
+            task_type="not-a-real-task-type",
+        )
+        with pytest.raises(ValueError, match="not-a-real-task-type"):
+            generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
 
 
 # ---------------------------------------------------------------------------

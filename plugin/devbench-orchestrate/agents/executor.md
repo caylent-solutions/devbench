@@ -161,6 +161,7 @@ If pre-existing index entries from a prior blocked task pollute your staging are
     - [ ] No bypass annotations staged: nosec, noqa, type: ignore, nolint, eslint-disable
     - [ ] `git status --short` (in repo_path) shows only files listed in the Changes Manifest
     - [ ] No edits made to ANY `backlog/**/*.md` work-unit file other than via `devbench log-comment`, `devbench log-tdd`, `devbench log-verdict`, `devbench request-amendment`, or `devbench add-dep`. Direct file edits to OTHER tasks' work-unit `.md` files are forbidden -- they bypass the manifest-amender gate and the audit trail. If you need to modify another task's Manifest or Dependencies, route the change through `devbench add-dep` (for dep wiring) or emit a proposal via `devbench write-proposal` (for everything else).
+    - [ ] If this work unit is bug-fix-shaped (see "BUG-FIX COMPLETENESS" below): a `[NEWLY_REACHABLE]` enumeration + live-verification entry is logged -- required even when the answer is "none".
     If any item is not satisfied, resolve it before proceeding to step 8.
 8. Log completion in the work unit Comments section.
 
@@ -310,6 +311,38 @@ Procedure (execute in order -- each step is load-bearing):
 7. The orchestrate skill (step 4c) detects the proposal file and invokes `devbench-orchestrate:task-factory`, which materialises the drafts at `## Status: proposed`. Do NOT attempt to run task-factory yourself.
 
 Scope discipline: use this procedure ONLY when the task itself is a validation gate. If the task's Approach authorises production fixes and you simply discovered an additional out-of-scope bug while implementing authorised changes, the correct path remains the amendment flow in step 3 (stage the fix, request an amendment). Do not use bug-escalation to route around a rejected amendment.
+
+**Newly-reachable-paths AC.** When a proposed follow-up task in step 2 above is itself a bug fix that was gating off a code path (a crash, a disabled control, a silently-skipped branch), add a third AC line to that entry's `suggested_acs`, e.g. `AC-VERIFY-001 newly-reachable code paths (see docs/newly-reachable-paths.md) enumerated and live-verified at smoke-test level; logged via [NEWLY_REACHABLE]`. This seeds the requirement into the follow-up task from the moment it is drafted, rather than relying on whichever executor later picks it up to know about the BUG-FIX COMPLETENESS section below on their own.
+
+## BUG-FIX COMPLETENESS: newly-reachable paths
+
+This section applies whenever the work unit you are executing is bug-fix-shaped: its title starts with "Fix", or its Description / Approach explicitly frames the work as correcting a defect (a crash, a permanently-disabled control, an exception that was silently short-circuiting downstream logic, a component that never mounted, a condition that always took the early-return branch). It does NOT apply to greenfield feature work, refactors with no reported defect, or documentation-only tasks. When in doubt, treat the task as bug-fix-shaped -- an unnecessary "none" line costs one sentence; skipping a genuinely gated-path fix costs another multi-round remediation chain. Full rationale and worked examples: `docs/newly-reachable-paths.md`.
+
+**Why this exists.** A defect that gates off a code path (the crash prevented a screen from rendering, the disabled button never let its handler run) hides everything downstream of the gate. Confirming the original repro now passes proves the gate opened -- it says nothing about what was behind the gate. Recurring pattern across multi-round remediation: the newly-reachable code turns out to have its own pre-existing (and previously untestable) defect, discovered one QA round later instead of in this task.
+
+**Step 1 -- enumerate.** Before logging completion, list every code path this fix newly makes reachable that was NOT reachable before your change ("newly reachable" = could not execute, render, or receive user interaction while the defect was present, and now can). Enumerate at minimum the FIRST HOP downstream of the gate you removed -- you are not required to trace every possible path transitively, but "the button is now enabled" without naming what the button's handler does is not adequate. See `docs/newly-reachable-paths.md` for adequate-vs-inadequate examples.
+
+If, after genuine consideration, the fix unlocks no new code path (the defect was fully self-contained), say so explicitly with a one-sentence justification rather than omitting the step.
+
+**Step 2 -- live-verify.** For each enumerated path, perform a real, smoke-test-level check that it actually works now that it is reachable -- running the app/service and exercising the path, an integration/functional test, or at minimum a targeted unit test against the newly-reachable branch. Reading the code and reasoning "this looks fine" is NOT verification.
+
+If live-verification surfaces a new, independent defect in a newly-reachable path, do NOT silently mark the task done. Treat it exactly like any other bug discovered during TDD GREEN: fix it under the Amendment path above if it is minimal and in scope, or escalate it via the BUG ESCALATION FOR VALIDATION GATES proposal flow (or a `[NEEDS_ESCALATION]` comment naming the newly-reachable path and the defect found in it) if it is not.
+
+**Step 3 -- log it.** Before your completion comment, log one audit line:
+
+```bash
+uv run devbench log-comment executor $ARGUMENTS "[NEWLY_REACHABLE] <path 1>: <what was verified and how -- command/test run and result>; <path 2>: ..."
+```
+
+or, when genuinely nothing new is unlocked:
+
+```bash
+uv run devbench log-comment executor $ARGUMENTS "[NEWLY_REACHABLE] none -- <one-sentence justification>"
+```
+
+This entry is what `code-reviewer.md`'s BUG-FIX COMPLETENESS rubric checks for -- a bug-fix task with no `[NEWLY_REACHABLE]` entry in its Comments fails review even if the original repro passes. Self-reporting this step is necessary but not sufficient: the code-reviewer's independent check is the actual gate, so do not treat logging the line as the end of the obligation -- the enumeration and verification have to be real.
+
+**Cross-cutting primitives.** If the workspace defines an optional cross-cutting-primitives registry (conventionally `backlog/config/cross-cutting-primitives.md` -- see `docs/newly-reachable-paths.md`), check whether any file in your diff matches a listed primitive (a shared z-index tier, a shared dirty-flag/`setField` path, a shared close/dismiss callback, or similar). If it does, explicitly enumerate and verify the primitive's OTHER named consumers as part of Step 1/Step 2 above, not just the consumer you were fixing -- a fix that reuses a shared stateful primitive without checking its other consumers is exactly the failure mode this section exists to catch.
 
 ## COMMENT LANGUAGE DISCIPLINE
 

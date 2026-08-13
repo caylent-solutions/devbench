@@ -35,6 +35,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   proceeds, surfacing a `[BLOCKING_FINDING]` for operator acknowledgement
   when the referenced pattern is not actually live.
 
+- **Added a newly-reachable-paths requirement to bug-fix tasks' Definition of
+  Done** (`caylent-solutions/devbench-internal-backlog#15`). A fix that clears
+  a reported repro often gates open a code path that was never reachable
+  before; confirming the repro passes says nothing about what was behind the
+  gate. `executor.md` gains a BUG-FIX COMPLETENESS section requiring the
+  executor to enumerate and live-verify what the fix newly unlocks before
+  completion, logged via `[NEWLY_REACHABLE]`; `code-reviewer.md` gains an
+  independent BUG-FIX COMPLETENESS rubric (items 53-55) backed by the new
+  `NEWLY_REACHABLE_PATH_UNVERIFIED` vocabulary code, and `blocker-resolver.md`
+  seeds a matching AC on bug-fix-shaped follow-up proposals. `proposal.py`'s
+  `generate_draft_md` auto-appends the matching Definition of Done item on
+  materialised drafts: keyed on the `## Task Type:` taxonomy
+  (`ProposedTask.task_type` resolving to `constants.TASK_TYPE_BEHAVIOR_FIX`),
+  not a title heuristic, so the mechanical DoD append is exempt from the
+  false positives/negatives a `"Fix "`-prefix title match would produce. See
+  `docs/newly-reachable-paths.md` for the full rationale and worked examples.
+
 - **`backlog_post_processor._find_section_bounds` matched heading text quoted
   in another section's prose** (issue #337). The unanchored
   `text.find(header)` let a Description that discusses "the task's

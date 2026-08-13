@@ -125,6 +125,8 @@ Every field is load-bearing. In particular, `suggested_approach` MUST be a rich,
 
 `title` MUST be in imperative form (`Fix X`, `Add Y`, `Document Z`) -- not descriptive (`Fixes X`, `Describes Y`). `files_to_own` MUST include every file the task will touch (production + tests + docs). `suggested_acs` MUST be concrete enough that a reviewer can verify each one without further clarification.
 
+**Newly-reachable-paths AC (bug-fix-shaped proposals).** When the proposed task corrects a defect that was itself gating off a code path -- the rejected diff or source-task context describes a crash, a disabled control, a silently-skipped branch, or similar -- `suggested_acs` MUST include one additional AC requiring the eventual executor to enumerate and live-verify the paths the fix newly unlocks, not just re-confirm the original failure is gone. Phrase it along these lines: `AC-VERIFY-001 newly-reachable code paths (see docs/newly-reachable-paths.md) enumerated and live-verified at smoke-test level; logged via [NEWLY_REACHABLE]`. A `title` in the imperative `Fix ...` form (required above) is the cheapest reliable signal that this applies -- `task-factory`'s `generate_draft_md` auto-appends a matching Definition of Done item on that same title signal, so using the correct imperative form keeps the seeded AC and the auto-generated DoD checklist item in sync. See `docs/newly-reachable-paths.md` for the full rationale, worked examples of adequate enumeration, and the optional cross-cutting-primitives registry convention.
+
 ```bash
 cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
 {

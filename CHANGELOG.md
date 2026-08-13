@@ -56,6 +56,35 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A single Claude Agent SDK transport hiccup ended a multi-hour unattended
+  `devbench start` run with no retry** (issue #331). `_run`'s SDK message
+  loop caught only `StopAsyncIteration` and `TimeoutError`; any other
+  exception raised from `agen.__anext__()` -- for example the upstream
+  `Exception: Claude Code returned an error result: success` frame reported
+  at anthropics/claude-agent-sdk-python#1203 -- propagated uncaught through
+  `asyncio.run` and killed the daemon; this happened twice in twelve hours.
+  `_run` now re-raises any other SDK-generator-boundary exception as a new
+  `_OrchestrateTransportError` (carrying the original as `__cause__`), and
+  `_drive_orchestrate_with_quota_resume` gains an
+  `except _OrchestrateTransportError` arm that logs the verbatim exception at
+  ERROR with its restart ordinal and cap, then restarts a fresh SDK session
+  -- bounded by the SAME `DEVBENCH_MAX_QUOTA_RESUMES` cap that already bounds
+  quota resumes and inactivity restarts, tracked with its own independent
+  counter -- or re-raises once the cap is exhausted, preserving the legacy
+  non-zero exit and the verbatim final exception. Classification is
+  structural (which call raised), never message-based: the observed
+  trigger's exception text was the literal word `success`, so pattern-
+  matching upstream text would be brittle exactly when it matters.
+  `_label_stop_reason` gains the `transport-error-restart-cap-exhausted`
+  class so the `orchestrator_stop` notification names the exhausted-cap case
+  instead of an unlabelled crash, and `devbench report` renders a
+  `Transport restarts <n>` row (only when `n > 0`) via the new
+  `report.transport_restarts_line`, counting `[ORCHESTRATOR_TRANSPORT_RESTART]`
+  audit lines. `docs/cli-reference.md` documents the recovery path and the
+  report row; `docs/adr/34-orchestrator-transport-restart.md` records the
+  design decisions, including why classification is structural rather than
+  message-based.
+
 - **The harness devbench install could run arbitrarily stale orchestrator code
   against a self-hosted target checkout with no signal to the operator**
   (issue #301). devbench self-hosts: the orchestrator executes from the

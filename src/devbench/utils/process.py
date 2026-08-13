@@ -20,6 +20,7 @@ def run_command(
     cmd: list[str],
     cwd: Path | None = None,
     timeout: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run *cmd* as a subprocess and return ``(returncode, stdout, stderr)``.
 
@@ -31,6 +32,12 @@ def run_command(
             ``COMMAND_TIMEOUT`` value from ``devbench.config`` (configured
             via the ``JUDGE_COMMAND_TIMEOUT`` environment variable at module
             import time).
+        env: Optional environment mapping passed straight through to
+            ``subprocess.run``.  ``None`` (the default) inherits the parent
+            process environment unchanged, matching every existing call site.
+            When provided, it *replaces* the parent environment for the
+            child process rather than merging with it, per
+            ``subprocess.run``'s own semantics.
 
     Returns:
         A three-tuple ``(returncode, stdout, stderr)``.  On ``FileNotFoundError``
@@ -45,6 +52,7 @@ def run_command(
             capture_output=True,
             text=True,
             timeout=effective_timeout,
+            env=env,
         )
     except FileNotFoundError:
         return SUBPROCESS_ERROR_EXIT_CODE, "", f"{cmd[0]}: command not found"

@@ -64,3 +64,12 @@ class TestIsValidCode:
         other_judges = [j for j in JUDGE_CATEGORIES if j != "test_review"]
         for judge in other_judges:
             assert is_valid_code(judge, "COMPOSITION_ROOT_MISSING") is False
+
+    def test_layout_stub_without_live_test_valid_for_test_review(self) -> None:
+        """caylent-solutions/devbench-internal-backlog#14: the layout-geometry gate
+        emits test_review:LAYOUT_STUB_WITHOUT_LIVE_TEST."""
+        assert is_valid_code("test_review", "LAYOUT_STUB_WITHOUT_LIVE_TEST") is True
+
+    def test_layout_stub_without_live_test_not_valid_for_code_review(self) -> None:
+        """The code is test_review-specific, not shared across judges."""
+        assert is_valid_code("code_review", "LAYOUT_STUB_WITHOUT_LIVE_TEST") is False

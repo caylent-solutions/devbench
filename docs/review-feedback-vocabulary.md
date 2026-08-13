@@ -40,6 +40,7 @@ example remediations.
 | `DRY_VIOLATION` | Duplicated test logic that should be parameterised | Extract a helper or use `pytest.mark.parametrize`. |
 | `FIXTURE_CATALOG_MISMATCH` | `devbench check-fixture-consistency` reported a `FAIL:` finding -- a mock/fixture file references an identifier absent from its designated canonical dataset, or a canonical source's coverage fell short of a declared `expected_count` | Fix the fixture to reference a real canonical key, add the value to `fixture_consistency.scan[].allow_missing` if it is an intentional edge case, or complete the backfill to satisfy `expected_count`. |
 | `COMPOSITION_ROOT_MISSING` | Only coverage for a state-consuming UI component is an isolated render with hand-supplied props/mocked store/DI container (caylent-solutions/devbench-internal-backlog#11) | Add a test that renders/exercises the component through the app's real composition root, or a documented smallest-real-ancestor exception -- see `docs/composition-root-testing.md`. |
+| `LAYOUT_STUB_WITHOUT_LIVE_TEST` | Diff stubs a DOM-layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, etc.) for a `[LAYOUT-AC]`-tagged AC with no companion real-render test for the same AC | Add a companion real-render/live-browser test (e.g. Playwright) at the viewport/breakpoint the AC names; the stub alone does not prove the fix. |
 
 ## `doc_review`
 

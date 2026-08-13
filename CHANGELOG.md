@@ -5,6 +5,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Layout/CSS-geometry AC tagging and live-render verification gate**
+  (`caylent-solutions/devbench-internal-backlog#14`). Standard jsdom-style
+  unit-test environments have no real layout, paint, or cascade engine, so
+  CSS-dependent runtime behaviour (sticky positioning, flex-shrink
+  collapse, media-query cascade, grid autosize, overlap) has been shipping
+  as "done" on jsdom-only tests -- including tests that stub the very
+  primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`)
+  responsible for the bug, which structurally cannot fail even when the
+  live defect persists. Adds a `spec-to-backlog` Step 3a keyword heuristic
+  that tags layout/geometry-sensitive acceptance criteria `[LAYOUT-AC]`
+  and requires a real-render/live-browser Definition of Done item for
+  tagged tasks, a `test-reviewer` rubric item that flags a DOM-layout
+  primitive stub for a `[LAYOUT-AC]`-tagged AC with no companion
+  live-render test, and the new controlled rejection code
+  `test_review:LAYOUT_STUB_WITHOUT_LIVE_TEST`. The vocabulary membership
+  test (`tests/test_backlog/test_review_feedback_vocabulary.py`) was
+  authored ahead of this pick because the source PR shipped zero tests.
+
 - **Composition-root test verification for state-consuming UI tasks**
   (`caylent-solutions/devbench-internal-backlog#11`). Backlog tasks were
   repeatedly marked done with large green test suites that only ever

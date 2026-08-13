@@ -58,7 +58,7 @@ whenever the task is not a behaviour fix.
 10. `## Dependencies` -- table of upstream tasks this task depends on (`| ID | Title | Status |`)
 11. `## Acceptance Criteria` -- task-specific ACs tied to spec section numbers or AC-N identifiers from spec Section 6; no `AC-XCUT-N` cross-cutting blocks
 12. `## Changes Manifest` -- the canonical 2-column form `| File | Change |`. EXACTLY two columns; the validator's `parse_manifest` rejects any other column count with `ManifestParseError: Manifest row must have exactly 2 columns`. Each row's File cell is a backtick-wrapped relative path (or a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` when the file list is undetermined); the Change cell is one of `add`, `modify`, `delete` (lowercase). Multi-repo work units encode the repo in the File cell as `` `<org/repo>` -- <path> `` (no per-row Repo column). The `## Target Repository` block at the top of the work-unit file is where Repo / Branch live; the Manifest carries paths only. NEVER use glob patterns (``*`` or ``**``) -- use a sentinel instead. See `docs/backlog-contract.md` 'Changes Manifest' section.
-13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`). **Bug-fix-shaped tasks** (title starts with "Fix", or the spec frames the task as correcting a defect that was gating a code path -- a crash, a permanently-disabled control, a silently-skipped branch) MUST include one additional item requiring the executor to enumerate the code paths the fix newly makes reachable and live-verify each at smoke-test level, logged via `[NEWLY_REACHABLE]` -- not just an item confirming the original defect no longer reproduces. See `docs/newly-reachable-paths.md` in the target workspace's devbench checkout for the full rationale and worked examples of adequate enumeration; the corresponding `## Acceptance Criteria` should carry a matching AC (e.g. `AC-VERIFY-NNN newly-reachable paths enumerated and live-verified`).
+13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`). **Bug-fix-shaped tasks** (title starts with "Fix", or the spec frames the task as correcting a defect that was gating a code path -- a crash, a permanently-disabled control, a silently-skipped branch) MUST include one additional item requiring the executor to enumerate the code paths the fix newly makes reachable and live-verify each at smoke-test level, logged via `[NEWLY_REACHABLE]` -- not just an item confirming the original defect no longer reproduces. See `docs/newly-reachable-paths.md` in the target workspace's devbench checkout for the full rationale and worked examples of adequate enumeration; the corresponding `## Acceptance Criteria` should carry a matching AC (e.g. `AC-VERIFY-NNN newly-reachable paths enumerated and live-verified`). **Layout/Visual AC exception**: if any item in `## Acceptance Criteria` carries the `[LAYOUT-AC]` tag (Step 3a), one Definition of Done item MUST require real-render/live-browser verification (e.g. Playwright, or the equivalent real-renderer for the target stack) at the specific viewport/breakpoint named in the AC -- a jsdom-only test, or a DOM-testing-library test that stubs a layout primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent), does not satisfy that item on its own.
     - **Composition-root DoD item (caylent-solutions/devbench-internal-backlog#11)**: when this task's Changes Manifest adds or modifies a UI component (or equivalent presentation-layer unit) that consumes shared/app-level state (a global store, dependency-injection container, routing context, or any shared provider/composition tree the real app assembles at startup), the DoD MUST include an explicit item requiring at least one test that exercises the component through the application's real composition root -- its actual entry point, or the smallest real ancestor that reproduces production's actual provider/store/DI nesting -- and NOT exclusively via hand-constructed test doubles for its dependencies (an isolated render with hand-supplied props, a locally-built store/DI container, or a dependency mocked at module scope). Do NOT add this item for genuinely stateless units (pure functions, presentational components with zero shared/app-level dependencies) -- key off "consumes shared/app state," not "is a UI file." Illustrative wording for a React + Redux target repo: `- [ ] At least one test renders <Component> through the app's real <Provider store={realStore}> / router tree (or documents a smallest-real-ancestor exception in ### Approach), not solely via an isolated render with a hand-built store`. See `docs/composition-root-testing.md` for the full definition, acceptable-exception rules, and the `test_review:COMPOSITION_ROOT_MISSING` enforcement this item is checked against.
 14. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
 15. `## Comments` -- header only (blank at authoring time)
@@ -138,8 +138,46 @@ Extract:
 - All acceptance criteria (AC-N identifiers from the spec's Section 6 or equivalent)
 - All constraints, NFRs, and implementation notes
 - The target repository and branch
+- Layout/geometry-sensitive language within each AC (Step 3a tagging, below)
 
 Record the FR list for coverage validation in the iterate-until-perfect loop.
+
+### 3a -- Tag layout/geometry-sensitive acceptance criteria (heuristic, not a guarantee)
+
+Standard jsdom-style unit-test environments have no real layout, paint, or cascade
+engine -- they can assert prop wiring or CSS source text, never rendered geometry. An
+AC whose behaviour can only be *observed* by a real renderer (sticky positioning,
+circular height/width measurement, flex-shrink collapse across an ancestor chain,
+media-query cascade/specificity, third-party grid autosize side effects, overlapping or
+pointer-blocking elements) is not provable by that kind of test alone, no matter how the
+implementation is written.
+
+While extracting ACs (above), keyword-scan each AC's text (case-insensitive, substring
+match) for layout/CSS-geometry-sensitive language: `sticky`, `z-index`, `viewport`,
+`breakpoint`, `flex-shrink`, `autosize`, `overlap`, `position: fixed`,
+`position: absolute`, `cascade`, `specificity`. An AC matching one or more of these terms
+is a **Layout/Visual AC** -- tag it `[LAYOUT-AC]` so every leaf task descending from it
+carries the tag through Step 5.
+
+**This is a keyword heuristic, not a guarantee.** Expect both:
+- **False positives** -- an AC that mentions "width" or "position" with no real rendered-geometry
+  risk (e.g. "the API response includes the item's `position` field"). Tagging it costs an
+  extra DoD line the operator can waive with a one-line justification in `## Comments`; it
+  is not a hard scope boundary.
+- **False negatives** -- a layout risk that only becomes visible in the implementation (a
+  third-party component the AC text never named turns out to use `ResizeObserver`
+  internally) and was never named in the AC text to begin with. The executor or reviewer
+  may retroactively tag an untagged task the same way, with the same one-line
+  justification convention, if implementation reveals a layout risk the AC text didn't
+  surface.
+
+Any leaf task whose Acceptance Criteria include a `[LAYOUT-AC]`-tagged item MUST, when
+authored in Step 5a:
+- Carry the `[LAYOUT-AC]` marker on the AC line itself in `## Acceptance Criteria`.
+- Carry a Definition of Done line requiring real-render/live-browser verification (e.g.
+  Playwright -- the most common case for web UI work, though the check applies equally to
+  any stack whose standard unit-test harness has no real layout/rendering engine) at the
+  specific viewport(s)/breakpoint(s) the AC names. See Step 1b item 13.
 
 **Declared work-group dependency (dependency-ancestry-gate)**: also extract any declared prerequisite on another work group's branch merging first. This is expressed either explicitly by the operator in their invocation message (e.g. "this work group depends on `<name>`, branch `origin/<dependency-branch>`, which must merge into `<target-branch>` before this work starts") or via a `## Dependencies` / `## Prerequisites` section in the spec naming another work group and its branch. When found, record:
 
@@ -340,6 +378,7 @@ See `docs/cross-backlog-dependencies.md` for the full worked pattern and the doc
 - Generic 11-step Approach templates. Approach steps MUST reference the specific files, lines, and pytest commands for THIS task.
 - DoR / DoD items mentioning paths not in this task's Changes Manifest. Either include the path in the Manifest, or rewrite the item behaviourally (no path tokens), or suffix the token with `(ref)`.
 - Glob patterns (``*`` or ``**``) in any Manifest row. Use a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` instead and rely on the orchestrator's `manifest_amendment` workflow to concretise the file list at execution time.
+- A `[LAYOUT-AC]`-tagged task (Step 3a) whose `## Definition of Done` treats a jsdom-only test, or a test that stubs a layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent), as sufficient proof of completion. The DoD line required by Step 1b item 13 must be present and must not be satisfiable by stub-only evidence.
 
 **Canonical dep-ID form (issue #229)**: every row in `## Dependencies` and `### Depends On This` MUST have its first column match the regex `E\d+(-F\d+)?(-S\d+)?(-T\d+)?`. Directory names are slugs (e.g., `E16-test-cleanup`) and are NOT valid IDs. Use the bare `E<n>` / `E<n>-F<m>` form. When citing existing-backlog epics, look up the canonical ID from `BACKLOG.md`'s Full Work Unit Index ID column (the first cell of each index row). The validator's `_check_dep_id_format` rule rejects slug-form IDs with `dependency ID '<slug>' does not match the canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]`. The `normalize_dep_ids` post-processor pass (Step 5d) rewrites slug-form IDs to canonical form when found.
 
@@ -385,6 +424,7 @@ Score each item PASS or FAIL:
 12. **AC-FINAL tier-suffix on non-Python tasks** (issue #228): when this task's Changes Manifest contains zero `.py` paths, the Python-tooling AC-FINAL lines (`AC-FINAL-002` ruff format, `AC-FINAL-003` ruff check, `AC-FINAL-004` mypy, `AC-FINAL-005` pytest tier, `AC-FINAL-006` pytest other tier, `AC-FINAL-008` bandit, `AC-FINAL-014` coverage) MUST carry the explicit suffix `-- N/A for <Tier> Tasks (no Python source authored)`. Tier is derived from the dominant Manifest file extension: `.yml` / `.yaml` -> `YAML`, `.md` -> `Markdown`, `.toml` -> `TOML`, `.tf` / `.hcl` / `.tfvars` -> `HCL`, `.json` -> `JSON`, `.xml` -> `XML`; manifests with multiple non-Python extensions report `Mixed`. FAIL if a non-Python task lacks the suffix on any of those AC-FINAL lines. The `suffix_na_on_non_python_tasks` post-processor pass (Step 5d) deterministically adds the suffix when missing. See `docs/acceptance-criteria-canonical.md`.
 13. **Write-path task is distinct and seam-referenced** (QA finding 07): if this task IS a permission/eligibility flag's write-path task (Step 4a), it does NOT also carry "add field to state" or "gate UI" scope (those stay in their own tasks), and its `### Approach` + `## Acceptance Criteria` name the placeholder/mock seam path from Step 3b-iv when one was found. If this task instead ADDS or GATES a permission/eligibility field, it does NOT itself claim to establish that field's write-path -- its Description or AC defers write-path responsibility to the dedicated task by ID. FAIL if either boundary is blurred (a write-path task also doing state/UI work, or a state/UI task silently claiming the write-path is handled). N/A for tasks that touch no permission/eligibility field.
 13. **Composition-root DoD item present when required** (caylent-solutions/devbench-internal-backlog#11): if the Changes Manifest adds or modifies a UI component (or equivalent presentation-layer unit) that consumes shared/app-level state, `## Definition of Done` contains an explicit item requiring a test through the real composition root (per Step 1b item 13 and `docs/composition-root-testing.md`). FAIL if such a task's manifest touches a state-consuming UI component and the DoD has no such item. Auto-PASS (not applicable) for tasks whose Changes Manifest contains no UI-component files, or whose UI components are genuinely stateless with no shared/app-level dependencies.
+13. **Layout/Visual AC Definition of Done**: when this task's `## Acceptance Criteria` contains any AC tagged `[LAYOUT-AC]` (Step 3a keyword heuristic: sticky, z-index, viewport, breakpoint, flex-shrink, autosize, overlap, position: fixed/absolute, cascade/specificity), `## Definition of Done` MUST contain an explicit real-render/live-browser verification line (e.g. Playwright, or the equivalent real-renderer for the target stack) naming the specific viewport(s)/breakpoint(s) from the AC. A jsdom-only test, or a test that stubs a layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent) without a companion real-render assertion for the same AC, is NOT sufficient proof of completion for that item. FAIL if a `[LAYOUT-AC]`-tagged task's Definition of Done omits this line or the line is satisfiable by stub-only evidence. This is a heuristic gate, not a guarantee -- false positives/negatives from the Step 3a keyword scan are expected and may be corrected with a one-line justification in `## Comments` rather than a rubric failure, provided the justification is present.
 
 ### 5c -- Revise
 
@@ -588,6 +628,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
 - **Per-task depth**: every task contains all 15 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
 - **Cross-work-group dependencies**: when a work-group dependency is declared (Step 3), a mandatory `E0-F<N>-S1-T1` ancestry-gate task blocks every root of the dependency DAG until `devbench check-ancestry` confirms the prerequisite has merged (see `docs/cross-backlog-dependencies.md`)
+- **Layout/Visual AC tagging**: ACs matching the Step 3a keyword heuristic are tagged `[LAYOUT-AC]` and their leaf tasks carry a Definition of Done line requiring real-render/live-browser verification -- a jsdom-only test is not sufficient proof of completion for those items. The keyword scan is a heuristic (documented false positives/negatives), not a guarantee -- see Step 3a.
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 

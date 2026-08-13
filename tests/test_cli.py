@@ -16308,6 +16308,157 @@ class TestCmdReconcileCascade:
         assert argc == 0
 
 
+class TestReconcileCascadeRepairsStrandedParents:
+    """E17-F1-S2-T1 (#332 FR-2): a second pass in ``reconcile-cascade`` repairs
+    containers (Story/Feature/Epic) that were already stranded before the
+    FR-1 live-rollup fix existed -- every child terminal, but the triggering
+    transition that would have promoted the parent has already passed, so
+    no live event remains to do it. The sweep walks every non-terminal
+    container, evaluates ``BacklogManager._all_children_done`` fresh, and
+    promotes qualifying containers, cascading upward exactly as a live
+    rollup would.
+    """
+
+    def test_stranded_chain_rolls_up_and_cascades_upward(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E14", "Epic", "in-queue", "None", "E14", ""),
+                ("E14-F1", "Feature", "in-queue", "None", "E14-F1", ""),
+                ("E14-F1-S1", "Story", "in-queue", "None", "E14-F1-S1", ""),
+                ("E14-F1-S1-T1", "Task", "done", "None", "E14-F1-S1-T1", ""),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert set(envelope["rolled_up"]) == {"E14", "E14-F1", "E14-F1-S1"}
+
+        for container_id in ("E14", "E14-F1", "E14-F1-S1"):
+            content = (tmp_path / "backlog" / f"{container_id}.md").read_text()
+            assert "## Status: done" in content
+
+        # The directly-promoted Story (the sweep's own seed write) carries
+        # the reconcile-cascade audit marker; its ancestors are promoted
+        # purely as a cascade side-effect of that write (the same
+        # ``_rollup_parent_status`` path a live terminal transition uses)
+        # and so carry the standard auto-rollup audit comment instead.
+        story_content = (tmp_path / "backlog" / "E14-F1-S1.md").read_text()
+        assert "[CASCADE_RECONCILED]" in story_content
+        for container_id in ("E14", "E14-F1"):
+            content = (tmp_path / "backlog" / f"{container_id}.md").read_text()
+            assert "Auto-rolled to done -- all children completed" in content
+
+        assert "reconcile-cascade: 0 flipped, 0 skipped, 3 parent(s) rolled up" in caplog.text
+
+    def test_second_run_is_idempotent_and_reports_zero_rolled_up(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E14", "Epic", "in-queue", "None", "E14", ""),
+                ("E14-F1", "Feature", "in-queue", "None", "E14-F1", ""),
+                ("E14-F1-S1", "Story", "in-queue", "None", "E14-F1-S1", ""),
+                ("E14-F1-S1-T1", "Task", "done", "None", "E14-F1-S1-T1", ""),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            first_rc = cli.cmd_reconcile_cascade()
+            capsys.readouterr()
+            second_rc = cli.cmd_reconcile_cascade()
+        assert first_rc == 0
+        assert second_rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["rolled_up"] == []
+
+    def test_container_with_non_terminal_child_is_left_alone(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E15", "Epic", "in-queue", "None", "E15", ""),
+                ("E15-F1", "Feature", "in-queue", "None", "E15-F1", ""),
+                ("E15-F1-S1", "Story", "in-queue", "None", "E15-F1-S1", ""),
+                ("E15-F1-S1-T1", "Task", "in-progress", "None", "E15-F1-S1-T1", ""),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["rolled_up"] == []
+        for container_id in ("E15", "E15-F1", "E15-F1-S1"):
+            content = (tmp_path / "backlog" / f"{container_id}.md").read_text()
+            assert "## Status: in-queue" in content
+
+    def test_unresolvable_container_is_skipped_with_warning(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E16", "Epic", "in-queue", "None", "E16", ""),
+                ("E16-F1", "Feature", "in-queue", "None", "E16-F1", ""),
+                ("E16-F1-S1", "Story", "in-queue", "None", "E16-F1-S1", ""),
+                ("E16-F1-S1-T1", "Task", "done", "None", "E16-F1-S1-T1", ""),
+            ],
+        )
+        # Blank the Story row's File Path cell so the parser tolerates the
+        # file-less container row (FR-20) instead of raising, while
+        # ``_parse_backlog_rows`` (which the repair sweep reads directly)
+        # still surfaces the row -- with a file that cannot be resolved.
+        content = index.read_text()
+        assert "`backlog/E16-F1-S1.md`" in content
+        content = content.replace("`backlog/E16-F1-S1.md`", "")
+        index.write_text(content)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        skip_reasons = {item["unit_id"]: item["reason"] for item in envelope["skipped"]}
+        assert "E16-F1-S1" in skip_reasons
+        assert "file" in skip_reasons["E16-F1-S1"].lower()
+        # The Story could not be promoted, so its ancestors must not be
+        # force-promoted either.
+        assert "E16-F1" not in envelope["rolled_up"]
+        assert "E16" not in envelope["rolled_up"]
+        assert any("E16-F1-S1" in record.message for record in caplog.records)
+
+
 class TestVariadicCommandsCoverage:
     """Issue #152: every command whose body parses a ``--<flag> <value>`` pair
     must be registered in ``_VARIADIC_COMMANDS``. Auto-discover via the

@@ -254,6 +254,7 @@ from devbench.constants import (
     SESSION_STARTED_AT_FILENAME,
     SESSION_STARTED_BY_FILENAME,
     STATUS_BLOCKED,
+    STATUS_DECLINED,
     STATUS_DONE,
     STATUS_DRAFT,
     STATUS_IN_PROGRESS,
@@ -2517,7 +2518,17 @@ def cmd_reconcile_cascade() -> int:
     Tasks left blocked are reported with the reason (open marker, unknown
     marker target, unsatisfied dep) so the operator can decide what to do.
 
-    Returns 0 always; output is a JSON envelope listing flips + skips.
+    Issue #332 FR-2: a second pass repairs containers (Story/Feature/Epic)
+    that were stranded BEFORE the FR-1 live-rollup fix existed. The
+    triggering terminal transition that would have promoted such a
+    container has already happened, so no live event remains to promote
+    it. This pass walks every non-terminal container, evaluates
+    ``BacklogManager._all_children_done`` fresh, and promotes qualifying
+    containers -- cascading upward exactly as a live rollup would. See
+    :func:`_repair_stranded_containers`.
+
+    Returns 0 always; output is a JSON envelope listing flips + skips +
+    rolled-up containers.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -2575,16 +2586,115 @@ def cmd_reconcile_cascade() -> int:
         manager._append_agent_comment(wu_file, "backlog_manager", message)
         flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
 
+    # Issue #332 FR-2: repair containers stranded before the FR-1 rollup fix
+    # existed -- walk every non-terminal Story/Feature/Epic, promote the
+    # ones whose children are all terminal, cascading upward exactly as a
+    # live rollup would.
+    rolled_up = _repair_stranded_containers(manager, BACKLOG_INDEX, skipped)
+
     # Issues #207, #209: surface classification transitions for tasks that remain
     # blocked after the reconcile sweep -- a stale ``[BLOCKED]`` audit that
     # has drifted into ``OPERATOR_ACTION_REQUIRED`` produces exactly one
     # Slack ping.  Cache-backed, idempotent across repeated invocations.
     _notify_blocked_classification_transitions(units)
 
-    output = {"flipped": flipped, "skipped": skipped}
+    output = {"flipped": flipped, "skipped": skipped, "rolled_up": rolled_up}
     print(json.dumps(output))
-    logger.info("reconcile-cascade: %d flipped, %d skipped", len(flipped), len(skipped))
+    logger.info(
+        "reconcile-cascade: %d flipped, %d skipped, %d parent(s) rolled up",
+        len(flipped),
+        len(skipped),
+        len(rolled_up),
+    )
     return 0
+
+
+# Matches Epic / Feature / Story compound IDs (0, 1, or 2 hyphens) while
+# explicitly excluding Task IDs (which always carry a trailing ``-T<n>``
+# segment) and non-ID table noise (header cells, separator rows, the
+# Status Summary table's numeric rows -- none of which match ``E\d+...``).
+_CONTAINER_ID_RE = re.compile(r"^E\d+(-F\d+(-S\d+)?)?$")
+
+
+def _repair_stranded_containers(
+    manager: BacklogManager,
+    backlog_index: Path,
+    skipped: list[dict[str, str]],
+) -> list[str]:
+    """Promote already-stranded Story/Feature/Epic containers (#332 FR-2).
+
+    The live auto-rollup cascade (``BacklogManager._set_status`` ->
+    ``_rollup_parent_status``) only fires from a fresh terminal transition.
+    A container stranded BEFORE that trigger existed -- or missed by a
+    crashed/partial write -- has no event left that could promote it. This
+    walks every non-terminal container directly from ``BACKLOG.md`` (via
+    ``BacklogManager._parse_backlog_rows``, which -- unlike
+    ``BacklogParser.parse_index`` -- does not require the container's own
+    ``.md`` file to exist, so a file-less container row is still visible
+    here rather than crashing the whole command), evaluates
+    ``BacklogManager._all_children_done`` fresh for each, and promotes
+    qualifying containers via ``BacklogManager._set_status`` -- the exact
+    private call ``_rollup_parent_status`` itself uses, so a promotion's
+    own terminal transition re-triggers ``_rollup_parent_status`` for its
+    own parent, cascading upward exactly as a live rollup would.
+
+    Runs the whole evaluate-and-promote sequence under a single
+    ``flock_backlog`` acquisition so a concurrent orchestrator process
+    cannot interleave a write mid-sweep.
+
+    Args:
+        manager: Shared ``BacklogManager`` instance.
+        backlog_index: Path to ``BACKLOG.md``.
+        skipped: The reconcile-cascade skip list; a container whose
+            work-unit file cannot be resolved is appended here (never
+            silently dropped).
+
+    Returns:
+        Every container ID that was non-terminal when the sweep started
+        and is ``done`` when it finished -- credits both containers
+        promoted directly by this sweep and ones promoted purely as a
+        cascade side-effect of promoting a descendant.
+    """
+    terminal_statuses = {STATUS_DONE, STATUS_DECLINED}
+
+    with flock_backlog(WORKSPACE_ROOT):
+        rows = manager._parse_backlog_rows(backlog_index)
+        # Rows with an empty status (e.g. the Status Summary table's
+        # numeric-count rows, which share Epic IDs with the Full Work Unit
+        # Index but carry no recognised status cell) never contribute a
+        # status here, so the dict naturally prefers the real Index row.
+        containers_by_id: dict[str, str] = {
+            row_id: status for row_id, status, _file_path in rows if status and _CONTAINER_ID_RE.match(row_id)
+        }
+        candidates = [cid for cid, status in containers_by_id.items() if status not in terminal_statuses]
+        # Deepest (Story) first: a promoted Story's own terminal transition
+        # cascades upward automatically, so later Feature/Epic entries in
+        # this same pass are usually already ``done`` by the time they are
+        # reached directly below.
+        candidates.sort(key=lambda cid: cid.count("-"), reverse=True)
+
+        for container_id in candidates:
+            fresh_rows = manager._parse_backlog_rows(backlog_index)
+            if not manager._all_children_done(fresh_rows, container_id):
+                continue
+            container_file = manager._find_work_unit_file(fresh_rows, container_id, backlog_index.parent)
+            if container_file is None:
+                skipped.append({"unit_id": container_id, "reason": "container work-unit file missing"})
+                logger.warning(
+                    "reconcile-cascade: cannot resolve work-unit file for container %s -- counted as skipped",
+                    container_id,
+                )
+                continue
+            manager._set_status(container_file, backlog_index, container_id, STATUS_DONE)
+            manager._append_agent_comment(
+                container_file,
+                "backlog_manager",
+                "[CASCADE_RECONCILED] all children terminal; rolling up to done via repair sweep",
+            )
+
+        final_rows = manager._parse_backlog_rows(backlog_index)
+        final_statuses = {row_id: status for row_id, status, _file_path in final_rows if status}
+        return [cid for cid in candidates if final_statuses.get(cid) == STATUS_DONE]
 
 
 def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> str:
@@ -12278,7 +12388,9 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         (
             "Walk every blocked task; flip eligible ones (markers all terminal "
             "AND regular deps satisfied) to in-queue with a [CASCADE_RECONCILED] "
-            "audit. Returns JSON envelope of flips + skips."
+            "audit. Also repairs already-stranded Story/Feature/Epic containers "
+            "(#332 FR-2), promoting any whose children are all terminal and "
+            "cascading upward. Returns JSON envelope of flips + skips + rolled_up."
         ),
     ),
     "new-task": (

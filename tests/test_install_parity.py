@@ -39,12 +39,23 @@ def _git(args: list[str], cwd: Path) -> str:
     return result.stdout.strip()
 
 
+def _configure_identity(path: Path) -> None:
+    """Configure a deterministic repo-local git identity for commits under *path*.
+
+    Required because CI runners have no global git identity (unlike local
+    developer machines) and ``git clone`` does not copy the source repo's
+    local ``.git/config`` identity into the destination checkout.
+    """
+    _git(["config", "user.email", "install-parity-test@example.com"], path)
+    _git(["config", "user.name", "Install Parity Test"], path)
+    _git(["config", "commit.gpgsign", "false"], path)
+
+
 def _init_repo(path: Path, *, origin_url: str | None = None) -> None:
     """Initialise a git repo at *path* with a deterministic identity and one commit."""
     path.mkdir(parents=True, exist_ok=True)
     _git(["init", "--initial-branch=main"], path)
-    _git(["config", "user.email", "install-parity-test@example.com"], path)
-    _git(["config", "user.name", "Install Parity Test"], path)
+    _configure_identity(path)
     (path / "README.md").write_text("# fixture\n", encoding="utf-8")
     _git(["add", "README.md"], path)
     _git(["commit", "-m", "initial commit"], path)
@@ -63,8 +74,14 @@ def _commit_file(path: Path, relative: str, content: str, message: str) -> str:
 
 
 def _clone(src: Path, dest: Path) -> None:
-    """Clone *src* into *dest* on the local filesystem (no network)."""
+    """Clone *src* into *dest* on the local filesystem (no network) with a repo-local identity.
+
+    Configures the target checkout's identity immediately after cloning, before
+    any caller can commit into it (git clone does not inherit the source repo's
+    local identity).
+    """
     subprocess.run(["git", "clone", str(src), str(dest)], check=True, capture_output=True, text=True)
+    _configure_identity(dest)
 
 
 def _patch_harness_root(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:

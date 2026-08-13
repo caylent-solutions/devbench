@@ -547,6 +547,155 @@ class TestRollupParentStatus:
             pytest.fail("E0-F1 feature row not found")
 
 
+class TestRollupFiresOnDeclinedTransition:
+    """Issue #332 / spec FR-1: ``_rollup_parent_status`` must run on ANY
+    terminal transition (``done`` OR ``declined``), not only ``done``.
+
+    Mirrors the precedent set by issue #147 for the auto-requeue cascade
+    (see ``TestAutoRequeueOnDeclineTransition``): before this fix the
+    rollup call sat behind an ``if canonical == STATUS_DONE:`` guard, so a
+    parent whose last remaining child resolved via Declined (rather than
+    Done) never triggered the promotion check at all.
+    """
+
+    def test_last_child_declined_rollup_cascades_to_feature_and_epic(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A story's sole child transitioning to Declined (never Done) must
+        still roll the story to done, cascading through the feature to the
+        epic."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+| E0-F1 | Feature | Feature | in-queue | None | git-repo | `backlog/E0-F1.md` |
+| E0 | Epic | Epic | in-queue | None | git-repo | `backlog/E0.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t1_file = backlog_dir / "E0-F1-S1-T1.md"
+        t1_file.write_text("# E0-F1-S1-T1\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+        feature_file = backlog_dir / "E0-F1.md"
+        feature_file.write_text("# E0-F1\n\n## Status: in-queue\n")
+        epic_file = backlog_dir / "E0.md"
+        epic_file.write_text("# E0\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        judge.mark_declined(t1_file, index_path, "E0-F1-S1-T1", "scope changed")
+
+        assert "## Status: done" in story_file.read_text()
+        assert "## Status: done" in feature_file.read_text()
+        assert "## Status: done" in epic_file.read_text()
+
+    def test_mixed_done_declined_children_rollup(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A parent with one Done and one freshly-Declined child rolls up."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | done | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t2_file = backlog_dir / "E0-F1-S1-T2.md"
+        t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        judge.mark_declined(t2_file, index_path, "E0-F1-S1-T2", "duplicate of T1")
+
+        assert "## Status: done" in story_file.read_text()
+
+    def test_non_terminal_sibling_blocks_declined_rollup(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Regression guard: a remaining non-terminal sibling still blocks
+        rollup after another sibling is declined."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | in-progress | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t2_file = backlog_dir / "E0-F1-S1-T2.md"
+        t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        judge.mark_declined(t2_file, index_path, "E0-F1-S1-T2", "not needed")
+
+        # T1 is still in-progress -- the story must NOT roll up.
+        assert "## Status: in-queue" in story_file.read_text()
+
+    def test_declined_transition_requeue_runs_before_rollup(self, tmp_path: Path) -> None:
+        """Ordering invariant holds for the declined branch too: the
+        sideways auto-requeue cascade must fire BEFORE the rollup check
+        runs, so a sibling freshly unblocked by the requeue is correctly
+        seen as non-terminal and blocks promotion.
+        """
+        markers = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=markers,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "in-queue")
+
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0 | Example | Epic | in-queue | None | example/repo | `backlog/E0.md` |\n"
+            "| E0-F1 | Feature | Feature | in-queue | None | example/repo | `backlog/E0-F1.md` |\n"
+            "| E0-F1-S1 | Story | Story | in-queue | None | example/repo | `backlog/E0-F1-S1.md` |\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | example/repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Dep | Task | in-queue | None | example/repo | `backlog/E0-F1-S1-T2.md` |\n",
+            encoding="utf-8",
+        )
+        (backlog_subdir / "E0.md").write_text("# E0\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_subdir / "E0-F1.md").write_text("# E0-F1\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_subdir / "E0-F1-S1.md").write_text("# E0-F1-S1\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_subdir / "E0-F1-S1-T1.md").write_text(src_file, encoding="utf-8")
+        (backlog_subdir / "E0-F1-S1-T2.md").write_text(dep_file, encoding="utf-8")
+
+        mgr = BacklogManager()
+        mgr.mark_declined(backlog_subdir / "E0-F1-S1-T2.md", index_path, "E0-F1-S1-T2", "duplicate work")
+
+        # T1 was requeued by the marker cascade.
+        t1 = (backlog_subdir / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in t1
+
+        # Parent Story S1 was NOT auto-rolled to done because T1 is now
+        # in-queue (not terminal) -- proof the requeue ran before rollup.
+        s1 = (backlog_subdir / "E0-F1-S1.md").read_text()
+        assert "## Status: in-queue" in s1
+
+
 class TestLogToTraceabilityMatrix:
     """Test traceability matrix logging."""
 

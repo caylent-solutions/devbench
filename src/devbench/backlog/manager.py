@@ -1689,8 +1689,16 @@ class BacklogManager:
                 # Dependencies table, no marker) were marooned. The regular-dep
                 # cascade closes that gap.
                 self._auto_requeue_regular_dep_dependents(backlog_index, unit_id)
-            if canonical == STATUS_DONE:
-                self._rollup_parent_status(backlog_index, unit_id)
+            # Issue #332: the rollup must run for every terminal transition
+            # (``done`` AND ``declined``), matching the #147 fix applied to
+            # the requeue cascade two calls above. A story whose last open
+            # child is Declined (not Done) previously never triggered this
+            # call, stranding the story -- and its feature/epic ancestors --
+            # in a non-terminal status forever. Runs AFTER both requeue
+            # calls: a child freshly unblocked by the requeue must be seen
+            # as non-terminal by ``_all_children_done`` so the rollup
+            # correctly declines to promote the parent.
+            self._rollup_parent_status(backlog_index, unit_id)
 
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.

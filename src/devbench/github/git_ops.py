@@ -48,6 +48,14 @@ _FAILING_CHECK_STATES: frozenset[str] = frozenset({"FAILURE", "TIMED_OUT", "CANC
 #: action_required, stale) refuses the merge immediately.
 _GOOD_CHECK_CONCLUSIONS: frozenset[str] = frozenset({"success", "neutral", "skipped"})
 
+#: #332 FR-3 / D-5: inline git credential helper, scoped to a single
+#: invocation via ``git -c credential.helper=<this>`` (never written to
+#: persistent git config). It answers a credential "get" request by reading
+#: ``GH_TOKEN`` from the subprocess environment -- the token is never placed
+#: in argv, a remote URL, or a log line. "store"/"erase" requests are
+#: ignored (no output), so this helper never persists or evicts anything.
+_GIT_CREDENTIAL_HELPER = '!f() { test "$1" = get && printf "username=x-access-token\\npassword=%s\\n" "$GH_TOKEN"; }; f'
+
 
 def _first_failing_job_link(checks: object, failing_states: AbstractSet[str]) -> str:
     """Return the link URL of the first failing check entry, or the empty string.
@@ -1461,11 +1469,41 @@ class GitOpsService:
             )
         return stdout.strip().removeprefix("origin/")
 
+    @staticmethod
+    def _env_with_gh_token() -> dict[str, str]:
+        """Return a copy of the process environment with ``GH_TOKEN`` set.
+
+        Shared by :meth:`_git` and :meth:`_gh` so every git/gh subprocess
+        authenticates against the same resolved token
+        (:func:`get_gh_token`) without duplicating the merge logic. Raises
+        ``RuntimeError`` (via :func:`get_gh_token`) when no token can be
+        resolved, before any subprocess runs.
+        """
+        return {**os.environ, "GH_TOKEN": get_gh_token()}
+
     def _git(self, args: list[str], cwd: Path) -> tuple[int, str, str]:
-        """Run a ``git`` command, raising ``RuntimeError`` on failure."""
-        cmd = ["git"] + args
+        """Run a ``git`` command, raising ``RuntimeError`` on failure.
+
+        Authenticates on the same ``GH_TOKEN`` :meth:`_gh` uses
+        (:func:`get_gh_token`), carried only through the subprocess
+        environment. An inline ``credential.helper``, scoped to this
+        invocation via ``-c`` (never a remote URL), reads the token from
+        that environment variable at credential-fetch time, so it never
+        appears in ``argv``, a remote URL, or a log line (spec Section 13
+        D-5). A missing token fails fast here, before any subprocess runs.
+
+        The first ``-c credential.helper=`` (empty value) resets git's
+        accumulated helper list before registering ours -- git config
+        merges ``credential.helper`` entries across scopes rather than
+        replacing them, so without the reset an ambient system/global
+        helper would still be consulted alongside (and could still win
+        over) the token-backed one, which is exactly the stale-credential
+        failure mode this method exists to eliminate.
+        """
+        env = self._env_with_gh_token()
+        cmd = ["git", "-c", "credential.helper=", "-c", f"credential.helper={_GIT_CREDENTIAL_HELPER}"] + args
         self.logger.debug("git cmd=%r cwd=%s", cmd, cwd)
-        rc, stdout, stderr = run_command(cmd, cwd=cwd)
+        rc, stdout, stderr = run_command(cmd, cwd=cwd, env=env)
         self.logger.debug(
             "git exit=%d stdout=%r stderr=%r",
             rc,
@@ -1493,8 +1531,7 @@ class GitOpsService:
                 ``--repo`` is prepended to *args* so ``gh`` targets the correct
                 repository instead of inferring it from fork metadata.
         """
-        token = get_gh_token()
-        env = {**os.environ, "GH_TOKEN": token}
+        env = self._env_with_gh_token()
         effective_timeout = timeout if timeout is not None else GH_API_TIMEOUT
         repo_args = ["--repo", repo] if repo else []
         cmd = ["gh"] + args + repo_args

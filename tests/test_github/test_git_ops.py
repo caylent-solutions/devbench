@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1118,20 +1119,147 @@ class TestUpdateParentSubmoduleRef:
 
 
 class TestGitHelper:
-    """Test _git helper method."""
+    """Test _git helper method.
+
+    #332 FR-3 / AC-9, AC-10, AC-11: ``_git()`` must authenticate on the same
+    ``GH_TOKEN`` the ``gh`` helper (:meth:`GitOpsService._gh`) already uses,
+    carried only through the subprocess environment -- never in ``argv``, a
+    remote URL, or a log line.
+    """
 
     def test_raises_runtime_error_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch("devbench.github.git_ops.run_command", return_value=(1, "", "fatal: error")):
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok"),
+            patch("devbench.github.git_ops.run_command", return_value=(1, "", "fatal: error")),
+        ):
             with pytest.raises(RuntimeError, match=r"git .* failed"):
                 judge._git(["status"], tmp_path)
 
     def test_returns_tuple_on_success(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch("devbench.github.git_ops.run_command", return_value=(0, "output", "")):
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok"),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "output", "")),
+        ):
             rc, stdout, stderr = judge._git(["status"], tmp_path)
         assert rc == 0
         assert stdout == "output"
+
+    def test_git_carries_gh_token_via_env(self, tmp_path: Path) -> None:
+        """AC-9: ``_git()`` resolves ``get_gh_token()`` and threads it through env."""
+        judge = GitOpsService()
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok-abc-123"),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")) as mock_run,
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["env"]["GH_TOKEN"] == "tok-abc-123"
+
+    def test_git_token_never_in_argv_or_remote_url(self, tmp_path: Path) -> None:
+        """AC-9: the token value never appears in any element of argv (incl. a remote URL)."""
+        judge = GitOpsService()
+        token = "tok-abc-123"
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value=token),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")) as mock_run,
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        cmd = mock_run.call_args.args[0]
+        assert all(token not in part for part in cmd), f"token leaked into argv: {cmd}"
+        assert all("@" not in part or token not in part for part in cmd), f"token leaked into a URL: {cmd}"
+
+    def test_git_debug_log_never_contains_token(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-11: no log line emitted by ``_git()`` renders the token value."""
+        judge = GitOpsService()
+        token = "tok-super-secret-999"
+        caplog.set_level(logging.DEBUG, logger="devbench.git_ops")
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value=token),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "ok stdout", "")),
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        assert token not in caplog.text
+
+    def test_git_failing_push_raises_with_stderr_surfaced(self, tmp_path: Path) -> None:
+        """AC-10: a failing push exits non-zero (via RuntimeError) with git's stderr surfaced."""
+        judge = GitOpsService()
+        stderr = "remote: No anonymous write access. fatal: Authentication failed for 'https://github.com/x/y.git/'"
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok"),
+            patch("devbench.github.git_ops.run_command", return_value=(1, "", stderr)),
+        ):
+            with pytest.raises(RuntimeError, match="Authentication failed"):
+                judge._git(["push", "origin", "feature/x"], tmp_path)
+
+    def test_git_raises_when_token_unavailable(self, tmp_path: Path) -> None:
+        """A missing token fails fast at get_gh_token() before any subprocess runs."""
+        judge = GitOpsService()
+        with (
+            patch(
+                "devbench.github.git_ops.get_gh_token",
+                side_effect=RuntimeError("GitHub token not found. Provide it via ..."),
+            ),
+            patch("devbench.github.git_ops.run_command") as mock_run,
+        ):
+            with pytest.raises(RuntimeError, match="GitHub token not found"):
+                judge._git(["status"], tmp_path)
+        mock_run.assert_not_called()
+
+    def test_git_credential_helper_resolves_token_from_env_via_real_git(self, tmp_path: Path) -> None:
+        """The real ``credential.helper`` string _git() builds genuinely reads GH_TOKEN.
+
+        Captures the exact argv/env ``_git()`` constructs, then re-executes it
+        through git's own ``credential fill`` plumbing -- the same mechanism a
+        real ``git push`` uses internally to fetch credentials -- so a shell
+        syntax bug in the inline helper (invisible to a fully-mocked test)
+        fails this test.
+        """
+        judge = GitOpsService()
+        token = "test-token-value-xyz"
+        captured_cmd: list[str] = []
+        captured_env: dict[str, str] | None = None
+
+        def _capture_run_command(
+            cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            nonlocal captured_cmd, captured_env
+            captured_cmd = cmd
+            captured_env = env
+            return 0, "", ""
+
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value=token),
+            patch("devbench.github.git_ops.run_command", side_effect=_capture_run_command),
+        ):
+            judge._git(["status"], tmp_path)
+
+        # The first five elements are git plus two -c flags: an empty-valued
+        # credential.helper reset (so an ambient system/global helper cannot
+        # also answer, and potentially win over, this one) followed by the
+        # helper that reads GH_TOKEN. See GitOpsService._git's docstring.
+        helper_prefix = captured_cmd[:5]
+        assert helper_prefix[0] == "git"
+        assert helper_prefix[1] == "-c"
+        assert helper_prefix[2] == "credential.helper="
+        assert helper_prefix[3] == "-c"
+        assert helper_prefix[4].startswith("credential.helper=")
+
+        result = subprocess.run(
+            [*helper_prefix, "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True,
+            text=True,
+            env=captured_env,
+            cwd=tmp_path,
+            check=True,
+        )
+        assert f"password={token}" in result.stdout
+        assert "username=x-access-token" in result.stdout
 
 
 class TestGhHelper:

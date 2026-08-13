@@ -5,6 +5,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Composition-root test verification for state-consuming UI tasks**
+  (`caylent-solutions/devbench-internal-backlog#11`). Backlog tasks were
+  repeatedly marked done with large green test suites that only ever
+  rendered a component in isolation (hand-supplied props, a locally-built
+  store, or a module-scope-mocked dependency) and never exercised the
+  app's real composition root, letting components ship that were never
+  wired into the running app, wired in wrong, or tested against a store
+  shape that had silently diverged from production. Adds rubric items to
+  `test-reviewer` requiring at least one test through the real
+  composition root (or a documented smallest-real-ancestor exception) for
+  any task touching a UI component that consumes shared/app-level state,
+  a new controlled rejection code `test_review:COMPOSITION_ROOT_MISSING`,
+  a `spec-to-backlog` Definition-of-Done requirement for tasks in that
+  category, and `docs/composition-root-testing.md` defining the
+  composition root, its scope, and acceptable exceptions.
+
 - **Fixture-catalog cross-reference check**
   (`caylent-solutions/devbench-internal-backlog#17`). A feature's data-fetch
   logic can be correct while reading from a mock/fixture lookup table whose

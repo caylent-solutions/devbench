@@ -123,6 +123,10 @@ Do NOT fail because files are staged but not yet committed -- commit happens in 
 55. If the evidence printed the skip note (no `fixture_consistency.canonical_sources` configured), this is NOT a finding either way -- the workspace has not opted in, so treat the check as silently absent, not as a pass or a fail signal.
 56. Do not flag a fixture value the evidence itself did not flag -- `allow_missing` entries in the workspace's config are the sanctioned way to scope an intentional edge-case fixture (e.g. testing an empty/not-found state); do not second-guess that allowlist from the diff alone.
 
+## COMPOSITION-ROOT / REAL-ENTRY-POINT VERIFICATION (caylent-solutions/devbench-internal-backlog#11)
+50. For any work unit that adds or modifies a UI component (or equivalent presentation-layer unit) consuming shared/app-level state (a global store, dependency-injection container, routing context, or any shared provider/composition tree the real app assembles at startup), at least one test MUST render/exercise that component through the application's real composition root -- its actual entry point, or the smallest real ancestor that reproduces production's actual provider/store/DI nesting -- not exclusively through hand-constructed test doubles for its dependencies. FAIL, and emit `test_review:COMPOSITION_ROOT_MISSING`, if the ONLY coverage for such a component is an isolated render with hand-supplied props, a locally-built store/DI container/provider, or a dependency mocked at module scope such that the dependency's real logic never runs. A component-in-isolation test may still exist alongside the composition-root test -- it just cannot be the sole coverage. See `docs/composition-root-testing.md` for the full definition, worked stack examples, and the smallest-real-ancestor exception.
+51. This requirement is scoped to state-consuming components -- do NOT flag genuinely stateless pure-logic units (a pure function, a presentational component with zero external/shared dependencies) for lacking a composition-root test; key off "consumes shared/app state," not "has any test." Illustrative note for a React + Redux target repo: an acceptable composition-root test mounts the component via the app's real `<Provider store={realStore}>` / router tree (or a documented smallest-real-ancestor exception recorded in the task's `### Approach` or `## Comments` section) rather than solely a bespoke `configureStore()` test double built only for the test.
+
 Be strict but fair. Fail for real test quality violations. Do not fail for subjective naming preferences that do not affect test reliability.
 
 ## OUT OF SCOPE FOR FINDINGS
@@ -152,7 +156,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback test_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`, `FIXTURE_CATALOG_MISMATCH`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`, `FIXTURE_CATALOG_MISMATCH`, `COMPOSITION_ROOT_MISSING`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

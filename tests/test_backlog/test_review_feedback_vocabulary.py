@@ -54,3 +54,13 @@ class TestIsValidCode:
 
     def test_empty_inputs_return_false(self) -> None:
         assert is_valid_code("", "") is False
+
+    def test_composition_root_missing_valid_for_test_review(self) -> None:
+        """caylent-solutions/devbench-internal-backlog#11: composition-root verification rejection code."""
+        assert is_valid_code("test_review", "COMPOSITION_ROOT_MISSING") is True
+
+    def test_composition_root_missing_not_valid_for_other_judges(self) -> None:
+        """The code is test_review-specific, not shared across judges."""
+        other_judges = [j for j in JUDGE_CATEGORIES if j != "test_review"]
+        for judge in other_judges:
+            assert is_valid_code(judge, "COMPOSITION_ROOT_MISSING") is False

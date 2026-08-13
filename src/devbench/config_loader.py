@@ -423,6 +423,66 @@ class ValidateConfig:
 
 
 @dataclass(frozen=True)
+class FixtureCanonicalSource:
+    """One canonical fixture/dataset file a workspace designates as authoritative.
+
+    Attributes:
+        path: Repo-relative path to the canonical fixture file (JSON or YAML).
+        identifier_field: Key name within each canonical record whose values
+            other fixtures must reference (SKU, product id, PO number, etc.).
+        expected_count: Optional exact expected number of distinct
+            ``identifier_field`` values. Set on a backfill task to assert
+            full dataset coverage; ``None`` skips the coverage check.
+    """
+
+    path: str
+    identifier_field: str
+    expected_count: int | None = None
+
+
+@dataclass(frozen=True)
+class FixtureScanTarget:
+    """One mock/fixture file to cross-reference against a canonical source.
+
+    Attributes:
+        path: Repo-relative path to the fixture file to scan (JSON or YAML).
+        identifier_field: Key name within each scanned record holding the
+            identifier literal(s) to cross-reference.
+        canonical_source: ``path`` of the ``FixtureCanonicalSource`` this
+            target checks against. ``None`` is valid only when exactly one
+            canonical source is configured (it is inferred in that case).
+        allow_missing: Identifier values explicitly permitted to be absent
+            from the canonical source -- the opt-out/scoping mechanism for
+            fixtures that intentionally model a not-found/empty-state edge
+            case (caylent-solutions/devbench-internal-backlog#17 AC3).
+    """
+
+    path: str
+    identifier_field: str
+    canonical_source: str | None = None
+    allow_missing: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+
+@dataclass(frozen=True)
+class FixtureConsistencyConfig:
+    """Per-backlog ``fixture_consistency:`` configuration.
+
+    Opt-in surface for ``devbench check-fixture-consistency``. Absent
+    ``canonical_sources`` (the default for every workspace that does not
+    configure this block) makes the check a no-op, since devbench cannot
+    infer a target repo's fixture-file layout on its own.
+
+    Attributes:
+        canonical_sources: Designated canonical fixture/dataset file(s).
+        scan: Mock/fixture files to cross-reference against a canonical
+            source.
+    """
+
+    canonical_sources: tuple[FixtureCanonicalSource, ...] = ()
+    scan: tuple[FixtureScanTarget, ...] = ()
+
+
+@dataclass(frozen=True)
 class TaskFactoryConfig:
     """Per-backlog task-factory configuration.
 
@@ -891,6 +951,82 @@ def _parse_task_factory_config(
     return TaskFactoryConfig(
         enabled=enabled,
         auto_accept_proposals=bool(task_factory_raw.get("auto_accept_proposals", defaults.auto_accept_proposals)),
+    )
+
+
+def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsistencyConfig:
+    """Parse and validate the ``fixture_consistency:`` YAML section.
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw ``fixture_consistency`` dict from YAML (already
+            schema-validated for unknown keys and types). May be an empty
+            dict when the section is absent -- that is the default,
+            opt-out state (the check becomes a no-op).
+
+    Returns:
+        A populated ``FixtureConsistencyConfig``.
+
+    Raises:
+        ValueError: If a ``canonical_sources`` entry has a non-positive
+            ``expected_count``; if any ``scan`` entry names a
+            ``canonical_source`` that does not match a configured
+            ``canonical_sources[].path``; or if a ``scan`` entry omits
+            ``canonical_source`` while more than one ``canonical_sources``
+            entry is configured (ambiguous target).
+    """
+    canonical_raw = raw.get("canonical_sources") or []
+    canonical_sources: list[FixtureCanonicalSource] = []
+    for entry in canonical_raw:
+        expected_count = entry.get("expected_count")
+        if expected_count is not None:
+            expected_count = int(expected_count)
+            if expected_count < 1:
+                raise ValueError(
+                    f"Config file '{path}': fixture_consistency.canonical_sources entry "
+                    f"'{entry.get('path')}' has expected_count={expected_count!r}; must be >= 1."
+                )
+        canonical_sources.append(
+            FixtureCanonicalSource(
+                path=str(entry["path"]),
+                identifier_field=str(entry["identifier_field"]),
+                expected_count=expected_count,
+            )
+        )
+
+    canonical_paths = {source.path for source in canonical_sources}
+    scan_raw = raw.get("scan") or []
+    scan_targets: list[FixtureScanTarget] = []
+    for entry in scan_raw:
+        canonical_source = entry.get("canonical_source") or None
+        if canonical_source is None:
+            if len(canonical_sources) == 1:
+                canonical_source = canonical_sources[0].path
+            elif len(canonical_sources) > 1:
+                raise ValueError(
+                    f"Config file '{path}': fixture_consistency.scan entry '{entry.get('path')}' "
+                    "does not set canonical_source, and more than one canonical_sources entry is "
+                    f"configured ({sorted(canonical_paths)}); the target is ambiguous. Set "
+                    "canonical_source to one of the configured canonical_sources[].path values."
+                )
+        elif canonical_source not in canonical_paths:
+            raise ValueError(
+                f"Config file '{path}': fixture_consistency.scan entry '{entry.get('path')}' sets "
+                f"canonical_source={canonical_source!r}, which does not match any configured "
+                f"canonical_sources[].path ({sorted(canonical_paths)})."
+            )
+        scan_targets.append(
+            FixtureScanTarget(
+                path=str(entry["path"]),
+                identifier_field=str(entry["identifier_field"]),
+                canonical_source=canonical_source,
+                allow_missing=frozenset(str(v) for v in entry.get("allow_missing") or []),
+            )
+        )
+
+    return FixtureConsistencyConfig(
+        canonical_sources=tuple(canonical_sources),
+        scan=tuple(scan_targets),
     )
 
 
@@ -1368,6 +1504,9 @@ class RuntimeConfig:
         backlog: Backlog lifecycle settings (default status for new WUs).
         quota_handling: Quota wait-and-resume configuration (issue #236,
             spec S5.2). Absent YAML block yields the full default set.
+        fixture_consistency: Opt-in canonical-fixture cross-reference
+            configuration for ``devbench check-fixture-consistency``.
+            Absent ``canonical_sources`` makes the check a no-op.
         allowed_orgs: List of permitted GitHub organisations.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
@@ -1406,6 +1545,7 @@ class RuntimeConfig:
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     agent_models: AgentModelsConfig = field(default_factory=AgentModelsConfig)
     validate: ValidateConfig = field(default_factory=ValidateConfig)
+    fixture_consistency: FixtureConsistencyConfig = field(default_factory=FixtureConsistencyConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     allowed_orgs: list[str] = field(default_factory=list)
@@ -1869,6 +2009,14 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
+    # Populate FixtureConsistencyConfig from YAML fixture_consistency block
+    # (caylent-solutions/devbench-internal-backlog#17 fixture-catalog
+    # cross-reference lint). Absent block -> default-constructed with empty
+    # canonical_sources -> the check is a no-op, since devbench cannot infer
+    # a target repo's fixture layout.
+    fixture_consistency_raw = raw.get("fixture_consistency") or {}
+    fixture_consistency = _parse_fixture_consistency_config(path, fixture_consistency_raw)
+
     # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
     stop_hook = StopHookConfig(
@@ -1951,6 +2099,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         task_factory=task_factory,
         agent_models=agent_models,
         validate=validate_cfg,
+        fixture_consistency=fixture_consistency,
         debug=debug,
         notifications=notifications,
         allowed_orgs=allowed_orgs,

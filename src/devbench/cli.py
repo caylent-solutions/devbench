@@ -46,6 +46,7 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     tdd-gate <id>                           Run the machine-observed RED gate for a gated task;
                                              on a genuine RED, records the orchestrator-only
                                              RED_OBSERVED entry (FR-4.2, exits 1 on any rejection)
+    check-fixture-consistency <id>          Cross-reference fixtures against the canonical dataset (opt-in)
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
     log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log;
@@ -5161,6 +5162,64 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
             file=sys.stderr,
         )
     return rc
+
+
+def cmd_check_fixture_consistency(unit_id: str) -> int:
+    """Cross-reference the work unit's target repo's mock/fixture files against its canonical dataset.
+
+    caylent-solutions/devbench-internal-backlog#17 (fixture-catalog cross-reference lint): a
+    feature's data-fetch logic is frequently correct but reads from a mock/fixture lookup table
+    whose keys were fabricated, keyed in the wrong namespace, or left
+    incomplete relative to the project's canonical shared fixture dataset --
+    functionally dead or crash-on-save for real records even though the
+    underlying logic is sound.
+
+    Opt-in and project-specific: devbench cannot infer a target repo's
+    fixture-file layout, so this is a deliberate no-op (prints a note,
+    exits 0) unless the workspace configures
+    ``fixture_consistency.canonical_sources`` in
+    ``backlog/config/devbench.yaml``. When configured, scans every
+    ``fixture_consistency.scan`` target for identifier literals absent from
+    its designated canonical source, and checks each canonical source's
+    distinct-identifier count against an optional ``expected_count``
+    (backfill coverage).
+
+    Used as review evidence by the test-reviewer agent.
+    """
+    from devbench.fixture_consistency import check_fixture_consistency
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    fixture_config = RUNTIME_CONFIG.fixture_consistency
+    if not fixture_config.canonical_sources:
+        print(
+            "(fixture-consistency check skipped: no fixture_consistency.canonical_sources "
+            "configured in backlog/config/devbench.yaml)"
+        )
+        return 0
+
+    findings = check_fixture_consistency(Path(repo_path), fixture_config)
+    if not findings:
+        sources = ", ".join(source.path for source in fixture_config.canonical_sources)
+        print(f"OK: fixture-catalog cross-reference check passed against canonical source(s): {sources}")
+        return 0
+
+    print("FAIL: fixture-catalog cross-reference check found issue(s):")
+    for finding in findings:
+        print(f"  [{finding.kind}] {finding.message}")
+    return 1
 
 
 def _reject_em_dash(field_name: str, text: str) -> int | None:
@@ -13407,6 +13466,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "check-shared-file-impact <id>. No-op unless the diff touches a "
             "repos.<repo>.shared_file_patterns match; blocks (exit 1) on new "
             "failures vs. the stored baseline."
+        ),
+    ),
+    "check-fixture-consistency": (
+        cmd_check_fixture_consistency,
+        1,
+        (
+            "Cross-reference mock/fixture files against the configured canonical dataset "
+            "(no-op unless fixture_consistency.canonical_sources is set): "
+            "check-fixture-consistency <id>"
         ),
     ),
     "tdd-gate": (

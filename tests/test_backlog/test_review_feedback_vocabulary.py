@@ -36,6 +36,11 @@ class TestIsValidCode:
         emits code_review:UNREACHABLE_ARTIFACT."""
         assert is_valid_code("code_review", "UNREACHABLE_ARTIFACT") is True
 
+    def test_fixture_catalog_mismatch_is_a_test_review_code(self) -> None:
+        """caylent-solutions/devbench-internal-backlog#17: the fixture-catalog
+        cross-reference gate emits test_review:FIXTURE_CATALOG_MISMATCH."""
+        assert is_valid_code("test_review", "FIXTURE_CATALOG_MISMATCH") is True
+
     def test_valid_code_for_each_judge(self) -> None:
         for judge, codes in JUDGE_CATEGORIES.items():
             for code in codes:

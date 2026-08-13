@@ -1236,6 +1236,32 @@ uv run devbench run-tests <id>
 
 Run the test suite in the work unit's target repo. Uses the repo's `make test` target when present; falls back to bare `pytest`. Used by `test_review`. Returns the test runner's exit code.
 
+### `check-fixture-consistency`
+
+```
+uv run devbench check-fixture-consistency <id>
+```
+
+Cross-reference the work unit's target repo's mock/fixture files against a workspace-designated canonical fixture/dataset (caylent-solutions/devbench-internal-backlog#17, fixture-catalog cross-reference lint). Catches the pattern where a feature's data-fetch logic is correct but reads from a mock lookup table whose keys were fabricated, keyed in the wrong namespace, or left incomplete relative to the project's canonical shared fixture data -- functionally dead or crash-on-save for real records even though the underlying logic is sound.
+
+**Opt-in and project-specific.** devbench cannot infer a target repo's fixture-file layout, so this is a deliberate no-op (prints a skip note, exits 0) unless the workspace configures `fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml`:
+
+```yaml
+fixture_consistency:
+  canonical_sources:
+    - path: tests/fixtures/catalog.json   # repo-relative path to the canonical dataset
+      identifier_field: sku               # key whose values other fixtures must reference
+      expected_count: 24                  # optional: assert full backfill coverage
+  scan:
+    - path: tests/fixtures/mock_catalog_lookup.json
+      identifier_field: sku
+      # canonical_source: tests/fixtures/catalog.json  # required when >1 canonical_sources entry
+      allow_missing:                      # opt-out for intentional edge-case fixtures
+        - SKU-DOES-NOT-EXIST
+```
+
+Exit 0 when every `scan` target's identifier values (other than those listed in `allow_missing`) are present in their `canonical_source`, and every canonical source's distinct-identifier count matches its `expected_count` (when set). Exit 1 with one `[missing_key|coverage_shortfall|load_error]` finding line per problem otherwise. Used as review evidence by `test_review` (rejection-feedback code `FIXTURE_CATALOG_MISMATCH`; see `docs/review-feedback-vocabulary.md`).
+
 ### `log`
 
 ```

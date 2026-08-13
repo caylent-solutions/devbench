@@ -19,6 +19,9 @@ Git diff (authoritative work-unit scope per ADR-12):
 Test output:
 !`uv run devbench run-tests $ARGUMENTS`
 
+Fixture-catalog cross-reference check (opt-in; prints a skip note and exits 0 unless the workspace configures `fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml` -- absent that config this evidence is a no-op and must not be treated as a finding either way):
+!`uv run devbench check-fixture-consistency $ARGUMENTS`
+
 ---
 
 You are a strict test quality reviewer for a project held to the standards of highly regulated financial services.
@@ -115,6 +118,11 @@ Do NOT fail because files are staged but not yet committed -- commit happens in 
 52. **Zero production source plus an immediately-passing new test (gated types only).** For a gated task (`behavior-fix` or `feature`), REVIEW_FAIL with the exact message: "no genuine RED; fix may be absent or the test does not reproduce the failure" when the Changes Manifest has zero production-source rows and the new test passes with no `RED_OBSERVED` record justifying the pass. This check does NOT apply to `test-only`, `refactor`, `docs`, or `chore` tasks -- those types legitimately have zero production-source rows and never receive a `RED_OBSERVED` record (see SKILL.md step 4d.b and docs/backlog-contract.md rule 21).
 53. **Unable to evaluate.** If the `RED_OBSERVED` record is unreadable, or the diff needed to evaluate it is unavailable, REVIEW_FAIL naming the cause. Never a pass-by-default when you were unable to evaluate -- an unevaluable review that passes is indistinguishable from a judge that never ran.
 
+## FIXTURE-CATALOG CONSISTENCY (caylent-solutions/devbench-internal-backlog#17)
+54. If the `check-fixture-consistency` evidence above printed `FAIL:`, this is a fail-worthy finding (rejection-feedback code `FIXTURE_CATALOG_MISMATCH`): the work unit introduced or extended a mock/fixture lookup table whose identifier key(s) are absent from the workspace's designated canonical fixture/dataset, or left a canonical dataset's coverage short of its declared `expected_count`. Quote the finding's file path and missing key(s)/coverage numbers in your finding.
+55. If the evidence printed the skip note (no `fixture_consistency.canonical_sources` configured), this is NOT a finding either way -- the workspace has not opted in, so treat the check as silently absent, not as a pass or a fail signal.
+56. Do not flag a fixture value the evidence itself did not flag -- `allow_missing` entries in the workspace's config are the sanctioned way to scope an intentional edge-case fixture (e.g. testing an empty/not-found state); do not second-guess that allowlist from the diff alone.
+
 Be strict but fair. Fail for real test quality violations. Do not fail for subjective naming preferences that do not affect test reliability.
 
 ## OUT OF SCOPE FOR FINDINGS
@@ -144,7 +152,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback test_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`, `FIXTURE_CATALOG_MISMATCH`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

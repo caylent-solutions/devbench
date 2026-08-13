@@ -24,6 +24,11 @@ from test_tdd_gate import write_scratch_file as _tdd_gate_write
 from devbench import cli
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.config_loader import (
+    FixtureCanonicalSource,
+    FixtureConsistencyConfig,
+    FixtureScanTarget,
+)
 from devbench.constants import (
     BACKLOG_SUBDIR,
     SESSION_DEFAULT_NAME,
@@ -7861,6 +7866,152 @@ class TestCmdCheckSharedFileImpact:
 
         baseline_after = json.loads(baseline_file.read_text())
         assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
+
+
+class TestCmdCheckFixtureConsistency:
+    """Test cmd_check_fixture_consistency command (caylent-solutions/devbench-internal-backlog#17)."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Unknown work unit id returns 1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_fixture_consistency("NONEXISTENT")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_no_local_path_configured(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """No local path configured for the resolved repo returns 1."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "No local path configured" in capsys.readouterr().err
+
+    def test_skips_as_no_op_when_unconfigured(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """No fixture_consistency.canonical_sources configured -> prints a skip note, exits 0."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 0
+        assert "skipped" in capsys.readouterr().out
+
+    def test_passes_when_fixtures_are_consistent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A configured check with no cross-reference issues returns 0 and prints OK."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 0
+        assert "OK" in capsys.readouterr().out
+
+    def test_fails_and_prints_findings_when_key_is_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A mock fixture referencing a key absent from the canonical source returns 1 and prints FAIL."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "GHOST-SKU"}]), encoding="utf-8")
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        out = capsys.readouterr().out
+        assert result == 1
+        assert "FAIL" in out
+        assert "GHOST-SKU" in out
+
+    def test_allow_missing_scoped_fixture_does_not_fail(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An allow_missing-scoped edge-case fixture passes even though its key is absent (AC3, internal-backlog#17)."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_not_found.json").write_text(json.dumps([{"sku": "SKU-DOES-NOT-EXIST"}]), encoding="utf-8")
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(
+                FixtureScanTarget(
+                    path="mock_not_found.json",
+                    identifier_field="sku",
+                    allow_missing=frozenset({"SKU-DOES-NOT-EXIST"}),
+                ),
+            ),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 0
+        assert "OK" in capsys.readouterr().out
 
 
 class TestCmdLogVerdict:

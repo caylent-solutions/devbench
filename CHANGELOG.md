@@ -5,6 +5,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Fixture-catalog cross-reference check**
+  (`caylent-solutions/devbench-internal-backlog#17`). A feature's data-fetch
+  logic can be correct while reading from a mock/fixture lookup table whose
+  keys were fabricated, keyed in the wrong namespace, or left incomplete
+  relative to the project's canonical shared fixture/demo dataset --
+  functionally dead or crash-on-save for real records even though the
+  underlying logic is sound, and invisible to the unit suite since each
+  task's own fixtures are self-consistent. Adds an opt-in `fixture_consistency:`
+  block to `devbench.yaml` (`canonical_sources` designating authoritative
+  fixture/dataset files and identifier fields, `scan` targets to
+  cross-reference, and per-target `allow_missing` scoping for intentional
+  edge-case fixtures) and `devbench check-fixture-consistency <id>`, a
+  deliberate no-op unless the workspace configures `canonical_sources`. The
+  check runs as `test-reviewer` review evidence and fails with
+  `FIXTURE_CATALOG_MISMATCH` when a scanned fixture references a key absent
+  from its canonical source, or a canonical source falls short of a
+  declared `expected_count`.
+
 - **Shared-file full-suite regression gate**
   (`caylent-solutions/devbench-internal-backlog#13`). A task's regression
   verification is scoped to its own Changes Manifest even when the diff

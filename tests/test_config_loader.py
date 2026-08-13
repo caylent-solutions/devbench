@@ -19,6 +19,8 @@ import yaml
 from devbench.config_loader import (
     DEFAULT_CONFIG_SUBPATH,
     BacklogConfig,
+    FixtureCanonicalSource,
+    FixtureConsistencyConfig,
     GitOpsConfig,
     LimitConfig,
     RepoConfig,
@@ -3984,3 +3986,219 @@ class TestSkillsConfig:
         rt = load_runtime_config(cfg, {})
         assert rt.skills.exemplar_backlog_path is None
         assert rt.skills.exemplar_spec_path is None
+
+
+class TestFixtureConsistencyConfig:
+    """FixtureConsistencyConfig dataclass and ``fixture_consistency:`` YAML section parsing.
+
+    caylent-solutions/devbench-internal-backlog#17 (fixture-catalog
+    cross-reference lint): opt-in per-workspace configuration naming
+    canonical fixture/dataset file(s) and the identifier field(s) other
+    mock/fixture files must stay consistent with. Absent section -> the
+    check is a no-op (empty canonical_sources).
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_fixture_consistency_config_defaults(self) -> None:
+        """Given no args, FixtureConsistencyConfig holds empty tuples (opt-out no-op)."""
+        cfg = FixtureConsistencyConfig()
+        assert cfg.canonical_sources == ()
+        assert cfg.scan == ()
+
+    def test_runtime_config_has_fixture_consistency_field(self) -> None:
+        """RuntimeConfig exposes ``fixture_consistency`` populated with defaults."""
+        rt = RuntimeConfig()
+        assert isinstance(rt.fixture_consistency, FixtureConsistencyConfig)
+        assert rt.fixture_consistency.canonical_sources == ()
+
+    def test_absent_fixture_consistency_section_falls_back_to_no_op_defaults(self, tmp_path: Path) -> None:
+        """A YAML config without a ``fixture_consistency:`` section yields an empty, no-op config."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.fixture_consistency.canonical_sources == ()
+        assert rt.fixture_consistency.scan == ()
+
+    def test_single_canonical_source_and_scan_target_parse(self, tmp_path: Path) -> None:
+        """A single canonical_sources entry + scan target round-trip; canonical_source is inferred."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+                  identifier_field: sku
+              scan:
+                - path: tests/fixtures/mock_lookup.json
+                  identifier_field: sku
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.fixture_consistency.canonical_sources == (
+            FixtureCanonicalSource(path="tests/fixtures/catalog.json", identifier_field="sku"),
+        )
+        assert len(rt.fixture_consistency.scan) == 1
+        scan = rt.fixture_consistency.scan[0]
+        assert scan.path == "tests/fixtures/mock_lookup.json"
+        assert scan.identifier_field == "sku"
+        # Inferred from the single configured canonical source.
+        assert scan.canonical_source == "tests/fixtures/catalog.json"
+        assert scan.allow_missing == frozenset()
+
+    def test_expected_count_and_allow_missing_parse(self, tmp_path: Path) -> None:
+        """expected_count and allow_missing round-trip into their respective dataclasses."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+                  identifier_field: sku
+                  expected_count: 24
+              scan:
+                - path: tests/fixtures/mock_lookup.json
+                  identifier_field: sku
+                  allow_missing:
+                    - SKU-NOT-FOUND
+                    - SKU-EMPTY-STATE
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.fixture_consistency.canonical_sources[0].expected_count == 24
+        assert rt.fixture_consistency.scan[0].allow_missing == frozenset({"SKU-NOT-FOUND", "SKU-EMPTY-STATE"})
+
+    def test_multiple_canonical_sources_require_explicit_canonical_source_on_scan(self, tmp_path: Path) -> None:
+        """A scan entry omitting canonical_source is ambiguous when >1 canonical source is configured."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+                  identifier_field: sku
+                - path: tests/fixtures/vendors.json
+                  identifier_field: vendor_id
+              scan:
+                - path: tests/fixtures/mock_lookup.json
+                  identifier_field: sku
+            """,
+        )
+        with pytest.raises(ValueError, match=r"does not set canonical_source.*ambiguous"):
+            load_runtime_config(cfg, {})
+
+    def test_multiple_canonical_sources_with_explicit_canonical_source_parses(self, tmp_path: Path) -> None:
+        """An explicit canonical_source resolves the ambiguity across multiple canonical sources."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+                  identifier_field: sku
+                - path: tests/fixtures/vendors.json
+                  identifier_field: vendor_id
+              scan:
+                - path: tests/fixtures/mock_lookup.json
+                  identifier_field: sku
+                  canonical_source: tests/fixtures/catalog.json
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.fixture_consistency.scan[0].canonical_source == "tests/fixtures/catalog.json"
+
+    def test_scan_canonical_source_referencing_unknown_path_raises(self, tmp_path: Path) -> None:
+        """A canonical_source that does not match a configured canonical_sources[].path fails fast."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+                  identifier_field: sku
+              scan:
+                - path: tests/fixtures/mock_lookup.json
+                  identifier_field: sku
+                  canonical_source: tests/fixtures/does_not_exist.json
+            """,
+        )
+        with pytest.raises(ValueError, match=r"does not match any configured canonical_sources"):
+            load_runtime_config(cfg, {})
+
+    def test_expected_count_below_minimum_raises(self, tmp_path: Path) -> None:
+        """A non-positive expected_count fails schema validation (minimum: 1)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+                  identifier_field: sku
+                  expected_count: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_fixture_consistency_key(self, tmp_path: Path) -> None:
+        """JSON Schema ``additionalProperties: false`` rejects unknown ``fixture_consistency:`` keys."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              unknown_field: foo
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*unknown_field"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_canonical_source_missing_identifier_field(self, tmp_path: Path) -> None:
+        """canonical_sources entries require both path and identifier_field."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            fixture_consistency:
+              canonical_sources:
+                - path: tests/fixtures/catalog.json
+            """,
+        )
+        with pytest.raises(ValueError, match=r"identifier_field"):
+            load_runtime_config(cfg, {})
+
+    def test_parse_fixture_consistency_config_raises_on_zero_expected_count_direct(self, tmp_path: Path) -> None:
+        """_parse_fixture_consistency_config defensive guard fires when the schema layer is bypassed."""
+        from devbench.config_loader import _parse_fixture_consistency_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"expected_count=0"):
+            _parse_fixture_consistency_config(
+                fake_path,
+                {
+                    "canonical_sources": [
+                        {"path": "tests/fixtures/catalog.json", "identifier_field": "sku", "expected_count": 0}
+                    ]
+                },
+            )

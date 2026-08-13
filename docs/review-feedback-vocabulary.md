@@ -38,6 +38,7 @@ example remediations.
 | `COVERAGE_REGRESSION` | Coverage on the gated modules dropped below 100% | Add tests that exercise every modified branch. |
 | `TDD_CYCLE_MISSING` | No `[RED]` / `[GREEN]` / `[REFACTOR]` audit entries | Re-run the TDD cycle and log the phases via `devbench log-tdd`. |
 | `DRY_VIOLATION` | Duplicated test logic that should be parameterised | Extract a helper or use `pytest.mark.parametrize`. |
+| `FIXTURE_CATALOG_MISMATCH` | `devbench check-fixture-consistency` reported a `FAIL:` finding -- a mock/fixture file references an identifier absent from its designated canonical dataset, or a canonical source's coverage fell short of a declared `expected_count` | Fix the fixture to reference a real canonical key, add the value to `fixture_consistency.scan[].allow_missing` if it is an intentional edge case, or complete the backfill to satisfy `expected_count`. |
 
 ## `doc_review`
 

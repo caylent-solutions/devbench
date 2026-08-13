@@ -7573,6 +7573,296 @@ class TestCmdRunTests:
         assert len(pytest_calls) == 1
 
 
+class TestCmdCheckSharedFileImpact:
+    """Test cmd_check_shared_file_impact -- caylent-solutions/devbench-internal-backlog#13
+
+    Shared-file full-suite regression gate.
+    """
+
+    REPO = "caylent-solutions/git-repo"
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo=self.REPO,
+            dependencies=[],
+        )
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+
+        return RuntimeConfig(repos={self.REPO: RepoConfig(shared_file_patterns=patterns)})
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return mock_parser
+
+    def test_unit_not_found(self) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_shared_file_impact("NONEXISTENT")
+        assert result == 1
+
+    def test_no_local_path(self) -> None:
+        unit = self._make_unit()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+        assert result == 1
+
+    def test_no_patterns_configured_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """No shared_file_patterns for the repo -- always a no-op, full suite never runs."""
+        unit = self._make_unit()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        mock_run.assert_not_called()
+
+    def test_changed_files_do_not_match_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Patterns configured, but this task's diff doesn't touch any of them -- no-op."""
+        unit = self._make_unit()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/unrelated/foo.py"]),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        mock_run.assert_not_called()
+
+    def test_matched_file_no_baseline_bootstraps(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """First run for a repo: no baseline exists yet, so the current failing set becomes
+        the baseline and the gate passes (nothing to compare against yet)."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        repo_path = tmp_path / "repo"
+        workspace.mkdir()
+        repo_path.mkdir()
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["make", "-n", "test"]:
+                return (1, "", "no rule")
+            return (1, "FAILED tests/test_a.py::test_x - AssertionError", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is True
+        assert payload["verdict"] == "bootstrap"
+        assert payload["failing_tests"] == ["tests/test_a.py::test_x"]
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / f"{self.REPO.replace('/', '__')}.json"
+        assert baseline_path.exists()
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["failing_tests"] == ["tests/test_a.py::test_x"]
+        assert baseline["updated_by_unit"] == "E0-F1-S1-T1"
+
+    def test_matched_file_new_failure_blocks(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A new failure not present in the baseline blocks with exit 1 and is attributed
+        to this unit_id; pre-existing baseline failures never block."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        repo_path = tmp_path / "repo"
+        baseline_dir = workspace / ".devbench" / "test-baselines"
+        baseline_dir.mkdir(parents=True)
+        repo_path.mkdir()
+        baseline_file = baseline_dir / f"{self.REPO.replace('/', '__')}.json"
+        baseline_file.write_text(json.dumps({"repo": self.REPO, "failing_tests": ["tests/test_a.py::test_x"]}))
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["make", "-n", "test"]:
+                return (1, "", "no rule")
+            return (
+                1,
+                "FAILED tests/test_a.py::test_x - AssertionError\nFAILED tests/test_b.py::test_y - TypeError",
+                "",
+            )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["verdict"] == "block"
+        assert payload["new_failures"] == ["tests/test_b.py::test_y"]
+        assert payload["pre_existing_failures"] == ["tests/test_a.py::test_x"]
+        assert "E0-F1-S1-T1" in captured.err
+        assert "tests/test_b.py::test_y" in captured.err
+
+        # Baseline must NOT be updated on a block -- it stays the pre-change state.
+        baseline_after = json.loads(baseline_file.read_text())
+        assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
+
+    def test_matched_file_no_new_failures_ratchets_baseline(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No new failures: gate passes and the baseline is refreshed to the current
+        failing set, so a test this task happened to fix drops out of the baseline."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        repo_path = tmp_path / "repo"
+        baseline_dir = workspace / ".devbench" / "test-baselines"
+        baseline_dir.mkdir(parents=True)
+        repo_path.mkdir()
+        baseline_file = baseline_dir / f"{self.REPO.replace('/', '__')}.json"
+        baseline_file.write_text(
+            json.dumps(
+                {
+                    "repo": self.REPO,
+                    "failing_tests": ["tests/test_a.py::test_x", "tests/test_old.py::test_fixed_now"],
+                }
+            )
+        )
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["make", "-n", "test"]:
+                return (1, "", "no rule")
+            return (1, "FAILED tests/test_a.py::test_x - AssertionError", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "pass"
+
+        baseline_after = json.loads(baseline_file.read_text())
+        assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
+
+    def test_degraded_when_no_recognised_failure_format(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Non-pytest/go/jest output on a non-zero exit: falls back to a single synthetic
+        marker and flags `degraded: true` rather than silently claiming precision."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        repo_path = tmp_path / "repo"
+        workspace.mkdir()
+        repo_path.mkdir()
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["make", "-n", "test"]:
+                return (1, "", "no rule")
+            return (1, "Build failed for unrelated reasons", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0  # bootstrap path: still nothing to compare against
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["degraded"] is True
+
+    def test_changed_files_query_failure_reports_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`list_changed_files` raising RuntimeError (git query timeout/failure) fails loudly."""
+        unit = self._make_unit()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch(
+                "devbench.backlog.manifest.list_changed_files",
+                side_effect=RuntimeError("git diff timed out"),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert "git diff timed out" in captured.err
+
+    def test_corrupt_baseline_file_treated_as_no_baseline(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A baseline file that fails to parse as JSON is treated as absent (bootstrap path),
+        never a hard crash that would block every subsequent task touching a shared file."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        repo_path = tmp_path / "repo"
+        baseline_dir = workspace / ".devbench" / "test-baselines"
+        baseline_dir.mkdir(parents=True)
+        repo_path.mkdir()
+        baseline_file = baseline_dir / f"{self.REPO.replace('/', '__')}.json"
+        baseline_file.write_text("{not valid json")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["make", "-n", "test"]:
+                return (1, "", "no rule")
+            return (1, "FAILED tests/test_a.py::test_x - AssertionError", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "bootstrap"
+
+        baseline_after = json.loads(baseline_file.read_text())
+        assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
+
+
 class TestCmdLogVerdict:
     """Test cmd_log_verdict command."""
 

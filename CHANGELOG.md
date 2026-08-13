@@ -5,6 +5,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Shared-file full-suite regression gate**
+  (`caylent-solutions/devbench-internal-backlog#13`). A task's regression
+  verification is scoped to its own Changes Manifest even when the diff
+  touches a shared/high-fan-in file (an app shell, a shared hook, a
+  widely-consumed component) that many unrelated features depend on;
+  previously such regressions surfaced only when an unrelated later task
+  happened to run the full suite. Adds `repos.<repo>.shared_file_patterns`
+  (a hand-maintained per-repo glob registry of shared composition-root
+  files) to `devbench.yaml`, and `devbench check-shared-file-impact <id>`,
+  a no-op unless the task's diff matches a registered pattern. On a match
+  it runs the full suite, parses per-test failure identifiers, and diffs
+  them against a stored baseline at `.devbench/test-baselines/<repo>.json`,
+  blocking (exit 1) only on newly-introduced failures, bootstrapping on
+  first run, and ratcheting the baseline down on a clean pass. A new
+  `assert-shared-file-impact.sh` `PostToolUse` guard hook (mirroring
+  `assert-tests-pass.sh`) makes the exit code load-bearing instead of
+  advisory, and `executor.md`'s Definition of Done now requires running
+  the gate before logging completion.
+
 - **Reachability check on the code-review gate**
   (`caylent-solutions/devbench-internal-backlog#10`). A task could
   previously build a component, hook, slice, or pure function as a

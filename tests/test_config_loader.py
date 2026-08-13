@@ -923,6 +923,48 @@ class TestRuntimeConfigPopulation:
             f"Expected merge_strategy=None, got {result.repos['org/repo'].merge_strategy!r}"
         )
 
+    def test_repo_config_shared_file_patterns_populated(self, tmp_path: Path) -> None:
+        """
+        Given: YAML with per-repo shared_file_patterns (caylent-solutions/devbench-internal-backlog#13 shared-file gate)
+        When: load_runtime_config is called
+        Then: RepoConfig.shared_file_patterns is a tuple of the configured globs, in order
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+                shared_file_patterns:
+                  - "src/app/Shell.tsx"
+                  - "src/hooks/useAuth.*"
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.repos["org/repo"].shared_file_patterns == (
+            "src/app/Shell.tsx",
+            "src/hooks/useAuth.*",
+        ), f"Expected the configured globs as a tuple, got {result.repos['org/repo'].shared_file_patterns!r}"
+
+    def test_repo_config_shared_file_patterns_empty_by_default(self, tmp_path: Path) -> None:
+        """
+        Given: YAML repo with no shared_file_patterns
+        When: load_runtime_config is called
+        Then: RepoConfig.shared_file_patterns is an empty tuple (gate never triggers)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.repos["org/repo"].shared_file_patterns == (), (
+            f"Expected shared_file_patterns=(), got {result.repos['org/repo'].shared_file_patterns!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC-10: config_loader.py does not read env vars

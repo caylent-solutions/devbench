@@ -62,7 +62,14 @@ plugin/devbench-orchestrate/
     │                              (ADR-33: review-supervisor never spawns the judges itself). Issue #118
     │                              -- closes the loophole where the supervisor escalated to repo-mutation
     │                              rights via subagent spawn.
-    └── assert-tests-pass.sh     ← enforces test suite passes after Bash
+    ├── assert-tests-pass.sh     ← enforces test suite passes after Bash
+    └── assert-shared-file-impact.sh
+                                 ← enforces the shared-file full-suite regression gate
+                                   (caylent-solutions/devbench-internal-backlog#13):
+                                   blocks when `devbench check-shared-file-impact` reports a diff
+                                   touched a `repos.<repo>.shared_file_patterns` match AND the
+                                   full-suite run introduced failures not present in the stored
+                                   baseline.
 ```
 
 ---

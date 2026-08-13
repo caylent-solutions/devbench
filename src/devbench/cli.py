@@ -4371,6 +4371,162 @@ def cmd_check_manifest_scope(unit_id: str) -> int:
     return 0
 
 
+def _resolve_ancestry_repo_context(unit_id: str) -> tuple[str, Path] | None:
+    """Resolve *unit_id* to its canonical repo + local checkout path for check-ancestry.
+
+    Returns ``None`` (after printing its own ``ERROR:`` to stderr) when the
+    unit is unknown or the repo has no configured local path. Split out of
+    :func:`cmd_check_ancestry` purely to keep that function's return-count
+    within the project's complexity lint budget.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return None
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return None
+    return canonical_repo, repo_path
+
+
+def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") -> int:
+    """Verify a declared work-group dependency has actually merged, via real git ancestry.
+
+    This is the **canonical, single-source-of-truth check** for "is a declared
+    prerequisite deliverable" across the pipeline (see
+    ``docs/cross-backlog-dependencies.md``). It exists so that
+    ``spec-to-backlog``-generated ancestry-gate tasks, and any other tooling
+    that needs the same answer, all shell out to one well-tested command
+    instead of inventing a weaker proxy (e.g. checking for a local
+    snapshot/report file, which can go stale or never existed).
+
+    Runs ``git merge-base --is-ancestor <dependency_ref> <target_ref>`` in
+    the work unit's target repo:
+
+    - *dependency_ref* should be a fully qualified, fetchable ref (e.g.
+      ``origin/<dependency-branch>`` or a commit SHA). This function does
+      not invent a remote-tracking prefix for a bare branch name.
+    - *target_ref* defaults to ``origin/<default-branch>`` (resolved the
+      same way as :func:`cmd_get_diff`) when omitted -- i.e. "has the
+      dependency merged into the branch this work group's tasks are based
+      against."
+
+    Best-effort ``git fetch origin`` runs first so a stale local view of
+    ``origin`` does not produce a false "not merged" result; a fetch
+    failure (offline, renamed remote) is logged to stderr but does not
+    abort the check -- the merge-base call still runs against whatever is
+    locally known.
+
+    Exit contract (unlike most devbench commands, which return 0 and encode
+    failure only in JSON): returns 0 only when *dependency_ref* IS an
+    ancestor of *target_ref* (the gate should pass). Returns 1 for
+    "not yet an ancestor" (the gate should block) as well as for any error
+    that prevents a decision (unknown work unit, empty dependency ref,
+    unresolvable repo/default-branch, invalid git refs). A JSON status line
+    is always printed to stdout so callers get a machine-readable record
+    either way.
+
+    Known limitation: ``git merge-base --is-ancestor`` is a strict commit
+    -graph ancestry check. It can report "not an ancestor" for a
+    logically-satisfied dependency when the producer branch was squash
+    -merged, rebased, or landed via a fix-pack branch that does not carry
+    the original branch's commit hashes. Callers hitting this should
+    target the actual merge commit / tag on the shared trunk (e.g.
+    ``origin/main`` after the squash-merge lands) rather than the
+    original feature branch ref, or fall back to the manual-blocker idiom
+    (``docs/manual-blockers.md``) with an operator-verified AC when no
+    ancestry-preserving ref exists.
+
+    Usage: check-ancestry <unit_id> <dependency-ref> [<target-ref>]
+    """
+    if not dependency_ref.strip():
+        print("ERROR: check-ancestry requires a non-empty dependency ref", file=sys.stderr)
+        return 1
+
+    resolved = _resolve_ancestry_repo_context(unit_id)
+    if resolved is None:
+        return 1
+    canonical_repo, repo_path = resolved
+
+    resolved_target_ref = target_ref.strip()
+    if not resolved_target_ref:
+        default_branch = _resolve_default_branch(canonical_repo, repo_path)
+        if default_branch is None:
+            print(
+                f"ERROR: Cannot determine default branch for '{canonical_repo}' to use as the "
+                "ancestry target. Run 'git remote set-head origin --auto' to configure it, or "
+                "pass an explicit target-ref.",
+                file=sys.stderr,
+            )
+            return 1
+        resolved_target_ref = f"origin/{default_branch}"
+
+    # Best-effort refresh so a stale local `origin` doesn't produce a false
+    # "not merged" result. Non-fatal: offline runs / renamed remotes still
+    # fall through to the merge-base check below against whatever refs are
+    # already known locally.
+    fetch_rc, _fetch_stdout, fetch_stderr = run_command(["git", "fetch", "origin"], cwd=repo_path)
+    if fetch_rc != 0:
+        print(
+            f"WARNING: 'git fetch origin' failed, checking against local refs as-is: {fetch_stderr.strip()}",
+            file=sys.stderr,
+        )
+
+    rc, _stdout, stderr = run_command(
+        ["git", "merge-base", "--is-ancestor", dependency_ref, resolved_target_ref],
+        cwd=repo_path,
+    )
+
+    if rc == 0:
+        print(
+            json.dumps(
+                {
+                    "unit_id": unit_id,
+                    "status": "ancestor",
+                    "dependency_ref": dependency_ref,
+                    "target_ref": resolved_target_ref,
+                }
+            )
+        )
+        return 0
+
+    if rc == 1:
+        print(
+            json.dumps(
+                {
+                    "unit_id": unit_id,
+                    "status": "not_ancestor",
+                    "dependency_ref": dependency_ref,
+                    "target_ref": resolved_target_ref,
+                }
+            )
+        )
+        print(
+            f"BLOCKED: '{dependency_ref}' is not yet an ancestor of '{resolved_target_ref}'. "
+            "The declared dependency has not merged. Do not proceed with any other task in "
+            "this backlog until this check passes.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # rc > 1 (or the run_command sentinel 127 for a missing/timed-out git)
+    # means git itself could not answer the question -- unknown ref, not a
+    # commit-ish, or the executable is missing. Treat as a hard failure
+    # rather than silently reporting "not merged".
+    print(
+        f"ERROR: 'git merge-base --is-ancestor {dependency_ref} {resolved_target_ref}' could not "
+        f"be evaluated (rc={rc}): {stderr.strip()}",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def cmd_run_tests(unit_id: str) -> int:
     """Run the test suite for the work unit's target repo and return the output.
 
@@ -12464,6 +12620,16 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "Reconcile a pause-before-merge work unit's PR state (issue #101). "
             "Promotes to done on merged, blocks on closed-without-merge, "
             "no-ops on still-open: check-merge <id>"
+        ),
+    ),
+    "check-ancestry": (
+        cmd_check_ancestry,
+        2,
+        (
+            "Canonical git-ancestry check for a declared work-group dependency. "
+            "Runs 'git merge-base --is-ancestor <dependency-ref> <target-ref>' in the work "
+            "unit's repo (target-ref defaults to origin/<default-branch>). Exit 0 only when "
+            "the dependency is merged: check-ancestry <id> <dependency-ref> [<target-ref>]"
         ),
     ),
     "cleanup-tracked-orphans": (

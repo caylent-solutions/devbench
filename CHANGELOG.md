@@ -5,6 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Added `devbench check-ancestry`, the canonical git-ancestry gate for
+  declared work-group dependencies**
+  (`caylent-solutions/devbench-internal-backlog#12`). Adds `devbench
+  check-ancestry <id> <dependency-ref> [<target-ref>]`, which runs `git
+  merge-base --is-ancestor` in the work unit's target repo to answer "has
+  this declared prerequisite actually merged" with real git ancestry
+  rather than a weaker proxy such as a local snapshot/report file. Wires
+  this into `spec-to-backlog`: when a spec/operator declares a
+  work-group dependency, the skill now auto-generates a mandatory,
+  executable ancestry-gate task at `E0-F<N>-S1-T1` that every root of the
+  intra-backlog dependency DAG depends on, so no other task in the
+  backlog can be claimed until the gate passes. `docs/cli-reference.md`
+  documents `devbench.check-ancestry` as the single canonical check for
+  dependency deliverability, and `docs/cross-backlog-dependencies.md`
+  gains a "producer is another devbench work group's branch" case
+  distinct from the existing operator-verified manual-blocker idiom.
+
 - **Added a copy-pattern permission/eligibility flag write-path audit helper**
   (`caylent-solutions/devbench-internal-backlog#16`). Specs that instruct an
   implementer to add a new permission/eligibility boolean by "following the

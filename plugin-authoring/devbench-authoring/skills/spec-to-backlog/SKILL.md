@@ -140,6 +140,13 @@ Extract:
 
 Record the FR list for coverage validation in the iterate-until-perfect loop.
 
+**Declared work-group dependency (dependency-ancestry-gate)**: also extract any declared prerequisite on another work group's branch merging first. This is expressed either explicitly by the operator in their invocation message (e.g. "this work group depends on `<name>`, branch `origin/<dependency-branch>`, which must merge into `<target-branch>` before this work starts") or via a `## Dependencies` / `## Prerequisites` section in the spec naming another work group and its branch. When found, record:
+
+- `dependency_ref` -- the fully qualified, fetchable branch ref of the prerequisite (e.g. `origin/<dependency-branch>`; NOT a bare branch name -- `devbench check-ancestry` does not invent a remote-tracking prefix for you)
+- `target_ref` (optional) -- the branch the prerequisite must have merged into; when the spec/operator does not name one explicitly, it defaults at generation time to this work group's own target repo's default branch (`origin/<default-branch>`)
+
+When no such declaration is found anywhere (operator message or spec), this work group has no cross-work-group prerequisite -- skip Step 4a's gate-task rule and the gate-task authoring in Step 5 entirely; every other part of the skill behaves exactly as before. This is additive and opt-in: backlogs authored from specs without a declared dependency are unaffected.
+
 ---
 
 ## Step 3b -- Copy-pattern permission/eligibility flag audit (QA finding 07)
@@ -240,6 +247,7 @@ Decompose every spec FR into the 4-level hierarchy. Rules:
 - **Task IDs**: `E<N>-F<M>-S<P>-T<Q>` (e.g. `E1-F1-S1-T1`)
 - **Cross-epic dependencies** expressed at the Feature level minimum (not at the Task level alone) to keep cycle-detection feasible in `devbench validate-backlog`
 - **Permission/eligibility flag write-path task, always separate** (QA finding 07): for every new boolean permission/eligibility-style field the spec introduces -- whether or not it matched a Step 3b copy-pattern clause -- generate a distinct leaf Task whose sole deliverable is that field's own write-path/data-source. This task is NEVER folded into, and never left implicit inside, an "add the field to the state slice" task or a "gate the UI on the field" task; those two remain scoped to state-shape and UI-gating respectively, and the write-path task is a peer of both (typically depended on by the UI-gating task, since gating on a field with no write path is untestable). When Step 3b-iv found a placeholder/mock permission-provider seam, this task's `### Approach` and `## Acceptance Criteria` name that seam by path as the minimum acceptable data source; when Step 3b-iv found no seam (or was skipped because no repo checkout was resolvable), the task's Description states explicitly that no seam exists yet and the Approach proposes one. When Step 3b-iii raised a blocking finding on the flag this field's spec clause copies from, this task's Description cites the finding and does NOT depend on, or assume soundness of, the referenced flag's own write path.
+- **Declared work-group dependency -> mandatory gate task** (see Step 3): when Step 3 extracted a `dependency_ref`, the tree gains a Workspace Bootstrap `E0` epic (reuse the existing `E0` if this backlog already has one, e.g. from a prior `docs/manual-blockers.md` gate) containing a new Feature whose sole Story/Task is the ancestry-gate task `E0-F<N>-S1-T1`, placed by the same convention as a manual blocker (`docs/manual-blockers.md`) but authored as a normal, executable, non-`DO NOT CLAIM` task per `docs/cross-backlog-dependencies.md`'s "Special case: the producer is another devbench work group's branch" section. Every Task, Story, and Feature that has no OTHER upstream dependency within this backlog (i.e. every root of the intra-backlog dependency DAG) MUST list `E0-F<N>-S1-T1` in its `## Dependencies` table. Wiring only the tasks that literally consume the dependency's output is NOT sufficient -- the gate must block every task in the backlog, not just the obviously-related ones, per the canonical pattern.
 
 ### 4b -- Self-critique at Epic granularity
 
@@ -253,6 +261,7 @@ Score each item PASS or FAIL. A FAIL is an unresolved item:
 6. **Cross-epic deps at Feature level**: no Task-level cross-epic dependency (use Feature-level). FAIL if any such dep exists.
 7. **Discovery-artifact coverage** (issue #221 A1): when Step 2 supplied a `discovery_artifacts_dir`, every row in every recognised artefact file (`verification_matrix.md`, `ci_failures.md`, `test_coverage_audit.md`, `ambiguities.md`, `scope_creep.md`) must be covered by at least one leaf task in the drafted tree -- either via a planned AC, an explicit task title that names the discovery row, or an Approach step that references it. FAIL if any artefact row is orphaned (no covering leaf task). Skipped when `discovery_artifacts_dir` is absent.
 8. **Every permission/eligibility flag has its own write-path task** (QA finding 07): every new boolean permission/eligibility-style field identified in Step 3 / Step 3b has a distinct leaf Task in the drafted tree dedicated to its write-path/data-source, separate from any "add field to state" or "gate UI" task. FAIL if any such field's write-path is only addressed inside another task's scope, or not addressed by any task at all. FAIL also if a Step 3b-iii blocking finding exists for a referenced flag and no acknowledgement of it is recorded in the audit trail.
+8. **Work-group dependency gate present** (dependency-ancestry-gate): when Step 3 extracted a `dependency_ref`, an ancestry-gate task exists at `E0-F<N>-S1-T1` and every root of the intra-backlog dependency DAG lists it in `## Dependencies`. FAIL if a dependency was declared but no gate task exists, or if any DAG-root task omits it from its Dependencies table. Skipped when Step 3 found no declared dependency.
 
 ### 4c -- Revise
 
@@ -291,6 +300,36 @@ For each leaf task in the Epic -> Feature -> Story -> Task tree:
 Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<feature-slug>/<story-id>-<story-slug>/<task-id>.md` using the `Write` tool. The file MUST contain all 15 canonical sections listed in Step 1b.
 
 **Fan-out** (issue #221 A5): if the leaf-task count from Step 4 strictly exceeds `skills.fan_out_threshold` (default 10), spawn one general-purpose sub-Agent per Feature to author that Feature's leaf tasks in parallel rather than writing them serially. The sub-Agent receives the canonical-section list (Step 1b) verbatim plus the Feature's leaf-task IDs and titles. Serial authoring remains the default when the leaf-task count is at or below the threshold.
+
+**Authoring the ancestry-gate task** (only when Step 3 extracted a `dependency_ref`): author `E0-F<N>-S1-T1` as a normal 15-section task file (all Step 1b sections apply -- this is NOT a `docs/manual-blockers.md` `DO NOT CLAIM` anchor, because unlike a truly external dependency this one is git-verifiable and devbench can check it itself). Distinguishing shape:
+
+- **Title / heading**: `# E0-F<N>-S1-T1: Verify <dependency-name> dependency has merged (ancestry gate)`.
+- **`## Target Repository`**: `Repo:` is this work group's own primary target repo (the repo whose branch `target_ref` names); `Branch:` follows the normal branch-naming convention from the "Branch naming" rule below -- this task DOES get a real branch, unlike a manual blocker's `Branch: N/A`.
+- **`### Approach`**: run the canonical check and act on its exit code -- do not invent an alternative verification (e.g. checking for a file, a tag, or a report artefact). Fill in `<dependency_ref>` / `<target_ref>` from Step 3:
+
+  ````markdown
+  Run the canonical dependency-deliverability check and report its result;
+  do not attempt to satisfy this task's AC any other way:
+
+  ```bash
+  devbench check-ancestry E0-F<N>-S1-T1 <dependency_ref> [<target_ref>]
+  ```
+
+  - Exit 0 ("ancestor"): the dependency has merged. Mark AC-DEP-001 met.
+  - Exit 1 ("not_ancestor" or an evaluation error): the dependency has NOT
+    merged (or ancestry could not be determined). Do not mark AC-DEP-001
+    met, and do not fabricate a pass -- leave the task unresolved so the
+    next orchestrator pass / operator re-run re-executes the same check.
+    Every other task in this backlog is transitively blocked behind this
+    one via the `## Dependencies` wiring from Step 4a.
+  ````
+
+- **`## Acceptance Criteria`**: a single `AC-DEP-001` stating that `devbench check-ancestry E0-F<N>-S1-T1 <dependency_ref> [<target_ref>]` exits 0.
+- **`## Changes Manifest`**: `(none)` -- this task makes no production-code changes, only runs the check (same convention as a validation-gate task, `docs/adr/06-validation-gate-bug-escalation.md`).
+- **`## Dependencies`**: `| none | | |` (the gate task itself has no upstream dependency within this backlog).
+- **`### Depends On This`**: every DAG-root task from Step 4a's rule, resolved to real IDs per the normal "Dependency wiring" rule below.
+
+See `docs/cross-backlog-dependencies.md` for the full worked pattern and the documented known limitation (squash-merge / rebase / fix-pack topologies where strict ancestry can under-report a logically-satisfied dependency).
 
 **Forbidden patterns** (the skill MUST NOT generate any of these):
 - Multiple `#### Error Handling Contract` subsections (general + this-task variants). Use ONE subsection; task-specific content follows the generic content under the same heading.
@@ -534,6 +573,10 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 12. **Write-path ownership never implicit**: every new boolean permission/eligibility-style field has its own distinct write-path task (Step 4a), and every copy-pattern spec clause detected in Step 3b that audited to a non-`live` verdict has a recorded, acknowledged `[BLOCKING_FINDING]` in the audit trail. FAIL if any new flag's write-path is left implicit inside an "add field" or "gate UI" task, or if a non-`live` referenced-flag audit was never surfaced.
 
+**Cross-work-group dependency gate (item 12)**
+
+12. **Ancestry gate present and fully wired** (dependency-ancestry-gate; skipped when Step 3 found no declared `dependency_ref`): an ancestry-gate task exists at `E0-F<N>-S1-T1`, its `### Approach` runs `devbench check-ancestry` (the canonical check -- see `docs/cli-reference.md#check-ancestry`) rather than a proxy such as a file-existence check, and every root of the intra-backlog dependency DAG lists it in `## Dependencies`. FAIL if any of these is missing.
+
 ---
 
 ## Output contract
@@ -541,6 +584,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 - **Output files**: `BACKLOG.md` + work-unit `.md` files under `backlog/` in canonical 7-column format
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
 - **Per-task depth**: every task contains all 15 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
+- **Cross-work-group dependencies**: when a work-group dependency is declared (Step 3), a mandatory `E0-F<N>-S1-T1` ancestry-gate task blocks every root of the dependency DAG until `devbench check-ancestry` confirms the prerequisite has merged (see `docs/cross-backlog-dependencies.md`)
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 

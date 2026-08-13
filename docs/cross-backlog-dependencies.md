@@ -18,6 +18,37 @@ Examples observed in production:
 - Backlog A (`caylent-telemetry-spec/backlog/`) consumes Backlog B (`tf-modules-backlog/`) released terraform-modules tags. 16 Backlog A Tasks reference `caylent-solutions/terraform-modules` modules by tag. Backlog B has its own orchestrator and `BACKLOG.md`.
 - Backlog A consumes a kanon integration-test fix being authored by another agent in the kanon repo. The fix's completion is verified externally by the operator running kanon's test suite locally.
 
+## Special case: the producer is another devbench work group's branch
+
+The most common cross-backlog dependency in practice is one devbench work group's backlog declaring "Task X in this backlog must not start until work group Y's branch has merged into our shared target branch." Unlike the general external-producer case above (an artifact tag, a human sign-off, a fix authored by someone outside devbench), **this specific case is git-verifiable** -- devbench itself can answer "has Y merged" by checking real ancestry, so it does not need to fall back to an operator-verified manual blocker.
+
+`spec-to-backlog` auto-generates this as an **ancestry-gate task** rather than a manual blocker whenever a spec declares a work-group dependency (see the skill's Step 2/4a). The gate task is a normal, executable Task -- not a `DO NOT CLAIM` anchor -- placed at `E0-F<N>-S1-T1` by the same convention as a manual blocker (Workspace Bootstrap epic, new Feature per declared dependency), and every other Task in the tree lists it in `## Dependencies` so no work can be claimed until it passes:
+
+````markdown
+### Approach
+
+Run the canonical dependency-deliverability check and report its result;
+do not attempt to satisfy this task's AC any other way:
+
+```bash
+devbench check-ancestry <this-task-id> origin/<dependency-branch>
+```
+
+- Exit 0 ("ancestor"): the dependency has merged. Mark AC-DEP-001 met.
+- Exit 1 ("not_ancestor" or an evaluation error): the dependency has NOT
+  merged (or ancestry could not be determined). Do not mark AC-DEP-001
+  met. This task -- and every Task depending on it -- must remain
+  unclaimed until a re-run of the same command exits 0.
+````
+
+`devbench check-ancestry` (see [`cli-reference.md`](cli-reference.md#check-ancestry)) is **the one canonical command** for this question across the whole pipeline: it runs `git merge-base --is-ancestor <dependency-ref> <target-ref>` against the real target repo, not a proxy such as checking for a local snapshot/report file. Every tool in this pipeline that needs to answer "is this prerequisite actually available" -- `spec-to-backlog`-generated gate tasks, `init-workgroup`-style pre-flight checks, merge-forecast/merge-resolve tooling -- should shell out to this command (or its underlying `git merge-base --is-ancestor` invocation, if run outside a devbench workspace) rather than reinvent the check.
+
+Because the gate is an ordinary Task, it is re-evaluated every time it is (re-)attempted -- including after the backlog is paused and resumed -- rather than being checked once at generation time and forgotten: the ADR-07 dependency mechanism keeps every dependent Task unclaimable as long as the gate has not reached a terminal-satisfying status, and a rejected/blocked gate task naturally gets re-attempted (re-running the same `check-ancestry` command) the next time the orchestrator or an operator revisits it.
+
+**Known limitation**: `git merge-base --is-ancestor` is a strict commit-graph check. It can report "not merged" for a dependency that is logically satisfied but was squash-merged, rebased, or landed via a fix-pack branch that doesn't carry the original branch's commit hashes. When the upstream work group's repo uses one of those merge strategies, point the gate task's `dependency-ref` at the resulting merge commit or a tag on the shared trunk instead of the original feature-branch ref; if no ancestry-preserving ref exists at all, fall back to the manual-blocker idiom below with an operator-verified `AC-MANUAL-001` instead of a `devbench check-ancestry`-backed AC.
+
+Use a plain manual blocker (not an ancestry gate) when the producer is NOT a devbench-tracked branch merge -- see the table in [`manual-blockers.md`](manual-blockers.md#when-to-use-a-manual-blocker-vs-a-regular-dependency).
+
 ## The pattern: anchor a manual blocker in this backlog
 
 Create a manual blocker (per `manual-blockers.md`) representing the external dependency. Wire every dependent Task in this backlog to it via `devbench add-dep`.

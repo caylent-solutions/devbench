@@ -142,6 +142,91 @@ Record the FR list for coverage validation in the iterate-until-perfect loop.
 
 ---
 
+## Step 3b -- Copy-pattern permission/eligibility flag audit (QA finding 07)
+
+Specs sometimes introduce a new derived boolean permission/eligibility
+field by instructing the implementer to "follow the exact existing
+pattern of `<some-existing-flag>`" (or equivalent wording: "same
+pattern as", "mirror the existing", "exactly like `<X>` today", "reuse
+the `<X>` approach"). Left unchecked, this clause silently becomes two
+tasks -- "add the field to the state slice" and "gate the UI on the
+field" -- and NEITHER task, nor any other, ever becomes responsible for
+"wire this flag to a real (or explicit placeholder) data source."
+Because work is decomposed strictly along feature/screen boundaries,
+"populate this flag with real data app-wide" never becomes any single
+task's -- or work group's -- deliverable, and if the referenced
+existing flag is itself hardcoded to a default with no setter
+anywhere, the new flag inherits the same defect on day one.
+
+**3b-i -- Detect copy-pattern clauses.** While reading the spec in Step
+3, flag every clause matching the pattern above. For each match record:
+the new field's name, the referenced existing flag's name, and the
+spec section citation. If the spec never uses this pattern, skip the
+rest of Step 3b entirely -- there is no behavioural change for specs
+that don't reference an existing flag.
+
+**3b-ii -- Audit the referenced flag's write-path.** For each match,
+when a target repo checkout is resolvable (the repo the spec's `##
+Target Repository` -- or equivalent -- section names is already
+checked out locally), run the write-path audit helper:
+
+```bash
+uv run python -c "from devbench.plugin_helpers.permission_flag_writepath import audit_write_path; from pathlib import Path; print(audit_write_path(Path('<target-repo-checkout>'), '<existing-flag-name>').render())"
+```
+
+This is a best-effort source-grep heuristic (see the module docstring
+in `src/devbench/plugin_helpers/permission_flag_writepath.py`), not a
+proof -- it exists to surface a finding for confirmation, not to
+silently decide the matter. Treat any verdict other than `live` (i.e.
+`default_only`, `no_write_path`, `not_found`, or `indeterminate`) as
+requiring the blocking-finding treatment below; only `live` clears the
+clause without further action.
+
+When no target repo checkout is resolvable yet (e.g. a greenfield spec
+authored before any checkout exists), skip the helper invocation and
+instead add an explicit Definition of Ready item to the new flag's
+write-path task (Step 4a) requiring manual confirmation of the
+referenced flag's write-path status before that task is claimed --
+this is the documented manual-verification fallback the automated
+check cannot replace when there is nothing on disk to grep yet.
+
+**3b-iii -- Surface a blocking finding on any non-`live` verdict.**
+Emit, and require an operator/agent acknowledgement of, one line per
+non-`live` referenced flag BEFORE Step 4 proceeds for that spec
+clause:
+
+```bash
+uv run python -c "from devbench.plugin_helpers.permission_flag_writepath import audit_write_path, render_blocking_finding; from pathlib import Path; a = audit_write_path(Path('<target-repo-checkout>'), '<existing-flag-name>'); print(render_blocking_finding('<new-field-name>', a))"
+```
+
+```
+[BLOCKING_FINDING] Spec instructs new field '<new-field>' to follow the pattern of '<existing-flag>', but '<existing-flag>' has no verified live write-path (verdict=<verdict>). Assignment/setter sites found: <sites>. Copying this pattern would propagate the same defect to the new field. Confirm with the operator (spec amendment, or confirmation that a fix is already planned) before generating tasks that assume this pattern is sound.
+```
+
+This is a blocking finding, not a silent pass-through: the skill does
+NOT continue decomposition for that spec clause as if the referenced
+pattern were sound. The operator's response (spec amendment, an
+explicit "known gap, proceed anyway" acknowledgement, or confirmation
+that a fix for `<existing-flag>` is already in flight elsewhere) is
+recorded in the audit trail alongside the finding. Regardless of the
+operator's response, Step 4a's mandatory write-path task for the NEW
+field still applies in full -- a blocking finding on the referenced
+flag is never a reason to skip generating the new flag's own
+write-path task.
+
+**3b-iv -- Locate the placeholder/mock seam.** Regardless of the
+verdict, when a target repo checkout is resolvable, also run:
+
+```bash
+uv run python -c "from devbench.plugin_helpers.permission_flag_writepath import find_placeholder_seam; from pathlib import Path; print(find_placeholder_seam(Path('<target-repo-checkout>')))"
+```
+
+Record the returned path (or `None`). Step 4a's mandatory write-path
+task uses this result to name a concrete minimum-viable destination
+instead of leaving "wire this to real or placeholder data" unspecified.
+
+---
+
 ## Step 4 -- Epic decomposition (iterate-until-perfect granularity 1)
 
 ### 4a -- Draft the Epic -> Feature -> Story -> Task tree
@@ -154,6 +239,7 @@ Decompose every spec FR into the 4-level hierarchy. Rules:
 - **Story IDs**: `E<N>-F<M>-S<P>` (e.g. `E1-F1-S1`)
 - **Task IDs**: `E<N>-F<M>-S<P>-T<Q>` (e.g. `E1-F1-S1-T1`)
 - **Cross-epic dependencies** expressed at the Feature level minimum (not at the Task level alone) to keep cycle-detection feasible in `devbench validate-backlog`
+- **Permission/eligibility flag write-path task, always separate** (QA finding 07): for every new boolean permission/eligibility-style field the spec introduces -- whether or not it matched a Step 3b copy-pattern clause -- generate a distinct leaf Task whose sole deliverable is that field's own write-path/data-source. This task is NEVER folded into, and never left implicit inside, an "add the field to the state slice" task or a "gate the UI on the field" task; those two remain scoped to state-shape and UI-gating respectively, and the write-path task is a peer of both (typically depended on by the UI-gating task, since gating on a field with no write path is untestable). When Step 3b-iv found a placeholder/mock permission-provider seam, this task's `### Approach` and `## Acceptance Criteria` name that seam by path as the minimum acceptable data source; when Step 3b-iv found no seam (or was skipped because no repo checkout was resolvable), the task's Description states explicitly that no seam exists yet and the Approach proposes one. When Step 3b-iii raised a blocking finding on the flag this field's spec clause copies from, this task's Description cites the finding and does NOT depend on, or assume soundness of, the referenced flag's own write path.
 
 ### 4b -- Self-critique at Epic granularity
 
@@ -166,6 +252,7 @@ Score each item PASS or FAIL. A FAIL is an unresolved item:
 5. **Dependency graph is a DAG**: no circular dependencies. FAIL if any cycle exists (pre-validate mentally).
 6. **Cross-epic deps at Feature level**: no Task-level cross-epic dependency (use Feature-level). FAIL if any such dep exists.
 7. **Discovery-artifact coverage** (issue #221 A1): when Step 2 supplied a `discovery_artifacts_dir`, every row in every recognised artefact file (`verification_matrix.md`, `ci_failures.md`, `test_coverage_audit.md`, `ambiguities.md`, `scope_creep.md`) must be covered by at least one leaf task in the drafted tree -- either via a planned AC, an explicit task title that names the discovery row, or an Approach step that references it. FAIL if any artefact row is orphaned (no covering leaf task). Skipped when `discovery_artifacts_dir` is absent.
+8. **Every permission/eligibility flag has its own write-path task** (QA finding 07): every new boolean permission/eligibility-style field identified in Step 3 / Step 3b has a distinct leaf Task in the drafted tree dedicated to its write-path/data-source, separate from any "add field to state" or "gate UI" task. FAIL if any such field's write-path is only addressed inside another task's scope, or not addressed by any task at all. FAIL also if a Step 3b-iii blocking finding exists for a referenced flag and no acknowledgement of it is recorded in the audit trail.
 
 ### 4c -- Revise
 
@@ -255,6 +342,7 @@ Score each item PASS or FAIL:
 10. **Approach-specificity check**: the Approach section names concrete files, line numbers (where applicable), and pytest commands for this task. FAIL if the Approach reads as a generic template substitutable across tasks.
 11. **Discovery-artifact coverage at task granularity** (issue #221 A1): when Step 2 supplied a `discovery_artifacts_dir`, if this task is the covering task for any artefact row (from the mapping established at Step 4b item 7), the AC or Approach explicitly cites the artefact row -- either by quoting the row text or by naming the artefact filename + the row identifier (line number, file path, claim ID, etc., depending on the artefact's row shape). FAIL if a discovery-artefact row mapped to this task has no citation in either AC or Approach. Skipped when `discovery_artifacts_dir` is absent or no rows map to this task.
 12. **AC-FINAL tier-suffix on non-Python tasks** (issue #228): when this task's Changes Manifest contains zero `.py` paths, the Python-tooling AC-FINAL lines (`AC-FINAL-002` ruff format, `AC-FINAL-003` ruff check, `AC-FINAL-004` mypy, `AC-FINAL-005` pytest tier, `AC-FINAL-006` pytest other tier, `AC-FINAL-008` bandit, `AC-FINAL-014` coverage) MUST carry the explicit suffix `-- N/A for <Tier> Tasks (no Python source authored)`. Tier is derived from the dominant Manifest file extension: `.yml` / `.yaml` -> `YAML`, `.md` -> `Markdown`, `.toml` -> `TOML`, `.tf` / `.hcl` / `.tfvars` -> `HCL`, `.json` -> `JSON`, `.xml` -> `XML`; manifests with multiple non-Python extensions report `Mixed`. FAIL if a non-Python task lacks the suffix on any of those AC-FINAL lines. The `suffix_na_on_non_python_tasks` post-processor pass (Step 5d) deterministically adds the suffix when missing. See `docs/acceptance-criteria-canonical.md`.
+13. **Write-path task is distinct and seam-referenced** (QA finding 07): if this task IS a permission/eligibility flag's write-path task (Step 4a), it does NOT also carry "add field to state" or "gate UI" scope (those stay in their own tasks), and its `### Approach` + `## Acceptance Criteria` name the placeholder/mock seam path from Step 3b-iv when one was found. If this task instead ADDS or GATES a permission/eligibility field, it does NOT itself claim to establish that field's write-path -- its Description or AC defers write-path responsibility to the dedicated task by ID. FAIL if either boundary is blurred (a write-path task also doing state/UI work, or a state/UI task silently claiming the write-path is handled). N/A for tasks that touch no permission/eligibility field.
 
 ### 5c -- Revise
 
@@ -441,6 +529,10 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 **Validation gate (item 11)**
 
 11. **validate-backlog rc=0**: `uv run devbench validate-backlog` returns zero errors. FAIL if any error remains.
+
+**Copy-pattern permission/eligibility flag integrity (item 12; QA finding 07)**
+
+12. **Write-path ownership never implicit**: every new boolean permission/eligibility-style field has its own distinct write-path task (Step 4a), and every copy-pattern spec clause detected in Step 3b that audited to a non-`live` verdict has a recorded, acknowledged `[BLOCKING_FINDING]` in the audit trail. FAIL if any new flag's write-path is left implicit inside an "add field" or "gate UI" task, or if a non-`live` referenced-flag audit was never surfaced.
 
 ---
 

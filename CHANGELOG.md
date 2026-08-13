@@ -5,6 +5,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Added a copy-pattern permission/eligibility flag write-path audit helper**
+  (`caylent-solutions/devbench-internal-backlog#16`). Specs that instruct an
+  implementer to add a new permission/eligibility boolean by "following the
+  exact pattern of" an existing flag could silently inherit that flag's
+  missing write-path, since backlog generation never produced a task owning
+  "wire this flag to real data." The new
+  `devbench.plugin_helpers.permission_flag_writepath` module gives the
+  `spec-to-backlog` skill's new Step 3b a heuristic, source-grep-based way to
+  audit the referenced flag's write-path status and locate an existing
+  placeholder/mock permission-provider seam before backlog generation
+  proceeds, surfacing a `[BLOCKING_FINDING]` for operator acknowledgement
+  when the referenced pattern is not actually live.
+
 - **`backlog_post_processor._find_section_bounds` matched heading text quoted
   in another section's prose** (issue #337). The unanchored
   `text.find(header)` let a Description that discusses "the task's

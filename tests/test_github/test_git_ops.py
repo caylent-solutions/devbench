@@ -1197,7 +1197,7 @@ class TestGitHelper:
                 judge._git(["push", "origin", "feature/x"], tmp_path)
 
     def test_git_raises_when_token_unavailable(self, tmp_path: Path) -> None:
-        """A missing token fails fast at get_gh_token() before any subprocess runs."""
+        """A missing token fails fast at get_gh_token() before any subprocess runs, for a remote op."""
         judge = GitOpsService()
         with (
             patch(
@@ -1207,17 +1207,18 @@ class TestGitHelper:
             patch("devbench.github.git_ops.run_command") as mock_run,
         ):
             with pytest.raises(RuntimeError, match="GitHub token not found"):
-                judge._git(["status"], tmp_path)
+                judge._git(["push", "origin", "feature/x"], tmp_path)
         mock_run.assert_not_called()
 
     def test_git_credential_helper_resolves_token_from_env_via_real_git(self, tmp_path: Path) -> None:
         """The real ``credential.helper`` string _git() builds genuinely reads GH_TOKEN.
 
-        Captures the exact argv/env ``_git()`` constructs, then re-executes it
-        through git's own ``credential fill`` plumbing -- the same mechanism a
-        real ``git push`` uses internally to fetch credentials -- so a shell
-        syntax bug in the inline helper (invisible to a fully-mocked test)
-        fails this test.
+        Captures the exact argv/env ``_git()`` constructs for a remote
+        subcommand (``push``), then re-executes it through git's own
+        ``credential fill`` plumbing -- the same mechanism a real ``git
+        push`` uses internally to fetch credentials -- so a shell syntax
+        bug in the inline helper (invisible to a fully-mocked test) fails
+        this test.
         """
         judge = GitOpsService()
         token = "test-token-value-xyz"
@@ -1236,7 +1237,7 @@ class TestGitHelper:
             patch("devbench.github.git_ops.get_gh_token", return_value=token),
             patch("devbench.github.git_ops.run_command", side_effect=_capture_run_command),
         ):
-            judge._git(["status"], tmp_path)
+            judge._git(["push", "origin", "feature/x"], tmp_path)
 
         # The first five elements are git plus two -c flags: an empty-valued
         # credential.helper reset (so an ambient system/global helper cannot
@@ -1260,6 +1261,56 @@ class TestGitHelper:
         )
         assert f"password={token}" in result.stdout
         assert "username=x-access-token" in result.stdout
+
+    def test_git_local_subcommand_never_calls_get_gh_token(self, tmp_path: Path) -> None:
+        """AC-E17-F2-S1-T3-1/2: a local-only subcommand (status) never resolves GH_TOKEN and runs with env=None."""
+        judge = GitOpsService()
+        with (
+            patch("devbench.github.git_ops.get_gh_token") as mock_token,
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")) as mock_run,
+        ):
+            judge._git(["status"], tmp_path)
+
+        mock_token.assert_not_called()
+        assert mock_run.call_args.kwargs["env"] is None
+        cmd = mock_run.call_args.args[0]
+        assert cmd == ["git", "status"]
+
+    def test_git_local_add_and_commit_succeed_without_any_token(self, tmp_path: Path) -> None:
+        """AC-E17-F2-S1-T3-2: real ``git add``/``git commit`` through _git() succeed with no token resolvable.
+
+        Reproduces the batch PR #334 CI symptom (get_gh_token raising
+        'GitHub token not found') and proves local subcommands never
+        trigger it: get_gh_token is patched to raise, and the two local
+        git operations must still complete against a real subprocess.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for init_args in (
+            ["init", "-q"],
+            ["config", "user.email", "x@y.z"],
+            ["config", "user.name", "test"],
+            ["config", "commit.gpgsign", "false"],
+        ):
+            subprocess.run(["git", "-C", str(repo), *init_args], check=True)
+        (repo / "file.txt").write_text("hello\n")
+
+        judge = GitOpsService()
+        with patch(
+            "devbench.github.git_ops.get_gh_token",
+            side_effect=RuntimeError("GitHub token not found. Provide it via ..."),
+        ) as mock_token:
+            judge._git(["add", "file.txt"], repo)
+            judge._git(["commit", "-m", "add file"], repo)
+
+        mock_token.assert_not_called()
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--oneline"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "add file" in log.stdout
 
 
 class TestGhHelper:

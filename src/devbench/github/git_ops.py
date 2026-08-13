@@ -56,6 +56,16 @@ _GOOD_CHECK_CONCLUSIONS: frozenset[str] = frozenset({"success", "neutral", "skip
 #: ignored (no output), so this helper never persists or evicts anything.
 _GIT_CREDENTIAL_HELPER = '!f() { test "$1" = get && printf "username=x-access-token\\npassword=%s\\n" "$GH_TOKEN"; }; f'
 
+#: Git subcommands that touch a remote and therefore require GH_TOKEN
+#: authentication. :meth:`GitOpsService._git` resolves the token env and
+#: registers the inline credential helper only when the subcommand in its
+#: ``args`` (the first element) is a member of this set. Every other
+#: subcommand -- add, commit, status, diff, stash, rev-parse, checkout,
+#: rebase, tag, etc. -- is local-only and runs with ``env=None``, never
+#: calling :func:`get_gh_token`, so purely local git operations succeed
+#: even when no token is configured.
+_REMOTE_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"push", "fetch", "pull", "ls-remote", "clone"})
+
 
 def _first_failing_job_link(checks: object, failing_states: AbstractSet[str]) -> str:
     """Return the link URL of the first failing check entry, or the empty string.
@@ -1484,10 +1494,14 @@ class GitOpsService:
     def _git(self, args: list[str], cwd: Path) -> tuple[int, str, str]:
         """Run a ``git`` command, raising ``RuntimeError`` on failure.
 
-        Authenticates on the same ``GH_TOKEN`` :meth:`_gh` uses
-        (:func:`get_gh_token`), carried only through the subprocess
-        environment. An inline ``credential.helper``, scoped to this
-        invocation via ``-c`` (never a remote URL), reads the token from
+        Token resolution and the inline credential helper are scoped to
+        remote-touching subcommands only -- those listed in
+        :data:`_REMOTE_GIT_SUBCOMMANDS` (``push``, ``fetch``, ``pull``,
+        ``ls-remote``, ``clone``), determined from ``args[0]``. For those
+        subcommands, this method authenticates on the same ``GH_TOKEN``
+        :meth:`_gh` uses (:func:`get_gh_token`), carried only through the
+        subprocess environment. An inline ``credential.helper``, scoped to
+        this invocation via ``-c`` (never a remote URL), reads the token from
         that environment variable at credential-fetch time, so it never
         appears in ``argv``, a remote URL, or a log line (spec Section 13
         D-5). A missing token fails fast here, before any subprocess runs.
@@ -1499,9 +1513,21 @@ class GitOpsService:
         helper would still be consulted alongside (and could still win
         over) the token-backed one, which is exactly the stale-credential
         failure mode this method exists to eliminate.
+
+        Every other (local-only) subcommand -- add, commit, status, diff,
+        stash, rev-parse, checkout, rebase, tag, etc. -- never touches a
+        remote, so it runs with ``env=None`` (inherits the parent process
+        environment unchanged) and never calls :func:`get_gh_token`. This
+        keeps local-only git operations working even when no token is
+        configured, e.g. a CI unit-test job that exports no ``GH_TOKEN``.
         """
-        env = self._env_with_gh_token()
-        cmd = ["git", "-c", "credential.helper=", "-c", f"credential.helper={_GIT_CREDENTIAL_HELPER}"] + args
+        subcommand = args[0] if args else ""
+        if subcommand in _REMOTE_GIT_SUBCOMMANDS:
+            env: dict[str, str] | None = self._env_with_gh_token()
+            cmd = ["git", "-c", "credential.helper=", "-c", f"credential.helper={_GIT_CREDENTIAL_HELPER}"] + args
+        else:
+            env = None
+            cmd = ["git"] + args
         self.logger.debug("git cmd=%r cwd=%s", cmd, cwd)
         rc, stdout, stderr = run_command(cmd, cwd=cwd, env=env)
         self.logger.debug(

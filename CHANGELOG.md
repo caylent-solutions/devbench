@@ -138,6 +138,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   deferred. `docs/cli-reference.md`, `docs/manual-blockers.md`, and
   `docs/cross-backlog-dependencies.md` document the corrected contract.
 
+- **A full backlog run finished 101 done and 9 declined tasks -- zero remaining -- and never
+  rolled its epics to `done` or opened a pull request** (issue #332). Two independent defects,
+  either alone enough to break the finish line. First, `BacklogManager._rollup_parent_status`
+  was invoked only from a fresh `STATUS_DONE` transition, so a Story/Feature/Epic whose last
+  remaining child resolved via `decline` (not `mark-done`) was stranded in a non-terminal status
+  forever, even though `_all_children_done` already treated `declined` as terminal; the rollup
+  call now fires from any terminal transition (`done` **or** `declined`), and `devbench
+  reconcile-cascade` gained a second pass (`_repair_stranded_containers`) that walks every
+  non-terminal container, re-evaluates `_all_children_done` fresh, and promotes qualifying
+  containers -- cascading upward exactly as a live rollup would -- reported in the command's JSON
+  envelope as `rolled_up` and idempotent on a second run. Second, the finalize auth gap:
+  `GitOpsService._git()` never carried `GH_TOKEN` in its subprocess environment the way `_gh()`
+  already did, so every `git push` -- including the one `git-ops-finalize` depends on -- fell
+  back to whatever ambient credential helper the launching shell had; with `defer_pr: true` that
+  push happens at the very end of a multi-hour run, exactly when an inherited VS Code
+  credential-helper socket is most likely stale, and the observed failure (`remote: No anonymous
+  write access. fatal: Authentication failed`) occurred twice against a token that was valid
+  throughout. `_git()` now builds the same `GH_TOKEN`-backed environment and inline
+  `credential.helper` as `_gh()`, so a drained backlog's finalize push authenticates identically.
+  A new integration test (`tests/test_integration/test_drained_backlog_finalize.py`) drives a
+  backlog with a declined leaf to fully terminal and asserts both that the rollup reaches the
+  epic and that `git-ops-finalize` is reached and attempts a push, pinning the whole "every task
+  terminal" to "a PR exists" path so the defect cannot regress silently again. `docs/cli-
+  reference.md` documents `reconcile-cascade`'s repair pass and summary-line format;
+  `docs/backlog-contract.md` documents the terminal-rollup contract.
+
 ### Changed
 
 - **Dependabot PRs #216 (`idna`) and #179 (`urllib3`) reconfirmed already

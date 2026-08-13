@@ -635,6 +635,26 @@ Tasks whose status is anything other than `in-queue` or `blocked` (e.g. `in-prog
 
 Useful as a pre-flight sweep before `devbench next` (after manual edits to the backlog) and for triage when a backlog has drifted out of sync. Combine with `validate-backlog` for a complete consistency check.
 
+### `reconcile-cascade`
+
+```
+uv run devbench reconcile-cascade
+```
+
+Reconcile every `blocked` Task against marker-target and regular-dependency state (issue #150), then repair any Story/Feature/Epic container stranded before the issue #332 FR-1 live-rollup fix landed. Two passes, always run together:
+
+1. **Blocked-task pass.** For each `blocked` Task: evaluates every `[BLOCKED_PENDING_PROPOSAL]` marker target's status via the loaded backlog index, and evaluates the Task's regular `## Dependencies` via `BacklogParser._deps_satisfied`. Flips the Task to `in-queue` ONLY when every marker target is terminal (`done` or `declined`) AND every regular dep is satisfied, writing a `[CASCADE_RECONCILED]` audit comment naming the closed markers. A Task left `blocked` is reported with the specific reason (an open marker, an unknown marker target, or an unsatisfied dep) so the operator can decide what to do next.
+
+2. **Container repair pass (issue #332 FR-2).** The live auto-rollup (see [Auto-rollup behavior](backlog-contract.md#auto-rollup-behavior)) only fires from a fresh terminal transition, so a Story/Feature/Epic whose children were already all terminal before that fix landed has no live event left to promote it. This pass walks every non-terminal container, re-evaluates `_all_children_done` fresh, and promotes qualifying containers -- cascading upward exactly as a live rollup would -- via `_repair_stranded_containers`. The whole pass runs under a single `flock_backlog` acquisition, and is idempotent: a second run against an already-repaired backlog reports zero rolled up.
+
+Output is a JSON envelope of the form `{"flipped": [...], "skipped": [...], "rolled_up": [...]}`, where `flipped` and `skipped` cover pass 1 (each entry names the Task id, and `flipped` entries also list the closed marker ids) and `rolled_up` lists every container id promoted by pass 2 (including ones promoted purely as a cascade side-effect of promoting a descendant). Exits **0** always; the operator reads the JSON envelope or the summary log line to see what happened:
+
+```
+reconcile-cascade: <n> flipped, <m> skipped, <k> parent(s) rolled up
+```
+
+Useful for triage when a backlog has drifted out of sync (a promoted proposal's auto-requeue trigger never fired, a process crashed mid-write) or after upgrading past the #332 fix, when existing backlogs may already be stranded and need the repair pass once. `devbench next`'s "no actionable units" message names both `validate-backlog` and `reconcile-cascade` as the next diagnostic steps.
+
 ### `scope`
 
 ```

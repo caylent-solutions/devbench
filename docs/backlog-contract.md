@@ -572,7 +572,10 @@ Higher-level files require only:
 |----|-------|--------|
 ```
 
-Status rolls up automatically when all children reach `done`.
+Status rolls up automatically when every child reaches a terminal status -- `done` **or**
+`declined` (issue #332 FR-1). See [Auto-rollup behavior](#auto-rollup-behavior) below for the
+full contract, including the `reconcile-cascade` repair pass for parents stranded before that
+fix landed.
 
 ---
 
@@ -633,11 +636,23 @@ A real Comments section looks like this:
 
 ## Auto-rollup behavior
 
-When `devbench mark-done <task-id>` succeeds, `BacklogManager._rollup_parent_status()` walks up the parent chain:
+When a Task reaches a terminal status -- `done` via `devbench mark-done <task-id>` or `declined`
+via `devbench decline <task-id> --reason "<text>"` -- `BacklogManager._rollup_parent_status()`
+walks up the parent chain:
 
-1. If all sibling tasks of the parent story are now done, the parent story is marked done.
-2. If marking that story done causes all sibling stories of the parent feature to be done, the parent feature is marked done.
+1. If every direct child of the parent story is now terminal (`done` **or** `declined`), the
+   parent story is marked done.
+2. If marking that story done causes every sibling story of the parent feature to be terminal,
+   the parent feature is marked done.
 3. Likewise for feature → epic.
+
+A child counts as "terminal" -- and therefore never blocks its parent's rollup -- when its status
+is `done` OR `declined`; `_all_children_done()` (the rollup's own gate, despite the `done`-only
+name) implements exactly that check. Declined work has been intentionally taken off the table, so
+a parent whose only remaining open child gets declined rolls up exactly as one whose last child is
+marked done (issue #332 FR-1: before this fix, the rollup call fired from a `done` transition
+only, so a `declined` last child left its story, feature, and epic stranded in a non-terminal
+status forever, even though `_all_children_done()` itself already treated `declined` as terminal).
 
 Each auto-rollup writes an audit comment to the parent's Comments section so the trail is visible:
 
@@ -645,7 +660,25 @@ Each auto-rollup writes an audit comment to the parent's Comments section so the
 [2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done -- all children completed.
 ```
 
-Rollup happens synchronously inside `mark-done`. There is no background process and no race condition.
+Rollup happens synchronously inside `mark-done` and `decline` alike -- both routes flow through
+the same `_set_status()` call, which fires `_rollup_parent_status()` from any terminal transition,
+not a `done` transition only. There is no background process and no race condition.
+
+### Repair sweep for parents stranded before the fix (`reconcile-cascade`)
+
+The live rollup above only fires from a fresh terminal transition. A parent whose children were
+already all terminal *before* the issue #332 FR-1 fix landed -- or one whose promoting transition
+was lost to a crashed or partial write -- has no live event left that could promote it; the FR-1
+fix is not retroactive. `devbench reconcile-cascade` closes that gap with a second pass
+(`_repair_stranded_containers` in `cli.py`): it walks every non-terminal Story/Feature/Epic
+container, re-evaluates `_all_children_done()` fresh against the current `BACKLOG.md`, and
+promotes each qualifying container via the same `_set_status()` call `_rollup_parent_status()`
+itself uses -- so a promoted container's own terminal transition cascades to its parent exactly as
+a live rollup would. Each repaired container gets a `[CASCADE_RECONCILED]` audit comment naming
+the repair. The sweep runs under `flock_backlog` and is idempotent: running it again against an
+already-repaired backlog reports zero containers rolled up. See
+[`reconcile-cascade`](cli-reference.md#reconcile-cascade) for the command reference, its JSON
+output envelope, and summary-line format.
 
 ### Auto-tick of AC / DoD checkboxes on done
 

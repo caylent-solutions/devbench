@@ -5,6 +5,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`backlog_post_processor._find_section_bounds` matched heading text quoted
+  in another section's prose** (issue #337). The unanchored
+  `text.find(header)` let a Description that discusses "the task's
+  `## Acceptance Criteria` line" hijack the section bounds, so
+  `suffix_ref_on_orphan_paths` appended ` (ref)` to path tokens far outside
+  the Acceptance Criteria / Definition of Done sections -- including inside
+  `### Code Standards` blocks, which `verify_code_standards_canonical` then
+  reported as permanent drift the two passes re-created on every `run_all`.
+  The heading is now matched as a whole line (`^<header>$`, MULTILINE),
+  mirroring the anchored `_NEXT_H2_RE` end bound and the validator's
+  line-anchored `_extract_sections`, so the post-processor and
+  validate-backlog Rule 20 agree about section membership.
+
 - **`guard-bash.sh` over-blocked `git checkout --theirs` / `git checkout
   --ours`** (issue #335). The blocked pattern was the bare substring
   `git checkout --`, which matched conflict-side selection during a merge

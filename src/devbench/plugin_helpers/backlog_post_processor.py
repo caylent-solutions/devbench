@@ -600,11 +600,24 @@ def _maybe_suffix(match: re.Match[str], in_manifest: set[str]) -> str:
 
 
 def _find_section_bounds(text: str, header: str) -> tuple[int, int] | None:
-    """Return ``(start, end)`` index range covering one section, or ``None``."""
-    idx = text.find(header)
-    if idx < 0:
+    """Return ``(start, end)`` index range covering one section, or ``None``.
+
+    The heading must occupy a whole line (issue #337): an unanchored
+    substring search here matched heading text QUOTED in another
+    section's prose (e.g. a Description discussing "the task's
+    ``## Acceptance Criteria`` line"), which made
+    ``suffix_ref_on_orphan_paths`` mutate text far outside the section
+    it was scoped to. Line-anchoring mirrors both the ``_NEXT_H2_RE``
+    end bound below and the validator's own line-anchored
+    ``_extract_sections`` (``src/devbench/backlog/manager.py``), so the
+    post-processor and validate-backlog Rule 20 agree about what is
+    inside a section.
+    """
+    heading_re = re.compile(rf"^{re.escape(header)}\s*$", re.MULTILINE)
+    match = heading_re.search(text)
+    if match is None:
         return None
-    section_start = idx + len(header)
+    section_start = match.end()
     next_h2 = _NEXT_H2_RE.search(text, section_start + 1)
     section_end = next_h2.start() if next_h2 else len(text)
     return section_start, section_end

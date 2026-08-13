@@ -495,6 +495,78 @@ class TestSuffixRefOnOrphanPaths:
         bpp.suffix_ref_on_orphan_paths(tmp_path)
         assert bpp.suffix_ref_on_orphan_paths(tmp_path) == 0
 
+    def test_quoted_heading_in_prose_does_not_hijack_bounds(self, tmp_path: Path) -> None:
+        """Issue #337: heading text QUOTED in another section's prose must not
+        move the section bounds. Pre-fix, the unanchored substring search
+        anchored 'Acceptance Criteria' at the Description's backtick quotation
+        and the pass suffixed a Code Standards path token far outside AC/DoD.
+        """
+        quoted = """\
+            # E1-F1-S1-T1: Title
+
+            ## Description
+
+            The new rule requires every task `## Acceptance Criteria` line to
+            carry the tag; an auto-ticked `## Definition of Done` item is never
+            accepted as satisfaction.
+
+            ### Code Standards
+
+            See `/workspace/CLAUDE.md` for the full engineering standards.
+
+            ## Changes Manifest
+
+            | File | Change |
+            |------|--------|
+            | `src/foo.py` | Add foo. |
+
+            ## Acceptance Criteria
+
+            - AC-1: integrates with the existing `src/legacy.py` interface.
+
+            ## Definition of Done
+
+            - DoD-1: tests in `tests/test_foo.py` pass.
+
+            ## Next
+            """
+        wu = _write(tmp_path / "T.md", quoted)
+        count = bpp.suffix_ref_on_orphan_paths(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        # The Code Standards token is OUTSIDE Acceptance Criteria / Definition
+        # of Done and must stay bare.
+        assert "`/workspace/CLAUDE.md` for the full" in text
+        assert "`/workspace/CLAUDE.md` (ref)" not in text
+        # Genuine orphans inside the REAL sections still get the suffix.
+        assert "`src/legacy.py` (ref)" in text
+        assert "`tests/test_foo.py` (ref)" in text
+
+    def test_only_quoted_heading_and_no_real_section_is_untouched(self, tmp_path: Path) -> None:
+        """Issue #337: a file that only QUOTES the heading strings has no AC or
+        DoD section, so the pass must leave it byte-identical."""
+        quoted_only = """\
+            # E1-F1-S1-T1: Title
+
+            ## Description
+
+            Discusses the `## Acceptance Criteria` grammar and the
+            `## Definition of Done` auto-tick behavior at `src/legacy.py`.
+
+            ## Changes Manifest
+
+            | File | Change |
+            |------|--------|
+            | `src/foo.py` | Add foo. |
+
+            ## Next
+            """
+        wu = _write(tmp_path / "T.md", quoted_only)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.suffix_ref_on_orphan_paths(tmp_path)
+        assert count == 0
+        assert wu.read_text(encoding="utf-8") == before
+
     def test_already_suffixed_left_alone(self, tmp_path: Path) -> None:
         already = """\
             # T

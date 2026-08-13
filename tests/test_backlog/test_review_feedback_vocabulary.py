@@ -31,6 +31,11 @@ class TestIsValidCode:
     def test_newly_reachable_path_unverified_is_a_valid_code_review_code(self) -> None:
         assert is_valid_code("code_review", "NEWLY_REACHABLE_PATH_UNVERIFIED") is True
 
+    def test_unreachable_artifact_is_a_code_review_code(self) -> None:
+        """caylent-solutions/devbench-internal-backlog#10: the reachability-check gate
+        emits code_review:UNREACHABLE_ARTIFACT."""
+        assert is_valid_code("code_review", "UNREACHABLE_ARTIFACT") is True
+
     def test_valid_code_for_each_judge(self) -> None:
         for judge, codes in JUDGE_CATEGORIES.items():
             for code in codes:

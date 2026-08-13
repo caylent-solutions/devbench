@@ -5,6 +5,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Reachability check on the code-review gate**
+  (`caylent-solutions/devbench-internal-backlog#10`). A task could
+  previously build a component, hook, slice, or pure function as a
+  self-contained deliverable, pass its own unit tests, clear `code-reviewer`,
+  and be marked done without the separate step of wiring it into the real app
+  (a route mount, a parent container's prop list, a shell's child
+  composition) ever happening -- `code-reviewer`'s rubric never checked
+  cross-file usage. A new `devbench check-reachability <id>` command greps
+  the target repo, language-agnostically, for newly-added source files with
+  zero non-test references, and `code-reviewer` now surfaces that evidence
+  and fails with `UNREACHABLE_ARTIFACT` when an artifact is genuinely
+  orphaned rather than a grep false positive. A `devbench-defer-reachability:
+  <reason>` comment is the documented, logged escape hatch for legitimately
+  deferred code (feature-flagged, Storybook-only, explicit follow-up task).
+
 - **Added `devbench check-ancestry`, the canonical git-ancestry gate for
   declared work-group dependencies**
   (`caylent-solutions/devbench-internal-backlog#12`). Adds `devbench

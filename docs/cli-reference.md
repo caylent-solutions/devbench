@@ -1214,6 +1214,20 @@ Read-only, deterministic wrapper around `assert_staged_matches_manifest`'s check
 
 Exists because `get-diff` is now Manifest-scoped (above): a staged-but-unmanifested file no longer appears in the diff a judge reads, so the `changes-manifest` judge runs this verb to get a deterministic staged-vs-Manifest signal it cannot drift from. A non-empty result is an unconditional automatic REVIEW_FAIL for that judge (FR-11-A2), never a judged PASS.
 
+### `check-reachability`
+
+```
+uv run devbench check-reachability <id>
+```
+
+Heuristic, language-agnostic evidence for `code-reviewer`'s `UNREACHABLE_ARTIFACT` check (`caylent-solutions/devbench-internal-backlog#10`). For every newly-added top-level source file in the work unit's diff (tracked-added, staged, unstaged, branch-vs-default, and untracked, mode-aware per the same ADR-12 contract as `get-diff`), derives candidate exported-symbol names (basename plus regex-extracted `export`/`def`/`class`/`func` names) and `git grep`s the rest of the target repo -- tracked and untracked, excluding the file's own test/spec/story/fixture files -- for any non-test reference. Files with zero hits print as `[POTENTIALLY UNREACHABLE]`; files with at least one non-test reference print as `[OK]` with the importer list.
+
+This is a candidate-surfacing tool, not a gate: a grep miss can be a false positive (dynamic `import()`, a barrel re-export the regex missed, a lazy route split). `code-reviewer` makes the final judgment call from this evidence.
+
+Honors an escape hatch: a line anywhere in the file containing `devbench-defer-reachability: <reason>` marks it `[DEFERRED]` and excludes it from the unreachable list; the reason is echoed in the report so the reviewer can judge whether it's a legitimate deferral (feature flag, Storybook-only, explicit follow-up task) rather than a silent bypass.
+
+Exit 0 once the unit/repo resolve (this command reports evidence, not a verdict); exit 1 when the work unit is not found or no local path is configured for its repo.
+
 ### `run-tests`
 
 ```

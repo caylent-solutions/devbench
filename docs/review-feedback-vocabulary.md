@@ -27,6 +27,7 @@ example remediations.
 | `MANIFEST_TODO_UNFILLED` | Manifest still has a `TBD` placeholder row | Replace placeholder with real file/change rows before claim. |
 | `AGENT_LOG_CONTRADICTS_DIFF` | TDD log claims work that does not appear in the diff | Reconcile log + diff; re-stage if work was lost, or trim the log claim. |
 | `NEWLY_REACHABLE_PATH_UNVERIFIED` | Bug-fix-shaped task has no `[NEWLY_REACHABLE]` entry, or an entry with unverified paths | Enumerate the paths the fix newly unlocks and live-verify each at smoke-test level; see `docs/newly-reachable-paths.md`. |
+| `UNREACHABLE_ARTIFACT` | New component/hook/slice/function has zero non-test importers per `devbench check-reachability` evidence | Import and wire the artifact into its real composition root (route table, parent container, shell), or add a `devbench-defer-reachability: <reason>` comment if intentionally deferred. |
 
 ## `test_review`
 

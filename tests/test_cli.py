@@ -6790,6 +6790,312 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
         assert "unmanifested.py" in scope_err
 
 
+class TestReachabilityHelperFunctions:
+    """Unit tests for the pure helper functions behind cmd_check_reachability
+    (caylent-solutions/devbench-internal-backlog#10)."""
+
+    def test_is_reachability_candidate_accepts_known_source_extension(self) -> None:
+        assert cli._is_reachability_candidate("src/components/Button.tsx") is True
+
+    def test_is_reachability_candidate_rejects_unknown_extension(self) -> None:
+        assert cli._is_reachability_candidate("src/data.json") is False
+
+    def test_is_reachability_candidate_rejects_test_and_story_paths(self) -> None:
+        assert cli._is_reachability_candidate("src/__tests__/Button.tsx") is False
+        assert cli._is_reachability_candidate("src/Button.test.tsx") is False
+        assert cli._is_reachability_candidate("src/Button.stories.tsx") is False
+        assert cli._is_reachability_candidate("src/tests/test_button.py") is False
+
+    def test_is_reachability_candidate_rejects_entry_point_stems(self) -> None:
+        assert cli._is_reachability_candidate("src/index.ts") is False
+        assert cli._is_reachability_candidate("src/App.tsx") is False
+        assert cli._is_reachability_candidate("pkg/__init__.py") is False
+
+    def test_derive_basename_symbol_uses_parent_dir_for_index_barrel(self) -> None:
+        assert cli._derive_reachability_basename_symbol("src/Button/index.tsx") == "Button"
+
+    def test_derive_basename_symbol_uses_filename_otherwise(self) -> None:
+        assert cli._derive_reachability_basename_symbol("src/Button.tsx") == "Button"
+
+    def test_extract_symbols_finds_named_js_export(self) -> None:
+        content = "export function useWidget() { return 1; }\n"
+        symbols = cli._extract_reachability_symbols(content, "src/hooks/useWidget.ts")
+        assert "useWidget" in symbols
+
+    def test_extract_symbols_finds_python_class_and_basename(self) -> None:
+        content = "class Validator:\n    pass\n"
+        symbols = cli._extract_reachability_symbols(content, "src/validators/rule.py")
+        assert "Validator" in symbols
+        assert "rule" in symbols
+
+    def test_extract_symbols_finds_export_brace_list(self) -> None:
+        content = "const helperA = 1;\nconst helperB = 2;\nexport { helperA, helperB as aliasedB };\n"
+        symbols = cli._extract_reachability_symbols(content, "src/helpers.ts")
+        assert "helperA" in symbols
+        assert "helperB" in symbols
+
+    def test_defer_reason_extracts_text_after_marker(self) -> None:
+        content = "// devbench-defer-reachability: waiting on flag ROLLOUT_X\nexport const x = 1;\n"
+        assert cli._reachability_defer_reason(content) == "waiting on flag ROLLOUT_X"
+
+    def test_defer_reason_returns_none_when_marker_absent(self) -> None:
+        assert cli._reachability_defer_reason("export const x = 1;\n") is None
+
+    def test_defer_reason_strips_trailing_comment_closer(self) -> None:
+        content = "/* devbench-defer-reachability: storybook only */\n"
+        assert cli._reachability_defer_reason(content) == "storybook only"
+
+    def test_parse_added_paths_keeps_only_status_a(self) -> None:
+        name_status = "A\tsrc/new.py\nM\tsrc/existing.py\nD\tsrc/removed.py\n"
+        assert cli._parse_reachability_added_paths(name_status) == ["src/new.py"]
+
+    def test_parse_added_paths_excludes_renames(self) -> None:
+        name_status = "R100\told.py\tnew.py\n"
+        assert cli._parse_reachability_added_paths(name_status) == []
+
+    def test_parse_added_paths_skips_blank_lines(self) -> None:
+        name_status = "\nA\tsrc/new.py\n\n"
+        assert cli._parse_reachability_added_paths(name_status) == ["src/new.py"]
+
+
+class TestCmdCheckReachability:
+    """Tests for cmd_check_reachability (caylent-solutions/devbench-internal-backlog#10:
+    reachability-check task-completion gate).
+
+    Uses a real git repo (not a mocked ``run_command``) so the ``git grep``
+    based importer search exercises real git semantics end-to-end.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _git_repo(self, tmp_path: Path) -> Path:
+        """Create a real git repo with one committed baseline file."""
+        repo = tmp_path / "checkout"
+        repo.mkdir()
+        for args in (
+            ["git", "init"],
+            ["git", "config", "user.email", "t@ex.com"],
+            ["git", "config", "user.name", "Test"],
+        ):
+            subprocess.run(args, cwd=repo, check=True, capture_output=True)
+        (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _run(self, unit: WorkUnit, repo: Path) -> int:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+        ):
+            return cli.cmd_check_reachability(unit.id)
+
+    def test_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_reachability("NONEXISTENT")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    def test_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_check_reachability(unit.id)
+
+        assert result == 1
+        assert "no local path" in capsys.readouterr().err.lower()
+
+    def test_no_new_files_reports_clean(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+
+        result = self._run(unit, repo)
+
+        assert result == 0
+        assert "No newly-added source files" in capsys.readouterr().out
+
+    def test_orphaned_component_flagged_unreachable(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        # The exported symbol name ("Impl") differs from the file basename
+        # ("Orphan") so a `git grep` for the basename finds zero hits at all
+        # (not even a self-match), exercising the "no match anywhere" path
+        # distinct from the "only self-referenced" path covered elsewhere.
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+
+        result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
+        assert "Summary: 1 candidate(s) examined, 1 flagged as potentially unreachable." in out
+
+    def test_defer_pr_mode_falls_back_to_git_show_head(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """In defer_pr mode with an empty staged/unstaged diff, new files come from `git show HEAD`."""
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Committed.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add Committed.tsx"], cwd=repo, check=True, capture_output=True)
+
+        with patch("devbench.config.DEFER_PR", True):
+            result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[POTENTIALLY UNREACHABLE] src/Committed.tsx" in out
+
+    def test_resolved_default_branch_diff_finds_new_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Non-defer_pr mode diffs against `origin/<default_branch>` to find branch-only new files."""
+        unit = self._make_unit()
+        upstream = tmp_path / "upstream.git"
+        subprocess.run(["git", "init", "--bare", str(upstream)], check=True, capture_output=True)
+        repo = self._git_repo(tmp_path)
+        subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "HEAD:main"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "src").mkdir()
+        (repo / "src/OnBranch.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add OnBranch.tsx"], cwd=repo, check=True, capture_output=True)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+        ):
+            result = cli.cmd_check_reachability(unit.id)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[POTENTIALLY UNREACHABLE] src/OnBranch.tsx" in out
+
+    def test_wired_component_passes_with_importer_listed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+
+        result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Wired.tsx" in out
+        assert "src/App.tsx" in out
+        assert "Summary: 1 candidate(s) examined, 0 flagged as potentially unreachable." in out
+
+    def test_referenced_only_by_own_test_still_flagged_unreachable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Lonely.tsx").write_text("export function Lonely() { return null; }\n", encoding="utf-8")
+        (repo / "src/Lonely.test.tsx").write_text(
+            "import { Lonely } from './Lonely';\ntest('x', () => Lonely());\n", encoding="utf-8"
+        )
+
+        result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[POTENTIALLY UNREACHABLE] src/Lonely.tsx" in out
+
+    def test_unreadable_file_reported_as_skipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Broken.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+
+        real_read_text: Callable[..., str] = Path.read_text
+
+        def fake_read_text(path_self: Path, *args: object, **kwargs: object) -> str:
+            if path_self.name == "Broken.tsx":
+                raise OSError("permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", fake_read_text):
+            result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[SKIPPED] src/Broken.tsx" in out
+        assert "Could not read file" in out
+
+    def test_importer_list_truncated_after_ten(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        for i in range(11):
+            (repo / f"src/Consumer{i}.tsx").write_text(
+                f"import {{ Widget }} from './Widget'; // consumer {i}\n", encoding="utf-8"
+            )
+
+        result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Widget.tsx" in out
+        assert "Non-test importers found: 11" in out
+        assert "... and 1 more" in out
+
+    def test_defer_marker_excludes_from_unreachable_and_echoes_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Deferred.tsx").write_text(
+            "// devbench-defer-reachability: feature-flagged for Q3 launch\n"
+            "export function Deferred() { return null; }\n",
+            encoding="utf-8",
+        )
+
+        result = self._run(unit, repo)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[DEFERRED] src/Deferred.tsx" in out
+        assert "feature-flagged for Q3 launch" in out
+        assert "Summary: 1 candidate(s) examined, 0 flagged as potentially unreachable." in out
+
+
 class TestCmdGetDiffModeAware:
     """Tests for ADR-12 mode-aware cmd_get_diff behaviour, updated for the
     Manifest-scoped pathspec (db-296/FR-12) and task-commit attribution

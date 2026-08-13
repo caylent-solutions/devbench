@@ -400,6 +400,8 @@ Set the work unit's status to `in-progress`. Fails if the unit is already in a t
 
 `claim` refuses, with a non-zero exit and no status write, when the unit's Changes Manifest still carries a placeholder row. Replace it with real file entries, or let the manifest-amendment workflow fill it in.
 
+**Active-work-unit marker (issue #336).** On every successful claim, under the same `BACKLOG.lock` as the status write, `claim` records the absolute path of the claimed unit's `.md` file in `<workspace>/.devbench/active-work-unit` (or `active-work-unit-<session>` when `DEVBENCH_SESSION_NAME` is set). The `guard-git-stage.sh` PreToolUse hook resolves the active work unit from this marker to enforce Changes-Manifest scope on `git add` -- hook processes inherit the long-lived orchestrator environment, so a per-work-unit environment variable can never reach them. The marker is never cleared: the hook checks that the referenced unit still declares `## Status: in-progress` before enforcing, so a stale marker after a terminal transition is a designed skip.
+
 **Checkout quarantine.** Before claiming, `claim` clears any uncommitted change in the unit's target checkout that falls outside that unit's Changes Manifest.
 
 This exists because the single-branch modes (`git_ops.single_branch` with `defer_pr`) run every work unit in one shared checkout. A unit that blocks, or a run that is interrupted, leaves its work in the tree, and the next unit to claim inherits it: its commit absorbs the sibling's files under the wrong unit's message, and the review judges reject it over code it does not own and cannot fix.

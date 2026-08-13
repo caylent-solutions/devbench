@@ -1484,12 +1484,41 @@ def _log_quarantine(record: QuarantineRecord, claiming_unit_id: str) -> None:
         logger.warning("quarantine audit comment failed for %s: %s", owner_id, exc)
 
 
+def _active_work_unit_marker_path(session_name: str | None) -> Path:
+    """Return the active-work-unit marker path for the given session.
+
+    Issue #336: ``guard-git-stage.sh`` rule 2 resolves the claimed work unit
+    from this marker because hook processes inherit the long-lived
+    orchestrator environment and cannot receive a per-work-unit environment
+    variable.  Named sessions get a suffixed marker so concurrent sessions
+    in one workspace never read each other's claim.
+
+    Args:
+        session_name: Optional named-session name from ``DEVBENCH_SESSION_NAME``.
+
+    Returns:
+        Absolute marker path under ``<workspace>/.devbench/``.
+    """
+    from devbench.constants import ACTIVE_WORK_UNIT_MARKER_PATH
+
+    marker = WORKSPACE_ROOT / ACTIVE_WORK_UNIT_MARKER_PATH
+    if session_name:
+        marker = marker.with_name(f"{marker.name}-{session_name}")
+    return marker
+
+
 def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:
     """Acquire BACKLOG.lock, re-read status, and write ``in-progress`` under the lock.
 
     Returns an error message string when the claim fails (race, timeout, or missing
     status line), or ``None`` on success.  Keeps ``cmd_claim`` within the
     PLR0911 return-statement budget.
+
+    On success, also records the claimed unit's file path in the
+    active-work-unit marker (issue #336) so ``guard-git-stage.sh`` rule 2
+    can enforce manifest scope on ``git add`` for the duration of the claim.
+    The marker is written under the same ``BACKLOG.lock`` as the status
+    transition, so the hook can never observe a claim without its marker.
 
     Args:
         wu_file: Absolute path to the work-unit ``.md`` file.
@@ -1500,7 +1529,10 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
         ``None`` on success; a human-readable error string on failure.
 
     Raises:
-        OSError: Unexpected OS error from ``fcntl.flock`` (propagated to caller).
+        OSError: Unexpected OS error from ``fcntl.flock`` or from writing the
+            active-work-unit marker (propagated to caller -- a claim whose
+            marker cannot be recorded must fail loudly, not degrade the
+            guard silently).
     """
     try:
         with flock_backlog(WORKSPACE_ROOT):
@@ -1519,6 +1551,9 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
                 )
             mgr = BacklogManager()
             mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS, session_name=session_name)
+            marker = _active_work_unit_marker_path(session_name)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(marker, f"{wu_file.resolve()}\n")
     except ClaimRaceError as exc:
         return (
             f"ERROR: claim race on {unit_id!r} -- another session already changed the status. "

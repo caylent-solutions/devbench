@@ -1038,6 +1038,20 @@ SESSION_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
 # single ISO 8601 UTC timestamp string.
 LAST_RESTART_MARKER_PATH: str = ".devbench/last-restart"
 
+# Relative path (from workspace root) of the active-work-unit marker written
+# by ``cmd_claim`` under ``flock(BACKLOG.lock)`` on every successful claim.
+# Issue #336: gives ``guard-git-stage.sh`` rule 2 (manifest-scope enforcement
+# on ``git add``) a production activation path -- hook processes inherit the
+# long-lived orchestrator environment, so a per-work-unit environment
+# variable can never be pinned for them.  The file contains a single line:
+# the absolute path of the claimed work unit's ``.md`` file.  Named sessions
+# get their own marker (``<path>-<DEVBENCH_SESSION_NAME>``) so concurrent
+# sessions in one workspace never read each other's claim.  The marker is
+# never cleared: the hook validates that the referenced unit still declares
+# ``## Status: in-progress`` before enforcing, so a stale marker is a
+# designed skip, not a false block.
+ACTIVE_WORK_UNIT_MARKER_PATH: str = ".devbench/active-work-unit"
+
 # ---------------------------------------------------------------------------
 # Bounded skill iterate-until-perfect mechanism (spec section 4.6.0, issue #204)
 # The four onboarding skills (create-spec, spec-to-backlog, bootstrap-environment,

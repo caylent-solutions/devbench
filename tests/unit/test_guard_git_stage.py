@@ -321,3 +321,122 @@ class TestGuardGitStageManifestScope:
         payload = _make_payload("git add anything.py")
         result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
         assert result.returncode == 0
+
+    def test_env_pinned_unit_not_in_progress_skips_check(self, tmp_path: Path) -> None:
+        """Issue #336: a pinned unit that is not in-progress means no active claim context."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        unit.write_text(unit.read_text(encoding="utf-8").replace("## Status: in-progress", "## Status: done"))
+        payload = _make_payload("git add TRACE_FILE")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
+        assert result.returncode == 0
+
+
+@pytest.mark.unit
+class TestGuardGitStageActiveWorkUnitMarker:
+    """Issue #336: rule 2 resolves the active work unit from the claim-written marker.
+
+    Production hook processes inherit the long-lived orchestrator environment,
+    so CURRENT_WORK_UNIT_FILE can never be pinned per work unit there. The
+    marker `devbench claim` writes under `.devbench/` is the activation path
+    that makes rule 2 live outside the test seam.
+    """
+
+    def _env_with_workspace(self, workspace: Path, session: str | None = None) -> dict[str, str]:
+        """Env with the workspace root pointed at ``workspace`` and no env pin."""
+        stripped = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_SESSION_NAME", "CURRENT_WORK_UNIT_FILE"}
+        env = {k: v for k, v in os.environ.items() if k not in stripped}
+        env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
+        env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
+        if session is not None:
+            env["DEVBENCH_SESSION_NAME"] = session
+        return env
+
+    def _run(self, payload: dict, env: dict[str, str], cwd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(SCRIPT_PATH)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+        )
+
+    def _write_marker(self, workspace: Path, unit: Path, session: str | None = None) -> Path:
+        name = "active-work-unit" if session is None else f"active-work-unit-{session}"
+        marker = workspace / ".devbench" / name
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{unit}\n", encoding="utf-8")
+        return marker
+
+    def test_marker_resolved_unit_enforces_manifest_scope(self, tmp_path: Path) -> None:
+        """Out-of-manifest add is blocked when the marker names an in-progress unit."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        self._write_marker(tmp_path, unit)
+        payload = _make_payload("git add TRACE_FILE")
+        result = self._run(payload, self._env_with_workspace(tmp_path), cwd=str(tmp_path))
+        assert result.returncode == 2
+        assert "manifest scope violation" in result.stderr
+
+    def test_marker_resolved_unit_allows_in_manifest_add(self, tmp_path: Path) -> None:
+        """In-manifest add passes when the marker names an in-progress unit."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        self._write_marker(tmp_path, unit)
+        payload = _make_payload("git add src/a.py")
+        result = self._run(payload, self._env_with_workspace(tmp_path), cwd=str(tmp_path))
+        assert result.returncode == 0, result.stderr
+
+    def test_env_pin_takes_precedence_over_marker(self, tmp_path: Path) -> None:
+        """CURRENT_WORK_UNIT_FILE wins over the marker when both are present."""
+        marker_unit = _write_manifest_unit(tmp_path / "marker-unit.md", ["src/marker.py"])
+        env_unit = _write_manifest_unit(tmp_path / "env-unit.md", ["src/env.py"])
+        self._write_marker(tmp_path, marker_unit)
+        env = self._env_with_workspace(tmp_path)
+        env["CURRENT_WORK_UNIT_FILE"] = str(env_unit)
+        # In scope for the env-pinned unit, out of scope for the marker unit:
+        # env precedence means this must pass.
+        payload = _make_payload("git add src/env.py")
+        result = self._run(payload, env, cwd=str(tmp_path))
+        assert result.returncode == 0, result.stderr
+
+    def test_session_scoped_marker_is_used_for_named_session(self, tmp_path: Path) -> None:
+        """A named session reads only its own suffixed marker."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        self._write_marker(tmp_path, unit, session="alpha")
+        payload = _make_payload("git add TRACE_FILE")
+        result = self._run(payload, self._env_with_workspace(tmp_path, session="alpha"), cwd=str(tmp_path))
+        assert result.returncode == 2
+        assert "manifest scope violation" in result.stderr
+
+    def test_named_session_ignores_default_marker(self, tmp_path: Path) -> None:
+        """A named session must not read the default (unsuffixed) marker."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        self._write_marker(tmp_path, unit)
+        payload = _make_payload("git add TRACE_FILE")
+        result = self._run(payload, self._env_with_workspace(tmp_path, session="alpha"), cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_stale_marker_unit_no_longer_in_progress_skips_check(self, tmp_path: Path) -> None:
+        """A marker pointing at a done unit is a designed skip, not a false block."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        unit.write_text(unit.read_text(encoding="utf-8").replace("## Status: in-progress", "## Status: done"))
+        self._write_marker(tmp_path, unit)
+        payload = _make_payload("git add TRACE_FILE")
+        result = self._run(payload, self._env_with_workspace(tmp_path), cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_marker_pointing_at_missing_file_skips_check(self, tmp_path: Path) -> None:
+        """A marker naming a deleted work-unit file skips enforcement."""
+        marker = tmp_path / ".devbench" / "active-work-unit"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{tmp_path / 'gone.md'}\n", encoding="utf-8")
+        payload = _make_payload("git add anything.py")
+        result = self._run(payload, self._env_with_workspace(tmp_path), cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_no_workspace_root_and_no_env_pin_skips_check(self, tmp_path: Path) -> None:
+        """Without a workspace root or env pin there is nothing to resolve."""
+        stripped = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_SESSION_NAME", "CURRENT_WORK_UNIT_FILE"}
+        env = {k: v for k, v in os.environ.items() if k not in stripped}
+        payload = _make_payload("git add anything.py")
+        result = self._run(payload, env, cwd=str(tmp_path))
+        assert result.returncode == 0

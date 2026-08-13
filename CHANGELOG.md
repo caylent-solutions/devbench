@@ -5,6 +5,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`guard-bash.sh` over-blocked `git checkout --theirs` / `git checkout
+  --ours`** (issue #335). The blocked pattern was the bare substring
+  `git checkout --`, which matched conflict-side selection during a merge
+  or cherry-pick as well as the destructive file-restore form it was
+  aimed at -- and unlike `guard-destructive-git.sh` there is no override
+  environment variable, so agent-driven conflict resolution was hard
+  blocked. The pattern is now `git checkout -- ` (trailing space),
+  matching the line `guard-destructive-git.sh` already draws, and the
+  previously untested hook gained its missing
+  `tests/unit/test_guard_bash.py` module.
+
+- **`guard-git-stage.sh` rule 2 (manifest-scope enforcement on `git
+  add`) was dead code in production** (issue #336). The rule gated on
+  the `CURRENT_WORK_UNIT_FILE` environment variable, which nothing in
+  the codebase ever set -- hook processes inherit the long-lived
+  orchestrator environment, so a per-work-unit variable can never reach
+  them, and the silent-skip branch hid the gap while the hook's own
+  tests set the variable themselves. `devbench claim` now records the
+  claimed unit's file path in `.devbench/active-work-unit[-<session>]`
+  under the same `BACKLOG.lock` as the status write, and the hook
+  resolves the active unit from that marker when the environment
+  variable is absent, enforcing only while the resolved unit still
+  declares `## Status: in-progress` (a stale marker is a designed skip,
+  so no clear-on-terminal-transition wiring is needed).
+
 - **Orchestrator inactivity net and cooperative SDK teardown** (FR-17,
   issues db-262 / db-325). `devbench start`'s `_run` SDK message loop
   no longer idles forever on a wound-down turn with no terminal

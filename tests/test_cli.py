@@ -1046,6 +1046,91 @@ class TestCmdClaim:
         assert call_args[0][3] == STATUS_IN_PROGRESS
         assert "Claimed E0-F1-S1-T2" in capsys.readouterr().out
 
+    def test_claim_writes_active_work_unit_marker(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Issue #336: a successful claim records the unit file in the marker.
+
+        guard-git-stage.sh rule 2 resolves the active work unit from this
+        marker in production, so the write must happen on every successful
+        claim and must contain the absolute unit-file path.
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
+                with patch("devbench.cli.BacklogManager", return_value=MagicMock()):
+                    with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                        result = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert result == 0
+        marker = tmp_path / ".devbench" / "active-work-unit"
+        assert marker.exists(), "claim must write the active-work-unit marker"
+        assert marker.read_text(encoding="utf-8") == f"{wu_file.resolve()}\n"
+        assert "Claimed E0-F1-S1-T2" in capsys.readouterr().out
+
+    def test_claim_writes_session_scoped_marker_for_named_session(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Issue #336: DEVBENCH_SESSION_NAME suffixes the marker filename."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-queue\n")
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "alpha")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
+                with patch("devbench.cli.BacklogManager", return_value=MagicMock()):
+                    with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                        result = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert result == 0
+        session_marker = tmp_path / ".devbench" / "active-work-unit-alpha"
+        assert session_marker.exists(), "named session must get its own suffixed marker"
+        assert session_marker.read_text(encoding="utf-8") == f"{wu_file.resolve()}\n"
+        assert not (tmp_path / ".devbench" / "active-work-unit").exists(), (
+            "a named session must not write the default marker"
+        )
+
+    def test_claim_overwrites_marker_on_subsequent_claim(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Issue #336: the marker always names the most recently claimed unit."""
+        first = backlog_dir / "E0-F1-S1-T2.md"
+        first.write_text("# Task\n## Status: in-queue\n")
+        second = backlog_dir / "E0-F1-S1-T3.md"
+        second.write_text("# Task\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
+                with patch("devbench.cli.BacklogManager", return_value=MagicMock()):
+                    with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                        assert cli.cmd_claim("E0-F1-S1-T2") == 0
+                        assert cli.cmd_claim("E0-F1-S1-T3") == 0
+
+        marker = tmp_path / ".devbench" / "active-work-unit"
+        assert marker.read_text(encoding="utf-8") == f"{second.resolve()}\n"
+
     def test_claim_refuses_when_manifest_has_tbd_placeholder(
         self,
         backlog_dir: Path,

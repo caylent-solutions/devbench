@@ -13,7 +13,12 @@ This module is parse/validate only -- it does not read environment variables.
 All env-var-driven defaults for operational parameters (timeouts, limits, model
 identifiers, region) are applied by ``config.py``.  Optional fields in the
 dataclasses default to ``None``; callers are responsible for substituting
-environment-driven values when ``None`` is encountered.
+environment-driven values when ``None`` is encountered.  ``resolve_gate_config``
+follows the same rule: its env-layer parameter is an already-resolved
+``bool | None`` the caller computes via ``config.resolve_gate_env_override``
+(which reads ``DEVBENCH_GATE_<NAME>_ENABLED`` through the existing
+``_resolve_bool`` chain) -- this module still never reads ``os.environ``
+itself.
 
 YAML schema::
 
@@ -84,9 +89,20 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
+    GATE_AUTO_DERIVE_REGISTRY_DEFAULT,
+    GATE_ENABLED_DEFAULT,
+    GATE_EXTRACT_SOURCE_LITERALS_DEFAULT,
+    GATE_FIELD_DEFAULTS,
+    GATE_PROVENANCE_BUILTIN,
+    GATE_PROVENANCE_ENV,
+    GATE_PROVENANCE_PROJECT,
+    GATE_PROVENANCE_REPO,
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
     ModelRates,
+)
+from devbench.constants import (
+    GATE_NAMES as _GATE_NAMES_ORDERED,
 )
 
 _BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
@@ -476,22 +492,24 @@ class FixtureConsistencyConfig:
     gate carries the same ``enabled`` toggle shape).
 
     Attributes:
-        enabled: Uniform gate toggle (D-2, D-17). Default ``False``. The
-            resolved value is consumed by the four-layer precedence
-            resolver landed in a follow-up task (``resolve_gate_config``);
-            this dataclass only models the raw parsed value.
+        enabled: Uniform gate toggle (D-2, D-17). Default
+            ``constants.GATE_ENABLED_DEFAULT`` (``False``). The resolved
+            value consumed by gate commands is computed by the four-layer
+            precedence resolver, ``resolve_gate_config``; this dataclass
+            only models the raw parsed project-level value.
         canonical_sources: Designated canonical fixture/dataset file(s).
         scan: Mock/fixture files to cross-reference against a canonical
             source.
         extract_source_literals: Reserved for a future literal-extraction
-            scanning mode (spec 4.7 hardening). Default ``False``; not yet
-            consumed by ``check_fixture_consistency``.
+            scanning mode (spec 4.7 hardening). Default
+            ``constants.GATE_EXTRACT_SOURCE_LITERALS_DEFAULT`` (``False``);
+            not yet consumed by ``check_fixture_consistency``.
     """
 
-    enabled: bool = False
+    enabled: bool = GATE_ENABLED_DEFAULT
     canonical_sources: tuple[FixtureCanonicalSource, ...] = ()
     scan: tuple[FixtureScanTarget, ...] = ()
-    extract_source_literals: bool = False
+    extract_source_literals: bool = GATE_EXTRACT_SOURCE_LITERALS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -567,19 +585,11 @@ class AmendmentConfig:
 
 
 # The eight integration-reality gates (spec 4.1; caylent-solutions/devbench-internal-backlog#10..#17).
-# Domain vocabulary, not operator-configurable -- deliberately NOT a constants.py env-tunable value.
-GATE_NAMES: frozenset[str] = frozenset(
-    {
-        "reachability",
-        "ancestry",
-        "shared_file_impact",
-        "fixture_consistency",
-        "write_path_audit",
-        "newly_reachable_paths",
-        "composition_root",
-        "layout_geometry",
-    }
-)
+# Domain vocabulary, single-sourced from the ordered ``constants.GATE_NAMES``
+# tuple (also consumed for `devbench gates` row order and the resolver's
+# built-in-default lookup); this frozenset exists only for O(1) membership
+# checks.
+GATE_NAMES: frozenset[str] = frozenset(_GATE_NAMES_ORDERED)
 
 
 @dataclass(frozen=True)
@@ -592,14 +602,14 @@ class GateEnabledConfig:
 
     Attributes:
         enabled: Whether this gate is enabled at the project level.
-            Default ``False`` (D-17: every gate disabled at the built-in
-            level). The resolved value consumed by gate commands is
-            computed by the four-layer precedence resolver landed in a
-            follow-up task (``resolve_gate_config``); this dataclass only
-            models the raw parsed project-level value.
+            Default ``constants.GATE_ENABLED_DEFAULT`` (``False``; D-17:
+            every gate disabled at the built-in level). The resolved value
+            consumed by gate commands is computed by the four-layer
+            precedence resolver, ``resolve_gate_config``; this dataclass
+            only models the raw parsed project-level value.
     """
 
-    enabled: bool = False
+    enabled: bool = GATE_ENABLED_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -608,16 +618,17 @@ class GateSharedFileImpactConfig:
 
     Attributes:
         enabled: Whether this gate is enabled at the project level.
-            Default ``False``.
+            Default ``constants.GATE_ENABLED_DEFAULT`` (``False``).
         auto_derive_registry: Reserved for the future auto-derived fan-in
             registry successor to the hand-maintained per-repo glob list
             (v1 is hand-maintained only, via ``gates.repos.<org/repo>
-            .shared_file_impact.patterns``). Default ``False``; not yet
-            consumed by ``check-shared-file-impact``.
+            .shared_file_impact.patterns``). Default
+            ``constants.GATE_AUTO_DERIVE_REGISTRY_DEFAULT`` (``False``);
+            not yet consumed by ``check-shared-file-impact``.
     """
 
-    enabled: bool = False
-    auto_derive_registry: bool = False
+    enabled: bool = GATE_ENABLED_DEFAULT
+    auto_derive_registry: bool = GATE_AUTO_DERIVE_REGISTRY_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -701,10 +712,10 @@ class GatesConfig:
     shipped -- both REMOVED by this same change, with zero remaining
     references (spec 4.1 Migration; complete replacement). Every gate is
     disabled by default at this built-in level (D-17); ``resolve_gate_config``
-    (a follow-up task) is the ONLY read path that resolves the full
-    built-in -> project -> per-repo -> env four-layer precedence (D-15) --
-    this dataclass models the raw parsed project + per-repo-override
-    layers only.
+    is the ONLY read path that resolves the full built-in -> project ->
+    per-repo -> env four-layer precedence (D-15) -- this dataclass models
+    the raw parsed project + per-repo-override layers only; no other
+    module reads its fields directly (AC-27).
 
     Attributes:
         reachability: check-reachability gate tunables.
@@ -1223,7 +1234,7 @@ def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsisten
     )
 
 
-def _parse_gate_enabled_field(path: Path, key: str, raw: dict, default: bool = False) -> bool:
+def _parse_gate_enabled_field(path: Path, key: str, raw: dict, default: bool = GATE_ENABLED_DEFAULT) -> bool:
     """Parse and validate one gate's ``enabled`` field, shared by every gate parser.
 
     Args:
@@ -2660,6 +2671,169 @@ def get_effective_merge_strategy(repo: str, runtime_config: RuntimeConfig) -> st
     if runtime_config.merge_strategy:
         return runtime_config.merge_strategy
     return None
+
+
+@dataclass(frozen=True)
+class ResolvedGateConfig:
+    """Fully-resolved effective configuration for one gate (spec 4.1, D-15; AC-27).
+
+    Returned exclusively by :func:`resolve_gate_config`, the ONLY
+    sanctioned read path for gate configuration -- every gate command
+    consumes this object rather than ``RuntimeConfig.gates`` directly, so a
+    second, potentially divergent interpretation of the four-layer
+    precedence model can never exist.
+
+    Attributes:
+        gate: The resolved gate's name (one of ``GATE_NAMES``).
+        values: Resolved field values by field name. Always includes
+            ``"enabled"``, plus any gate-specific tunable(s) declared for
+            *gate* in ``constants.GATE_FIELD_DEFAULTS`` (for example
+            ``"auto_derive_registry"`` for ``shared_file_impact``).
+        provenance: The layer that set each field in ``values`` -- one of
+            ``constants.GATE_PROVENANCE_BUILTIN`` / ``_PROJECT`` /
+            ``_REPO`` / ``_ENV`` (spec 4.1; rendered as the ``devbench
+            gates`` provenance column).
+    """
+
+    gate: str
+    values: Mapping[str, bool]
+    provenance: Mapping[str, str]
+
+
+def _merge_gate_project_layer(gate: str, runtime_config: RuntimeConfig) -> tuple[dict[str, bool], dict[str, str]]:
+    """Merge the built-in and project-level layers for *gate*, field-wise.
+
+    Generic over every gate's field set (``constants.GATE_FIELD_DEFAULTS``)
+    so adding a ninth gate later requires only a new
+    ``GATE_FIELD_DEFAULTS`` entry and a matching attribute on
+    ``GatesConfig``/``GateRepoOverrides`` -- not a resolver change.
+
+    Args:
+        gate: Gate name; must already be validated as a member of
+            ``GATE_NAMES`` by the caller.
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        A ``(values, provenance)`` pair covering every field declared for
+        *gate*, seeded from the built-in layer and overridden field-wise by
+        any project-level value that differs from the built-in default.
+    """
+    defaults = GATE_FIELD_DEFAULTS[gate]
+    values: dict[str, bool] = dict(defaults)
+    provenance: dict[str, str] = dict.fromkeys(defaults, GATE_PROVENANCE_BUILTIN)
+
+    project_gate = getattr(runtime_config.gates, gate)
+    for field_name, default_value in defaults.items():
+        project_value = getattr(project_gate, field_name)
+        if project_value != default_value:
+            values[field_name] = project_value
+            provenance[field_name] = GATE_PROVENANCE_PROJECT
+    return values, provenance
+
+
+def _merge_gate_repo_layer(
+    gate: str,
+    repo: str,
+    runtime_config: RuntimeConfig,
+    values: dict[str, bool],
+    provenance: dict[str, str],
+) -> None:
+    """Field-wise merge *repo*'s override for *gate* over *values*/*provenance*, in place.
+
+    A field absent from the override (``None``, or the field does not
+    exist at all on the override dataclass -- e.g. ``auto_derive_registry``
+    has no override field on ``GateSharedFileImpactOverride``) is left
+    untouched: the AC-E2-F1-S1-T2-2 inheritance guarantee that flipping
+    ``enabled`` for one repo never resets that repo's other tunables to
+    the built-in default.
+
+    Args:
+        gate: Gate name; must already be validated as a member of
+            ``GATE_NAMES`` by the caller.
+        repo: Fully-qualified repository name (``org/repo``).
+        runtime_config: Loaded runtime configuration.
+        values: The project-layer-merged values dict to update in place.
+        provenance: The project-layer-merged provenance dict to update in
+            place.
+    """
+    repo_overrides = runtime_config.gates.repos.get(repo)
+    if repo_overrides is None:
+        return
+    gate_override = getattr(repo_overrides, gate)
+    if gate_override is None:
+        return
+    for field_name in GATE_FIELD_DEFAULTS[gate]:
+        override_value = getattr(gate_override, field_name, None)
+        if override_value is not None:
+            values[field_name] = override_value
+            provenance[field_name] = GATE_PROVENANCE_REPO
+
+
+def resolve_gate_config(
+    gate: str,
+    repo: str,
+    runtime_config: RuntimeConfig,
+    env_enabled_override: bool | None = None,
+) -> ResolvedGateConfig:
+    """Resolve *gate*'s fully-effective configuration for *repo*.
+
+    THE single read path for gate configuration (spec 4.1, D-15; AC-27):
+    every gate command must call this function instead of reading
+    ``runtime_config.gates`` directly, so a second interpretation of the
+    four-layer precedence model can never silently diverge from this one
+    (pinned by ``tests/test_config_loader.py::TestResolveGateConfigSingleReadPathPin``).
+
+    Merges four layers field-wise, in ascending precedence (D-15):
+
+    1. Built-in defaults (``constants.GATE_FIELD_DEFAULTS``; D-17: every
+       gate disabled, every tunable at its documented default).
+    2. Project level (``runtime_config.gates.<gate>``).
+    3. Per-repo override (``runtime_config.gates.repos[repo].<gate>``),
+       field-wise merged OVER the project level -- flipping ``enabled``
+       for one repo never resets that repo's other tunables to the
+       built-in default; they keep inheriting the project-level value.
+    4. Environment (*env_enabled_override*) -- the already-resolved
+       ``DEVBENCH_GATE_<NAME>_ENABLED`` value (see
+       ``devbench.config.resolve_gate_env_override``, which applies the
+       existing ``_resolve_bool`` parsing/failure semantics; this module
+       does not read environment variables itself, matching every other
+       parse/validate-only function here). Workspace-wide and highest
+       precedence. Only ``enabled`` has an env layer (spec Section 7);
+       gate-specific tunables have none.
+
+    Pure function -- no I/O, no env reads; directly testable with an
+    in-memory ``RuntimeConfig`` and a plain ``bool | None``.
+
+    Args:
+        gate: Gate name; must be one of ``GATE_NAMES``.
+        repo: Fully-qualified repository name (``org/repo``) whose
+            per-repo override layer to apply. A repo absent from
+            ``runtime_config.gates.repos`` simply has no override layer
+            (not an error -- most repos never override any gate).
+        runtime_config: Loaded runtime configuration.
+        env_enabled_override: The caller-resolved
+            ``DEVBENCH_GATE_<NAME>_ENABLED`` value for *gate* -- ``True``/
+            ``False`` when the operator set the env var, ``None`` (the
+            default) when unset, falling through to the per-repo/project/
+            built-in layers.
+
+    Returns:
+        The resolved, frozen ``ResolvedGateConfig`` with per-field
+        provenance.
+
+    Raises:
+        ValueError: If *gate* is not one of ``GATE_NAMES``.
+    """
+    if gate not in GATE_NAMES:
+        raise ValueError(f"resolve_gate_config: unknown gate {gate!r}; valid gate names are {sorted(GATE_NAMES)}.")
+
+    values, provenance = _merge_gate_project_layer(gate, runtime_config)
+    _merge_gate_repo_layer(gate, repo, runtime_config, values, provenance)
+    if env_enabled_override is not None:
+        values["enabled"] = env_enabled_override
+        provenance["enabled"] = GATE_PROVENANCE_ENV
+
+    return ResolvedGateConfig(gate=gate, values=values, provenance=provenance)
 
 
 def get_effective_branch_prefix(repo: str, runtime_config: RuntimeConfig) -> str | None:

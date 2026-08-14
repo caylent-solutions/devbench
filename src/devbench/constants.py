@@ -1105,3 +1105,74 @@ ORCHESTRATOR_SOURCE_PREFIX: str = "src/devbench/"
 # character count) consumed by every module that displays or compares
 # abbreviated revisions for the harness/target install-parity gate.
 INSTALL_PARITY_SHORT_REVISION_CHARS: int = 7
+
+# ---------------------------------------------------------------------------
+# Integration-reality gates (spec integration-reality-gates-hardening.md
+# section 4.1; caylent-solutions/devbench-internal-backlog#10..#17; D-2,
+# D-15, D-17). Built-in defaults for the eight gates' resolver-managed
+# fields, consumed exclusively by ``config_loader.resolve_gate_config`` --
+# the single read path for gate configuration (AC-27).
+# ``config_loader.GATE_NAMES`` (a frozenset, used for O(1) membership
+# checks) derives from the ordered tuple below rather than repeating the
+# literal gate-name list a second time.
+# ---------------------------------------------------------------------------
+
+# Ordered, canonical list of the eight integration-reality gate names.
+GATE_NAMES: tuple[str, ...] = (
+    "reachability",
+    "ancestry",
+    "shared_file_impact",
+    "fixture_consistency",
+    "write_path_audit",
+    "newly_reachable_paths",
+    "composition_root",
+    "layout_geometry",
+)
+
+# D-17: every gate disabled by default; every implemented tunable at its
+# documented, equally-disabled default. ``fan_in_threshold`` (spec 4.6
+# hardening) is reserved for a future gate epic (E5-F2-S1) and has no
+# dataclass field yet, so it is intentionally not modeled here.
+GATE_ENABLED_DEFAULT: bool = False
+GATE_AUTO_DERIVE_REGISTRY_DEFAULT: bool = False
+GATE_EXTRACT_SOURCE_LITERALS_DEFAULT: bool = False
+
+# Built-in per-gate default field values, keyed by gate name then field
+# name. Every gate carries "enabled"; `shared_file_impact` additionally
+# carries "auto_derive_registry" and `fixture_consistency` additionally
+# carries "extract_source_literals" -- the only tunables with a
+# project/built-in precedence relationship today (spec 4.1). Structural,
+# list-valued config (`canonical_sources`, `scan`, `patterns`) is
+# project/per-repo-only with no built-in default to merge against, so it
+# is intentionally absent here.
+GATE_FIELD_DEFAULTS: dict[str, dict[str, bool]] = {
+    "reachability": {"enabled": GATE_ENABLED_DEFAULT},
+    "ancestry": {"enabled": GATE_ENABLED_DEFAULT},
+    "shared_file_impact": {
+        "enabled": GATE_ENABLED_DEFAULT,
+        "auto_derive_registry": GATE_AUTO_DERIVE_REGISTRY_DEFAULT,
+    },
+    "fixture_consistency": {
+        "enabled": GATE_ENABLED_DEFAULT,
+        "extract_source_literals": GATE_EXTRACT_SOURCE_LITERALS_DEFAULT,
+    },
+    "write_path_audit": {"enabled": GATE_ENABLED_DEFAULT},
+    "newly_reachable_paths": {"enabled": GATE_ENABLED_DEFAULT},
+    "composition_root": {"enabled": GATE_ENABLED_DEFAULT},
+    "layout_geometry": {"enabled": GATE_ENABLED_DEFAULT},
+}
+
+# DEVBENCH_GATE_<NAME>_ENABLED env-var name components (spec Section 7):
+# workspace-wide, highest-precedence layer, resolved by
+# ``devbench.config.resolve_gate_env_override`` through the existing
+# ``_resolve_bool`` chain.
+GATE_ENV_VAR_PREFIX: str = "DEVBENCH_GATE_"
+GATE_ENV_VAR_SUFFIX: str = "_ENABLED"
+
+# Per-field provenance labels rendered by the `devbench gates` provenance
+# column (spec 4.1, D-15; AC-27) -- which of the four precedence layers set
+# a resolved field.
+GATE_PROVENANCE_BUILTIN: str = "builtin"
+GATE_PROVENANCE_PROJECT: str = "project"
+GATE_PROVENANCE_REPO: str = "repo"
+GATE_PROVENANCE_ENV: str = "env"

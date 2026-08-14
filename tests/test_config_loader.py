@@ -4643,3 +4643,234 @@ class TestGatesMigrationRemovesPreReleaseKeys:
             f"top-level 'fixture_consistency:' key ({len(matches)} occurrence(s)); migrate to "
             "gates.fixture_consistency."
         )
+
+
+# ---------------------------------------------------------------------------
+# resolve_gate_config -- four-layer field-wise precedence (spec 4.1, D-15; AC-27)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestResolveGateConfigPrecedence:
+    """Four-layer field-wise precedence for ``resolve_gate_config`` (spec 4.1,
+    D-15; AC-27): built-in -> project -> per-repo override -> env, resolved
+    per field with per-field provenance. Covers the AC-27 scenario matrix:
+    built-in only, project sets a tunable, a per-repo override flips
+    ``enabled`` while inheriting the project-level tunable, and an env
+    override wins regardless of the lower layers.
+    """
+
+    _REPO = "org/repo"
+
+    def test_built_in_only_yields_every_field_from_builtin_layer(self) -> None:
+        """No project config, no repo override, no env override: every
+        field's value and provenance come from the built-in layer."""
+        from devbench.config_loader import GatesConfig, RepoConfig, RuntimeConfig, resolve_gate_config
+
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=GatesConfig())
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.gate == "shared_file_impact"
+        assert result.values == {"enabled": False, "auto_derive_registry": False}
+        assert result.provenance == {"enabled": "builtin", "auto_derive_registry": "builtin"}
+
+    def test_project_level_tunable_is_project_provenance_enabled_stays_builtin(self) -> None:
+        """Project sets a tunable away from its built-in default: that
+        field's provenance is 'project'; 'enabled' (untouched) stays
+        'builtin'."""
+        from devbench.config_loader import (
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(shared_file_impact=GateSharedFileImpactConfig(auto_derive_registry=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": False, "auto_derive_registry": True}
+        assert result.provenance == {"enabled": "builtin", "auto_derive_registry": "project"}
+
+    def test_repo_override_flips_enabled_and_inherits_project_tunable(self) -> None:
+        """A per-repo override that flips 'enabled' inherits the
+        project-level tunable rather than resetting it to the built-in
+        default (AC-E2-F1-S1-T2-2)."""
+        from devbench.config_loader import (
+            GateRepoOverrides,
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            GateSharedFileImpactOverride,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(
+            shared_file_impact=GateSharedFileImpactConfig(auto_derive_registry=True),
+            repos={self._REPO: GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(enabled=True))},
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "auto_derive_registry": True}
+        assert result.provenance == {"enabled": "repo", "auto_derive_registry": "project"}
+
+    def test_env_override_wins_regardless_of_lower_layers(self) -> None:
+        """The env layer overrides 'enabled' regardless of project/repo
+        layers; other tunables are left untouched. Setting env to the
+        opposite of the repo-override value proves precedence, not merely
+        that env can set a previously-unset field."""
+        from devbench.config_loader import (
+            GateRepoOverrides,
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            GateSharedFileImpactOverride,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(
+            shared_file_impact=GateSharedFileImpactConfig(auto_derive_registry=True),
+            repos={self._REPO: GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(enabled=True))},
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config, env_enabled_override=False)
+
+        assert result.values == {"enabled": False, "auto_derive_registry": True}
+        assert result.provenance == {"enabled": "env", "auto_derive_registry": "project"}
+
+    def test_fixture_consistency_tunable_uses_extract_source_literals_field(self) -> None:
+        """A different gate's differently-named tunable (extract_source_literals)
+        goes through the same generic field-wise merge."""
+        from devbench.config_loader import (
+            FixtureConsistencyConfig,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(fixture_consistency=FixtureConsistencyConfig(extract_source_literals=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("fixture_consistency", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": False, "extract_source_literals": True}
+        assert result.provenance == {"enabled": "builtin", "extract_source_literals": "project"}
+
+    def test_simple_gate_with_only_enabled_field_resolves(self) -> None:
+        """A gate with no tunable beyond 'enabled' (e.g. reachability)
+        resolves with a single-field values/provenance mapping."""
+        from devbench.config_loader import (
+            GateEnabledConfig,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(reachability=GateEnabledConfig(enabled=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_repo_present_but_no_override_for_this_gate_uses_project_layer(self) -> None:
+        """The target repo has overrides configured for a different gate;
+        the gate under test falls through to the project layer untouched."""
+        from devbench.config_loader import (
+            GateEnabledConfig,
+            GateEnabledOverride,
+            GateRepoOverrides,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(
+            reachability=GateEnabledConfig(enabled=True),
+            repos={self._REPO: GateRepoOverrides(ancestry=GateEnabledOverride(enabled=True))},
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_repo_absent_from_gates_repos_map_uses_only_builtin_and_project_layers(self) -> None:
+        """A repo with zero configured gate overrides at all (absent from
+        gates.repos) is not an error -- it simply has no repo layer."""
+        from devbench.config_loader import (
+            GateEnabledConfig,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(reachability=GateEnabledConfig(enabled=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        assert runtime_config.gates.repos == {}
+        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_unknown_gate_name_raises_value_error_naming_gate(self) -> None:
+        """resolve_gate_config raises ValueError naming the gate when asked
+        to resolve a gate outside the declared set."""
+        from devbench.config_loader import GatesConfig, RepoConfig, RuntimeConfig, resolve_gate_config
+
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=GatesConfig())
+        with pytest.raises(ValueError, match=r"nosuchgate"):
+            resolve_gate_config("nosuchgate", self._REPO, runtime_config)
+
+
+@pytest.mark.unit
+class TestResolveGateConfigSingleReadPathPin:
+    """AC-E2-F1-S1-T2-5 (AC-27): ``resolve_gate_config`` is the ONLY sanctioned
+    read path for a gate's resolver-managed fields (``enabled``,
+    ``auto_derive_registry``, ``extract_source_literals``). Fails when a
+    module other than ``config_loader.py`` reads one of these fields
+    directly off the raw ``GatesConfig`` tree instead of calling the
+    resolver, so a later gate epic cannot quietly re-introduce a second,
+    potentially divergent interpretation of the precedence chain.
+
+    Scoped to the three resolver-managed field names rather than every
+    ``.gates.`` access, because two pre-existing, sanctioned direct reads
+    of *structural* (non-resolver) gate fields already exist in
+    ``cli.py`` (``gates.repos.<repo>.shared_file_impact.patterns`` and
+    ``gates.fixture_consistency.canonical_sources``/``scan``) -- fields
+    ``resolve_gate_config`` does not manage at all (no four-layer
+    precedence applies to them).
+    """
+
+    _SRC_ROOT = Path(__file__).parent.parent / "src" / "devbench"
+    _EXEMPT_MODULE = _SRC_ROOT / "config_loader.py"
+    _RAW_GATE_FIELD_ACCESS_RE = re.compile(
+        r"\.gates\.[\w.\[\]\"' ()]*?\.(enabled|auto_derive_registry|extract_source_literals)\b"
+    )
+
+    def _scanned_files(self) -> list[Path]:
+        return sorted(p for p in self._SRC_ROOT.rglob("*.py") if p != self._EXEMPT_MODULE)
+
+    def test_discovers_at_least_one_scanned_file(self) -> None:
+        """Guards against the check below silently collecting zero files."""
+        assert len(self._scanned_files()) >= 1
+
+    def test_no_module_reads_raw_gate_field_directly(self) -> None:
+        offenders: list[str] = []
+        for path in self._scanned_files():
+            text = path.read_text(encoding="utf-8")
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if self._RAW_GATE_FIELD_ACCESS_RE.search(line):
+                    offenders.append(f"{path.relative_to(self._SRC_ROOT.parent.parent)}:{line_no}: {line.strip()}")
+        assert not offenders, (
+            "resolve_gate_config is the only sanctioned read path for gate-resolved fields "
+            "(enabled, auto_derive_registry, extract_source_literals); found direct access(es) "
+            "outside config_loader.py:\n" + "\n".join(offenders)
+        )

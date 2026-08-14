@@ -1010,3 +1010,103 @@ class TestOrchestratorSourcePrefixConstant:
         import devbench.constants as constants_module
 
         assert "ORCHESTRATOR_SOURCE_PREFIX" in vars(constants_module)
+
+
+@pytest.mark.unit
+class TestGateConstants:
+    """Integration-reality gate constants (spec 4.1; D-2, D-15, D-17;
+    AC-E2-F1-S1-T2-6): every built-in default lives here as a named
+    constant, single-sourced with no literal defaults inside the resolver.
+    """
+
+    _EXPECTED_GATE_NAMES = (
+        "reachability",
+        "ancestry",
+        "shared_file_impact",
+        "fixture_consistency",
+        "write_path_audit",
+        "newly_reachable_paths",
+        "composition_root",
+        "layout_geometry",
+    )
+
+    def test_gate_names_matches_the_eight_declared_gates_in_order(self) -> None:
+        from devbench.constants import GATE_NAMES
+
+        assert GATE_NAMES == self._EXPECTED_GATE_NAMES
+
+    def test_gate_defaults_are_all_disabled(self) -> None:
+        """D-17: every gate disabled by default; every tunable off."""
+        from devbench.constants import (
+            GATE_AUTO_DERIVE_REGISTRY_DEFAULT,
+            GATE_ENABLED_DEFAULT,
+            GATE_EXTRACT_SOURCE_LITERALS_DEFAULT,
+        )
+
+        assert GATE_ENABLED_DEFAULT is False
+        assert GATE_AUTO_DERIVE_REGISTRY_DEFAULT is False
+        assert GATE_EXTRACT_SOURCE_LITERALS_DEFAULT is False
+
+    def test_gate_field_defaults_covers_every_declared_gate(self) -> None:
+        from devbench.constants import GATE_FIELD_DEFAULTS, GATE_NAMES
+
+        assert set(GATE_FIELD_DEFAULTS) == set(GATE_NAMES)
+
+    def test_gate_field_defaults_every_gate_has_enabled(self) -> None:
+        from devbench.constants import GATE_FIELD_DEFAULTS
+
+        for gate, fields in GATE_FIELD_DEFAULTS.items():
+            assert "enabled" in fields, f"{gate} is missing the uniform 'enabled' field"
+            assert fields["enabled"] is False
+
+    def test_gate_field_defaults_shared_file_impact_has_auto_derive_registry(self) -> None:
+        from devbench.constants import GATE_FIELD_DEFAULTS
+
+        assert GATE_FIELD_DEFAULTS["shared_file_impact"] == {
+            "enabled": False,
+            "auto_derive_registry": False,
+        }
+
+    def test_gate_field_defaults_fixture_consistency_has_extract_source_literals(self) -> None:
+        from devbench.constants import GATE_FIELD_DEFAULTS
+
+        assert GATE_FIELD_DEFAULTS["fixture_consistency"] == {
+            "enabled": False,
+            "extract_source_literals": False,
+        }
+
+    @pytest.mark.parametrize(
+        "gate",
+        [
+            "reachability",
+            "ancestry",
+            "write_path_audit",
+            "newly_reachable_paths",
+            "composition_root",
+            "layout_geometry",
+        ],
+    )
+    def test_gate_field_defaults_single_tunable_gates_have_only_enabled(self, gate: str) -> None:
+        from devbench.constants import GATE_FIELD_DEFAULTS
+
+        assert GATE_FIELD_DEFAULTS[gate] == {"enabled": False}
+
+    def test_gate_env_var_prefix_and_suffix(self) -> None:
+        from devbench.constants import GATE_ENV_VAR_PREFIX, GATE_ENV_VAR_SUFFIX
+
+        assert GATE_ENV_VAR_PREFIX == "DEVBENCH_GATE_"
+        assert GATE_ENV_VAR_SUFFIX == "_ENABLED"
+        derived = f"{GATE_ENV_VAR_PREFIX}SHARED_FILE_IMPACT{GATE_ENV_VAR_SUFFIX}"
+        assert derived == "DEVBENCH_GATE_SHARED_FILE_IMPACT_ENABLED"
+
+    def test_gate_provenance_labels_are_distinct_strings(self) -> None:
+        from devbench.constants import (
+            GATE_PROVENANCE_BUILTIN,
+            GATE_PROVENANCE_ENV,
+            GATE_PROVENANCE_PROJECT,
+            GATE_PROVENANCE_REPO,
+        )
+
+        labels = {GATE_PROVENANCE_BUILTIN, GATE_PROVENANCE_PROJECT, GATE_PROVENANCE_REPO, GATE_PROVENANCE_ENV}
+        assert labels == {"builtin", "project", "repo", "env"}
+        assert len(labels) == 4

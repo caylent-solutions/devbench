@@ -498,6 +498,44 @@ class TestResolveHelpers:
             assert config._resolve_str_tuple("TEST_TUPLE", ("x", "y")) == ("x", "y")
 
 
+@pytest.mark.unit
+class TestGateEnvOverrides:
+    """``DEVBENCH_GATE_<NAME>_ENABLED`` env-override resolution (spec 4.1,
+    Section 7; AC-E2-F1-S1-T2-4).
+
+    ``resolve_gate_env_override`` derives the env var name for a gate and
+    resolves it through the existing ``_resolve_bool`` chain -- same
+    accepted boolean vocabulary, same failure semantics -- so
+    ``config_loader.resolve_gate_config`` callers thread its result into
+    the resolver's env layer.
+    """
+
+    _ENV_VAR = "DEVBENCH_GATE_REACHABILITY_ENABLED"
+
+    def test_true_value_resolves_true(self) -> None:
+        with patch.dict(os.environ, {self._ENV_VAR: "true"}, clear=False):
+            assert config.resolve_gate_env_override("reachability") is True
+
+    def test_false_value_resolves_false(self) -> None:
+        with patch.dict(os.environ, {self._ENV_VAR: "false"}, clear=False):
+            assert config.resolve_gate_env_override("reachability") is False
+
+    def test_unset_env_returns_none(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != self._ENV_VAR}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config.resolve_gate_env_override("reachability") is None
+
+    def test_unparseable_value_raises(self) -> None:
+        with patch.dict(os.environ, {self._ENV_VAR: "maybe"}, clear=False):
+            with pytest.raises(ValueError, match=rf"{self._ENV_VAR} must be one of"):
+                config.resolve_gate_env_override("reachability")
+
+    def test_derives_env_var_name_from_multi_word_gate(self) -> None:
+        """A multi-word gate name (e.g. shared_file_impact) uppercases correctly."""
+        with patch.dict(os.environ, {"DEVBENCH_GATE_SHARED_FILE_IMPACT_ENABLED": "on"}, clear=False):
+            assert config.resolve_gate_env_override("shared_file_impact") is True
+
+
 class TestRequireEnv:
     """The required-env-var contract: ``_require_env`` is the single source of
     truth for the import-time required env vars (``DEVBENCH_WORKSPACE_ROOT``

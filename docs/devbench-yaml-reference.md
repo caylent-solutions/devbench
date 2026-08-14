@@ -106,12 +106,19 @@ Every gate field resolves through four layers, in this order (lowest to highest 
    project level, so a repo can flip `enabled` while inheriting every other tunable.
 4. **Environment** -- `DEVBENCH_GATE_<NAME>_ENABLED`, workspace-wide, highest precedence.
 
-**Status: config model only.** This task lands the `GatesConfig` dataclass tree, the JSON Schema
-block, and fail-fast parsing (`_parse_gates_config`) -- the raw YAML round-trips into
-`RuntimeConfig.gates` exactly as written. The single resolver that reads this four-layer
-precedence chain, `resolve_gate_config(gate, repo) -> ResolvedGateConfig`, and the
-`DEVBENCH_GATE_<NAME>_ENABLED` env-override layer, ship in a follow-up task
-(E2-F1-S1-T2). No gate command consumes `RuntimeConfig.gates` yet.
+**Status: resolver landed (E2-F1-S1-T2).** `config_loader.resolve_gate_config(gate, repo,
+runtime_config, env_enabled_override=None) -> ResolvedGateConfig` is now the single read path for
+this four-layer precedence chain: it merges built-in defaults, the project layer, the per-repo
+override layer, and the caller-supplied env layer field-wise, and records per-field provenance
+(`builtin` / `project` / `repo` / `env`) so a repo that flips `enabled` inherits every other
+project-level tunable instead of resetting it. `config.resolve_gate_env_override(gate)` resolves
+the `DEVBENCH_GATE_<NAME>_ENABLED` env layer through the existing `_resolve_bool` chain and is the
+value callers thread into `resolve_gate_config`'s `env_enabled_override` parameter --
+`config_loader.py` remains parse/validate-only and never reads environment variables itself. No
+consumer other than `resolve_gate_config` may read a gate's resolver-managed fields (`enabled`,
+`auto_derive_registry`, `extract_source_literals`) directly off `RuntimeConfig.gates` (AC-27). No
+gate command consumes the resolver yet -- the `devbench gates` read-only verb and the per-gate
+check commands land in follow-up tasks (E2-F1-S2-T1 onward).
 
 ### Per-gate tunables
 

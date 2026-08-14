@@ -5,6 +5,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`resolve_gate_config` -- the single four-layer precedence resolver for
+  gate configuration** (spec `integration-reality-gates-hardening.md`
+  section 4.1, D-15, D-17; AC-27). Adds `resolve_gate_config(gate, repo,
+  runtime_config, env_enabled_override=None) -> ResolvedGateConfig` to
+  `config_loader.py`: merges built-in defaults, project-level `gates.<gate>.*`,
+  per-repo `gates.repos.<org/repo>.<gate>.*` overrides, and the
+  `DEVBENCH_GATE_<NAME>_ENABLED` env layer field-wise, in that ascending
+  precedence order, recording per-field provenance (`builtin` / `project` /
+  `repo` / `env`) so a repo that flips `enabled` inherits every other
+  project-level tunable instead of resetting it. Every built-in default
+  (gate names, per-gate field defaults, the env-var prefix/suffix, and the
+  provenance labels) is a named constant in `constants.py` -- no literal
+  defaults inline in the resolver -- and the `GatesConfig` dataclass tree's
+  own field defaults (`GateEnabledConfig`, `GateSharedFileImpactConfig`,
+  `FixtureConsistencyConfig`) now reference the same constants instead of
+  duplicated literals. Adds `config.resolve_gate_env_override(gate)`,
+  deriving the env var name and resolving it through the existing
+  `_resolve_bool` chain so the accepted boolean vocabulary and failure
+  semantics never diverge from every other env-driven boolean in that
+  module. Pins that `resolve_gate_config` is the ONLY module that reads a
+  gate's resolver-managed fields (`enabled`, `auto_derive_registry`,
+  `extract_source_literals`) directly off the raw config tree, so a later
+  gate epic cannot quietly re-introduce a second, divergent interpretation.
+
 - **Unified `gates:` config section for the eight integration-reality gates**
   (spec `integration-reality-gates-hardening.md` section 4.1;
   `caylent-solutions/devbench-internal-backlog#10`..`#17`). Replaces the

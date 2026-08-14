@@ -342,6 +342,8 @@ uv run devbench log-comment executor $ARGUMENTS "[NEWLY_REACHABLE] none -- <one-
 
 This entry is what `code-reviewer.md`'s BUG-FIX COMPLETENESS rubric checks for -- a bug-fix task with no `[NEWLY_REACHABLE]` entry in its Comments fails review even if the original repro passes. Self-reporting this step is necessary but not sufficient: the code-reviewer's independent check is the actual gate, so do not treat logging the line as the end of the obligation -- the enumeration and verification have to be real.
 
+**Gate tier note.** `newly_reachable_paths` is a judge-evidence gate (`constants.GATE_TIERS`); the code-reviewer's BUG-FIX COMPLETENESS check weighs the `[NEWLY_REACHABLE]` entry as evidence, not as a machine-checked outcome, and a `{"gate":"newly_reachable_paths","status":"disabled"}` line in a future Evidence block for this gate means it is not configured -- treat it as neither a pass nor a fail signal (spec `integration-reality-gates-hardening.md` Section 0.2).
+
 **Cross-cutting primitives.** If the workspace defines an optional cross-cutting-primitives registry (conventionally `backlog/config/cross-cutting-primitives.md` -- see `docs/newly-reachable-paths.md`), check whether any file in your diff matches a listed primitive (a shared z-index tier, a shared dirty-flag/`setField` path, a shared close/dismiss callback, or similar). If it does, explicitly enumerate and verify the primitive's OTHER named consumers as part of Step 1/Step 2 above, not just the consumer you were fixing -- a fix that reuses a shared stateful primitive without checking its other consumers is exactly the failure mode this section exists to catch.
 
 ## COMMENT LANGUAGE DISCIPLINE

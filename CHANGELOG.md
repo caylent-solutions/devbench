@@ -5,6 +5,33 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`tests/test_docs/test_gate_tier_vocabulary.py` -- the G3 blocking-vocabulary
+  truthfulness pin, plus the disabled-status-line prose sweep** (spec
+  `integration-reality-gates-hardening.md` section 4.2, G3, Section 0.2;
+  AC-E2-F2-S2-T1-1 through -6, AC-8). New docs test walks
+  `plugin/devbench-orchestrate/agents/` (the review-team prompts and the
+  executor prompt), `plugin/devbench-orchestrate/skills/`, and `docs/` for
+  blocking-vocabulary phrases (`blocks`/`blocking`/`blocked`,
+  `enforces`/`enforced`/`enforcing`, `cannot be marked done` -- a named
+  `BLOCKING_VOCABULARY_PATTERNS` constant, not an inline literal) that
+  co-occur, on the same line, with one of the eight declared gate names. A
+  violation is reported only when that gate's tier -- looked up directly
+  from `constants.GATE_TIERS`, never a second hand-maintained list -- is not
+  `machine-blocking`, so a machine-blocking gate may truthfully use blocking
+  vocabulary (AC-E2-F2-S2-T1-3). The shared scanner
+  (`scan_for_blocking_vocabulary_violations`) is exercised by a
+  seeded-violation test, a machine-blocking-acceptance test, and a
+  shipped-tree regression test that asserts zero violations across the real
+  surface; a fourth test pins that every judge-evidence gate rubric in the
+  three swept prompts states the Section 0.2 disabled-status-line semantics.
+  `code-reviewer.md`'s BUG-FIX COMPLETENESS rubric, `test-reviewer.md`'s
+  COMPOSITION-ROOT and LAYOUT rubrics, and `executor.md`'s BUG-FIX
+  COMPLETENESS section each gain a sentence naming the judge-evidence gate
+  they cover (`newly_reachable_paths`, `composition_root`,
+  `layout_geometry`) and stating that a `{"gate":"<name>","status":"disabled"}`
+  line means the gate is not configured -- neither a pass nor a fail signal,
+  never a finding on its own.
+
 - **Gate tier taxonomy and the `[GATE_PASS]` record module** (spec
   `integration-reality-gates-hardening.md` section 4.2, 5.3, D-6;
   AC-E2-F2-S1-T1-1 through -6). `constants.py` gains `GATE_TIER_MACHINE_BLOCKING`,

@@ -148,6 +148,7 @@ from devbench.backlog.manager import (
     _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE,
     BacklogManager,
     _build_remedies_rejection_message,
+    compose_gate_waiver_record,
     green_green_observed_satisfied,
     red_gate_satisfied,
 )
@@ -232,6 +233,8 @@ from devbench.constants import (
     FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    GATE_TIER_MACHINE_BLOCKING,
+    GATE_TIERS,
     INSTALL_PARITY_SHORT_REVISION_CHARS,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
@@ -5708,6 +5711,231 @@ def _resolve_work_unit_file(unit: WorkUnit) -> Path:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / unit.file_path
     return wu_file
+
+
+def _gate_verb_usage_error(message: str) -> int:
+    """Print ``ERROR: <message>`` to stderr and return exit code 2.
+
+    The exit-2 usage-error shape spec `integration-reality-gates-hardening.md`
+    section 4.9 defines for the structured gate-marker verbs (``log-waiver``;
+    mirrored by ``log-newly-reachable``, E2-F4-S1-T2: "log-newly-reachable
+    mirrors these semantics for its fields"): every usage failure -- an
+    unknown judge/gate name, an empty required field, or a machine-blocking
+    gate waived without ``--operator`` -- exits 2 naming the offending
+    argument. Centralising the shape here means the two verbs' usage errors
+    can never drift (their argument sets differ, but the exit code and
+    stderr shape must not).
+
+    Args:
+        message: Already names the offending argument, e.g. ``"--reason is
+            required and must be non-empty"``.
+
+    Returns:
+        ``2``.
+    """
+    print(f"ERROR: {message}", file=sys.stderr)
+    return 2
+
+
+def _consume_log_waiver_flag_value(args: list[str], i: int, flag: str) -> tuple[str, int] | int:
+    """Return ``(value, next_index)`` for *flag*'s value at ``args[i + 1]``.
+
+    Shared by every ``--gate``/``--target``/``--reason`` flag in
+    :func:`_scan_log_waiver_flags` so the "flag requires a value" usage
+    error has one definition instead of being duplicated per flag.
+
+    Returns:
+        ``(value, i + 2)`` on success, or the ``2`` usage-error exit code
+        (already printed to stderr via :func:`_gate_verb_usage_error`) when
+        *flag* has no following token or the following token is empty.
+    """
+    if i + 1 >= len(args) or not args[i + 1]:
+        return _gate_verb_usage_error(f"{flag} requires a value")
+    return args[i + 1], i + 2
+
+
+def _scan_log_waiver_flags(argv: tuple[str, ...]) -> tuple[list[str], str, str, str, bool] | int:
+    """Scan ``log-waiver``'s argv into positionals plus its four flags.
+
+    Returns:
+        ``(positional, gate, target, reason, operator)`` on success (empty
+        string for any flag not supplied). On a missing flag value, returns
+        the ``2`` usage-error exit code already printed to stderr.
+    """
+    positional: list[str] = []
+    gate = ""
+    target = ""
+    reason = ""
+    operator = False
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg in ("--gate", "--target", "--reason"):
+            consumed = _consume_log_waiver_flag_value(args, i, arg)
+            if isinstance(consumed, int):
+                return consumed
+            value, i = consumed
+            if arg == "--gate":
+                gate = value
+            elif arg == "--target":
+                target = value
+            else:
+                reason = value
+            continue
+        if arg == "--operator":
+            operator = True
+            i += 1
+            continue
+        positional.append(arg)
+        i += 1
+    return positional, gate, target, reason, operator
+
+
+def _parse_log_waiver_argv(
+    argv: tuple[str, ...],
+) -> tuple[str, str, str, str, str, bool] | int:
+    """Parse ``log-waiver <judge> <unit-id> --gate <g> --target <t> --reason <r> [--operator]``.
+
+    Returns:
+        ``(judge, unit_id, gate, target, reason, operator)`` on success.
+        On a usage error (missing positional, missing/empty flag value),
+        prints an ``ERROR: ...`` naming the offending argument via
+        :func:`_gate_verb_usage_error` and returns ``2`` for the caller to
+        return directly.
+    """
+    scanned = _scan_log_waiver_flags(argv)
+    if isinstance(scanned, int):
+        return scanned
+    positional, gate, target, reason, operator = scanned
+
+    if len(positional) < 2:
+        return _gate_verb_usage_error(
+            "log-waiver requires <judge> <unit-id> --gate <g> --target <t> --reason <r> [--operator]"
+        )
+    judge, unit_id = positional[0], positional[1]
+
+    if not gate:
+        return _gate_verb_usage_error("--gate is required")
+    if not target or not target.strip():
+        return _gate_verb_usage_error("--target is required and must be non-empty")
+    if not reason or not reason.strip():
+        return _gate_verb_usage_error("--reason is required and must be non-empty")
+
+    return judge, unit_id, gate, target, reason, operator
+
+
+def _validate_log_waiver_semantics(judge: str, gate: str, operator: bool) -> int | None:
+    """Validate ``<judge>``/``--gate`` against their vocabularies and the machine-blocking/``--operator`` rule.
+
+    Args:
+        judge: The ``<judge>`` positional argument.
+        gate: The ``--gate`` flag value.
+        operator: Whether ``--operator`` was supplied.
+
+    Returns:
+        The ``2`` usage-error exit code (already printed to stderr) on the
+        first violation, or ``None`` when the combination is valid.
+    """
+    if judge not in ALL_REQUIRED_JUDGE_NAMES:
+        valid = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+        return _gate_verb_usage_error(f"unknown judge {judge!r}; valid choices are: {valid}.")
+
+    if gate not in GATE_TIERS:
+        valid = ", ".join(sorted(GATE_TIERS))
+        return _gate_verb_usage_error(f"--gate names an unknown gate {gate!r}; declared gates are: {valid}.")
+
+    if GATE_TIERS[gate] == GATE_TIER_MACHINE_BLOCKING and not operator:
+        return _gate_verb_usage_error(
+            f"--operator is required to waive machine-blocking gate {gate!r} "
+            "(spec Section 3.6: the operator is the only waiver authority for a machine-blocking gate)."
+        )
+
+    return None
+
+
+def cmd_log_waiver(*argv: str) -> int:
+    """Record a structured ``[GATE_WAIVER <gate>]`` waiver marker (spec 4.9, 5.3).
+
+    Usage::
+
+        log-waiver <judge> <unit-id> --gate <g> --target <t> --reason <r> [--operator]
+
+    Writes ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor>
+    <reason>`` (spec 5.3 field order, composed by
+    ``devbench.backlog.manager.compose_gate_waiver_record`` -- the sole
+    authorized builder, mirroring ``devbench.gate_records.compose_gate_pass_record``'s
+    role for ``[GATE_PASS]``) into the unit's ``## TDD Cycle Log`` section
+    (via ``BacklogManager._append_audit_marker_before_comments``), the audit
+    surface that survives every review judge's ``read-unit --strip-comments``
+    Evidence fetch (PM-6 evidence-horizon rule, E2-F3-S1-T2). ``## Comments``
+    itself is stripped by that fetch and would make the marker invisible to
+    the very judges spec 3.6 says must weigh it.
+
+    Trust model (spec Section 3.6): the operator is the only waiver
+    authority for a machine-blocking gate
+    (``constants.GATE_TIER_MACHINE_BLOCKING``); a machine-blocking gate
+    waived without ``--operator`` is a usage error. A judge-evidence gate
+    accepts either attribution.
+
+    Args:
+        argv: ``<judge> <unit-id> --gate <g> --target <t> --reason <r>
+            [--operator]``. ``<judge>`` must be one of the five canonical
+            review judges (``constants.ALL_REQUIRED_JUDGE_NAMES`` -- the
+            same vocabulary ``log-verdict`` validates against, per spec
+            4.9's "single source of truth" requirement). ``--reason`` is
+            validated by ``_validate_agent_free_text`` (em-dash, control
+            characters, bracketed TDD-phase tags all rejected).
+
+    Returns:
+        ``0`` on success (the marker was written; stdout carries a JSON
+        summary). ``1`` when the unit does not exist, or when ``--reason``
+        fails the free-text boundary validation. ``2`` (usage error, naming
+        the offending argument) when ``<judge>`` or ``--gate`` names an
+        unknown value, a required field is missing or empty, or a
+        machine-blocking gate is waived without ``--operator``.
+    """
+    parsed = _parse_log_waiver_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    judge, unit_id, gate, target, reason, operator = parsed
+
+    rc = _validate_log_waiver_semantics(judge, gate, operator)
+    if rc is not None:
+        return rc
+
+    rc = _validate_agent_free_text("reason", reason)
+    if rc is not None:
+        return rc
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_work_unit_file(unit)
+    attribution = "operator" if operator else "executor"
+    marker = compose_gate_waiver_record(gate, target, attribution, reason)
+    BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+
+    logger.info("GATE_WAIVER %s recorded for %s (judge=%s, attribution=%s)", gate, unit_id, judge, attribution)
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "judge": judge,
+                "gate": gate,
+                "target": target,
+                "attribution": attribution,
+            }
+        )
+    )
+    return 0
 
 
 def build_red_observed_message(exit_code: int | None, test_node_id: str, failure_digest: str) -> str:
@@ -13639,6 +13867,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "check-fixture-consistency <id>"
         ),
     ),
+    "log-waiver": (
+        cmd_log_waiver,
+        2,
+        "Record a structured gate waiver: log-waiver <judge> <id> --gate <g> --target <t> --reason <r> [--operator]",
+    ),
     "tdd-gate": (
         cmd_tdd_gate,
         1,
@@ -13786,6 +14019,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "sessions",
         # Issue #192 E4-F5-S1-T2: stop --session <name> flag
         "stop",
+        # E2-F4-S1-T1: --gate/--target/--reason/--operator flags.
+        "log-waiver",
     }
 )
 

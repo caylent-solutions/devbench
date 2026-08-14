@@ -2411,6 +2411,11 @@ class _BacklogTotals:
     tasks_blocked_on_held: int = 0  # BLOCKED_ON_HELD
     tasks_blocked_runtime_degradation: int = 0  # RUNTIME_DEGRADATION (auto-recovers on orchestrator restart)
     tasks_blocked_operator: int = 0  # OPERATOR_ACTION_REQUIRED
+    # spec 4.9, PM-5 (E2-F4-S1-T1): count of well-formed [GATE_WAIVER] audit
+    # markers currently in the backlog, split by attribution -- "so an
+    # operator sees at a glance how much of the run is riding on [waivers]".
+    tasks_waived_operator: int = 0
+    tasks_waived_executor: int = 0
 
     @property
     def tasks_blocked_recovery(self) -> int:
@@ -2427,6 +2432,41 @@ class _BacklogTotals:
         Used by _compute_window_stats for the ETA projection denominator.
         """
         return self.tasks_blocked_auto_clearing
+
+
+def _gate_waiver_counts(tasks: list) -> tuple[int, int]:
+    """Return ``(operator_count, executor_count)`` of well-formed ``[GATE_WAIVER]`` markers across *tasks*.
+
+    Scans each task's backing file content once (spec 4.9, PM-5): "an
+    operator sees at a glance how much of the run is riding on [waivers]"
+    (E2-F4-S1-T1 description). Uses
+    ``devbench.backlog.manager.count_gate_waiver_markers`` -- the single
+    grammar authority ``validate-backlog``'s own grammar rule enforces --
+    so a malformed marker (already flagged by ``validate-backlog``) is
+    silently excluded from the count rather than crashing report
+    rendering. A task whose backing file does not exist on disk
+    contributes zero rather than raising, matching every other
+    file-content scan in this module (e.g. ``_extract_session_from_wu``).
+
+    Args:
+        tasks: ``WorkUnit`` instances of type ``WorkUnitType.TASK``.
+
+    Returns:
+        A ``(operator_count, executor_count)`` tuple summed across every
+        task.
+    """
+    from devbench.backlog.manager import count_gate_waiver_markers
+
+    operator_total = 0
+    executor_total = 0
+    for task in tasks:
+        if not task.file_path.exists():
+            continue
+        content = task.file_path.read_text(encoding="utf-8")
+        op, exe = count_gate_waiver_markers(content)
+        operator_total += op
+        executor_total += exe
+    return operator_total, executor_total
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -2501,6 +2541,8 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
                     "update _BacklogTotals + this if/elif chain."
                 )
 
+    tasks_waived_operator, tasks_waived_executor = _gate_waiver_counts(tasks)
+
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -2525,6 +2567,8 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_blocked_on_held=cnt_on_held,
         tasks_blocked_runtime_degradation=cnt_runtime_degradation,
         tasks_blocked_operator=cnt_operator,
+        tasks_waived_operator=tasks_waived_operator,
+        tasks_waived_executor=tasks_waived_executor,
     )
 
 
@@ -2555,6 +2599,10 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
         (
             "Stories / Features / Epics auto-rolled to done",
             f"{b.stories_done} / {b.features_done} / {b.epics_done}",
+        ),
+        (
+            "Gate waivers (operator / executor)",
+            f"{b.tasks_waived_operator} / {b.tasks_waived_executor}",
         ),
     ]
 

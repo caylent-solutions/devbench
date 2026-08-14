@@ -389,7 +389,7 @@ Print the work-unit content (the `.md` file body) plus the resolved repo path as
 
 ## Gates
 
-Read-only introspection for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates` only -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
+Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates` and `log-waiver` -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
 
 ### `gates`
 
@@ -424,6 +424,42 @@ write_path_audit       judge-evidence    disabled  -                           b
 newly_reachable_paths  judge-evidence    disabled  -                           builtin
 composition_root       judge-evidence    disabled  -                           builtin
 layout_geometry        judge-evidence    disabled  -                           builtin
+```
+
+### `log-waiver`
+
+```
+uv run devbench log-waiver <judge> <id> --gate <g> --target <t> --reason <r> [--operator]
+```
+
+Record a structured gate waiver: log-waiver <judge> <id> --gate <g> --target <t> --reason <r> [--operator]
+
+Writes a `[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor> <reason>` marker (spec section 5.3 field order) into the unit's `## TDD Cycle Log` section -- the audit surface that survives every review judge's `read-unit --strip-comments` Evidence fetch (the PM-6 evidence-horizon rule, E2-F3-S1-T2). `## Comments` itself is stripped by that fetch, so a marker appended there would be invisible to the very judge spec section 3.6 requires to weigh it; `log-waiver` never writes to `## Comments`.
+
+Arguments:
+
+- `<judge>` -- one of the five canonical review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review` -- `constants.ALL_REQUIRED_JUDGE_NAMES`, the same vocabulary `log-verdict` validates against) whose Evidence block should treat this waiver as evidence.
+- `<id>` -- the work unit ID.
+- `--gate <g>` -- one of the eight declared gate names (`constants.GATE_NAMES`).
+- `--target <t>` -- the specific file, path, or artifact the waiver covers. A single token with no whitespace.
+- `--reason <r>` -- REQUIRED, non-empty rationale. Validated by the same em-dash / control-character / bracketed-TDD-phase-tag boundary check `log-comment` / `log-tdd` / `log-verdict` use (`_validate_agent_free_text`).
+- `--operator` -- marks the waiver as operator-attributed. REQUIRED when `--gate` names a `machine-blocking` gate (spec Section 3.6: the operator is the only waiver authority for a machine-blocking gate); omit for an executor-attributed waiver, valid only for a `judge-evidence` gate.
+
+Exit codes:
+
+- `0` -- the marker was written; stdout carries a JSON summary (`unit_id`, `judge`, `gate`, `target`, `attribution`).
+- `1` -- the work unit does not exist, or `--reason` fails the free-text validation (em-dash, control character, or bracketed phase tag).
+- `2` -- a usage error naming the offending argument: unknown `<judge>`, unknown `--gate`, an empty/missing `--gate` / `--target` / `--reason`, or a `machine-blocking` gate waived without `--operator`.
+
+`validate-backlog` rejects a malformed `[GATE_WAIVER]` marker (grammar drift from spec 5.3) naming the unit and the offending line; `report` counts outstanding waivers split by `operator` / `executor` attribution (spec PM-5).
+
+Example (spec G7):
+
+```
+$ uv run devbench log-waiver code_review E9-F1-S1-T1 \
+    --gate reachability --target src/ui/LegacyPanel.tsx \
+    --reason "mounted via route-split registry resolved at runtime" --operator
+{"unit_id": "E9-F1-S1-T1", "judge": "code_review", "gate": "reachability", "target": "src/ui/LegacyPanel.tsx", "attribution": "operator"}
 ```
 
 ---

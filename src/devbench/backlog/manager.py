@@ -39,6 +39,7 @@ import re
 import subprocess
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -402,6 +403,197 @@ def _latest_gate_waiver_attribution(content: str, gate: str) -> str | None:
             continue
         latest = match.group("attribution")
     return latest
+
+
+# ---------------------------------------------------------------------------
+# GATE_WAIVER WRITER (spec 4.9, 5.3; E2-F4-S1-T1). ``log-waiver`` is the CLI
+# verb that authors a ``[GATE_WAIVER <gate>] <iso-utc> <target>
+# <operator|executor> <reason>`` marker; ``compose_gate_waiver_record`` below
+# is the sole authorized builder of that text (spec 3.6: executors do not
+# self-certify, so a waiver record can only ever come from this function,
+# never hand-typed agent prose), mirroring
+# ``devbench.gate_records.compose_gate_pass_record``'s role for the sibling
+# ``[GATE_PASS]`` marker family. ``parse_gate_waiver_record`` is the matching
+# strict reader, reused by both ``validate-backlog``'s grammar rule
+# (``BacklogManager._check_gate_waiver_grammar``) and
+# ``count_gate_waiver_markers`` (the ``report`` PM-5 waiver-count consumer),
+# so "what a well-formed marker looks like" has exactly one definition.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GateWaiverRecord:
+    """A parsed ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor> <reason>`` marker (spec 5.3).
+
+    Attributes:
+        gate: The declared gate name (a ``devbench.constants.GATE_TIERS`` key).
+        timestamp: The timezone-aware UTC instant the waiver was issued.
+        target: The specific file/path/artifact the waiver covers.
+        attribution: ``"operator"`` or ``"executor"``.
+        reason: The free-text rationale (the remainder of the line).
+    """
+
+    gate: str
+    timestamp: datetime
+    target: str
+    attribution: str
+    reason: str
+
+
+def compose_gate_waiver_record(
+    gate: str,
+    target: str,
+    attribution: str,
+    reason: str,
+    *,
+    timestamp: datetime | None = None,
+) -> str:
+    """Compose the single-line ``[GATE_WAIVER <gate>] <iso-utc> <target> <attribution> <reason>`` marker (spec 5.3).
+
+    The sole authorized builder of the ``[GATE_WAIVER]`` marker text (spec
+    3.6): ``cli.cmd_log_waiver`` calls this function rather than formatting
+    the tag itself, so a waiver record can only ever be produced from
+    already-validated fields -- never from agent prose.
+
+    Args:
+        gate: One of the declared ``devbench.constants.GATE_TIERS`` gate names.
+        target: The specific file/path/artifact the waiver covers. Must be a
+            single non-empty token with no whitespace -- the marker grammar
+            is space-delimited positional fields, so a whitespace-bearing
+            target would corrupt the field boundary on read-back.
+        attribution: ``"operator"`` or ``"executor"``.
+        reason: Free-text rationale. Must be non-empty. The caller
+            (``cli.cmd_log_waiver``) is responsible for the em-dash /
+            control-character / bracketed-phase-tag boundary validation
+            (``cli._validate_agent_free_text``) before calling this
+            function; this function only enforces non-emptiness.
+        timestamp: The timezone-aware instant the waiver was issued.
+            Defaults to the current UTC time. A timezone-aware value in
+            another zone is converted to UTC; a naive value is rejected.
+
+    Returns:
+        The exact one-line marker text (no trailing newline).
+
+    Raises:
+        ValueError: If ``gate`` is not declared, ``attribution`` is not
+            ``"operator"``/``"executor"``, ``target`` is empty or contains
+            whitespace, ``reason`` is empty, or ``timestamp`` is naive.
+    """
+    if gate not in GATE_TIERS:
+        raise ValueError(f"Unknown gate {gate!r}; declared gates are: {', '.join(sorted(GATE_TIERS))}.")
+    if attribution not in (_GATE_WAIVER_ATTRIBUTION_OPERATOR, _GATE_WAIVER_ATTRIBUTION_EXECUTOR):
+        raise ValueError(
+            f"attribution must be {_GATE_WAIVER_ATTRIBUTION_OPERATOR!r} or "
+            f"{_GATE_WAIVER_ATTRIBUTION_EXECUTOR!r}; got {attribution!r}."
+        )
+    if not target or any(ch.isspace() for ch in target):
+        raise ValueError(f"target must be a single non-empty token with no whitespace; got {target!r}.")
+    if not reason or not reason.strip():
+        raise ValueError("reason must be non-empty.")
+
+    if timestamp is None:
+        resolved_timestamp = datetime.now(tz=UTC)
+    elif timestamp.tzinfo is None:
+        raise ValueError(f"timestamp must be timezone-aware; got a naive datetime {timestamp!r}.")
+    else:
+        resolved_timestamp = timestamp.astimezone(UTC)
+
+    return f"[GATE_WAIVER {gate}] {resolved_timestamp.isoformat()} {target} {attribution} {reason}"
+
+
+# Strict full-grammar match, anchored from the tag through end-of-line:
+# ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor> <reason>``.
+# Distinct from ``_GATE_WAIVER_TAG_RE`` above (a loose, embedded-anywhere
+# search used only to pull out the attribution field for the done-gate
+# check) -- this pattern is the strict grammar authority both
+# ``parse_gate_waiver_record`` and, transitively, the validate-backlog
+# grammar rule and the report waiver-count consumer rely on.
+_GATE_WAIVER_RECORD_RE = re.compile(
+    r"^\[GATE_WAIVER (?P<gate>[A-Za-z0-9_]+)\] (?P<timestamp>\S+) (?P<target>\S+) "
+    rf"(?P<attribution>{_GATE_WAIVER_ATTRIBUTION_OPERATOR}|{_GATE_WAIVER_ATTRIBUTION_EXECUTOR}) (?P<reason>.+)$"
+)
+
+
+def parse_gate_waiver_record(text: str) -> GateWaiverRecord:
+    """Parse one isolated ``[GATE_WAIVER <gate>] ...`` marker (spec 5.3).
+
+    Args:
+        text: A single already-isolated marker string, starting at the
+            ``[GATE_WAIVER`` tag (leading/trailing whitespace is tolerated
+            and stripped) -- e.g. one produced by
+            ``compose_gate_waiver_record``, or a candidate line sliced from
+            the tag's position onward by a caller scanning a larger file.
+
+    Returns:
+        The parsed :class:`GateWaiverRecord`.
+
+    Raises:
+        ValueError: If ``text`` does not match the spec-5.3 grammar exactly,
+            names an undeclared gate, or carries a timestamp that is not a
+            timezone-aware ISO-8601 value. No partial record is ever
+            returned.
+    """
+    match = _GATE_WAIVER_RECORD_RE.match(text.strip())
+    if match is None:
+        raise ValueError(f"Malformed [GATE_WAIVER] marker (does not match the spec 5.3 grammar): {text!r}")
+
+    gate = match.group("gate")
+    if gate not in GATE_TIERS:
+        raise ValueError(
+            f"Unknown gate {gate!r} in [GATE_WAIVER] marker; declared gates are: {', '.join(sorted(GATE_TIERS))}."
+        )
+
+    raw_timestamp = match.group("timestamp")
+    try:
+        timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError as exc:
+        raise ValueError(f"Malformed [GATE_WAIVER] marker (timestamp is not valid ISO-8601): {text!r}") from exc
+    if timestamp.tzinfo is None:
+        raise ValueError(f"Malformed [GATE_WAIVER] marker (timestamp is not timezone-aware): {text!r}")
+
+    return GateWaiverRecord(
+        gate=gate,
+        timestamp=timestamp,
+        target=match.group("target"),
+        attribution=match.group("attribution"),
+        reason=match.group("reason"),
+    )
+
+
+def count_gate_waiver_markers(content: str) -> tuple[int, int]:
+    """Return ``(operator_count, executor_count)`` of well-formed ``[GATE_WAIVER]`` markers in *content*.
+
+    Used by ``devbench.reporting.report`` (spec 4.9, PM-5) to surface the
+    outstanding-waiver count split by attribution, "so an operator sees at a
+    glance how much of the run is riding on [waivers]". Every well-formed
+    marker (per ``parse_gate_waiver_record`` -- the single grammar authority
+    ``validate-backlog``'s own grammar rule enforces) counts once; a line
+    that fails to parse is skipped here rather than raised -- a malformed
+    marker is already flagged as a validate-backlog error, and the report is
+    a best-effort operational snapshot that must never crash on malformed
+    data in an unrelated unit.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+
+    Returns:
+        A ``(operator_count, executor_count)`` tuple.
+    """
+    operator_count = 0
+    executor_count = 0
+    for line in content.splitlines():
+        tag_idx = line.find("[GATE_WAIVER")
+        if tag_idx == -1:
+            continue
+        try:
+            record = parse_gate_waiver_record(line[tag_idx:])
+        except ValueError:
+            continue
+        if record.attribution == _GATE_WAIVER_ATTRIBUTION_OPERATOR:
+            operator_count += 1
+        else:
+            executor_count += 1
+    return operator_count, executor_count
 
 
 def _gate_check_command(gate: str) -> str:
@@ -1076,6 +1268,11 @@ class BacklogManager:
             file-less; this converges the validator with ``parse_index``, which
             raises on the same file-less Task row and tolerates a file-less
             non-Task row.
+        27. ``[GATE_WAIVER]`` marker grammar (spec 5.3; E2-F4-S1-T1): a
+            ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor>
+            <reason>`` line that fails to parse against the spec grammar
+            (``parse_gate_waiver_record``) is an error naming the unit and
+            the offending line; a well-formed marker is accepted silently.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -1124,6 +1321,7 @@ class BacklogManager:
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         self._check_already_satisfied_decline_citation(rows, workspace_root, errors)
+        self._check_gate_waiver_grammar(rows, workspace_root, errors)
         return errors
 
     _CANONICAL_FULL_INDEX_HEADER_CELLS: tuple[str, ...] = (
@@ -2428,6 +2626,82 @@ class BacklogManager:
                 return idx
         return -1
 
+    @staticmethod
+    def _insert_entry_before_heading(lines: list[str], heading_idx: int, entry: str) -> list[str]:
+        """Return *lines* with *entry* spliced in immediately before ``lines[heading_idx]``.
+
+        Trims trailing blank lines from the block preceding the heading,
+        then inserts exactly one blank line, *entry* (its own trailing
+        newline stripped), another blank line, and the heading line onward
+        unchanged. Shared splice primitive behind both ``_append_tdd_entry``
+        (inserts before the next ``## `` heading following ``## TDD Cycle
+        Log``) and ``_append_audit_marker_before_comments`` (inserts before
+        ``## Comments`` specifically) so the "insert with exactly one blank
+        line of separation on each side" formatting rule has one definition
+        (DRY).
+
+        Args:
+            lines: File content split into lines (no trailing newline on
+                each).
+            heading_idx: Index of the heading line *entry* is inserted
+                before.
+            entry: The entry text (a trailing newline, if present, is
+                stripped).
+
+        Returns:
+            The new full line list. The caller joins it with ``"\\n"`` and
+            appends a trailing newline.
+        """
+        before = lines[:heading_idx]
+        while before and before[-1].strip() == "":
+            before.pop()
+        new_lines = before + ["", entry.rstrip("\n"), "", lines[heading_idx]]
+        new_lines.extend(lines[heading_idx + 1 :])
+        return new_lines
+
+    def _append_audit_marker_before_comments(self, work_unit_path: Path, marker: str) -> None:
+        """Insert a single-line structured audit marker immediately before ``## Comments``.
+
+        ``read-unit --strip-comments`` (``cli.cmd_read_unit``) truncates a
+        work unit's content at the literal ``\\n## Comments`` marker before
+        every review judge's Evidence fetch reads it (the PM-6
+        evidence-horizon rule, E2-F3-S1-T2 pins this empirically). A
+        structured marker appended via ``_append_comment`` (the normal
+        audit-comment path used by ``[BLOCKED]``/``[QUOTA_WAITING]``) would
+        therefore be invisible to the very judges spec 3.6 requires to
+        weigh it. This helper is the alternative insertion point every
+        judge-visible structured marker writer must use instead --
+        currently ``compose_gate_waiver_record``'s ``[GATE_WAIVER]`` marker
+        (spec 5.3, this task); ``log-newly-reachable``'s
+        ``[NEWLY_REACHABLE]`` marker (spec 4.9(a), E2-F4-S1-T2) is a
+        documented future consumer of the same insertion point.
+
+        Mechanically identical to ``_append_tdd_entry``'s "insert before the
+        next ``## `` heading" logic (both delegate to
+        ``_insert_entry_before_heading``), but keyed to ``## Comments``
+        specifically rather than assuming ``## TDD Cycle Log`` happens to be
+        the section immediately preceding it -- so this insertion point
+        stays correct even if a future template inserts another section
+        between TDD Cycle Log and Comments. When the file carries no ``##
+        Comments`` section at all, the marker is appended at EOF (there is
+        nothing to strip against, so any location is judge-visible).
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            marker: The exact one-line marker text (no trailing newline).
+        """
+        content = work_unit_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        comments_idx = next((i for i, line in enumerate(lines) if line == COMMENTS_SECTION_HEADER), -1)
+
+        if comments_idx == -1:
+            content = content.rstrip("\n") + "\n\n" + marker.rstrip("\n") + "\n"
+        else:
+            new_lines = self._insert_entry_before_heading(lines, comments_idx, marker)
+            content = "\n".join(new_lines) + "\n"
+
+        atomic_write_text(work_unit_path, content)
+
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
@@ -2479,12 +2753,7 @@ class BacklogManager:
         else:
             # Insert before the next ## heading, preserving exactly one blank
             # line above the entry and exactly one blank line below it.
-            before_next = lines[:next_section_idx]
-            # Strip trailing blank lines from the block before the next heading.
-            while before_next and before_next[-1].strip() == "":
-                before_next.pop()
-            new_lines = before_next + ["", entry.rstrip("\n"), "", lines[next_section_idx]]
-            new_lines.extend(lines[next_section_idx + 1 :])
+            new_lines = self._insert_entry_before_heading(lines, next_section_idx, entry)
             content = "\n".join(new_lines) + "\n"
 
         atomic_write_text(work_unit_path, content)
@@ -4060,6 +4329,65 @@ class BacklogManager:
                     f"already-satisfied decline to cite the closing commit or task, e.g. "
                     f"'already-satisfied (citing abc1234)'."
                 )
+
+    def _check_gate_waiver_grammar(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 27: every ``[GATE_WAIVER <gate>]`` marker matches the spec 5.3 grammar.
+
+        Scans only the ``## TDD Cycle Log`` section body of every Task
+        work-unit file -- the sole location ``log-waiver``
+        (``BacklogManager._append_audit_marker_before_comments``) ever
+        writes a ``[GATE_WAIVER]`` marker -- for lines containing the
+        literal ``[GATE_WAIVER`` tag substring, and re-parses each one with
+        ``parse_gate_waiver_record`` -- the single writer-and-reader
+        authority for the marker grammar (mirrors how ``gate_records``'s
+        ``parse_gate_pass_record`` polices the sibling ``[GATE_PASS]``
+        family). A line that fails to parse is reported naming the unit id
+        and the exact offending line text, so an operator can locate and fix
+        (or re-issue via ``log-waiver``) the malformed waiver directly. A
+        well-formed marker produces no error.
+
+        Scoping to the TDD Cycle Log section (mirroring
+        ``TDD_CYCLE_LOG_SECTION_BODY_RE``'s use by ``red_gate_satisfied``) is
+        load-bearing, not cosmetic: an unscoped whole-file scan false-flags
+        every backtick-quoted mention of the ``[GATE_WAIVER <gate>]``
+        grammar in prose sections (Description, Approach, Acceptance
+        Criteria, Related Specifications, Comments) -- exactly the kind of
+        documentation citation this very work unit's own Acceptance Criteria
+        and Approach sections contain -- as a malformed marker.
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` index rows.
+            workspace_root: Workspace root used to resolve work-unit file
+                paths.
+            errors: Shared error accumulator; violations are appended here.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            section_match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+            if section_match is None:
+                continue
+            for line in section_match.group(1).splitlines():
+                tag_idx = line.find("[GATE_WAIVER")
+                if tag_idx == -1:
+                    continue
+                try:
+                    parse_gate_waiver_record(line[tag_idx:])
+                except ValueError as exc:
+                    errors.append(f"{row_id}: malformed [GATE_WAIVER] marker {line.strip()!r}: {exc}")
 
     @staticmethod
     def _derive_branch_for_row(

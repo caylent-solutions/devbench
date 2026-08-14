@@ -7955,6 +7955,379 @@ class TestCmdLogTddUnitNotFound:
         assert "not found" in capsys.readouterr().err.lower()
 
 
+@pytest.mark.unit
+class TestCmdLogWaiver:
+    """Tests for cmd_log_waiver (spec 4.9, 5.3; AC-E2-F4-S1-T1-1..4)."""
+
+    _UNIT_ID = "E9-F1-S1-T1"
+
+    def _make_wu_file(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Return (backlog_dir, wu_file) with a real-shape ## TDD Cycle Log / ## Comments ordering.
+
+        Mirrors the ordering every generated backlog task file uses (TDD
+        Cycle Log immediately before Comments), which is the ordering
+        ``read-unit --strip-comments`` relies on to keep a marker written
+        into TDD Cycle Log visible (AC-E2-F4-S1-T1-1).
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / f"{self._UNIT_ID}.md"
+        wu_file.write_text(
+            f"# {self._UNIT_ID}: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [WU_CLAIMED] Set to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        return backlog_dir, wu_file
+
+    def _make_unit(self, backlog_dir: Path) -> WorkUnit:
+        return WorkUnit(
+            id=self._UNIT_ID,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=backlog_dir / f"{self._UNIT_ID}.md",
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _run(self, tmp_path: Path, *args: str) -> tuple[int, Path]:
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_waiver(*args)
+        return result, wu_file
+
+    # -- (a) valid executor waiver for a judge-evidence gate: exit 0 --
+
+    def test_valid_executor_waiver_writes_marker_and_exits_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/ui/LegacyPanel.tsx",
+            "--reason",
+            "mounted via route-split registry resolved at runtime",
+        )
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        comments_start = content.find("## Comments")
+        marker_idx = content.find("[GATE_WAIVER layout_geometry]")
+        assert tdd_start != -1
+        assert marker_idx != -1
+        assert tdd_start < marker_idx < comments_start
+        assert (
+            "[GATE_WAIVER layout_geometry] " in content[marker_idx : marker_idx + len("[GATE_WAIVER layout_geometry] ")]
+        )
+        assert "src/ui/LegacyPanel.tsx executor mounted via route-split registry resolved at runtime" in content
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "unit_id": self._UNIT_ID,
+            "judge": "code_review",
+            "gate": "layout_geometry",
+            "target": "src/ui/LegacyPanel.tsx",
+            "attribution": "executor",
+        }
+
+    def test_marker_survives_strip_comments_evidence_fetch(self, tmp_path: Path) -> None:
+        """AC-E2-F4-S1-T1-1: the marker lands where the judges' Evidence fetch retains it."""
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_log_waiver(
+                "code_review",
+                self._UNIT_ID,
+                "--gate",
+                "layout_geometry",
+                "--target",
+                "src/x.py",
+                "--reason",
+                "reason text",
+            )
+            assert rc == 0
+
+            content = wu_file.read_text(encoding="utf-8")
+            marker = f"\n{cli.COMMENTS_SECTION_HEADER}"
+            idx = content.find(marker)
+            stripped_content = content[:idx] if idx != -1 else content
+            assert "[GATE_WAIVER layout_geometry]" in stripped_content
+
+    # -- (a-operator) machine-blocking gate WITH --operator succeeds --
+
+    def test_machine_blocking_gate_with_operator_succeeds_and_attributes_operator(self, tmp_path: Path) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "reachability",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reviewed by hand",
+            "--operator",
+        )
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[GATE_WAIVER reachability]" in content
+        assert " operator reviewed by hand" in content
+
+    # -- (b) machine-blocking gate without --operator: exit 2 naming --operator --
+
+    @pytest.mark.parametrize("gate", ["reachability", "ancestry", "shared_file_impact", "fixture_consistency"])
+    def test_machine_blocking_gate_without_operator_exits_2_naming_operator(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], gate: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            gate,
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--operator" in err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (c) empty or whitespace-only --reason: exit 2 naming --reason --
+
+    @pytest.mark.parametrize("reason", ["", "   "])
+    def test_empty_or_whitespace_reason_exits_2_naming_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], reason: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            reason,
+        )
+
+        assert result == 2
+        assert "--reason" in capsys.readouterr().err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (d) unknown judge / unknown gate: exit 2 naming the offending argument --
+
+    def test_unknown_judge_exits_2_naming_judge(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "not_a_real_judge",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "judge" in err.lower()
+        assert "not_a_real_judge" in err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    def test_unknown_gate_exits_2_naming_gate(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "not_a_real_gate",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--gate" in err
+        assert "not_a_real_gate" in err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (e) unit id that does not exist: exit 1 --
+
+    def test_unknown_unit_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_waiver(
+                "code_review",
+                "NONEXISTENT",
+                "--gate",
+                "layout_geometry",
+                "--target",
+                "src/x.py",
+                "--reason",
+                "reason text",
+            )
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    # -- (f) reason containing an em-dash: rejected by the existing free-text validation --
+
+    _EM_DASH_REASON = "bad \u2014 emdash reason"
+
+    def test_em_dash_in_reason_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            self._EM_DASH_REASON,
+        )
+
+        assert result == 1
+        assert "em-dash" in capsys.readouterr().err.lower()
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    def test_control_character_in_reason_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "bad\tcontrol char",
+        )
+
+        assert result == 1
+        assert "control character" in capsys.readouterr().err.lower()
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- usage-error paths not enumerated above but required for fail-fast coverage --
+
+    def test_missing_positional_args_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, "code_review")
+        assert result == 2
+        assert "log-waiver requires" in capsys.readouterr().err
+
+    def test_missing_gate_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, "code_review", self._UNIT_ID, "--target", "src/x.py", "--reason", "reason text")
+        assert result == 2
+        assert "--gate" in capsys.readouterr().err
+
+    def test_missing_target_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--reason",
+            "reason text",
+        )
+        assert result == 2
+        assert "--target" in capsys.readouterr().err
+
+    def test_missing_target_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--reason",
+            "reason text",
+            "--target",
+        )
+        assert result == 2
+        assert "--target" in capsys.readouterr().err
+
+    def test_missing_gate_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+        )
+        assert result == 2
+        assert "--gate" in capsys.readouterr().err
+
+    def test_missing_reason_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+        )
+        assert result == 2
+        assert "--reason" in capsys.readouterr().err
+
+    def test_registered_in_commands_with_two_min_args(self) -> None:
+        func, min_args, _ = cli._COMMANDS["log-waiver"]
+        assert func is cli.cmd_log_waiver
+        assert min_args == 2
+
+    def test_registered_as_variadic(self) -> None:
+        assert "log-waiver" in cli._VARIADIC_COMMANDS
+
+    def test_empty_string_token_is_skipped_during_flag_scan(self, tmp_path: Path) -> None:
+        """An empty-string argv token (e.g. from shell interpolation) is skipped, not treated as positional."""
+        result, wu_file = self._run(
+            tmp_path,
+            "",
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 0
+        assert "[GATE_WAIVER layout_geometry]" in wu_file.read_text(encoding="utf-8")
+
+
 class TestCmdRunTests:
     """Test cmd_run_tests command."""
 

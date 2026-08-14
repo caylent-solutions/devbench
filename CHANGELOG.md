@@ -5,6 +5,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`log-waiver` -- structured, judge-visible `[GATE_WAIVER]` waivers, a
+  validate-backlog grammar rule, and the report waiver count** (spec
+  `integration-reality-gates-hardening.md` section 4.9, 5.3, G7, D-5/PM-5;
+  AC-E2-F4-S1-T1-1 through -7). New CLI verb `log-waiver <judge> <id> --gate
+  <g> --target <t> --reason <r> [--operator]` writes a `[GATE_WAIVER <gate>]
+  <iso-utc> <target> <operator|executor> <reason>` marker
+  (`devbench.backlog.manager.compose_gate_waiver_record`, the sole authorized
+  builder) into the unit's `## TDD Cycle Log` section -- the audit surface
+  that survives every review judge's `read-unit --strip-comments` Evidence
+  fetch (the PM-6 evidence-horizon rule, E2-F3-S1-T2), unlike `## Comments`
+  which that fetch strips. Trust model enforced at the CLI boundary (spec
+  Section 3.6): `<judge>` must be one of the five canonical review judges
+  (`constants.ALL_REQUIRED_JUDGE_NAMES`), `--gate` one of the eight declared
+  gates, `--reason` mandatory and validated by the existing
+  `_validate_agent_free_text` em-dash / control-character / bracketed-tag
+  boundary check, and a `machine-blocking` gate requires `--operator` --
+  every usage failure exits 2 naming the offending argument; a missing unit
+  exits 1. `validate-backlog` gains Check 27, rejecting a malformed
+  `[GATE_WAIVER]` line via the same grammar authority
+  (`parse_gate_waiver_record`) the marker is built from, naming the unit and
+  the offending line. `devbench report`'s Backlog state table gains a "Gate
+  waivers (operator / executor)" row (`count_gate_waiver_markers`), so an
+  operator sees at a glance how much of the run is riding on waivers.
+  `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
+  `tests/test_docs/test_cli_reference_log_waiver.py`.
+
 - **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
   helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,
   AC-9; AC-E2-F3-S1-T1-1 through -6). New `resolve_changed_files(unit_id,

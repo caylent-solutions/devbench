@@ -6204,3 +6204,116 @@ class TestGenerateReportTransportRestartsRow:
         assert "Transport restarts        1" in report
         assert "Tasks completed" in report
         assert "Tasks remaining" in report
+
+
+class TestReportWaiverCount:
+    """spec 4.9, PM-5 (E2-F4-S1-T1, AC-E2-F4-S1-T1-6): report surfaces the
+    outstanding [GATE_WAIVER] waiver count, split by operator/executor
+    attribution."""
+
+    @staticmethod
+    def _mk_task(tmp_path: Path, uid: str, waiver_lines: list[str]) -> WorkUnit:
+        wu_file = tmp_path / f"{uid}.md"
+        body = "\n\n".join(waiver_lines)
+        wu_file.write_text(
+            f"# {uid}\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n{body}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        return WorkUnit(
+            id=uid,
+            title=f"task-{uid}",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_backlog_totals_counts_split_by_attribution(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T1",
+                [compose_gate_waiver_record("reachability", "src/a.py", "operator", "reason a")],
+            ),
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T2",
+                [
+                    compose_gate_waiver_record("layout_geometry", "src/b.py", "executor", "reason b"),
+                    compose_gate_waiver_record("ancestry", "src/c.py", "executor", "reason c"),
+                ],
+            ),
+        ]
+
+        totals = _backlog_totals_from_units(units)
+
+        assert totals.tasks_waived_operator == 1
+        assert totals.tasks_waived_executor == 2
+
+    def test_no_waivers_counts_zero(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [self._mk_task(tmp_path, "E9-F1-S1-T1", [])]
+
+        totals = _backlog_totals_from_units(units)
+
+        assert totals.tasks_waived_operator == 0
+        assert totals.tasks_waived_executor == 0
+
+    def test_missing_backing_file_contributes_zero(self) -> None:
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        unit = WorkUnit(
+            id="E9-F1-S1-T1",
+            title="t",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/nonexistent/E9-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+        totals = _backlog_totals_from_units([unit])
+
+        assert totals.tasks_waived_operator == 0
+        assert totals.tasks_waived_executor == 0
+
+    def test_backlog_state_rows_include_gate_waiver_row(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        units = [
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T1",
+                [compose_gate_waiver_record("reachability", "src/a.py", "operator", "reason a")],
+            ),
+        ]
+        totals = _backlog_totals_from_units(units)
+
+        rows = dict(_backlog_state_rows(totals))
+
+        assert rows["Gate waivers (operator / executor)"] == "1 / 0"
+
+    def test_gate_waiver_counts_helper_direct(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+        from devbench.reporting.report import _gate_waiver_counts
+
+        tasks = [
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T1",
+                [compose_gate_waiver_record("reachability", "src/a.py", "operator", "reason a")],
+            ),
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T2",
+                [compose_gate_waiver_record("layout_geometry", "src/b.py", "executor", "reason b")],
+            ),
+        ]
+
+        assert _gate_waiver_counts(tasks) == (1, 1)

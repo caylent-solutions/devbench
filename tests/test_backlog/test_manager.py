@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8591,3 +8592,302 @@ class TestMarkerScannerIgnoresQuotedMarkers:
             "\n[2026-05-01 12:00 UTC] [agent/operator] [WU_WIRED] x. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9   \n",
         )
         assert BacklogManager()._extract_pending_proposal_markers(wu) == {"E0-F1-S1-T9"}
+
+
+# ---------------------------------------------------------------------------
+# E2-F4-S1-T1: log-waiver's [GATE_WAIVER] writer/reader grammar, its
+# audit-section insertion point, the report waiver-count helper, and the
+# validate-backlog grammar rule.
+# ---------------------------------------------------------------------------
+
+
+class TestComposeGateWaiverRecord:
+    """compose_gate_waiver_record: the sole authorized [GATE_WAIVER] marker builder (spec 5.3).
+
+    Imports are deferred inside each test body (rather than a module-level
+    import) so that stashing only ``src/devbench/backlog/manager.py`` (the
+    RED-gate's production-source-only stash scope, ``devbench tdd-gate``)
+    never breaks collection of this whole test module for an unrelated
+    node id: a module-level import of a brand-new symbol would raise
+    ``ImportError`` at collection time (a false, rejected RED) rather than
+    letting the individual test that actually calls the missing symbol fail
+    on its own.
+    """
+
+    def test_valid_call_produces_spec_5_3_field_order(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+        marker = compose_gate_waiver_record(
+            "reachability", "src/ui/Foo.tsx", "operator", "mounted via route-split registry", timestamp=ts
+        )
+        assert marker == (
+            "[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 "
+            "src/ui/Foo.tsx operator mounted via route-split registry"
+        )
+
+    def test_default_timestamp_is_utc_now(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, parse_gate_waiver_record
+
+        before = datetime.now(tz=UTC)
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "y")
+        after = datetime.now(tz=UTC)
+        record = parse_gate_waiver_record(marker)
+        assert before <= record.timestamp <= after
+
+    def test_non_utc_timezone_is_converted(self) -> None:
+        from datetime import timedelta, timezone
+
+        from devbench.backlog.manager import compose_gate_waiver_record, parse_gate_waiver_record
+
+        tz_offset = timezone(timedelta(hours=-5))
+        ts = datetime(2026, 1, 1, 12, 0, tzinfo=tz_offset)
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "y", timestamp=ts)
+        record = parse_gate_waiver_record(marker)
+        assert record.timestamp == ts.astimezone(UTC)
+
+    def test_undeclared_gate_raises(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="Unknown gate"):
+            compose_gate_waiver_record("not_a_real_gate", "x", "executor", "y")
+
+    def test_invalid_attribution_raises(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="attribution must be"):
+            compose_gate_waiver_record("layout_geometry", "x", "manager", "y")
+
+    @pytest.mark.parametrize("bad_target", ["", "a b", "a\tb"])
+    def test_target_with_whitespace_or_empty_raises(self, bad_target: str) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="target must be"):
+            compose_gate_waiver_record("layout_geometry", bad_target, "executor", "y")
+
+    @pytest.mark.parametrize("bad_reason", ["", "   "])
+    def test_empty_or_whitespace_reason_raises(self, bad_reason: str) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="reason must be non-empty"):
+            compose_gate_waiver_record("layout_geometry", "x", "executor", bad_reason)
+
+    def test_naive_timestamp_raises(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        naive_timestamp = datetime(2026, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            compose_gate_waiver_record("layout_geometry", "x", "executor", "y", timestamp=naive_timestamp)
+
+
+class TestParseGateWaiverRecord:
+    """parse_gate_waiver_record: strict reader for the spec 5.3 grammar.
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    def test_round_trip_compose_then_parse(self) -> None:
+        from devbench.backlog.manager import GateWaiverRecord, compose_gate_waiver_record, parse_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/x.py", "operator", "reviewed manually")
+        record = parse_gate_waiver_record(marker)
+        assert record == GateWaiverRecord(
+            gate="ancestry",
+            timestamp=record.timestamp,
+            target="src/x.py",
+            attribution="operator",
+            reason="reviewed manually",
+        )
+
+    def test_leading_prefix_is_isolated_by_caller_slice(self) -> None:
+        """Mirrors how validate-backlog/count_gate_waiver_markers slice from the tag onward."""
+        from devbench.backlog.manager import compose_gate_waiver_record, parse_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/x.py", "executor", "ok")
+        line = f"- {marker}"
+        tag_idx = line.find("[GATE_WAIVER")
+        record = parse_gate_waiver_record(line[tag_idx:])
+        assert record.gate == "ancestry"
+
+    def test_malformed_grammar_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match=r"does not match the spec 5\.3 grammar"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] not-a-timestamp")
+
+    def test_undeclared_gate_in_marker_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match="Unknown gate"):
+            parse_gate_waiver_record("[GATE_WAIVER not_a_real_gate] 2026-01-01T00:00:00+00:00 x executor y")
+
+    def test_invalid_timestamp_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match="not valid ISO-8601"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] not-iso x executor y")
+
+    def test_naive_timestamp_in_marker_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match="not timezone-aware"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] 2026-01-01T00:00:00 x executor y")
+
+    def test_missing_attribution_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match=r"does not match the spec 5\.3 grammar"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 x manager y")
+
+
+class TestCountGateWaiverMarkers:
+    """count_gate_waiver_markers: the report PM-5 waiver-count consumer.
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    def test_counts_split_by_attribution(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, count_gate_waiver_markers
+
+        content = (
+            f"{compose_gate_waiver_record('reachability', 'a', 'operator', 'r1')}\n"
+            f"{compose_gate_waiver_record('layout_geometry', 'b', 'executor', 'r2')}\n"
+            f"{compose_gate_waiver_record('ancestry', 'c', 'operator', 'r3')}\n"
+        )
+        assert count_gate_waiver_markers(content) == (2, 1)
+
+    def test_no_markers_returns_zero_zero(self) -> None:
+        from devbench.backlog.manager import count_gate_waiver_markers
+
+        assert count_gate_waiver_markers("## TDD Cycle Log\n\n## Comments\n") == (0, 0)
+
+    def test_malformed_marker_is_skipped_not_raised(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, count_gate_waiver_markers
+
+        content = (
+            f"{compose_gate_waiver_record('reachability', 'a', 'operator', 'r1')}\n"
+            "[GATE_WAIVER bogus] not-a-timestamp\n"
+        )
+        assert count_gate_waiver_markers(content) == (1, 0)
+
+    def test_tag_embedded_after_a_prefix_still_counts(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, count_gate_waiver_markers
+
+        marker = compose_gate_waiver_record("reachability", "a", "executor", "r1")
+        content = f"- {marker}\n"
+        assert count_gate_waiver_markers(content) == (0, 1)
+
+
+class TestAppendAuditMarkerBeforeComments:
+    """_append_audit_marker_before_comments: the judge-visible insertion point (spec 4.3, 4.9).
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    def test_marker_lands_before_comments_header(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n", encoding="utf-8")
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "reason text")
+
+        BacklogManager()._append_audit_marker_before_comments(wu, marker)
+
+        content = wu.read_text(encoding="utf-8")
+        comments_idx = content.index("## Comments")
+        marker_idx = content.index("[GATE_WAIVER")
+        assert marker_idx < comments_idx
+
+    def test_marker_survives_strip_comments_boundary(self, tmp_path: Path) -> None:
+        """The exact boundary cli.cmd_read_unit's --strip-comments truncates at."""
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n", encoding="utf-8")
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "reason text")
+
+        BacklogManager()._append_audit_marker_before_comments(wu, marker)
+
+        content = wu.read_text(encoding="utf-8")
+        stripped = content[: content.find("\n## Comments")]
+        assert "[GATE_WAIVER" in stripped
+
+    def test_no_comments_section_appends_at_eof(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n", encoding="utf-8")
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "reason text")
+
+        BacklogManager()._append_audit_marker_before_comments(wu, marker)
+
+        content = wu.read_text(encoding="utf-8")
+        assert content.rstrip("\n").endswith(marker)
+
+
+class TestGateWaiverGrammarRule:
+    """Check 27: validate-backlog rejects a malformed [GATE_WAIVER] marker (spec 5.3).
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _append_tdd_cycle_log_marker(wu_path: Path, marker_line: str) -> None:
+        content = wu_path.read_text(encoding="utf-8")
+        content += f"\n## TDD Cycle Log\n\n{marker_line}\n"
+        wu_path.write_text(content, encoding="utf-8")
+
+    def test_malformed_marker_reports_unit_and_line(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", "| `src/foo.py` | new |\n")
+        self._append_tdd_cycle_log_marker(wu, "[GATE_WAIVER reachability] not-a-timestamp")
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        matches = [e for e in errors if "EX-F1-S1-T1" in e and "malformed [GATE_WAIVER] marker" in e]
+        assert len(matches) == 1
+        assert "not-a-timestamp" in matches[0]
+
+    def test_well_formed_marker_is_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = self.H.make_task(backlog_dir, "EX-F1-S1-T2", "ex/foo", "| `src/foo.py` | new |\n")
+        marker = compose_gate_waiver_record("layout_geometry", "src/foo.py", "executor", "reviewed by hand")
+        self._append_tdd_cycle_log_marker(wu, marker)
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T2 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        assert not any("EX-F1-S1-T2" in e and "GATE_WAIVER" in e for e in errors)
+
+    def test_no_marker_present_is_a_no_op(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = self.H.make_task(backlog_dir, "EX-F1-S1-T3", "ex/foo", "| `src/foo.py` | new |\n")
+        self._append_tdd_cycle_log_marker(wu, "no waiver markers here")
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T3 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T3.md` |\n",
+        )
+
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        assert not any("GATE_WAIVER" in e for e in errors)
+
+    def test_missing_file_path_row_skipped(self, tmp_path: Path) -> None:
+        """Defensive guard: rows with empty file_path should not crash the rule."""
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "in-queue", "")]
+        manager._check_gate_waiver_grammar(rows, tmp_path, errors)
+        assert errors == []

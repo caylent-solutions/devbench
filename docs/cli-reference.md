@@ -96,20 +96,6 @@ DRAIN REQUESTED [session=alpha]: at 2026-05-14T13:56:12+00:00 by matt (reason: p
 
 The workspace-root line omits the session qualifier; each per-session line inserts `[session=<name>]` immediately after `DRAIN REQUESTED` so an operator scanning the output can tell at a glance which signal(s) are pending and where each one came from. Every line names the requester, the UTC timestamp, and the reason (or `(none)` when no reason was supplied). When no drain signal is present anywhere, the banner is suppressed entirely. See [`### drain`](#drain-graceful-orchestrator-stop) for the full drain subcommand reference, including the identical listing produced by `devbench drain --status`.
 
-**Install parity row (issue #301):** immediately after the drain banner, `devbench status` renders the harness/target install-parity row via `report.install_parity_line()` -- the identical function [`start`](#start)'s pre-flight gate reuses, so the two surfaces can never disagree about whether the harness install is behind. The row reads:
-
-```
-Install parity   harness be5e819 (feat/bug-closure) == target be5e819   IN SYNC
-```
-
-or, once the target moves ahead:
-
-```
-Install parity   harness be5e819 (feat/bug-closure) != target 1f4c2ab   BEHIND by 3 commit(s) touching src/devbench/
-```
-
-The row is omitted entirely when the configured workspace is not self-hosting devbench (most workspaces), and degrades to a single `Install parity   unavailable: <reason>` line -- with the rest of the status output still rendering -- when the resolver itself fails. See [`docs/devbench-self-hosting.md`](devbench-self-hosting.md) for the full harness/target split reference.
-
 ### `next`
 
 ```
@@ -138,9 +124,7 @@ The Status Summary per-epic table (also written to `BACKLOG.md` by `validate-bac
 
 **Drain banner (issue #188, db-306):** like `devbench status`, `devbench report` prepends one `DRAIN REQUESTED` line above the report body for every pending drain signal -- the workspace-root `drain.signal` (if present) AND every per-session `<workspace>/.devbench/sessions/<name>/drain.signal` (if present), regardless of `DEVBENCH_SESSION_NAME`. The line format, ordering, and session-qualifier rules (`[session=<name>]` on per-session lines, omitted on the workspace-root line) are identical to the `status` banner -- see [`status`](#status) for the exact wording and worked format. The banner is rendered LIVE, immediately before the report body, on all three of `report`'s emit paths: the cached-snapshot fast-path (a `read_snapshot` hit), the one-shot live path (`generate_report` invoked directly), and every frame of the streaming loop. In every case the banner text is produced by a fresh scan of the drain signals and is never baked into the cached snapshot string or memoised inside a streamed frame's report body, so a drain requested after a snapshot was written -- or between two streaming redraws -- is never hidden behind stale output.
 
-**Install parity row (issue #301):** rendered immediately below the banner line, via `report.install_parity_line()` -- the same function [`status`](#status) renders, so the two commands can never disagree about whether the harness install is behind. See [`status`](#status) for the exact `IN SYNC` / `BEHIND` / `unavailable` row formats and [`docs/devbench-self-hosting.md`](devbench-self-hosting.md) for the harness/target split reference. Omitted entirely when the configured workspace is not self-hosting devbench, so a non-self-hosted workspace's report stays byte-identical to the pre-#301 layout.
-
-**Transport restarts row (issue #331):** rendered immediately below the install-parity row (when present), via `report.transport_restarts_line()`. Reads the orchestrator log directly and counts every genuine `[ORCHESTRATOR_TRANSPORT_RESTART]` audit line that `start`'s transport-error recovery path (see [`start`](#start) above and [ADR-34](adr/34-orchestrator-transport-restart.md)) has logged, rendering:
+**Transport restarts row (issue #331):** rendered immediately below the banner line, via `report.transport_restarts_line()`. Reads the orchestrator log directly and counts every genuine `[ORCHESTRATOR_TRANSPORT_RESTART]` audit line that `start`'s transport-error recovery path (see [`start`](#start) above and [ADR-34](adr/34-orchestrator-transport-restart.md)) has logged, rendering:
 
 ```
 Transport restarts        2
@@ -833,21 +817,6 @@ uv run devbench start [--daemon] [--include "<tokens>"] [--exclude "<tokens>"] [
 ```
 
 Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin.
-
-**Install-parity pre-flight gate (issue #301):** before any orchestration work -- before the PID file is written, before the SDK session opens, and before any work unit is claimed -- `start` compares the harness install (the checkout actually executing) against the target checkout configured under `repos:` in `backlog/config/devbench.yaml`. When the workspace is self-hosting devbench (the target checkout's `origin` remote canonically matches the harness install's own `origin`) and the harness is missing one or more commits touching `src/devbench/` that the target checkout already has, `start` refuses to run: it exits **1** and prints both installs' path, abbreviated revision, and branch; the number of missing commits; and the exact three-command resync procedure:
-
-```
-ERROR: harness install is behind the target checkout.
-  harness: /workspaces/.../harness/devbench @ 898beb6 (feat/updates)
-  target:  /workspaces/.../devbench @ be5e819 (feat/bug-closure)
-  The harness is missing 31 commit(s) touching src/devbench/.
-  Resync before starting:
-    git -C /workspaces/.../harness/devbench fetch origin feat/bug-closure
-    git -C /workspaces/.../harness/devbench checkout -B feat/bug-closure origin/feat/bug-closure
-    uv sync --project /workspaces/.../harness/devbench
-```
-
-A resolver failure (a checkout that cannot be introspected) is itself fatal and also exits 1, naming the unreadable path. Workspaces that are not self-hosting devbench see no gate and no change in behaviour. There is deliberately no flag to bypass this check -- the only supported escape is to run the resync commands the refusal prints. See [`docs/devbench-self-hosting.md`](devbench-self-hosting.md) for the full harness/target split and resync reference, and the [`report`](#report) / [`status`](#status) sections below for the matching `Install parity` row.
 
 **Transport-error recovery (issue #331):** `start`'s SDK message loop treats a transient Claude Agent SDK transport failure as a bounded-restart case, joining drain, quota resume ([`docs/quota-handling.md`](quota-handling.md)), and the inactivity timeout (`timeouts.orchestrator_inactivity` -- see [`docs/devbench-yaml-reference.md`](devbench-yaml-reference.md)) as the orchestrator's named recovery paths. Any exception raised by the SDK generator boundary other than `StopAsyncIteration` or `TimeoutError` -- an upstream defect, a dropped connection, anything devbench does not already have a name for -- is classified structurally (by which call raised, never by the exception's message text) and re-raised as an internal `_OrchestrateTransportError`. `start` logs the verbatim upstream exception at ERROR with its restart ordinal and cap, then opens a brand-new SDK session on the remaining backlog (no conversation state is carried over, matching the quota-resume and inactivity-restart contract) rather than exiting. The restart is bounded by the SAME `DEVBENCH_MAX_QUOTA_RESUMES` cap (default 1000) that already bounds quota resumes and inactivity restarts, tracked with its own independent counter, so a transport restart never consumes quota-resume or inactivity-restart budget and vice versa. Once the cap is exhausted, `start` re-raises the final exception verbatim and exits non-zero, and the `orchestrator_stop` notification carries the `transport-error-restart-cap-exhausted` stop class (see [`report`](#report) below for the matching `Transport restarts` row). There is no configuration key for this cap and none is added -- it deliberately reuses the existing resolver. See [ADR-34](adr/34-orchestrator-transport-restart.md) for the full design record, including why classification must be structural rather than message-based.
 

@@ -9716,6 +9716,124 @@ class TestResolveCleanStopReason:
             == "drain enforced: operator requested"
         )
 
+    @pytest.mark.parametrize(
+        "narration",
+        [
+            "The executor agent is running in the background for work unit E2-F5-S1-T1. "
+            "I've scheduled a fallback check-in, but the primary trigger will be the agent's "
+            "completion notification, at which point I'll continue the orchestrate loop automatically.",
+            "Next: re-invoke executor for E1-F1-S1-T2.",
+            "Waiting for the review judges to finish.",
+        ],
+    )
+    def test_non_terminal_narration_is_never_a_clean_exit(self, narration: str) -> None:
+        """Only ALL_DONE / NO_ACTIONABLE may claim a clean exit.
+
+        Regression: the original truthy check (PR #202) reported the model's own
+        narration as ``clean exit``, so an orchestrator that ended its turn
+        mid-backlog was indistinguishable from a finished run. The narration is
+        retained on the premature path so the operator keeps the diagnostic.
+        """
+        from devbench.cli import _PREMATURE_TURN_END_REASON, _resolve_clean_stop_reason
+
+        resolved = _resolve_clean_stop_reason("clean", narration)
+
+        assert not resolved.startswith("clean exit:")
+        assert resolved.startswith(_PREMATURE_TURN_END_REASON)
+        assert narration in resolved
+
+    @pytest.mark.parametrize("sentinel", ["ALL_DONE", "NO_ACTIONABLE", "NO_ACTIONABLE_IN_SCOPE -- 3/7 done"])
+    def test_terminal_sentinels_still_report_clean_exit(self, sentinel: str) -> None:
+        """Issue #217's intent is preserved verbatim for genuine end-of-run text."""
+        from devbench.cli import _resolve_clean_stop_reason
+
+        assert _resolve_clean_stop_reason("clean", sentinel) == f"clean exit: {sentinel}"
+
+    def test_non_terminal_text_does_not_override_a_loop_disposition(self) -> None:
+        """A drain/quota disposition still wins over stray narration."""
+        from devbench.cli import _resolve_clean_stop_reason
+
+        assert (
+            _resolve_clean_stop_reason("drain enforced: operator requested", "I'll continue automatically.")
+            == "drain enforced: operator requested"
+        )
+
+
+class TestPrematureTurnEndRestart:
+    """The orchestrate loop stops only on a terminal sentinel or operator drain.
+
+    A model that ends its own turn while backlog work remains is a recoverable
+    fault -- previously the single failure mode with no recovery at all, while a
+    model going silent for the inactivity window already earned a bounded
+    fresh-session restart.
+    """
+
+    def test_sentinel_is_baseexception_not_exception(self) -> None:
+        """Must survive ``asyncio.run`` and any broad ``except Exception``,
+        matching its quota / inactivity / transport siblings."""
+        from devbench.cli import _OrchestratePrematureTurnEnd
+
+        assert issubclass(_OrchestratePrematureTurnEnd, BaseException)
+        assert not issubclass(_OrchestratePrematureTurnEnd, Exception)
+
+    def test_sentinel_carries_the_result_text_for_diagnosis(self) -> None:
+        from devbench.cli import _OrchestratePrematureTurnEnd
+
+        exc = _OrchestratePrematureTurnEnd("I'll continue automatically.")
+
+        assert exc.result_text == "I'll continue automatically."
+        assert "I'll continue automatically." in str(exc)
+
+    def test_sentinel_without_result_text_says_so(self) -> None:
+        from devbench.cli import _OrchestratePrematureTurnEnd
+
+        assert "no SDK result text" in str(_OrchestratePrematureTurnEnd(None))
+
+    def test_restart_permitted_below_cap(self) -> None:
+        from devbench.cli import _should_restart_after_premature_turn_end
+
+        assert _should_restart_after_premature_turn_end(0, 10) is True
+        assert _should_restart_after_premature_turn_end(9, 10) is True
+
+    def test_restart_refused_at_cap(self) -> None:
+        """Fail fast rather than loop without progress: cap exhaustion is
+        itself the signal that a human is needed."""
+        from devbench.cli import _should_restart_after_premature_turn_end
+
+        assert _should_restart_after_premature_turn_end(10, 10) is False
+        assert _should_restart_after_premature_turn_end(11, 10) is False
+
+    def test_cap_default_is_far_below_the_shared_quota_ceiling(self) -> None:
+        """A turn end can repeat immediately, unlike the three self-throttling
+        failure modes, so it must not inherit the 1000-resume ceiling."""
+        from devbench.constants import DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS, DEFAULT_MAX_QUOTA_RESUMES
+
+        assert DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS < DEFAULT_MAX_QUOTA_RESUMES
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("3", 3), ("1", 1), ("", None), ("   ", None), ("not-an-int", None), ("0", None), ("-5", None)],
+    )
+    def test_cap_env_override_is_fail_safe(
+        self, raw: str, expected: int | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """env > default, and a typo can neither remove the bound nor disable
+        the restart loop -- mirrors ``_resolve_max_quota_resumes``."""
+        from devbench.cli import _resolve_max_premature_turn_end_restarts
+        from devbench.constants import DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+
+        monkeypatch.setenv("DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS", raw)
+
+        assert _resolve_max_premature_turn_end_restarts() == (expected or DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS)
+
+    def test_cap_unset_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.cli import _resolve_max_premature_turn_end_restarts
+        from devbench.constants import DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+
+        monkeypatch.delenv("DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS", raising=False)
+
+        assert _resolve_max_premature_turn_end_restarts() == DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+
 
 class TestFireOrchestratorStopNotificationProgress:
     """db-271 (spec FR-18 Part C, AC-E12-F3-S1-T1-3): ``_fire_orchestrator_stop_notification``
@@ -10438,6 +10556,23 @@ class TestIssue331RegressionFixture:
         assert type(exc_info.value) is RuntimeError, "exception must propagate with its original type, not wrapped"
 
 
+class _TerminalSdkResult:
+    """A fake SDK message that ends the orchestrate loop legitimately.
+
+    ``cmd_start`` stops only on a terminal sentinel (``ALL_DONE`` /
+    ``NO_ACTIONABLE``) or an operator drain: a session that merely stops while
+    the backlog still holds actionable work is the premature-turn-end fault that
+    earns a bounded fresh-session restart, not a clean exit. Any test whose fake
+    SDK ends its stream AND whose fixture backlog has claimable tasks must
+    therefore yield one of these to reach the clean-exit path.
+
+    Duck-typed on ``.result`` to match ``cli._extract_sdk_result_text``, so it
+    needs no SDK import and no ``ResultMessage`` construction.
+    """
+
+    result = "ALL_DONE"
+
+
 class _FakeSdkModule(types.ModuleType):
     """Typed fake claude_agent_sdk module for tests.
 
@@ -10689,12 +10824,17 @@ class TestCmdStartScopeOverlap:
     """
 
     def _make_mock_sdk(self) -> _FakeSdkModule:
-        """Return a minimal fake claude_agent_sdk module."""
+        """Return a fake claude_agent_sdk module that ends on a terminal sentinel.
+
+        This class's fixtures seed actionable work, so the session must announce
+        ``ALL_DONE`` to reach the clean-exit path these overlap tests assert on
+        (see :class:`_TerminalSdkResult`).
+        """
         mock_sdk = _FakeSdkModule()
         mock_sdk.ClaudeAgentOptions = MagicMock()
 
         async def mock_query(**kwargs: object) -> object:
-            yield "test message"
+            yield _TerminalSdkResult()
 
         mock_sdk.query = mock_query
         return mock_sdk
@@ -20117,13 +20257,20 @@ class _CmdStartScopeTestBase:
     # ------------------------------------------------------------------
 
     def _make_sdk_mock(self) -> object:
+        """Fake SDK whose session ends on a GENUINE terminal sentinel.
+
+        These classes assert clean-exit behaviour (scope.json lifecycle), and
+        ``_fake_units`` below is six actionable IN_QUEUE tasks, so the session
+        must end on a real terminal sentinel to reach that path. See
+        :class:`_TerminalSdkResult`.
+        """
         import types
 
         mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_sdk.ClaudeAgentOptions = MagicMock()
 
         async def _query(**kwargs: object) -> object:
-            yield "msg"
+            yield _TerminalSdkResult()
 
         mock_sdk.query = _query
         return mock_sdk
@@ -20226,7 +20373,7 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
         async def _capturing_query(**kwargs: object) -> object:
             if scope_path.exists():
                 captured.append(json.loads(scope_path.read_text()))
-            yield "msg"
+            yield _TerminalSdkResult()
 
         capturing_sdk: Any = types.ModuleType("claude_agent_sdk")
         capturing_sdk.ClaudeAgentOptions = MagicMock()
@@ -20334,7 +20481,7 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
             import os
 
             captured_env.update(os.environ)
-            yield "msg"
+            yield _TerminalSdkResult()
 
         custom_sdk: Any = types.ModuleType("claude_agent_sdk")
         custom_sdk.ClaudeAgentOptions = MagicMock()

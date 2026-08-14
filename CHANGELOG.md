@@ -31,6 +31,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
   `tests/test_docs/test_cli_reference_log_waiver.py`.
 
+- **`log-newly-reachable` -- structured, judge-visible `[NEWLY_REACHABLE]`
+  path-verification markers** (spec `integration-reality-gates-hardening.md`
+  section 4.9(a), 5.3, S1; AC-E2-F4-S1-T2-1 through -6; AC-21). New CLI verb
+  `log-newly-reachable <id> --path <p> --method <m> --result <r>` writes a
+  `[NEWLY_REACHABLE] <path> <method> <result>` marker
+  (`devbench.cli.compose_newly_reachable_record`, the sole authorized
+  builder) into the unit's `## TDD Cycle Log` section via the same
+  `BacklogManager._append_audit_marker_before_comments` insertion point
+  `log-waiver` uses -- the audit surface that survives every review judge's
+  `read-unit --strip-comments` Evidence fetch (the PM-6 evidence-horizon
+  rule, E2-F3-S1-T2). This replaces the free-text `[NEWLY_REACHABLE]`
+  convention `docs/newly-reachable-paths.md` previously documented (written
+  via `log-comment` into `## Comments`, which that fetch strips and which was
+  therefore invisible to the judges spec 4.3 requires to weigh it); a
+  Definition-of-Done checkbox is auto-ticked on the done transition (S1), so
+  only a validated, judge-visible marker is auditable. `--method` (`manual`,
+  `unit_test`, `integration_test`, `functional_test`) and `--result`
+  (`verified`, `broken`) are validated against named importable
+  `NEWLY_REACHABLE_METHODS`/`NEWLY_REACHABLE_RESULTS` constants rather than
+  inline literals; an unknown or empty field exits 2 naming the offending
+  argument and listing the accepted values, and a missing unit exits 1
+  writing no marker -- the same 0/1/2 exit-code contract `log-waiver` uses.
+  Flag scanning reuses the newly-generalised `_consume_gate_verb_flag_value`
+  (renamed from `_consume_log_waiver_flag_value`) rather than duplicating
+  flag-parsing between the two structured gate-marker verbs.
+  `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
+  `tests/test_docs/test_cli_reference_log_newly_reachable.py`.
+  `docs/newly-reachable-paths.md`'s audit-trail and enforcement sections
+  still describe the superseded `log-comment`/`## Comments` convention;
+  syncing that doc to the shipped verb is deferred to the named successor
+  task E2-F4-S1-T4.
+
 - **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
   helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,
   AC-9; AC-E2-F3-S1-T1-1 through -6). New `resolve_changed_files(unit_id,

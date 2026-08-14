@@ -389,7 +389,7 @@ Print the work-unit content (the `.md` file body) plus the resolved repo path as
 
 ## Gates
 
-Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates` and `log-waiver` -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
+Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver` and `log-newly-reachable` -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
 
 ### `gates`
 
@@ -460,6 +460,37 @@ $ uv run devbench log-waiver code_review E9-F1-S1-T1 \
     --gate reachability --target src/ui/LegacyPanel.tsx \
     --reason "mounted via route-split registry resolved at runtime" --operator
 {"unit_id": "E9-F1-S1-T1", "judge": "code_review", "gate": "reachability", "target": "src/ui/LegacyPanel.tsx", "attribution": "operator"}
+```
+
+### `log-newly-reachable`
+
+```
+uv run devbench log-newly-reachable <id> --path <p> --method <m> --result <r>
+```
+
+Record a newly-reachable-path verification: log-newly-reachable <id> --path <p> --method <m> --result <r>
+
+Writes a `[NEWLY_REACHABLE] <path> <method> <result>` marker (spec section 5.3 field order) into the unit's `## TDD Cycle Log` section -- the audit surface that survives every review judge's `read-unit --strip-comments` Evidence fetch (the PM-6 evidence-horizon rule, E2-F3-S1-T2). `## Comments` itself is stripped by that fetch, so a marker appended there would be invisible to the judges that must weigh it; `log-newly-reachable` never writes to `## Comments`. It replaces the free-text `[NEWLY_REACHABLE]` prose convention written via `log-comment` into `## Comments` (spec 4.9(a); AC-21: the structured marker survives the Evidence fetch the prose convention did not).
+
+Arguments:
+
+- `<id>` -- the work unit ID.
+- `--path <p>` -- REQUIRED, non-empty. The specific code path (file, route, component) newly reachable because of this fix. A single token with no whitespace.
+- `--method <m>` -- REQUIRED. How the path was verified: `manual`, `unit_test`, `integration_test`, or `functional_test` (`cli.NEWLY_REACHABLE_METHODS`; PR #320's proposed schema).
+- `--result <r>` -- REQUIRED. The verification outcome: `verified` (the path behaves correctly) or `broken` (verification surfaced a new, independent defect) (`cli.NEWLY_REACHABLE_RESULTS`).
+
+Exit codes:
+
+- `0` -- the marker was written; stdout carries a JSON summary (`unit_id`, `path`, `method`, `result`).
+- `1` -- the work unit does not exist.
+- `2` -- a usage error naming the offending argument: an empty/missing `--path`, an unknown `--method`, or an unknown `--result` (listing the accepted values for the enumerated fields).
+
+Example (spec 4.9(a)):
+
+```
+$ uv run devbench log-newly-reachable E9-F1-S1-T1 \
+    --path src/ui/LegacyPanel.tsx --method manual --result verified
+{"unit_id": "E9-F1-S1-T1", "path": "src/ui/LegacyPanel.tsx", "method": "manual", "result": "verified"}
 ```
 
 ---

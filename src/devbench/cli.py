@@ -5737,12 +5737,16 @@ def _gate_verb_usage_error(message: str) -> int:
     return 2
 
 
-def _consume_log_waiver_flag_value(args: list[str], i: int, flag: str) -> tuple[str, int] | int:
+def _consume_gate_verb_flag_value(args: list[str], i: int, flag: str) -> tuple[str, int] | int:
     """Return ``(value, next_index)`` for *flag*'s value at ``args[i + 1]``.
 
-    Shared by every ``--gate``/``--target``/``--reason`` flag in
-    :func:`_scan_log_waiver_flags` so the "flag requires a value" usage
-    error has one definition instead of being duplicated per flag.
+    Shared by every flag-scanning function behind a structured gate-marker
+    verb -- :func:`_scan_log_waiver_flags` (``--gate``/``--target``/``--reason``)
+    and :func:`_scan_log_newly_reachable_flags` (``--path``/``--method``/``--result``)
+    -- so the "flag requires a value" usage error has exactly one definition
+    across both verbs instead of being duplicated per verb (E2-F4-S1-T2
+    REFACTOR: was ``_consume_log_waiver_flag_value``, generalised once
+    ``log-newly-reachable`` needed the identical behaviour).
 
     Returns:
         ``(value, i + 2)`` on success, or the ``2`` usage-error exit code
@@ -5775,7 +5779,7 @@ def _scan_log_waiver_flags(argv: tuple[str, ...]) -> tuple[list[str], str, str, 
             i += 1
             continue
         if arg in ("--gate", "--target", "--reason"):
-            consumed = _consume_log_waiver_flag_value(args, i, arg)
+            consumed = _consume_gate_verb_flag_value(args, i, arg)
             if isinstance(consumed, int):
                 return consumed
             value, i = consumed
@@ -5935,6 +5939,216 @@ def cmd_log_waiver(*argv: str) -> int:
             }
         )
     )
+    return 0
+
+
+# Accepted `--method` values for `log-newly-reachable` (spec 4.9(a), 5.3; PR #320's
+# proposed schema; AC-E2-F4-S1-T2-5). Named constants (not inline literals) so the CLI
+# and its docs (`docs/cli-reference.md`) can never drift, mirroring how `GATE_TIERS` /
+# `ALL_REQUIRED_JUDGE_NAMES` back `log-waiver`'s vocabularies. The four values mirror
+# `docs/newly-reachable-paths.md`'s "What counts as live verification" categories:
+# exercising the path by hand, or via one of this repo's three test tiers.
+NEWLY_REACHABLE_METHOD_MANUAL: str = "manual"
+NEWLY_REACHABLE_METHOD_UNIT_TEST: str = "unit_test"
+NEWLY_REACHABLE_METHOD_INTEGRATION_TEST: str = "integration_test"
+NEWLY_REACHABLE_METHOD_FUNCTIONAL_TEST: str = "functional_test"
+NEWLY_REACHABLE_METHODS: frozenset[str] = frozenset(
+    {
+        NEWLY_REACHABLE_METHOD_MANUAL,
+        NEWLY_REACHABLE_METHOD_UNIT_TEST,
+        NEWLY_REACHABLE_METHOD_INTEGRATION_TEST,
+        NEWLY_REACHABLE_METHOD_FUNCTIONAL_TEST,
+    }
+)
+
+# Accepted `--result` values for `log-newly-reachable` (spec 4.9(a), 5.3;
+# AC-E2-F4-S1-T2-5): the path either behaves as expected once reached, or the live
+# verification surfaced a new, independent defect (`docs/newly-reachable-paths.md`:
+# "If verification surfaces a new, independent defect in a newly-reachable path, the
+# executor does not silently mark the task done").
+NEWLY_REACHABLE_RESULT_VERIFIED: str = "verified"
+NEWLY_REACHABLE_RESULT_BROKEN: str = "broken"
+NEWLY_REACHABLE_RESULTS: frozenset[str] = frozenset({NEWLY_REACHABLE_RESULT_VERIFIED, NEWLY_REACHABLE_RESULT_BROKEN})
+
+
+def _scan_log_newly_reachable_flags(argv: tuple[str, ...]) -> tuple[list[str], str, str, str] | int:
+    """Scan ``log-newly-reachable``'s argv into positionals plus its three flags.
+
+    Returns:
+        ``(positional, path, method, result)`` on success (empty string for any flag
+        not supplied). On a missing flag value, returns the ``2`` usage-error exit
+        code already printed to stderr.
+    """
+    positional: list[str] = []
+    path = ""
+    method = ""
+    result = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg in ("--path", "--method", "--result"):
+            consumed = _consume_gate_verb_flag_value(args, i, arg)
+            if isinstance(consumed, int):
+                return consumed
+            value, i = consumed
+            if arg == "--path":
+                path = value
+            elif arg == "--method":
+                method = value
+            else:
+                result = value
+            continue
+        positional.append(arg)
+        i += 1
+    return positional, path, method, result
+
+
+def _parse_log_newly_reachable_argv(
+    argv: tuple[str, ...],
+) -> tuple[str, str, str, str] | int:
+    """Parse ``log-newly-reachable <unit-id> --path <p> --method <m> --result <r>``.
+
+    Returns:
+        ``(unit_id, path, method, result)`` on success. On a usage error (missing
+        positional, missing/empty flag value), prints an ``ERROR: ...`` naming the
+        offending argument via :func:`_gate_verb_usage_error` and returns ``2`` for
+        the caller to return directly.
+    """
+    scanned = _scan_log_newly_reachable_flags(argv)
+    if isinstance(scanned, int):
+        return scanned
+    positional, path, method, result = scanned
+
+    if len(positional) < 1:
+        return _gate_verb_usage_error("log-newly-reachable requires <unit-id> --path <p> --method <m> --result <r>")
+    unit_id = positional[0]
+
+    if not path or not path.strip():
+        return _gate_verb_usage_error("--path is required and must be non-empty")
+    if not method:
+        return _gate_verb_usage_error("--method is required")
+    if not result:
+        return _gate_verb_usage_error("--result is required")
+
+    return unit_id, path, method, result
+
+
+def _validate_log_newly_reachable_semantics(method: str, result: str) -> int | None:
+    """Validate ``--method``/``--result`` against their declared vocabularies.
+
+    Args:
+        method: The ``--method`` flag value.
+        result: The ``--result`` flag value.
+
+    Returns:
+        The ``2`` usage-error exit code (already printed to stderr) on the first
+        violation, or ``None`` when both are valid.
+    """
+    if method not in NEWLY_REACHABLE_METHODS:
+        valid = ", ".join(sorted(NEWLY_REACHABLE_METHODS))
+        return _gate_verb_usage_error(f"--method names an unknown method {method!r}; valid choices are: {valid}.")
+
+    if result not in NEWLY_REACHABLE_RESULTS:
+        valid = ", ".join(sorted(NEWLY_REACHABLE_RESULTS))
+        return _gate_verb_usage_error(f"--result names an unknown result {result!r}; valid choices are: {valid}.")
+
+    return None
+
+
+def compose_newly_reachable_record(path: str, method: str, result: str) -> str:
+    """Compose the single-line ``[NEWLY_REACHABLE] <path> <method> <result>`` marker (spec 5.3).
+
+    The sole authorized builder of the ``[NEWLY_REACHABLE]`` marker text: ``cli.cmd_log_newly_reachable``
+    calls this function rather than formatting the tag itself, mirroring
+    ``devbench.backlog.manager.compose_gate_waiver_record``'s role for ``[GATE_WAIVER]``.
+
+    Args:
+        path: The specific code path made newly reachable. Must be a single
+            non-empty token with no whitespace -- the marker grammar is
+            space-delimited positional fields, so a whitespace-bearing path would
+            corrupt the field boundary on read-back.
+        method: One of :data:`NEWLY_REACHABLE_METHODS`.
+        result: One of :data:`NEWLY_REACHABLE_RESULTS`.
+
+    Returns:
+        The exact one-line marker text (no trailing newline).
+
+    Raises:
+        ValueError: If ``path`` is empty or contains whitespace, ``method`` is not
+            declared, or ``result`` is not declared. The CLI boundary
+            (:func:`_parse_log_newly_reachable_argv`,
+            :func:`_validate_log_newly_reachable_semantics`) already rejects these
+            cases before this function is ever called from :func:`cmd_log_newly_reachable`;
+            these checks are defense in depth for any other caller.
+    """
+    if not path or any(ch.isspace() for ch in path):
+        raise ValueError(f"path must be a single non-empty token with no whitespace; got {path!r}.")
+    if method not in NEWLY_REACHABLE_METHODS:
+        valid_methods = ", ".join(sorted(NEWLY_REACHABLE_METHODS))
+        raise ValueError(f"Unknown method {method!r}; declared methods are: {valid_methods}.")
+    if result not in NEWLY_REACHABLE_RESULTS:
+        valid_results = ", ".join(sorted(NEWLY_REACHABLE_RESULTS))
+        raise ValueError(f"Unknown result {result!r}; declared results are: {valid_results}.")
+
+    return f"[NEWLY_REACHABLE] {path} {method} {result}"
+
+
+def cmd_log_newly_reachable(*argv: str) -> int:
+    """Record a structured ``[NEWLY_REACHABLE]`` marker (spec 4.9(a), 5.3; AC-21).
+
+    Usage::
+
+        log-newly-reachable <unit-id> --path <p> --method <m> --result <r>
+
+    Writes ``[NEWLY_REACHABLE] <path> <method> <result>`` (spec 5.3 field order,
+    composed by :func:`compose_newly_reachable_record` -- the sole authorized
+    builder) into the unit's ``## TDD Cycle Log`` section (via
+    ``BacklogManager._append_audit_marker_before_comments``, the same insertion
+    point ``log-waiver`` uses), the audit surface that survives every review
+    judge's ``read-unit --strip-comments`` Evidence fetch (PM-6 evidence-horizon
+    rule, E2-F3-S1-T2). ``## Comments`` itself is stripped by that fetch, so the
+    prose ``[NEWLY_REACHABLE]`` convention ``docs/newly-reachable-paths.md``
+    previously documented (written via ``log-comment`` into ``## Comments``) was
+    invisible to the very judges spec 4.3 requires to weigh it; this verb replaces
+    that convention with a validated, judge-visible structured marker.
+
+    Args:
+        argv: ``<unit-id> --path <p> --method <m> --result <r>``. ``--method``
+            must be one of :data:`NEWLY_REACHABLE_METHODS`; ``--result`` must be
+            one of :data:`NEWLY_REACHABLE_RESULTS`.
+
+    Returns:
+        ``0`` on success (the marker was written; stdout carries a JSON summary).
+        ``1`` when the unit does not exist. ``2`` (usage error, naming the
+        offending argument) when a required field is missing or empty, or
+        ``--method``/``--result`` names an unknown value.
+    """
+    parsed = _parse_log_newly_reachable_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, path, method, result = parsed
+
+    rc = _validate_log_newly_reachable_semantics(method, result)
+    if rc is not None:
+        return rc
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_work_unit_file(unit)
+    marker = compose_newly_reachable_record(path, method, result)
+    BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+
+    logger.info("NEWLY_REACHABLE recorded for %s (path=%s, method=%s, result=%s)", unit_id, path, method, result)
+    print(json.dumps({"unit_id": unit_id, "path": path, "method": method, "result": result}))
     return 0
 
 
@@ -13872,6 +14086,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Record a structured gate waiver: log-waiver <judge> <id> --gate <g> --target <t> --reason <r> [--operator]",
     ),
+    "log-newly-reachable": (
+        cmd_log_newly_reachable,
+        1,
+        "Record a newly-reachable-path verification: log-newly-reachable <id> --path <p> --method <m> --result <r>",
+    ),
     "tdd-gate": (
         cmd_tdd_gate,
         1,
@@ -14021,6 +14240,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "stop",
         # E2-F4-S1-T1: --gate/--target/--reason/--operator flags.
         "log-waiver",
+        # E2-F4-S1-T2: --path/--method/--result flags.
+        "log-newly-reachable",
     }
 )
 

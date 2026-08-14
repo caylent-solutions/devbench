@@ -8328,6 +8328,346 @@ class TestCmdLogWaiver:
         assert "[GATE_WAIVER layout_geometry]" in wu_file.read_text(encoding="utf-8")
 
 
+@pytest.mark.unit
+class TestCmdLogNewlyReachable:
+    """Tests for cmd_log_newly_reachable (spec 4.9(a), 5.3; AC-E2-F4-S1-T2-1..4)."""
+
+    _UNIT_ID = "E9-F1-S1-T1"
+    _REPO = "caylent-solutions/devbench"
+
+    # Expected accepted values (spec 4.9(a), PR #320's proposed schema). Deliberately
+    # literal (not `cli.NEWLY_REACHABLE_METHODS`/`cli.NEWLY_REACHABLE_RESULTS`) so this
+    # test module still COLLECTS when `src/devbench/cli.py`'s production changes are
+    # stashed (the `tdd-gate` RED re-verification cycle stashes only production-source
+    # Changes Manifest rows and re-runs a named node id -- a collection-time
+    # `AttributeError` from a `@pytest.mark.parametrize(..., cli.X)` decorator would be a
+    # collection error, not a genuine test failure). `test_declared_vocabularies_match_expected`
+    # below cross-checks these literals against the real production constants at test-body
+    # (not collection) time.
+    _EXPECTED_METHODS = ("functional_test", "integration_test", "manual", "unit_test")
+    _EXPECTED_RESULTS = ("broken", "verified")
+
+    def _make_wu_file(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Return (backlog_dir, wu_file) with a real-shape ## TDD Cycle Log / ## Comments ordering.
+
+        Mirrors the ordering every generated backlog task file uses (TDD
+        Cycle Log immediately before Comments), which is the ordering
+        ``read-unit --strip-comments`` relies on to keep a marker written
+        into TDD Cycle Log visible (AC-E2-F4-S1-T2-4).
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / f"{self._UNIT_ID}.md"
+        wu_file.write_text(
+            f"# {self._UNIT_ID}: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [WU_CLAIMED] Set to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        return backlog_dir, wu_file
+
+    def _make_unit(self, backlog_dir: Path) -> WorkUnit:
+        return WorkUnit(
+            id=self._UNIT_ID,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=backlog_dir / f"{self._UNIT_ID}.md",
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _run(self, tmp_path: Path, *args: str) -> tuple[int, Path]:
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_newly_reachable(*args)
+        return result, wu_file
+
+    # -- (a) valid invocation writes exactly one marker with the spec field order, exits 0 --
+
+    def test_valid_invocation_writes_marker_and_exits_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/ui/LegacyPanel.tsx",
+            "--method",
+            "manual",
+            "--result",
+            "verified",
+        )
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        comments_start = content.find("## Comments")
+        marker_idx = content.find("[NEWLY_REACHABLE]")
+        assert tdd_start != -1
+        assert marker_idx != -1
+        assert tdd_start < marker_idx < comments_start
+        assert content.count("[NEWLY_REACHABLE]") == 1
+        assert "[NEWLY_REACHABLE] src/ui/LegacyPanel.tsx manual verified" in content
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "unit_id": self._UNIT_ID,
+            "path": "src/ui/LegacyPanel.tsx",
+            "method": "manual",
+            "result": "verified",
+        }
+
+    @pytest.mark.parametrize("method", _EXPECTED_METHODS)
+    @pytest.mark.parametrize("result_value", _EXPECTED_RESULTS)
+    def test_every_declared_method_and_result_combination_succeeds(
+        self, tmp_path: Path, method: str, result_value: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            method,
+            "--result",
+            result_value,
+        )
+
+        assert result == 0
+        assert f"[NEWLY_REACHABLE] src/x.py {method} {result_value}" in wu_file.read_text(encoding="utf-8")
+
+    def test_declared_vocabularies_match_expected(self) -> None:
+        """AC-E2-F4-S1-T2-5: cross-checks the real constants against `_EXPECTED_METHODS`/`_EXPECTED_RESULTS`."""
+        assert frozenset(self._EXPECTED_METHODS) == cli.NEWLY_REACHABLE_METHODS
+        assert frozenset(self._EXPECTED_RESULTS) == cli.NEWLY_REACHABLE_RESULTS
+
+    # -- (f) the marker survives the judge Evidence fetch (AC-21/AC-E2-F4-S1-T2-4) --
+
+    def test_marker_survives_strip_comments_evidence_fetch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_log_newly_reachable(
+                self._UNIT_ID,
+                "--path",
+                "src/x.py",
+                "--method",
+                "unit_test",
+                "--result",
+                "verified",
+            )
+            assert rc == 0
+            capsys.readouterr()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: tmp_path}),
+        ):
+            rc = cli.cmd_read_unit("--strip-comments", self._UNIT_ID)
+        assert rc == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert "## Comments" not in payload["content"]
+        assert "[NEWLY_REACHABLE] src/x.py unit_test verified" in payload["content"]
+
+    # -- (b) unknown --method: exit 2 naming --method and listing the accepted values --
+
+    def test_unknown_method_exits_2_naming_method(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            "telepathy",
+            "--result",
+            "verified",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--method" in err
+        assert "telepathy" in err
+        for accepted in cli.NEWLY_REACHABLE_METHODS:
+            assert accepted in err
+        assert "[NEWLY_REACHABLE" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (c) unknown --result: exit 2 naming --result and listing the accepted values --
+
+    def test_unknown_result_exits_2_naming_result(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            "manual",
+            "--result",
+            "maybe",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--result" in err
+        assert "maybe" in err
+        for accepted in cli.NEWLY_REACHABLE_RESULTS:
+            assert accepted in err
+        assert "[NEWLY_REACHABLE" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (d) empty or whitespace-only --path: exit 2 naming --path --
+
+    @pytest.mark.parametrize("path", ["", "   "])
+    def test_empty_or_whitespace_path_exits_2_naming_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], path: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            path,
+            "--method",
+            "manual",
+            "--result",
+            "verified",
+        )
+
+        assert result == 2
+        assert "--path" in capsys.readouterr().err
+        assert "[NEWLY_REACHABLE" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (e) unit id that does not exist: exit 1, writes nothing --
+
+    def test_unknown_unit_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_newly_reachable(
+                "NONEXISTENT",
+                "--path",
+                "src/x.py",
+                "--method",
+                "manual",
+                "--result",
+                "verified",
+            )
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    # -- usage-error paths not enumerated above but required for fail-fast coverage --
+
+    def test_missing_positional_arg_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path)
+        assert result == 2
+        assert "log-newly-reachable requires" in capsys.readouterr().err
+
+    def test_missing_path_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--method", "manual", "--result", "verified")
+        assert result == 2
+        assert "--path" in capsys.readouterr().err
+
+    def test_missing_method_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--result", "verified")
+        assert result == 2
+        assert "--method" in capsys.readouterr().err
+
+    def test_missing_result_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--method", "manual")
+        assert result == 2
+        assert "--result" in capsys.readouterr().err
+
+    def test_missing_path_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--method", "manual", "--result", "verified", "--path")
+        assert result == 2
+        assert "--path" in capsys.readouterr().err
+
+    def test_missing_method_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--result", "verified", "--method")
+        assert result == 2
+        assert "--method" in capsys.readouterr().err
+
+    def test_missing_result_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--method", "manual", "--result")
+        assert result == 2
+        assert "--result" in capsys.readouterr().err
+
+    def test_registered_in_commands_with_one_min_arg(self) -> None:
+        func, min_args, _ = cli._COMMANDS["log-newly-reachable"]
+        assert func is cli.cmd_log_newly_reachable
+        assert min_args == 1
+
+    def test_registered_as_variadic(self) -> None:
+        assert "log-newly-reachable" in cli._VARIADIC_COMMANDS
+
+    def test_empty_string_token_is_skipped_during_flag_scan(self, tmp_path: Path) -> None:
+        """An empty-string argv token (e.g. from shell interpolation) is skipped, not treated as positional."""
+        result, wu_file = self._run(
+            tmp_path,
+            "",
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            "manual",
+            "--result",
+            "verified",
+        )
+
+        assert result == 0
+        assert "[NEWLY_REACHABLE] src/x.py manual verified" in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestComposeNewlyReachableRecord:
+    """Direct tests for compose_newly_reachable_record's defense-in-depth validation.
+
+    ``cmd_log_newly_reachable`` never reaches these raise paths (the CLI boundary
+    already rejects an empty/whitespace-bearing path and an undeclared
+    method/result before this function is called), so they are exercised directly
+    here.
+    """
+
+    def test_composes_the_exact_spec_5_3_field_order(self) -> None:
+        assert (
+            cli.compose_newly_reachable_record("src/x.py", "manual", "verified")
+            == "[NEWLY_REACHABLE] src/x.py manual verified"
+        )
+
+    def test_empty_path_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="non-empty token"):
+            cli.compose_newly_reachable_record("", "manual", "verified")
+
+    def test_whitespace_bearing_path_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="non-empty token"):
+            cli.compose_newly_reachable_record("src/x y.py", "manual", "verified")
+
+    def test_unknown_method_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="Unknown method"):
+            cli.compose_newly_reachable_record("src/x.py", "telepathy", "verified")
+
+    def test_unknown_result_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="Unknown result"):
+            cli.compose_newly_reachable_record("src/x.py", "manual", "maybe")
+
+
 class TestCmdRunTests:
     """Test cmd_run_tests command."""
 

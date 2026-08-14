@@ -1220,6 +1220,91 @@ class TestPromoteProposal:
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         assert "| E0-F1-S1-T2 |" not in source.read_text()
 
+    def _promote_with_source_status(self, tmp_path: Path, source_status: str) -> tuple[Path, Path]:
+        """Promote a proposal whose source task sits at ``source_status``.
+
+        Returns ``(workspace_root, source_work_unit_path)`` -- both explicitly,
+        rather than deriving the root from the unit path, so a test cannot
+        silently assert against a miscounted ``parents[n]``.
+        """
+        workspace = _build_workspace(tmp_path)
+        source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace("## Status: in-queue", f"## Status: {source_status}"),
+            encoding="utf-8",
+        )
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            index.read_text(encoding="utf-8").replace("| in-queue |", f"| {source_status} |", 1),
+            encoding="utf-8",
+        )
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=index,
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=index,
+            task_id="E0-F1-S1-T2",
+        )
+        return workspace, source
+
+    @pytest.mark.parametrize("source_status", ["in-progress", "in-queue", "in-review"])
+    def test_promote_sets_wired_source_to_blocked(self, tmp_path: Path, source_status: str) -> None:
+        """Wiring the marker MUST also write the status.
+
+        Regression: the promote path wrote the marker and the dependency row but
+        never the status, so a task blocked pending a proposal kept whatever
+        status it had. That mismatch is load-bearing rather than cosmetic --
+        ``_auto_requeue_marker_dependents`` skips any candidate whose status is
+        not ``blocked``, so the source would never be requeued when the promoted
+        dep completed; ``in-progress`` additionally suppresses auto-restart and
+        can be re-claimed by a sweep while the blocker is unresolved.
+        """
+        _workspace, source = self._promote_with_source_status(tmp_path, source_status)
+
+        content = source.read_text(encoding="utf-8")
+        assert "## Status: blocked" in content
+        assert f"## Status: {source_status}" not in content
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in content, "marker and status must be written together"
+
+    def test_promote_status_write_reaches_the_backlog_index(self, tmp_path: Path) -> None:
+        """``force_status`` updates both files, so the index must agree too.
+
+        A unit file saying ``blocked`` while the index still says ``in-progress``
+        would leave the cascade -- which reads the index -- just as blind as
+        before.
+        """
+        workspace, _source = self._promote_with_source_status(tmp_path, "in-progress")
+        index_text = (workspace / "BACKLOG.md").read_text(encoding="utf-8")
+
+        row = next(line for line in index_text.splitlines() if "| E0-F1-S1-T1 |" in line)
+        assert "blocked" in row.lower(), f"index row not updated: {row!r}"
+
+    def test_promoted_dep_completion_requeues_the_source(self, tmp_path: Path) -> None:
+        """End-to-end proof the ADR-07 cascade now fires.
+
+        This is the behaviour the missing status write silently broke: marking
+        the promoted dep ``done`` must flip the source back to ``in-queue``. With
+        the source stuck at ``in-progress`` the cascade skipped it entirely and
+        the task stranded with a satisfied dependency.
+        """
+        from devbench.backlog.manager import BacklogManager
+
+        workspace, source = self._promote_with_source_status(tmp_path, "in-progress")
+        index = workspace / "BACKLOG.md"
+        promoted = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+
+        BacklogManager().force_status(promoted, index, "E0-F1-S1-T2", "done")
+
+        assert "## Status: in-queue" in source.read_text(encoding="utf-8")
+
     def test_promote_writes_blocked_pending_proposal_marker(self, tmp_path: Path) -> None:
         """The wiring write must include the ``[BLOCKED_PENDING_PROPOSAL]`` marker.
 

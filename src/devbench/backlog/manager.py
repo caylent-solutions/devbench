@@ -1273,6 +1273,14 @@ class BacklogManager:
             <reason>`` line that fails to parse against the spec grammar
             (``parse_gate_waiver_record``) is an error naming the unit and
             the offending line; a well-formed marker is accepted silently.
+        28. Marker/status agreement: a non-terminal Task carrying a
+            ``[BLOCKED_PENDING_PROPOSAL]`` marker whose target is itself
+            non-terminal MUST have status ``blocked``. The marker and the status
+            are written by separate steps, and the ADR-07 cascade
+            (:meth:`_auto_requeue_marker_dependents`) skips non-blocked
+            candidates, so a mismatch strands the task permanently once its
+            blocker completes. Markers whose targets are all terminal are exempt
+            (the cascade has legitimately requeued the task).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -1320,6 +1328,7 @@ class BacklogManager:
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
+        self._check_marker_status_agreement(rows, workspace_root, errors)
         self._check_already_satisfied_decline_citation(rows, workspace_root, errors)
         self._check_gate_waiver_grammar(rows, workspace_root, errors)
         return errors
@@ -4166,6 +4175,85 @@ class BacklogManager:
             has_ref = match.group(2) is not None
             out.append((token, has_ref))
         return out
+
+    def _check_marker_status_agreement(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Rule 28: a task waiting on a live ``[BLOCKED_PENDING_PROPOSAL]`` marker must be ``blocked``.
+
+        The marker and the ``## Status:`` line are written by separate steps, and
+        three consumers read them independently, so a disagreement is silently
+        load-bearing rather than cosmetic:
+
+        - :meth:`_auto_requeue_marker_dependents` (the ADR-07 cascade) skips any
+          candidate whose status is not ``blocked``, so a marked-but-unblocked
+          task is never requeued when its promoted dependency completes -- it
+          strands with a satisfied dependency, the exact outcome the cascade
+          exists to prevent.
+        - ``cli._should_auto_restart_after_no_actionable`` refuses to restart
+          while any task is ``in-progress``, so a target marked mid-execution
+          suppresses auto-restart indefinitely.
+        - :meth:`~devbench.backlog.parser.BacklogParser.find_next_actionable`
+          PRIORITISES ``in-progress`` over ``in-queue``, so a claim sweep can
+          re-claim the target while its blocker is unresolved.
+
+        ``classify_blocked_task`` keys off marker presence, not status, so it
+        reports such a task as auto-clearing while the status line disagrees;
+        neither view cross-checks the other. This rule is that cross-check, and
+        it holds regardless of which code path introduced the mismatch --
+        including future ones -- rather than relying on every marker writer
+        remembering to write the status too.
+
+        Only markers with a NON-TERMINAL target are checked. A task whose
+        markers all point at ``done``/``declined`` work is legitimately back in
+        ``in-queue`` (or already running) because the cascade requeued it, so
+        requiring ``blocked`` there would flag correct state.
+
+        Terminal statuses are exempt: a ``done`` or ``declined`` task that still
+        carries an old marker is finished, and its history is not a defect.
+
+        Args:
+            rows: ``(id, status, file_path)`` triples from the backlog index.
+            workspace_root: Workspace root that ``file_path`` is relative to.
+            errors: Accumulator appended to on violation.
+        """
+        status_by_id = {
+            row_id: (status or "").strip().lower()
+            for row_id, status, _ in rows
+            if row_id and not row_id.startswith("-") and row_id.lower() != "id"
+        }
+        terminal = {STATUS_DONE, STATUS_DECLINED}
+
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            own_status = (status or "").strip().lower()
+            if own_status in (STATUS_BLOCKED, *terminal):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            live_markers = sorted(
+                marker_id
+                for marker_id in self._extract_pending_proposal_markers(wu_path)
+                if status_by_id.get(marker_id, "") not in terminal
+            )
+            if not live_markers:
+                continue
+            errors.append(
+                f"{row_id}: status is {own_status!r} but the task carries a live "
+                f"[BLOCKED_PENDING_PROPOSAL] marker on {', '.join(live_markers)}. A task "
+                f"waiting on a promoted proposal MUST be 'blocked': the ADR-07 auto-requeue "
+                f"cascade skips non-blocked candidates, so this task would never be requeued "
+                f"when its blocker completes, and 'in-progress' additionally suppresses "
+                f"auto-restart and can be re-claimed by a sweep. Run "
+                f"'uv run devbench sync-blocked' to reconcile status against dependency state."
+            )
 
     def _check_no_orphan_path_tokens(
         self,

@@ -5,6 +5,46 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Wiring a `[BLOCKED_PENDING_PROPOSAL]` marker never wrote the status, so the
+  ADR-07 auto-requeue cascade silently skipped the task forever.**
+  `proposal.promote_proposal` wrote the marker into Comments and the row into
+  the Dependencies table, but nothing in the promote path -- or in the sibling
+  `add-dep` operator path, which writes the byte-identical marker -- set
+  `## Status:` to `blocked`. A task blocked pending a proposal therefore kept
+  whatever status it had. Observed with a work unit left `in-progress` after the
+  manifest-amender failed it mid-execution: the report showed two tasks
+  in-progress when only one was running.
+
+  The mismatch is load-bearing, not cosmetic. Three consumers read marker and
+  status independently: `_auto_requeue_marker_dependents` skips any candidate
+  whose status is not `blocked`, so the task would never be requeued when its
+  promoted dependency completed -- stranding permanently with a *satisfied*
+  dependency, the exact outcome the cascade exists to prevent;
+  `cli._should_auto_restart_after_no_actionable` refuses to restart while any
+  task is `in-progress`, so a target wired mid-execution suppresses auto-restart
+  indefinitely; and `BacklogParser.find_next_actionable` *prioritises*
+  `in-progress` over `in-queue`, so a claim sweep could re-claim the task while
+  its blocker was unresolved and re-run work that was deliberately halted.
+  `classify_blocked_task` keys off marker presence rather than status, so it
+  reported the task as auto-clearing while the status line disagreed -- neither
+  view cross-checked the other, which is why this survived until an operator
+  read both.
+
+  Both writers now set the status through `BacklogManager.force_status` (so the
+  `[STATUS]` audit row and the `BACKLOG.md` index row are written too), ordered
+  marker-then-status: a crash between them leaves a marker with a stale status,
+  which `sync-blocked` reconciles, rather than a `blocked` status with no marker,
+  which `classify_blocked_task` buckets as `OPERATOR_ACTION_REQUIRED` and only a
+  human can clear. New validate-backlog rule 27 makes the invariant
+  unviolatable by any future path: a non-terminal Task carrying a marker whose
+  target is itself non-terminal MUST be `blocked`. Markers whose targets are all
+  terminal are exempt, since the cascade has legitimately requeued the task --
+  demanding `blocked` there would flag correct state.
+
+  Same shape as issue #332 (rollup fired its audit comment but not its status
+  write), one path over: marker-writing and status-writing were separate steps
+  with no invariant tying them together. Rule 27 is that invariant.
+
 - **The Bedrock backend could not run any current-generation model** (issue
   #342). `BEDROCK_AGENT_MODEL_PATTERN` required every id to end in `-v<N>`
   (`^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$`), a convention AWS does not

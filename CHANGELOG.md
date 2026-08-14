@@ -5,6 +5,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Gate tier taxonomy and the `[GATE_PASS]` record module** (spec
+  `integration-reality-gates-hardening.md` section 4.2, 5.3, D-6;
+  AC-E2-F2-S1-T1-1 through -6). `constants.py` gains `GATE_TIER_MACHINE_BLOCKING`,
+  `GATE_TIER_JUDGE_EVIDENCE`, `GATE_TIER_ADVISORY` and `GATE_TIERS: Mapping[str, str]`,
+  declaring the tier of all eight gates (reachability, ancestry,
+  shared_file_impact, fixture_consistency = machine-blocking; write_path_audit,
+  newly_reachable_paths, composition_root, layout_geometry = judge-evidence),
+  built as a dict comprehension over the existing `GATE_NAMES` tuple so the
+  two collections can never drift. New module `gate_records.py` is the sole
+  authority for the `[GATE_PASS <gate>] <iso-utc> <scope-hash>` marker
+  grammar (Section 3.6: executors do not self-certify gate outcomes):
+  `compose_gate_pass_record` builds the one-line marker from an
+  already-resolved scope hash (rejecting undeclared gates, malformed scope
+  hashes and naive timestamps); `parse_gate_pass_record` re-validates a
+  marker on read, never returning a partial record on malformed input;
+  `latest_gate_pass_record` locates the most recent record for a gate within
+  arbitrary content (tolerating the marker being embedded inside a larger
+  audit-comment line, since the grammar is additive to the audit-comment
+  contract); `compute_scope_hash` is the SHA-256-over-sorted-file-list-plus-
+  blob-hashes function backing the stale-record invalidation rule (AC-7),
+  rejecting an empty scope. Mirroring `devbench.tdd_gate`, the module
+  performs no work-unit-file or git I/O of its own -- gate commands persist
+  the composed marker via the existing audit-append machinery, wired by the
+  gate-specific tasks that consume this module (E2-F2-S1-T2 onward).
+
 - **`devbench gates` -- read-only overview of every integration-reality
   gate's status, repo overrides and provenance** (spec
   `integration-reality-gates-hardening.md` G2, section 4.1; AC-4, AC-27).

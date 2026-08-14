@@ -1110,3 +1110,44 @@ class TestGateConstants:
         labels = {GATE_PROVENANCE_BUILTIN, GATE_PROVENANCE_PROJECT, GATE_PROVENANCE_REPO, GATE_PROVENANCE_ENV}
         assert labels == {"builtin", "project", "repo", "env"}
         assert len(labels) == 4
+
+    def test_gate_tier_labels_are_distinct_strings(self) -> None:
+        """spec 4.2, D-6 (AC-E2-F2-S1-T1-4/5): the three tier constants."""
+        from devbench.constants import (
+            GATE_TIER_ADVISORY,
+            GATE_TIER_JUDGE_EVIDENCE,
+            GATE_TIER_MACHINE_BLOCKING,
+        )
+
+        tiers = {GATE_TIER_MACHINE_BLOCKING, GATE_TIER_JUDGE_EVIDENCE, GATE_TIER_ADVISORY}
+        assert tiers == {"machine-blocking", "judge-evidence", "advisory"}
+        assert len(tiers) == 3
+
+    def test_gate_tiers_is_its_own_module_level_name(self) -> None:
+        import devbench.constants as constants_module
+
+        assert "GATE_TIERS" in vars(constants_module)
+
+    def test_gate_tiers_keys_are_keyed_off_gate_names_so_they_cannot_drift(self) -> None:
+        """AC-E2-F2-S1-T1-5: GATE_TIERS is derived from GATE_NAMES, not an
+        independently-maintained literal, so the two collections cannot
+        drift apart."""
+        from devbench.constants import GATE_NAMES, GATE_TIERS
+
+        assert set(GATE_TIERS) == set(GATE_NAMES)
+        assert len(GATE_TIERS) == len(GATE_NAMES)
+
+    def test_gate_tiers_assigns_the_d6_machine_blocking_set(self) -> None:
+        from devbench.constants import GATE_TIER_MACHINE_BLOCKING, GATE_TIERS
+
+        expected = {"reachability", "ancestry", "shared_file_impact", "fixture_consistency"}
+        actual = {gate for gate, tier in GATE_TIERS.items() if tier == GATE_TIER_MACHINE_BLOCKING}
+        assert actual == expected
+
+    def test_gate_tiers_assigns_the_remaining_gates_judge_evidence(self) -> None:
+        from devbench.constants import GATE_NAMES, GATE_TIER_JUDGE_EVIDENCE, GATE_TIERS
+
+        machine_blocking = {"reachability", "ancestry", "shared_file_impact", "fixture_consistency"}
+        expected = set(GATE_NAMES) - machine_blocking
+        actual = {gate for gate, tier in GATE_TIERS.items() if tier == GATE_TIER_JUDGE_EVIDENCE}
+        assert actual == expected

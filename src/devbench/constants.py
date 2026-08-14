@@ -12,6 +12,7 @@ region below and consumed by ``src/devbench/session.py``.
 """
 
 import re
+from collections.abc import Mapping
 
 # ---------------------------------------------------------------------------
 # Markdown section headers
@@ -1176,3 +1177,43 @@ GATE_PROVENANCE_BUILTIN: str = "builtin"
 GATE_PROVENANCE_PROJECT: str = "project"
 GATE_PROVENANCE_REPO: str = "repo"
 GATE_PROVENANCE_ENV: str = "env"
+
+# ---------------------------------------------------------------------------
+# Gate tier taxonomy (spec integration-reality-gates-hardening.md section
+# 4.2, D-6; AC-E2-F2-S1-T1-4, AC-E2-F2-S1-T1-5). Three tiers describe how
+# strongly a gate's outcome is trusted:
+#   - machine-blocking: a passing `[GATE_PASS <gate>]` record
+#     (`devbench.gate_records`) is REQUIRED before `mark_done` proceeds
+#     (E2-F2-S1-T2's `_check_gate_pass_done_invariant`).
+#   - judge-evidence: the gate's findings inform the review judges but do
+#     not themselves block `mark_done`.
+#   - advisory: informational only. No gate carries this tier today -- D-6
+#     assigns only the two tiers above to the eight declared gates -- but
+#     the symbol exists so a future gate can adopt the weakest tier without
+#     inventing a fourth taxonomy value.
+# PM-3: these are named importable symbols, not inline strings, because the
+# `gates` CLI table, each gate command's output line, and the judge/docs
+# vocabulary tests (E2-F2-S2-T1) all cross-reference them.
+# ---------------------------------------------------------------------------
+GATE_TIER_MACHINE_BLOCKING: str = "machine-blocking"
+GATE_TIER_JUDGE_EVIDENCE: str = "judge-evidence"
+GATE_TIER_ADVISORY: str = "advisory"
+
+# D-6's machine-blocking set, declared once as the single input GATE_TIERS
+# below is built from. Keeping this private and gate-name-only (rather than
+# writing GATE_TIERS as an independent literal dict) means GATE_TIERS's keys
+# can never drift from GATE_NAMES: a ninth gate added to GATE_NAMES without a
+# tier decision here automatically lands in the weaker judge-evidence tier
+# instead of being silently absent from GATE_TIERS.
+_GATE_TIER_D6_MACHINE_BLOCKING_NAMES: frozenset[str] = frozenset(
+    {"reachability", "ancestry", "shared_file_impact", "fixture_consistency"}
+)
+
+# Declares the tier of all eight gates (spec 4.2, D-6): reachability,
+# ancestry, shared_file_impact and fixture_consistency are machine-blocking;
+# write_path_audit, newly_reachable_paths, composition_root and
+# layout_geometry are judge-evidence.
+GATE_TIERS: Mapping[str, str] = {
+    gate: (GATE_TIER_MACHINE_BLOCKING if gate in _GATE_TIER_D6_MACHINE_BLOCKING_NAMES else GATE_TIER_JUDGE_EVIDENCE)
+    for gate in GATE_NAMES
+}

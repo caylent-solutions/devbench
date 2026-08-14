@@ -5755,6 +5755,128 @@ class TestIsValidCitation:
         assert BacklogManager.is_valid_citation("  abc1234  ") is True
 
 
+class TestValidateMarkerStatusAgreement:
+    """Check 27: a live ``[BLOCKED_PENDING_PROPOSAL]`` marker requires status ``blocked``.
+
+    Regression: the promote/wire path wrote the marker and the Dependencies row
+    but never the status, so a task blocked pending a proposal kept whatever
+    status it had. Observed with a task left ``in-progress`` after the
+    manifest-amender failed it mid-execution. That mismatch is load-bearing --
+    the ADR-07 cascade skips non-blocked candidates, so the task would never be
+    requeued once its blocker completed.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _append_marker(wu_path: Path, marker_target: str) -> None:
+        content = wu_path.read_text(encoding="utf-8")
+        entry = (
+            f"[2026-01-01 00:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] {marker_target} "
+            f"promoted and wired. [BLOCKED_PENDING_PROPOSAL] {marker_target}\n"
+        )
+        content += ("\n## Comments\n\n" + entry) if "## Comments" not in content else ("\n" + entry)
+        wu_path.write_text(content, encoding="utf-8")
+
+    def _errors_for(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        *,
+        source_status: str,
+        blocker_status: str,
+        source_id: str = "E9-F1-S1-T1",
+        blocker_id: str = "E9-F1-S1-T2",
+    ) -> list[str]:
+        source = self.H.make_task(
+            backlog_dir,
+            source_id,
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            status=source_status,
+        )
+        self._append_marker(source, blocker_id)
+        self.H.make_task(
+            backlog_dir,
+            blocker_id,
+            "ex/foo",
+            "| `src/bar.py` | new |\n| `tests/unit/test_bar.py` | new |\n",
+            status=blocker_status,
+        )
+        idx = self.H.make_index(
+            tmp_path,
+            f"| {source_id} | T | Task | {source_status} | none | ex/foo | `backlog/{source_id}.md` |\n"
+            f"| {blocker_id} | T | Task | {blocker_status} | none | ex/foo | `backlog/{blocker_id}.md` |\n",
+        )
+        return BacklogManager().validate(idx, tmp_path)
+
+    def _violations(self, errors: list[str], row_id: str = "E9-F1-S1-T1") -> list[str]:
+        return [e for e in errors if row_id in e and "BLOCKED_PENDING_PROPOSAL" in e]
+
+    @pytest.mark.parametrize("source_status", ["in-progress", "in-queue", "in-review"])
+    def test_non_blocked_status_with_live_marker_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path, source_status: str
+    ) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, source_status=source_status, blocker_status="in-queue")
+
+        matches = self._violations(errors)
+        assert len(matches) == 1, f"expected exactly one violation, got: {matches}"
+        assert source_status in matches[0]
+        assert "E9-F1-S1-T2" in matches[0], "the error must name the blocking target"
+
+    def test_error_names_the_reconciling_command(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """An operator reading the failure must be told how to clear it."""
+        errors = self._errors_for(tmp_path, backlog_dir, source_status="in-progress", blocker_status="in-queue")
+
+        assert "devbench sync-blocked" in self._violations(errors)[0]
+
+    def test_blocked_status_with_live_marker_is_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The correct state: marker present, status agrees."""
+        errors = self._errors_for(tmp_path, backlog_dir, source_status="blocked", blocker_status="in-queue")
+
+        assert not self._violations(errors)
+
+    @pytest.mark.parametrize("blocker_status", ["done", "declined"])
+    def test_terminal_marker_target_exempts_a_requeued_task(
+        self, tmp_path: Path, backlog_dir: Path, blocker_status: str
+    ) -> None:
+        """A task the cascade legitimately requeued keeps its stale marker.
+
+        Once every marker target is terminal the source is correctly back in
+        ``in-queue``, so demanding ``blocked`` here would flag correct state as a
+        defect -- the inverse failure of the bug this rule closes.
+        """
+        errors = self._errors_for(tmp_path, backlog_dir, source_status="in-queue", blocker_status=blocker_status)
+
+        assert not self._violations(errors)
+
+    @pytest.mark.parametrize("source_status", ["done", "declined"])
+    def test_terminal_source_with_stale_marker_is_exempt(
+        self, tmp_path: Path, backlog_dir: Path, source_status: str
+    ) -> None:
+        """A finished task's marker history is not a live defect."""
+        errors = self._errors_for(tmp_path, backlog_dir, source_status=source_status, blocker_status="in-queue")
+
+        assert not self._violations(errors)
+
+    def test_no_marker_means_no_constraint(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """An ordinary in-progress task with no marker is untouched by this rule."""
+        row_id = "E9-F1-S1-T3"
+        self.H.make_task(
+            backlog_dir,
+            row_id,
+            "ex/foo",
+            "| `src/baz.py` | new |\n| `tests/unit/test_baz.py` | new |\n",
+            status="in-progress",
+        )
+        idx = self.H.make_index(
+            tmp_path,
+            f"| {row_id} | T | Task | in-progress | none | ex/foo | `backlog/{row_id}.md` |\n",
+        )
+
+        assert not self._violations(BacklogManager().validate(idx, tmp_path), row_id)
+
+
 class TestValidateAlreadySatisfiedDeclineCitation:
     """Check 22: an already-satisfied decline must cite a commit or task id (FR-4.5).
 

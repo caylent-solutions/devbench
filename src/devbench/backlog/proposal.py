@@ -45,6 +45,7 @@ from devbench.constants import (
     COMMENTS_SECTION_HEADER,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     DEPENDENCY_NONE_VALUES,
+    STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
     STATUS_DRAFT,
@@ -1925,10 +1926,66 @@ def promote_proposal(
             if dep_on_source or target_id != proposal.source_task_id:
                 _append_dependency_to_source(backlog_root, backlog_index, target_id, task_id)
                 _append_promote_comment(source_file, target_id, task_id, audit_suffix=audit_suffix)
+                _block_wired_target(backlog_index, source_file, target_id, task_id)
                 wired_targets.append(target_id)
                 logger.info("promote-proposal: wired marker + dep on %s", target_id)
 
     return PromoteResult(draft_path=draft, wired_targets=wired_targets)
+
+
+def _block_wired_target(
+    backlog_index: Path,
+    source_file: Path,
+    target_id: str,
+    promoted_task_id: str,
+) -> None:
+    """Set a freshly-wired target to ``blocked`` so its marker and status agree.
+
+    Writing the ``[BLOCKED_PENDING_PROPOSAL]`` marker without also writing the
+    status left the two disagreeing, and three independent consumers read them
+    separately:
+
+    - :meth:`~devbench.backlog.manager.BacklogManager._auto_requeue_marker_dependents`
+      (the ADR-07 cascade) skips any candidate whose status is not ``blocked``,
+      so a marked-but-not-blocked task is never auto-requeued when its promoted
+      dependency completes -- it strands permanently with a satisfied
+      dependency, which is the exact outcome the cascade exists to prevent.
+    - ``cli._should_auto_restart_after_no_actionable`` refuses to restart while
+      any task is ``in-progress``, so a target wired mid-execution suppresses
+      auto-restart indefinitely.
+    - ``BacklogParser.find_next_actionable`` PRIORITISES ``in-progress`` over
+      ``in-queue``, so a claim sweep could re-claim the target while its blocker
+      is still unresolved and re-run work that was deliberately halted.
+
+    ``classify_blocked_task`` keys off marker presence rather than status, so it
+    reported such a task as auto-clearing while the status line still read
+    ``in-progress``: the two views disagreed and neither cross-checked the
+    other, which is why this went unnoticed until an operator read both.
+
+    Ordering is deliberate. The caller writes the dependency row and the marker
+    FIRST, then this status write. A crash between them leaves a marker with a
+    stale status, which ``devbench sync-blocked`` reconciles and
+    ``validate-backlog``'s marker/status rule reports. The reverse order would
+    leave a ``blocked`` status with no marker, which
+    :func:`classify_blocked_task` buckets as ``OPERATOR_ACTION_REQUIRED`` --
+    a state only a human can clear.
+
+    Idempotent: ``force_status`` writes the same value on a re-promote, and a
+    target already ``blocked`` is unchanged.
+
+    Args:
+        backlog_index: Path to ``BACKLOG.md``, updated alongside the unit file.
+        source_file: Path to the target's work-unit ``.md`` file.
+        target_id: The work unit being blocked on *promoted_task_id*.
+        promoted_task_id: The promoted draft, named in the log line only.
+    """
+    BacklogManager().force_status(source_file, backlog_index, target_id, STATUS_BLOCKED)
+    logger.info(
+        "promote-proposal: set %s to '%s' pending %s",
+        target_id,
+        STATUS_BLOCKED,
+        promoted_task_id,
+    )
 
 
 def delete_proposal_if_consumed(workspace_root: Path, backlog_root: Path, proposal: Proposal | None) -> None:
@@ -2133,6 +2190,17 @@ def add_dep(
     if not _comments_have_marker(blocked_file, blocker_task_id):
         _append_manual_dep_comment(blocked_file, blocked_task_id, blocker_task_id, reason)
         wrote_marker = True
+
+    # Same marker, so the same status invariant applies: this operator path
+    # writes the byte-identical [BLOCKED_PENDING_PROPOSAL] marker the promote
+    # path writes, and the ADR-07 cascade skips any candidate whose status is
+    # not `blocked`. Wiring a dep without the status write would strand the task
+    # exactly as the promote path did. Runs whenever the marker is present --
+    # including a re-run that wrote nothing new -- so a target left with a stale
+    # status by an earlier partial write is reconciled rather than needing
+    # `sync-blocked`. See :func:`_block_wired_target` for the full rationale.
+    if _comments_have_marker(blocked_file, blocker_task_id):
+        _block_wired_target(backlog_index, blocked_file, blocked_task_id, blocker_task_id)
 
     return wrote_row or wrote_marker
 

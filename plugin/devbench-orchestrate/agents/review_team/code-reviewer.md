@@ -152,7 +152,9 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback code_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`, `NEWLY_REACHABLE_PATH_UNVERIFIED`, `UNREACHABLE_ARTIFACT`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. <!-- generated:vocabulary -->
+Every `code` MUST come from the controlled vocabulary for `code_review`: `AGENT_LOG_CONTRADICTS_DIFF`, `HARDCODED_URL`, `MAKE_VALIDATE_FAILURE`, `MANIFEST_TODO_UNFILLED`, `MISSING_AC_EVIDENCE`, `NEWLY_REACHABLE_PATH_UNVERIFIED`, `SCOPE_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SOLID_VIOLATION`, `UNREACHABLE_ARTIFACT`.
+<!-- /generated:vocabulary --> The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

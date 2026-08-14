@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage generate-vocabulary validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -93,6 +93,12 @@ test-coverage:
 
 ## test: Run all tests
 test: test-unit
+
+## generate-vocabulary: Render docs/review-feedback-vocabulary.md tables and judge-prompt
+## sentences from JUDGE_CATEGORIES between <!-- generated:vocabulary --> guard markers
+## (idempotent -- re-run after adding/renaming a review-judge rejection-feedback code)
+generate-vocabulary:
+	uv run python -m devbench.vocabulary_generation
 
 ## validate: Full validation (all checks -- identical to CI and pre-push)
 validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage

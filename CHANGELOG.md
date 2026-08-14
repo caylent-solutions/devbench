@@ -188,6 +188,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   syncing that doc to the shipped verb is deferred to the named successor
   task E2-F4-S1-T4.
 
+- **`make generate-vocabulary` -- generated vocabulary docs table and judge
+  prompt sentences replace three hand-maintained copies with one** (spec
+  `integration-reality-gates-hardening.md` section 4.10, 5.7, G5, D-4,
+  Section 0.4; AC-E2-F5-S1-T1-1 through -6, AC-11 idempotence half). New
+  module `devbench.vocabulary_generation` (run via `make generate-vocabulary`
+  / `python -m devbench.vocabulary_generation`) renders the per-judge tables
+  in `docs/review-feedback-vocabulary.md` and the per-judge vocabulary
+  sentence in the five judge prompts (`review_team/code-reviewer.md`,
+  `review_team/test-reviewer.md`, `review_team/doc-reviewer.md`,
+  `review_team/changes-manifest.md`, `security-reviewer.md`) from
+  `JUDGE_CATEGORIES` (`devbench.backlog.review_feedback_vocabulary`),
+  writing only between `<!-- generated:vocabulary -->` /
+  `<!-- /generated:vocabulary -->` guard markers so hand-written prose
+  outside them is preserved byte for byte. Generation is idempotent (a
+  second consecutive run produces zero diff); a target surface missing its
+  guard markers, or carrying an unterminated pair, raises loudly naming the
+  file (and, for an unterminated pair, the opening marker's line number)
+  rather than being silently skipped. Behaviour change for operators:
+  hand-edits inside a generated block are now overwritten by the next
+  `make generate-vocabulary` run (Section 0.4); the `manifest_amender` table
+  remains hand-maintained (different source of truth,
+  `AMENDER_REJECTION_CATEGORIES`). The drift check that fails
+  `make validate` on an un-regenerated surface lands in the named successor
+  task E2-F5-S1-T2.
+
 - **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
   helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,
   AC-9; AC-E2-F3-S1-T1-1 through -6). New `resolve_changed_files(unit_id,

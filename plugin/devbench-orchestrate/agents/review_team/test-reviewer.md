@@ -161,7 +161,9 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback test_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`, `FIXTURE_CATALOG_MISMATCH`, `COMPOSITION_ROOT_MISSING`, `LAYOUT_STUB_WITHOUT_LIVE_TEST`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. <!-- generated:vocabulary -->
+Every `code` MUST come from the controlled vocabulary for `test_review`: `COMPOSITION_ROOT_MISSING`, `COVERAGE_REGRESSION`, `DRY_VIOLATION`, `FIXTURE_CATALOG_MISMATCH`, `GIT_COMPLETENESS`, `LAYOUT_STUB_WITHOUT_LIVE_TEST`, `STUB_TEST`, `TDD_CYCLE_MISSING`.
+<!-- /generated:vocabulary --> See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

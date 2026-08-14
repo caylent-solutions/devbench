@@ -98,7 +98,9 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback doc_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `doc_review`: `README_SYNC`, `CHANGELOG_SYNC`, `API_DOCS_STALE`, `EVIDENCE_BASED_CLAIM`, `CONFIG_DOCS`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. <!-- generated:vocabulary -->
+Every `code` MUST come from the controlled vocabulary for `doc_review`: `API_DOCS_STALE`, `CHANGELOG_SYNC`, `CONFIG_DOCS`, `EVIDENCE_BASED_CLAIM`, `README_SYNC`.
+<!-- /generated:vocabulary --> See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

@@ -312,6 +312,7 @@ from devbench.scope import (
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
+from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeResult, resolve_changed_files
 
 if TYPE_CHECKING:
     from devbench.config_loader import ResolvedGateConfig, RuntimeConfig
@@ -4167,77 +4168,89 @@ def _render_untracked_hunks(repo_path: Path, allowed: set[str]) -> list[str]:
     return hunks
 
 
-def _load_manifest_paths_or_report(unit_id: str, wu_file: Path | None) -> list[str] | None:
-    """Return the unit's real Changes Manifest file paths, or ``None`` on failure.
+def _no_task_commit_found_message(unit_id: str, repo_path: Path) -> str:
+    """Build the fail-fast diagnostic for defer_pr post-commit with zero matching commits.
 
-    Shared by :func:`cmd_get_diff` (FR-12) and :func:`cmd_check_manifest_scope`
-    (spec 4.C) so a missing work-unit file or a malformed ``## Changes Manifest``
-    table is reported identically from either verb. ``_is_real_manifest_path``
-    filters sentinel/placeholder cells (``(none)``, ``<verification-only>``, ...)
-    so callers never see a non-file token as a pathspec entry or a Manifest match
-    target. On failure, the verbatim ERROR is already printed to stderr; the
-    caller must return 1 without printing anything further.
+    Shared by :func:`cmd_get_diff`'s defer_pr branch: the working tree is
+    clean but :func:`devbench.work_unit_scope.resolve_changed_files` found no
+    commit whose subject matches ``^<unit_id>:`` -- there is no HEAD
+    fallback (db-247).
     """
-    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+    _, branch_out, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+    branch = branch_out.strip()
+    return "\n".join(
+        [
+            f"ERROR: get-diff (defer_pr, post-commit): no commit found for work unit '{unit_id}' on branch '{branch}'.",
+            f"The working tree is clean but no commit subject matches '^{unit_id}:'. This task's changes were not",
+            "committed under its own name (possibly bundled into a sibling's commit, or the commit is missing).",
+            f"Inspect with: git log --grep '^{unit_id}:' --format='%H %s' in {repo_path}.",
+        ]
+    )
 
-    if wu_file is None:
-        print(f"ERROR: Cannot scope diff for '{unit_id}': work-unit file not found", file=sys.stderr)
-        return None
+
+def _append_defer_pr_task_commit_hunks(
+    unit_id: str, repo_path: Path, scope: ScopeResult, pathspec: list[str], parts: list[str]
+) -> int | None:
+    """Append this unit's own commit-sha hunk(s) to ``parts`` in defer_pr mode.
+
+    Only called by :func:`cmd_get_diff` when ``parts`` (staged + unstaged)
+    is already empty. Returns ``None`` on success (``parts`` mutated in
+    place); returns ``1`` (having already printed the fail-fast diagnostic)
+    when ``scope`` carries no commit sha to substitute -- there is no HEAD
+    fallback (db-247).
+    """
+    if not scope.commit_shas:
+        print(_no_task_commit_found_message(unit_id, repo_path), file=sys.stderr)
+        return 1
+    for sha in scope.commit_shas:
+        rc, stdout, _ = run_command(["git", "show", "--format=", sha, *pathspec], cwd=repo_path)
+        if rc == 0 and stdout.strip():
+            parts.append(stdout)
+    return None
+
+
+def _append_branch_vs_default_hunk(
+    canonical_repo: str, repo_path: Path, pathspec: list[str], parts: list[str]
+) -> int | None:
+    """Append the branch-vs-default hunk to ``parts`` in per_task_branch mode.
+
+    Returns ``None`` on success (``parts`` mutated in place); returns ``1``
+    (having already printed the fail-fast diagnostic) when the default
+    branch cannot be resolved.
+    """
+    default_branch = _resolve_default_branch(canonical_repo, repo_path)
+    if default_branch is None:
+        print(
+            f"ERROR: Cannot determine default branch for '{canonical_repo}'. "
+            "Run 'git remote set-head origin --auto' to configure it.",
+            file=sys.stderr,
+        )
+        return 1
+    rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}", *pathspec], cwd=repo_path)
+    if rc == 0 and stdout.strip():
+        parts.append(stdout)
+    return None
+
+
+def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str) -> ScopeResult | None:
+    """Resolve ``unit_id``'s scope via :func:`resolve_changed_files`, or ``None`` on failure.
+
+    Shared by :func:`cmd_get_diff` and :func:`cmd_check_manifest_scope` (spec
+    4.3, AC-9) so both verbs resolve scope through the single ADR-12
+    mode-aware implementation and report a resolution failure identically.
+    On failure, the verbatim ERROR is already printed to stderr; the caller
+    must return 1 without printing anything further.
+    """
+    from devbench.backlog.manifest import ManifestParseError
+
     try:
-        rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+        return resolve_changed_files(unit_id, repo_path, mode)
     except ManifestParseError as exc:
         print(f"ERROR: Cannot scope diff for '{unit_id}': Changes Manifest is malformed: {exc}", file=sys.stderr)
         return None
-    return sorted({row.file for row in rows if BacklogManager._is_real_manifest_path(row.file)})
-
-
-def _render_task_commit_hunks(unit_id: str, repo_path: Path, pathspec: list[str]) -> list[str] | None:
-    """Return Manifest-scoped ``git show`` hunks for this unit's own commit(s).
-
-    Replaces the unconditional ``git show HEAD`` substitution ADR-12 originally
-    specified (superseded in place, db-247/FR-13): in single-branch + defer_pr
-    mode, HEAD may belong to a sibling task that committed after this unit's own
-    commit landed, so post-commit attribution MUST resolve this unit's own
-    commit(s) by subject (``^<unit_id>:``, the exact prefix ``cmd_git_ops`` writes
-    every commit message with) instead of trusting HEAD. A task may carry more
-    than one commit of its own (an initial commit plus a later
-    ``pr_review_resolution`` fix commit); every matching commit is emitted, each
-    scoped to the Manifest pathspec so the combined query is
-    ``git show --format= <sha> -- <manifest_paths>``.
-
-    Returns ``None`` (having already printed the fail-fast diagnostic to stderr)
-    when no commit subject matches -- there is no HEAD fallback.
-    """
-    rc, stdout, _ = run_command(
-        ["git", "log", "--grep", f"^{unit_id}:", "--format=%H"],
-        cwd=repo_path,
-    )
-    shas = [line.strip() for line in stdout.splitlines() if line.strip()] if rc == 0 else []
-    if not shas:
-        _, branch_out, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
-        branch = branch_out.strip()
-        print(
-            "\n".join(
-                [
-                    f"ERROR: get-diff (defer_pr, post-commit): no commit found for work unit "
-                    f"'{unit_id}' on branch '{branch}'.",
-                    "The working tree is clean but no commit subject matches "
-                    f"'^{unit_id}:'. This task's changes were not",
-                    "committed under its own name (possibly bundled into a sibling's "
-                    "commit, or the commit is missing).",
-                    f"Inspect with: git log --grep '^{unit_id}:' --format='%H %s' in {repo_path}.",
-                ]
-            ),
-            file=sys.stderr,
-        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"ERROR: Cannot scope diff for '{unit_id}': {exc}", file=sys.stderr)
         return None
-
-    hunks: list[str] = []
-    for sha in shas:
-        rc, stdout, _ = run_command(["git", "show", "--format=", sha, *pathspec], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            hunks.append(stdout)
-    return hunks
 
 
 def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | None:
@@ -4268,19 +4281,21 @@ def cmd_get_diff(unit_id: str) -> int:
     """Return the combined git diff for the work unit's target repo.
 
     Mode-aware per ADR-12, and Manifest-scoped per db-296/db-247 (spec FR-12,
-    FR-13). Every git query below is restricted to the unit's real Changes
-    Manifest paths (:func:`_load_manifest_paths_or_report`) so a sibling task's
-    dirty residue in the shared checkout can never leak into this unit's diff.
+    FR-13, 4.3). Scope (which files, which ADR-12 mode, and -- in defer_pr
+    mode -- this unit's own commit sha(s)) is resolved through the single
+    shared implementation, :func:`devbench.work_unit_scope.resolve_changed_files`
+    (spec 4.3, AC-9), so a sibling task's dirty residue in the shared
+    checkout can never leak into this unit's diff and every scope consumer
+    agrees on the same answer.
 
     In the default per-task-branch mode, emits staged + unstaged +
     branch-vs-default + untracked hunks, all pathspec-scoped. In defer_pr mode
     (single_branch + defer_pr: true), the branch-vs-default hunk is omitted
     because it accumulates every prior task's commits on the shared branch;
     instead the function emits staged + unstaged + untracked, and when both
-    staged and unstaged are empty (a post-commit judge invocation) resolves
-    and emits this unit's own commit(s) via
-    :func:`_render_task_commit_hunks` instead of the old unconditional
-    ``git show HEAD``.
+    staged and unstaged are empty (a post-commit judge invocation) emits
+    ``git show`` hunks for the scope's resolved commit sha(s) instead of the
+    old unconditional ``git show HEAD``.
 
     A missing work-unit file or a malformed Changes Manifest fails fast. An
     empty (verification-only) Manifest returns ``(no changes)`` -- never an
@@ -4296,13 +4311,14 @@ def cmd_get_diff(unit_id: str) -> int:
         return 1
     unit, canonical_repo, repo_path = resolved
 
-    manifest_paths = _load_manifest_paths_or_report(unit_id, _resolve_unit_file(unit))
-    if manifest_paths is None:
+    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
+    if scope is None:
         return 1
-    if not manifest_paths:
+    if not scope.files:
         print("(no changes)")
         return 0
-    pathspec = ["--", *manifest_paths]
+    pathspec = ["--", *scope.files]
 
     parts: list[str] = []
 
@@ -4314,26 +4330,17 @@ def cmd_get_diff(unit_id: str) -> int:
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 
-    if DEFER_PR:
+    if scope.mode == MODE_DEFER_PR:
         if not parts:
-            task_commit_hunks = _render_task_commit_hunks(unit_id, repo_path, pathspec)
-            if task_commit_hunks is None:
-                return 1
-            parts.extend(task_commit_hunks)
+            error = _append_defer_pr_task_commit_hunks(unit_id, repo_path, scope, pathspec, parts)
+            if error is not None:
+                return error
     else:
-        default_branch = _resolve_default_branch(canonical_repo, repo_path)
-        if default_branch is None:
-            print(
-                f"ERROR: Cannot determine default branch for '{canonical_repo}'. "
-                "Run 'git remote set-head origin --auto' to configure it.",
-                file=sys.stderr,
-            )
-            return 1
-        rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}", *pathspec], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
+        error = _append_branch_vs_default_hunk(canonical_repo, repo_path, pathspec, parts)
+        if error is not None:
+            return error
 
-    parts.extend(_render_untracked_hunks(repo_path, allowed=set(manifest_paths)))
+    parts.extend(_render_untracked_hunks(repo_path, allowed=set(scope.files)))
 
     print("\n".join(parts) if parts else "(no changes)")
     return 0
@@ -4347,7 +4354,8 @@ def cmd_check_manifest_scope(unit_id: str) -> int:
     changes-manifest judge shells out to this verb to get a deterministic
     staged-vs-Manifest signal that a judged read of the diff cannot drift from,
     now that ``get-diff`` is Manifest-scoped and a staged-but-unmanifested file
-    no longer appears in the diff it reads (FR-11-A2).
+    no longer appears in the diff it reads (FR-11-A2). Scope is resolved
+    through the same shared implementation ``get-diff`` uses (spec 4.3, AC-9).
 
     Prints the out-of-Manifest staged paths (embedded in the underlying
     ``RuntimeError``) and exits non-zero when the staged set is not within the
@@ -4355,18 +4363,20 @@ def cmd_check_manifest_scope(unit_id: str) -> int:
     Manifest fails fast with the same verbatim ERROR as ``get-diff``.
     """
     from devbench.backlog.manifest import assert_staged_matches_manifest
+    from devbench.config import DEFER_PR
 
     resolved = _resolve_unit_repo_and_path(unit_id)
     if resolved is None:
         return 1
     unit, _canonical_repo, repo_path = resolved
 
-    manifest_paths = _load_manifest_paths_or_report(unit_id, _resolve_unit_file(unit))
-    if manifest_paths is None:
+    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
+    if scope is None:
         return 1
 
     try:
-        assert_staged_matches_manifest(repo_path, manifest_paths)
+        assert_staged_matches_manifest(repo_path, scope.files)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1

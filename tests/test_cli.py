@@ -3887,6 +3887,51 @@ class TestPreParseConfig:
         assert argv == original
 
 
+def _seed_scope_backlog(
+    tmp_path: Path,
+    unit_id: str = "E0-F1-S1-T1",
+    files: tuple[str, ...] = ("src/foo.py",),
+    *,
+    manifest_body: str | None = None,
+) -> tuple[Path, Path]:
+    """Write a scratch ``BACKLOG.md`` + one work-unit ``.md`` file under ``tmp_path``.
+
+    ``get-diff`` and ``check-manifest-scope`` resolve scope through
+    ``devbench.work_unit_scope.resolve_changed_files``, which does its own
+    ``BacklogParser`` lookup against ``devbench.work_unit_scope.BACKLOG_ROOT``
+    / ``BACKLOG_INDEX`` -- independent of, and not satisfied by, a mocked
+    ``devbench.cli.BacklogParser`` (which only serves ``cli.py``'s own,
+    earlier unit/repo lookup in ``_resolve_unit_repo_and_path``). Returns
+    ``(backlog_root, backlog_index)`` for patching those two module-level
+    constants so ``resolve_changed_files`` resolves ``unit_id`` against real
+    fixture data.
+
+    ``manifest_body`` overrides the auto-generated ``## Changes Manifest``
+    table body entirely (including header/separator rows), for tests that
+    need a deliberately malformed table; ``files`` is ignored when supplied.
+    """
+    backlog_root = tmp_path / "backlog"
+    backlog_root.mkdir(exist_ok=True)
+    wu_file = backlog_root / f"{unit_id}.md"
+    if manifest_body is None:
+        rows = "".join(f"| `{f}` | modify |\n" for f in files)
+        manifest_body = f"| File | Change |\n|------|--------|\n{rows}"
+    wu_file.write_text(
+        f"# {unit_id}: Scope test task\n\n## Status: in-progress\n\n"
+        f"## Changes Manifest\n\n{manifest_body}\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    backlog_index = tmp_path / "BACKLOG.md"
+    backlog_index.write_text(
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|----------|\n"
+        f"| {unit_id} | Scope test task | Task | in-progress | None | git-repo | `backlog/{unit_id}.md` |\n",
+        encoding="utf-8",
+    )
+    return backlog_root, backlog_index
+
+
 def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
     """Write a minimal work-unit file carrying a real Changes Manifest.
 
@@ -4365,7 +4410,9 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
-        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
 
         diff_calls: list[list[str]] = []
 
@@ -4376,10 +4423,11 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             cli.cmd_get_diff("E225-F1-S1-T1")
 
@@ -4401,7 +4449,9 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
-        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
         expected_diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -4411,10 +4461,11 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E225-F1-S1-T1")
 
@@ -4434,7 +4485,9 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
-        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("new_feature.py",))
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id="E225-F1-S1-T1", files=("new_feature.py",))
 
         # Simulate: bare main3 would include upstream-merged file, origin/main3 would not
         branch_only_diff = (
@@ -4451,10 +4504,11 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E225-F1-S1-T1")
 
@@ -6277,7 +6331,8 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("some/file.py",))
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("some/file.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
@@ -6286,10 +6341,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value=None),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6302,7 +6358,8 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("some/file.py",))
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("some/file.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
@@ -6311,10 +6368,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value=None),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6328,7 +6386,8 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("new_file.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("new_file.py",))
         # Create an untracked file for the synthetic diff
         untracked_file = repo_path / "new_file.py"
         untracked_file.write_text("print('hello')\n", encoding="utf-8")
@@ -6340,10 +6399,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6359,7 +6419,8 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("foo.py",))
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("foo.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "diff", "--cached", "--", "foo.py"]:
@@ -6370,10 +6431,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6391,7 +6453,8 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("nonexistent_file.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("nonexistent_file.py",))
         # Do NOT create the file so reading it raises OSError
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6401,10 +6464,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6417,7 +6481,8 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("valid.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("valid.py",))
         # Create a valid file so one line succeeds, and one blank line gets skipped
         valid_file = repo_path / "valid.py"
         valid_file.write_text("x = 1\n", encoding="utf-8")
@@ -6430,10 +6495,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6466,16 +6532,17 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("A.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("A.py",))
 
         (tmp_repo_dir / "A.py").write_text("print('mine')\n", encoding="utf-8")
         (tmp_repo_dir / "sibling.py").write_text("print('not mine')\n", encoding="utf-8")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6494,7 +6561,7 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("A.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("A.py",))
 
         # Both files are committed first so a later edit is "unstaged", not
         # "untracked" -- this test targets the `git diff` pathspec, not
@@ -6510,9 +6577,10 @@ class TestCmdGetDiffManifestScoping:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6531,7 +6599,7 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=())
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=())
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
@@ -6540,9 +6608,11 @@ class TestCmdGetDiffManifestScoping:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6554,19 +6624,18 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = tmp_path / "E0-F1-S1-T1.md"
-        wu_file.write_text(
-            "# E0-F1-S1-T1: Test Task\n\n## Status: in-progress\n\n"
-            "## Changes Manifest\n\n| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |\n",
-            encoding="utf-8",
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path,
+            manifest_body="| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |",
         )
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6604,7 +6673,8 @@ class TestCmdGetDiffTaskCommitAttribution:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6619,10 +6689,12 @@ class TestCmdGetDiffTaskCommitAttribution:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6644,7 +6716,8 @@ class TestCmdGetDiffTaskCommitAttribution:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6659,10 +6732,12 @@ class TestCmdGetDiffTaskCommitAttribution:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6687,7 +6762,8 @@ class TestCmdGetDiffTaskCommitAttribution:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
@@ -6700,10 +6776,12 @@ class TestCmdGetDiffTaskCommitAttribution:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6738,7 +6816,7 @@ class TestCmdCheckManifestScope:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
         (tmp_repo_dir / "unowned.py").write_text("not mine\n", encoding="utf-8")
@@ -6746,8 +6824,9 @@ class TestCmdCheckManifestScope:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
 
@@ -6762,15 +6841,16 @@ class TestCmdCheckManifestScope:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
         subprocess.run(["git", "add", "owned.py"], cwd=tmp_repo_dir, check=True, capture_output=True)
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
 
@@ -6784,19 +6864,18 @@ class TestCmdCheckManifestScope:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = tmp_path / "E0-F1-S1-T1.md"
-        wu_file.write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: in-progress\n\n"
-            "## Changes Manifest\n\n| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |\n",
-            encoding="utf-8",
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path,
+            manifest_body="| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |",
         )
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
 
@@ -6862,7 +6941,7 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
         )
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         # Sibling residue: untracked, never staged by this unit.
         (tmp_repo_dir / "sibling.py").write_text("not mine\n", encoding="utf-8")
@@ -6873,9 +6952,10 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             diff_rc = cli.cmd_get_diff("E0-F1-S1-T1")
             diff_output = capsys.readouterr().out
@@ -6889,6 +6969,64 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
         )
         assert scope_rc == 1, "check-manifest-scope must trip on the unmanifested staged file"
         assert "unmanifested.py" in scope_err
+
+
+@pytest.mark.unit
+class TestScopeSingleImplementationPin:
+    """AC-E2-F3-S1-T1-5 (spec 4.3, AC-9): no module other than
+    ``devbench.work_unit_scope`` may resolve a work unit's own commit(s) by
+    commit-message subject via raw git plumbing -- that is the ADR-12
+    attribution logic ``get-diff`` and ``check-manifest-scope`` were
+    migrated to consume from the single shared implementation (db-247), and
+    the near-copy this task's Approach names (the reachability evidence
+    command, the shared-file and fixture working-tree scans) must never
+    reintroduce it independently.
+
+    ``--format=%H`` is the exact, narrow fingerprint of that resolution --
+    ``git log --grep '^<unit_id>:' --format=%H`` -- chosen because it is
+    unlikely to collide with any other legitimate git invocation, unlike a
+    broader pattern (e.g. ``git diff``) that ``cli.py`` still legitimately
+    issues directly for hunk *rendering* once scope is already resolved.
+    """
+
+    _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "devbench"
+    _SCOPE_HELPER = _SRC_ROOT / "work_unit_scope.py"
+    _COMMIT_SHA_RESOLUTION_MARKER = "--format=%H"
+
+    def _other_python_files(self) -> list[Path]:
+        return [
+            path
+            for path in self._SRC_ROOT.rglob("*.py")
+            if path.resolve() != self._SCOPE_HELPER.resolve() and "__pycache__" not in path.parts
+        ]
+
+    def test_scope_helper_itself_carries_the_marker(self) -> None:
+        """Sanity check: the marker exists exactly where it is supposed to."""
+        assert self._SCOPE_HELPER.is_file()
+        content = self._SCOPE_HELPER.read_text(encoding="utf-8")
+        assert self._COMMIT_SHA_RESOLUTION_MARKER in content
+
+    def test_no_other_module_resolves_commit_sha_scope_via_raw_git_plumbing(self) -> None:
+        offenders = sorted(
+            str(path.relative_to(self._SRC_ROOT))
+            for path in self._other_python_files()
+            if self._COMMIT_SHA_RESOLUTION_MARKER in path.read_text(encoding="utf-8")
+        )
+        assert offenders == [], (
+            "AC-9: only devbench.work_unit_scope may resolve a work unit's own commit(s) via raw "
+            f"git plumbing; found a second implementation in: {offenders}"
+        )
+
+    def test_pin_detector_flags_a_synthetic_second_implementation(self, tmp_path: Path) -> None:
+        """Proves the detector logic above is load-bearing (fails when a
+        second path is introduced), without actually reintroducing the
+        regression into the real codebase."""
+        decoy = tmp_path / "decoy_scope_module.py"
+        decoy.write_text('run_command(["git", "log", "--grep", f"^{unit_id}:", "--format=%H"])\n', encoding="utf-8")
+
+        offenders = [decoy] if self._COMMIT_SHA_RESOLUTION_MARKER in decoy.read_text(encoding="utf-8") else []
+
+        assert offenders == [decoy], "the detector must flag a module that reintroduces the marker"
 
 
 class TestReachabilityHelperFunctions:
@@ -7440,7 +7578,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py", "untracked.py"))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py", "untracked.py"))
         (repo_path / "untracked.py").write_text("x = 1\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -7456,11 +7595,12 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", False),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -7481,7 +7621,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "diff", "--cached", "--", "owned.py"]:
@@ -7492,11 +7633,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -7508,15 +7651,19 @@ class TestCmdGetDiffModeAware:
     def test_defer_pr_mode_pre_commit_returns_staged_and_unstaged(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Pre-commit: staged and unstaged are both present; both appear;
-        the post-commit task-commit resolution never runs because parts is
-        already non-empty."""
+        """Pre-commit: staged and unstaged are both present; both appear.
+        Scope resolution may resolve this unit's commit sha(s) as ordinary
+        attribution metadata regardless of staged/unstaged state (spec 4.3),
+        but ``cmd_get_diff`` never substitutes commit-sha hunks while its own
+        staged/unstaged parts are non-empty, and there is never a HEAD
+        fallback."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -7529,11 +7676,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -7541,9 +7690,6 @@ class TestCmdGetDiffModeAware:
         output = capsys.readouterr().out
         assert "STAGED-HUNK" in output
         assert "UNSTAGED-HUNK" in output
-        assert not any(c[:2] == ["git", "log"] for c in calls), (
-            "task-commit resolution should only run when staged/unstaged are empty"
-        )
         assert ["git", "show", "--format=", "HEAD"] not in calls, (
             "the superseded unconditional git show HEAD substitution must never run"
         )
@@ -7560,9 +7706,10 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        (repo_path / ".git").mkdir()
         # Regression fixture update (db-247): the file(s) `git show` would
         # emit now MUST be in the Manifest, since the show is pathspec-scoped.
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -7577,11 +7724,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -7604,7 +7753,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("current.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("current.py",))
         current_staged = "diff --git a/current.py b/current.py\n+new line\n"
         accumulated_branch = "".join(f"diff --git a/prior-{i}.py b/prior-{i}.py\n+prior line {i}\n" for i in range(10))
 
@@ -7617,11 +7767,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -7642,7 +7794,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("brand_new.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("brand_new.py",))
         (repo_path / "brand_new.py").write_text("print('hi')\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -7654,15 +7807,22 @@ class TestCmdGetDiffModeAware:
             # fail-fast diagnostic.
             if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
                 return (0, "task-sha\n", "")
+            if cmd[:2] == ["git", "hash-object"]:
+                # brand_new.py exists on disk; resolve_changed_files hashes it
+                # for the scope hash (spec 4.2) -- irrelevant to this test's
+                # own assertions, so any well-formed hash satisfies it.
+                return (0, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -7681,7 +7841,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             # This unit's own commit exists (so the fail-fast no-commit
@@ -7693,11 +7854,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 

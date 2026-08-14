@@ -5,6 +5,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
+  helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,
+  AC-9; AC-E2-F3-S1-T1-1 through -6). New `resolve_changed_files(unit_id,
+  repo_path, mode) -> ScopeResult` extracts the mode-aware scope-resolution
+  logic that used to live inline in `cmd_get_diff` -- which files are in
+  scope (the unit's real Changes Manifest paths), which ADR-12 mode applies,
+  this unit's own commit sha(s) in `defer_pr` mode (resolved by
+  commit-message subject, never `HEAD`), and the spec-4.2 `[GATE_PASS]` scope
+  hash (`devbench.gate_records.compute_scope_hash`, so the value later
+  gate-record freshness checks recompute can never drift from a second hash
+  definition). `devbench get-diff` and `devbench check-manifest-scope` are
+  migrated to call it in this same change, with their prior inline scope
+  code (`_load_manifest_paths_or_report`, `_render_task_commit_hunks`)
+  deleted, not left dormant. Error semantics: an unknown unit id or an
+  invalid/non-work-tree repo path raise `ValueError` naming the offending
+  value and (for the repo path) the config key to fix; git plumbing exiting
+  >= 2 raises `RuntimeError` with stderr attached; the function never
+  returns a partial `ScopeResult`. A grep-shaped pin
+  (`TestScopeSingleImplementationPin` in `tests/test_cli.py`) asserts no
+  other module reintroduces the commit-sha-by-subject resolution
+  independently.
+
 - **`tests/test_docs/test_gate_tier_vocabulary.py` -- the G3 blocking-vocabulary
   truthfulness pin, plus the disabled-status-line prose sweep** (spec
   `integration-reality-gates-hardening.md` section 4.2, G3, Section 0.2;

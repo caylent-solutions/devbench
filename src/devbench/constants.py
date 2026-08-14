@@ -967,9 +967,33 @@ ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet", "
 # id added by issue #233 with zero pattern changes.
 ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(-[a-z0-9]+)+$")
 
-# AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted
-# only when ``use_bedrock: true``; rejected otherwise.
-BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$")
+# AWS Bedrock cross-region inference-profile id pattern
+# (``us.anthropic.claude-opus-5``, ``us.anthropic.claude-sonnet-4-5-20250929-v1:0``).
+# Accepted only when ``use_bedrock: true``; rejected otherwise.
+#
+# Deliberately does NOT require a version suffix (issue #342). The previous
+# pattern was ``^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$``, which demanded a
+# trailing ``-v<N>``; AWS does not name profiles uniformly, so that rejected two
+# whole shapes of real id: current-generation profiles carry no version segment
+# at all (``us.anthropic.claude-opus-5``, ``...-opus-4-8``, ``...-sonnet-5``),
+# and dated profiles end ``-v1:0`` whose ``:0`` failed the ``$`` anchor. Measured
+# against ``aws bedrock list-inference-profiles``: of 12 ACTIVE non-haiku
+# ``us.anthropic.claude*`` profiles the old pattern accepted 1, pinning Bedrock
+# operators to ``us.anthropic.claude-opus-4-6-v1`` while every current model
+# failed at config load.
+#
+# What remains enforced is the part devbench actually depends on: the ``us.``
+# cross-region prefix (see docs/llm-authentication.md "Region mismatch") and the
+# ``anthropic.claude`` family. ``.`` and ``:`` are admitted so dated ``-v1:0``
+# ids parse. Haiku stays rejected by ``validate_agent_model_value``'s own
+# substring check, which runs before this pattern.
+#
+# This validator cannot confirm a model is ENABLED in the caller's account --
+# that needs an API call, and config load must not make one -- so the contract
+# is deliberately "structurally a Bedrock Claude id". A genuinely unavailable
+# model surfaces at first invocation, where AWS names the real failure, rather
+# than being guessed at here.
+BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9.:-]+$")
 
 # ---------------------------------------------------------------------------
 # Quota recovery probe (FR-2.5, issue #236, E2-F1-S2-T2)

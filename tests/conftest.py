@@ -40,6 +40,17 @@ os.environ["DEVBENCH_CONFIG_PATH"] = str(Path(__file__).parent / "fixtures" / "t
 # workspace root; leaving an inherited one in place would send session logs to
 # the live workspace's session tree.
 os.environ.pop("DEVBENCH_SESSION_NAME", None)
+# The LLM-backend toggle must come from the fixture YAML, never from the shell
+# (issue #342). An operator running Bedrock exports DEVBENCH_USE_BEDROCK=1 for
+# their real workspace, and env beats yaml, so an inherited value silently
+# flipped `use_bedrock` for the whole suite: every test asserting the Anthropic
+# path (short names, `claude-*` ids, the "not a valid Anthropic API" rejection)
+# failed with a Bedrock complaint, and the suite became unrunnable in exactly
+# the shell where devbench is configured. Popped rather than pinned to a value
+# so the fixture YAML stays the single source of truth; the tests that exercise
+# either backend set it explicitly per-case.
+os.environ.pop("DEVBENCH_USE_BEDROCK", None)
+os.environ.pop("DEVBENCH_BEDROCK_REGION", None)
 
 import pytest
 from fixtures.data import WORK_UNIT_MARKDOWN_TEMPLATE as _WORK_UNIT_TEMPLATE

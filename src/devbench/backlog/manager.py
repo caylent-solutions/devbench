@@ -36,6 +36,7 @@ the ``## Status Summary`` table in sync.
 import itertools
 import logging
 import re
+import subprocess
 from collections import deque
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -57,6 +58,8 @@ from devbench.constants import (
     EM_DASH,
     EPIC_ID_RE,
     FAILURE_DIGEST_RE,
+    GATE_TIER_MACHINE_BLOCKING,
+    GATE_TIERS,
     GATED_TASK_TYPES,
     RED_OBSERVED_ENTRY_LINE_RE,
     RED_OBSERVED_MESSAGE_FIELDS_RE,
@@ -340,6 +343,81 @@ def green_green_observed_satisfied(content: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Spec 4.2/G4 machine-blocking gate-record done-gate invariant (E2-F2-S1-T2).
+# Mirrors the FR-4.5/FR-4.6 section above: a manager-level check consumed
+# directly by ``mark_done`` so every caller inherits it. Per Section 3.6,
+# executors do not self-certify gate outcomes -- the operator is the only
+# waiver authority for a machine-blocking gate -- so this module must be able
+# to tell an operator-attributed ``[GATE_WAIVER <gate>]`` marker apart from
+# an executor-attributed one before it can decide whether an ENABLED
+# machine-blocking gate's requirement is met.
+#
+# The ``log-waiver`` WRITER verb lands in E2-F4-S1-T1, and the properly
+# consolidated waiver READER moves into ``gate_records.py`` when E3-F2-S1-T1
+# (the first per-gate consumer) needs to share it across gates -- this task's
+# Changes Manifest does not touch ``gate_records.py``, so the read-side
+# grammar below is intentionally local to this module until that promotion.
+# ---------------------------------------------------------------------------
+
+_GATE_WAIVER_ATTRIBUTION_OPERATOR: str = "operator"
+_GATE_WAIVER_ATTRIBUTION_EXECUTOR: str = "executor"
+
+# Bounded timeout (seconds) for the read-only ``git hash-object`` call used
+# to recompute a machine-blocking gate's scope hash for freshness comparison
+# (spec 4.2, AC-7). Mirrors ``devbench.backlog.manifest._GIT_DIFF_TIMEOUT``'s
+# generous-but-bounded git-subprocess discipline.
+_GATE_SCOPE_HASH_GIT_TIMEOUT: int = 30
+
+# Locates a ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor>
+# <reason>`` marker (spec 5.3) wherever it appears on a line -- mirroring
+# ``gate_records._TAG_RE``'s "additive to the audit-comment contract" search,
+# since the marker may follow a ``[<timestamp>] [agent/<name>]`` prefix
+# rather than being the entire line.
+_GATE_WAIVER_TAG_RE: re.Pattern[str] = re.compile(
+    r"\[GATE_WAIVER (?P<gate>[A-Za-z0-9_]+)\]\s+\S+\s+\S+\s+"
+    rf"(?P<attribution>{_GATE_WAIVER_ATTRIBUTION_OPERATOR}|{_GATE_WAIVER_ATTRIBUTION_EXECUTOR})\b"
+)
+
+
+def _latest_gate_waiver_attribution(content: str, gate: str) -> str | None:
+    """Return the attribution of the most recent ``[GATE_WAIVER <gate>]`` marker for *gate*.
+
+    Mirrors ``gate_records.latest_gate_pass_record``'s append-only-log
+    semantics: scans every line and keeps the LAST match, so the most
+    recently written waiver for *gate* wins.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+        gate: The declared gate name to look up.
+
+    Returns:
+        ``"operator"`` or ``"executor"`` (the marker's attribution field),
+        or ``None`` when no ``[GATE_WAIVER <gate>]`` marker is present.
+    """
+    latest: str | None = None
+    for line in content.splitlines():
+        match = _GATE_WAIVER_TAG_RE.search(line)
+        if match is None or match.group("gate") != gate:
+            continue
+        latest = match.group("attribution")
+    return latest
+
+
+def _gate_check_command(gate: str) -> str:
+    """Return the ``check-<gate>`` CLI verb name for *gate* (e.g. ``check-reachability``).
+
+    Every machine-blocking gate's check verb is registered as
+    ``check-<gate-name-with-underscores-replaced-by-hyphens>`` (see
+    ``cli.py``'s ``_COMMANDS`` registry: ``check-reachability``,
+    ``check-ancestry``, ``check-shared-file-impact``,
+    ``check-fixture-consistency``) -- derived here rather than duplicated as
+    a second literal mapping, so the remediation command named in a done-gate
+    refusal can never drift from the registered verb name.
+    """
+    return f"check-{gate.replace('_', '-')}"
+
+
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
@@ -443,17 +521,187 @@ class BacklogManager:
                 )
             )
 
+    @staticmethod
+    def _git_blob_hash(repo_path: Path, rel_path: str) -> str:
+        """Return the git blob hash of *rel_path*'s current on-disk content in *repo_path*.
+
+        Uses ``git hash-object`` against the working tree, so an
+        uncommitted edit is hashed by its live bytes rather than its
+        last-committed blob -- the scope hash a machine-blocking gate
+        command persists (spec 4.2) is over the content actually in scope
+        when it ran, not over whatever HEAD happened to hold.
+
+        Args:
+            repo_path: Local repo checkout root.
+            rel_path: Path to hash, relative to *repo_path*.
+
+        Returns:
+            The lowercase git blob hash (SHA-1) hex string.
+
+        Raises:
+            RuntimeError: If git times out or exits non-zero (e.g. the file
+                no longer exists in the checkout).
+        """
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), "hash-object", "--", rel_path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_GATE_SCOPE_HASH_GIT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"git hash-object timed out hashing {rel_path!r} in {repo_path}") from exc
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git hash-object failed for {rel_path!r} in {repo_path} "
+                f"(exit {result.returncode}): {result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    @staticmethod
+    def _recompute_gate_scope_hash(repo: str, content: str) -> str:
+        """Recompute *content*'s current Changes-Manifest scope hash (spec 4.2, AC-7).
+
+        The freshness half of the machine-blocking gate-record invariant: a
+        persisted ``[GATE_PASS <gate>]`` record's ``scope_hash`` is only
+        valid for the exact file content that was in scope when the gate
+        ran. This recomputes ``gate_records.compute_scope_hash``'s formula
+        (SHA-256 over the sorted changed-file list plus per-file git blob
+        hashes) over the unit's CURRENT ``## Changes Manifest`` file list,
+        read from the resolved repo checkout
+        (``config_loader.get_repo_local_path``) -- so an edit to any
+        in-scope file's content after the gate ran changes the recomputed
+        hash even though the manifest's declared file list is unchanged.
+
+        Args:
+            repo: Canonical ``org/repo`` string (``_extract_repo``'s result).
+            content: The full text of the work-unit markdown file.
+
+        Returns:
+            The recomputed scope hash.
+
+        Raises:
+            RuntimeError: If the Changes Manifest is missing/malformed, is
+                empty, or a file it declares cannot be hashed in the
+                checkout -- never silently treated as "no change".
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.config import RUNTIME_CONFIG, WORKSPACE_ROOT
+        from devbench.config_loader import get_repo_local_path
+        from devbench.gate_records import compute_scope_hash
+
+        try:
+            manifest_rows = parse_manifest(content)
+        except ManifestParseError as exc:
+            raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
+
+        repo_path = get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT)
+        file_blob_hashes = {row.file: BacklogManager._git_blob_hash(repo_path, row.file) for row in manifest_rows}
+        try:
+            return compute_scope_hash(file_blob_hashes)
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
+
+    def _check_gate_pass_done_invariant(self, unit_id: str, content: str) -> None:
+        """Raise ``RuntimeError`` when an ENABLED machine-blocking gate lacks
+        a fresh ``[GATE_PASS]`` record or an operator ``[GATE_WAIVER]``
+        (spec 4.2, G4).
+
+        Mirrors ``_check_task_type_done_invariant``'s pattern: a single,
+        manager-level check consumed directly by :meth:`mark_done`, so every
+        caller (``cmd_mark_done``, ``_check_merge_handle_merged``, and any
+        future caller) inherits it identically -- the exact bug class that
+        pattern was introduced to close (spec Section 3 reuse table).
+
+        For each of the four machine-blocking gates (``constants.GATE_TIERS``)
+        that resolves ENABLED for the unit's repo
+        (``config_loader.resolve_gate_config``, the sole read path, AC-27):
+
+        1. An operator-attributed ``[GATE_WAIVER <gate>]`` marker alone
+           satisfies the requirement (spec 3.6, 4.9) -- checked first so a
+           waived gate never needs a repo checkout to recompute anything.
+        2. Otherwise a ``[GATE_PASS <gate>]`` record must exist, and its
+           persisted scope hash must match the CURRENT recomputed scope
+           hash (``_recompute_gate_scope_hash``); a mismatch is a stale
+           record (AC-7), refused with the spec 4.2 wording.
+        3. Otherwise: an executor-attributed waiver is insufficient for a
+           machine-blocking gate (spec 3.6) and is refused naming the
+           missing operator attribution; no waiver and no record at all is
+           refused with the exact G4 worked-example remediation.
+
+        A unit with no ``## Target Repository`` section (``_extract_repo``
+        returns ``None``) is "check does not apply" -- the same
+        fail-open-on-absent-section behaviour every other repo-scoped check
+        in this module already uses (e.g. ``_fix_manifest_prefixes``),
+        preserving today's behaviour for every existing caller/test that
+        never declared a repo.
+
+        Args:
+            unit_id: Work unit ID, named in every rejection message.
+            content: The full text of the work-unit markdown file.
+
+        Raises:
+            RuntimeError: An enabled machine-blocking gate's requirement is
+                unmet, per the three cases above.
+        """
+        repo = self._extract_repo(content)
+        if repo is None:
+            return
+
+        from devbench.config import RUNTIME_CONFIG, resolve_gate_env_override
+        from devbench.config_loader import resolve_gate_config
+        from devbench.gate_records import latest_gate_pass_record
+
+        for gate, tier in GATE_TIERS.items():
+            if tier != GATE_TIER_MACHINE_BLOCKING:
+                continue
+            resolved = resolve_gate_config(gate, repo, RUNTIME_CONFIG, resolve_gate_env_override(gate))
+            if not resolved.values["enabled"]:
+                continue
+
+            attribution = _latest_gate_waiver_attribution(content, gate)
+            if attribution == _GATE_WAIVER_ATTRIBUTION_OPERATOR:
+                continue
+
+            remediation = f"uv run devbench {_gate_check_command(gate)} {unit_id}"
+            record = latest_gate_pass_record(content, gate)
+            if record is not None:
+                current_hash = self._recompute_gate_scope_hash(repo, content)
+                if current_hash == record.scope_hash:
+                    continue
+                raise RuntimeError(
+                    f"gate {gate!r} record is stale (scope changed since it ran). "
+                    f"Run: {remediation} to produce a fresh record."
+                )
+
+            if attribution == _GATE_WAIVER_ATTRIBUTION_EXECUTOR:
+                raise RuntimeError(
+                    f"gate {gate!r} is enabled for repo {repo!r} but its only [GATE_WAIVER {gate}] "
+                    f"record for {unit_id} is executor-attributed; a machine-blocking gate requires an "
+                    "operator-attributed waiver (spec Section 3.6: executors do not self-certify). "
+                    f"Run: {remediation}, or have an operator issue an operator-attributed waiver."
+                )
+
+            raise RuntimeError(
+                f"done-gate: gate {gate!r} is enabled for repo {repo!r} but has no [GATE_PASS {gate}] "
+                f"record for {unit_id}. Run: {remediation}"
+            )
+
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
 
         Raises ``RuntimeError`` if the task's own FR-4.5/FR-4.6 task-type
         completion invariant is unmet (``_check_task_type_done_invariant``),
-        or if not all required review judges have passed in the most recent
-        review round (done-gate enforcement). Both checks are enforced here
-        -- not in a CLI-layer wrapper -- so every caller (``cmd_mark_done``,
-        ``_check_merge_handle_merged``, and any future caller) inherits them
-        identically; there is no second done-transition path that can skip
-        either check (E4-F4-S1-T2 round 3).
+        if an enabled machine-blocking gate lacks a fresh ``[GATE_PASS]``
+        record or operator ``[GATE_WAIVER]`` (``_check_gate_pass_done_invariant``,
+        spec 4.2/G4), or if not all required review judges have passed in
+        the most recent review round (done-gate enforcement). All three
+        checks are enforced here -- not in a CLI-layer wrapper -- so every
+        caller (``cmd_mark_done``, ``_check_merge_handle_merged``, and any
+        future caller) inherits them identically; there is no second
+        done-transition path that can skip any of them (E4-F4-S1-T2 round 3;
+        E2-F2-S1-T2).
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -461,13 +709,15 @@ class BacklogManager:
             unit_id: The work-unit identifier.
 
         Raises:
-            RuntimeError: If the task-type invariant is unmet, or if not all
-                required judges passed in the last round.
+            RuntimeError: If the task-type invariant is unmet, if an enabled
+                machine-blocking gate's record requirement is unmet, or if
+                not all required judges passed in the last round.
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
         content = work_unit_path.read_text(encoding="utf-8")
         self._check_task_type_done_invariant(unit_id, content)
+        self._check_gate_pass_done_invariant(unit_id, content)
         if not self._last_round_all_passed(work_unit_path):
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"

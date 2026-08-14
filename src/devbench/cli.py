@@ -4879,24 +4879,32 @@ def _format_gates_table(records: Sequence[tuple[str, "ResolvedGateConfig", list[
     """Render the ``devbench gates`` table from resolved gate records.
 
     Column widths are computed from the actual header/cell content on every
-    call (``str.ljust`` never truncates), so a later unit adding the tier
-    column (E2-F2-S1-T2) needs no re-layout of this function.
+    call (``str.ljust`` never truncates), so a future column addition needs
+    no re-layout of this function.
+
+    The ``tier`` column (spec G2 worked example; E2-F2-S1-T2) is looked up
+    from ``constants.GATE_TIERS`` by gate name rather than threaded through
+    *records* as a fourth tuple element -- the tier is a static fact about
+    the gate name, not something ``resolve_gate_config`` resolves, so it
+    needs no extra plumbing through the caller's row-collection loop.
 
     Args:
         records: ``(gate, resolved, override_repos)`` triples in row order --
             ``resolved`` is the ``ResolvedGateConfig`` returned by
             ``resolve_gate_config`` for that gate (only the ``enabled``
-            field/provenance are rendered; the tier column is a later
-            unit's addition), and ``override_repos`` is
-            ``_gate_override_repos``'s result for that gate.
+            field/provenance are rendered from it), and ``override_repos``
+            is ``_gate_override_repos``'s result for that gate.
 
     Returns:
         Rendered lines: the header row followed by one row per record.
     """
-    header = ("gate", "status", "repos", "provenance")
+    from devbench.constants import GATE_TIERS
+
+    header = ("gate", "tier", "status", "repos", "provenance")
     rows = [
         (
             gate,
+            GATE_TIERS[gate],
             "enabled" if resolved.values["enabled"] else "disabled",
             ", ".join(override_repos) if override_repos else "-",
             resolved.provenance["enabled"],
@@ -4915,10 +4923,12 @@ def cmd_gates() -> int:
     declaration order) and resolves each one's ``enabled`` status and
     provenance exclusively through ``config_loader.resolve_gate_config`` --
     the ONLY sanctioned read path for gate configuration (AC-27); this
-    command never reads ``RuntimeConfig.gates`` fields directly. Total and
-    read-only: renders all eight rows even when the workspace has no
-    ``gates:`` key at all, since an absent block loads into the all-disabled
-    built-in tree (D-17).
+    command never reads ``RuntimeConfig.gates`` fields directly. The
+    rendered ``tier`` column (``machine-blocking`` or ``judge-evidence``) is
+    looked up from ``constants.GATE_TIERS`` (spec 4.2, D-6), completing the
+    G2 worked-example table shape. Total and read-only: renders all eight
+    rows even when the workspace has no ``gates:`` key at all, since an
+    absent block loads into the all-disabled built-in tree (D-17).
 
     Reloads the config file fresh from disk (mirrors ``cmd_check``) instead
     of trusting the process-wide ``RUNTIME_CONFIG`` singleton, so a config

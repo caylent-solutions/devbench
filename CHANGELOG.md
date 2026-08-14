@@ -53,6 +53,36 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `tests/test_docs/test_cli_reference_gates.py` against the `_COMMANDS`
   description string so the doc can never drift from the registry.
 
+- **`mark-done` wired to the machine-blocking gate-record invariant, and the
+  `gates` table's `tier` column** (spec `integration-reality-gates-hardening.md`
+  section 4.2, G2, G4; AC-E2-F2-S1-T2-1 through -6). `BacklogManager.mark_done`
+  gains `_check_gate_pass_done_invariant`, mirroring the existing
+  `_check_task_type_done_invariant` pattern so every caller (`cmd_mark_done`
+  and `_check_merge_handle_merged` alike) inherits it identically: for each
+  of the four machine-blocking gates (`constants.GATE_TIERS`) that resolves
+  `enabled` for the unit's repo (`config_loader.resolve_gate_config`), the
+  unit must carry a fresh `[GATE_PASS <gate>]` record or an
+  operator-attributed `[GATE_WAIVER <gate>]` marker; an executor-attributed
+  waiver is rejected as insufficient for a machine-blocking gate (spec
+  Section 3.6), naming the missing operator attribution. Absent both, `mark-
+  done` exits 1, writes no status, and names the exact remediation command,
+  matching the spec G4 worked example verbatim in shape (`ERROR: done-gate:
+  gate '<name>' is enabled for repo '<repo>' but has no [GATE_PASS <name>]
+  record for <unit>. Run: uv run devbench check-<name> <unit>`). A
+  `[GATE_PASS <gate>]` record's `scope_hash` is recomputed from the unit's
+  current `## Changes Manifest` file list (`gate_records.compute_scope_hash`
+  over each file's live `git hash-object` blob hash), so an edit to any
+  in-scope file after the gate ran invalidates the record, refused with
+  `ERROR: gate '<name>' record is stale (scope changed since it ran)`
+  (AC-7). A disabled gate imposes nothing, preserving today's behaviour for
+  every workspace that has not opted in. Separately, `devbench gates`
+  (`_format_gates_table`) now renders the `tier` column (`machine-blocking`
+  / `judge-evidence`, looked up from `constants.GATE_TIERS` by gate name)
+  that E2-F1-S2-T1 deliberately deferred, completing the spec G2
+  worked-example table shape. `docs/cli-reference.md`'s `## Gates` and
+  `mark-done` sections document both changes with the recomputed example
+  table and the G4 worked example.
+
 - **`resolve_gate_config` -- the single four-layer precedence resolver for
   gate configuration** (spec `integration-reality-gates-hardening.md`
   section 4.1, D-15, D-17; AC-27). Adds `resolve_gate_config(gate, repo,

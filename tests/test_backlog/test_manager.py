@@ -2,24 +2,44 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from test_tdd_gate import (
+    commit_scratch_repo,
+    init_scratch_repo,
+    run_scratch_git,
+    write_scratch_file,
+)
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitType
-from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
+from devbench.config_loader import (
+    FixtureConsistencyConfig,
+    GateEnabledConfig,
+    GatesConfig,
+    GateSharedFileImpactConfig,
+    RepoConfig,
+    RuntimeConfig,
+    ValidateConfig,
+)
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
+    GATE_TIER_MACHINE_BLOCKING,
+    GATE_TIERS,
     REVIEW_JUDGE_NAMES,
     SECURITY_JUDGE_NAMES,
     STATUS_DRAFT,
     VALID_STATUSES,
 )
+from devbench.gate_records import compose_gate_pass_record, compute_scope_hash
 from devbench.scope import ScopeFilter
+
+_MACHINE_BLOCKING_GATES: list[str] = sorted(g for g, t in GATE_TIERS.items() if t == GATE_TIER_MACHINE_BLOCKING)
 
 
 @pytest.fixture
@@ -954,6 +974,272 @@ class TestMarkDoneGate:
         judge = BacklogManager()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")
         assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+
+class TestMarkDoneGateRecords:
+    """mark_done enforces the machine-blocking gate-record invariant (spec
+    4.2, G4; AC-E2-F2-S1-T2-1..5): an ENABLED machine-blocking gate requires
+    either a fresh [GATE_PASS <gate>] record or an operator-attributed
+    [GATE_WAIVER <gate>] marker before a unit can reach done."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_index(self, tmp_path: Path, unit_id: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            f"| {unit_id} | Task | Task | in-review | None | {self._REPO} | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return idx
+
+    def _make_wu(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        *,
+        with_repo_section: bool = True,
+        manifest_file: str = "src/foo.py",
+        extra_comments: str = "",
+    ) -> Path:
+        repo_section = f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n" if with_repo_section else ""
+        wu = tmp_path / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            "## Status: in-review\n\n"
+            "## Task Type: chore\n\n"
+            f"{repo_section}"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            f"| `{manifest_file}` | update |\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n\n"
+            f"{_all_five_judges_pass_block()}{extra_comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    @staticmethod
+    def _gates_config(enabled_gates: set[str]) -> GatesConfig:
+        """Build a project-level ``GatesConfig`` enabling exactly *enabled_gates*.
+
+        Project-level (not per-repo override) so every gate's dataclass
+        shape is uniform apart from ``shared_file_impact``/
+        ``fixture_consistency``'s extra tunables. Covers exactly the four
+        machine-blocking gates (``_MACHINE_BLOCKING_GATES``) with explicit,
+        correctly-typed fields -- this test class never needs to enable a
+        judge-evidence gate.
+        """
+        return GatesConfig(
+            reachability=GateEnabledConfig(enabled="reachability" in enabled_gates),
+            ancestry=GateEnabledConfig(enabled="ancestry" in enabled_gates),
+            shared_file_impact=GateSharedFileImpactConfig(enabled="shared_file_impact" in enabled_gates),
+            fixture_consistency=FixtureConsistencyConfig(enabled="fixture_consistency" in enabled_gates),
+        )
+
+    def _runtime_config(self, *, enabled_gates: set[str], repo_path: Path | None = None) -> RuntimeConfig:
+        return RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo_path)},
+            gates=self._gates_config(enabled_gates),
+        )
+
+    @staticmethod
+    def _check_command(gate: str) -> str:
+        return f"check-{gate.replace('_', '-')}"
+
+    # -- (a) missing record: refused, naming gate/repo/remediation (AC-1) --
+
+    @pytest.mark.parametrize("gate", _MACHINE_BLOCKING_GATES)
+    def test_missing_record_blocks_with_g4_remediation_message(self, tmp_path: Path, gate: str) -> None:
+        unit_id = "E0-F1-S1-T1"
+        wu = self._make_wu(tmp_path, unit_id)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={gate})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg), pytest.raises(RuntimeError) as exc_info:
+            mgr.mark_done(wu, idx, unit_id)
+
+        message = str(exc_info.value)
+        assert f"gate {gate!r} is enabled for repo {self._REPO!r}" in message
+        assert f"has no [GATE_PASS {gate}] record for {unit_id}" in message
+        assert f"Run: uv run devbench {self._check_command(gate)} {unit_id}" in message
+        content = wu.read_text(encoding="utf-8")
+        assert "## Status: in-review" in content
+        assert "## Status: done" not in content
+
+    # -- (b) fresh record: proceeds to done (AC-2) --
+
+    def test_fresh_record_allows_done(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hello')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        blob_hash = run_scratch_git(["hash-object", "--", "src/foo.py"], repo_path).stdout.strip()
+        scope_hash = compute_scope_hash({"src/foo.py": blob_hash})
+        record_line = compose_gate_pass_record("reachability", scope_hash)
+        wu = self._make_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=f"[2026-01-01 00:00 UTC] [agent/orchestrator] {record_line}\n",
+        )
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"}, repo_path=repo_path)
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    # -- (c) stale record: refused with the spec 4.2 wording (AC-3, AC-7) --
+
+    def test_stale_record_blocks_with_spec_wording(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hello')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        blob_hash = run_scratch_git(["hash-object", "--", "src/foo.py"], repo_path).stdout.strip()
+        scope_hash = compute_scope_hash({"src/foo.py": blob_hash})
+        record_line = compose_gate_pass_record("reachability", scope_hash)
+        wu = self._make_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=f"[2026-01-01 00:00 UTC] [agent/orchestrator] {record_line}\n",
+        )
+        idx = self._make_index(tmp_path, unit_id)
+        # Edit the in-scope file AFTER the record was captured: the
+        # recomputed scope hash must now differ (AC-7).
+        write_scratch_file(repo_path, "src/foo.py", "print('hello world')\n")
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"}, repo_path=repo_path)
+
+        mgr = BacklogManager()
+        with (
+            patch("devbench.config.RUNTIME_CONFIG", rt_cfg),
+            pytest.raises(RuntimeError, match=r"gate 'reachability' record is stale \(scope changed since it ran\)"),
+        ):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" not in wu.read_text(encoding="utf-8")
+
+    # -- (d) waiver adoption: operator satisfies, executor does not (AC-4) --
+
+    def test_operator_waiver_satisfies_with_no_record(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        waiver = (
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py operator pre-existing dead artifact, tracked separately\n"
+        )
+        wu = self._make_wu(tmp_path, unit_id, extra_comments=waiver)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_executor_waiver_alone_is_insufficient(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        waiver = (
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py executor pre-existing dead artifact, tracked separately\n"
+        )
+        wu = self._make_wu(tmp_path, unit_id, extra_comments=waiver)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg), pytest.raises(RuntimeError) as exc_info:
+            mgr.mark_done(wu, idx, unit_id)
+
+        message = str(exc_info.value)
+        assert "executor-attributed" in message
+        assert "operator-attributed waiver" in message
+        content = wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in content
+
+    # -- (e) every gate disabled: behaves exactly as before (AC-5) --
+
+    def test_all_gates_disabled_behaves_as_before(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        wu = self._make_wu(tmp_path, unit_id)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates=set())
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_no_target_repository_section_skips_check_entirely(self, tmp_path: Path) -> None:
+        """A unit with no ``## Target Repository`` section is untouched by
+        this invariant (``_extract_repo`` returns None), preserving today's
+        behaviour for every pre-existing caller/test that never declared a
+        repo -- even when a machine-blocking gate is enabled project-wide."""
+        unit_id = "E0-F1-S1-T1"
+        wu = self._make_wu(tmp_path, unit_id, with_repo_section=False)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+
+class TestRecomputeGateScopeHashErrorPaths:
+    """Error paths of BacklogManager._git_blob_hash /
+    _recompute_gate_scope_hash: every failure is a specific, actionable
+    RuntimeError (Error Handling Contract), never a raw git/ManifestParseError/
+    ValueError escaping to a caller that only catches RuntimeError."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def test_git_blob_hash_raises_when_git_exits_non_zero(self, tmp_path: Path) -> None:
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        with pytest.raises(RuntimeError, match="git hash-object failed"):
+            BacklogManager._git_blob_hash(repo_path, "src/does_not_exist.py")
+
+    def test_git_blob_hash_raises_on_timeout(self, tmp_path: Path) -> None:
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        with patch(
+            "devbench.backlog.manager.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="git hash-object", timeout=30),
+        ):
+            with pytest.raises(RuntimeError, match="git hash-object timed out"):
+                BacklogManager._git_blob_hash(repo_path, "src/foo.py")
+
+    def test_recompute_scope_hash_wraps_missing_manifest_section(self, tmp_path: Path) -> None:
+        content = "# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n"
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig()})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content)
+
+    def test_recompute_scope_hash_wraps_empty_manifest(self, tmp_path: Path) -> None:
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n## Comments\n\n"
+        )
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig()})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content)
 
 
 def _extract_summary_lines(content: str) -> list[str]:

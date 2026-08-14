@@ -402,6 +402,7 @@ Show every gate's tier, status and repo overrides. Renders one row per declared 
 Columns:
 
 - **gate** -- the gate's declared name.
+- **tier** -- `machine-blocking` or `judge-evidence`, the gate's declared enforcement tier (`constants.GATE_TIERS`, spec section 4.2, D-6). `reachability`, `ancestry`, `shared_file_impact`, and `fixture_consistency` are `machine-blocking`; the other four gates are `judge-evidence`. No gate carries the weaker `advisory` tier today. A `machine-blocking` gate that is `enabled` for a unit's repo is wired into `mark-done` (see below); a `judge-evidence` gate never blocks `mark-done` on its own.
 - **status** -- `enabled` or `disabled`, the resolved value of that gate's `enabled` field.
 - **repos** -- the `org/repo` name(s) carrying an explicit override for that gate (comma-separated when more than one), or `-` when none override it.
 - **provenance** -- which layer set the resolved `status`: `builtin`, `project`, `repo`, or `env`.
@@ -414,18 +415,16 @@ Example, with a per-repo override enabling `shared_file_impact` for `caylent-sol
 
 ```
 $ uv run devbench gates
-gate                   status    repos                       provenance
-reachability           disabled  -                           builtin
-ancestry               disabled  -                           builtin
-shared_file_impact     enabled   caylent-solutions/devbench  repo
-fixture_consistency    disabled  -                           builtin
-write_path_audit       disabled  -                           builtin
-newly_reachable_paths  disabled  -                           builtin
-composition_root       disabled  -                           builtin
-layout_geometry        disabled  -                           builtin
+gate                   tier              status    repos                       provenance
+reachability           machine-blocking  disabled  -                           builtin
+ancestry               machine-blocking  disabled  -                           builtin
+shared_file_impact     machine-blocking  enabled   caylent-solutions/devbench  repo
+fixture_consistency    machine-blocking  disabled  -                           builtin
+write_path_audit       judge-evidence    disabled  -                           builtin
+newly_reachable_paths  judge-evidence    disabled  -                           builtin
+composition_root       judge-evidence    disabled  -                           builtin
+layout_geometry        judge-evidence    disabled  -                           builtin
 ```
-
-The `tier` column shown in the spec's `G2` worked example is added by a later unit once `constants.GATE_TIERS` (spec section 4.2) exists.
 
 ---
 
@@ -553,6 +552,17 @@ Mark the unit as `done`. Enforces the done-gate: all four review judges (`code_r
 - **`refactor`**: requires a machine-observed `GREEN_GREEN_OBSERVED` entry in the TDD Cycle Log, written only by `uv run devbench green-green-check <id> <test_node_id> [...]`.
 
 This invariant check is deliberately implemented once in `BacklogManager.mark_done` -- not in a CLI-layer wrapper -- so every caller inherits it identically; see `check-merge` below.
+
+**Machine-blocking gate-record invariant (spec `integration-reality-gates-hardening.md` section 4.2, G4; E2-F2-S1-T2).** `BacklogManager.mark_done` also calls `_check_gate_pass_done_invariant`: for every gate in `constants.GATE_TIERS` whose tier is `machine-blocking` (`reachability`, `ancestry`, `shared_file_impact`, `fixture_consistency`) that resolves `enabled` for the unit's repo (`config_loader.resolve_gate_config`, the single read path), the unit must carry either a fresh `[GATE_PASS <gate>]` record or an operator-attributed `[GATE_WAIVER <gate>]` marker (spec 5.3); an executor-attributed waiver never satisfies a machine-blocking gate (spec Section 3.6: executors do not self-certify gate outcomes). Absent both, `mark-done` exits 1, writes no status, and names the exact remediation command, matching the spec G4 worked example in shape:
+
+```
+$ uv run devbench mark-done E9-F1-S1-T1
+ERROR: done-gate: gate 'reachability' is enabled for repo
+'caylent-solutions/devbench' but has no [GATE_PASS reachability] record for
+E9-F1-S1-T1. Run: uv run devbench check-reachability E9-F1-S1-T1
+```
+
+A `[GATE_PASS <gate>]` record's `scope_hash` is recomputed from the unit's current `## Changes Manifest` file list (SHA-256 over the sorted file list plus each file's live `git hash-object` blob hash, `gate_records.compute_scope_hash`); any edit to an in-scope file's content after the gate ran invalidates the record, refused with `ERROR: gate '<name>' record is stale (scope changed since it ran)`. A disabled gate imposes nothing at all. Like the task-type invariant above, this check is implemented once in `BacklogManager.mark_done` and inherits into every caller, including `check-merge` below.
 
 ### `decline`
 

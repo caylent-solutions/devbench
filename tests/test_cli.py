@@ -33,6 +33,7 @@ from devbench.config_loader import (
 from devbench.constants import (
     BACKLOG_SUBDIR,
     GATE_NAMES,
+    GATE_TIERS,
     SESSION_DEFAULT_NAME,
     SESSION_SESSIONS_BASE_DIR,
     TDD_ENTRY_TEMPLATE,
@@ -3290,6 +3291,99 @@ class TestCmdMarkDoneGatedBlock:
         assert REMEDY_1 in err
         assert REMEDY_2 in err
         assert REMEDY_3 in err
+
+
+@pytest.mark.unit
+class TestCmdMarkDoneGateRefusal:
+    """cmd_mark_done: an enabled machine-blocking gate without a fresh
+    [GATE_PASS] record refuses (rc=1), writes no status, and the message
+    reaches stderr (spec 4.2, G4; AC-E2-F2-S1-T2-1)."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _setup(self, tmp_path: Path, unit_id: str) -> tuple[Path, Path, MagicMock]:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {unit_id} | Gate refusal test | Task | in-review | None | {self._REPO} | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: chore\n\n"
+            f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | update |\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id=unit_id,
+            title="Gate refusal test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return backlog_index, wu_file, mock_parser
+
+    def _reachability_enabled_runtime_config(self) -> object:
+        from devbench.config_loader import GateEnabledConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        return RuntimeConfig(
+            repos={self._REPO: RepoConfig()},
+            gates=GatesConfig(reachability=GateEnabledConfig(enabled=True)),
+        )
+
+    def test_enabled_gate_without_record_refuses_and_writes_nothing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E233-F1-S1-T1"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", self._reachability_enabled_runtime_config()),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR: done-gate: gate 'reachability' is enabled for repo" in err
+        assert f"'{self._REPO}'" in err
+        assert f"has no [GATE_PASS reachability] record for {unit_id}" in err
+        assert f"Run: uv run devbench check-reachability {unit_id}" in err
+        assert wu_file.read_text(encoding="utf-8") == before, "a refused mark-done must write nothing"
+
+    def test_disabled_gate_imposes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E233-F1-S1-T2"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "[DONE]" in wu_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.unit
@@ -6883,34 +6977,42 @@ def _make_resolved_gate_config(gate: str = "reachability", *, enabled: bool, pro
 class TestFormatGatesTable:
     """cli._format_gates_table: pure row-rendering, column widths computed
     from the data (AC-E2-F1-S2-T1-2, AC-E2-F1-S2-T1-3; DoD: no hard-coded
-    widths)."""
+    widths). The ``tier`` column (AC-E2-F2-S1-T2-6) is looked up from
+    ``constants.GATE_TIERS`` by gate name, completing the G2 worked-example
+    shape."""
 
     def test_header_only_when_no_records(self) -> None:
         lines = cli._format_gates_table([])
-        assert lines == ["gate  status  repos  provenance"]
+        assert lines == ["gate  tier  status  repos  provenance"]
 
     def test_disabled_row_uses_no_override_placeholder(self) -> None:
         resolved = _make_resolved_gate_config(enabled=False, provenance="builtin")
         lines = cli._format_gates_table([("reachability", resolved, [])])
         assert len(lines) == 2
-        assert _gates_table_cells(lines[0]) == ["gate", "status", "repos", "provenance"]
-        assert _gates_table_cells(lines[1]) == ["reachability", "disabled", "-", "builtin"]
+        assert _gates_table_cells(lines[0]) == ["gate", "tier", "status", "repos", "provenance"]
+        assert _gates_table_cells(lines[1]) == ["reachability", "machine-blocking", "disabled", "-", "builtin"]
 
     def test_enabled_repo_override_row_lists_the_repo(self) -> None:
         resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
         lines = cli._format_gates_table([("shared_file_impact", resolved, ["caylent-solutions/devbench"])])
         assert _gates_table_cells(lines[1]) == [
             "shared_file_impact",
+            "machine-blocking",
             "enabled",
             "caylent-solutions/devbench",
             "repo",
         ]
 
+    def test_judge_evidence_gate_renders_its_tier(self) -> None:
+        resolved = _make_resolved_gate_config("write_path_audit", enabled=False, provenance="builtin")
+        lines = cli._format_gates_table([("write_path_audit", resolved, [])])
+        assert _gates_table_cells(lines[1]) == ["write_path_audit", "judge-evidence", "disabled", "-", "builtin"]
+
     def test_multiple_override_repos_are_comma_joined(self) -> None:
         resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
         repos = ["org-a/repo-a", "org-b/repo-b"]
         lines = cli._format_gates_table([("shared_file_impact", resolved, repos)])
-        assert _gates_table_cells(lines[1])[2] == "org-a/repo-a, org-b/repo-b"
+        assert _gates_table_cells(lines[1])[3] == "org-a/repo-a, org-b/repo-b"
 
     def test_column_width_grows_to_fit_longest_cell_without_truncation(self) -> None:
         long_repo = "an-organisation-with-a-very-long-name/an-equally-long-repository-name"
@@ -6918,7 +7020,7 @@ class TestFormatGatesTable:
         lines = cli._format_gates_table([("shared_file_impact", resolved, [long_repo])])
         header, row = lines
         # The full, untruncated repo name is preserved as its own cell...
-        assert _gates_table_cells(row)[2] == long_repo
+        assert _gates_table_cells(row)[3] == long_repo
         # ...and since it is by far the widest cell in the "repos" column,
         # the column carries no extra padding: the next column
         # ("provenance") starts immediately after it plus the 2-space
@@ -6946,10 +7048,10 @@ class TestFormatGatesTable:
 
 
 class TestCmdGates:
-    """devbench gates: read-only overview of every declared gate's status,
-    repo overrides and provenance, resolved exclusively through
-    resolve_gate_config (spec G2, section 4.1; AC-E2-F1-S2-T1-1..4, AC-4,
-    AC-27)."""
+    """devbench gates: read-only overview of every declared gate's tier,
+    status, repo overrides and provenance, resolved exclusively through
+    resolve_gate_config (spec G2, section 4.1; AC-E2-F1-S2-T1-1..4,
+    AC-E2-F2-S1-T2-6, AC-4, AC-27)."""
 
     _REPO = "caylent-solutions/devbench"
 
@@ -6977,9 +7079,10 @@ class TestCmdGates:
         assert rendered_gates == set(GATE_NAMES)
         for row in lines[1:]:
             cells = _gates_table_cells(row)
-            assert cells[1] == "disabled"
-            assert cells[2] == "-"
-            assert cells[3] == "builtin"
+            assert cells[1] == GATE_TIERS[cells[0]]
+            assert cells[2] == "disabled"
+            assert cells[3] == "-"
+            assert cells[4] == "builtin"
 
     def test_repo_override_enables_shared_file_impact(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -6993,7 +7096,13 @@ class TestCmdGates:
         assert result == 0
         out = capsys.readouterr().out
         row = next(ln for ln in out.splitlines() if ln.startswith("shared_file_impact"))
-        assert _gates_table_cells(row) == ["shared_file_impact", "enabled", self._REPO, "repo"]
+        assert _gates_table_cells(row) == [
+            "shared_file_impact",
+            "machine-blocking",
+            "enabled",
+            self._REPO,
+            "repo",
+        ]
 
     def test_project_level_config_sets_provenance_project(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -7011,7 +7120,7 @@ class TestCmdGates:
         # No per-repo override exists, so the "repos" column still shows the
         # no-override placeholder even though the gate is enabled at the
         # project level.
-        assert _gates_table_cells(row) == ["ancestry", "enabled", "-", "project"]
+        assert _gates_table_cells(row) == ["ancestry", "machine-blocking", "enabled", "-", "project"]
 
     def test_env_override_sets_provenance_env(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -7025,7 +7134,7 @@ class TestCmdGates:
         assert result == 0
         out = capsys.readouterr().out
         row = next(ln for ln in out.splitlines() if ln.startswith("reachability"))
-        assert _gates_table_cells(row) == ["reachability", "enabled", "-", "env"]
+        assert _gates_table_cells(row) == ["reachability", "machine-blocking", "enabled", "-", "env"]
 
     def test_config_load_failure_exits_1_with_loader_message_and_no_table(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch

@@ -461,15 +461,31 @@ def observe_red(
     assert observation is not None, "unreachable: neither observation nor test_exception was set"
 
     if observation.exit_code != PYTEST_EXIT_TESTS_FAILED or observation.node_outcome != "FAILED":
-        raise TddGateRejectionError(
-            _build_rejection_message(
-                unit_id,
-                test_node_id,
-                observation.exit_code,
-                f"{_exit_code_reason(observation.exit_code)}; named test outcome was "
-                f"{observation.node_outcome or 'not collected'}.",
-            )
+        detail = (
+            f"{_exit_code_reason(observation.exit_code)}; named test outcome was "
+            f"{observation.node_outcome or 'not collected'}."
         )
+        if not pushed:
+            # Nothing was stashed, so the run above observed the tree exactly as
+            # found. That is legitimate when the committed baseline is itself the
+            # "before" state (test-first TDD: a pinning test committed alongside
+            # still-broken production source genuinely fails here). But when the
+            # named test PASSES in that situation, the cause is specifically that
+            # no production change was removed -- the fix is already in the
+            # committed baseline -- and the bare outcome above reports only the
+            # symptom, leaving the operator to reverse-engineer why. Name the
+            # cause. Diagnostic only: the pass/fail decision is unchanged, and no
+            # reconstruction is attempted or implied.
+            detail += (
+                f" Note: 'git stash push -u -- {' '.join(prod_paths)}' removed nothing, so this run "
+                f"observed the working tree as found. Every production-source row is already committed "
+                f"or absent in {repo_path}, which is why the test could not fail. The executor stages "
+                f"production changes and leaves committing to 'devbench git-ops', so this usually means "
+                f"the rows were committed out of band -- for example an operator commit that snapshotted "
+                f"this task's in-flight files. To re-derive an observable RED, commit the removal of the "
+                f"production change so its content returns to a staged, uncommitted state, then re-run."
+            )
+        raise TddGateRejectionError(_build_rejection_message(unit_id, test_node_id, observation.exit_code, detail))
 
     failure_digest = hashlib.sha256(observation.raw_output.encode("utf-8")).hexdigest()
     return RedObservation(exit_code=observation.exit_code, test_node_id=test_node_id, failure_digest=failure_digest)

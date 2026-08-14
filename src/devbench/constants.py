@@ -798,6 +798,16 @@ ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
 # reason=runtime_degradation tasks=<id1,id2,...>``.
 ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
 
+# Audit-log prefix written once per stash entry when a task transitioning to
+# ``blocked`` has its target-repo residue quarantined out of the shared
+# checkout (``cli._clean_target_repo_on_block``). Blocking used to run
+# ``git reset --hard`` + ``git clean -fd`` and destroy uncommitted work
+# outright; it now reuses the same non-destructive quarantine claim-time uses,
+# and this marker records where each entry went so an operator can recover it
+# from ``git stash list``. Format: ``[BLOCK_QUARANTINE] <unit-id> owner=<id>
+# paths=<n> stash=<message>``.
+ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX: str = "[BLOCK_QUARANTINE] "
+
 # Bound on the number of consecutive in-process quota-recovery resumes
 # ``_drive_orchestrate_with_quota_resume`` performs before stopping the
 # orchestrator (spec FR-2.8, AC-22). Overridable via

@@ -5,6 +5,40 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Blocking a task destroyed every uncommitted change in the target repo**
+  (issue #340). `cli._clean_target_repo_on_block` ran `git reset --hard HEAD`
+  plus `git clean -fd` against the target checkout on every transition to
+  `blocked`. The executor stages production changes and leaves committing to
+  `devbench git-ops`, so a task that blocked after finishing its work had that
+  work annihilated -- unconditionally, irreversibly, and with no operator
+  confirmation. The tell was the orchestrator routing around its own tool: an
+  observed run deliberately chose `hold` over `blocked` to keep a complete
+  task's verified work alive. Block-time cleanup now delegates to
+  `git_quarantine.quarantine_paths`, the same non-destructive primitive
+  claim-time quarantine (`_prepare_worktree_for_claim`) already used, so the
+  shared checkout is still cleared for the next claim but the residue lands in
+  recoverable `git stash` entries, one per owning unit, discoverable via
+  `git stash list` and recorded with the new
+  `[BLOCK_QUARANTINE] <unit-id> owner=<id> paths=<n> stash=<message>` audit
+  line. The two "clear this shared checkout" paths now share one
+  implementation instead of disagreeing about whether the work survives.
+
+- **The RED gate rejected an out-of-band-committed production change by
+  reporting only the symptom** (issue #341). When every production-source row
+  is already committed, `git stash push -u -- <rows>` removes nothing, the
+  named test necessarily passes, and `tdd_gate.observe_red` rejected with
+  `named test outcome was PASSED` -- true but describing a consequence, so the
+  operator had to reverse-engineer the cause. An observed run stranded a
+  complete work unit exactly this way after an operator commit snapshotted its
+  in-flight production file. The rejection now names the cause when nothing was
+  stashed: that no production change was removed, that this normally means the
+  rows were committed out of band, and how to re-derive an observable RED.
+  Deliberately diagnostic-only -- the pass/fail decision is unchanged and no
+  reconstruction is attempted. "Nothing to stash" remains legitimate on its own
+  (test-first TDD, where a pinning test committed alongside still-broken
+  production source genuinely fails; `TestJourneyJ8HonestBehaviorFix` pins
+  that path), so the run still happens and the outcome still decides.
+
 - **The orchestrator exited permanently, and reported a clean exit, when the
   model ended its own turn with the backlog unfinished** (issue #339). The
   orchestrate loop is designed to stop on exactly three conditions --

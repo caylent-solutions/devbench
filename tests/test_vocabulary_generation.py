@@ -36,9 +36,22 @@ Covers:
   end against a fixture repository tree; writes go through
   ``atomic_write_text`` (AC-E2-F5-S1-T1-6, asserted via a tracking wrapper);
   a second consecutive run produces zero diff (AC-E2-F5-S1-T1-2, AC-11).
+- ``all_generated_relative_paths``: single enumeration combining
+  ``DOC_RELATIVE_PATH`` and ``PROMPT_TARGETS``' keys, with no duplicates
+  (AC-E2-F5-S1-T3-1).
+- ``find_drifted_surfaces``: reports no drift on a freshly generated tree;
+  reports exactly the surface a hand-edit touched (parametrized off
+  ``all_generated_relative_paths`` so a newly added surface is covered
+  automatically, AC-E2-F5-S1-T3-4); never mutates the tree it inspects, even
+  when it reports drift (AC-E2-F5-S1-T3-2); propagates ``GuardMarkerError``
+  for a surface with missing/unterminated guard markers rather than treating
+  it as clean (AC-E2-F5-S1-T3-5).
 - ``main``: happy path returns 0 and reports every generated path; a
   guard-marker failure in any target surface returns 1 with an ``ERROR:``
-  line on stderr naming the file.
+  line on stderr naming the file; ``--check`` verifies instead of
+  regenerating, exiting 0 on a clean tree and 1 -- naming every drifted
+  surface plus a single remediation line built from ``DRIFT_REMEDIATION_COMMAND``
+  -- on a drifted one (AC-E2-F5-S1-T3-3).
 - ``_repo_root``: resolves to this checkout's actual root.
 - Module-internal consistency between this test file's literal fixtures and
   the production module's own constant tables (guards against silent drift
@@ -47,6 +60,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import ModuleType
 
@@ -331,14 +345,24 @@ def _write_doc_fixture(path: Path) -> None:
     path.write_text("# Review-Feedback Vocabulary\n\n" + "\n".join(sections), encoding="utf-8")
 
 
+def _build_fixture_repo(root: Path) -> Path:
+    """Populate ``root`` with a minimal repo tree shaped like the real
+    target surfaces (the doc surface plus every prompt-target surface).
+
+    Shared by the ``fixture_repo`` fixture and by
+    ``TestFindDriftedSurfaces.test_mutating_each_surface_in_turn_is_reported_individually``,
+    which needs one fresh tree per surface rather than a single shared one.
+    """
+    _write_doc_fixture(root / _DOC_RELATIVE_PATH)
+    for relative_path, judge in _PROMPT_TARGET_ITEMS:
+        _write_prompt_fixture(root / relative_path, judge)
+    return root
+
+
 @pytest.fixture
 def fixture_repo(tmp_path: Path) -> Path:
     """Build a minimal repo tree shaped like the real target surfaces."""
-    repo_root = tmp_path / "repo"
-    _write_doc_fixture(repo_root / _DOC_RELATIVE_PATH)
-    for relative_path, judge in _PROMPT_TARGET_ITEMS:
-        _write_prompt_fixture(repo_root / relative_path, judge)
-    return repo_root
+    return _build_fixture_repo(tmp_path / "repo")
 
 
 class TestGeneratePromptFile:
@@ -427,6 +451,105 @@ class TestGenerateAll:
 
 
 # ---------------------------------------------------------------------------
+# all_generated_relative_paths / find_drifted_surfaces
+# ---------------------------------------------------------------------------
+
+
+def _hand_edit_within_guard_markers(vg: ModuleType, content: str) -> str:
+    """Insert a byte inside the first guard-marker pair of *content*.
+
+    Shared by every drift test that needs a real (non-guard-marker-breaking)
+    mutation: inserting right after the opening marker always lands inside
+    an existing pair, so the mutation changes rendered content without
+    ever tripping ``GuardMarkerError`` itself.
+    """
+    marker_index = content.index(vg.GUARD_MARKER_START) + len(vg.GUARD_MARKER_START)
+    return content[:marker_index] + "\nHAND_EDITED_ROW\n" + content[marker_index:]
+
+
+class TestAllGeneratedRelativePaths:
+    """AC-E2-F5-S1-T3-1: single enumeration -- the doc surface plus every
+    ``PROMPT_TARGETS`` key -- so ``generate_all`` and ``find_drifted_surfaces``
+    can never iterate a different file set from one another."""
+
+    @pytest.mark.unit
+    def test_matches_doc_relative_path_and_prompt_targets(self, vg: ModuleType) -> None:
+        assert vg.all_generated_relative_paths() == (vg.DOC_RELATIVE_PATH, *vg.PROMPT_TARGETS.keys())
+
+    @pytest.mark.unit
+    def test_no_duplicate_entries(self, vg: ModuleType) -> None:
+        paths = vg.all_generated_relative_paths()
+        assert len(paths) == len(set(paths))
+
+
+class TestFindDriftedSurfaces:
+    """AC-E2-F5-S1-T3-1/2/4/5: regenerates every guard-marked surface into a
+    scratch directory and diffs it against the committed tree, without ever
+    writing to the tree it inspects."""
+
+    @pytest.mark.unit
+    def test_freshly_generated_tree_reports_no_drift(self, vg: ModuleType, fixture_repo: Path) -> None:
+        vg.generate_all(fixture_repo)
+        assert vg.find_drifted_surfaces(fixture_repo) == []
+
+    @pytest.mark.unit
+    def test_hand_edited_surface_is_reported(self, vg: ModuleType, fixture_repo: Path) -> None:
+        vg.generate_all(fixture_repo)
+        doc_path = fixture_repo / vg.DOC_RELATIVE_PATH
+        original = doc_path.read_text(encoding="utf-8")
+        doc_path.write_text(_hand_edit_within_guard_markers(vg, original), encoding="utf-8")
+        assert vg.find_drifted_surfaces(fixture_repo) == [vg.DOC_RELATIVE_PATH]
+
+    @pytest.mark.unit
+    def test_mutating_each_surface_in_turn_is_reported_individually(self, vg: ModuleType, tmp_path: Path) -> None:
+        """AC-E2-F5-S1-T3-4: loops over ``all_generated_relative_paths()`` (the
+        module's own enumeration) rather than a re-typed list in this test
+        file, so a surface added to the module later is exercised here
+        without a matching test-file edit -- the failure mode a second
+        hand-maintained copy of this list in the build file would allow."""
+        for relative_path in vg.all_generated_relative_paths():
+            repo_root = _build_fixture_repo(tmp_path / relative_path.replace("/", "_"))
+            vg.generate_all(repo_root)
+
+            target = repo_root / relative_path
+            original = target.read_text(encoding="utf-8")
+            mutated = _hand_edit_within_guard_markers(vg, original)
+            assert mutated != original, f"Mutation produced no change for {relative_path}"
+            target.write_text(mutated, encoding="utf-8")
+
+            drifted = vg.find_drifted_surfaces(repo_root)
+            assert drifted == [relative_path], (
+                f"Mutating only {relative_path} should report exactly that surface; got {drifted}"
+            )
+
+    @pytest.mark.unit
+    def test_never_writes_to_the_inspected_tree(self, vg: ModuleType, fixture_repo: Path) -> None:
+        """AC-E2-F5-S1-T3-2: every surface's bytes are identical before and
+        after a run that itself reports drift."""
+        vg.generate_all(fixture_repo)
+        doc_path = fixture_repo / vg.DOC_RELATIVE_PATH
+        original = doc_path.read_text(encoding="utf-8")
+        doc_path.write_text(_hand_edit_within_guard_markers(vg, original), encoding="utf-8")
+
+        relative_paths = vg.all_generated_relative_paths()
+        before = {relative_path: (fixture_repo / relative_path).read_bytes() for relative_path in relative_paths}
+        drifted = vg.find_drifted_surfaces(fixture_repo)
+        after = {relative_path: (fixture_repo / relative_path).read_bytes() for relative_path in relative_paths}
+
+        assert drifted, "Expected the hand-edit to be reported as drift"
+        assert before == after
+
+    @pytest.mark.unit
+    def test_missing_guard_marker_raises_naming_file(self, vg: ModuleType, fixture_repo: Path) -> None:
+        """AC-E2-F5-S1-T3-5: a marker-less surface fails fast rather than being
+        silently treated as clean."""
+        broken = fixture_repo / vg.DOC_RELATIVE_PATH
+        broken.write_text("no markers anywhere in this doc\n", encoding="utf-8")
+        with pytest.raises(vg.GuardMarkerError, match=re.escape(vg.DOC_RELATIVE_PATH)):
+            vg.find_drifted_surfaces(fixture_repo)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -463,6 +586,108 @@ class TestMain:
         err = capsys.readouterr().err
         assert err.startswith("ERROR:")
         assert str(broken) in err
+
+    @pytest.mark.unit
+    def test_argv_without_check_flag_still_regenerates(
+        self,
+        vg: ModuleType,
+        fixture_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """An empty/non-``--check`` argv must not accidentally enter check mode."""
+        monkeypatch.setattr(vg, "_repo_root", lambda: fixture_repo)
+        exit_code = vg.main([])
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "generated:" in out
+
+
+class TestMainCheckMode:
+    """AC-E2-F5-S1-T3-3: ``main([CHECK_FLAG])`` verifies without regenerating."""
+
+    @pytest.mark.unit
+    def test_clean_tree_returns_zero_without_regenerating(
+        self,
+        vg: ModuleType,
+        fixture_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        vg.generate_all(fixture_repo)
+        committed = {p: p.read_bytes() for p in fixture_repo.rglob("*.md")}
+        monkeypatch.setattr(vg, "_repo_root", lambda: fixture_repo)
+        exit_code = vg.main([vg.CHECK_FLAG])
+        assert exit_code == 0
+        after = {p: p.read_bytes() for p in fixture_repo.rglob("*.md")}
+        assert after == committed
+
+    @pytest.mark.unit
+    def test_drifted_tree_returns_one_naming_surface_and_remediation(
+        self,
+        vg: ModuleType,
+        fixture_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        vg.generate_all(fixture_repo)
+        doc_path = fixture_repo / vg.DOC_RELATIVE_PATH
+        doc_path.write_text(_hand_edit_within_guard_markers(vg, doc_path.read_text(encoding="utf-8")), encoding="utf-8")
+        monkeypatch.setattr(vg, "_repo_root", lambda: fixture_repo)
+        exit_code = vg.main([vg.CHECK_FLAG])
+        assert exit_code == 1
+        err = capsys.readouterr().err
+        assert vg.DOC_RELATIVE_PATH in err
+        assert vg.DRIFT_REMEDIATION_COMMAND in err
+
+    @pytest.mark.unit
+    def test_remediation_command_is_a_single_module_constant_printed_once(
+        self,
+        vg: ModuleType,
+        fixture_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-E2-F5-S1-T3-3: the remediation text is not repeated at each
+        drifted surface's line, even when more than one surface drifted."""
+        vg.generate_all(fixture_repo)
+        first_prompt_relative_path = next(iter(vg.PROMPT_TARGETS))
+        for relative_path in (vg.DOC_RELATIVE_PATH, first_prompt_relative_path):
+            target = fixture_repo / relative_path
+            target.write_text(_hand_edit_within_guard_markers(vg, target.read_text(encoding="utf-8")), encoding="utf-8")
+        monkeypatch.setattr(vg, "_repo_root", lambda: fixture_repo)
+        exit_code = vg.main([vg.CHECK_FLAG])
+        assert exit_code == 1
+        err = capsys.readouterr().err
+        assert err.count(vg.DRIFT_REMEDIATION_COMMAND) == 1, f"Expected exactly one occurrence, got stderr:\n{err}"
+        assert vg.DOC_RELATIVE_PATH in err
+        assert first_prompt_relative_path in err
+
+    @pytest.mark.unit
+    def test_guard_marker_failure_in_check_mode_returns_one_with_stderr(
+        self,
+        vg: ModuleType,
+        fixture_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        broken = fixture_repo / vg.DOC_RELATIVE_PATH
+        broken.write_text("no markers anywhere\n", encoding="utf-8")
+        monkeypatch.setattr(vg, "_repo_root", lambda: fixture_repo)
+        exit_code = vg.main([vg.CHECK_FLAG])
+        assert exit_code == 1
+        err = capsys.readouterr().err
+        assert err.startswith("ERROR:")
+        assert vg.DOC_RELATIVE_PATH in err
+
+
+class TestDriftRemediationCommandConstant:
+    """The remediation command is pinned as a single module constant naming
+    the regeneration make target (AC-E2-F5-S1-T3-3)."""
+
+    @pytest.mark.unit
+    def test_value_names_the_generate_vocabulary_make_target(self, vg: ModuleType) -> None:
+        assert vg.DRIFT_REMEDIATION_COMMAND == "make generate-vocabulary"
 
 
 # ---------------------------------------------------------------------------

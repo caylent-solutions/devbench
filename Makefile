@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage generate-vocabulary validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage generate-vocabulary check-vocabulary-drift validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -100,15 +100,25 @@ test: test-unit
 generate-vocabulary:
 	uv run python -m devbench.vocabulary_generation
 
-## validate: Full validation (all checks -- identical to CI and pre-push)
-validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage
+## check-vocabulary-drift: Verify every guard-marked vocabulary surface
+## matches its regenerated form (spec 4.10, AC-11). Single delegation to the
+## generator module's own check mode -- carries no separate copy of the
+## surface list, so a surface added to the module is covered automatically.
+## Fails naming the offending file(s) and `make generate-vocabulary` when a
+## generated block was hand-edited (or JUDGE_CATEGORIES changed without
+## regenerating). Never writes to the working tree.
+check-vocabulary-drift:
+	uv run python -m devbench.vocabulary_generation --check
+
+## validate: Full validation (CI's job set plus check-vocabulary-drift, which CI reaches only indirectly via TestVocabularyDriftCheck in test-coverage)
+validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck check-vocabulary-drift test-coverage
 	@echo "All validations passed"
 
 ## pre-commit-check: Checks that run on every commit (fast)
 pre-commit-check: lint-ruff format-check
 	@echo "Pre-commit checks passed"
 
-## pre-push-check: Checks that run before push (full -- identical to CI)
+## pre-push-check: Checks that run before push (runs validate, a superset of CI's job set that also gates check-vocabulary-drift)
 pre-push-check: validate
 	@echo "Pre-push checks passed"
 

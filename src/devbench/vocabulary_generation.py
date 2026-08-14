@@ -28,11 +28,24 @@ from ``JUDGE_CATEGORIES`` (which stores only codes) so it is captured once,
 here, in ``CATEGORY_DESCRIPTIONS`` -- the single remaining hand-maintained
 copy of that prose, validated against ``JUDGE_CATEGORIES`` at generation
 time so the two cannot silently drift apart.
+
+``find_drifted_surfaces`` (invoked via ``make check-vocabulary-drift``,
+which runs this module in check mode as
+``python -m devbench.vocabulary_generation --check``) regenerates every
+surface listed by :func:`all_generated_relative_paths` into a scratch
+directory and diffs it against the committed tree, never writing to the
+tree it inspects. It reuses ``all_generated_relative_paths`` -- the same
+enumeration ``generate_all`` iterates -- so there is exactly one place that
+lists the guard-marked surfaces; a second hand-maintained copy of this list
+in the build file would let a newly added surface sit outside the gate.
 """
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -423,6 +436,49 @@ def generate_doc_file(path: Path) -> None:
     atomic_write_text(path, content)
 
 
+def all_generated_relative_paths() -> tuple[str, ...]:
+    """Every guard-marked surface this module generates or verifies, repo-relative.
+
+    Single source of truth combining :data:`DOC_RELATIVE_PATH` and
+    :data:`PROMPT_TARGETS`'s keys, in generation order (the docs surface
+    first, then each prompt file in ``PROMPT_TARGETS`` declaration order).
+    Both :func:`generate_all` and :func:`find_drifted_surfaces` iterate this
+    one enumeration, so the two can never disagree on which surfaces exist
+    -- the failure mode a hand-maintained, second copy of this list (as the
+    ``Makefile`` previously carried) allowed.
+
+    Returns:
+        Repo-relative paths, doc surface first.
+    """
+    return (DOC_RELATIVE_PATH, *PROMPT_TARGETS.keys())
+
+
+def _generate_surface(repo_root: Path, relative_path: str) -> Path:
+    """Regenerate exactly one guard-marked surface identified by *relative_path*, in place.
+
+    Args:
+        repo_root: Absolute path of the repository root *relative_path* is
+            resolved against.
+        relative_path: One entry of :func:`all_generated_relative_paths`.
+
+    Returns:
+        The absolute path written.
+
+    Raises:
+        GuardMarkerError: The surface is missing its guard-marker pair, or
+            has an unterminated one.
+        ValueError: *relative_path* is the docs surface and a
+            ``CATEGORY_DESCRIPTIONS`` entry has drifted from
+            ``JUDGE_CATEGORIES`` for one of ``DOC_JUDGES``.
+    """
+    path = repo_root / relative_path
+    if relative_path == DOC_RELATIVE_PATH:
+        generate_doc_file(path)
+    else:
+        generate_prompt_file(path, PROMPT_TARGETS[relative_path])
+    return path
+
+
 def generate_all(repo_root: Path) -> list[Path]:
     """Regenerate every guard-marked surface under *repo_root*.
 
@@ -431,9 +487,8 @@ def generate_all(repo_root: Path) -> list[Path]:
             containing ``Makefile`` and ``docs/``).
 
     Returns:
-        The absolute paths written, in the order generated: the docs
-        surface first, then each prompt file in ``PROMPT_TARGETS``
-        declaration order.
+        The absolute paths written, in :func:`all_generated_relative_paths`
+        order.
 
     Raises:
         GuardMarkerError: Any target surface is missing its guard-marker
@@ -444,21 +499,68 @@ def generate_all(repo_root: Path) -> list[Path]:
         ValueError: A ``CATEGORY_DESCRIPTIONS`` entry is out of sync with
             ``JUDGE_CATEGORIES``.
     """
-    written: list[Path] = []
-    doc_path = repo_root / DOC_RELATIVE_PATH
-    generate_doc_file(doc_path)
-    written.append(doc_path)
-    for relative_path, judge in PROMPT_TARGETS.items():
-        prompt_path = repo_root / relative_path
-        generate_prompt_file(prompt_path, judge)
-        written.append(prompt_path)
-    return written
+    return [_generate_surface(repo_root, relative_path) for relative_path in all_generated_relative_paths()]
 
 
 # ---------------------------------------------------------------------------
-# Script entry point (``make generate-vocabulary`` runs this module via
-# ``python -m devbench.vocabulary_generation``).
+# Drift check (spec 4.10, AC-11; ``make check-vocabulary-drift`` runs this
+# module in check mode via ``python -m devbench.vocabulary_generation
+# --check``).
 # ---------------------------------------------------------------------------
+
+
+def find_drifted_surfaces(repo_root: Path) -> list[str]:
+    """Regenerate every guard-marked surface into a scratch directory and diff it against *repo_root*.
+
+    Never writes to *repo_root* itself: every committed surface is copied
+    into a temporary scratch directory, which is what :func:`generate_all`
+    actually regenerates; *repo_root*'s own files are only ever read.
+
+    Args:
+        repo_root: Absolute path of the repository root whose committed
+            surfaces are inspected.
+
+    Returns:
+        Repo-relative paths, in :func:`all_generated_relative_paths` order,
+        whose committed bytes differ from freshly regenerated bytes. An
+        empty list means no drift.
+
+    Raises:
+        GuardMarkerError: A surface's guard markers are missing or
+            malformed. Propagated unchanged rather than swallowed -- a
+            marker-less surface is a real defect the check must fail fast
+            on, not a signal to treat that surface as clean.
+        ValueError: A ``CATEGORY_DESCRIPTIONS`` entry has drifted from
+            ``JUDGE_CATEGORIES``. Propagated unchanged, same reasoning.
+    """
+    relative_paths = all_generated_relative_paths()
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        scratch_root = Path(scratch_dir)
+        for relative_path in relative_paths:
+            destination = scratch_root / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(repo_root / relative_path, destination)
+        generate_all(scratch_root)
+        return [
+            relative_path
+            for relative_path in relative_paths
+            if (repo_root / relative_path).read_bytes() != (scratch_root / relative_path).read_bytes()
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Script entry point (``make generate-vocabulary`` / ``make
+# check-vocabulary-drift`` run this module via ``python -m
+# devbench.vocabulary_generation`` -- the latter with ``--check``).
+# ---------------------------------------------------------------------------
+
+#: ``main`` argv flag that switches from regenerate mode to verify mode.
+CHECK_FLAG: Final[str] = "--check"
+
+#: Command an operator runs to fix reported drift. A single module constant
+#: so the text is never repeated (and so can never itself drift) across the
+#: per-surface stderr lines `_run_check` prints.
+DRIFT_REMEDIATION_COMMAND: Final[str] = "make generate-vocabulary"
 
 
 def _repo_root() -> Path:
@@ -469,16 +571,16 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def main() -> int:
-    """Regenerate every vocabulary surface in this checkout.
+def _run_generate(repo_root: Path) -> int:
+    """Regenerate every vocabulary surface under *repo_root*, in place.
 
     Returns:
-        ``0`` on success. ``1`` if any target surface's guard markers are
+        ``0`` on success, printing one ``generated:`` line per surface
+        written. ``1`` if a target surface's guard markers are
         missing/malformed or a ``CATEGORY_DESCRIPTIONS`` entry drifted from
         ``JUDGE_CATEGORIES`` -- an ``ERROR:`` line naming the surface and
         the remedy is printed to stderr.
     """
-    repo_root = _repo_root()
     try:
         written = generate_all(repo_root)
     except (GuardMarkerError, ValueError) as exc:
@@ -489,5 +591,56 @@ def main() -> int:
     return 0
 
 
+def _run_check(repo_root: Path) -> int:
+    """Verify every vocabulary surface under *repo_root* without regenerating it.
+
+    Returns:
+        ``0`` if no surface has drifted. ``1`` if any surface has drifted
+        (one ``ERROR:`` stderr line naming each drifted surface, followed
+        by a single summary line naming :data:`DRIFT_REMEDIATION_COMMAND`),
+        or if a target surface's guard markers are missing/malformed (an
+        ``ERROR:`` line naming the surface).
+    """
+    try:
+        drifted = find_drifted_surfaces(repo_root)
+    except (GuardMarkerError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if not drifted:
+        print("vocabulary drift check passed: generated surfaces match the committed tree")
+        return 0
+    for relative_path in drifted:
+        print(
+            f"ERROR: '{relative_path}' has drifted from its generated form "
+            "(hand-edited after generation, or JUDGE_CATEGORIES changed without regenerating).",
+            file=sys.stderr,
+        )
+    print(
+        f"ERROR: vocabulary surface(s) have drifted. Run '{DRIFT_REMEDIATION_COMMAND}', "
+        "review the diff, and commit the result.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def main(argv: Sequence[str] = ()) -> int:
+    """Regenerate (default) or verify (``--check``) every vocabulary surface in this checkout.
+
+    Args:
+        argv: Command-line arguments after the program name. Defaults to an
+            empty tuple so calling ``main()`` directly (as this module's own
+            tests do) never inherits the calling process's ``sys.argv``.
+            Contains :data:`CHECK_FLAG` to switch to verify mode.
+
+    Returns:
+        See :func:`_run_generate` / :func:`_run_check` for the mode-specific
+        meaning of the returned code.
+    """
+    repo_root = _repo_root()
+    if CHECK_FLAG in argv:
+        return _run_check(repo_root)
+    return _run_generate(repo_root)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

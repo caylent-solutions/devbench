@@ -250,8 +250,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `make generate-vocabulary` run (Section 0.4); the `manifest_amender` table
   remains hand-maintained (different source of truth,
   `AMENDER_REJECTION_CATEGORIES`). The drift check that fails
-  `make validate` on an un-regenerated surface lands in the named successor
-  task E2-F5-S1-T2.
+  `make validate` on an un-regenerated surface is implemented as
+  `make check-vocabulary-drift`, described in the following entry.
+
+- **`make check-vocabulary-drift` -- `make validate` now fails on a
+  hand-edited generated vocabulary block** (spec
+  `integration-reality-gates-hardening.md` section 4.10, AC-11;
+  AC-E2-F5-S1-T2-1 through -3, AC-E2-F5-S1-T3-1 through -7). The drift-check
+  logic lives in `src/devbench/vocabulary_generation.py`, not the `Makefile`:
+  `all_generated_relative_paths()` is the single enumeration of every
+  guard-marked surface (the doc-surface constant plus the prompt-target
+  mapping keys -- no second, hand-maintained copy of that list exists
+  anywhere in production code; a literal fixture copy in
+  `tests/test_vocabulary_generation.py` is deliberately pinned to these same
+  constants by an equality assertion, so it cannot silently drift);
+  `find_drifted_surfaces()` regenerates each surface into a scratch
+  directory (never writing to the working tree it inspects) and diffs it
+  against the six committed surfaces; `main` in check mode
+  (`python -m devbench.vocabulary_generation --check`) reports the result,
+  naming the offending file(s) and `make generate-vocabulary` as the fix.
+  `check-vocabulary-drift` is now a single-line `Makefile` delegation to that
+  check mode, carrying no copy of the surface list, and remains a `validate`
+  prerequisite, so the pre-push hook catches a hand-edit before it is
+  pushed; CI does not invoke `make validate` directly, so it catches the
+  same hand-edit only indirectly, through `TestVocabularyDriftCheck` running
+  inside `make test-coverage`.
 
 - **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
   helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,

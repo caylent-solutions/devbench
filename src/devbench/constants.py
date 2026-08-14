@@ -1080,28 +1080,3 @@ SKILL_AUDIT_MAX_ITERATIONS_REACHED: str = "[SKILL_MAX_ITERATIONS_REACHED]"
 
 # Audit-row tag emitted when a skill converges (unresolved count <= threshold).
 SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"
-
-# ---------------------------------------------------------------------------
-# Harness/target install parity (issue #301, spec harness-target-install-parity.md)
-# devbench self-hosts through two checkouts: the harness install (the code
-# that executes) and a configured target repo (the checkout devbench edits).
-# Nothing compared the two before this constant existed, so the harness could
-# run arbitrarily stale orchestrator code indefinitely with no signal
-# (Section 1.2 incident record). Consumed by ``src/devbench/install_parity.py``.
-# ---------------------------------------------------------------------------
-
-# Pathspec passed to ``git rev-list --count <harness>..<target> -- <prefix>``
-# when counting how far a self-hosted target checkout has advanced past the
-# harness install (spec D-2). During self-hosting the target lands a commit
-# per completed task, so an unfiltered count is non-zero within minutes and
-# the gate would become noise; only commits touching this prefix can change
-# how the orchestrator behaves. Deliberately a module constant, not YAML
-# config (spec D-5): it describes this repository's own layout, an in-tree
-# invariant a config key would let an operator silently widen to nothing and
-# re-disable the gate.
-ORCHESTRATOR_SOURCE_PREFIX: str = "src/devbench/"
-
-# Shared install-parity short-revision / git-abbrev length (git short-hash
-# character count) consumed by every module that displays or compares
-# abbreviated revisions for the harness/target install-parity gate.
-INSTALL_PARITY_SHORT_REVISION_CHARS: int = 7

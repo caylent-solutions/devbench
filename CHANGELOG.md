@@ -123,38 +123,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   design decisions, including why classification is structural rather than
   message-based.
 
-- **The harness devbench install could run arbitrarily stale orchestrator code
-  against a self-hosted target checkout with no signal to the operator**
-  (issue #301). devbench self-hosts: the orchestrator executes from the
-  harness checkout (`harness/devbench`, resolved from
-  `src/devbench/install_parity.py`'s own package location) while landing
-  commits into a separate target checkout (`devbench/`, resolved via
-  `RepoConfig.resolved_checkout_path`) of the same repository, and nothing
-  compared the two -- on 2026-08-12 the harness ran 30+ commits behind the
-  target for over five hours before the resulting stale-code crash was
-  noticed. `src/devbench/install_parity.py` adds `resolve_install_parity`,
-  which resolves both installs' git identity (path, revision, branch, origin
-  URL) and detects self-hosting by canonical origin match, then counts
-  commits reachable from the target and not the harness that touch
-  `src/devbench/`. `devbench start`'s new pre-flight gate
-  (`cli._check_install_parity`) refuses to run -- exit code **1**, before any
-  PID file is written, any SDK session opens, or any work unit is claimed --
-  when self-hosting is detected and the harness is behind, naming both
-  installs' path/revision/branch, the missing commit count, and the exact
-  three-command resync procedure (`git fetch`, `git checkout -B`,
-  `uv sync --project`); a resolver failure (an unreadable checkout) is
-  itself fatal and also exits 1. There is no opt-out flag. `devbench report`
-  and `devbench status` render the identical comparison as an
-  `Install parity` row (`report.install_parity_line`, the single
-  row-rendering path both commands reuse) reading `IN SYNC` or
-  `BEHIND by <N> commit(s) touching src/devbench/`, rendered only when
-  self-hosting is detected and degrading to a single
-  `Install parity   unavailable: <reason>` line (the rest of the output
-  still renders) on a resolver failure. `docs/cli-reference.md` documents
-  the gate, its exit code, and the report/status row; the new
-  `docs/devbench-self-hosting.md` documents the two-checkout split and the
-  resync procedure.
-
 - **`add-dep` reported `"wired": true` and exited 0 even when the printed
   Manifest-conflict remedy stayed inert** (issue #330 FR-1, FR-2). The
   Manifest Conflict Rule's dep-chain scan reads the `## Dependencies`

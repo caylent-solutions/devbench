@@ -284,10 +284,6 @@ class TestRunCallsCheckQuotaAndDrainPerMessage:
         escape undispatched as it did before the resume loop was wired.
         """
         rate_limit_message = _make_rate_limit_message()
-        # repos={} (#301 FR-3): cmd_start's install-parity gate reads
-        # RUNTIME_CONFIG.repos before any orchestration work; an empty
-        # mapping makes resolve_install_parity report self_hosting=False so
-        # this fixture stays focused on quota dispatch, not install parity.
         fail_cfg = SimpleNamespace(
             quota_handling=QuotaHandlingConfig(enabled=True, on_exhaustion="fail"),
             repos={},

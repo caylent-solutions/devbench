@@ -975,38 +975,3 @@ class TestMinutesPerHourConstant:
 
         assert "MINUTES_PER_HOUR" in vars(constants_module)
         assert constants_module.MINUTES_PER_HOUR == constants_module.SECONDS_PER_MINUTE == 60
-
-
-class TestOrchestratorSourcePrefixConstant:
-    """#301 FR-1/D-5 (E15-F1-S1-T1): ``ORCHESTRATOR_SOURCE_PREFIX`` is the
-    pathspec ``git rev-list -- <prefix>`` filters on when counting how far a
-    self-hosted target checkout has advanced past the harness install. It is
-    a module constant, not YAML config (D-5), because it describes this
-    repository's own layout, an in-tree invariant a config key would let an
-    operator silently widen away."""
-
-    @pytest.mark.unit
-    def test_orchestrator_source_prefix_equals_src_devbench(self) -> None:
-        from devbench.constants import ORCHESTRATOR_SOURCE_PREFIX
-
-        assert ORCHESTRATOR_SOURCE_PREFIX == "src/devbench/"
-
-    @pytest.mark.unit
-    def test_orchestrator_source_prefix_is_str(self) -> None:
-        from devbench.constants import ORCHESTRATOR_SOURCE_PREFIX
-
-        assert isinstance(ORCHESTRATOR_SOURCE_PREFIX, str)
-
-    @pytest.mark.unit
-    def test_orchestrator_source_prefix_has_trailing_slash(self) -> None:
-        """A trailing slash keeps the git pathspec scoped to the directory
-        (not to any file merely prefixed by the same characters)."""
-        from devbench.constants import ORCHESTRATOR_SOURCE_PREFIX
-
-        assert ORCHESTRATOR_SOURCE_PREFIX.endswith("/")
-
-    @pytest.mark.unit
-    def test_orchestrator_source_prefix_is_own_module_level_name(self) -> None:
-        import devbench.constants as constants_module
-
-        assert "ORCHESTRATOR_SOURCE_PREFIX" in vars(constants_module)

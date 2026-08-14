@@ -89,9 +89,9 @@ Either of the following satisfies the requirement:
    feature container, real tab panel, or real routed page the component
    is actually rendered under in production, using the app's real
    store/provider setup (not a hand-rolled substitute). This exception
-   MUST be documented in the task's `### Approach` or `## Comments`
-   section with a one-line justification for why the literal entry point
-   was impractical and why the chosen ancestor still reproduces the real
+   MUST be documented in the task's `### Approach` section with a
+   one-line justification for why the literal entry point was
+   impractical and why the chosen ancestor still reproduces the real
    nesting.
 
 What does **not** satisfy the requirement, regardless of test count or

@@ -809,6 +809,24 @@ ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reaso
 # (Section 7.3).
 DEFAULT_MAX_QUOTA_RESUMES: int = 1000
 
+# Bound on the number of consecutive in-process restarts
+# ``_drive_orchestrate_with_quota_resume`` performs after a PREMATURE TURN END
+# -- the SDK session ending while backlog work remains and no terminal
+# sentinel (``ALL_DONE`` / ``NO_ACTIONABLE``) was ever observed. Overridable
+# via ``DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS`` and resolved through
+# ``_resolve_max_premature_turn_end_restarts``'s fail-safe parse, mirroring
+# ``DEFAULT_MAX_QUOTA_RESUMES``.
+#
+# Deliberately far lower than the quota / inactivity / transport cap: those
+# three failure modes each self-throttle (a quota window must elapse, an
+# inactivity restart costs a full timeout window, a transport fault is rare),
+# whereas a model that ends its turn immediately can do so again immediately.
+# Sharing the 1000 ceiling would let one reproducible prompt-following failure
+# burn a thousand consecutive sessions with no operator in the loop. This cap
+# is a cost guard, not a correctness bound: exhausting it is itself the signal
+# that the loop is not making progress and needs a human.
+DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS: int = 10
+
 # Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
 # permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]
 # resume=<n> max=<cap>`` (spec FR-2.10).

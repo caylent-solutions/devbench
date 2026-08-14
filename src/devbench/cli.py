@@ -220,6 +220,7 @@ from devbench.constants import (
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS,
     DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
@@ -7428,6 +7429,46 @@ class _OrchestrateTransportError(BaseException):
         self.original = original
 
 
+class _OrchestratePrematureTurnEnd(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when the SDK session ends with work left.
+
+    Sibling of :class:`_QuotaDetected`, :class:`_OrchestrateInactivityTimeout`
+    and :class:`_OrchestrateTransportError`: a :class:`BaseException` subclass
+    (not :class:`Exception`) so ``asyncio.run`` propagates it without any broad
+    ``except Exception`` handler swallowing it.
+
+    Raised when ``agen.__anext__()`` reports ``StopAsyncIteration`` -- the SDK
+    generator is exhausted -- WITHOUT the loop having already returned on a
+    terminal sentinel. A genuine end-of-run returns early from
+    :func:`_log_terminal_exit_if_applicable` the moment ``ALL_DONE`` /
+    ``NO_ACTIONABLE`` is observed, so reaching the end of the generator instead
+    means the model ended its own turn while backlog work remained.
+
+    Before this sentinel, that path was a bare ``break``: the orchestrator
+    exited permanently, rc=0, and the ``orchestrator_stop`` notification
+    labelled it a clean exit. That left the fastest-firing failure mode as the
+    only one with no recovery at all, while a model going *silent* for the
+    inactivity window (a slower form of the same failure) already earned a
+    bounded fresh-session restart. The observed trigger was a model ending its
+    turn on the claim that it had scheduled a background notification to wake
+    itself, a capability devbench does not have.
+
+    Args:
+        result_text: The last ``ResultMessage.result`` text observed before the
+            generator ended, or ``None`` when the SDK emitted none. Carried into
+            this sentinel's message so the restart log line records what the
+            model actually said instead of discarding the only diagnostic.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, result_text: str | None) -> None:
+        detail = f": {result_text}" if result_text else " (no SDK result text)"
+        super().__init__(f"SDK session ended with no terminal sentinel{detail}")
+        self.result_text = result_text
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -7997,6 +8038,35 @@ def _resolve_max_quota_resumes() -> int:
     return DEFAULT_MAX_QUOTA_RESUMES
 
 
+def _resolve_max_premature_turn_end_restarts() -> int:
+    """Return the effective premature-turn-end restart cap (env > default).
+
+    Mirrors :func:`_resolve_max_quota_resumes`'s fail-safe parse for
+    ``DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS``: a missing, empty,
+    non-integer, or non-positive value falls back to
+    :data:`~devbench.constants.DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS` so a
+    typo can neither remove the bound nor disable the restart loop.
+
+    This cap is deliberately separate from (and much lower than) the shared
+    quota / inactivity / transport ceiling -- see the constant's own comment for
+    why a fast-repeating turn end needs a tighter cost guard than the three
+    self-throttling failure modes.
+
+    Returns:
+        The maximum number of consecutive in-process premature-turn-end
+        restarts ``cmd_start`` performs before failing fast.
+    """
+    raw = os.environ.get("DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+        if parsed > 0:
+            return parsed
+    return DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+
+
 def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> bool:
     """Decide whether ``cmd_start`` may resume the orchestrate skill in-process.
 
@@ -8143,6 +8213,90 @@ def _should_restart_after_transport_error(restarts_used: int, max_resumes: int) 
     return True
 
 
+#: Audit markers for the premature-turn-end bounded-restart path. Siblings of
+#: the transport-error markers above; the orchestrate loop is designed to stop
+#: only on ``ALL_DONE`` / ``NO_ACTIONABLE`` / operator drain, so a turn end with
+#: work remaining is a recoverable fault that earns a fresh session, not an exit.
+_ORCHESTRATOR_PREMATURE_TURN_END_AUDIT_PREFIX: str = "[ORCHESTRATOR_PREMATURE_TURN_END]"
+_ORCHESTRATOR_PREMATURE_TURN_END_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_PREMATURE_TURN_END_RESTART]"
+_ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = (
+    "[ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED]"
+)
+
+
+def _has_actionable_work_remaining() -> bool:
+    """Return ``True`` when the backlog still holds a claimable task.
+
+    Gates the premature-turn-end escalation in ``cmd_start._run``: the loop must
+    never end while work remains, but with nothing actionable left, the SDK
+    session ending IS the ``NO_ACTIONABLE`` condition -- just discovered here
+    rather than announced by the model -- so a restart would spend another
+    session re-deriving the same answer.
+
+    Delegates to :meth:`~devbench.backlog.parser.BacklogParser.find_next_actionable`,
+    the same selector ``devbench next`` uses, so this check can never disagree
+    with the orchestrate loop about what counts as actionable (it resumes
+    ``in-progress`` tasks before ``in-queue`` ones, and treats a task with
+    unsatisfied dependencies as not actionable).
+
+    A backlog that cannot be read is reported as "no actionable work": the SDK
+    session has already ended by the time this runs, so the alternative would be
+    to restart into a workspace whose index is unreadable and fail again there.
+    The parse failure is logged rather than swallowed, and the run still stops
+    with the honest premature-turn-end label.
+
+    Returns:
+        ``True`` when at least one task is actionable; ``False`` when none is or
+        the backlog index cannot be parsed.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        return parser.find_next_actionable(parser.parse_index()) is not None
+    except (OSError, ValueError) as exc:
+        logger.error(
+            "premature-turn-end actionability check could not read the backlog index: %r; "
+            "treating as no actionable work",
+            exc,
+        )
+        return False
+
+
+def _should_restart_after_premature_turn_end(restarts_used: int, max_restarts: int) -> bool:
+    """Decide whether ``cmd_start`` may reopen a fresh SDK session after a premature turn end.
+
+    Mirrors :func:`_should_restart_after_transport_error`'s bounded-restart
+    shape, but bounded by :func:`_resolve_max_premature_turn_end_restarts`
+    rather than the shared quota ceiling, because this fault can repeat
+    immediately whereas quota / inactivity / transport faults each self-throttle.
+
+    - Below the cap: emits ``[ORCHESTRATOR_PREMATURE_TURN_END_RESTART]
+      attempt=<n> max=<cap>`` and returns ``True`` (caller re-runs ``_run`` in a
+      fresh session on the remaining backlog).
+    - At the cap: emits ``[ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED]
+      max=<cap>`` and returns ``False`` so the caller fails fast rather than
+      looping without progress.
+
+    Args:
+        restarts_used: Premature-turn-end restarts already performed during this
+            ``cmd_start`` invocation (0 on the first occurrence).
+        max_restarts: The cap from :func:`_resolve_max_premature_turn_end_restarts`.
+
+    Returns:
+        ``True`` when another in-process restart is permitted; ``False`` when the
+        cap is exhausted and the run must fail fast.
+    """
+    if restarts_used >= max_restarts:
+        logger.info("%s max=%d", _ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_restarts)
+        return False
+    logger.info(
+        "%s attempt=%d max=%d",
+        _ORCHESTRATOR_PREMATURE_TURN_END_RESTART_AUDIT_PREFIX,
+        restarts_used + 1,
+        max_restarts,
+    )
+    return True
+
+
 class _OrchestrateLoopResult(NamedTuple):
     """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
 
@@ -8238,7 +8392,9 @@ def _drive_orchestrate_with_quota_resume(
     resumes_used = 0
     inactivity_restarts_used = 0
     transport_restarts_used = 0
+    premature_restarts_used = 0
     max_resumes = _resolve_max_quota_resumes()
+    max_premature_restarts = _resolve_max_premature_turn_end_restarts()
     while True:
         try:
             asyncio.run(run())
@@ -8271,6 +8427,18 @@ def _drive_orchestrate_with_quota_resume(
             )
             if _should_restart_after_transport_error(transport_restarts_used, max_resumes):
                 transport_restarts_used += 1
+                continue
+            raise
+        except _OrchestratePrematureTurnEnd as exc:
+            logger.error(
+                "%s restart=%d max=%d: %s",
+                _ORCHESTRATOR_PREMATURE_TURN_END_AUDIT_PREFIX,
+                premature_restarts_used + 1,
+                max_premature_restarts,
+                exc,
+            )
+            if _should_restart_after_premature_turn_end(premature_restarts_used, max_premature_restarts):
+                premature_restarts_used += 1
                 continue
             raise
         return _OrchestrateLoopResult(None, "clean", False)
@@ -8701,17 +8869,27 @@ def _resolve_clean_stop_reason(current_reason: str, sdk_result_text: str | None)
     from ``cmd_start`` so its branch count stays under ruff's PLR0912
     ceiling:
 
-    1. ``sdk_result_text`` is present -> ``"clean exit: <text>"`` (issue
-       #217: surfaces the orchestrate skill's ``ALL_DONE`` /
+    1. ``sdk_result_text`` actually CARRIES a terminal sentinel
+       (:func:`_is_terminal_orchestrate_result`) -> ``"clean exit: <text>"``
+       (issue #217: surfaces the orchestrate skill's ``ALL_DONE`` /
        ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` end-of-run summary).
-    2. No result text AND ``current_reason`` is still the ``"clean"`` seed
-       -> the distinct :data:`_PREMATURE_TURN_END_REASON` (db-271): the SDK
-       loop exited cleanly (``StopAsyncIteration``, no drain/quota) but
-       never captured a terminal sentinel, so keeping the bare ``"clean"``
-       label would hide a stalled/aborted mid-cascade run behind the same
-       wording as a genuinely finished one.
+    2. Otherwise, when ``current_reason`` is still the ``"clean"`` seed ->
+       the distinct :data:`_PREMATURE_TURN_END_REASON` (db-271), with any
+       non-terminal result text appended verbatim for diagnosis.
     3. Otherwise, ``current_reason`` already carries the loop-provided
        drain / quota disposition -- returned unchanged.
+
+    Rule 1 tests the text for a terminal sentinel rather than merely for
+    being non-empty. The original truthy check (PR #202) predates the
+    premature-turn-end bucket and made rule 2 unreachable whenever the model
+    said ANYTHING before stopping: an observed run ended on the model's own
+    narration ("the executor agent is running in the background... I'll
+    continue automatically", a capability devbench does not have) and that
+    narration was reported to the operator as ``clean exit``, indistinguishable
+    from a finished backlog. Only the two sentinels the orchestrate skill
+    actually emits at end-of-run may claim a clean exit; the text is retained
+    on the premature path so the operator sees what the model claimed instead
+    of losing the only diagnostic.
 
     Args:
         current_reason: The ``_stop_reason`` value accumulated so far.
@@ -8721,9 +8899,11 @@ def _resolve_clean_stop_reason(current_reason: str, sdk_result_text: str | None)
     Returns:
         The resolved stop-reason label.
     """
-    if sdk_result_text:
+    if _is_terminal_orchestrate_result(sdk_result_text):
         return f"clean exit: {sdk_result_text}"
     if current_reason == "clean":
+        if sdk_result_text:
+            return f"{_PREMATURE_TURN_END_REASON}; last SDK result text: {sdk_result_text}"
         return _PREMATURE_TURN_END_REASON
     return current_reason
 
@@ -9162,6 +9342,24 @@ def cmd_start(*argv: str) -> int:
                 try:
                     message = await asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)
                 except StopAsyncIteration:
+                    # The generator is exhausted WITHOUT the loop having already
+                    # returned on a terminal sentinel: a genuine end-of-run
+                    # returns from _log_terminal_exit_if_applicable the moment
+                    # ALL_DONE / NO_ACTIONABLE is observed. Reaching here means
+                    # the model stopped talking without announcing why.
+                    #
+                    # Escalate to the bounded-restart path ONLY when the backlog
+                    # still holds actionable work: that is the case the loop must
+                    # never end on (it stops only on a terminal sentinel or an
+                    # operator drain), and it was previously a bare ``break`` --
+                    # the one failure mode with no recovery, while a model going
+                    # silent for the inactivity window already earned a restart.
+                    # With nothing actionable left, ending here IS the
+                    # NO_ACTIONABLE condition, just discovered by us rather than
+                    # announced by the model, so restarting would only re-derive
+                    # the same answer at the cost of another session.
+                    if _has_actionable_work_remaining():
+                        raise _OrchestratePrematureTurnEnd(_sdk_result_text) from None
                     break
                 except TimeoutError:
                     raise _OrchestrateInactivityTimeout(_ORCH_INACTIVITY_TIMEOUT) from None

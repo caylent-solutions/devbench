@@ -5,6 +5,58 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **The orchestrator exited permanently, and reported a clean exit, when the
+  model ended its own turn with the backlog unfinished** (issue #339). The
+  orchestrate loop is designed to stop on exactly three conditions --
+  `ALL_DONE`, `NO_ACTIONABLE`, or an operator drain -- but a fourth path
+  ended it silently. Observed 2026-08-14T14:44 with 105 of 138 work units
+  outstanding: the orchestrator attempted `git add` itself (out of scope; a
+  guard hook correctly denied it), then ended its turn claiming "the executor
+  agent is running in the background ... I've scheduled a fallback check-in
+  ... I'll continue the orchestrate loop automatically". devbench has no
+  background execution, no completion callback, and no scheduler; nothing
+  resumed it and the daemon exited rc=0.
+
+  Three defects, fixed together:
+
+  1. `cmd_start._run` treated the SDK generator's `StopAsyncIteration` as a
+     normal exit (a bare `break`), leaving the fastest-firing failure mode as
+     the only one with no recovery, while a model going *silent* for the
+     inactivity window -- a slower form of the same failure -- already earned
+     a bounded fresh-session restart. It now raises the new
+     `_OrchestratePrematureTurnEnd` sentinel (a `BaseException`, matching its
+     quota / inactivity / transport siblings) carrying the model's last result
+     text, and `_drive_orchestrate_with_quota_resume` disposes of it as a
+     bounded restart on the remaining backlog. A genuine end-of-run never
+     reaches this path: the loop returns as soon as a terminal sentinel is
+     observed. The restart is bounded by its own
+     `DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS` cap (new
+     `DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS`, default 10) rather than the
+     shared 1000-resume ceiling: quota, inactivity, and transport faults each
+     self-throttle, whereas an immediate turn end can repeat immediately, so
+     sharing that ceiling would let one reproducible prompt-following failure
+     burn a thousand consecutive sessions unattended.
+  2. `_resolve_clean_stop_reason` promoted ANY non-empty
+     `ResultMessage.result` text to `clean exit: <text>`, so the model's own
+     narration was reported to the operator as a clean exit, indistinguishable
+     from a finished backlog. This truthy check predates the
+     premature-turn-end bucket (added later, by db-271) and made that bucket
+     unreachable whenever the model said anything at all before stopping.
+     Rule 1 now requires the text to actually carry a terminal sentinel
+     (`_is_terminal_orchestrate_result`, the same helper the SDK loop uses),
+     and the premature label retains the non-terminal text verbatim so the
+     operator sees what the model claimed instead of losing the only
+     diagnostic. Issue #217's intent -- surfacing
+     `NO_ACTIONABLE -- 190/212 done, 11 blocked` in the ping -- is preserved
+     unchanged for genuine end-of-run text.
+  3. The orchestrate SKILL gained two rules: Agent tool calls are synchronous
+     and no background task, completion notification, callback, scheduler,
+     wakeup timer, or fallback check-in exists, so ending a turn on any such
+     claim is a fabrication that kills the run; and the orchestrator never
+     issues state-changing git commands (staging belongs to the executor,
+     committing to `devbench git-ops`), with read-only inspection still
+     permitted and a guard denial explicitly not a reason to end a turn.
+
 - **`backlog_post_processor._find_section_bounds` matched heading text quoted
   in another section's prose** (issue #337). The unanchored
   `text.find(header)` let a Description that discusses "the task's

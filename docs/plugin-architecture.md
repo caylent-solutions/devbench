@@ -67,9 +67,9 @@ plugin/devbench-orchestrate/
                                  ← enforces the shared-file full-suite regression gate
                                    (caylent-solutions/devbench-internal-backlog#13):
                                    blocks when `devbench check-shared-file-impact` reports a diff
-                                   touched a `repos.<repo>.shared_file_patterns` match AND the
-                                   full-suite run introduced failures not present in the stored
-                                   baseline.
+                                   touched a `gates.repos.<repo>.shared_file_impact.patterns`
+                                   match AND the full-suite run introduced failures not present
+                                   in the stored baseline.
 ```
 
 ---

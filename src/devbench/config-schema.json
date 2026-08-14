@@ -32,11 +32,6 @@
             "branch_prefix": {
               "type": "string",
               "description": "Per-repo task-branch prefix override. When set, task branches are named backlog/<prefix>/<unit-id-lower> instead of backlog/<unit-id-lower>. Overrides the top-level git_ops.branch_prefix for this repo. Must not be empty, have leading/trailing '/', or contain '..'."
-            },
-            "shared_file_patterns": {
-              "type": "array",
-              "description": "Glob patterns (fnmatch-style, matched against POSIX paths relative to the repo root, e.g. 'src/app/shell/**') identifying shared/high-fan-in composition-root files for this repo -- files with unusually broad blast radius (app shells, shared hooks, widely-imported components). When a task's diff touches a path matching one of these patterns, 'devbench check-shared-file-impact' requires a full test-suite run and blocks task completion on newly-introduced failures (vs. a stored baseline) instead of accepting the task's scoped Changes-Manifest test run as sufficient regression coverage. Hand-maintained per repo in v1: auto-derivation from an import/mount-graph is a known follow-up (see docs/devbench-yaml-reference.md).",
-              "items": { "type": "string", "minLength": 1 }
             }
           }
         }
@@ -492,63 +487,235 @@
         }
       }
     },
-    "fixture_consistency": {
+    "gates": {
       "type": "object",
-      "description": "Opt-in per-workspace configuration for `devbench check-fixture-consistency`, consumed as test-reviewer evidence. Lets a workspace designate one or more canonical fixture/dataset files plus the identifier field(s) within them, and which mock/fixture files must stay cross-referenced against that canonical data. Devbench cannot infer a target repo's fixture-file layout on its own, so this section is absent (and the check is a no-op) by default. Absent `canonical_sources` means the check always passes trivially.",
+      "description": "Unified opt-in configuration for the eight integration-reality gates (spec section 4.1; caylent-solutions/devbench-internal-backlog#10..#17). Every gate is disabled by default at the built-in level (D-17); each block below is individually enabled and carries its own tunables, each with a built-in default. `additionalProperties: false` at every level means an unrecognised key (a typo, or a key from either retired pre-release opt-in surface -- PR #318's per-repo glob key or PR #322's bare top-level block) is a load-time error rather than a silently ignored key (D-2). See docs/devbench-yaml-reference.md for the full four-layer precedence model (built-in -> project -> per-repo override -> env).",
       "additionalProperties": false,
       "properties": {
-        "canonical_sources": {
-          "type": "array",
-          "minItems": 1,
-          "description": "One or more designated canonical fixture/dataset files. Every scan target's identifier literals must cross-reference the identifier values found in the canonical source it targets.",
-          "items": {
-            "type": "object",
-            "required": ["path", "identifier_field"],
-            "additionalProperties": false,
-            "properties": {
-              "path": {
-                "type": "string",
-                "description": "Repo-relative path to the canonical fixture file (JSON or YAML)."
-              },
-              "identifier_field": {
-                "type": "string",
-                "description": "Key name within each canonical record (SKU, product id, PO number, or whatever the workspace's canonical identifier type is) whose values other fixtures must reference. Every dict found anywhere in the parsed file that has this key contributes its value."
-              },
-              "expected_count": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Optional: exact expected number of distinct identifier_field values in this canonical source. Set on a backfill task to assert full coverage (e.g. 'must cover N of N records'); the check fails when the actual distinct-value count differs."
-              }
+        "reachability": {
+          "type": "object",
+          "description": "check-reachability gate (caylent-solutions/devbench-internal-backlog#10). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the reachability gate for this workspace. Default false."
             }
           }
         },
-        "scan": {
-          "type": "array",
-          "minItems": 1,
-          "description": "Mock/fixture files to scan for identifier literals that must cross-reference a canonical_sources entry. A key found in a scan target that is absent from its canonical source fails the check with a clear, actionable message naming the file and the missing key(s).",
-          "items": {
-            "type": "object",
-            "required": ["path", "identifier_field"],
-            "additionalProperties": false,
-            "properties": {
-              "path": {
-                "type": "string",
-                "description": "Repo-relative path to the mock/fixture file to scan (JSON or YAML)."
-              },
-              "identifier_field": {
-                "type": "string",
-                "description": "Key name within each scanned record holding the identifier literal(s) to cross-reference against the canonical source."
-              },
-              "canonical_source": {
-                "type": "string",
-                "description": "The `path` of the canonical_sources entry this scan target checks against. Optional and inferred when exactly one canonical_sources entry is configured; required (and validated against the configured canonical_sources paths) when more than one is configured."
-              },
-              "allow_missing": {
-                "type": "array",
-                "items": {
-                  "type": "string"
+        "ancestry": {
+          "type": "object",
+          "description": "check-ancestry gate (caylent-solutions/devbench-internal-backlog#12). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the ancestry gate for this workspace. Default false."
+            }
+          }
+        },
+        "shared_file_impact": {
+          "type": "object",
+          "description": "check-shared-file-impact gate (caylent-solutions/devbench-internal-backlog#13). Supersedes PR #318's retired per-repo glob key: per-repo glob patterns now live under gates.repos.<org/repo>.shared_file_impact.patterns.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the shared-file-impact gate for this workspace. Default false."
+            },
+            "auto_derive_registry": {
+              "type": "boolean",
+              "description": "Reserved for the future auto-derived fan-in registry successor to the hand-maintained per-repo glob list (v1 is hand-maintained only). Default false."
+            }
+          }
+        },
+        "fixture_consistency": {
+          "type": "object",
+          "description": "check-fixture-consistency gate (caylent-solutions/devbench-internal-backlog#17). Supersedes the retired top-level fixture_consistency: block, now nested here. Devbench cannot infer a target repo's fixture-file layout on its own, so absent canonical_sources makes the check a no-op even when enabled: true.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the fixture-consistency gate for this workspace. Default false."
+            },
+            "canonical_sources": {
+              "type": "array",
+              "minItems": 1,
+              "description": "One or more designated canonical fixture/dataset files. Every scan target's identifier literals must cross-reference the identifier values found in the canonical source it targets.",
+              "items": {
+                "type": "object",
+                "required": ["path", "identifier_field"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Repo-relative path to the canonical fixture file (JSON or YAML)."
+                  },
+                  "identifier_field": {
+                    "type": "string",
+                    "description": "Key name within each canonical record (SKU, product id, PO number, or whatever the workspace's canonical identifier type is) whose values other fixtures must reference. Every dict found anywhere in the parsed file that has this key contributes its value."
+                  },
+                  "expected_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional: exact expected number of distinct identifier_field values in this canonical source. Set on a backfill task to assert full coverage (e.g. 'must cover N of N records'); the check fails when the actual distinct-value count differs."
+                  }
+                }
+              }
+            },
+            "scan": {
+              "type": "array",
+              "minItems": 1,
+              "description": "Mock/fixture files to scan for identifier literals that must cross-reference a canonical_sources entry. A key found in a scan target that is absent from its canonical source fails the check with a clear, actionable message naming the file and the missing key(s).",
+              "items": {
+                "type": "object",
+                "required": ["path", "identifier_field"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Repo-relative path to the mock/fixture file to scan (JSON or YAML)."
+                  },
+                  "identifier_field": {
+                    "type": "string",
+                    "description": "Key name within each scanned record holding the identifier literal(s) to cross-reference against the canonical source."
+                  },
+                  "canonical_source": {
+                    "type": "string",
+                    "description": "The `path` of the canonical_sources entry this scan target checks against. Optional and inferred when exactly one canonical_sources entry is configured; required (and validated against the configured canonical_sources paths) when more than one is configured."
+                  },
+                  "allow_missing": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Explicit allowlist of identifier values in this fixture that are permitted to be absent from the canonical source -- e.g. a fixture that deliberately models a not-found/empty-state edge case. This is the opt-out/scoping mechanism for legitimate edge-case fixtures; values listed here never produce a missing_key finding for this scan target."
+                  }
+                }
+              }
+            },
+            "extract_source_literals": {
+              "type": "boolean",
+              "description": "Reserved for a future literal-extraction scanning mode (spec 4.7 hardening). Default false."
+            }
+          }
+        },
+        "write_path_audit": {
+          "type": "object",
+          "description": "write-path-audit gate (caylent-solutions/devbench-internal-backlog#16). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the write-path-audit gate for this workspace. Default false."
+            }
+          }
+        },
+        "newly_reachable_paths": {
+          "type": "object",
+          "description": "newly-reachable-paths gate (caylent-solutions/devbench-internal-backlog#14). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the newly-reachable-paths gate for this workspace. Default false."
+            }
+          }
+        },
+        "composition_root": {
+          "type": "object",
+          "description": "composition-root gate (caylent-solutions/devbench-internal-backlog#11). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the composition-root gate for this workspace. Default false."
+            }
+          }
+        },
+        "layout_geometry": {
+          "type": "object",
+          "description": "layout-geometry gate (caylent-solutions/devbench-internal-backlog#15). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the layout-geometry gate for this workspace. Default false."
+            }
+          }
+        },
+        "repos": {
+          "type": "object",
+          "description": "Optional per-repo override map (D-15 precedence: field-wise merged OVER the project-level gates.* values above). Keys must be 'org/repo' and must already be present in the top-level repos: mapping -- an override naming an unconfigured repo is a load-time error.",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[^/]+/[^/]+$": {
+              "type": "object",
+              "description": "Per-repo gate overrides for this org/repo.",
+              "additionalProperties": false,
+              "properties": {
+                "reachability": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
                 },
-                "description": "Explicit allowlist of identifier values in this fixture that are permitted to be absent from the canonical source -- e.g. a fixture that deliberately models a not-found/empty-state edge case. This is the opt-out/scoping mechanism for legitimate edge-case fixtures; values listed here never produce a missing_key finding for this scan target."
+                "ancestry": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "shared_file_impact": {
+                  "type": "object",
+                  "description": "Per-repo shared-file-impact override. `patterns` is the migrated home of PR #318's retired per-repo glob key.",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "patterns": {
+                      "type": "array",
+                      "description": "Glob patterns (fnmatch-style, matched against POSIX paths relative to the repo root) identifying shared/high-fan-in composition-root files for this repo.",
+                      "items": { "type": "string", "minLength": 1 }
+                    }
+                  }
+                },
+                "fixture_consistency": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "write_path_audit": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "newly_reachable_paths": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "composition_root": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "layout_geometry": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                }
               }
             }
           }

@@ -4559,7 +4559,7 @@ def cmd_run_tests(unit_id: str) -> int:
     convention is which parts of the *output* an executor/reviewer treats as
     this task's responsibility -- nothing here enforces that at the tooling
     level. When a task's diff touches a shared/high-fan-in file (per
-    `repos.<repo>.shared_file_patterns` in devbench.yaml),
+    `gates.repos.<repo>.shared_file_impact.patterns` in devbench.yaml),
     `check-shared-file-impact` should be used instead: it runs this same
     command but diffs the failure set against a stored baseline and blocks
     on newly-introduced failures.
@@ -5079,14 +5079,14 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     A task can pass its own narrow verification while silently breaking
     hundreds of already-passing tests elsewhere, discovered only when some
     later, unrelated task happens to run the full suite. This command closes
-    that gap for repos with `repos.<repo>.shared_file_patterns` configured
-    in devbench.yaml:
+    that gap for repos with `gates.repos.<repo>.shared_file_impact.patterns`
+    configured in devbench.yaml:
 
     1. Computes the work unit's changed-file set via
        `list_changed_files` (staged + unstaged + untracked, relative to the
        repo root -- the same read-only query the claim-scope guard uses).
-    2. Cross-references it against the repo's `shared_file_patterns` glob
-       list. No match: no-op (exit 0, `shared_file_impact: false`); the
+    2. Cross-references it against the repo's `shared_file_impact.patterns`
+       glob list. No match: no-op (exit 0, `shared_file_impact: false`); the
        task's normal `run-tests` evidence stands.
     3. On a match (`_evaluate_shared_file_gate`): runs the full-suite
        command, parses individual failing-test identifiers out of the
@@ -5104,12 +5104,14 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
 
     Known limitation (v1, documented rather than hidden): this is a
     hand-maintained glob registry, not an auto-derived import/mount-graph
-    of actual fan-in -- see `docs/devbench-yaml-reference.md` for the
-    tradeoff. Per-test failure attribution is parsed from common textual
-    formats (pytest, `go test`, jest/mocha-style); other runners still get
-    suite-level bootstrap/ratchet behaviour but degrade to a single
-    synthetic marker instead of per-test identifiers, surfaced via the
-    `degraded` field in the JSON output.
+    of actual fan-in (`gates.shared_file_impact.auto_derive_registry` is
+    the reserved config surface for the eventual auto-derivation successor
+    -- see `docs/devbench-yaml-reference.md` for the tradeoff). Per-test
+    failure attribution is parsed from common textual formats (pytest,
+    `go test`, jest/mocha-style); other runners still get suite-level
+    bootstrap/ratchet behaviour but degrade to a single synthetic marker
+    instead of per-test identifiers, surfaced via the `degraded` field in
+    the JSON output.
     """
     from devbench.backlog.manifest import list_changed_files
 
@@ -5127,8 +5129,9 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    repo_config = RUNTIME_CONFIG.repos.get(canonical_repo)
-    patterns = repo_config.shared_file_patterns if repo_config is not None else ()
+    gate_repo_override = RUNTIME_CONFIG.gates.repos.get(canonical_repo)
+    shared_file_impact_override = gate_repo_override.shared_file_impact if gate_repo_override is not None else None
+    patterns = shared_file_impact_override.patterns if shared_file_impact_override is not None else ()
 
     try:
         changed_files = list_changed_files(repo_path)
@@ -5145,7 +5148,7 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
             "changed_files": changed_files,
         }
         if not patterns:
-            payload["reason"] = "no shared_file_patterns configured for this repo"
+            payload["reason"] = "no gates.repos.<repo>.shared_file_impact.patterns configured for this repo"
         print(json.dumps(payload, indent=2))
         return 0
 
@@ -5177,12 +5180,12 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
     Opt-in and project-specific: devbench cannot infer a target repo's
     fixture-file layout, so this is a deliberate no-op (prints a note,
     exits 0) unless the workspace configures
-    ``fixture_consistency.canonical_sources`` in
+    ``gates.fixture_consistency.canonical_sources`` in
     ``backlog/config/devbench.yaml``. When configured, scans every
-    ``fixture_consistency.scan`` target for identifier literals absent from
-    its designated canonical source, and checks each canonical source's
-    distinct-identifier count against an optional ``expected_count``
-    (backfill coverage).
+    ``gates.fixture_consistency.scan`` target for identifier literals
+    absent from its designated canonical source, and checks each canonical
+    source's distinct-identifier count against an optional
+    ``expected_count`` (backfill coverage).
 
     Used as review evidence by the test-reviewer agent.
     """
@@ -5202,10 +5205,10 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    fixture_config = RUNTIME_CONFIG.fixture_consistency
+    fixture_config = RUNTIME_CONFIG.gates.fixture_consistency
     if not fixture_config.canonical_sources:
         print(
-            "(fixture-consistency check skipped: no fixture_consistency.canonical_sources "
+            "(fixture-consistency check skipped: no gates.fixture_consistency.canonical_sources "
             "configured in backlog/config/devbench.yaml)"
         )
         return 0
@@ -13464,7 +13467,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         (
             "Full-suite regression gate for shared/high-fan-in files: "
             "check-shared-file-impact <id>. No-op unless the diff touches a "
-            "repos.<repo>.shared_file_patterns match; blocks (exit 1) on new "
+            "gates.repos.<repo>.shared_file_impact.patterns match; blocks (exit 1) on new "
             "failures vs. the stored baseline."
         ),
     ),
@@ -13473,7 +13476,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         1,
         (
             "Cross-reference mock/fixture files against the configured canonical dataset "
-            "(no-op unless fixture_consistency.canonical_sources is set): "
+            "(no-op unless gates.fixture_consistency.canonical_sources is set): "
             "check-fixture-consistency <id>"
         ),
     ),

@@ -374,6 +374,72 @@ class TestCheckFixtureConsistency:
         assert findings[0].kind == "load_error"
         assert "mock_lookup.json" in findings[0].message
 
+    def test_missing_canonical_file_message_names_gates_fixture_consistency_key(self, tmp_path: Path) -> None:
+        """The load_error message for a missing canonical file names the gates.fixture_consistency
+        key (spec 4.1 migration: the retired top-level fixture_consistency: block moved under
+        gates:), not the retired bare top-level spelling."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="does_not_exist.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        assert len(findings) == 1
+        assert "gates.fixture_consistency.canonical_sources" in findings[0].message
+
+    def test_missing_scan_file_message_names_gates_fixture_consistency_key(self, tmp_path: Path) -> None:
+        """The load_error message for a missing scan file names gates.fixture_consistency.scan."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        self._write_json(tmp_path / "catalog.json", [{"sku": "A1"}])
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="does_not_exist.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        assert len(findings) == 1
+        assert "gates.fixture_consistency.scan" in findings[0].message
+
+    def test_ambiguous_scan_target_message_names_gates_fixture_consistency_key(self, tmp_path: Path) -> None:
+        """The load_error message for an ambiguous scan target names
+        gates.fixture_consistency.scan[].canonical_source."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        self._write_json(tmp_path / "catalog.json", [{"sku": "A1"}])
+        self._write_json(tmp_path / "vendors.json", [{"vendor_id": "V1"}])
+        self._write_json(tmp_path / "mock_lookup.json", [{"sku": "A1"}])
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(
+                cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),
+                cl.FixtureCanonicalSource(path="vendors.json", identifier_field="vendor_id"),
+            ),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        assert len(findings) == 1
+        assert "gates.fixture_consistency.scan[].canonical_source" in findings[0].message
+
+    def test_missing_key_message_names_gates_fixture_consistency_allow_missing_key(self, tmp_path: Path) -> None:
+        """The missing_key remediation message names gates.fixture_consistency.scan[].allow_missing."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        self._write_json(tmp_path / "catalog.json", [{"sku": "A1"}])
+        self._write_json(tmp_path / "mock_lookup.json", [{"sku": "GHOST-SKU"}])
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        assert len(findings) == 1
+        assert "gates.fixture_consistency.scan[].allow_missing" in findings[0].message
+
     def test_fixture_finding_is_frozen_dataclass(self) -> None:
         """FixtureFinding is immutable -- mutating a field raises FrozenInstanceError."""
         fc = _fixture_consistency()

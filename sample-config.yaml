@@ -18,19 +18,6 @@ repos:
     # merge_strategy: squash
     # Per-repo branch_prefix override; falls back to the top-level git_ops.branch_prefix.
     # branch_prefix: wg_004
-    # Shared/high-fan-in file registry (caylent-solutions/devbench-internal-backlog#13).
-    # Glob patterns (fnmatch-style, relative to the repo root) for composition-root
-    # files whose blast radius
-    # extends beyond any one task's Changes Manifest (app shells, shared hooks,
-    # widely-consumed components). A diff touching one of these triggers
-    # `devbench check-shared-file-impact` to run the FULL suite and block on
-    # NEW failures vs. a stored baseline, instead of accepting the task's
-    # scoped test run as sufficient regression coverage. See
-    # docs/devbench-yaml-reference.md for the full algorithm and known
-    # limitations (v1 is a hand-maintained list, not auto-derived).
-    # shared_file_patterns:
-    #   - "src/app/Shell.tsx"
-    #   - "src/hooks/useAuth.*"
 
 # ---------------------------------------------------------------------------
 # Top-level identity / runtime knobs
@@ -372,37 +359,70 @@ validate:
   check_orphan_path_tokens: true
 
 # ---------------------------------------------------------------------------
-# Fixture-catalog cross-reference check (caylent-solutions/devbench-internal-backlog#17).
-# Opt-in and project-specific: `devbench check-fixture-consistency` is a no-op unless this
-# section designates canonical_sources, since devbench cannot infer a
-# target repo's fixture/mock-file layout on its own. When configured, the
-# test-reviewer agent runs the check as review evidence and fails the
-# review if a scanned fixture references an identifier absent from its
-# canonical source, or a canonical source's coverage falls short of an
-# expected_count. See docs/backlog-contract.md.
+# Integration-reality gates (spec section 4.1; caylent-solutions/devbench-internal-backlog#10..#17).
+# Unified opt-in config section for all eight gates. Every gate is disabled
+# by default at the built-in level (D-17) -- this block shows every gate and
+# every tunable at its built-in default. `additionalProperties: false`
+# applies at every level (gates:, each per-gate block, and gates.repos.*), so
+# an unrecognised key fails config-load with a clear error naming it (D-2)
+# instead of being silently ignored. Superseded and REMOVED pre-release
+# opt-in surfaces: PR #318's per-repo glob key (now
+# gates.repos.<org/repo>.shared_file_impact.patterns) and PR #322's bare
+# top-level opt-in block (now gates.fixture_consistency). See
+# docs/devbench-yaml-reference.md for the full four-layer precedence model
+# (built-in -> project -> per-repo override
+# -> env, D-15) -- the resolver that reads this precedence chain
+# (resolve_gate_config) ships in a follow-up task; this config model landing
+# alone does not yet change any gate command's behaviour.
 # ---------------------------------------------------------------------------
-# fixture_consistency:
-#   canonical_sources:
-#     # Repo-relative path to the canonical fixture/dataset file, and the
-#     # key name within each record holding the identifier value(s)
-#     # (SKU, product id, PO number, etc.) other fixtures must reference.
-#     - path: tests/fixtures/catalog.json
-#       identifier_field: sku
-#       # Optional: assert full backfill coverage -- fails the check when
-#       # the canonical file's distinct `sku` count differs from this.
-#       expected_count: 24
-#   scan:
-#     # Mock/fixture files to cross-reference against a canonical_sources
-#     # entry. `canonical_source` is inferred when exactly one
-#     # canonical_sources entry is configured (as above); set it
-#     # explicitly when more than one canonical source is configured.
-#     - path: tests/fixtures/mock_catalog_lookup.json
-#       identifier_field: sku
-#       # Explicit opt-out for fixtures that intentionally model a
-#       # not-found/empty-state edge case -- values here never produce a
-#       # missing-key finding for this scan target.
-#       allow_missing:
-#         - SKU-DOES-NOT-EXIST
+# gates:
+#   reachability:                       # caylent-solutions/devbench-internal-backlog#10
+#     enabled: false
+#   ancestry:                           # caylent-solutions/devbench-internal-backlog#12
+#     enabled: false
+#   shared_file_impact:                 # caylent-solutions/devbench-internal-backlog#13
+#     enabled: false
+#     auto_derive_registry: false       # reserved for a future auto-derived fan-in registry
+#   fixture_consistency:                # caylent-solutions/devbench-internal-backlog#17
+#     enabled: false
+#     canonical_sources:
+#       # Repo-relative path to the canonical fixture/dataset file, and the
+#       # key name within each record holding the identifier value(s)
+#       # (SKU, product id, PO number, etc.) other fixtures must reference.
+#       - path: tests/fixtures/catalog.json
+#         identifier_field: sku
+#         # Optional: assert full backfill coverage -- fails the check when
+#         # the canonical file's distinct `sku` count differs from this.
+#         expected_count: 24
+#     scan:
+#       # Mock/fixture files to cross-reference against a canonical_sources
+#       # entry. `canonical_source` is inferred when exactly one
+#       # canonical_sources entry is configured (as above); set it
+#       # explicitly when more than one canonical source is configured.
+#       - path: tests/fixtures/mock_catalog_lookup.json
+#         identifier_field: sku
+#         # Explicit opt-out for fixtures that intentionally model a
+#         # not-found/empty-state edge case -- values here never produce a
+#         # missing-key finding for this scan target.
+#         allow_missing:
+#           - SKU-DOES-NOT-EXIST
+#     extract_source_literals: false    # reserved for a future literal-extraction scan mode
+#   write_path_audit:                   # caylent-solutions/devbench-internal-backlog#16
+#     enabled: false
+#   newly_reachable_paths:              # caylent-solutions/devbench-internal-backlog#14
+#     enabled: false
+#   composition_root:                   # caylent-solutions/devbench-internal-backlog#11
+#     enabled: false
+#   layout_geometry:                    # caylent-solutions/devbench-internal-backlog#15
+#     enabled: false
+#   repos:                              # optional per-repo override, field-wise merged over the project level
+#     caylent-solutions/devbench:
+#       shared_file_impact:
+#         enabled: true
+#         # Migrated home of PR #318's retired per-repo glob key.
+#         patterns:
+#           - "src/app/Shell.tsx"
+#           - "src/hooks/useAuth.*"
 
 # ---------------------------------------------------------------------------
 # Plugin-skill (spec-to-backlog, create-spec) configuration (issue #221

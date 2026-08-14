@@ -47,14 +47,111 @@ repos:
     checkout_directory: devbench  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
     merge_strategy: squash        # optional -- overrides top-level merge_strategy
     branch_prefix: wg_004         # optional -- overrides top-level git_ops.branch_prefix
-    shared_file_patterns:         # optional -- see "repos.<repo>.shared_file_patterns" below
-      - "src/app/Shell.tsx"
-      - "src/hooks/useAuth.*"
 ```
+
+Per-repo shared/high-fan-in file registration moved under `gates.repos.<org/repo>
+.shared_file_impact.patterns` -- see the `gates:` section below.
 
 ---
 
-### `repos.<repo>.shared_file_patterns` (caylent-solutions/devbench-internal-backlog#13 -- shared-file full-suite regression gate)
+## `gates:` -- integration-reality gates (spec 4.1)
+
+Unified opt-in configuration for the eight integration-reality gates (caylent-solutions/devbench-internal-backlog#10..#17):
+`reachability`, `ancestry`, `shared_file_impact`, `fixture_consistency`, `write_path_audit`,
+`newly_reachable_paths`, `composition_root`, and `layout_geometry`. Every gate is disabled by
+default at the built-in level (D-17). `additionalProperties: false` applies at every level
+(`gates:`, each per-gate block, and `gates.repos.*`), so an unrecognised key -- including a typo,
+or a key from either retired pre-release surface below -- fails config-load with a `ValueError`
+naming the offending key rather than being silently ignored (D-2).
+
+```yaml
+gates:
+  reachability:
+    enabled: false
+  ancestry:
+    enabled: false
+  shared_file_impact:
+    enabled: false
+    auto_derive_registry: false
+  fixture_consistency:
+    enabled: false
+    canonical_sources: []
+    scan: []
+    extract_source_literals: false
+  write_path_audit:
+    enabled: false
+  newly_reachable_paths:
+    enabled: false
+  composition_root:
+    enabled: false
+  layout_geometry:
+    enabled: false
+  repos:
+    caylent-solutions/devbench:
+      shared_file_impact:
+        enabled: true
+        patterns:
+          - "src/app/Shell.tsx"
+          - "src/hooks/useAuth.*"
+```
+
+### Value-resolution precedence (D-15)
+
+Every gate field resolves through four layers, in this order (lowest to highest precedence):
+
+1. **Built-in default** -- `constants.py`; every gate disabled, every tunable at its
+   documented default.
+2. **Project level** -- `gates.<gate>.*` in the workspace `devbench.yaml`.
+3. **Per-repo override** -- `gates.repos.<org/repo>.<gate>.*`, field-wise merged OVER the
+   project level, so a repo can flip `enabled` while inheriting every other tunable.
+4. **Environment** -- `DEVBENCH_GATE_<NAME>_ENABLED`, workspace-wide, highest precedence.
+
+**Status: config model only.** This task lands the `GatesConfig` dataclass tree, the JSON Schema
+block, and fail-fast parsing (`_parse_gates_config`) -- the raw YAML round-trips into
+`RuntimeConfig.gates` exactly as written. The single resolver that reads this four-layer
+precedence chain, `resolve_gate_config(gate, repo) -> ResolvedGateConfig`, and the
+`DEVBENCH_GATE_<NAME>_ENABLED` env-override layer, ship in a follow-up task
+(E2-F1-S1-T2). No gate command consumes `RuntimeConfig.gates` yet.
+
+### Per-gate tunables
+
+| Gate | Tunables (beyond `enabled`) | Per-repo override tunables |
+|------|------------------------------|------------------------------|
+| `reachability` | none | `enabled` |
+| `ancestry` | none | `enabled` |
+| `shared_file_impact` | `auto_derive_registry` (reserved, unused v1) | `enabled`, `patterns` |
+| `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (reserved, unused v1) | `enabled` |
+| `write_path_audit` | none | `enabled` |
+| `newly_reachable_paths` | none | `enabled` |
+| `composition_root` | none | `enabled` |
+| `layout_geometry` | none | `enabled` |
+
+### Migration: retired pre-release keys (spec 4.1, Section 6)
+
+Two keys that arrived on the branch ahead of any release are REMOVED by this same change, with
+zero remaining references anywhere in the loader, schema, sample config, or reference docs (spec
+Section 6: no released version ever carried these keys, so no migration path is owed):
+
+| Retired pre-release surface | New location |
+|-------------|---------------|
+| PR #318's per-repo glob key (nested under `repos.<repo>`) | `gates.repos.<org/repo>.shared_file_impact.patterns` |
+| PR #322's bare top-level opt-in block | `gates.fixture_consistency:` |
+
+A config that still sets either retired key fails `load_runtime_config` with a schema-validation
+`ValueError` (`additionalProperties: false` at the top level and on `repos.<repo>.*`). An absent
+`gates:` block loads into the all-disabled built-in tree with no error and no warning, so a
+0.4.0-era config with neither key keeps working unmodified (AC-4, Section 6).
+
+### `gates.fixture_consistency` -- fixture-catalog cross-reference (caylent-solutions/devbench-internal-backlog#17)
+
+Opt-in and project-specific: `devbench check-fixture-consistency` is a no-op unless
+`gates.fixture_consistency.canonical_sources` is configured, since devbench cannot infer a
+target repo's fixture/mock-file layout on its own. When configured, the test-reviewer agent runs
+the check as review evidence and fails the review if a scanned fixture references an identifier
+absent from its canonical source, or a canonical source's coverage falls short of an
+`expected_count`. See `docs/backlog-contract.md`.
+
+### `gates.repos.<org/repo>.shared_file_impact.patterns` -- shared-file full-suite regression gate (caylent-solutions/devbench-internal-backlog#13)
 
 Optional list of `fnmatch`-style glob patterns, matched against POSIX paths relative to the
 repo root. Identifies "shared/high-fan-in" files for this repo -- app-level composition roots,
@@ -78,8 +175,8 @@ introduced the gate; the manual list is a deliberate, honest starting point rath
 promise of completeness. Regenerate/review the list periodically as the codebase evolves --
 nothing here does that automatically yet.
 
-Omitting `shared_file_patterns` entirely (or leaving it empty) makes `check-shared-file-impact`
-a permanent no-op for that repo, identical to today's behavior before this feature existed.
+Omitting `patterns` entirely (or leaving it empty) makes `check-shared-file-impact` a permanent
+no-op for that repo, identical to today's behavior before this feature existed.
 
 ---
 

@@ -6,7 +6,7 @@
 # Issue caylent-solutions/devbench-internal-backlog#13 (shared-file
 # full-suite regression gate). `devbench check-shared-file-impact
 # <unit-id>` is a no-op (exit 0) unless the task's diff touches a file
-# matching the target repo's `shared_file_patterns`
+# matching the target repo's `gates.repos.<repo>.shared_file_impact.patterns`
 # (devbench.yaml); when it does match, it runs the FULL test suite and
 # diffs the failure set against a stored baseline, exiting non-zero only on
 # NEWLY introduced failures (pre-existing/flaky failures never block). This

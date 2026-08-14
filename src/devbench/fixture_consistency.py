@@ -9,9 +9,9 @@ logic is sound. This survives the unit suite because each task's own tests
 construct a self-consistent fixture inline rather than exercising the
 shared canonical dataset.
 
-This module implements the opt-in check driven by the ``fixture_consistency``
-block of ``backlog/config/devbench.yaml`` (see ``config-schema.json`` and
-``config_loader.FixtureConsistencyConfig``):
+This module implements the opt-in check driven by the ``gates.fixture_consistency``
+block of ``backlog/config/devbench.yaml`` (spec 4.1 gates migration; see
+``config-schema.json`` and ``config_loader.FixtureConsistencyConfig``):
 
 1. Loads each configured canonical fixture/dataset file and collects the
    set of identifier values found under the configured
@@ -52,6 +52,12 @@ __all__ = [
     "check_fixture_consistency",
     "collect_identifiers",
 ]
+
+# Dotted YAML key prefix for every operator-facing config-key reference in
+# this module's finding messages. Centralised so the spec 4.1 gates
+# migration (top-level `fixture_consistency:` -> `gates.fixture_consistency:`)
+# cannot drift key-by-key across the four finding sites below.
+_CONFIG_KEY_PREFIX = "gates.fixture_consistency"
 
 
 @dataclass(frozen=True)
@@ -173,7 +179,7 @@ def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig)
                 FixtureFinding(
                     "load_error",
                     f"Canonical fixture file not found: '{source.path}' "
-                    f"(configured under fixture_consistency.canonical_sources).",
+                    f"(configured under {_CONFIG_KEY_PREFIX}.canonical_sources).",
                 )
             )
             continue
@@ -208,7 +214,7 @@ def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig)
                     "load_error",
                     f"Scan target '{scan.path}' does not resolve to a valid canonical_source "
                     f"(configured canonical_sources: {sorted(canonical_by_path)}). Set "
-                    "fixture_consistency.scan[].canonical_source explicitly when more than one "
+                    f"{_CONFIG_KEY_PREFIX}.scan[].canonical_source explicitly when more than one "
                     "canonical_sources entry is configured.",
                 )
             )
@@ -222,7 +228,7 @@ def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig)
             findings.append(
                 FixtureFinding(
                     "load_error",
-                    f"Scan target fixture file not found: '{scan.path}' (configured under fixture_consistency.scan).",
+                    f"Scan target fixture file not found: '{scan.path}' (configured under {_CONFIG_KEY_PREFIX}.scan).",
                 )
             )
             continue
@@ -247,7 +253,7 @@ def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig)
                     f"{', '.join(missing)}. Fix the fixture to reference a real canonical key, "
                     "or if this is an intentional edge-case fixture (e.g. testing an "
                     "empty/not-found state), add the value(s) to "
-                    "fixture_consistency.scan[].allow_missing for this scan target.",
+                    f"{_CONFIG_KEY_PREFIX}.scan[].allow_missing for this scan target.",
                 )
             )
 

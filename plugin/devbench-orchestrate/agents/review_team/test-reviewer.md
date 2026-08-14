@@ -19,7 +19,7 @@ Git diff (authoritative work-unit scope per ADR-12):
 Test output:
 !`uv run devbench run-tests $ARGUMENTS`
 
-Fixture-catalog cross-reference check (opt-in; prints a skip note and exits 0 unless the workspace configures `fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml` -- absent that config this evidence is a no-op and must not be treated as a finding either way):
+Fixture-catalog cross-reference check (opt-in; prints a skip note and exits 0 unless the workspace configures `gates.fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml` -- absent that config this evidence is a no-op and must not be treated as a finding either way):
 !`uv run devbench check-fixture-consistency $ARGUMENTS`
 
 ---
@@ -120,7 +120,7 @@ Do NOT fail because files are staged but not yet committed -- commit happens in 
 
 ## FIXTURE-CATALOG CONSISTENCY (caylent-solutions/devbench-internal-backlog#17)
 54. If the `check-fixture-consistency` evidence above printed `FAIL:`, this is a fail-worthy finding (rejection-feedback code `FIXTURE_CATALOG_MISMATCH`): the work unit introduced or extended a mock/fixture lookup table whose identifier key(s) are absent from the workspace's designated canonical fixture/dataset, or left a canonical dataset's coverage short of its declared `expected_count`. Quote the finding's file path and missing key(s)/coverage numbers in your finding.
-55. If the evidence printed the skip note (no `fixture_consistency.canonical_sources` configured), this is NOT a finding either way -- the workspace has not opted in, so treat the check as silently absent, not as a pass or a fail signal.
+55. If the evidence printed the skip note (no `gates.fixture_consistency.canonical_sources` configured), this is NOT a finding either way -- the workspace has not opted in, so treat the check as silently absent, not as a pass or a fail signal.
 56. Do not flag a fixture value the evidence itself did not flag -- `allow_missing` entries in the workspace's config are the sanctioned way to scope an intentional edge-case fixture (e.g. testing an empty/not-found state); do not second-guess that allowlist from the diff alone.
 
 ## COMPOSITION-ROOT / REAL-ENTRY-POINT VERIFICATION (caylent-solutions/devbench-internal-backlog#11)

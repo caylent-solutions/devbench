@@ -383,8 +383,8 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
   uv run devbench check-shared-file-impact $ARGUMENTS
   ```
   This is a no-op (exit 0, `shared_file_impact: false`) for most tasks -- it only does
-  anything when the target repo has `repos.<repo>.shared_file_patterns` configured in
-  `backlog/config/devbench.yaml` AND this task's diff touches one of those patterns (an
+  anything when the target repo has `gates.repos.<repo>.shared_file_impact.patterns`
+  configured in `backlog/config/devbench.yaml` AND this task's diff touches one of those patterns (an
   app-level composition root, a shared shell/container component, a widely-consumed shared
   hook). When it matches, the command runs the FULL test suite (not just the files this task
   touched) and blocks (non-zero exit) on any NEWLY introduced failure vs. the stored baseline

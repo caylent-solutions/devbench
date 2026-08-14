@@ -7598,9 +7598,19 @@ class TestCmdCheckSharedFileImpact:
         )
 
     def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
-        from devbench.config_loader import RepoConfig, RuntimeConfig
+        from devbench.config_loader import (
+            GateRepoOverrides,
+            GatesConfig,
+            GateSharedFileImpactOverride,
+            RepoConfig,
+            RuntimeConfig,
+        )
 
-        return RuntimeConfig(repos={self.REPO: RepoConfig(shared_file_patterns=patterns)})
+        overrides = GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(patterns=patterns))
+        return RuntimeConfig(
+            repos={self.REPO: RepoConfig()},
+            gates=GatesConfig(repos={self.REPO: overrides}),
+        )
 
     def _parser(self, unit: WorkUnit) -> MagicMock:
         mock_parser = MagicMock()
@@ -7624,7 +7634,7 @@ class TestCmdCheckSharedFileImpact:
         assert result == 1
 
     def test_no_patterns_configured_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """No shared_file_patterns for the repo -- always a no-op, full suite never runs."""
+        """No shared_file_impact patterns for the repo -- always a no-op, full suite never runs."""
         unit = self._make_unit()
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
@@ -7909,12 +7919,12 @@ class TestCmdCheckFixtureConsistency:
         assert "No local path configured" in capsys.readouterr().err
 
     def test_skips_as_no_op_when_unconfigured(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """No fixture_consistency.canonical_sources configured -> prints a skip note, exits 0."""
+        """No gates.fixture_consistency.canonical_sources configured -> prints a skip note, exits 0."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         mock_runtime_cfg = MagicMock()
-        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig()
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig()
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
@@ -7936,7 +7946,7 @@ class TestCmdCheckFixtureConsistency:
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
 
         mock_runtime_cfg = MagicMock()
-        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig(
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
         )
@@ -7963,7 +7973,7 @@ class TestCmdCheckFixtureConsistency:
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "GHOST-SKU"}]), encoding="utf-8")
 
         mock_runtime_cfg = MagicMock()
-        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig(
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
         )
@@ -7992,7 +8002,7 @@ class TestCmdCheckFixtureConsistency:
         (tmp_path / "mock_not_found.json").write_text(json.dumps([{"sku": "SKU-DOES-NOT-EXIST"}]), encoding="utf-8")
 
         mock_runtime_cfg = MagicMock()
-        mock_runtime_cfg.fixture_consistency = FixtureConsistencyConfig(
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(
                 FixtureScanTarget(

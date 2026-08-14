@@ -5,6 +5,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Unified `gates:` config section for the eight integration-reality gates**
+  (spec `integration-reality-gates-hardening.md` section 4.1;
+  `caylent-solutions/devbench-internal-backlog#10`..`#17`). Replaces the
+  ad-hoc per-PR opt-in surfaces the eight cherry-picked PRs shipped with ONE
+  top-level `gates:` block covering `reachability`, `ancestry`,
+  `shared_file_impact`, `fixture_consistency`, `write_path_audit`,
+  `newly_reachable_paths`, `composition_root`, and `layout_geometry`, plus
+  an optional `gates.repos.<org/repo>` per-repo override map. Adds the
+  frozen `GatesConfig` dataclass tree and `RuntimeConfig.gates` field in
+  `config_loader.py`, `_parse_gates_config` with fail-fast `ValueError` on
+  an unknown gate name, a wrong-typed value, or a per-repo override naming
+  a repo absent from `repos:`, and a matching JSON Schema block with
+  `additionalProperties: false` at every level so a typo is a load-time
+  error rather than a silently ignored key. Every gate is disabled by
+  default (absent `gates:` behaves exactly as before this change); the
+  four-layer precedence resolver (`resolve_gate_config`, adding per-repo
+  and `DEVBENCH_GATE_<NAME>_ENABLED` env-override resolution) ships in a
+  follow-up task. **Migration (complete replacement):** the pre-release
+  keys that arrived on the branch ahead of any release -- a per-repo
+  glob-pattern key nested under `repos:` and a bare top-level fixture-catalog
+  opt-in block -- are REMOVED in this same change, with every consumer
+  (`cli.py`'s `check-shared-file-impact` / `check-fixture-consistency`
+  commands, `fixture_consistency.py`'s operator-facing messages, and the
+  CLI/doc/plugin references below) updated to the new `gates.*` key paths
+  and zero remaining references to either retired spelling.
+
 - **Layout/CSS-geometry AC tagging and live-render verification gate**
   (`caylent-solutions/devbench-internal-backlog#14`). Standard jsdom-style
   unit-test environments have no real layout, paint, or cascade engine, so
@@ -46,7 +72,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   relative to the project's canonical shared fixture/demo dataset --
   functionally dead or crash-on-save for real records even though the
   underlying logic is sound, and invisible to the unit suite since each
-  task's own fixtures are self-consistent. Adds an opt-in `fixture_consistency:`
+  task's own fixtures are self-consistent. Adds an opt-in `gates.fixture_consistency:`
   block to `devbench.yaml` (`canonical_sources` designating authoritative
   fixture/dataset files and identifier fields, `scan` targets to
   cross-reference, and per-target `allow_missing` scoping for intentional
@@ -55,7 +81,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   check runs as `test-reviewer` review evidence and fails with
   `FIXTURE_CATALOG_MISMATCH` when a scanned fixture references a key absent
   from its canonical source, or a canonical source falls short of a
-  declared `expected_count`.
+  declared `expected_count`. (E2-F1-S1-T1 re-nested this block under the
+  unified `gates:` config section; see the "Unified `gates:` config section"
+  entry below.)
 
 - **Shared-file full-suite regression gate**
   (`caylent-solutions/devbench-internal-backlog#13`). A task's regression
@@ -63,7 +91,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   touches a shared/high-fan-in file (an app shell, a shared hook, a
   widely-consumed component) that many unrelated features depend on;
   previously such regressions surfaced only when an unrelated later task
-  happened to run the full suite. Adds `repos.<repo>.shared_file_patterns`
+  happened to run the full suite. Adds `gates.repos.<repo>.shared_file_impact.patterns`
   (a hand-maintained per-repo glob registry of shared composition-root
   files) to `devbench.yaml`, and `devbench check-shared-file-impact <id>`,
   a no-op unless the task's diff matches a registered pattern. On a match

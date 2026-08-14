@@ -465,21 +465,33 @@ class FixtureScanTarget:
 
 @dataclass(frozen=True)
 class FixtureConsistencyConfig:
-    """Per-backlog ``fixture_consistency:`` configuration.
+    """Per-backlog ``gates.fixture_consistency:`` configuration (spec 4.1, 4.7).
 
-    Opt-in surface for ``devbench check-fixture-consistency``. Absent
-    ``canonical_sources`` (the default for every workspace that does not
-    configure this block) makes the check a no-op, since devbench cannot
-    infer a target repo's fixture-file layout on its own.
+    Opt-in surface for ``devbench check-fixture-consistency``, one of the
+    eight gates nested under ``GatesConfig``. Absent ``canonical_sources``
+    (the default for every workspace that does not configure this block)
+    makes the check a no-op, since devbench cannot infer a target repo's
+    fixture-file layout on its own -- independent of ``enabled``, which
+    exists purely for uniformity with the other seven gates (D-2: every
+    gate carries the same ``enabled`` toggle shape).
 
     Attributes:
+        enabled: Uniform gate toggle (D-2, D-17). Default ``False``. The
+            resolved value is consumed by the four-layer precedence
+            resolver landed in a follow-up task (``resolve_gate_config``);
+            this dataclass only models the raw parsed value.
         canonical_sources: Designated canonical fixture/dataset file(s).
         scan: Mock/fixture files to cross-reference against a canonical
             source.
+        extract_source_literals: Reserved for a future literal-extraction
+            scanning mode (spec 4.7 hardening). Default ``False``; not yet
+            consumed by ``check_fixture_consistency``.
     """
 
+    enabled: bool = False
     canonical_sources: tuple[FixtureCanonicalSource, ...] = ()
     scan: tuple[FixtureScanTarget, ...] = ()
+    extract_source_literals: bool = False
 
 
 @dataclass(frozen=True)
@@ -552,6 +564,172 @@ class AmendmentConfig:
         default_factory=lambda: frozenset({"tdd_green_production_fix", "doc_sync_review_fix"})
     )
     max_requests_per_execution: int = 1
+
+
+# The eight integration-reality gates (spec 4.1; caylent-solutions/devbench-internal-backlog#10..#17).
+# Domain vocabulary, not operator-configurable -- deliberately NOT a constants.py env-tunable value.
+GATE_NAMES: frozenset[str] = frozenset(
+    {
+        "reachability",
+        "ancestry",
+        "shared_file_impact",
+        "fixture_consistency",
+        "write_path_audit",
+        "newly_reachable_paths",
+        "composition_root",
+        "layout_geometry",
+    }
+)
+
+
+@dataclass(frozen=True)
+class GateEnabledConfig:
+    """Project-level tunables for a gate with no tunable beyond ``enabled``.
+
+    Shared by the six gates whose spec-4.1 tunable set is exactly
+    ``{enabled}``: reachability, ancestry, write_path_audit,
+    newly_reachable_paths, composition_root, layout_geometry.
+
+    Attributes:
+        enabled: Whether this gate is enabled at the project level.
+            Default ``False`` (D-17: every gate disabled at the built-in
+            level). The resolved value consumed by gate commands is
+            computed by the four-layer precedence resolver landed in a
+            follow-up task (``resolve_gate_config``); this dataclass only
+            models the raw parsed project-level value.
+    """
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
+class GateSharedFileImpactConfig:
+    """Project-level ``gates.shared_file_impact:`` tunables (spec 4.1, 4.6).
+
+    Attributes:
+        enabled: Whether this gate is enabled at the project level.
+            Default ``False``.
+        auto_derive_registry: Reserved for the future auto-derived fan-in
+            registry successor to the hand-maintained per-repo glob list
+            (v1 is hand-maintained only, via ``gates.repos.<org/repo>
+            .shared_file_impact.patterns``). Default ``False``; not yet
+            consumed by ``check-shared-file-impact``.
+    """
+
+    enabled: bool = False
+    auto_derive_registry: bool = False
+
+
+@dataclass(frozen=True)
+class GateEnabledOverride:
+    """Per-repo override for a gate with no tunable beyond ``enabled``.
+
+    Attributes:
+        enabled: ``None`` means "not overridden for this repo -- inherit
+            the project-level value"; ``True``/``False`` explicitly flips
+            the gate for this repo only (D-15 field-wise merge).
+    """
+
+    enabled: bool | None = None
+
+
+@dataclass(frozen=True)
+class GateSharedFileImpactOverride:
+    """Per-repo override for ``gates.repos.<org/repo>.shared_file_impact``.
+
+    The migrated home of PR #318's retired per-repo glob-pattern key
+    (spec 4.1 migration): a repo's shared-file glob registry is now
+    ``gates.repos.<org/repo>.shared_file_impact.patterns``.
+
+    Attributes:
+        enabled: ``None`` means "not overridden for this repo -- inherit
+            the project-level value"; ``True``/``False`` explicitly flips
+            the gate for this repo only.
+        patterns: Glob patterns (fnmatch-style, matched against POSIX
+            paths relative to the repo root) identifying shared/high-fan-in
+            composition-root files for this repo. Empty tuple when unset,
+            which means the gate never triggers on this repo's diffs even
+            when enabled.
+    """
+
+    enabled: bool | None = None
+    patterns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class GateRepoOverrides:
+    """Per-repo gate overrides nested under ``gates.repos.<org/repo>`` (spec 4.1, D-15).
+
+    Every field is ``None`` when the repo does not override that
+    particular gate -- absence, not a zero-value object, so the (future)
+    four-layer resolver can distinguish "not overridden" from "explicitly
+    set to the built-in default value" during field-wise merge.
+
+    Attributes:
+        reachability: Override for the reachability gate, or ``None``.
+        ancestry: Override for the ancestry gate, or ``None``.
+        shared_file_impact: Override for the shared-file-impact gate
+            (carries ``patterns`` in addition to ``enabled``), or ``None``.
+        fixture_consistency: Override for the fixture-consistency gate, or
+            ``None``.
+        write_path_audit: Override for the write-path-audit gate, or
+            ``None``.
+        newly_reachable_paths: Override for the newly-reachable-paths
+            gate, or ``None``.
+        composition_root: Override for the composition-root gate, or
+            ``None``.
+        layout_geometry: Override for the layout-geometry gate, or
+            ``None``.
+    """
+
+    reachability: GateEnabledOverride | None = None
+    ancestry: GateEnabledOverride | None = None
+    shared_file_impact: GateSharedFileImpactOverride | None = None
+    fixture_consistency: GateEnabledOverride | None = None
+    write_path_audit: GateEnabledOverride | None = None
+    newly_reachable_paths: GateEnabledOverride | None = None
+    composition_root: GateEnabledOverride | None = None
+    layout_geometry: GateEnabledOverride | None = None
+
+
+@dataclass(frozen=True)
+class GatesConfig:
+    """Unified ``gates:`` configuration tree (spec 4.1; D-2, D-15, D-17).
+
+    Replaces the ad-hoc per-PR opt-in surfaces #318 (a per-repo glob-pattern
+    key nested under ``repos:``) and #322 (a bare top-level opt-in block)
+    shipped -- both REMOVED by this same change, with zero remaining
+    references (spec 4.1 Migration; complete replacement). Every gate is
+    disabled by default at this built-in level (D-17); ``resolve_gate_config``
+    (a follow-up task) is the ONLY read path that resolves the full
+    built-in -> project -> per-repo -> env four-layer precedence (D-15) --
+    this dataclass models the raw parsed project + per-repo-override
+    layers only.
+
+    Attributes:
+        reachability: check-reachability gate tunables.
+        ancestry: check-ancestry gate tunables.
+        shared_file_impact: check-shared-file-impact gate tunables.
+        fixture_consistency: check-fixture-consistency gate tunables.
+        write_path_audit: write-path-audit gate tunables.
+        newly_reachable_paths: newly-reachable-paths gate tunables.
+        composition_root: composition-root gate tunables.
+        layout_geometry: layout-geometry gate tunables.
+        repos: Optional per-repo override map, keyed by ``org/repo``. Every
+            key must already be present in the top-level ``repos:``
+            mapping -- an override naming an unconfigured repo is a
+            load-time error (AC-E2-F1-S1-T1-2).
+    """
+
+    reachability: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    ancestry: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    shared_file_impact: GateSharedFileImpactConfig = field(default_factory=GateSharedFileImpactConfig)
+    fixture_consistency: FixtureConsistencyConfig = field(default_factory=FixtureConsistencyConfig)
+    write_path_audit: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    newly_reachable_paths: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    composition_root: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    layout_geometry: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    repos: dict[str, GateRepoOverrides] = field(default_factory=dict)
 
 
 @dataclass
@@ -955,26 +1133,39 @@ def _parse_task_factory_config(
 
 
 def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsistencyConfig:
-    """Parse and validate the ``fixture_consistency:`` YAML section.
+    """Parse and validate the ``gates.fixture_consistency:`` YAML section (spec 4.1, 4.7).
 
     Args:
         path: Config file path (used in error messages).
-        raw: Raw ``fixture_consistency`` dict from YAML (already
+        raw: Raw ``gates.fixture_consistency`` dict from YAML (already
             schema-validated for unknown keys and types). May be an empty
             dict when the section is absent -- that is the default,
-            opt-out state (the check becomes a no-op).
+            opt-out state (the check becomes a no-op regardless of
+            ``enabled``).
 
     Returns:
         A populated ``FixtureConsistencyConfig``.
 
     Raises:
-        ValueError: If a ``canonical_sources`` entry has a non-positive
+        ValueError: If ``enabled`` or ``extract_source_literals`` is not a
+            boolean; if a ``canonical_sources`` entry has a non-positive
             ``expected_count``; if any ``scan`` entry names a
             ``canonical_source`` that does not match a configured
             ``canonical_sources[].path``; or if a ``scan`` entry omits
             ``canonical_source`` while more than one ``canonical_sources``
             entry is configured (ambiguous target).
     """
+    defaults = FixtureConsistencyConfig()
+    enabled = _parse_gate_enabled_field(path, "gates.fixture_consistency", raw, defaults.enabled)
+
+    extract_source_literals = raw.get("extract_source_literals", defaults.extract_source_literals)
+    if not isinstance(extract_source_literals, bool):
+        raise ValueError(
+            f"Config file '{path}': gates.fixture_consistency.extract_source_literals must be a "
+            f"boolean (true/false), got {type(extract_source_literals).__name__} "
+            f"({extract_source_literals!r})."
+        )
+
     canonical_raw = raw.get("canonical_sources") or []
     canonical_sources: list[FixtureCanonicalSource] = []
     for entry in canonical_raw:
@@ -983,7 +1174,7 @@ def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsisten
             expected_count = int(expected_count)
             if expected_count < 1:
                 raise ValueError(
-                    f"Config file '{path}': fixture_consistency.canonical_sources entry "
+                    f"Config file '{path}': gates.fixture_consistency.canonical_sources entry "
                     f"'{entry.get('path')}' has expected_count={expected_count!r}; must be >= 1."
                 )
         canonical_sources.append(
@@ -1004,14 +1195,14 @@ def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsisten
                 canonical_source = canonical_sources[0].path
             elif len(canonical_sources) > 1:
                 raise ValueError(
-                    f"Config file '{path}': fixture_consistency.scan entry '{entry.get('path')}' "
+                    f"Config file '{path}': gates.fixture_consistency.scan entry '{entry.get('path')}' "
                     "does not set canonical_source, and more than one canonical_sources entry is "
                     f"configured ({sorted(canonical_paths)}); the target is ambiguous. Set "
                     "canonical_source to one of the configured canonical_sources[].path values."
                 )
         elif canonical_source not in canonical_paths:
             raise ValueError(
-                f"Config file '{path}': fixture_consistency.scan entry '{entry.get('path')}' sets "
+                f"Config file '{path}': gates.fixture_consistency.scan entry '{entry.get('path')}' sets "
                 f"canonical_source={canonical_source!r}, which does not match any configured "
                 f"canonical_sources[].path ({sorted(canonical_paths)})."
             )
@@ -1025,8 +1216,304 @@ def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsisten
         )
 
     return FixtureConsistencyConfig(
+        enabled=enabled,
         canonical_sources=tuple(canonical_sources),
         scan=tuple(scan_targets),
+        extract_source_literals=extract_source_literals,
+    )
+
+
+def _parse_gate_enabled_field(path: Path, key: str, raw: dict, default: bool = False) -> bool:
+    """Parse and validate one gate's ``enabled`` field, shared by every gate parser.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key prefix (e.g. ``gates.reachability`` or
+            ``gates.repos.org/repo.ancestry``) used to build the error
+            message and to disambiguate which gate/override is at fault.
+        raw: The gate's own raw dict (already schema-validated for type
+            when reached through ``load_runtime_config``; re-validated
+            here so a direct call bypassing the schema layer still fails
+            fast, matching every other ``_parse_*_config`` helper in this
+            module).
+        default: Value to return when ``enabled`` is absent from *raw*.
+
+    Returns:
+        The validated boolean value, or *default* when absent.
+
+    Raises:
+        ValueError: If ``enabled`` is present but not a boolean.
+    """
+    if "enabled" not in raw:
+        return default
+    value = raw["enabled"]
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"Config file '{path}': {key}.enabled must be a boolean (true/false), got "
+            f"{type(value).__name__} ({value!r})."
+        )
+    return value
+
+
+def _parse_simple_gate_enabled(path: Path, key: str, gate_raw: object) -> GateEnabledConfig:
+    """Parse one of the six enabled-only gates (spec 4.1: everything except
+    shared_file_impact and fixture_consistency).
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key for this gate (e.g. ``gates.reachability``).
+        gate_raw: Raw value from YAML for this gate -- ``None`` when the
+            gate key is absent from ``gates:``, otherwise a dict (schema-
+            validated).
+
+    Returns:
+        ``GateEnabledConfig`` populated from *gate_raw*, or the built-in
+        default (``enabled=False``) when *gate_raw* is ``None``.
+
+    Raises:
+        ValueError: If *gate_raw* is present but not a mapping, or its
+            ``enabled`` field is not a boolean.
+    """
+    if gate_raw is None:
+        return GateEnabledConfig()
+    if not isinstance(gate_raw, dict):
+        raise ValueError(f"Config file '{path}': {key} must be a mapping, got {type(gate_raw).__name__}.")
+    return GateEnabledConfig(enabled=_parse_gate_enabled_field(path, key, gate_raw))
+
+
+def _parse_shared_file_impact_gate(path: Path, gate_raw: object) -> GateSharedFileImpactConfig:
+    """Parse the project-level ``gates.shared_file_impact:`` YAML section.
+
+    Args:
+        path: Config file path (used in error messages).
+        gate_raw: Raw value from YAML -- ``None`` when the key is absent,
+            otherwise a dict (schema-validated).
+
+    Returns:
+        ``GateSharedFileImpactConfig`` populated from *gate_raw*.
+
+    Raises:
+        ValueError: If *gate_raw* is present but not a mapping, or
+            ``enabled``/``auto_derive_registry`` is not a boolean.
+    """
+    defaults = GateSharedFileImpactConfig()
+    if gate_raw is None:
+        return defaults
+    if not isinstance(gate_raw, dict):
+        raise ValueError(
+            f"Config file '{path}': gates.shared_file_impact must be a mapping, got {type(gate_raw).__name__}."
+        )
+    enabled = _parse_gate_enabled_field(path, "gates.shared_file_impact", gate_raw, defaults.enabled)
+    auto_derive_registry = gate_raw.get("auto_derive_registry", defaults.auto_derive_registry)
+    if not isinstance(auto_derive_registry, bool):
+        raise ValueError(
+            f"Config file '{path}': gates.shared_file_impact.auto_derive_registry must be a boolean "
+            f"(true/false), got {type(auto_derive_registry).__name__} ({auto_derive_registry!r})."
+        )
+    return GateSharedFileImpactConfig(enabled=enabled, auto_derive_registry=auto_derive_registry)
+
+
+def _parse_gate_override_enabled(path: Path, key: str, raw: dict) -> GateEnabledOverride:
+    """Parse one per-repo enabled-only gate override.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key for this override (e.g.
+            ``gates.repos.org/repo.reachability``).
+        raw: The override's own raw dict.
+
+    Returns:
+        ``GateEnabledOverride`` with ``enabled=None`` when the override
+        dict omits ``enabled`` (not overridden, inherit project level).
+
+    Raises:
+        ValueError: If ``enabled`` is present but not a boolean.
+    """
+    if "enabled" not in raw:
+        return GateEnabledOverride()
+    value = raw["enabled"]
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"Config file '{path}': {key}.enabled must be a boolean (true/false), got "
+            f"{type(value).__name__} ({value!r})."
+        )
+    return GateEnabledOverride(enabled=value)
+
+
+def _parse_gate_override_shared_file_impact(path: Path, key: str, raw: dict) -> GateSharedFileImpactOverride:
+    """Parse the per-repo ``gates.repos.<org/repo>.shared_file_impact`` override.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key for this override.
+        raw: The override's own raw dict.
+
+    Returns:
+        ``GateSharedFileImpactOverride`` with ``enabled=None`` when the
+        override omits ``enabled`` (not overridden) and ``patterns=()``
+        when omitted.
+
+    Raises:
+        ValueError: If ``enabled`` is present but not a boolean.
+    """
+    enabled: bool | None = None
+    if "enabled" in raw:
+        value = raw["enabled"]
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Config file '{path}': {key}.enabled must be a boolean (true/false), got "
+                f"{type(value).__name__} ({value!r})."
+            )
+        enabled = value
+    patterns = tuple(raw.get("patterns") or ())
+    return GateSharedFileImpactOverride(enabled=enabled, patterns=patterns)
+
+
+def _parse_one_gate_repo_override(path: Path, repo_name: str, raw: dict) -> GateRepoOverrides:
+    """Parse the full set of gate overrides configured for one repo.
+
+    Args:
+        path: Config file path (used in error messages).
+        repo_name: The ``org/repo`` key this override block belongs to.
+        raw: Raw dict of ``{gate_name: gate_override_dict}`` for this repo.
+
+    Returns:
+        ``GateRepoOverrides`` with only the explicitly-configured gate
+        fields populated; every other field stays ``None``.
+
+    Raises:
+        ValueError: If a key is not one of the eight declared gate names,
+            or a gate's override value is not a mapping.
+    """
+    reachability: GateEnabledOverride | None = None
+    ancestry: GateEnabledOverride | None = None
+    shared_file_impact: GateSharedFileImpactOverride | None = None
+    fixture_consistency: GateEnabledOverride | None = None
+    write_path_audit: GateEnabledOverride | None = None
+    newly_reachable_paths: GateEnabledOverride | None = None
+    composition_root: GateEnabledOverride | None = None
+    layout_geometry: GateEnabledOverride | None = None
+
+    for gate_name, gate_raw in raw.items():
+        if gate_name not in GATE_NAMES:
+            raise ValueError(
+                f"Config file '{path}': gates.repos.{repo_name}.{gate_name} is not a recognised gate "
+                f"name; valid gate names are {sorted(GATE_NAMES)}."
+            )
+        key = f"gates.repos.{repo_name}.{gate_name}"
+        if not isinstance(gate_raw, dict):
+            raise ValueError(f"Config file '{path}': {key} must be a mapping, got {type(gate_raw).__name__}.")
+        if gate_name == "reachability":
+            reachability = _parse_gate_override_enabled(path, key, gate_raw)
+        elif gate_name == "ancestry":
+            ancestry = _parse_gate_override_enabled(path, key, gate_raw)
+        elif gate_name == "shared_file_impact":
+            shared_file_impact = _parse_gate_override_shared_file_impact(path, key, gate_raw)
+        elif gate_name == "fixture_consistency":
+            fixture_consistency = _parse_gate_override_enabled(path, key, gate_raw)
+        elif gate_name == "write_path_audit":
+            write_path_audit = _parse_gate_override_enabled(path, key, gate_raw)
+        elif gate_name == "newly_reachable_paths":
+            newly_reachable_paths = _parse_gate_override_enabled(path, key, gate_raw)
+        elif gate_name == "composition_root":
+            composition_root = _parse_gate_override_enabled(path, key, gate_raw)
+        else:
+            layout_geometry = _parse_gate_override_enabled(path, key, gate_raw)
+
+    return GateRepoOverrides(
+        reachability=reachability,
+        ancestry=ancestry,
+        shared_file_impact=shared_file_impact,
+        fixture_consistency=fixture_consistency,
+        write_path_audit=write_path_audit,
+        newly_reachable_paths=newly_reachable_paths,
+        composition_root=composition_root,
+        layout_geometry=layout_geometry,
+    )
+
+
+def _parse_gate_repo_overrides(
+    path: Path, repos_raw: dict, configured_repos: dict[str, RepoConfig]
+) -> dict[str, GateRepoOverrides]:
+    """Parse the optional ``gates.repos:`` per-repo override map.
+
+    Args:
+        path: Config file path (used in error messages).
+        repos_raw: Raw ``gates.repos`` dict from YAML. May be empty when
+            the section is absent.
+        configured_repos: The already-parsed top-level ``repos:`` mapping
+            -- every override key must already be a member of this dict.
+
+    Returns:
+        Mapping of ``org/repo`` -> ``GateRepoOverrides``.
+
+    Raises:
+        ValueError: If an override names a repo absent from
+            *configured_repos* (AC-E2-F1-S1-T1-2).
+    """
+    overrides: dict[str, GateRepoOverrides] = {}
+    for repo_key, repo_gate_raw in repos_raw.items():
+        repo_name = str(repo_key)
+        if repo_name not in configured_repos:
+            raise ValueError(
+                f"Config file '{path}': gates.repos.{repo_name} overrides a repo that is not "
+                f"configured under the top-level repos: mapping ({sorted(configured_repos)}). Add "
+                f"'{repo_name}' to repos: or remove this override."
+            )
+        if not isinstance(repo_gate_raw, dict):
+            raise ValueError(
+                f"Config file '{path}': gates.repos.{repo_name} must be a mapping, got {type(repo_gate_raw).__name__}."
+            )
+        overrides[repo_name] = _parse_one_gate_repo_override(path, repo_name, repo_gate_raw)
+    return overrides
+
+
+def _parse_gates_config(path: Path, gates_raw: dict, repos: dict[str, RepoConfig]) -> GatesConfig:
+    """Parse and validate the ``gates:`` YAML section (spec 4.1; D-2, D-15, D-17).
+
+    Modelled on ``_parse_task_factory_config``: schema validation already
+    rejects unknown keys and gross type errors via ``additionalProperties:
+    false``; this function re-validates independently (defense in depth,
+    matching every other ``_parse_*_config`` helper in this module) so a
+    direct call bypassing the schema layer still fails fast with a message
+    naming the offending key.
+
+    Args:
+        path: Config file path (used in error messages).
+        gates_raw: Raw ``gates`` dict from YAML. May be an empty dict when
+            the section is absent -- that yields the all-disabled built-in
+            tree (AC-E2-F1-S1-T1-4).
+        repos: The already-parsed top-level ``repos:`` mapping, needed to
+            validate ``gates.repos`` override keys.
+
+    Returns:
+        ``GatesConfig`` populated from *gates_raw*.
+
+    Raises:
+        ValueError: If ``gates_raw`` names a key that is not one of the
+            eight declared gates (plus the optional ``repos`` override
+            map); if any gate's ``enabled`` (or other tunable) is the
+            wrong type; or if ``gates.repos`` overrides a repo absent from
+            *repos*.
+    """
+    unknown = set(gates_raw) - GATE_NAMES - {"repos"}
+    if unknown:
+        raise ValueError(
+            f"Config file '{path}': gates section names unknown gate(s) {sorted(unknown)}; valid "
+            f"gate names are {sorted(GATE_NAMES)} (plus the optional 'repos' override map)."
+        )
+    return GatesConfig(
+        reachability=_parse_simple_gate_enabled(path, "gates.reachability", gates_raw.get("reachability")),
+        ancestry=_parse_simple_gate_enabled(path, "gates.ancestry", gates_raw.get("ancestry")),
+        shared_file_impact=_parse_shared_file_impact_gate(path, gates_raw.get("shared_file_impact")),
+        fixture_consistency=_parse_fixture_consistency_config(path, gates_raw.get("fixture_consistency") or {}),
+        write_path_audit=_parse_simple_gate_enabled(path, "gates.write_path_audit", gates_raw.get("write_path_audit")),
+        newly_reachable_paths=_parse_simple_gate_enabled(
+            path, "gates.newly_reachable_paths", gates_raw.get("newly_reachable_paths")
+        ),
+        composition_root=_parse_simple_gate_enabled(path, "gates.composition_root", gates_raw.get("composition_root")),
+        layout_geometry=_parse_simple_gate_enabled(path, "gates.layout_geometry", gates_raw.get("layout_geometry")),
+        repos=_parse_gate_repo_overrides(path, gates_raw.get("repos") or {}, repos),
     )
 
 
@@ -1290,13 +1777,6 @@ class RepoConfig:
             populated by ``load_runtime_config`` from the YAML repos map
             key. Stored verbatim so consumers do not re-validate the
             shape per-call.
-        shared_file_patterns: Glob patterns (fnmatch-style, matched
-            against POSIX paths relative to the repo root) identifying
-            shared/high-fan-in composition-root files for this repo.
-            Consumed by ``devbench check-shared-file-impact``
-            (caylent-solutions/devbench-internal-backlog#13 -- shared-file
-            full-suite regression gate). Empty tuple when unset, which
-            means the gate never triggers for this repo.
     """
 
     default_branch: str | None = None
@@ -1305,7 +1785,6 @@ class RepoConfig:
     branch_prefix: str | None = None
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
-    shared_file_patterns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1504,9 +1983,12 @@ class RuntimeConfig:
         backlog: Backlog lifecycle settings (default status for new WUs).
         quota_handling: Quota wait-and-resume configuration (issue #236,
             spec S5.2). Absent YAML block yields the full default set.
-        fixture_consistency: Opt-in canonical-fixture cross-reference
-            configuration for ``devbench check-fixture-consistency``.
-            Absent ``canonical_sources`` makes the check a no-op.
+        gates: Unified configuration tree for the eight integration-reality
+            gates (spec 4.1; D-2, D-15, D-17), including the migrated
+            ``gates.fixture_consistency`` opt-in canonical-fixture
+            cross-reference configuration for ``devbench
+            check-fixture-consistency``. Every gate is disabled by default;
+            absent ``gates:`` yields the all-disabled built-in tree.
         allowed_orgs: List of permitted GitHub organisations.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
@@ -1545,7 +2027,7 @@ class RuntimeConfig:
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     agent_models: AgentModelsConfig = field(default_factory=AgentModelsConfig)
     validate: ValidateConfig = field(default_factory=ValidateConfig)
-    fixture_consistency: FixtureConsistencyConfig = field(default_factory=FixtureConsistencyConfig)
+    gates: GatesConfig = field(default_factory=GatesConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     allowed_orgs: list[str] = field(default_factory=list)
@@ -1643,7 +2125,6 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
 
     repo_branch_prefix = _parse_branch_prefix(path, f"repos.{repo_name}.branch_prefix", repo_data.get("branch_prefix"))
-    shared_file_patterns = tuple(repo_data.get("shared_file_patterns") or ())
 
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
@@ -1651,7 +2132,6 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
             default_branch=default_branch,
             merge_strategy=repo_merge_strategy,
             branch_prefix=repo_branch_prefix,
-            shared_file_patterns=shared_file_patterns,
         )
 
     if Path(raw_checkout).is_absolute():
@@ -1669,7 +2149,6 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         checkout_directory=raw_checkout,
         merge_strategy=repo_merge_strategy,
         branch_prefix=repo_branch_prefix,
-        shared_file_patterns=shared_file_patterns,
     )
 
 
@@ -2009,13 +2488,13 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
-    # Populate FixtureConsistencyConfig from YAML fixture_consistency block
-    # (caylent-solutions/devbench-internal-backlog#17 fixture-catalog
-    # cross-reference lint). Absent block -> default-constructed with empty
-    # canonical_sources -> the check is a no-op, since devbench cannot infer
-    # a target repo's fixture layout.
-    fixture_consistency_raw = raw.get("fixture_consistency") or {}
-    fixture_consistency = _parse_fixture_consistency_config(path, fixture_consistency_raw)
+    # Populate GatesConfig from YAML gates block (spec 4.1; D-2, D-15, D-17).
+    # Absent block -> default-constructed all-disabled tree (AC-E2-F1-S1-T1-4).
+    # Nests the migrated gates.fixture_consistency surface (superseding the
+    # removed top-level fixture_consistency: block, caylent-solutions/
+    # devbench-internal-backlog#17).
+    gates_raw = raw.get("gates") or {}
+    gates = _parse_gates_config(path, gates_raw, repos)
 
     # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
@@ -2099,7 +2578,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         task_factory=task_factory,
         agent_models=agent_models,
         validate=validate_cfg,
-        fixture_consistency=fixture_consistency,
+        gates=gates,
         debug=debug,
         notifications=notifications,
         allowed_orgs=allowed_orgs,

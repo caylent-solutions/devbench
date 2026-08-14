@@ -5,6 +5,45 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **The Bedrock backend could not run any current-generation model** (issue
+  #342). `BEDROCK_AGENT_MODEL_PATTERN` required every id to end in `-v<N>`
+  (`^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$`), a convention AWS does not
+  follow. Two whole shapes of real inference-profile id were rejected: current
+  generations carry no version segment (`us.anthropic.claude-opus-5`,
+  `...-sonnet-5`, `...-opus-4-8`, `...-opus-4-7`), and dated profiles end
+  `-v1:0` whose `:0` failed the `$` anchor. Measured against
+  `aws bedrock list-inference-profiles`: of 12 ACTIVE non-haiku
+  `us.anthropic.claude*` profiles the pattern accepted **1**, so
+  `use_bedrock: true` plus any current model failed at config load with a
+  `ValueError` and nothing started -- pinning Bedrock operators to
+  `us.anthropic.claude-opus-4-6-v1`. The rejection message's own example,
+  `us.anthropic.claude-opus-4-7-v1`, is not a real profile id (the real one
+  has no `-v1`), so it steered operators toward a value AWS rejects at
+  invocation.
+
+  The pattern is now `^us\.anthropic\.claude-[a-z0-9.:-]+$`, keeping what
+  devbench actually depends on (the `us.` cross-region prefix, the
+  `anthropic.claude` family, the separately-enforced haiku ban) and dropping
+  the false version-suffix assumption; `.` and `:` are admitted so dated ids
+  parse. The message now names a real id and points at
+  `aws bedrock list-inference-profiles`. A validator cannot confirm a model is
+  *enabled* in the caller's account -- that needs an API call config load must
+  not make -- so the contract is deliberately "structurally a Bedrock Claude
+  id", with genuine access errors surfacing at first invocation where AWS names
+  the real failure. New tests parametrize over real profile ids captured from
+  the live API rather than synthesising `f"us.anthropic.{id}-v1"`, which is how
+  the over-strict pattern survived until a real Bedrock run.
+
+- **The test suite was unrunnable in a shell configured for Bedrock** (issue
+  #342). `tests/conftest.py` forces every other backend-affecting variable but
+  left `DEVBENCH_USE_BEDROCK` / `DEVBENCH_BEDROCK_REGION` inherited. Since env
+  beats yaml, an operator who had legitimately exported them for their real
+  workspace saw `use_bedrock` silently flip for the whole suite: five
+  `tests/test_config.py` cases asserting the Anthropic path failed with Bedrock
+  complaints. Both are now popped alongside `DEVBENCH_SESSION_NAME`, so the
+  fixture YAML stays the single source of truth and cases that exercise either
+  backend set the variable explicitly.
+
 - **Blocking a task destroyed every uncommitted change in the target repo**
   (issue #340). `cli._clean_target_repo_on_block` ran `git reset --hard HEAD`
   plus `git clean -fd` against the target checkout on every transition to

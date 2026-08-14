@@ -3532,6 +3532,129 @@ _NEW_LINEUP_MODEL_IDS = (
 )
 
 
+#: Real ``us.anthropic.claude*`` inference-profile ids, taken verbatim from
+#: ``aws bedrock list-inference-profiles --region us-east-1`` (all reported
+#: ACTIVE, 2026-08-14). Three distinct shapes appear in AWS's own naming, and
+#: issue #342's pattern accepted only the first:
+#:   * ``-v<N>``            (older, e.g. opus-4-6-v1)
+#:   * no version segment   (current generation, e.g. opus-5)
+#:   * dated ``-v<N>:<M>``  (e.g. sonnet-4-5-20250929-v1:0)
+#: Pinned as data rather than synthesised (``f"us.anthropic.{id}-v1"``) because
+#: a synthesised id cannot catch a naming convention AWS does not follow -- that
+#: is exactly how the over-strict pattern survived until a real Bedrock run.
+_REAL_BEDROCK_PROFILE_IDS: tuple[str, ...] = (
+    "us.anthropic.claude-opus-4-6-v1",
+    "us.anthropic.claude-opus-5",
+    "us.anthropic.claude-sonnet-5",
+    "us.anthropic.claude-opus-4-8",
+    "us.anthropic.claude-opus-4-7",
+    "us.anthropic.claude-sonnet-4-6",
+    "us.anthropic.claude-fable-5",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "us.anthropic.claude-opus-4-5-20251101-v1:0",
+    "us.anthropic.claude-opus-4-1-20250805-v1:0",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+)
+
+
+@pytest.mark.unit
+class TestRealBedrockProfileIdsAccepted:
+    """Issue #342: every real ACTIVE profile id must load under use_bedrock.
+
+    The previous pattern required a trailing ``-v<N>``, accepting 1 of the 12
+    ACTIVE non-haiku profiles in a live account and failing config load for
+    every current-generation model, so the Bedrock backend could only run on
+    ``us.anthropic.claude-opus-4-6-v1``.
+    """
+
+    @pytest.mark.parametrize("model_id", _REAL_BEDROCK_PROFILE_IDS)
+    def test_real_profile_id_accepted(self, model_id: str) -> None:
+        from devbench.config_loader import validate_agent_model_value
+
+        validate_agent_model_value("yaml", "executor", model_id, True)
+
+    @pytest.mark.parametrize("model_id", _REAL_BEDROCK_PROFILE_IDS)
+    def test_real_profile_id_matches_the_pattern_directly(self, model_id: str) -> None:
+        from devbench.constants import BEDROCK_AGENT_MODEL_PATTERN
+
+        assert BEDROCK_AGENT_MODEL_PATTERN.match(model_id), (
+            f"{model_id!r} is a real ACTIVE Bedrock inference profile and must validate"
+        )
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "us.anthropic.claude-opus-5",  # no version segment
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",  # dated, ':' in id
+        ],
+    )
+    def test_both_previously_rejected_shapes_round_trip_via_yaml(self, tmp_path: Path, model_id: str) -> None:
+        """A full config-load round trip, not just the validator in isolation."""
+        cfg = self._write_bedrock_cfg(tmp_path / f"cfg-{abs(hash(model_id))}.yaml", model_id)
+
+        rt = load_runtime_config(cfg, {})
+
+        assert rt.agent_models.executor == model_id
+
+    @staticmethod
+    def _write_bedrock_cfg(path: Path, model_id: str) -> Path:
+        path.write_text(
+            textwrap.dedent(
+                f"""\
+                repos:
+                  org/repo:
+                    default_branch: main
+                use_bedrock: true
+                agents:
+                  executor: {model_id}
+                """
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "anthropic.claude-opus-5",  # missing the us. cross-region prefix
+            "eu.anthropic.claude-opus-5",  # wrong region prefix
+            "us.anthropic.titan-text-v1",  # wrong model family
+            "us.amazon.claude-opus-5",  # wrong vendor
+            "claude-opus-5",  # first-party id, not a Bedrock profile
+            "opus",  # short name
+        ],
+    )
+    def test_non_bedrock_shapes_still_rejected(self, model_id: str) -> None:
+        """Relaxing the version suffix must not turn the check into a no-op."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="not a valid Bedrock model id"):
+            validate_agent_model_value("yaml", "executor", model_id, True)
+
+    def test_haiku_profile_id_still_rejected(self) -> None:
+        """The haiku ban (issue #198) runs before the pattern check, so a
+        structurally valid haiku profile id must still fail -- and fail with the
+        haiku rationale, not a pattern complaint."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="devbench#198"):
+            validate_agent_model_value("yaml", "executor", "us.anthropic.claude-haiku-4-5-20251001-v1:0", True)
+
+    def test_rejection_message_names_a_real_profile_id(self) -> None:
+        """The old message's example, 'us.anthropic.claude-opus-4-7-v1', is not a
+        real profile id (the real one has no '-v1'), so it pointed operators at a
+        value AWS rejects at invocation."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError) as excinfo:
+            validate_agent_model_value("yaml", "executor", "opus", True)
+        message = str(excinfo.value)
+
+        assert "us.anthropic.claude-opus-4-7-v1" not in message
+        assert "us.anthropic.claude-opus-5" in message
+        assert "aws bedrock list-inference-profiles" in message
+
+
 @pytest.mark.unit
 class TestNewLineupModelIdsAccepted:
     """AC-E3-F1-S1-T1-6: validate_agent_model_value accepts every new-lineup

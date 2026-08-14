@@ -1272,9 +1272,12 @@ def validate_agent_model_value(
         if not BEDROCK_AGENT_MODEL_PATTERN.match(value):
             raise ValueError(
                 f"{source}: agents.{agent_label} = {value!r} is not a valid Bedrock "
-                "model id while use_bedrock: true. Expected pattern "
-                "'us.anthropic.claude-<name>-<ver>-v<N>' (e.g. "
-                "'us.anthropic.claude-opus-4-7-v1')."
+                "model id while use_bedrock: true. Expected a cross-region "
+                "inference-profile id: 'us.anthropic.claude-<name>' (e.g. "
+                "'us.anthropic.claude-opus-5'), optionally with a dated version "
+                "suffix (e.g. 'us.anthropic.claude-sonnet-4-5-20250929-v1:0'). "
+                "Run 'aws bedrock list-inference-profiles' to see the ids enabled "
+                "in your account and region."
             )
         return
     if value in ALLOWED_AGENT_MODEL_SHORT_NAMES:

@@ -314,6 +314,7 @@ from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
 if TYPE_CHECKING:
+    from devbench.config_loader import ResolvedGateConfig, RuntimeConfig
     from devbench.install_parity import InstallIdentity
 
 __all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
@@ -4819,6 +4820,139 @@ def _search_reachability_importers(repo_path: Path, rel_path: str, symbols: list
                 continue
             importers.add(hit)
     return sorted(importers)
+
+
+def _gate_override_repos(gate: str, runtime_config: "RuntimeConfig") -> list[str]:
+    """Return the repos carrying an explicit override object for *gate*, sorted.
+
+    "Carrying an override" means ``gates.repos.<repo>.<gate>`` is present at
+    all in the parsed config (a non-``None`` override object) -- even one
+    that only sets a structural field like ``shared_file_impact.patterns``
+    and leaves ``enabled`` inheriting the project level. This is the set
+    rendered in the ``devbench gates`` "repos" column (AC-E2-F1-S2-T1-2),
+    distinct from ``_gate_resolution_repo`` below (which repo's ``enabled``
+    override actually drives the row's resolved status).
+
+    Args:
+        gate: Gate name; one of ``constants.GATE_NAMES``.
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        Sorted list of ``org/repo`` names with an override for *gate*; empty
+        when none carry one.
+    """
+    return sorted(
+        repo for repo, overrides in runtime_config.gates.repos.items() if getattr(overrides, gate) is not None
+    )
+
+
+def _gate_resolution_repo(gate: str, override_repos: list[str], runtime_config: "RuntimeConfig") -> str:
+    """Pick the repo whose override should drive *gate*'s resolved status.
+
+    ``devbench gates`` renders one row per gate, not one row per repo, so
+    when multiple repos carry an override for the same gate this picks the
+    first (sorted, so deterministic) repo whose override actually sets
+    ``enabled`` -- the only field ``resolve_gate_config`` uses to compute
+    the row's ``status``/``provenance`` columns. Falls back to the first
+    override repo (still "carrying an override", just not one that changes
+    ``enabled``) when none of them set it, or to ``""`` (a no-op repo key
+    that matches no entry in ``runtime_config.gates.repos``) when *gate* has
+    no override at all -- ``resolve_gate_config`` then resolves purely from
+    the project/built-in/env layers.
+
+    Args:
+        gate: Gate name; one of ``constants.GATE_NAMES``.
+        override_repos: Result of ``_gate_override_repos(gate, runtime_config)``.
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        The repo name to pass as ``resolve_gate_config``'s ``repo`` argument.
+    """
+    for repo in override_repos:
+        override = getattr(runtime_config.gates.repos[repo], gate)
+        if getattr(override, "enabled", None) is not None:
+            return repo
+    return override_repos[0] if override_repos else ""
+
+
+def _format_gates_table(records: Sequence[tuple[str, "ResolvedGateConfig", list[str]]]) -> list[str]:
+    """Render the ``devbench gates`` table from resolved gate records.
+
+    Column widths are computed from the actual header/cell content on every
+    call (``str.ljust`` never truncates), so a later unit adding the tier
+    column (E2-F2-S1-T2) needs no re-layout of this function.
+
+    Args:
+        records: ``(gate, resolved, override_repos)`` triples in row order --
+            ``resolved`` is the ``ResolvedGateConfig`` returned by
+            ``resolve_gate_config`` for that gate (only the ``enabled``
+            field/provenance are rendered; the tier column is a later
+            unit's addition), and ``override_repos`` is
+            ``_gate_override_repos``'s result for that gate.
+
+    Returns:
+        Rendered lines: the header row followed by one row per record.
+    """
+    header = ("gate", "status", "repos", "provenance")
+    rows = [
+        (
+            gate,
+            "enabled" if resolved.values["enabled"] else "disabled",
+            ", ".join(override_repos) if override_repos else "-",
+            resolved.provenance["enabled"],
+        )
+        for gate, resolved, override_repos in records
+    ]
+    all_rows = [header, *rows]
+    widths = [max(len(row[i]) for row in all_rows) for i in range(len(header))]
+    return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)) for row in all_rows]
+
+
+def cmd_gates() -> int:
+    """Render the read-only ``devbench gates`` overview table (spec G2, 4.1; AC-4, AC-27).
+
+    Iterates the eight declared gates (``constants.GATE_NAMES``, in
+    declaration order) and resolves each one's ``enabled`` status and
+    provenance exclusively through ``config_loader.resolve_gate_config`` --
+    the ONLY sanctioned read path for gate configuration (AC-27); this
+    command never reads ``RuntimeConfig.gates`` fields directly. Total and
+    read-only: renders all eight rows even when the workspace has no
+    ``gates:`` key at all, since an absent block loads into the all-disabled
+    built-in tree (D-17).
+
+    Reloads the config file fresh from disk (mirrors ``cmd_check``) instead
+    of trusting the process-wide ``RUNTIME_CONFIG`` singleton, so a config
+    load failure is caught HERE with the loader's own clean, single-line
+    message on stderr rather than letting the raw exception escape
+    uncaught (spec Section 7: errors on stderr, no stack traces for
+    expected failures).
+
+    Returns:
+        0 with the rendered table on stdout. 1 with the loader's own
+        fail-fast message on stderr and nothing on stdout when the config
+        file is missing or fails YAML/schema validation.
+    """
+    from devbench.config import resolve_gate_env_override
+    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
+    from devbench.constants import GATE_NAMES as _GATE_ROW_ORDER
+
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    try:
+        runtime_config = load_runtime_config(cfg_path, os.environ)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    records: list[tuple[str, ResolvedGateConfig, list[str]]] = []
+    for gate in _GATE_ROW_ORDER:
+        override_repos = _gate_override_repos(gate, runtime_config)
+        resolution_repo = _gate_resolution_repo(gate, override_repos, runtime_config)
+        resolved = resolve_gate_config(gate, resolution_repo, runtime_config, resolve_gate_env_override(gate))
+        records.append((gate, resolved, override_repos))
+
+    for line in _format_gates_table(records):
+        print(line)
+    return 0
 
 
 def cmd_check_reachability(unit_id: str) -> int:
@@ -13454,6 +13588,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         1,
         "Print out-of-Manifest staged paths and exit non-zero on mismatch (read-only, "
         "deterministic; spec 4.C): check-manifest-scope <id>",
+    ),
+    "gates": (
+        cmd_gates,
+        0,
+        "Show every gate's tier, status and repo overrides",
     ),
     "check-reachability": (
         cmd_check_reachability,

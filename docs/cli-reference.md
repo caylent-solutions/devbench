@@ -27,6 +27,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 ## Contents
 
 - [Backlog read](#backlog-read)
+- [Gates](#gates)
 - [Backlog write](#backlog-write)
 - [Drain (graceful orchestrator stop)](#drain-graceful-orchestrator-stop)
 - [Named sessions](#named-sessions)
@@ -383,6 +384,48 @@ uv run devbench read-unit [--strip-comments] <id>
 ```
 
 Print the work-unit content (the `.md` file body) plus the resolved repo path as JSON. Used by agents to fetch work-unit context for their prompts. `--strip-comments` omits the `## Comments` audit history, useful for first-round review agents that do not need prior feedback context.
+
+---
+
+## Gates
+
+Read-only introspection for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates` only -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
+
+### `gates`
+
+```
+uv run devbench gates
+```
+
+Show every gate's tier, status and repo overrides. Renders one row per declared gate (`reachability`, `ancestry`, `shared_file_impact`, `fixture_consistency`, `write_path_audit`, `newly_reachable_paths`, `composition_root`, `layout_geometry`, in that order), each resolved exclusively through `config_loader.resolve_gate_config` -- the single read path for the four-layer precedence model (built-in -> project -> per-repo -> env; see [devbench-yaml-reference.md](devbench-yaml-reference.md#gates----integration-reality-gates-spec-41)). This command never reads `gates:` config directly.
+
+Columns:
+
+- **gate** -- the gate's declared name.
+- **status** -- `enabled` or `disabled`, the resolved value of that gate's `enabled` field.
+- **repos** -- the `org/repo` name(s) carrying an explicit override for that gate (comma-separated when more than one), or `-` when none override it.
+- **provenance** -- which layer set the resolved `status`: `builtin`, `project`, `repo`, or `env`.
+
+Read-only and total: on a fresh workspace with no `gates:` key at all, every row renders `disabled` / `-` / `builtin` (D-17: every gate disabled by default). Column widths are computed from the row data on every run, not hard-coded.
+
+Exits 1 with the loader's own fail-fast message on stderr (and no table on stdout) when `backlog/config/devbench.yaml` is missing or fails YAML/schema validation.
+
+Example, with a per-repo override enabling `shared_file_impact` for `caylent-solutions/devbench`:
+
+```
+$ uv run devbench gates
+gate                   status    repos                       provenance
+reachability           disabled  -                           builtin
+ancestry               disabled  -                           builtin
+shared_file_impact     enabled   caylent-solutions/devbench  repo
+fixture_consistency    disabled  -                           builtin
+write_path_audit       disabled  -                           builtin
+newly_reachable_paths  disabled  -                           builtin
+composition_root       disabled  -                           builtin
+layout_geometry        disabled  -                           builtin
+```
+
+The `tier` column shown in the spec's `G2` worked example is added by a later unit once `constants.GATE_TIERS` (spec section 4.2) exists.
 
 ---
 

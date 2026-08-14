@@ -28,9 +28,11 @@ from devbench.config_loader import (
     FixtureCanonicalSource,
     FixtureConsistencyConfig,
     FixtureScanTarget,
+    ResolvedGateConfig,
 )
 from devbench.constants import (
     BACKLOG_SUBDIR,
+    GATE_NAMES,
     SESSION_DEFAULT_NAME,
     SESSION_SESSIONS_BASE_DIR,
     TDD_ENTRY_TEMPLATE,
@@ -6861,6 +6863,199 @@ class TestReachabilityHelperFunctions:
     def test_parse_added_paths_skips_blank_lines(self) -> None:
         name_status = "\nA\tsrc/new.py\n\n"
         assert cli._parse_reachability_added_paths(name_status) == ["src/new.py"]
+
+
+def _gates_table_cells(line: str) -> list[str]:
+    """Split one rendered ``devbench gates`` line back into its cells.
+
+    Columns are separated by at least two spaces (``_format_gates_table``
+    left-justifies each cell to its column width, then joins with two more
+    spaces); no cell value used by these tests ever contains two
+    consecutive spaces, so this split is unambiguous.
+    """
+    return re.split(r"\s{2,}", line.strip())
+
+
+def _make_resolved_gate_config(gate: str = "reachability", *, enabled: bool, provenance: str) -> ResolvedGateConfig:
+    return ResolvedGateConfig(gate=gate, values={"enabled": enabled}, provenance={"enabled": provenance})
+
+
+class TestFormatGatesTable:
+    """cli._format_gates_table: pure row-rendering, column widths computed
+    from the data (AC-E2-F1-S2-T1-2, AC-E2-F1-S2-T1-3; DoD: no hard-coded
+    widths)."""
+
+    def test_header_only_when_no_records(self) -> None:
+        lines = cli._format_gates_table([])
+        assert lines == ["gate  status  repos  provenance"]
+
+    def test_disabled_row_uses_no_override_placeholder(self) -> None:
+        resolved = _make_resolved_gate_config(enabled=False, provenance="builtin")
+        lines = cli._format_gates_table([("reachability", resolved, [])])
+        assert len(lines) == 2
+        assert _gates_table_cells(lines[0]) == ["gate", "status", "repos", "provenance"]
+        assert _gates_table_cells(lines[1]) == ["reachability", "disabled", "-", "builtin"]
+
+    def test_enabled_repo_override_row_lists_the_repo(self) -> None:
+        resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
+        lines = cli._format_gates_table([("shared_file_impact", resolved, ["caylent-solutions/devbench"])])
+        assert _gates_table_cells(lines[1]) == [
+            "shared_file_impact",
+            "enabled",
+            "caylent-solutions/devbench",
+            "repo",
+        ]
+
+    def test_multiple_override_repos_are_comma_joined(self) -> None:
+        resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
+        repos = ["org-a/repo-a", "org-b/repo-b"]
+        lines = cli._format_gates_table([("shared_file_impact", resolved, repos)])
+        assert _gates_table_cells(lines[1])[2] == "org-a/repo-a, org-b/repo-b"
+
+    def test_column_width_grows_to_fit_longest_cell_without_truncation(self) -> None:
+        long_repo = "an-organisation-with-a-very-long-name/an-equally-long-repository-name"
+        resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
+        lines = cli._format_gates_table([("shared_file_impact", resolved, [long_repo])])
+        header, row = lines
+        # The full, untruncated repo name is preserved as its own cell...
+        assert _gates_table_cells(row)[2] == long_repo
+        # ...and since it is by far the widest cell in the "repos" column,
+        # the column carries no extra padding: the next column
+        # ("provenance") starts immediately after it plus the 2-space
+        # separator, at the SAME offset in both the header and the data
+        # row -- proving the width is derived from the data (a fixed,
+        # hard-coded width would either truncate this cell or misalign the
+        # header).
+        expected_provenance_start = row.index(long_repo) + len(long_repo) + 2
+        assert row.index("repo", expected_provenance_start) == expected_provenance_start
+        assert header.index("provenance") == expected_provenance_start
+
+    def test_multiple_rows_stay_column_aligned(self) -> None:
+        short = _make_resolved_gate_config("ancestry", enabled=False, provenance="builtin")
+        long_gate = _make_resolved_gate_config("newly_reachable_paths", enabled=True, provenance="env")
+        lines = cli._format_gates_table(
+            [
+                ("ancestry", short, []),
+                ("newly_reachable_paths", long_gate, []),
+            ]
+        )
+        header, row_a, row_b = lines
+        status_offset = header.index("status")
+        assert row_a.index("disabled") == status_offset
+        assert row_b.index("enabled") == status_offset
+
+
+class TestCmdGates:
+    """devbench gates: read-only overview of every declared gate's status,
+    repo overrides and provenance, resolved exclusively through
+    resolve_gate_config (spec G2, section 4.1; AC-E2-F1-S2-T1-1..4, AC-4,
+    AC-27)."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    @staticmethod
+    def _write_config(tmp_path: Path, gates_block: str = "") -> Path:
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {TestCmdGates._REPO}:\n    default_branch: main\n{gates_block}")
+        return cfg_path
+
+    def test_no_gates_key_renders_all_eight_disabled(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_path = self._write_config(tmp_path)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        assert len(lines) == 1 + len(GATE_NAMES)
+        rendered_gates = {_gates_table_cells(ln)[0] for ln in lines[1:]}
+        assert rendered_gates == set(GATE_NAMES)
+        for row in lines[1:]:
+            cells = _gates_table_cells(row)
+            assert cells[1] == "disabled"
+            assert cells[2] == "-"
+            assert cells[3] == "builtin"
+
+    def test_repo_override_enables_shared_file_impact(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gates_block = f"gates:\n  repos:\n    {self._REPO}:\n      shared_file_impact:\n        enabled: true\n"
+        cfg_path = self._write_config(tmp_path, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("shared_file_impact"))
+        assert _gates_table_cells(row) == ["shared_file_impact", "enabled", self._REPO, "repo"]
+
+    def test_project_level_config_sets_provenance_project(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-E2-F1-S2-T1-3: provenance is asserted for the project layer too (not just repo/env)."""
+        gates_block = "gates:\n  ancestry:\n    enabled: true\n"
+        cfg_path = self._write_config(tmp_path, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("ancestry"))
+        # No per-repo override exists, so the "repos" column still shows the
+        # no-override placeholder even though the gate is enabled at the
+        # project level.
+        assert _gates_table_cells(row) == ["ancestry", "enabled", "-", "project"]
+
+    def test_env_override_sets_provenance_env(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_path = self._write_config(tmp_path)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.setenv("DEVBENCH_GATE_REACHABILITY_ENABLED", "true")
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("reachability"))
+        assert _gates_table_cells(row) == ["reachability", "enabled", "-", "env"]
+
+    def test_config_load_failure_exits_1_with_loader_message_and_no_table(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text("repos: [unterminated\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "Invalid YAML" in captured.err
+
+    def test_missing_config_file_exits_1_with_loader_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+
+        result = cli.cmd_gates()
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "not found" in captured.err
 
 
 class TestCmdCheckReachability:

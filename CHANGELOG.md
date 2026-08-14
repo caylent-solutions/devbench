@@ -5,6 +5,29 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`devbench gates` -- read-only overview of every integration-reality
+  gate's status, repo overrides and provenance** (spec
+  `integration-reality-gates-hardening.md` G2, section 4.1; AC-4, AC-27).
+  New zero-argument CLI verb registered in `_COMMANDS`
+  (`"Show every gate's tier, status and repo overrides"`, matching the spec
+  Section 14 `--help` snapshot) renders one row per declared gate
+  (`constants.GATE_NAMES`), resolving each row exclusively through
+  `config_loader.resolve_gate_config` -- never reading
+  `RuntimeConfig.gates` fields directly (AC-27) -- so the table can never
+  diverge from the four-layer precedence resolver. A fresh workspace with
+  no `gates:` key renders all eight rows as `disabled` with the `-`
+  no-override placeholder (D-17); a per-repo override or the
+  `DEVBENCH_GATE_<NAME>_ENABLED` env var is reflected in both the `status`
+  and `provenance` columns. Column widths are computed from the row data
+  (`_format_gates_table`), not hard-coded, so the tier column a later unit
+  adds needs no re-layout. Reloads `devbench.yaml` fresh from disk so a
+  config load failure (missing file, invalid YAML/schema) is caught with
+  the loader's own fail-fast message on stderr and exit 1, with no partial
+  table printed (spec Section 7). Documented in `docs/cli-reference.md`'s
+  new `## Gates` section, pinned by
+  `tests/test_docs/test_cli_reference_gates.py` against the `_COMMANDS`
+  description string so the doc can never drift from the registry.
+
 - **`resolve_gate_config` -- the single four-layer precedence resolver for
   gate configuration** (spec `integration-reality-gates-hardening.md`
   section 4.1, D-15, D-17; AC-27). Adds `resolve_gate_config(gate, repo,

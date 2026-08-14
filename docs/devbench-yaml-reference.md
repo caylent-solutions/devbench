@@ -116,9 +116,12 @@ the `DEVBENCH_GATE_<NAME>_ENABLED` env layer through the existing `_resolve_bool
 value callers thread into `resolve_gate_config`'s `env_enabled_override` parameter --
 `config_loader.py` remains parse/validate-only and never reads environment variables itself. No
 consumer other than `resolve_gate_config` may read a gate's resolver-managed fields (`enabled`,
-`auto_derive_registry`, `extract_source_literals`) directly off `RuntimeConfig.gates` (AC-27). No
-gate command consumes the resolver yet -- the `devbench gates` read-only verb and the per-gate
-check commands land in follow-up tasks (E2-F1-S2-T1 onward).
+`auto_derive_registry`, `extract_source_literals`) directly off `RuntimeConfig.gates` (AC-27).
+`devbench gates` (E2-F1-S2-T1) is the first consumer: it renders one row per declared gate with the
+resolved `enabled` status and per-field provenance for every row, calling `resolve_gate_config`
+once per gate rather than reading `RuntimeConfig.gates` directly. The per-gate check commands
+(`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later
+gate epics add) adopt the resolver in follow-up tasks.
 
 ### Per-gate tunables
 

@@ -94,17 +94,63 @@ COMPLETENESS" section for the exact procedure.
 
 ## The audit trail: `[NEWLY_REACHABLE]`
 
-Before logging completion, the executor logs one audit line:
+Before logging completion, the executor logs one structured marker per newly-reachable
+path:
 
 ```bash
-uv run devbench log-comment executor <task-id> "[NEWLY_REACHABLE] <path 1>: <what was verified and how>; <path 2>: ..."
+uv run devbench log-newly-reachable <task-id> --path <p> --method <m> --result <r>
 ```
 
-or, when nothing new is unlocked:
+This writes `[NEWLY_REACHABLE] <path> <method> <result>` (spec section 5.3 field
+order) into the unit's `## TDD Cycle Log` section -- the audit surface that survives
+every review judge's `read-unit --strip-comments` Evidence fetch (the PM-6
+evidence-horizon rule, E2-F3-S1-T2). Call it once per newly-reachable path; each
+invocation appends exactly one marker line.
 
-```bash
-uv run devbench log-comment executor <task-id> "[NEWLY_REACHABLE] none -- <one-sentence justification>"
+- `<p>` -- the specific code path (file, route, component) made newly reachable. A
+  single non-empty token with no whitespace.
+- `<m>` -- how the path was verified: `manual`, `unit_test`, `integration_test`, or
+  `functional_test` (`cli.NEWLY_REACHABLE_METHODS`).
+- `<r>` -- the verification outcome: `verified` (the path behaves correctly) or
+  `broken` (verification surfaced a new, independent defect).
+
+Example:
+
 ```
+$ uv run devbench log-newly-reachable E9-F1-S1-T1 \
+    --path src/ui/LegacyPanel.tsx --method manual --result verified
+{"unit_id": "E9-F1-S1-T1", "path": "src/ui/LegacyPanel.tsx", "method": "manual", "result": "verified"}
+```
+
+See `docs/cli-reference.md`'s `log-newly-reachable` entry for the full argument list
+and exit-code contract (`0`/`1`/`2`).
+
+**Migration note (superseded convention).** This section previously instructed the
+executor to log free-text `[NEWLY_REACHABLE] ...` prose via `log-comment` into a work
+unit's `## Comments` section. That convention is superseded by `log-newly-reachable`
+(E2-F4-S1-T2) and must not be used going forward: `## Comments` is stripped by every
+review judge's `read-unit --strip-comments` Evidence fetch, so a marker written there
+was never actually visible to the judges `code-reviewer.md`'s BUG-FIX COMPLETENESS
+rubric relies on (AC-21). The structured verb above writes into `## TDD Cycle Log`
+instead, which survives that fetch.
+
+## When no path is newly reachable
+
+`log-newly-reachable` has no sentinel value for "nothing new was unlocked": `--path`
+must be a real, non-empty, whitespace-free token, and `--method`/`--result` must each
+be one of the enumerated values above -- neither vocabulary has an `n/a` or `none`
+member, and an empty `--path` is rejected outright with exit `2`. Inventing a
+placeholder token anyway (for example a literal path of `none`) would not signal
+absence; it would record a fabricated path as `verified`/`broken`, which is worse than
+not logging anything. Do not invoke `log-newly-reachable` for this case.
+
+If, after genuine consideration (see "What counts as adequate enumeration" above), the
+fix unlocks no new code path, record that explicitly through a supported
+general-purpose channel instead: fold a one-sentence justification into the task's
+GREEN `log-tdd` entry (already required for every task, and it also lands in
+`## TDD Cycle Log`), or note it via `log-comment` if a GREEN entry is not a natural
+fit. Either way this is plain prose, not a `[NEWLY_REACHABLE]` marker -- there is no
+structured schema for the no-path case today (see "Known limitations" below).
 
 ## Where this is enforced
 
@@ -121,7 +167,7 @@ having an independent check that the self-report actually happened and holds up.
   checklist item requiring the enumeration + live-verification step, so materialised
   drafts carry the requirement even before a human edits them.
 - **`code-reviewer.md`** ("BUG-FIX COMPLETENESS" rubric) -- the independent check.
-  A bug-fix-shaped task with no `[NEWLY_REACHABLE]` entry in its Comments/Agent Log
+  A bug-fix-shaped task with no `[NEWLY_REACHABLE]` marker in its `## TDD Cycle Log`
   fails review, even if the original repro now passes and every other rubric item is
   clean. This is the gate that makes the requirement more than self-reported: the
   executor's own claim is not sufficient for the task to close.
@@ -175,9 +221,15 @@ version would need.
   follow-up could add a `cmd_check_cross_cutting_primitives` CLI helper that does a
   deterministic path-match and surfaces a `[CROSS_CUTTING_PRIMITIVE_TOUCHED]` audit
   line, removing the dependence on the agent noticing the overlap unprompted.
-- Live verification is judged by the code-reviewer reading the `[NEWLY_REACHABLE]`
-  entry's prose, the same way `AC-FINAL` evidence is judged today (issue #156's
-  `MISSING_AC_EVIDENCE` pattern) -- there is no structured schema for "verification
-  evidence" the way there is for, say, TDD Cycle Log entries. This is consistent with
-  how the rest of the review rubric works, but a stricter follow-up could require a
-  structured `{path, method, command, result}` JSON blob instead of prose.
+- The `[NEWLY_REACHABLE] <path> <method> <result>` marker is delivered, not
+  hypothetical: `log-newly-reachable` (E2-F4-S1-T2) writes it as a structured,
+  judge-visible record of the path, verification method, and outcome, replacing the
+  free-text `[NEWLY_REACHABLE]`-into-`## Comments` prose convention this document
+  previously described (see the migration note under "The audit trail" above). It
+  still carries no field for the verification *evidence* itself (the command run, the
+  output observed): that evidence remains prose, cited alongside the marker in a
+  `log-tdd`/`log-comment` entry, and the code-reviewer's BUG-FIX COMPLETENESS rubric
+  judges that prose qualitatively, the same way `AC-FINAL` evidence is judged today
+  (issue #156's `MISSING_AC_EVIDENCE` pattern). A stricter follow-up could add a
+  fourth `--evidence` field to the marker's grammar to make the verification-evidence
+  claim itself structured.

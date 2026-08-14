@@ -217,6 +217,7 @@ from devbench.constants import (
     AGENT_WRITABLE_TDD_PHASES,
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
+    BACKLOG_REPO_RE,
     BACKLOG_STATUS_RE,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
@@ -238,6 +239,7 @@ from devbench.constants import (
     GATE_TIERS,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX,
     ORCHESTRATOR_ONLY_TDD_PHASES,
     ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
@@ -1662,7 +1664,7 @@ def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
     logger.info("Set %s to %s", unit_id, new_status)
 
     if new_status.lower() == "blocked":
-        rc = _clean_target_repo_on_block(wu_file)
+        rc = _clean_target_repo_on_block(wu_file, unit_id)
         if rc != 0:
             print(f"WARNING: target repo cleanup failed for '{unit_id}' (exit {rc})", file=sys.stderr)
 
@@ -1935,12 +1937,26 @@ def _apply_bulk_set_status(
     )
 
 
-def _clean_target_repo_on_block(wu_file: Path) -> int:
-    """Reset and clean the target repo's working tree when a task transitions to blocked.
+def _clean_target_repo_on_block(wu_file: Path, unit_id: str) -> int:
+    """Quarantine the target repo's working tree when a task transitions to blocked.
 
-    Reads the ``Local path:`` field from the work-unit file and runs
-    ``git reset --hard HEAD`` and ``git clean -fd`` against that directory.
-    Both commands are run with ``check=False``; returns 1 if either fails.
+    A shared single-branch checkout must not carry a blocked task's residue
+    into the next unit's claim, but clearing it MUST NOT destroy it. This
+    previously ran ``git reset --hard HEAD`` plus ``git clean -fd``, which
+    annihilated every uncommitted change in the target repo -- including work
+    that was complete and verified but not yet committed, since the executor
+    stages and leaves committing to ``devbench git-ops``. The destruction was
+    unconditional, irreversible, and silent, and it made ``blocked`` a status
+    the orchestrator had to actively avoid: an observed run chose ``hold`` over
+    ``blocked`` specifically to keep a finished task's work alive.
+
+    Now delegates to :func:`~devbench.git_quarantine.quarantine_paths` -- the
+    same non-destructive primitive claim-time quarantine already uses
+    (:func:`_prepare_worktree_for_claim`) -- so the tree is cleared into
+    recoverable ``git stash`` entries, one per owning unit, discoverable via
+    ``git stash list``. Blocking a task can no longer lose work, and the two
+    "clear this shared checkout" paths now share one implementation instead of
+    disagreeing about whether the work survives.
 
     If ``Local path:`` is absent from the file (e.g. validation gates with no
     local path), logs a warning and returns 0 as a defensive skip -- this is
@@ -1949,10 +1965,13 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
 
     Args:
         wu_file: Path to the work-unit ``.md`` file.
+        unit_id: The blocking unit's ID, recorded in each stash message so the
+            audit trail shows which block triggered the quarantine.
 
     Returns:
-        0 on success or when ``Local path:`` is absent; 1 if a git command
-        errors.
+        0 on success, when the tree is already clean, or when ``Local path:``
+        is absent; 1 when the work-unit file is unreadable or the quarantine
+        could not clear the tree.
     """
     try:
         content = wu_file.read_text()
@@ -1976,35 +1995,43 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
         )
         return 0
 
-    reset_result = subprocess.run(
-        ["git", "-C", local_path, "reset", "--hard", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if reset_result.returncode != 0:
-        logger.warning(
-            "_clean_target_repo_on_block: git reset failed for '%s': %s",
-            local_path,
-            reset_result.stderr.strip(),
+    from devbench.backlog.manifest import list_changed_files
+    from devbench.git_quarantine import quarantine_paths
+
+    repo_path = Path(local_path)
+    changed = list_changed_files(repo_path)
+    if not changed:
+        logger.info("_clean_target_repo_on_block: target repo at '%s' is already clean", local_path)
+        return 0
+
+    repo_match = BACKLOG_REPO_RE.search(content)
+    canonical_repo = resolve_repo(repo_match.group(1).strip()) if repo_match else ""
+    try:
+        records = quarantine_paths(
+            repo_path,
+            changed,
+            _non_terminal_manifests(canonical_repo) if canonical_repo else {},
+            unit_id,
         )
+    except RuntimeError as exc:
+        logger.warning("_clean_target_repo_on_block: quarantine failed for '%s': %s", local_path, exc)
         return 1
 
-    clean_result = subprocess.run(
-        ["git", "-C", local_path, "clean", "-fd"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if clean_result.returncode != 0:
-        logger.warning(
-            "_clean_target_repo_on_block: git clean failed for '%s': %s",
-            local_path,
-            clean_result.stderr.strip(),
+    for record in records:
+        logger.info(
+            "%s%s owner=%s paths=%d stash=%s",
+            ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX,
+            unit_id,
+            record.owner_id,
+            len(record.paths),
+            record.stash_message,
         )
-        return 1
-
-    logger.info("_clean_target_repo_on_block: cleaned target repo at '%s'", local_path)
+    logger.info(
+        "_clean_target_repo_on_block: quarantined %d path(s) out of '%s' into %d recoverable stash entry(ies)",
+        len(changed),
+        local_path,
+        len(records),
+    )
     return 0
 
 

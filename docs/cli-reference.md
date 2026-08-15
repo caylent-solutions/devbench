@@ -131,6 +131,16 @@ Transport restarts        2
 
 Rendered only when at least one transport restart has been logged (`n > 0`); omitted entirely on a clean run, so a run with no transport restarts stays byte-identical to the pre-#331 layout.
 
+**Review rejections row (issue #122):** rendered immediately below the transport-restarts row, via `report.review_rejections_line()`. For every non-terminal task (`in-progress` or `blocked`) carrying at least one `[REVIEW_FAIL]`, it lists the rejection rounds each canonical reviewer has spent against that judge's budget:
+
+```
+Review rejections        E2-F5-S1-T2 changes_manifest 1/10, doc_review 2/10
+```
+
+This row exists because a review-rejection loop is otherwise indistinguishable from steady progress: the process stays alive, the log keeps advancing, and no error is ever logged, while a single task can consume hours and a large token budget being rejected and reworked. A task showing `3/10` is not making progress in the way the rest of the report implies.
+
+The denominator is resolved by the same `backlog.manager.resolve_judge_retry_budget` that [`log-verdict`](#log-verdict) enforces, so the number displayed can never disagree with the budget actually applied. Audit-only workflow agents are excluded -- they own no review gate. Rendered only when some non-terminal task has a rejection; omitted entirely otherwise, so a clean run's report stays byte-identical.
+
 **Required environment variables (issue #221 B7):** every `devbench` subcommand -- including `report` -- requires both `DEVBENCH_WORKSPACE_ROOT` and `DEVBENCH_CLAUDE_MODEL` to be set before invocation. The check fires at module-import time (`src/devbench/config.py::_require_env`); when either variable is missing devbench prints a single actionable line to stderr (`devbench: DEVBENCH_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root.`) and exits with code 2. Before the issue #221 B7 fix this path raised a Python traceback to stderr instead, which stdout-only consumers (`devbench report > out.txt`) saw as "rc=0, empty output" -- the symptom that the issue is filed against. The current behaviour is fail-fast (CLAUDE.md): non-zero exit, no traceback, no silent fallback.
 
 - `--once` (alias `--no-stream`) -- forces the legacy one-shot snapshot, suitable for scripts and CI consumers that pipe the output. Auto-engaged when stdout is not a TTY (pipe / file redirect / CI).
@@ -1221,6 +1231,35 @@ Two enforcement layers prevent malformed audit rows:
 
 Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
 
+#### Retry-budget enforcement (issue #122)
+
+A `fail` verdict from one of the **canonical reviewers** also enforces that judge's executor retry budget, so a review-rejection loop is bounded instead of able to repeat indefinitely.
+
+- The count is the number of `[judge/<name>] [REVIEW_FAIL]` rows already in the work-unit file, so the audit trail is the counter -- there is no separate state to drift.
+- The budget is that judge's entry in [`max_executor_retries_per_judge`](devbench-yaml-reference.md) when listed, otherwise the global `max_executor_retries` (env override `DEVBENCH_MAX_RETRIES`).
+- On exhaustion the command appends a `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` audit row, forces the unit to `blocked`, and sends the operator-action-required notification. The tag is what makes [`block-types.md`](block-types.md) classify the unit `OPERATOR_ACTION_REQUIRED` rather than `AWAITING_AMENDMENT_RECOVERY`.
+- The emitted JSON carries `retry_budget_exhausted`. When `true` the unit is already blocked: do not re-invoke the executor for it and do not write a second `[RETRY_BUDGET_EXHAUSTED]` row.
+- **Audit-only workflow agents never charge a budget** -- they do not own a review gate, so their verdicts cannot block a unit.
+
+Below budget, behaviour is unchanged from a plain verdict write.
+
+### `config-resolve`
+
+```
+uv run devbench config-resolve <field> [<field>...]
+```
+
+Print fully-resolved runtime-config values (env > YAML > built-in default) as one-line JSON, so an agent can read a setting without re-deriving the precedence chain or assuming a default.
+
+`<field>` names are `RuntimeConfig` attributes, for example `max_executor_retries`, `max_executor_retries_per_judge`, `manifest_amendment`. Nested sections are returned as JSON objects.
+
+```
+$ uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge
+{"max_executor_retries": 10, "max_executor_retries_per_judge": {}}
+```
+
+An unknown field name exits non-zero and lists the valid choices; it never returns a silent `null`, which would read as "configured empty" and hide a typo. Calling with no field name is likewise an error.
+
 ### `log-comment`
 
 ```
@@ -1441,14 +1480,23 @@ See [manifest-amendments.md](manifest-amendments.md) and [ADR-02](adr/02-manifes
 cat <<'EOF' | uv run devbench request-amendment <id>
 {
   "reason": "tdd_green_production_fix",
-  "files_to_add": ["src/path/to/file.py"],
+  "files_to_add": [{"path": "src/path/to/file.py", "change": "minimum fix for AC-TEST-001"}],
+  "files_to_remove": ["tests/test_stale.py"],
   "justification": "...",
   "linked_acs": ["AC-TEST-001"]
 }
 EOF
 ```
 
-Register an amendment request at `<workspace>/.devbench/amendments/<id>.json`. Payload is JSON on stdin; the four fields above are required. Invoked by the executor during TDD GREEN when a production fix is needed but out of manifest scope.
+Register an amendment request at `<workspace>/.devbench/amendments/<id>.json`. Payload is JSON on stdin. `reason`, `justification`, `files_to_add` and `linked_acs` are required (`files_to_add` entries are `{path, change}` objects, not bare strings); `files_to_remove` is optional. At least one of `files_to_add` / `files_to_remove` must be non-empty -- a request that changes nothing is rejected as a no-op.
+
+Invoked by the executor during TDD GREEN when a production fix is needed but out of manifest scope, and by the review-fix path when a judge requires a Manifest correction.
+
+**Every Layer 1 pre-filter check runs before the request is written**, so a request that cannot be approved never reaches disk and never occupies the single pending-request slot. The checks are deterministic: the workflow must be enabled, the `reason` must be in this backlog's configured [`manifest_amendment.allowed_reasons`](devbench-yaml-reference.md), the rate limit must allow it, the task must be `in-progress`, `linked_acs` must exist, added files must not already be declared and must be present in the staged diff, and removals must satisfy the rule below.
+
+**`files_to_remove` and `AC-FINAL-015`.** [`AC-FINAL-015`](acceptance-criteria-canonical.md) requires the Changes Manifest to match the files git changed *exactly* -- no extra, no missing -- so a declared row whose file ends up with a zero-line diff (its work having landed under a sibling unit, for instance) is a real violation that `changes_manifest` fails the unit for. `files_to_remove` is how a unit complies.
+
+A row may only be dropped when its file has **no staged, unstaged, or untracked changes**. That is the safety property: the Manifest row is the only thing authorising a file to appear in the unit's commit, so permitting removal for a file with real changes would let work leave the unit's reviewed scope. A dirty path is refused with an error naming it. Removals are also recorded in the `[AMENDMENT_APPLIED]` audit row, so a dropped row is never invisible to a reviewer.
 
 ### `apply-amendment`
 
@@ -1457,6 +1505,8 @@ uv run devbench apply-amendment <id>
 ```
 
 Atomically update the Changes Manifest after the `manifest-amender` judge approves. Runs a deterministic Layer 3 post-check (em-dash scan plus `validate-backlog`) and rolls back on any failure, so a failed post-check cannot leave the backlog half-updated.
+
+Removals and additions are applied inside the **same** atomic write and rollback envelope, so a post-check failure restores the Manifest whole rather than leaving it half-amended. The `reason` is re-checked here against the same configured `allowed_reasons` the request passed, so hand-editing a pending request on disk between `request-amendment` and this command cannot smuggle in a reason the backlog disallows.
 
 ### `reject-amendment`
 

@@ -41,6 +41,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -52,6 +53,7 @@ from devbench.backlog.manifest import (
     ManifestRow,
     append_rows,
     parse_manifest,
+    remove_rows,
 )
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
@@ -136,7 +138,18 @@ class AmendmentFileEntry:
 
 @dataclass(frozen=True)
 class AmendmentRequest:
-    """Serialised form of an amendment request emitted by the executor."""
+    """Serialised form of an amendment request emitted by the executor.
+
+    ``files_to_remove`` holds repo-relative paths whose Manifest rows should be
+    dropped. It exists because ``AC-FINAL-015`` requires the Changes Manifest to
+    match the files git actually changed EXACTLY -- "no extra, no missing" --
+    so a declared row whose file ends up with a zero-line diff (its work having
+    landed under a sibling unit, say) is a real violation. The
+    ``changes_manifest`` judge fails the unit for it and prescribes an
+    amendment, which was previously impossible: the request could only ADD.
+    Defaults to empty so every request written before this field existed still
+    parses.
+    """
 
     task_id: str
     requested_at: str
@@ -144,6 +157,7 @@ class AmendmentRequest:
     justification: str
     files_to_add: list[AmendmentFileEntry]
     linked_acs: list[str]
+    files_to_remove: list[str] = dataclass_field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the request as a JSON-serialisable dict."""
@@ -171,6 +185,13 @@ class AmendmentRequest:
             _require_keys(entry, ["path", "change"])
             files.append(AmendmentFileEntry(path=str(entry["path"]), change=str(entry["change"])))
 
+        files_to_remove = _parse_files_to_remove(data)
+
+        if not files and not files_to_remove:
+            raise ValueError(
+                "amendment request must change the Manifest: files_to_add and files_to_remove are both empty"
+            )
+
         linked_acs_raw = data["linked_acs"]
         if not isinstance(linked_acs_raw, list):
             raise ValueError(f"linked_acs must be a list, got {type(linked_acs_raw).__name__}")
@@ -195,7 +216,31 @@ class AmendmentRequest:
             justification=justification,
             files_to_add=files,
             linked_acs=linked_acs,
+            files_to_remove=files_to_remove,
         )
+
+
+def _parse_files_to_remove(data: dict[str, Any]) -> list[str]:
+    """Validate and return the request's ``files_to_remove`` list.
+
+    Optional and defaulting to empty so amendment requests written before the
+    field existed still parse. Entries must be non-blank strings (bare paths,
+    not the ``{path, change}`` objects ``files_to_add`` uses -- a removal has no
+    change to describe). Extracted from ``AmendmentRequest.from_dict`` to keep
+    that method within its branch budget.
+    """
+    remove_raw = data.get("files_to_remove", [])
+    if not isinstance(remove_raw, list):
+        raise ValueError(f"files_to_remove must be a list, got {type(remove_raw).__name__}")
+    files_to_remove: list[str] = []
+    for entry in remove_raw:
+        if not isinstance(entry, str):
+            raise ValueError(f"files_to_remove entries must be strings, got {type(entry).__name__}")
+        path = entry.strip()
+        if not path:
+            raise ValueError("files_to_remove entries must be non-empty strings")
+        files_to_remove.append(path)
+    return files_to_remove
 
 
 def _require_keys(data: dict[str, Any], keys: list[str]) -> None:
@@ -215,6 +260,15 @@ def _check_reason_path_guard(reason: str, files: list[AmendmentFileEntry]) -> No
     Called from BOTH ``write_request`` and ``apply_amendment`` so the guard
     cannot be bypassed by hand-editing a pending request file between the
     two calls.
+
+    Deliberately applies to ``files_to_add`` only. This guard bounds what a
+    reason may bring INTO the unit's declared scope; a removal only shrinks
+    scope, and is separately gated by
+    ``PreFilter.check_files_to_remove_have_no_diff``, which proves the file has
+    no changes of any kind. Restricting removals by path class would block the
+    exact case removal exists for -- a stale non-documentation row under a
+    documentation reason -- while adding no safety, since a file with no diff
+    carries no work to smuggle out.
     """
     classifiers = _REASON_PATH_CLASSIFIERS.get(reason)
     if classifiers is None:
@@ -227,15 +281,41 @@ def _check_reason_path_guard(reason: str, files: list[AmendmentFileEntry]) -> No
         )
 
 
+def _resolve_allowed_reasons(allowed_reasons: frozenset[str] | None) -> frozenset[str]:
+    """Return the reason set to enforce, preferring the per-backlog configuration.
+
+    ``ALLOWED_AMENDMENT_REASONS`` is the set of reasons devbench IMPLEMENTS; a
+    backlog may narrow it via ``manifest_amendment.allowed_reasons``. Enforcing
+    the module global instead of the configured set made a backlog's narrowing
+    a no-op -- the config was loaded, validated against the schema, and then
+    ignored at every gate.
+
+    ``None`` means the caller has no configuration to offer (a direct library
+    call), in which case the implemented set applies. Configuration is never
+    widened here: a configured reason devbench does not implement is a config
+    error, so the result is the intersection.
+    """
+    if allowed_reasons is None:
+        return ALLOWED_AMENDMENT_REASONS
+    return frozenset(allowed_reasons) & ALLOWED_AMENDMENT_REASONS
+
+
 def request_path(workspace_root: Path, task_id: str) -> Path:
     """Return the filesystem path for a pending amendment request JSON file."""
     return workspace_root / AMENDMENT_DIR_NAME / f"{task_id}.json"
 
 
-def write_request(workspace_root: Path, request: AmendmentRequest) -> Path:
+def write_request(
+    workspace_root: Path,
+    request: AmendmentRequest,
+    allowed_reasons: frozenset[str] | None = None,
+) -> Path:
     """Persist ``request`` to the pending-amendments directory.
 
-    Raises ``AmendmentError`` if a pending request already exists for this task.
+    Raises ``AmendmentError`` if a pending request already exists for this task,
+    or if the reason is outside the effective allowed set. ``allowed_reasons``
+    is the backlog's configured narrowing; ``None`` enforces every reason
+    devbench implements.
     """
     target = request_path(workspace_root, request.task_id)
     if target.exists():
@@ -243,10 +323,9 @@ def write_request(workspace_root: Path, request: AmendmentRequest) -> Path:
             f"Amendment request already exists for task {request.task_id} at {target}. "
             "Resolve it with apply-amendment or reject-amendment first."
         )
-    if request.reason not in ALLOWED_AMENDMENT_REASONS:
-        raise AmendmentError(
-            f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(ALLOWED_AMENDMENT_REASONS)}"
-        )
+    effective = _resolve_allowed_reasons(allowed_reasons)
+    if request.reason not in effective:
+        raise AmendmentError(f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(effective)}")
     _check_reason_path_guard(request.reason, request.files_to_add)
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, json.dumps(request.to_dict(), indent=2) + "\n")
@@ -299,7 +378,12 @@ def archive_rejected_request(workspace_root: Path, task_id: str) -> Path | None:
     return target
 
 
-def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> None:
+def apply_amendment(
+    workspace_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    allowed_reasons: frozenset[str] | None = None,
+) -> None:
     """Apply an approved amendment atomically with Layer 3 post-check.
 
     Reads the pending amendment request, appends its rows to the work-unit's
@@ -308,14 +392,19 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
     failure the work-unit file is restored to its pre-amendment content and
     ``AmendmentError`` is raised -- the caller is expected to log a
     REVIEW_FAIL verdict.
+
+    The reason is re-checked here against the same effective allowed set
+    ``write_request`` used, so hand-editing a pending request on disk between
+    the two calls cannot smuggle in a reason the backlog disallows.
+    ``allowed_reasons`` is the backlog's configured narrowing; ``None``
+    enforces every reason devbench implements.
     """
     request = read_request(workspace_root, task_id)
     if request.task_id != task_id:
         raise AmendmentError(f"Amendment request task_id ({request.task_id!r}) does not match argument ({task_id!r})")
-    if request.reason not in ALLOWED_AMENDMENT_REASONS:
-        raise AmendmentError(
-            f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(ALLOWED_AMENDMENT_REASONS)}"
-        )
+    effective = _resolve_allowed_reasons(allowed_reasons)
+    if request.reason not in effective:
+        raise AmendmentError(f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(effective)}")
     _check_reason_path_guard(request.reason, request.files_to_add)
 
     wu_file = _resolve_task_file(backlog_index, task_id)
@@ -333,8 +422,14 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
     except ValueError as exc:
         raise AmendmentError(f"Amendment contains invalid manifest row: {exc}") from exc
 
+    # Removals apply first so a request that both drops a stale row and adds a
+    # new one lands the additions at the end of the surviving table, matching
+    # the append-only ordering reviewers already read. Both operations sit
+    # inside the same atomic write and rollback envelope below, so a post-check
+    # failure restores the manifest whole -- never half-amended.
     try:
-        content_with_rows = append_rows(original_content, manifest_rows)
+        content_with_rows = remove_rows(original_content, request.files_to_remove)
+        content_with_rows = append_rows(content_with_rows, manifest_rows)
     except ManifestParseError as exc:
         raise AmendmentError(f"Cannot apply amendment: {exc}") from exc
 
@@ -550,8 +645,13 @@ def _build_audit_entry(
     """Render a one-line audit entry for the Comments section."""
     timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
     if action == AMENDMENT_APPLIED_ACTION:
-        file_count = len(request.files_to_add)
-        message = f"{request.reason}; added {file_count} file(s); justification: {request.justification}"
+        # Both directions are reported so a removal is never invisible in the
+        # audit trail: a dropped Manifest row changes what the unit is allowed
+        # to commit, which a reviewer must be able to see happened.
+        parts = [f"added {len(request.files_to_add)} file(s)"]
+        if request.files_to_remove:
+            parts.append(f"removed {len(request.files_to_remove)} row(s): {', '.join(request.files_to_remove)}")
+        message = f"{request.reason}; {'; '.join(parts)}; justification: {request.justification}"
     elif action == AMENDMENT_REJECTED_ACTION:
         message = f"{request.reason}; rejected: {rejection_reason}"
     else:
@@ -633,6 +733,7 @@ class PreFilter:
         request: AmendmentRequest,
         *,
         staged_files: frozenset[str] | None = None,
+        changed_files: frozenset[str] | None = None,
         prior_applied_count: int = 0,
     ) -> None:
         """Run every check in a fixed order. Raise ``AmendmentError`` on the first failure.
@@ -640,7 +741,10 @@ class PreFilter:
         ``staged_files`` is the set of file paths the executor has staged in
         git against the base branch; pass ``None`` to skip the in-diff check
         (for contexts where git access is unavailable, such as unit tests of
-        earlier checks). ``prior_applied_count`` is the number of amendments
+        earlier checks). ``changed_files`` is the union of staged, unstaged, and
+        untracked paths used to prove a removal candidate really has no changes;
+        pass ``None`` to skip that check on the same terms.
+        ``prior_applied_count`` is the number of amendments
         already applied to this task in the current executor run.
         """
         self.check_enabled()
@@ -649,8 +753,11 @@ class PreFilter:
         unit = self.check_task_exists_and_in_progress(request)
         self.check_linked_acs_exist(request, unit)
         self.check_files_not_already_in_manifest(request, unit)
+        self.check_files_to_remove_are_declared(request, unit)
         if staged_files is not None:
             self.check_files_in_staged_diff(request, staged_files)
+        if changed_files is not None:
+            self.check_files_to_remove_have_no_diff(request, changed_files)
 
     def check_enabled(self) -> None:
         """The backlog config must have ``manifest_amendment.enabled: true``."""
@@ -730,6 +837,62 @@ class PreFilter:
             raise AmendmentError(
                 f"Amendment lists file(s) not in the staged diff: {missing}. "
                 "Executor cannot request amendment for files it hasn't staged."
+            )
+
+    def check_files_to_remove_are_declared(self, request: AmendmentRequest, unit: WorkUnit) -> None:
+        """Every path in ``files_to_remove`` must currently appear in the Changes Manifest.
+
+        Rejecting an undeclared path here (rather than letting
+        ``manifest.remove_rows`` raise during apply) keeps the failure in Layer
+        1 where the message is actionable and nothing has been written yet.
+        A request cannot both add and remove the same path -- that is
+        self-contradictory, and permitting it would make the final manifest
+        depend on the order the two lists happen to be applied in.
+        """
+        if not request.files_to_remove:
+            return
+        content = unit.file_path.read_text(encoding="utf-8")
+        try:
+            existing_files = {row.file for row in parse_manifest(content)}
+        except ManifestParseError as exc:
+            raise AmendmentError(f"Cannot read current Changes Manifest for task {request.task_id}: {exc}") from exc
+
+        undeclared = [p for p in request.files_to_remove if p not in existing_files]
+        if undeclared:
+            raise AmendmentError(
+                f"Amendment lists file(s) to remove that are not in the Changes Manifest: {undeclared}. "
+                f"Manifest declares: {sorted(existing_files)}"
+            )
+
+        added = {f.path for f in request.files_to_add}
+        contradictory = sorted(added & set(request.files_to_remove))
+        if contradictory:
+            raise AmendmentError(
+                f"Amendment both adds and removes the same file(s): {contradictory}. Choose one direction per path."
+            )
+
+    def check_files_to_remove_have_no_diff(self, request: AmendmentRequest, changed_files: frozenset[str]) -> None:
+        """No path in ``files_to_remove`` may have ANY change in the target repo.
+
+        This is the safety property that makes removal non-abusable. A Manifest
+        row is the only thing authorising a file to appear in the unit's commit,
+        so if removal were permitted for a file with real changes, an executor
+        could drop the row and carry the work along unreviewed -- exactly the
+        scope violation ``assert_staged_matches_manifest`` exists to stop.
+
+        ``changed_files`` must be the UNION of staged, unstaged, and untracked
+        paths (``manifest.list_changed_files``), not just the staged set: a file
+        modified but not yet staged still represents real work.
+        """
+        if not request.files_to_remove:
+            return
+        dirty = [p for p in request.files_to_remove if p in changed_files]
+        if dirty:
+            raise AmendmentError(
+                f"Amendment cannot remove Manifest row(s) for file(s) with changes: {dirty}. "
+                "A row may only be dropped once its file has no staged, unstaged, or untracked "
+                "changes; otherwise the work would leave the unit's declared scope. "
+                "Commit or revert the changes first, or keep the row."
             )
 
 

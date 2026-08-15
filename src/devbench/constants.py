@@ -808,6 +808,25 @@ ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reaso
 # paths=<n> stash=<message>``.
 ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX: str = "[BLOCK_QUARANTINE] "
 
+# Audit-row tag written by ``cli.cmd_log_verdict`` at the moment a review
+# judge's executor retry budget is spent, so the run stops re-litigating a
+# work unit no further executor round can fix.
+#
+# The tag text is load-bearing and must appear verbatim (issue #248):
+# ``backlog.proposal._RETRY_EXHAUSTED_TAG_RE`` matches it case-sensitively to
+# classify the unit as ``OPERATOR_ACTION_REQUIRED`` instead of
+# ``AWAITING_AMENDMENT_RECOVERY``, whose contract is "operator does nothing".
+# Without the tag a spent budget reads as a recovery signal and the run
+# stalls with no operator alert.
+#
+# Enforcement lives in code rather than in orchestrate SKILL.md prose because
+# the prose contract was unenforceable: it told the orchestrator to read the
+# budget via ``devbench config-resolve``, a verb that did not exist, so the
+# per-judge budget in ``max_executor_retries_per_judge`` was parsed by
+# ``config_loader`` and never consumed. Reviews could therefore repeat without
+# bound; the audit trail this tag lands in is the same one the counter reads.
+ORCHESTRATOR_RETRY_BUDGET_EXHAUSTED_AUDIT_TAG: str = "[RETRY_BUDGET_EXHAUSTED]"
+
 # Bound on the number of consecutive in-process quota-recovery resumes
 # ``_drive_orchestrate_with_quota_resume`` performs before stopping the
 # orchestrator (spec FR-2.8, AC-22). Overridable via

@@ -19,6 +19,7 @@ from devbench.backlog.manifest import (
     list_changed_files,
     list_staged_files,
     parse_manifest,
+    remove_rows,
     render_manifest_rows,
 )
 
@@ -306,6 +307,54 @@ class TestRenderManifestRows:
 # ---------------------------------------------------------------------------
 # append_rows tests
 # ---------------------------------------------------------------------------
+
+
+class TestRemoveRows:
+    """remove_rows is the counterpart to append_rows and preserves everything else."""
+
+    def test_removes_only_the_named_row(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py"])
+        assert [r.file for r in parse_manifest(out)] == [
+            "src/example/parser.py",
+            "docs/example.md",
+        ]
+
+    def test_removes_multiple_rows(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py", "docs/example.md"])
+        assert [r.file for r in parse_manifest(out)] == ["src/example/parser.py"]
+
+    def test_remove_nothing_is_noop(self) -> None:
+        assert remove_rows(SAMPLE_MANY_ROWS, []) == SAMPLE_MANY_ROWS
+
+    def test_undeclared_path_raises_rather_than_silently_passing(self) -> None:
+        """A typo must surface, not report success while the real stale row remains."""
+        with pytest.raises(ManifestParseError, match="not declared"):
+            remove_rows(SAMPLE_MANY_ROWS, ["src/never_declared.py"])
+
+    def test_removing_every_row_raises(self) -> None:
+        with pytest.raises(ManifestParseError, match="at least one file"):
+            remove_rows(SAMPLE_ONE_ROW, ["src/example/parser.py"])
+
+    def test_missing_section_raises(self) -> None:
+        with pytest.raises(ManifestParseError, match=MANIFEST_HEADER):
+            remove_rows(SAMPLE_NO_MANIFEST, ["src/a.py"])
+
+    def test_preserves_content_before_section(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["docs/example.md"])
+        prefix = SAMPLE_MANY_ROWS.split("## Changes Manifest", 1)[0]
+        assert out.startswith(prefix)
+
+    def test_preserves_content_after_section(self) -> None:
+        out = remove_rows(SAMPLE_MANY_ROWS, ["docs/example.md"])
+        suffix = "## Definition of Done" + SAMPLE_MANY_ROWS.split("## Definition of Done", 1)[1]
+        assert out.endswith(suffix)
+
+    def test_surviving_change_text_is_preserved(self) -> None:
+        """Removal must not disturb the remaining rows' change descriptions."""
+        out = remove_rows(SAMPLE_MANY_ROWS, ["tests/test_example.py"])
+        rows = {r.file: r.change for r in parse_manifest(out)}
+        assert rows["src/example/parser.py"] == "add feature"
+        assert rows["docs/example.md"] == "document feature"
 
 
 class TestAppendRows:

@@ -261,8 +261,14 @@ manifest_amendment:
   allowed_reasons:
     - tdd_green_production_fix
     - doc_sync_review_fix
-  max_requests_per_execution: 1
+  max_requests_per_execution: 2    # default; one add + one row removal
 ```
+
+`allowed_reasons` **narrows** the set of reasons devbench implements; it cannot widen it. A reason listed here that devbench does not implement is a config error and stays refused.
+
+The narrowing is enforced at both gates -- when the request is written and again when it is applied. Before this was wired up, `PreFilter` was reachable from no CLI path and the apply path checked a module-level constant instead of the config, so a backlog that narrowed this list had the narrowing silently ignored and every reason was accepted. If your backlog narrows the list, expect requests using an excluded reason to now be refused at request time with a message naming the configured set.
+
+`max_requests_per_execution` defaults to `2` so a unit correcting its Changes Manifest in both directions -- adding a file review demanded and dropping a row that went stale -- can satisfy [`AC-FINAL-015`](acceptance-criteria-canonical.md) within one execution. A limit of `1` made that combination impossible. See [`docs/manifest-amendments.md`](manifest-amendments.md) for the removal workflow and its no-diff precondition.
 
 ---
 
@@ -421,6 +427,16 @@ max_executor_retries_per_judge:
 ```
 
 Each entry falls back to `max_executor_retries` when absent.
+
+**Enforced in code (issue #122).** `devbench log-verdict <judge> <id> fail` counts that judge's prior `[REVIEW_FAIL]` rows in the work unit and, once the budget is spent, writes the `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` audit row, forces the unit to `blocked`, and notifies the operator. Enforcement counts per judge across the whole unit, so ANY single judge exhausting its own budget blocks the unit; only the five canonical reviewers charge a budget.
+
+This bound previously lived only in orchestrate SKILL.md prose, which instructed the orchestrator to read the budget via `devbench config-resolve` -- a verb that did not exist. The budget was therefore unreadable at runtime and never enforced, so reviews could reject the same unit without limit. Inspect the resolved values with:
+
+```
+uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge
+```
+
+Rounds spent against budget are also surfaced per task in the `devbench report` **Review rejections** row -- see [`docs/cli-reference.md`](cli-reference.md).
 
 ---
 

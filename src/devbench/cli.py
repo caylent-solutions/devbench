@@ -114,6 +114,7 @@ from devbench.backlog.amendment import (
     REVIEW_FAILURES_DIR_NAME,
     AmendmentError,
     AmendmentRequest,
+    PreFilter,
     apply_amendment,
     read_review_failure_files,
     reject_amendment,
@@ -145,8 +146,11 @@ from devbench.backlog.manager import (
     _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE,
     BacklogManager,
     _build_remedies_rejection_message,
+    _extract_wu_title,
+    count_review_fails_for_judge,
     green_green_observed_satisfied,
     red_gate_satisfied,
+    resolve_judge_retry_budget,
 )
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
@@ -238,6 +242,7 @@ from devbench.constants import (
     ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    ORCHESTRATOR_RETRY_BUDGET_EXHAUSTED_AUDIT_TAG,
     RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_TIMEOUT_SECONDS,
     RED_OBSERVED_FIELD_EXIT_CODE,
@@ -3426,6 +3431,55 @@ def _check_repo_preflight(
     return errors
 
 
+def cmd_config_resolve(*argv: str) -> int:
+    """Print resolved runtime-config values as one-line JSON: ``config-resolve <field>...``.
+
+    Exposes the fully-resolved configuration (env > YAML > built-in default)
+    so an agent can read a setting deterministically instead of re-deriving
+    the precedence chain itself, or worse, assuming a default.
+
+    Added because orchestrate SKILL.md already instructed the orchestrator to
+    read its retry budget via this verb while the verb did not exist: the call
+    failed, so ``max_executor_retries_per_judge`` was unreadable at runtime
+    and the review-rejection loop it was meant to bound ran unbounded.
+
+    Field names are ``RuntimeConfig`` attribute names, e.g.
+    ``max_executor_retries``, ``max_executor_retries_per_judge``. Nested
+    dataclass sections are returned as JSON objects. An unknown field name is
+    a hard error naming the valid choices -- never a silent ``null``, which
+    would read as "configured empty" and hide a typo.
+
+    Returns 0 on success; 1 when no field is given or any field is unknown.
+    """
+    from dataclasses import asdict, fields, is_dataclass
+
+    from devbench.config import RUNTIME_CONFIG
+
+    names = [a for a in argv if a]
+    if not names:
+        valid = ", ".join(sorted(f.name for f in fields(RUNTIME_CONFIG)))
+        print(f"ERROR: config-resolve requires at least one field name. Valid fields: {valid}", file=sys.stderr)
+        return 1
+
+    known = {f.name for f in fields(RUNTIME_CONFIG)}
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        print(
+            f"ERROR: unknown config field(s): {', '.join(unknown)}. Valid fields: {', '.join(sorted(known))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    resolved: dict[str, Any] = {}
+    for name in names:
+        value = getattr(RUNTIME_CONFIG, name)
+        # ``is_dataclass`` narrows to the type, not the instance, so the
+        # non-type guard keeps mypy satisfied without a cast.
+        resolved[name] = asdict(value) if is_dataclass(value) and not isinstance(value, type) else value
+    print(json.dumps(resolved, default=str))
+    return 0
+
+
 def cmd_check() -> int:
     """Pre-flight verifier for orchestrator launch readiness.
 
@@ -4512,6 +4566,60 @@ def _validate_agent_free_text(field_name: str, text: str) -> int | None:
     )
 
 
+def _enforce_judge_retry_budget(judge_name: str, unit_id: str, wu_file: Path, content: str) -> bool:
+    """Block *unit_id* when *judge_name* has spent its retry budget. Return whether it blocked.
+
+    Called only for canonical review judges after a ``REVIEW_FAIL`` row has
+    been written, so the row just appended is included in the count and the
+    audit trail stays the single source of truth.
+
+    On exhaustion this appends the ``[BLOCKED]``
+    ``[RETRY_BUDGET_EXHAUSTED]`` audit row (the verbatim tag
+    ``backlog.proposal`` matches to classify the unit
+    ``OPERATOR_ACTION_REQUIRED``), forces the unit to ``blocked``, and
+    notifies the operator -- the same escalation shape
+    ``_handle_ci_failure`` uses when the CI retry budget is spent.
+
+    Args:
+        judge_name: Canonical judge that just failed the unit.
+        unit_id: The work-unit identifier.
+        wu_file: Path to the work-unit ``.md`` file.
+        content: The work-unit text INCLUDING the verdict row just written.
+
+    Returns:
+        ``True`` when the budget was exhausted and the unit was blocked;
+        ``False`` when rounds remain and nothing was changed.
+    """
+    budget = resolve_judge_retry_budget(judge_name)
+    fails = count_review_fails_for_judge(content, judge_name)
+    if fails < budget:
+        return False
+
+    mgr = BacklogManager()
+    reason = (
+        f"{judge_name} rejected this unit {fails} time(s), spending its executor retry budget "
+        f"of {budget}; no further executor round is coming and an operator must review"
+    )
+    mgr._append_agent_comment(
+        wu_file,
+        "orchestrator",
+        f"[BLOCKED] {ORCHESTRATOR_RETRY_BUDGET_EXHAUSTED_AUDIT_TAG} {reason}",
+    )
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_BLOCKED)
+    logger.info(
+        "log-verdict: %s exhausted its retry budget (%d of %d) for %s; unit set to '%s'",
+        judge_name,
+        fails,
+        budget,
+        unit_id,
+        STATUS_BLOCKED,
+    )
+    from devbench.notifications import notify_work_unit_blocked_operator
+
+    notify_work_unit_blocked_operator(unit_id, _extract_wu_title(wu_file, unit_id), reason)
+    return True
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -4529,6 +4637,17 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     ``[judge/<name>] [REVIEW_PASS|REVIEW_FAIL] <feedback>``
 
     Feedback is also written to the orchestrator log for audit purposes.
+
+    Issue #122: a ``REVIEW_FAIL`` from one of the canonical
+    ``ALL_REQUIRED_JUDGE_NAMES`` also enforces that judge's executor retry
+    budget. When the budget is spent, this command appends the
+    ``[RETRY_BUDGET_EXHAUSTED]`` audit row, forces the unit to ``blocked``,
+    and notifies the operator -- see ``_enforce_judge_retry_budget``. The
+    emitted JSON carries ``retry_budget_exhausted`` so the caller can tell a
+    bounded rejection from a terminal one. Enforcement lives here because
+    this is the single choke point every judge verdict passes through; the
+    previous contract lived only in orchestrate SKILL.md prose and was
+    unenforceable.
     """
     verdict_lower = verdict.strip().lower()
     if verdict_lower not in ("pass", "fail"):
@@ -4596,7 +4715,25 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     if feedback:
         logger.info("%s judge feedback for %s: %s", judge_name, unit_id, feedback)
 
-    print(json.dumps({"unit_id": unit_id, "judge": judge_name, "verdict": verdict_lower}))
+    # Issue #122: bound the review-rejection loop. Only the canonical
+    # reviewers charge the budget -- workflow agents on the broader
+    # ``KNOWN_JUDGE_NAMES`` allowlist (``executor``, ``task_factory``,
+    # ``blocker_resolver``, ``manifest_amender``) write audit-only verdicts
+    # that must not count against a review budget they do not own.
+    budget_exhausted = False
+    if action == "REVIEW_FAIL" and judge_clean in ALL_REQUIRED_JUDGE_NAMES:
+        budget_exhausted = _enforce_judge_retry_budget(judge_clean, unit_id, wu_file, content)
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "judge": judge_name,
+                "verdict": verdict_lower,
+                "retry_budget_exhausted": budget_exhausted,
+            }
+        )
+    )
     return 0
 
 
@@ -10711,18 +10848,59 @@ def cmd_request_amendment(unit_id: str) -> int:
 
     Reads the request payload as JSON on stdin. Expected fields:
     ``reason``, ``justification``, ``files_to_add`` (list of ``{path, change}``),
-    ``linked_acs`` (list of AC IDs). The ``task_id`` and ``requested_at``
-    fields are filled in by this command -- the caller does not provide them.
+    ``linked_acs`` (list of AC IDs), and the optional ``files_to_remove`` (list
+    of repo-relative paths whose Manifest rows should be dropped). The
+    ``task_id`` and ``requested_at`` fields are filled in by this command --
+    the caller does not provide them. At least one of ``files_to_add`` /
+    ``files_to_remove`` must be non-empty.
+
+    A row may only be removed when its file has no staged, unstaged, or
+    untracked changes, so a removal can never carry real work out of the unit's
+    reviewed scope.
+
+    Every Layer 1 pre-filter check runs BEFORE the request is written, so a
+    request that cannot be approved never reaches disk and never occupies the
+    single pending-request slot. The checks are deterministic: the reason must
+    be in this backlog's configured ``allowed_reasons``, the task must be
+    in-progress, linked ACs must exist, added files must not already be in the
+    Manifest and must be present in the staged diff.
+
+    Previously ``PreFilter`` was wired to no CLI path at all, so a backlog that
+    narrowed ``manifest_amendment.allowed_reasons`` had that narrowing silently
+    ignored and every request was accepted regardless.
 
     On success, writes the request to
     ``<DEVBENCH_WORKSPACE_ROOT>/.devbench/amendments/<unit_id>.json`` and prints
-    a one-line JSON summary. Fails fast on schema errors, duplicate pending
-    requests, or unknown reasons.
+    a one-line JSON summary. Returns 1 on any pre-filter or schema failure.
     """
+    from devbench.backlog.manifest import list_changed_files, list_staged_files
+
+    # Parse stdin BEFORE resolving the repo so a malformed payload reports the
+    # schema error the caller can act on, rather than a repo-configuration error
+    # that says nothing about what was wrong with the request.
     try:
         request = _build_amendment_request_from_stdin(unit_id)
-        written_path = write_request(WORKSPACE_ROOT, request)
-    except (_AmendmentRequestInputError, AmendmentError) as exc:
+    except _AmendmentRequestInputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    _, _, repo_path = resolved
+
+    try:
+        PreFilter(BACKLOG_INDEX, RUNTIME_CONFIG.manifest_amendment).run_all(
+            request,
+            staged_files=frozenset(list_staged_files(repo_path)),
+            changed_files=frozenset(list_changed_files(repo_path)),
+        )
+        written_path = write_request(
+            WORKSPACE_ROOT,
+            request,
+            allowed_reasons=RUNTIME_CONFIG.manifest_amendment.allowed_reasons,
+        )
+    except AmendmentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -10732,6 +10910,7 @@ def cmd_request_amendment(unit_id: str) -> int:
                 "task_id": unit_id,
                 "request_path": str(written_path),
                 "files_to_add": [f.path for f in request.files_to_add],
+                "files_to_remove": list(request.files_to_remove),
                 "reason": request.reason,
             }
         )
@@ -10777,7 +10956,12 @@ def cmd_apply_amendment(unit_id: str) -> int:
     is restored to its pre-amendment content and this command exits non-zero.
     """
     try:
-        apply_amendment(WORKSPACE_ROOT, BACKLOG_INDEX, unit_id)
+        apply_amendment(
+            WORKSPACE_ROOT,
+            BACKLOG_INDEX,
+            unit_id,
+            allowed_reasons=RUNTIME_CONFIG.manifest_amendment.allowed_reasons,
+        )
     except AmendmentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -12760,6 +12944,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         3,
         "Persist review-judge rejection JSON: log-rejection-feedback <judge> <id> --json '<payload>'",
     ),
+    "config-resolve": (
+        cmd_config_resolve,
+        1,
+        "Print resolved config values as JSON: config-resolve <field> [<field>...]",
+    ),
     "list-proposals": (
         cmd_list_proposals,
         0,
@@ -12829,6 +13018,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "reject-proposal",
         "validate-backlog",
         "log-rejection-feedback",
+        # Issue #122: variadic list of RuntimeConfig field names to resolve.
+        "config-resolve",
         # Issue #162 Phase 6: pre-render the report into a snapshot file.
         "write-snapshot",
         # Issue #162 Phase 2: rebuild per-task window-stats aggregates from the log.

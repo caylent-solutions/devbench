@@ -38,6 +38,10 @@ Implemented in `src/devbench/backlog/amendment.py::PreFilter`. Every rule below 
 - No path in `files_to_add` is already present in the Changes Manifest (no silent duplicates).
 - Every entry in `linked_acs` appears verbatim in the task's `## Acceptance Criteria` section.
 - The count of amendments applied to this task in the current executor run is below `max_requests_per_execution`.
+- Every path in `files_to_remove` is currently declared in the Changes Manifest, and no path is in both `files_to_add` and `files_to_remove` (self-contradictory).
+- **No path in `files_to_remove` has any change in the target repo** -- not staged, not unstaged, not untracked. See "Removing a stale row" below.
+
+`PreFilter` runs from `request-amendment` **before the request is written**, so a request that cannot be approved never reaches disk and never occupies the single pending-request slot. Before this was wired up the class was reachable from no CLI path at all: every check above was dead code, and a backlog that narrowed `allowed_reasons` had the narrowing silently ignored.
 
 ### Layer 2 -- LLM semantic judge
 
@@ -80,15 +84,29 @@ The executor writes JSON with these fields. `request-amendment` fills in `task_i
   "files_to_add": [
     {"path": "<staged-file-path-relative-to-repo-root>", "change": "<one-line description>"}
   ],
+  "files_to_remove": ["<declared-path-with-no-diff>"],
   "linked_acs": ["<AC-ID-1>", "<AC-ID-2>"]
 }
 ```
+
+`files_to_remove` is optional and defaults to empty, so requests written before it existed still parse. At least one of `files_to_add` / `files_to_remove` must be non-empty -- a request that changes nothing is rejected as a no-op.
+
+### Removing a stale row
+
+[`AC-FINAL-015`](acceptance-criteria-canonical.md) requires the Changes Manifest to match the files git changed *exactly* -- "no extra, no missing". A declared row whose file ends up with a zero-line diff is therefore a real violation, and the usual cause is benign: the work that row was written for landed under a sibling unit instead. `changes_manifest` fails the unit with `MANIFEST_MISMATCH` and prescribes an amendment; `files_to_remove` is how the unit complies. Until it existed the prescribed remedy was unimplementable, because a request could only ever add.
+
+**The safety property: a row may only be dropped once its file has no changes of any kind.** The Manifest row is the only thing authorising a file to appear in the unit's commit, so if removal were permitted for a file with real changes, the work could leave the unit's reviewed scope entirely -- precisely the violation `assert_staged_matches_manifest` exists to stop. The check unions `git diff --cached`, `git diff`, and untracked files (`manifest.list_changed_files`), so an unstaged edit or a brand-new untracked file blocks removal just as a staged change does. A dirty path is refused with an error naming it.
+
+Removals and additions apply inside the **same** atomic write and rollback envelope, so a Layer 3 post-check failure restores the Manifest whole rather than leaving it half-amended. The post-check itself needs no special casing for removals: it re-runs whole-backlog validation, so a removal that orphaned a source/test pair is caught by the existing source-test atomicity rule.
+
+Removing every row is refused -- a unit that declares no files has nothing to verify its staged changes against, which is a manifest to rewrite by hand rather than arrive at by amendment. A path that is not declared is likewise an error rather than a silent no-op, so a typo surfaces instead of reporting success while the real stale row keeps failing the gate.
 
 ## Audit trail
 
 Every amendment action leaves a timestamped entry in the work-unit `## Comments` section:
 
 - On apply: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_APPLIED] <reason>; added N file(s); justification: <...>`
+- On apply with removals, the same row also names them: `... added N file(s); removed M row(s): <paths>; justification: <...>`. A dropped row changes what the unit is allowed to commit, so it is never invisible in the audit trail.
 - On reject: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_REJECTED] <reason>; rejected: <...>`
 
 The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent.
@@ -118,6 +136,7 @@ The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_han
 - **It does not weaken `AC-FINAL-015`.** The Changes Manifest mismatch rule still fires; amendments are the only path to a manifest change, and every amendment is audited.
 - **It does not let the executor edit work-unit files directly.** The guard hook `guard-work-unit-write.sh` continues to block Edit/Write on `backlog/**/*.md`. The CLI writes via subprocess, bypassing the hook the same way `log-verdict` has always worked.
 - **It does not allow amendments outside the staged diff.** Every file in `files_to_add` must be in the staged diff against base; the pre-filter rejects attempts to include unrelated files.
+- **It does not let a removal carry work out of scope.** `files_to_remove` only drops rows whose files have no staged, unstaged, or untracked changes, so removal can never be used to move real work outside the unit's reviewed Manifest.
 - **It does not retry.** One pending request per task at a time; `max_requests_per_execution` caps the total per executor run. If the amender rejects, the task blocks for human review.
 - **It does not cover validation-gate tasks.** Validation gates (empty Changes Manifest / Approach that forbids production-code changes) never stage a fix, so they never produce an amendment request for the amender to review. When a validation gate surfaces an out-of-scope production bug, the executor uses a separate path -- the BUG ESCALATION FOR VALIDATION GATES procedure in `plugin/devbench-orchestrate/agents/executor.md`, which writes a proposal JSON directly so task-factory can materialise follow-up work units. See [ADR-06: Validation-gate bug escalation](adr/06-validation-gate-bug-escalation.md) and [docs/task-factory.md](task-factory.md) for the full flow.
 

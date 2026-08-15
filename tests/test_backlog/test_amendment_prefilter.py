@@ -321,3 +321,95 @@ class TestExtractAcId:
 
     def test_single_token(self) -> None:
         assert _extract_ac_id("AC-ONLY-ID") == "AC-ONLY-ID"
+
+
+# ---------------------------------------------------------------------------
+# check_files_to_remove_are_declared
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFilesToRemoveAreDeclared:
+    def test_declared_path_passes(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        unit = pf.check_task_exists_and_in_progress(request)
+        pf.check_files_to_remove_are_declared(request, unit)
+
+    def test_undeclared_path_rejected(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/never_declared.py"])
+        unit = pf.check_task_exists_and_in_progress(request)
+        with pytest.raises(AmendmentError, match="not in the Changes Manifest"):
+            pf.check_files_to_remove_are_declared(request, unit)
+
+    def test_empty_list_is_a_noop(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request()
+        unit = pf.check_task_exists_and_in_progress(request)
+        pf.check_files_to_remove_are_declared(request, unit)
+
+    def test_adding_and_removing_same_path_rejected(self, tmp_backlog: Path) -> None:
+        """Self-contradictory: the outcome would depend on which list applies last."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(
+            files_to_add=[{"path": "tests/test_example.py", "change": "touch"}],
+            files_to_remove=["tests/test_example.py"],
+        )
+        unit = pf.check_task_exists_and_in_progress(request)
+        with pytest.raises(AmendmentError, match="both adds and removes"):
+            pf.check_files_to_remove_are_declared(request, unit)
+
+
+# ---------------------------------------------------------------------------
+# check_files_to_remove_have_no_diff -- the removal safety property
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFilesToRemoveHaveNoDiff:
+    """A Manifest row may only be dropped when its file provably has no changes.
+
+    The row is the only thing authorising a file to appear in the unit's commit,
+    so permitting removal for a file with real changes would let work leave the
+    unit's reviewed scope -- the violation
+    ``assert_staged_matches_manifest`` exists to stop.
+    """
+
+    def test_unchanged_path_passes(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        pf.check_files_to_remove_have_no_diff(request, frozenset({"some/other/file.py"}))
+
+    def test_staged_change_blocks_removal(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        with pytest.raises(AmendmentError, match="with changes"):
+            pf.check_files_to_remove_have_no_diff(request, frozenset({"tests/test_example.py"}))
+
+    def test_error_names_the_offending_path_only(self, tmp_backlog: Path) -> None:
+        """The message must name the dirty path so the executor can act precisely."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        with pytest.raises(AmendmentError) as exc:
+            pf.check_files_to_remove_have_no_diff(request, frozenset({"tests/test_example.py", "unrelated.py"}))
+        assert "tests/test_example.py" in str(exc.value)
+        assert "unrelated.py" not in str(exc.value)
+
+    def test_empty_list_is_a_noop(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        pf.check_files_to_remove_have_no_diff(_make_request(), frozenset({"anything.py"}))
+
+    def test_run_all_enforces_the_no_diff_rule(self, tmp_backlog: Path) -> None:
+        """The check is wired into run_all, not merely available to call."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        with pytest.raises(AmendmentError, match="with changes"):
+            pf.run_all(
+                request,
+                staged_files=frozenset(),
+                changed_files=frozenset({"tests/test_example.py"}),
+            )
+
+    def test_run_all_passes_for_a_clean_removal(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        pf.run_all(request, staged_files=frozenset(), changed_files=frozenset())

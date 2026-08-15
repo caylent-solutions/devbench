@@ -340,6 +340,57 @@ def green_green_observed_satisfied(content: str) -> bool:
     )
 
 
+def resolve_judge_retry_budget(judge_name: str) -> int:
+    """Return the executor retry budget that applies to *judge_name*.
+
+    Precedence (issue #122): the per-judge entry in
+    ``max_executor_retries_per_judge`` when present, else the global
+    ``max_executor_retries``. Both come from resolved config -- the global is
+    already env-overridable via ``DEVBENCH_MAX_RETRIES`` -- so no bound is
+    hard-coded here.
+
+    Single implementation shared by the enforcement in ``cli.cmd_log_verdict``
+    and the display in ``reporting.report.review_rejections_line``, so the
+    budget shown to an operator can never disagree with the budget applied.
+    Imported lazily to keep config import order out of this module's contract.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS, RUNTIME_CONFIG
+
+    per_judge = RUNTIME_CONFIG.max_executor_retries_per_judge.get(judge_name)
+    return per_judge if per_judge is not None else MAX_RETRY_ATTEMPTS
+
+
+def count_review_fails_for_judge(content: str, judge_name: str) -> int:
+    """Return how many ``[REVIEW_FAIL]`` verdicts *judge_name* has recorded in *content*.
+
+    The audit trail is the counter: every judge verdict already lands in the
+    work unit's Comments section as
+    ``[<ts>] [judge/<name>] [REVIEW_FAIL|REVIEW_PASS] <feedback>``, so the
+    number of rejection rounds a judge has spent is derivable from the file
+    with no new bookkeeping state to drift out of sync. Mirrors the audit-row
+    counting ``cli._count_ci_fail_attempts`` already does for ``[CI_FAIL]``.
+
+    Matching is per line and substring-based on both bracketed tokens, the
+    same idiom ``BacklogManager._last_round_all_passed`` uses, so a judge name
+    quoted inside another judge's prose feedback cannot inflate the count --
+    the ``[judge/<name>]`` agent-id token only appears at a verdict row's
+    structural position.
+
+    Unlike ``_last_round_all_passed`` this deliberately does NOT stop at a
+    round boundary: the budget bounds the TOTAL rounds a judge may spend on a
+    unit, so every historical failure counts.
+
+    Args:
+        content: Full text of a work-unit markdown file.
+        judge_name: Underscored judge identifier, e.g. ``doc_review``.
+
+    Returns:
+        The count of ``[REVIEW_FAIL]`` rows attributed to *judge_name*.
+    """
+    token = f"[judge/{judge_name}]"
+    return sum(1 for line in content.splitlines() if token in line and "[REVIEW_FAIL]" in line)
+
+
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 

@@ -305,6 +305,13 @@ triggers include:
   that skipped the cascade trigger).
 - A `[BLOCKED]` audit comment from a non-recovery agent, or a recovery comment
   that is older than the recovery window.
+- **A spent review-retry budget (issue #122).** A canonical reviewer rejected the
+  unit as many times as its budget allows, so `devbench log-verdict` wrote a
+  `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` row, forced the unit to `blocked`, and
+  notified the operator. The verbatim tag is what makes this bucket fire rather
+  than `AWAITING_AMENDMENT_RECOVERY` -- without it a spent budget would read as a
+  recovery signal whose contract is "operator does nothing", and the run would
+  stall with no alert because no further executor round is coming.
 
 **Detection.**
 `classify_blocked_task` falls through to `OPERATOR_ACTION_REQUIRED` from two
@@ -326,6 +333,12 @@ recent `[BLOCKED]` audit row. Common fixes:
   manually.
 - If the cascade is stuck (all markers terminal but task still blocked), run
   `devbench set-status <task-id> in-queue` to manually unblock.
+- If the row is `[RETRY_BUDGET_EXHAUSTED]`, read the failing judge's most recent
+  verdicts: the reviews genuinely did not converge, so re-queueing without
+  changing anything will spend a fresh budget the same way. The
+  `devbench report` **Review rejections** row shows rounds spent per judge. Either
+  fix the underlying disagreement, or raise that judge's budget in
+  `max_executor_retries_per_judge` if the work legitimately needs more rounds.
 
 **Config / env knobs.**
 None -- `OPERATOR_ACTION_REQUIRED` is the classifier's catch-all; no configurable parameters govern whether a task lands here (the knobs in other states govern whether the task is diverted away before reaching this path).

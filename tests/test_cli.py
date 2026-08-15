@@ -10,7 +10,8 @@ import os
 import re
 import subprocess
 import types
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -7145,6 +7146,172 @@ class TestCmdLogVerdict:
         assert "## Comments" in content
 
 
+class TestLogVerdictRetryBudget:
+    """Issue #122: cmd_log_verdict enforces the per-judge executor retry budget.
+
+    Before this, ``max_executor_retries_per_judge`` was parsed by
+    ``config_loader`` and consumed by nothing: enforcement lived only in
+    orchestrate SKILL.md prose that told the orchestrator to read the budget
+    via ``devbench config-resolve``, a verb that did not exist. Reviews could
+    reject the same unit without bound.
+    """
+
+    def _unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def _wu_file(self, tmp_path: Path, prior_fails: int, judge: str = "doc_review") -> Path:
+        """Write a work unit whose audit trail already holds *prior_fails* rows for *judge*."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        rows = "".join(
+            f"[2026-08-15 0{i}:00 UTC] [judge/{judge}] [REVIEW_FAIL] round {i}\n\n" for i in range(1, prior_fails + 1)
+        )
+        wu_file.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n\n{rows}",
+            encoding="utf-8",
+        )
+        return wu_file
+
+    def _run(self, tmp_path: Path, wu_file: Path, judge: str, per_judge: dict[str, int], global_budget: int) -> str:
+        """Invoke a failing verdict with a stubbed budget; return the resulting file content."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [self._unit()]
+        cfg = MagicMock()
+        cfg.max_executor_retries_per_judge = per_judge
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "| ID | Title | Type | Status | Repo | Deps | File |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| E0-F1-S1-T1 | Test Task | Task | in-progress | caylent-solutions/git-repo |  | "
+            "backlog/E0-F1-S1-T1.md |\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.config.RUNTIME_CONFIG", cfg),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", global_budget),
+            patch("devbench.notifications.notify_work_unit_blocked_operator") as notify,
+        ):
+            rc = cli.cmd_log_verdict(judge, "E0-F1-S1-T1", "fail", "still wrong")
+        assert rc == 0
+        self.last_notify = notify
+        return wu_file.read_text(encoding="utf-8")
+
+    def test_below_budget_does_not_block(self, tmp_path: Path) -> None:
+        """Round 2 of a 3-round budget records the failure and leaves the unit workable."""
+        wu_file = self._wu_file(tmp_path, prior_fails=1)
+        content = self._run(tmp_path, wu_file, "doc_review", {}, global_budget=3)
+
+        assert content.count("[REVIEW_FAIL]") == 2
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+        self.last_notify.assert_not_called()
+
+    def test_at_budget_blocks_and_tags(self, tmp_path: Path) -> None:
+        """The round that spends the budget tags, blocks, and alerts the operator."""
+        wu_file = self._wu_file(tmp_path, prior_fails=2)
+        content = self._run(tmp_path, wu_file, "doc_review", {}, global_budget=3)
+
+        assert content.count("[REVIEW_FAIL]") == 3
+        assert "[RETRY_BUDGET_EXHAUSTED]" in content
+        assert "[BLOCKED]" in content
+        assert "## Status: blocked" in content
+        self.last_notify.assert_called_once()
+
+    def test_per_judge_budget_overrides_global(self, tmp_path: Path) -> None:
+        """A per-judge budget of 1 trips on the first failure despite a global budget of 10."""
+        wu_file = self._wu_file(tmp_path, prior_fails=0)
+        content = self._run(tmp_path, wu_file, "doc_review", {"doc_review": 1}, global_budget=10)
+
+        assert "[RETRY_BUDGET_EXHAUSTED]" in content
+        assert "## Status: blocked" in content
+
+    def test_unlisted_judge_falls_back_to_global(self, tmp_path: Path) -> None:
+        """A judge absent from the per-judge map uses the global budget, not another judge's."""
+        wu_file = self._wu_file(tmp_path, prior_fails=0, judge="code_review")
+        content = self._run(tmp_path, wu_file, "code_review", {"doc_review": 1}, global_budget=10)
+
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+
+    def test_non_canonical_judge_does_not_charge_budget(self, tmp_path: Path) -> None:
+        """``manifest_amender`` writes audit-only verdicts and must never trip a review budget.
+
+        It logged 3 REVIEW_FAILs against a single real task, so this boundary
+        is load-bearing rather than theoretical.
+        """
+        wu_file = self._wu_file(tmp_path, prior_fails=5, judge="manifest_amender")
+        content = self._run(tmp_path, wu_file, "manifest_amender", {}, global_budget=1)
+
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+
+    def test_pass_verdict_never_blocks(self, tmp_path: Path) -> None:
+        """A REVIEW_PASS is not a rejection round even when prior failures exhausted the budget."""
+        wu_file = self._wu_file(tmp_path, prior_fails=5)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [self._unit()]
+        cfg = MagicMock()
+        cfg.max_executor_retries_per_judge = {}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.config.RUNTIME_CONFIG", cfg),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 1),
+        ):
+            rc = cli.cmd_log_verdict("doc_review", "E0-F1-S1-T1", "pass", "resolved")
+
+        assert rc == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+
+
+class TestCmdConfigResolve:
+    """Issue #122: the ``config-resolve`` verb orchestrate SKILL.md already referenced."""
+
+    def test_resolves_requested_fields(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Named scalar and mapping fields are returned as JSON."""
+        rc = cli.cmd_config_resolve("max_executor_retries", "max_executor_retries_per_judge")
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload) == {"max_executor_retries", "max_executor_retries_per_judge"}
+
+    def test_nested_dataclass_section_is_expanded(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A dataclass section resolves to an object, not a repr string."""
+        rc = cli.cmd_config_resolve("manifest_amendment")
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "enabled" in payload["manifest_amendment"]
+
+    def test_unknown_field_fails_fast(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """An unknown field is an error naming the valid choices, never a silent null."""
+        rc = cli.cmd_config_resolve("not_a_real_field")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not_a_real_field" in err
+        assert "max_executor_retries" in err
+
+    def test_no_field_fails_fast(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Calling with no field name is an error, not an empty success."""
+        rc = cli.cmd_config_resolve()
+        assert rc == 1
+        assert "at least one field" in capsys.readouterr().err
+
+
 class TestCmdLogCommentFileResolution:
     """Test cmd_log_comment file resolution fallback paths."""
 
@@ -9607,6 +9774,20 @@ class TestRejectEmDash:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _patched_amendment_cli(workspace: Path, repo: Path) -> Iterator[None]:
+    """Patch the module globals ``cmd_request_amendment`` resolves its target repo through."""
+    with (
+        patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+        patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/example": repo}),
+        patch("devbench.cli.resolve_repo", return_value="caylent-solutions/example"),
+        patch("devbench.cli.validate_repo", return_value=None),
+    ):
+        yield
+
+
 class TestCmdRequestAmendment:
     """cmd_request_amendment reads JSON from stdin and delegates to write_request."""
 
@@ -9622,13 +9803,56 @@ class TestCmdRequestAmendment:
 
         monkeypatch.setattr("sys.stdin", io.StringIO(text))
 
+    def _accepting_workspace(self, tmp_path: Path) -> AbstractContextManager[None]:
+        """Build a backlog + real repo so the Layer 1 pre-filter can pass.
+
+        ``cmd_request_amendment`` runs every pre-filter check before writing, so
+        an accepted request needs a resolvable in-progress task and a real git
+        repo in which the requested file is staged.
+        """
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| EX-F1-S1-T1 | Sample | Task | in-progress | None | caylent-solutions/example "
+            "| `backlog/EX-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        (backlog_dir / "EX-F1-S1-T1.md").write_text(
+            "# EX-F1-S1-T1: Sample\n\n## Status: in-progress\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 covers it\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `tests/test_example.py` | add tests |\n\n## Definition of Done\n",
+            encoding="utf-8",
+        )
+
+        repo = tmp_path / "target-repo"
+        repo.mkdir(exist_ok=True)
+        for cmd in (
+            ["git", "init"],
+            ["git", "config", "user.email", "t@ex.com"],
+            ["git", "config", "user.name", "Test"],
+        ):
+            subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+        (repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "baseline.txt"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+        staged = repo / "src/example/parser.py"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text("content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/example/parser.py"], cwd=repo, check=True, capture_output=True)
+
+        return _patched_amendment_cli(tmp_path, repo)
+
     def test_happy_path_writes_request(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+        with self._accepting_workspace(tmp_path):
             rc = cli.cmd_request_amendment("EX-F1-S1-T1")
-        assert rc == 0
+        assert rc == 0, capsys.readouterr().err
         out = capsys.readouterr().out
         summary = json.loads(out)
         assert summary["task_id"] == "EX-F1-S1-T1"
@@ -9676,12 +9900,14 @@ class TestCmdRequestAmendment:
     def test_duplicate_request_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # One workspace build, reused for both calls: re-running the setup would
+        # re-init the repo and drop the staged file the pre-filter requires.
+        ctx = self._accepting_workspace(tmp_path)
         self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            assert cli.cmd_request_amendment("EX-F1-S1-T1") == 0
-        # Second call with a fresh stdin attempts to write duplicate
-        self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+        with ctx:
+            assert cli.cmd_request_amendment("EX-F1-S1-T1") == 0, capsys.readouterr().err
+            # Second call with a fresh stdin attempts to write duplicate
+            self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
             rc = cli.cmd_request_amendment("EX-F1-S1-T1")
         assert rc == 1
         assert "already exists" in capsys.readouterr().err

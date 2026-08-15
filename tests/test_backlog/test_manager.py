@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from devbench.backlog.manager import BacklogManager
+from devbench.backlog.manager import BacklogManager, count_review_fails_for_judge
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
@@ -724,6 +724,47 @@ class TestLogToTraceabilityMatrix:
         assert "AC-02" in content
         lines = [line for line in content.strip().splitlines() if line.startswith("|")]
         assert len(lines) >= 4
+
+
+class TestCountReviewFailsForJudge:
+    """Issue #122: the audit trail is the rejection-round counter."""
+
+    def test_counts_only_the_named_judge(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 02:00 UTC] [judge/code_review] [REVIEW_FAIL] b\n"
+            "[2026-08-15 03:00 UTC] [judge/doc_review] [REVIEW_FAIL] c\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 2
+        assert count_review_fails_for_judge(content, "code_review") == 1
+
+    def test_passes_are_not_counted(self) -> None:
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 02:00 UTC] [judge/doc_review] [REVIEW_PASS] b\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 1
+
+    def test_counts_across_round_boundaries(self) -> None:
+        """The budget bounds TOTAL rounds, so a REVIEW_REJECTED boundary must not reset it."""
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 01:30 UTC] [orchestrator] [REVIEW_REJECTED] round 1 rejected\n"
+            "[2026-08-15 02:00 UTC] [judge/doc_review] [REVIEW_FAIL] b\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 2
+
+    def test_judge_name_quoted_in_prose_does_not_inflate_count(self) -> None:
+        """A judge name inside another judge's feedback text is not a verdict row."""
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/code_review] [REVIEW_FAIL] "
+            "deferring to judge/doc_review on the CHANGELOG wording\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 0
+
+    def test_empty_content_is_zero(self) -> None:
+        assert count_review_fails_for_judge("", "doc_review") == 0
 
 
 class TestLastRoundAllPassed:

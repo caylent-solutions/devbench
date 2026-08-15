@@ -436,7 +436,7 @@
         "max_requests_per_execution": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum amendments applied to one task during one executor run. Default 1. Prevents amendment loops."
+          "description": "Maximum amendments applied to one task during one executor run. Default 2, which admits one addition plus one row removal so a unit can satisfy AC-FINAL-015 in both directions within a single run. Prevents amendment loops."
         }
       }
     },

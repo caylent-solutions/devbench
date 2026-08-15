@@ -56,6 +56,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from devbench.backlog.actionability import actionability_line
 from devbench.backlog.index_errors import exit_with_index_error
+from devbench.backlog.manager import count_review_fails_for_judge, resolve_judge_retry_budget
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
@@ -75,6 +76,7 @@ from devbench.config import (
     WORKSPACE_ROOT,
 )
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
     DEFAULT_SESSION_GAP_MINUTES,
     LOG_NOISE_LOGGER_NAME,
     MIN_PACE_SAMPLES,
@@ -1659,6 +1661,67 @@ def transport_restarts_line(log_path: Path) -> str | None:
     return f"Transport restarts        {count}"
 
 
+def _optional_banner_rows(*rows: str | None) -> list[str]:
+    """Return the rows that have something to say, in the order given.
+
+    Each banner-adjacent row builder returns ``None`` when it would say nothing,
+    so a clean run's report stays byte-identical. Collecting them here keeps
+    ``generate_report`` free of one conditional append per row.
+    """
+    return [row for row in rows if row is not None]
+
+
+def review_rejections_line(units: list[WorkUnit], budget_for_judge: Callable[[str], int]) -> str | None:
+    """Render the per-judge review-rejection row for ``devbench report``.
+
+    A task can spend hours and a large token budget looping through review
+    rejections while every other health signal reads green: the process is
+    alive, the log is advancing, and no error is ever logged. That failure mode
+    is indistinguishable from steady progress unless the rejection count is
+    surfaced, so this row exists to make a stalling task visible before the
+    budget is spent rather than after.
+
+    Only non-terminal units with at least one recorded ``REVIEW_FAIL`` are
+    reported, and only the judges that actually failed. Returns ``None`` when
+    there is nothing to say, following ``transport_restarts_line``'s
+    "no row when it wouldn't say anything" contract so a clean run's report
+    stays byte-identical.
+
+    Args:
+        units: Work units from the backlog index (only in-progress and blocked
+            tasks are considered; a done unit's history is not actionable).
+        budget_for_judge: Resolves a judge's effective retry budget, so the row
+            shows rounds spent against rounds allowed rather than a bare count.
+
+    Returns:
+        ``"Review rejections        <id> doc_review 3/10"`` style text (one
+        task per line), or ``None`` when no non-terminal task has any rejection.
+    """
+    entries: list[str] = []
+    for unit in units:
+        if unit.status not in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.BLOCKED):
+            continue
+        try:
+            content = unit.file_path.read_text(encoding="utf-8")
+        except OSError:
+            # An unreadable work unit is surfaced by the checks that need its
+            # content; it must not take the whole report down.
+            continue
+        counts = [
+            (judge, count)
+            for judge in sorted(ALL_REQUIRED_JUDGE_NAMES)
+            if (count := count_review_fails_for_judge(content, judge)) > 0
+        ]
+        if not counts:
+            continue
+        detail = ", ".join(f"{judge} {count}/{budget_for_judge(judge)}" for judge, count in counts)
+        entries.append(f"{unit.id} {detail}")
+
+    if not entries:
+        return None
+    return "Review rejections        " + "; ".join(entries)
+
+
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
     """Render a single bordered two-column table (metric | value).
 
@@ -3238,6 +3301,13 @@ def generate_report(
 
     backlog = _backlog_totals_from_units(units)
 
+    # Per-judge review-rejection row. Rendered only when non-None so a run with
+    # no rejections stays byte-identical, matching transport_restarts_row above.
+    # Resolved lazily per judge from the same config the enforcement in
+    # ``cli.cmd_log_verdict`` reads, so the row can never disagree with the
+    # budget actually being applied.
+    review_rejections_row = review_rejections_line(units, resolve_judge_retry_budget)
+
     # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index
     # against the orchestrator log + hook log + transcripts (each call
     # is a mtime+size check + delta-only re-parse on append, full
@@ -3334,10 +3404,7 @@ def generate_report(
         else None
     )
 
-    lines: list[str] = [banner_line]
-    if transport_restarts_row is not None:
-        lines.append(transport_restarts_row)
-    lines.append("")
+    lines: list[str] = [banner_line, *_optional_banner_rows(transport_restarts_row, review_rejections_row), ""]
 
     # Spanning-row follow-up: thread the All-time cost (already paid in
     # lifetime_stats above) as the additive base for every narrower

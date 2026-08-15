@@ -16,7 +16,13 @@ import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
-from devbench.reporting.report import HookLogTotals, WindowStats, generate_report, read_all_drain_states
+from devbench.reporting.report import (
+    HookLogTotals,
+    WindowStats,
+    generate_report,
+    read_all_drain_states,
+    review_rejections_line,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -5981,3 +5987,142 @@ class TestGenerateReportTransportRestartsRow:
         assert "Transport restarts        1" in report
         assert "Tasks completed" in report
         assert "Tasks remaining" in report
+
+
+class TestReviewRejectionsLine:
+    """Tests for ``review_rejections_line()`` -- making a review stall visible.
+
+    A task can burn hours and a large token budget looping through review
+    rejections while every health signal reads green: process alive, log
+    advancing, zero errors logged. This row is what distinguishes that from
+    steady progress.
+    """
+
+    def _unit(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        status: WorkUnitStatus,
+        verdicts: str = "",
+    ) -> WorkUnit:
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}\n\n## Comments\n\n{verdicts}", encoding="utf-8")
+        return WorkUnit(
+            id=unit_id,
+            title="Sample",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/example",
+            dependencies=[],
+        )
+
+    def _fail_rows(self, judge: str, count: int) -> str:
+        return "".join(
+            f"[2026-08-15 0{i}:00 UTC] [judge/{judge}] [REVIEW_FAIL] round {i}\n\n" for i in range(1, count + 1)
+        )
+
+    def test_returns_none_when_no_units(self) -> None:
+        assert review_rejections_line([], lambda _judge: 10) is None
+
+    def test_returns_none_when_no_rejections(self, tmp_path: Path) -> None:
+        """The clean-run contract: no row when there is nothing to say."""
+        units = [self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS)]
+        assert review_rejections_line(units, lambda _judge: 10) is None
+
+    def test_reports_count_and_budget(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 3),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "E0-F1-S1-T1" in row
+        assert "doc_review 3/10" in row
+
+    def test_reports_only_the_judges_that_failed(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 2) + self._fail_rows("code_review", 1),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 5)
+        assert row is not None
+        assert "doc_review 2/5" in row
+        assert "code_review 1/5" in row
+        assert "test_review" not in row
+
+    def test_per_judge_budget_is_reflected(self, tmp_path: Path) -> None:
+        """The denominator comes from the resolver, so it tracks per-judge config."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 1),
+            )
+        ]
+        row = review_rejections_line(units, lambda judge: 2 if judge == "doc_review" else 99)
+        assert row is not None
+        assert "doc_review 1/2" in row
+
+    def test_done_units_are_ignored(self, tmp_path: Path) -> None:
+        """A completed task's rejection history is not actionable."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.DONE,
+                self._fail_rows("doc_review", 4),
+            )
+        ]
+        assert review_rejections_line(units, lambda _judge: 10) is None
+
+    def test_blocked_units_are_reported(self, tmp_path: Path) -> None:
+        """A blocked task with a spent budget is exactly what an operator must see."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.BLOCKED,
+                self._fail_rows("doc_review", 10),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "doc_review 10/10" in row
+
+    def test_multiple_units_are_all_listed(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS, self._fail_rows("doc_review", 1)),
+            self._unit(tmp_path, "E0-F1-S1-T2", WorkUnitStatus.BLOCKED, self._fail_rows("code_review", 2)),
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "E0-F1-S1-T1" in row
+        assert "E0-F1-S1-T2" in row
+
+    def test_unreadable_work_unit_does_not_break_the_report(self, tmp_path: Path) -> None:
+        """A missing file is surfaced by the checks that need it, not by killing the report."""
+        unit = self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS, self._fail_rows("doc_review", 1))
+        unit.file_path.unlink()
+        assert review_rejections_line([unit], lambda _judge: 10) is None
+
+    def test_non_canonical_judge_is_not_counted(self, tmp_path: Path) -> None:
+        """``manifest_amender`` writes audit-only verdicts and owns no review budget."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("manifest_amender", 3),
+            )
+        ]
+        assert review_rejections_line(units, lambda _judge: 10) is None

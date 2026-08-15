@@ -485,13 +485,18 @@ class AmendmentConfig:
             "doc_sync_review_fix"}`` (db-327 Leg A1).
         max_requests_per_execution: Upper bound on amendments applied to a
             single task during one executor run; prevents amendment loops.
+            Default 2 rather than 1 because a unit correcting its Changes
+            Manifest in both directions -- adding a file review demanded and
+            dropping a row that went stale -- needs two amendments to comply
+            with ``AC-FINAL-015``, and a limit of 1 made that combination
+            impossible to satisfy.
     """
 
     enabled: bool = True
     allowed_reasons: frozenset[str] = field(
         default_factory=lambda: frozenset({"tdd_green_production_fix", "doc_sync_review_fix"})
     )
-    max_requests_per_execution: int = 1
+    max_requests_per_execution: int = 2
 
 
 @dataclass

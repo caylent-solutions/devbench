@@ -5,6 +5,79 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **A review-rejection loop had no bound in code, so one task could be rejected
+  and reworked indefinitely while every health signal read green.** Issue #122
+  shipped `max_executor_retries_per_judge` with a config field, a runtime
+  validator, a JSON-schema entry and reference docs, but no code consumer: the
+  only enforcement was orchestrate SKILL.md prose instructing the orchestrator
+  to read the budget via `devbench config-resolve`, **a verb that did not
+  exist**. The budget was therefore unreadable at runtime and never applied.
+  `cmd_log_verdict` wrote `[REVIEW_FAIL]` and returned 0 unconditionally -- no
+  counting, no cap, no escalation -- so `[RETRY_BUDGET_EXHAUSTED]` was never
+  emitted and `backlog.proposal`'s classifier never saw the tag it needs to
+  raise `OPERATOR_ACTION_REQUIRED`. Observed on a live run: one docs task spent
+  4 review rounds across 4 claim cycles over ~5 hours against a configured
+  budget of 10, with zero work units completed in the final window and no error
+  logged. Three changes close it: the missing `config-resolve` verb now exists
+  and prints resolved config as JSON (unknown field exits non-zero rather than
+  returning a silent `null`); `cmd_log_verdict` counts the failing judge's prior
+  `[REVIEW_FAIL]` rows in the work unit -- the audit trail is the counter, so
+  there is no new state to drift -- and on exhaustion writes the verbatim
+  `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` row, forces the unit to `blocked`, and
+  sends the operator notification, mirroring `_handle_ci_failure`'s existing
+  escalation shape; and `devbench report` gains a `Review rejections` row
+  showing rounds spent per judge against budget for every non-terminal task, so
+  a stalling task is no longer indistinguishable from a progressing one. Only
+  the five canonical reviewers charge a budget -- audit-only workflow agents own
+  no review gate, a boundary that matters because `manifest_amender` logged 3
+  `REVIEW_FAIL`s against the same task. `log-verdict`'s JSON now carries
+  `retry_budget_exhausted` so the orchestrator can tell a bounded rejection from
+  a terminal one. Enforcement and display share one
+  `backlog.manager.resolve_judge_retry_budget`, so the budget shown can never
+  disagree with the budget applied. Below budget, behaviour is unchanged.
+
+- **The amendment pre-filter was dead code from the CLI, so a backlog's
+  configured `allowed_reasons` narrowing was silently ignored.**
+  `amendment.PreFilter` implements 7 deterministic checks but was referenced
+  nowhere in `cli.py`: `cmd_request_amendment` claimed in its own docstring to
+  "fail fast on unknown reasons" while calling none of them, and
+  `apply_amendment` validated against the module-level
+  `ALLOWED_AMENDMENT_REASONS` (what devbench implements) instead of the
+  per-backlog `AmendmentConfig.allowed_reasons` (what the backlog permits) --
+  a fail-open bypass in which the config was loaded, schema-validated, and then
+  disregarded at every gate. `request-amendment` now runs the full pre-filter
+  before writing, so a request that cannot be approved never reaches disk or
+  occupies the single pending-request slot, and both gates enforce the
+  configured set. The set can only be narrowed, never widened: a configured
+  reason devbench does not implement stays refused.
+
+- **A judge could mandate a Changes Manifest correction that was impossible to
+  perform.** `AC-FINAL-015` requires the Manifest to match the files git changed
+  exactly -- "no extra, no missing" -- so a declared row whose file ends up with
+  a zero-line diff (its work having landed under a sibling unit) is a real
+  violation, and `changes_manifest` correctly fails the unit and prescribes an
+  amendment. But `AmendmentRequest` was add-only: no `files_to_remove`,
+  `files_to_drop`, or equivalent field existed, so the prescribed remedy could
+  not be carried out. Adds `files_to_remove` (optional, defaults to empty so
+  existing request JSON still parses) and a `manifest.remove_rows` counterpart
+  to `append_rows` that reuses the same section regex, body parser and renderer
+  so content outside the Changes Manifest stays byte-identical. Removal is
+  gated on a deterministic safety property: a row may only be dropped once its
+  file has **no staged, unstaged, or untracked changes**
+  (`manifest.list_changed_files`), because the row is the only thing authorising
+  a file to appear in the unit's commit -- permitting removal for a file with
+  real changes would let work leave the unit's reviewed scope, the violation
+  `assert_staged_matches_manifest` exists to stop. Removals ride the same atomic
+  write and rollback envelope as additions, so a Layer 3 post-check failure
+  restores the Manifest whole; the post-check needed no change, and its existing
+  source-test atomicity rule still catches a removal that orphans a pair.
+  Removing every row, removing an undeclared path, and adding plus removing the
+  same path are each refused. The `[AMENDMENT_APPLIED]` audit row now names
+  removals, so a dropped row is never invisible to a reviewer.
+  `manifest_amendment.max_requests_per_execution` default rises from 1 to 2:
+  a unit correcting its Manifest in both directions needs two amendments, which
+  a limit of 1 made impossible to satisfy.
+
 - **Wiring a `[BLOCKED_PENDING_PROPOSAL]` marker never wrote the status, so the
   ADR-07 auto-requeue cascade silently skipped the task forever.**
   `proposal.promote_proposal` wrote the marker into Comments and the row into

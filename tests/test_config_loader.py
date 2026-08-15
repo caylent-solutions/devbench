@@ -1543,7 +1543,9 @@ class TestManifestAmendmentConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.manifest_amendment.enabled is True
-        assert result.manifest_amendment.max_requests_per_execution == 1
+        # 2 admits one addition plus one row removal in a single execution, the
+        # combination AC-FINAL-015 can require when a declared row goes stale.
+        assert result.manifest_amendment.max_requests_per_execution == 2
         assert "tdd_green_production_fix" in result.manifest_amendment.allowed_reasons
 
     def test_enabled_from_yaml(self, tmp_path: Path) -> None:

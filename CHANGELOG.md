@@ -276,6 +276,70 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   same hand-edit only indirectly, through `TestVocabularyDriftCheck` running
   inside `make test-coverage`.
 
+- **Closed finding 322-D21: every `JUDGE_CATEGORIES` code is now accounted
+  for by the `_LEGACY_CODES`/`_CAMPAIGN_CODES` partition, every campaign
+  code carries an ownership plus non-membership assertion, `_LEGACY_CODES`
+  is frozen by `TestLegacyCodesAreFrozen` so a new code cannot be parked
+  there to dodge the gate, and `make validate` is proven to reach the
+  module that enforces all three** (spec
+  `integration-reality-gates-hardening.md` section 4.10;
+  AC-E2-F5-S1-T2-4 through -6). The prior coverage was uneven, not
+  uniformly absent: PR #322 shipped `FIXTURE_CATALOG_MISMATCH` proving only
+  that it belonged to `test_review`, never that it was absent from every
+  other judge's set, and `UNREACHABLE_ARTIFACT` and
+  `NEWLY_REACHABLE_PATH_UNVERIFIED` shipped with that same one-sided gap.
+  `LAYOUT_STUB_WITHOUT_LIVE_TEST` already had partial negative coverage
+  (absence from `code_review` only, not from every other judge), and
+  `COMPOSITION_ROOT_MISSING` already had full negative coverage via
+  `test_composition_root_missing_not_valid_for_other_judges`, which looped
+  over every judge but `test_review`. `tests/test_backlog/test_review_feedback_vocabulary.py`
+  now partitions every code in `JUDGE_CATEGORIES` into `_LEGACY_CODES`
+  (closed permanently, and pinned against an independently maintained
+  `_LEGACY_CODES_SNAPSHOT` literal by the new `TestLegacyCodesAreFrozen`)
+  and `_CAMPAIGN_CODES` (grows by one entry per new code, each proven by
+  `TestCampaignCodeMembership`). Its positive half is parametrized off a
+  literal `_CAMPAIGN_CODE_OWNERS` code-to-judge table, cross-checked against
+  the published mapping in `docs/review-feedback-vocabulary.md`'s
+  `code_review` and `test_review` tables (each code is documented once,
+  under its owning judge's heading) and, for `FIXTURE_CATALOG_MISMATCH`
+  specifically, `docs/cli-reference.md` line 1355, so reassigning a
+  campaign code to a different judge's frozenset fails the test directly --
+  deriving the "owning judge" from `JUDGE_CATEGORIES` itself, as an earlier
+  revision of this test did, cannot detect that reassignment because the
+  derivation and the assertion move together. `_owner`'s existing
+  single-owner precondition is kept and cross-checked against the same
+  literal table by `test_owner_matches_literal_table`. The negative half
+  remains the non-membership cross-product against every other judge in
+  `JUDGE_CATEGORIES`, parametrized so a judge added later cannot be silently
+  skipped. The seven pre-existing ad-hoc single-code tests for these five
+  codes are superseded: each pinned a literal judge mapping for one code
+  with no negative coverage for three of them and partial negative coverage
+  for a fourth (the historical detail above); `TestCampaignCodeMembership`
+  now pins that same literal mapping for all five plus the full
+  non-membership cross-product for all five uniformly.
+  Together, `TestJudgeCategoryMembershipCoverage.test_every_code_is_accounted_for`
+  (fails, naming the code, whenever a code lands in neither set) and
+  `TestLegacyCodesAreFrozen.test_legacy_codes_matches_frozen_snapshot`
+  (fails, naming the divergence, whenever `_LEGACY_CODES` is extended
+  instead of `_CAMPAIGN_CODES`) mean a new code cannot ship without
+  triggering `TestCampaignCodeMembership`'s ownership and non-membership
+  assertion. `tests/test_integration/test_make_targets.py` adds
+  `TestMembershipCoverageGateReachableFromValidate`, the direct analogue of
+  `TestVocabularyDriftCheck.test_validate_runs_the_drift_check` above, with
+  two assertions: `test_validate_pytest_invocation_collects_the_membership_module`
+  extracts `test-coverage`'s real pytest invocation from `make -n` and runs
+  it in `--collect-only` mode to prove the invocation actually collects the
+  membership-coverage module, so a future marker filter or path list that
+  narrows the invocation fails loudly instead of silently dropping this
+  gate out of `test-coverage`; `test_test_coverage_is_a_validate_prerequisite`
+  separately asserts that same invocation line appears in `make -n
+  validate`'s dry-run output, so removing `test-coverage` from the
+  `validate` prerequisite list would also fail loudly rather than leaving
+  the first assertion green in isolation. `WRITE_PATH_UNVERIFIED`, added
+  later by E7, is deliberately not asserted here: the completeness test is
+  what obliges that unit to bring its own membership assertion in the same
+  change that adds the code.
+
 - **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
   helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,
   AC-9; AC-E2-F3-S1-T1-1 through -6). New `resolve_changed_files(unit_id,

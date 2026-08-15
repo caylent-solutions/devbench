@@ -11,18 +11,29 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import os
+import shlex
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import test_backlog.test_review_feedback_vocabulary as _membership_coverage_module
 
 from devbench.vocabulary_generation import DOC_RELATIVE_PATH
 
 # Repo root is two levels above this test file:
 # tests/test_integration/test_make_targets.py -> tests/test_integration -> tests -> repo root
 _REPO_ROOT = Path(__file__).parent.parent.parent
+
+# Repo-relative path of finding 322-D21's membership-coverage module,
+# derived from the imported module's own file identity rather than a
+# hand-typed literal, so a future rename of the test file cannot leave a
+# stale path string behind unnoticed.
+_MEMBERSHIP_COVERAGE_MODULE_RELATIVE_PATH = (
+    Path(inspect.getfile(_membership_coverage_module)).relative_to(_REPO_ROOT).as_posix()
+)
 
 
 def _make_dry_run(target: str, env: dict[str, str] | None = None) -> str:
@@ -387,5 +398,67 @@ class TestVocabularyDriftCheck:
         for line in drift_recipe_lines:
             assert line in validate_output, (
                 f"Expected drift target's recipe line to appear in 'make -n validate' output.\n"
+                f"Missing line: {line!r}\nvalidate output:\n{validate_output}"
+            )
+
+
+@pytest.mark.functional
+class TestMembershipCoverageGateReachableFromValidate:
+    """AC-E2-F5-S1-T2-4/-5/-6 (spec 4.10; finding 322-D21): `validate`'s test
+    stage must actually execute the membership-coverage module, the same way
+    `TestVocabularyDriftCheck.test_validate_runs_the_drift_check` above pins
+    that the drift target is reachable from `validate`. `test-coverage`'s
+    recipe is a single ``pytest tests/`` invocation with no marker filter or
+    explicit path list today; this test proves that invocation, run for
+    real in collect-only mode, actually collects the membership-coverage
+    module, so a future narrowing of the invocation fails here instead of
+    silently dropping finding 322-D21's completeness gate out of
+    `make validate`."""
+
+    def test_validate_pytest_invocation_collects_the_membership_module(self) -> None:
+        coverage_recipe = _make_dry_run("test-coverage")
+        pytest_invocation_lines = [line for line in coverage_recipe.splitlines() if "pytest" in line]
+        assert len(pytest_invocation_lines) == 1, (
+            f"Expected exactly one pytest invocation line in 'make -n test-coverage' output, got:\n{coverage_recipe}"
+        )
+        pytest_command = shlex.split(pytest_invocation_lines[0])
+
+        collection = subprocess.run(
+            [*pytest_command, "--collect-only", "-q"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert collection.returncode == 0, (
+            f"Expected validate's pytest invocation to collect cleanly, got rc={collection.returncode}.\n"
+            f"stdout:\n{collection.stdout}\nstderr:\n{collection.stderr}"
+        )
+        assert _MEMBERSHIP_COVERAGE_MODULE_RELATIVE_PATH in collection.stdout, (
+            "Expected validate's pytest invocation to collect tests from "
+            f"'{_MEMBERSHIP_COVERAGE_MODULE_RELATIVE_PATH}', but it is absent from the collection output "
+            "-- a narrowed path list or marker filter would silently drop finding 322-D21's completeness "
+            f"gate out of 'make validate'.\ncollection output:\n{collection.stdout}"
+        )
+
+    def test_test_coverage_is_a_validate_prerequisite(self) -> None:
+        """Pins that `test-coverage` -- and therefore the membership-coverage
+        module `test_validate_pytest_invocation_collects_the_membership_module`
+        above proves it collects -- is actually reachable from `validate`,
+        the same way `TestVocabularyDriftCheck.test_validate_runs_the_drift_check`
+        pins the drift target's wiring. Without this test, removing
+        `test-coverage` from the `validate` prerequisite list in `Makefile`
+        would leave the test above green (it invokes `test-coverage`
+        directly) while silently dropping finding 322-D21's completeness
+        gate out of `make validate`."""
+        coverage_recipe = _make_dry_run("test-coverage")
+        pytest_invocation_lines = [line for line in coverage_recipe.splitlines() if "pytest" in line]
+        assert pytest_invocation_lines, (
+            f"Expected 'make -n test-coverage' to produce at least one pytest invocation line, got:\n{coverage_recipe}"
+        )
+
+        validate_output = _make_dry_run("validate")
+        for line in pytest_invocation_lines:
+            assert line in validate_output, (
+                "Expected test-coverage's pytest invocation line to appear in 'make -n validate' output.\n"
                 f"Missing line: {line!r}\nvalidate output:\n{validate_output}"
             )

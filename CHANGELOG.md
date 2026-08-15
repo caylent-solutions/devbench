@@ -5,6 +5,48 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`src/devbench/source_classification.py` -- the single source/test-path/
+  entry-point classification module** (spec
+  `integration-reality-gates-hardening.md` section 4.3, D-3, PM-3;
+  AC-E2-F6-S1-T1-1 through -5). "Which file extensions are source, which
+  paths are tests, which filenames are entry points" used to have two
+  independent answers: the CLI's own reachability-evidence classification
+  and the write-path audit helper's scan vocabulary. New
+  `SOURCE_EXTENSIONS`, `ENTRY_POINT_STEMS`, `TEST_PATH_MARKERS` and
+  `TEST_FILENAME_MARKERS` frozensets, plus `is_source_extension`,
+  `is_entry_point_stem`, `is_test_path` and `classify_extension`, are the
+  one place that answers the reachability-evidence question now. `cli.py`'s
+  `_is_reachability_candidate` consumes `is_source_extension`,
+  `is_entry_point_stem` and (via `_is_reachability_test_path`)
+  `is_test_path`, matching its pre-migration behaviour, which already
+  lowercased the suffix and already used `SOURCE_EXTENSIONS`'s full
+  15-extension union; `_is_reachability_test_path` itself delegates only
+  to `is_test_path`. This half of the migration is behaviour-preserving,
+  and `cli.py`'s local extension tuples are deleted, not left dormant.
+
+  `plugin_helpers/permission_flag_writepath.py`'s write-path audit
+  historically scanned a narrower 9-extension set, so rather than widen
+  that scan to `SOURCE_EXTENSIONS`, this module keeps the audit's own
+  scan scope as a *second* named set in the same single home,
+  `WRITE_PATH_AUDIT_SCAN_EXTENSIONS`, consumed via the new
+  `is_write_path_audit_extension` predicate. `_iter_source_files` now
+  calls that predicate instead of declaring its own tuple, which matches
+  exact-case (does not lowercase the suffix), preserving the audit's
+  pre-migration case-sensitive scan byte-for-byte. One definition site
+  (this module, AC-2/AC-3), two named scopes: `SOURCE_EXTENSIONS` answers
+  "is this extension source code" for the reachability consumer;
+  `WRITE_PATH_AUDIT_SCAN_EXTENSIONS` answers the narrower, audit-specific
+  "is this one of the 9 extensions the write-path audit has always
+  scanned." Both migrations are therefore behaviour-preserving
+  (AC-E2-F6-S1-T1-5); broadening or narrowing the audit's scan set is
+  left to the gate epic that actually needs it (spec 4.8), not this
+  extraction. The pre-existing witness tests in `tests/test_cli.py` and
+  `tests/test_plugin_helpers/test_permission_flag_writepath.py` pass
+  unchanged before and after, recorded via `green-green-check`, and new
+  tests pin each consumer's continued dependence on the shared module's
+  symbols so a future reversal of the migration is caught rather than
+  silently accepted.
+
 - **Wiring a `[BLOCKED_PENDING_PROPOSAL]` marker never wrote the status, so the
   ADR-07 auto-requeue cascade silently skipped the task forever.**
   `proposal.promote_proposal` wrote the marker into Comments and the row into

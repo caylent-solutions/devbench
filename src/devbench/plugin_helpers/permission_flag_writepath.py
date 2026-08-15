@@ -46,10 +46,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# File extensions the audit scans. Kept narrow and explicit -- scanning
-# vendored/build artefacts produces noise that undermines trust in the
-# finding.
-_SOURCE_EXTENSIONS: frozenset[str] = frozenset({".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".go", ".rb", ".cs"})
+from devbench.source_classification import is_write_path_audit_extension
 
 # Directories excluded from the scan: dependency trees, build output, and
 # the devbench backlog tree itself (a flag name can legitimately appear in
@@ -146,12 +143,31 @@ class WritePathAudit:
 
 
 def _iter_source_files(repo_root: Path) -> list[Path]:
-    """Return every scanned source file under *repo_root*, excluded dirs pruned."""
+    """Return every scanned source file under *repo_root*, excluded dirs pruned.
+
+    "Source" here is this audit's own historical scan scope,
+    :data:`devbench.source_classification.WRITE_PATH_AUDIT_SCAN_EXTENSIONS`
+    (spec 3.5, 4.3, D-3, AC-E2-F6-S1-T1-5) -- this module no longer
+    declares its own extension tuple, but the shared module preserves this
+    audit's pre-migration 9-extension scan set byte-for-byte rather than
+    widening it to the broader
+    :data:`devbench.source_classification.SOURCE_EXTENSIONS` reachability
+    union: scanning vendored/build artefacts in the six additional
+    languages ``SOURCE_EXTENSIONS`` also recognises (``.cjs``, ``.kt``,
+    ``.mjs``, ``.php``, ``.swift``, ``.vue``) would produce noise that
+    undermines trust in a write-path finding, per this audit's original
+    design rationale. Matching stays exact-case, as before this
+    migration: :func:`devbench.source_classification.is_write_path_audit_extension`
+    does not lowercase ``path.suffix`` first, preserving this audit's
+    original case-sensitive matching style byte-for-byte. Broadening this
+    scan set for the audit specifically is deferred to spec 4.8, not done
+    here.
+    """
     files: list[Path] = []
     for path in repo_root.rglob("*"):
         if not path.is_file():
             continue
-        if path.suffix not in _SOURCE_EXTENSIONS:
+        if not is_write_path_audit_extension(path.suffix):
             continue
         if _EXCLUDED_DIR_NAMES.intersection(path.relative_to(repo_root).parts[:-1]):
             continue

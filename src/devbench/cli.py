@@ -313,6 +313,7 @@ from devbench.scope import (
     _tokenise,
 )
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
+from devbench.source_classification import is_entry_point_stem, is_source_extension, is_test_path
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeResult, resolve_changed_files
@@ -4615,53 +4616,10 @@ def cmd_run_tests(unit_id: str) -> int:
 # code-reviewer makes the final judgment call (dynamic imports, barrel
 # re-exports, and lazy route splits are known false-positive shapes it can
 # rule out that a grep cannot).
-
-_REACHABILITY_SOURCE_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".js",
-        ".jsx",
-        ".ts",
-        ".tsx",
-        ".mjs",
-        ".cjs",
-        ".vue",
-        ".py",
-        ".go",
-        ".rb",
-        ".java",
-        ".kt",
-        ".swift",
-        ".cs",
-        ".php",
-    }
-)
-
-# Composition-root / package-entry filenames: nothing is expected to import
-# these by name, so flagging them as "unreachable" would be a guaranteed
-# false positive rather than a useful signal.
-_REACHABILITY_ENTRY_POINT_STEMS: frozenset[str] = frozenset(
-    {"index", "main", "app", "__init__", "setup", "conftest", "wsgi", "asgi"}
-)
-
-_REACHABILITY_TEST_PATH_MARKERS: tuple[str, ...] = (
-    "/__tests__/",
-    "/__mocks__/",
-    "/__snapshots__/",
-    "/test/",
-    "/tests/",
-    "/spec/",
-    "/specs/",
-    "/fixtures/",
-    "/mocks/",
-    "/.storybook/",
-    "/stories/",
-)
-
-_REACHABILITY_TEST_FILENAME_MARKERS: tuple[str, ...] = (
-    ".test.",
-    ".spec.",
-    ".stories.",
-)
+#
+# Which extensions are source, which paths are tests, and which filenames
+# are entry points is answered once, by `devbench.source_classification`
+# (spec 4.3, D-3) -- this module no longer declares its own copies.
 
 _REACHABILITY_DEFER_MARKER = "devbench-defer-reachability"
 
@@ -4683,29 +4641,23 @@ def _is_reachability_test_path(rel_path: str) -> bool:
     Used both to exclude such files from the "newly-added artifact"
     candidate set and to exclude them when counting importers -- a file
     referenced only by its own test/story file is exactly the orphan
-    pattern this check exists to catch.
+    pattern this check exists to catch. Delegates to
+    :func:`devbench.source_classification.is_test_path` (spec 4.3, D-3).
     """
-    normalized = "/" + rel_path.replace("\\", "/").lower()
-    if any(marker in normalized for marker in _REACHABILITY_TEST_PATH_MARKERS):
-        return True
-    filename = normalized.rsplit("/", 1)[-1]
-    if any(marker in filename for marker in _REACHABILITY_TEST_FILENAME_MARKERS):
-        return True
-    stem = filename.rsplit(".", 1)[0]
-    return stem.startswith("test_") or stem.endswith("_test")
+    return is_test_path(rel_path)
 
 
 def _is_reachability_candidate(rel_path: str) -> bool:
     """Return True when *rel_path* is a source file this check should examine."""
     normalized = rel_path.replace("\\", "/")
     suffix = "." + normalized.rsplit(".", 1)[-1].lower() if "." in normalized.rsplit("/", 1)[-1] else ""
-    if suffix not in _REACHABILITY_SOURCE_EXTENSIONS:
+    if not is_source_extension(suffix):
         return False
     if _is_reachability_test_path(normalized):
         return False
     filename = normalized.rsplit("/", 1)[-1]
     stem = filename[: -len(suffix)] if suffix else filename
-    return stem.lower() not in _REACHABILITY_ENTRY_POINT_STEMS
+    return not is_entry_point_stem(stem)
 
 
 def _derive_reachability_basename_symbol(rel_path: str) -> str:

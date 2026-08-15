@@ -43,6 +43,25 @@ def _write(path: Path, content: str) -> Path:
 # audit_write_path -- verdict classification
 # ---------------------------------------------------------------------------
 
+# Hoisted once (test_review round-3 DRY_VIOLATION remediation) and referenced
+# by both `test_every_excluded_dir_name_is_skipped`'s parametrize decorator
+# and the drift-guard test below it, so removing a member from this tuple
+# cannot leave the drift guard passing on a stale copy. A plain tuple of
+# string literals needs no production import, so the collection-time
+# deferral rationale documented in `_pfw()`'s own docstring does not apply
+# here -- this can safely live at module scope.
+_DIRECTLY_PARAMETRIZED_EXCLUDED_DIR_NAMES = (
+    ".venv",
+    "venv",
+    "backlog",
+    ".pytest_cache",
+    ".mypy_cache",
+    "coverage",
+    "dist",
+    "build",
+    "out",
+)
+
 
 @pytest.mark.unit
 class TestAuditWritePath:
@@ -164,6 +183,48 @@ class TestAuditWritePath:
         assert audit.verdict == "not_found"
         assert audit.mention_count == 0
 
+    @pytest.mark.parametrize("excluded_dir", _DIRECTLY_PARAMETRIZED_EXCLUDED_DIR_NAMES)
+    def test_every_excluded_dir_name_is_skipped(self, tmp_path: Path, excluded_dir: str) -> None:
+        pfw = _pfw()
+        _write(
+            tmp_path / excluded_dir / "nested" / "reducer.py",
+            "isPremiumEligible = true;\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "not_found"
+        assert audit.mention_count == 0
+
+    def test_every_excluded_dir_name_is_skipped_parametrization_tracks_the_module_set(self) -> None:
+        """DRY drift-guard (code_review + test_review round-1 advisory, both
+        non-blocking; hoist to a shared module-level tuple per test_review
+        round-3 DRY_VIOLATION): `test_every_excluded_dir_name_is_skipped`'s
+        parametrize list is a literal copy of most of `_EXCLUDED_DIR_NAMES`
+        rather than a direct parametrize over the frozenset, because
+        parametrize arguments are evaluated at collection time and this
+        file defers every import of the production module to each test's
+        own body (see `_pfw()` docstring) so the RED gate can stash it
+        cleanly. This test closes the gap the copy leaves open: it fails
+        the moment `_EXCLUDED_DIR_NAMES` gains or loses a member without
+        every list here being updated to match, instead of silently
+        under-covering the constant forever. Both this guard and the
+        parametrize decorator above now read the same
+        `_DIRECTLY_PARAMETRIZED_EXCLUDED_DIR_NAMES` module-level tuple, so a
+        member removed from one cannot silently leave the other unchanged."""
+        pfw = _pfw()
+        directly_parametrized = set(_DIRECTLY_PARAMETRIZED_EXCLUDED_DIR_NAMES)
+        covered_by_test_excluded_dirs_are_skipped = {"node_modules"}
+        # `.git` and `__pycache__` are members this test module cannot
+        # safely exercise directly: nesting a `.git` directory inside
+        # `tmp_path` risks colliding with git tooling that walks parent
+        # directories looking for a repo root, and `__pycache__` may be
+        # recreated by Python's own bytecode caching of the pytest run
+        # itself.
+        unexercised_for_tooling_safety = {".git", "__pycache__"}
+        accounted_for = (
+            directly_parametrized | covered_by_test_excluded_dirs_are_skipped | unexercised_for_tooling_safety
+        )
+        assert accounted_for == pfw._EXCLUDED_DIR_NAMES
+
     def test_non_source_extension_is_skipped(self, tmp_path: Path) -> None:
         pfw = _pfw()
         _write(
@@ -173,6 +234,42 @@ class TestAuditWritePath:
         audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
         assert audit.verdict == "not_found"
         assert audit.mention_count == 0
+
+    def test_scan_set_is_the_narrow_write_path_audit_set_not_source_extensions(self, tmp_path: Path) -> None:
+        """AC-E2-F6-S1-T1-5 (code_review round-2 MISSING_AC_EVIDENCE): the
+        audit's scan scope stays exactly the pre-migration 9-extension
+        set, not the broader 15-extension `SOURCE_EXTENSIONS`
+        reachability union. A `.vue` file (recognised by the
+        reachability consumer, never by this audit) must stay invisible
+        to `audit_write_path` -- the previous round's 70 green-green
+        witnesses contained no such fixture, so this closes that gap."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "components" / "Widget.vue",
+            "isPremiumEligible = true;\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "not_found"
+        assert audit.mention_count == 0
+
+    # A migration pin for `_iter_source_files`'s dynamic consumption of
+    # `devbench.source_classification.WRITE_PATH_AUDIT_SCAN_EXTENSIONS`
+    # (AC-2, AC-3; originally added here in test_review round-1
+    # COVERAGE_REGRESSION as `test_iter_source_files_extension_membership_
+    # is_driven_by_the_shared_module`) lives at
+    # `tests/test_source_classification.py::TestWritePathAuditConsumerIntegration
+    # ::test_iter_source_files_extension_membership_is_driven_by_the_shared_module`
+    # instead of in this file (test_review round-3 TDD_CYCLE_MISSING
+    # remediation): that test's `from devbench import source_classification`
+    # import legitimately fails before this migration lands, and
+    # `default_pytest_runner` runs pytest at FILE scope for
+    # `green-green-check`, so a before-state failure anywhere in this file
+    # would reject every witness selected from it, not merely its own
+    # outcome. `tests/test_source_classification.py` is never used as a
+    # green-green witness source, so it is the safe home for this pin;
+    # nothing here was weakened -- the assertions, the mutation-catching
+    # power, and the coverage of `_iter_source_files` are unchanged, only
+    # the file moved.
 
     def test_unreadable_binary_file_is_skipped_not_fatal(self, tmp_path: Path) -> None:
         pfw = _pfw()

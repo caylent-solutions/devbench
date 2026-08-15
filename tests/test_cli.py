@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+from test_source_classification import _CLI_REACHABILITY_HISTORICAL_EXTENSIONS
 from test_tdd_gate import commit_scratch_repo as _tdd_gate_commit_all
 from test_tdd_gate import init_scratch_repo as _init_scratch_repo_for_cli
 from test_tdd_gate import write_scratch_file as _tdd_gate_write
@@ -7049,6 +7050,51 @@ class TestReachabilityHelperFunctions:
         assert cli._is_reachability_candidate("src/index.ts") is False
         assert cli._is_reachability_candidate("src/App.tsx") is False
         assert cli._is_reachability_candidate("pkg/__init__.py") is False
+
+    def test_is_reachability_candidate_matches_extension_case_insensitively(self) -> None:
+        """AC-E2-F6-S1-T1-4 (spec 4.3): the shared classification is case-insensitive
+        on the suffix; this asserts `cli.py`'s own consumer inherits that property."""
+        assert cli._is_reachability_candidate("src/components/Button.TSX") is True
+        assert cli._is_reachability_candidate("src/components/Button.Tsx") is True
+
+    @pytest.mark.parametrize("extension", sorted(_CLI_REACHABILITY_HISTORICAL_EXTENSIONS))
+    def test_is_reachability_candidate_accepts_every_shared_source_extension(self, extension: str) -> None:
+        """Migration pin (AC-2, AC-3; test_review round-1 COVERAGE_REGRESSION):
+        fails if `cli.py` ever re-declares a private, narrower extension
+        tuple instead of importing
+        `devbench.source_classification.SOURCE_EXTENSIONS` -- a private
+        copy would omit at least one of these 15 extensions and this
+        parametrization would catch it.
+
+        Parametrized over `_CLI_REACHABILITY_HISTORICAL_EXTENSIONS`,
+        imported from `tests/test_source_classification.py` rather than a
+        collection-time import of the live `SOURCE_EXTENSIONS` constant
+        (test_review round-3 TDD_CYCLE_MISSING remediation):
+        `source_classification.py` is a Changes-Manifest "add" row that
+        `BacklogManager._is_production_source` classifies as production,
+        so `green-green-check`'s scoped stash deletes it to reconstruct
+        the "before" state, and `default_pytest_runner` runs pytest at
+        FILE scope -- a module-scope import of the live constant, or any
+        other test in this file that legitimately fails before the
+        module exists, would fail this whole file's process exit code
+        and reject every witness selected from it, not merely the one
+        test that touches the constant. Importing the inlined literal
+        from `test_source_classification` (itself never importing the
+        production module at module scope, so it stays collectible even
+        when `source_classification.py` is stashed away) is safe here for
+        the same reason `test_tdd_gate`'s helpers are already imported
+        this way above. Parametrizing over this literal instead of
+        `sorted(SOURCE_EXTENSIONS)` is also the stronger pin on its own
+        merits: a live import would let a future narrowing of the shared
+        set silently shrink what gets parametrized instead of failing it.
+        The literal's own drift guard --
+        `tests/test_source_classification.py
+        ::TestSourceExtensions::test_historical_reachability_extensions_equal_source_extensions_exactly`
+        -- ties it to the live `SOURCE_EXTENSIONS` constant by equality,
+        so a narrowing or widening of the shared set still fails loudly;
+        it lives there (not here) so the deferred, before-state-failing
+        import stays out of this witness-bearing file."""
+        assert cli._is_reachability_candidate(f"src/Widget{extension}") is True
 
     def test_derive_basename_symbol_uses_parent_dir_for_index_barrel(self) -> None:
         assert cli._derive_reachability_basename_symbol("src/Button/index.tsx") == "Button"

@@ -7,6 +7,9 @@ Covers:
 - AC-FUNC-004: help output includes env-var tokens for report-session and watch-live
 - AC-FUNC-005: make -n start resolves unchanged (uv run python -m devbench.cli start)
 - AC-CYCLE-001: end-to-end invocation via subprocess asserting observed CLI behaviour
+- install wires the guard-hook runtime deps (jq + PyYAML for the system python3)
+  through scripts/install-hook-deps.sh so a fresh checkout gets them from
+  `make install`, not from tribal knowledge
 """
 
 from __future__ import annotations
@@ -292,3 +295,31 @@ class TestCoverageGate:
         assert "--cov-fail-under=98" in output, (
             f"Expected '--cov-fail-under=98' in make -n test-coverage output, got:\n{output}"
         )
+
+
+@pytest.mark.functional
+class TestInstallProvisionsHookDeps:
+    """`make install` must provision the guard hooks' runtime deps (jq, PyYAML
+    for the system python3 that guard-work-unit-write.sh resolves) via
+    scripts/install-hook-deps.sh, in addition to `uv sync`. Without this a
+    fresh macOS / minimal-Linux operator gets a Rule 11 guard that cannot
+    run."""
+
+    def test_install_runs_uv_sync_then_hook_deps(self) -> None:
+        output = _make_dry_run("install")
+        assert "uv sync --all-extras" in output, output
+        assert "install-hook-deps" in output, output
+
+    def test_install_hook_deps_target_invokes_script(self) -> None:
+        output = _make_dry_run("install-hook-deps")
+        assert "scripts/install-hook-deps.sh" in output, output
+
+    def test_install_hook_deps_script_exists_executable_and_parses(self) -> None:
+        script = _REPO_ROOT / "scripts" / "install-hook-deps.sh"
+        assert script.exists(), f"missing {script}"
+        assert os.access(script, os.X_OK), f"not executable: {script}"
+        result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    def test_help_lists_install_hook_deps(self) -> None:
+        assert "install-hook-deps" in _make_help()

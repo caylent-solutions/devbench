@@ -47,8 +47,17 @@ Verify each tool is present before cloning.
 | git | 2.30+ | `git --version` |
 | uv | 0.5+ | `uv --version` |
 | Claude Code CLI | any | `claude --version` |
+| jq | 1.6+ | `jq --version` |
+| python3 (system) with PyYAML | 3.9+ | `python3 -c 'import yaml'` |
 
-Install missing tools using your OS package manager for git, `curl -LsSf https://astral.sh/uv/install.sh | sh` for uv, and `npm install -g @anthropic-ai/claude-code` for Claude Code.
+Install missing tools using your OS package manager for git and jq, `curl -LsSf https://astral.sh/uv/install.sh | sh` for uv, and `npm install -g @anthropic-ai/claude-code` for Claude Code.
+
+`jq` and a system `python3` that can `import yaml` are runtime dependencies of the
+plugin's PreToolUse guard hooks, which run inside your Claude Code session, outside
+the devbench `.venv`. `make install` (Step 2) checks both and installs PyYAML for
+that interpreter non-invasively (`pip install --user`) when it is missing; where that
+is not possible (PEP 668 externally-managed interpreters) it prints the exact
+package-manager command (`apt-get install python3-yaml`, `dnf install python3-pyyaml`).
 
 Also confirm you have a Claude Code subscription (Claude Pro or Enterprise) **or** AWS
 credentials with Bedrock model access enabled. See [Step 4](#step-4-authenticate-claude--bedrock)
@@ -85,9 +94,13 @@ make -C $DEVBENCH_DIR install
 ```
 
 This runs `uv sync --all-extras` inside the devbench clone, creating a `.venv/` and
-installing every runtime and dev dependency declared in `pyproject.toml`.
+installing every runtime and dev dependency declared in `pyproject.toml`, then
+`scripts/install-hook-deps.sh`, which verifies the guard hooks' runtime deps
+(`jq`, and PyYAML for the system `python3` that `guard-work-unit-write.sh` uses)
+and installs PyYAML for that interpreter when missing.
 
-**Without make:** run `uv sync --all-extras` from inside `$DEVBENCH_DIR`.
+**Without make:** run `uv sync --all-extras` and then `./scripts/install-hook-deps.sh`
+from inside `$DEVBENCH_DIR`.
 
 Expected exit code: 0. You will see uv resolving and installing packages; the final line
 will be something like `Installed N packages`.

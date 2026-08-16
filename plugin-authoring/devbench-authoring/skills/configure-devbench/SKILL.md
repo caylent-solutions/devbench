@@ -264,7 +264,7 @@ Ask the operator:
 >   allowed_reasons            -- List of amendment reasons accepted by the pre-filter.
 >                                 Default: [tdd_green_production_fix]
 >                                 (Enter comma-separated values, or leave blank for the default.)
->   max_requests_per_execution -- Max amendments applied to one task per executor run. [integer >= 1, default: 1]"
+>   max_requests_per_execution -- Max amendments applied to one task per executor run. [integer >= 1, default: 2 -- one addition plus one row removal so a unit can satisfy AC-FINAL-015 in both directions within a single run]"
 
 ---
 

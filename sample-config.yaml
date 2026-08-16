@@ -307,7 +307,11 @@ manifest_amendment:
   allowed_reasons:
     - tdd_green_production_fix
     - doc_sync_review_fix
-  max_requests_per_execution: 1
+  # Built-in default is 2 (was 1): a unit correcting its Changes Manifest in
+  # both directions -- adding a file a review demanded and dropping a row
+  # that went stale -- needs two amendments to satisfy AC-FINAL-015 within
+  # one executor run; a limit of 1 made that combination impossible.
+  max_requests_per_execution: 2
 
 # ---------------------------------------------------------------------------
 # Task factory loop (on by default, ADR-32; requires manifest_amendment.enabled:

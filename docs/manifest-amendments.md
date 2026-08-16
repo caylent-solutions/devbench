@@ -9,11 +9,13 @@ Add to your backlog's `backlog/config/devbench.yaml`:
 ```yaml
 manifest_amendment:
   enabled: true
-  max_requests_per_execution: 1
+  max_requests_per_execution: 2   # built-in default: one add + one row removal per run
   allowed_reasons:
     - tdd_green_production_fix
     - doc_sync_review_fix
 ```
+
+`max_requests_per_execution` defaults to `2` so a unit correcting its Changes Manifest in both directions -- adding a file a review demanded and dropping a row that went stale -- can satisfy `AC-FINAL-015` within one executor run; see [docs/devbench-yaml-reference.md](devbench-yaml-reference.md).
 
 Two amendment reasons are sanctioned by default:
 

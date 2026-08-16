@@ -2705,9 +2705,29 @@ class BacklogManager:
 
         if PurePosixPath(path).name == "__init__.py":
             return False
+        # A workspace whose production code lives outside src/ declares its own
+        # prefixes via validate.production_source_paths. Absent (the default),
+        # the built-in prefixes apply unchanged.
+        configured = cls._configured_production_source_paths()
+        if configured is not None:
+            return any(path.startswith(prefix) for prefix in configured)
         return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
             seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
         )
+
+    @staticmethod
+    def _configured_production_source_paths() -> tuple[str, ...] | None:
+        """Return the workspace's declared production-source prefixes, or None.
+
+        Isolated so the classifier stays import-light and so a workspace that
+        never configures the key pays no behavioural cost.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.production_source_paths
+        except Exception:
+            return None
 
     @staticmethod
     def _is_documentation_path(path: str) -> bool:

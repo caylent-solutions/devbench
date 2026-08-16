@@ -3631,6 +3631,36 @@ class TestIsProductionSource:
         # Random top-level .py is not classified as production source
         assert BacklogManager._is_production_source("setup.py") is False
 
+    def test_workspace_configured_prefix_is_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A workspace whose production code lives outside src/ declares its own prefixes,
+        so the task-type invariant recognises them. Without this, a repo that keeps tested
+        production modules in (for example) scripts/ cannot author a behavior-fix task."""
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/", "tools/"))
+        )
+        assert BacklogManager._is_production_source("scripts/observability.py") is True
+        assert BacklogManager._is_production_source("tools/audit_style.py") is True
+
+    def test_workspace_configured_prefix_still_excludes_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Configuring extra prefixes never reclassifies a test file or package marker."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
+        assert BacklogManager._is_production_source("scripts/tests/test_thing.py") is False
+        assert BacklogManager._is_production_source("scripts/__init__.py") is False
+        assert BacklogManager._is_production_source("scripts/notes.md") is False
+
+    def test_configured_prefixes_replace_builtins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Declaring prefixes is authoritative: the workspace states where its production
+        source lives, so an undeclared tree is not silently still counted."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
+        assert BacklogManager._is_production_source("src/foo/bar.py") is False
+
+    def test_unset_config_preserves_built_in_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the workspace declares nothing, behaviour is exactly as before."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: None))
+        assert BacklogManager._is_production_source("src/foo/bar.py") is True
+        assert BacklogManager._is_production_source("services/api/src/handler.py") is True
+        assert BacklogManager._is_production_source("scripts/observability.py") is False
+
 
 class TestIsRealManifestPath:
     """Direct tests for the placeholder-string filter."""

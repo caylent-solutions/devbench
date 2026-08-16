@@ -417,9 +417,20 @@ class ValidateConfig:
             treated as a declared read-only reference and skipped. Catches
             spec drift where AC/DoD prose restates a path that disagrees
             with the Manifest. Default ``True`` (set ``false`` to opt out).
+        production_source_paths: Path prefixes this workspace treats as
+            production source for the task-type invariant (rule 21) and the
+            source-test atomicity rule (rule 14). ``None`` (the default)
+            preserves the built-in prefixes ``src/`` and ``infra/scripts/``
+            plus any nested ``/src/`` segment. Set this when a repository
+            keeps tested production modules somewhere else -- for example a
+            monorepo whose control-plane and per-service renderers live in
+            ``scripts/`` -- otherwise a genuine behaviour fix in that tree
+            cannot satisfy the invariant and cannot be authored at all.
+            Test paths and ``__init__.py`` are excluded regardless.
     """
 
     check_orphan_path_tokens: bool = True
+    production_source_paths: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1639,6 +1650,37 @@ def _schema_error_message(path: Path, exc: jsonschema.ValidationError) -> str:
     return f"Config file '{path}' failed schema validation: {detail}"
 
 
+def _parse_production_source_paths(path: Path, validate_raw: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Parse ``validate.production_source_paths`` into a tuple, or ``None`` when absent.
+
+    ``None`` means "use the built-in prefixes", so a workspace that never declares
+    the key sees no behaviour change. A declared list REPLACES the built-ins: the
+    workspace is stating authoritatively where its production source lives.
+
+    Args:
+        path: Config file path, used only for error messages.
+        validate_raw: The raw ``validate`` mapping from the YAML.
+
+    Returns:
+        The declared prefixes as a tuple, or ``None`` when the key is absent.
+
+    Raises:
+        ValueError: When the value is not a list of non-empty strings.
+    """
+    raw = validate_raw.get("production_source_paths")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(
+            f"{path}: validate.production_source_paths must be a list of path-prefix strings "
+            f"(for example ['scripts/', 'tools/']), got {raw!r}."
+        )
+    stripped = [x.strip() for x in raw]
+    if any(not x for x in stripped):
+        raise ValueError(f"{path}: validate.production_source_paths must not contain an empty entry.")
+    return tuple(stripped)
+
+
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
 
@@ -1864,6 +1906,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         check_orphan_path_tokens=bool(
             validate_raw.get("check_orphan_path_tokens", default_validate.check_orphan_path_tokens)
         ),
+        production_source_paths=_parse_production_source_paths(path, validate_raw),
     )
 
     # Populate StopHookConfig from YAML stop_hook block.

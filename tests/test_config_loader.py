@@ -1604,6 +1604,41 @@ class TestManifestAmendmentConfig:
             f"must list exactly the two sanctioned reasons; got {enum}"
         )
 
+    def test_production_source_paths_from_yaml(self, tmp_path: Path) -> None:
+        """validate.production_source_paths is parsed into a tuple on ValidateConfig."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_paths:\n    - scripts/\n    - tools/\n"
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.validate.production_source_paths == ("scripts/", "tools/")
+
+    def test_production_source_paths_absent_defaults_to_none(self, tmp_path: Path) -> None:
+        """Absent means built-in behaviour, expressed as None rather than an empty tuple."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
+        assert load_runtime_config(cfg, {}).validate.production_source_paths is None
+
+    def test_production_source_paths_rejects_non_list(self, tmp_path: Path) -> None:
+        """A scalar is a config error, not silently coerced."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\nvalidate:\n  production_source_paths: scripts/\n"
+        )
+        with pytest.raises(ValueError, match="production_source_paths"):
+            load_runtime_config(cfg, {})
+
+    def test_production_source_paths_rejects_empty_entry(self, tmp_path: Path) -> None:
+        """An empty entry would match every path; reject it loudly."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_paths:\n    - scripts/\n    - '  '\n"
+        )
+        with pytest.raises(ValueError, match="must not contain an empty entry"):
+            load_runtime_config(cfg, {})
+
     def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",

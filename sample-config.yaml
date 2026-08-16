@@ -361,6 +361,19 @@ validate:
   # inline "(ref)" suffix to declare a token a read-only reference and
   # exempt it from the check. See docs/backlog-contract.md.
   check_orphan_path_tokens: true
+  # Path prefixes THIS workspace treats as production source, consumed by the
+  # task-type invariant (rule 21) and source-test atomicity (rule 14). Absent
+  # (the default) keeps the built-in prefixes `src/` and `infra/scripts/` plus
+  # any nested `/src/` segment. Set this when a repository keeps tested
+  # production modules somewhere else -- for example a monorepo whose control
+  # plane and per-service renderers live in `scripts/` -- otherwise a genuine
+  # behaviour fix in that tree cannot satisfy the invariant and cannot be
+  # authored at all. Declaring the key is authoritative: it REPLACES the
+  # built-in prefixes rather than adding to them. Test paths and `__init__.py`
+  # are excluded regardless.
+  # production_source_paths:
+  #   - scripts/
+  #   - tools/
 
 # ---------------------------------------------------------------------------
 # Plugin-skill (spec-to-backlog, create-spec) configuration (issue #221

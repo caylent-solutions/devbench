@@ -1620,6 +1620,16 @@ class TestManifestAmendmentConfig:
         cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
         assert load_runtime_config(cfg, {}).validate.production_source_paths is None
 
+    def test_production_source_extensions_supports_extensionless_names(self, tmp_path: Path) -> None:
+        """An entry is a filename SUFFIX, so an extensionless source file can be declared.
+        Inferring a leading dot would make `Makefile` unmatchable."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_extensions:\n    - .py\n    - Makefile\n"
+        )
+        assert load_runtime_config(cfg, {}).validate.production_source_extensions == (".py", "makefile")
+
     def test_production_source_paths_rejects_non_list(self, tmp_path: Path) -> None:
         """A scalar is a config error, not silently coerced."""
         cfg = tmp_path / "devbench.yaml"

@@ -1693,8 +1693,13 @@ def _parse_production_source_extensions(path: Path, validate_raw: Mapping[str, o
         path: Config file path, used only for error messages.
         validate_raw: The raw ``validate`` mapping from the YAML.
 
+    Each entry is a case-insensitive FILENAME SUFFIX, not strictly an extension, so an
+    extensionless source file can be declared too: ``.py`` matches ``a/b.py`` and
+    ``Makefile`` matches both ``Makefile`` and ``providers/x/Makefile``. No dot is
+    inferred, because inferring one would make an extensionless entry unmatchable.
+
     Returns:
-        The declared extensions (lowercased, each guaranteed to start with a dot), or ``None``.
+        The declared suffixes, lowercased, or ``None`` when the key is absent.
 
     Raises:
         ValueError: When the value is not a list of non-empty strings.
@@ -1704,13 +1709,13 @@ def _parse_production_source_extensions(path: Path, validate_raw: Mapping[str, o
         return None
     if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
         raise ValueError(
-            f"{path}: validate.production_source_extensions must be a list of file-extension "
-            f"strings (for example ['.py', '.yml', '.tf']), got {raw!r}."
+            f"{path}: validate.production_source_extensions must be a list of filename-suffix "
+            f"strings (for example ['.py', '.yml', 'Makefile']), got {raw!r}."
         )
     cleaned = [x.strip().lower() for x in raw]
     if any(not x for x in cleaned):
         raise ValueError(f"{path}: validate.production_source_extensions must not contain an empty entry.")
-    return tuple(x if x.startswith(".") else f".{x}" for x in cleaned)
+    return tuple(cleaned)
 
 
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:

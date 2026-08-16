@@ -375,7 +375,9 @@ validate:
   #   - scripts/
   #   - tools/
   #
-  # File extensions this workspace treats as production source, consumed together
+  # Filename SUFFIXES this workspace treats as production source (an entry is matched
+  # case-insensitively against the end of the path, so an extensionless file such as
+  # `Makefile` can be declared; no leading dot is inferred), consumed together
   # with production_source_paths. Absent (the default) keeps the built-in
   # Python-only behaviour. Declare it when behaviour lives in non-Python
   # artefacts -- an infrastructure repository whose service specs are YAML, whose

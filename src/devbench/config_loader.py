@@ -431,6 +431,7 @@ class ValidateConfig:
 
     check_orphan_path_tokens: bool = True
     production_source_paths: tuple[str, ...] | None = None
+    production_source_extensions: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1681,6 +1682,37 @@ def _parse_production_source_paths(path: Path, validate_raw: Mapping[str, object
     return tuple(stripped)
 
 
+def _parse_production_source_extensions(path: Path, validate_raw: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Parse ``validate.production_source_extensions``, or ``None`` when absent.
+
+    ``None`` keeps the built-in Python-only behaviour. A declared list REPLACES it, so an
+    infrastructure repository whose behaviour lives in YAML specs, HCL modules or dashboard
+    JSON can have those changes recognised as production source and therefore RED-gated.
+
+    Args:
+        path: Config file path, used only for error messages.
+        validate_raw: The raw ``validate`` mapping from the YAML.
+
+    Returns:
+        The declared extensions (lowercased, each guaranteed to start with a dot), or ``None``.
+
+    Raises:
+        ValueError: When the value is not a list of non-empty strings.
+    """
+    raw = validate_raw.get("production_source_extensions")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(
+            f"{path}: validate.production_source_extensions must be a list of file-extension "
+            f"strings (for example ['.py', '.yml', '.tf']), got {raw!r}."
+        )
+    cleaned = [x.strip().lower() for x in raw]
+    if any(not x for x in cleaned):
+        raise ValueError(f"{path}: validate.production_source_extensions must not contain an empty entry.")
+    return tuple(x if x.startswith(".") else f".{x}" for x in cleaned)
+
+
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
 
@@ -1907,6 +1939,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             validate_raw.get("check_orphan_path_tokens", default_validate.check_orphan_path_tokens)
         ),
         production_source_paths=_parse_production_source_paths(path, validate_raw),
+        production_source_extensions=_parse_production_source_extensions(path, validate_raw),
     )
 
     # Populate StopHookConfig from YAML stop_hook block.

@@ -2681,7 +2681,7 @@ class BacklogManager:
         classifier is prohibited -- both call sites must reuse this method
         so the production/test boundary can never drift out of sync.
         """
-        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+        if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
         return path.startswith("tests/") or "/tests/" in path
 
@@ -2695,7 +2695,7 @@ class BacklogManager:
         any ``tests/`` segment, per ``_is_test_source_path``) are excluded --
         they are not production source even when their extension is ``.py``.
         """
-        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+        if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
         # Exclude test files
         if cls._is_test_source_path(path):
@@ -2726,6 +2726,29 @@ class BacklogManager:
             from devbench.config import RUNTIME_CONFIG
 
             return RUNTIME_CONFIG.validate.production_source_paths
+        except Exception:
+            return None
+
+    @classmethod
+    def _production_source_extensions(cls) -> tuple[str, ...]:
+        """The effective source-file extensions: workspace-declared, else Python only.
+
+        Shared by ``_is_test_source_path`` and ``_is_production_source`` so the
+        production/test boundary can never drift between them.
+        """
+        return cls._configured_production_source_extensions() or cls._PYTHON_EXTS
+
+    @staticmethod
+    def _configured_production_source_extensions() -> tuple[str, ...] | None:
+        """Return the workspace's declared production-source extensions, or None.
+
+        None keeps the built-in Python-only behaviour, so a workspace that never
+        configures the key sees no change.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.production_source_extensions
         except Exception:
             return None
 

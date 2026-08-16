@@ -374,6 +374,23 @@ validate:
   # production_source_paths:
   #   - scripts/
   #   - tools/
+  #
+  # File extensions this workspace treats as production source, consumed together
+  # with production_source_paths. Absent (the default) keeps the built-in
+  # Python-only behaviour. Declare it when behaviour lives in non-Python
+  # artefacts -- an infrastructure repository whose service specs are YAML, whose
+  # modules are HCL, and whose dashboards are JSON -- so those changes are
+  # RED-gated as `feature`/`behavior-fix` instead of being forced to `chore`,
+  # which would silently drop the TDD gate on the majority of the repo's work.
+  # Source-test atomicity (rule 14) then pairs, for example, `falco.yml` with
+  # `tests/test_falco.py`, which is exactly the convention such repos already use.
+  # production_source_extensions:
+  #   - .py
+  #   - .yml
+  #   - .yaml
+  #   - .tf
+  #   - .hcl
+  #   - .json
 
 # ---------------------------------------------------------------------------
 # Plugin-skill (spec-to-backlog, create-spec) configuration (issue #221

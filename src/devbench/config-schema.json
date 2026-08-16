@@ -580,6 +580,14 @@
             "minLength": 1
           },
           "description": "Path prefixes this workspace treats as production source for the task-type invariant (rule 21) and source-test atomicity (rule 14). Absent preserves the built-in prefixes 'src/' and 'infra/scripts/' plus any nested '/src/' segment. Set this when a repository keeps tested production modules elsewhere, for example a monorepo whose control plane lives in 'scripts/'. Test paths and __init__.py are excluded regardless. See docs/backlog-contract.md 'Task-Type Taxonomy'."
+        },
+        "production_source_extensions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "File extensions this workspace treats as production source, consumed with production_source_paths by the task-type invariant (rule 21) and source-test atomicity (rule 14). Absent keeps the built-in Python-only behaviour. Declare it when behaviour lives in non-Python artefacts, for example an infrastructure repo whose service specs are YAML and whose modules are HCL, so those changes are RED-gated instead of being forced to task type 'chore'."
         }
       }
     },

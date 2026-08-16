@@ -3654,6 +3654,37 @@ class TestIsProductionSource:
         monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
         assert BacklogManager._is_production_source("src/foo/bar.py") is False
 
+    def test_configured_extensions_widen_production_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An infrastructure repo whose behaviour lives in YAML specs, HCL modules and
+        dashboard JSON can declare those extensions as production source. Without this,
+        rule 21 forces every such change to be typed `chore`, which drops the RED gate
+        that behavior-fix and feature exist to enforce."""
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/", "providers/"))
+        )
+        monkeypatch.setattr(
+            BacklogManager,
+            "_configured_production_source_extensions",
+            staticmethod(lambda: (".py", ".yml", ".yaml", ".tf", ".hcl", ".json")),
+        )
+        assert BacklogManager._is_production_source("servers/hp/k8s/addons/falco/falco.yml") is True
+        assert BacklogManager._is_production_source("providers/aws/references/x/main.tf") is True
+
+    def test_configured_extensions_still_exclude_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Widening extensions never reclassifies a test file as production source."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/",)))
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_extensions", staticmethod(lambda: (".py", ".yml"))
+        )
+        assert BacklogManager._is_production_source("servers/tests/test_thing.yml") is False
+
+    def test_unset_extensions_preserve_python_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Absent, only Python counts, exactly as before."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/",)))
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_extensions", staticmethod(lambda: None))
+        assert BacklogManager._is_production_source("servers/hp/k8s/addons/falco/falco.yml") is False
+        assert BacklogManager._is_production_source("servers/hp/thing.py") is True
+
     def test_unset_config_preserves_built_in_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When the workspace declares nothing, behaviour is exactly as before."""
         monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: None))

@@ -25837,3 +25837,96 @@ class TestCmdInstancesDocstringMatchesResolvedDefault:
             "table output is the unconditional default and only --json "
             "changes the format."
         )
+
+
+def _seed_no_output_wu(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", sentinel: str = "<verification-only>") -> Path:
+    """Write a work-unit file declaring `## Expected Output: none`."""
+    wu = tmp_path / f"{unit_id}.md"
+    wu.write_text(
+        f"# {unit_id}: Test Task\n\n## Status: in-progress\n\n"
+        f"## Expected Output: none\n\n## Task Type: chore\n\n"
+        f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+        f"| `{sentinel}` | modify |\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    return wu
+
+
+@pytest.mark.unit
+class TestCmdGitOpsNoOutputUnit:
+    """`## Expected Output: none` completes a unit without a commit (ADR-29).
+
+    Before rule 28 existed, a Manifest of only `<verification-only>` reached
+    git_ops._stage_for_commit, which refused with "resolve the sentinel to real
+    paths via a manifest amendment" -- unsatisfiable for a unit that by
+    definition modifies nothing. Every verification unit therefore blocked
+    permanently after passing all four review judges.
+    """
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E202-F1-S1-T9",
+            title="Verify something",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E202-F1-S1-T9.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _run(self, tmp_path: Path, wu_file: Path, staged: str = "", tree: str = ""):
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd, **kwargs):
+            if cmd[:3] == ["git", "diff", "--cached"]:
+                return (0, staged, "")
+            if cmd[:2] == ["git", "status"]:
+                return (0, tree, "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+        ):
+            rc = cli.cmd_git_ops("E202-F1-S1-T9")
+        return rc, mock_ops
+
+    def test_completes_without_commit_or_pr(self, tmp_path: Path) -> None:
+        wu = _seed_no_output_wu(tmp_path)
+        rc, mock_ops = self._run(tmp_path, wu)
+
+        assert rc == 0
+        mock_ops.commit_and_push.assert_not_called()
+        mock_ops.create_pr.assert_not_called()
+        mock_ops.wait_for_checks_and_classify.assert_not_called()
+        mock_ops.merge_pr.assert_not_called()
+
+    def test_records_an_observable_audit_comment(self, tmp_path: Path) -> None:
+        """Never silent: the WU file states which path git-ops took."""
+        wu = _seed_no_output_wu(tmp_path)
+        self._run(tmp_path, wu)
+
+        assert "[GIT_OPS_NO_OUTPUT]" in wu.read_text(encoding="utf-8")
+
+    def test_refuses_when_changes_are_staged(self, tmp_path: Path) -> None:
+        """Staged changes contradict the declaration; completing would discard them."""
+        wu = _seed_no_output_wu(tmp_path)
+        rc, mock_ops = self._run(tmp_path, wu, staged="scripts/foo.py\n")
+
+        assert rc == 1
+        mock_ops.commit_and_push.assert_not_called()
+
+    def test_unstaged_tooling_drift_does_not_block(self, tmp_path: Path) -> None:
+        """uv.lock rewrites by tooling are a pre-existing repo condition, not this unit's work."""
+        wu = _seed_no_output_wu(tmp_path)
+        rc, _ = self._run(tmp_path, wu, tree=" M uv.lock\n")
+
+        assert rc == 0
+        assert "dirty" in wu.read_text(encoding="utf-8")

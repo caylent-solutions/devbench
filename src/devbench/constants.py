@@ -403,6 +403,23 @@ TASK_TYPE_SECTION_PREFIX: str = "## Task Type:"
 TASK_TYPE_LINE_RE = re.compile(r"^(##\s*Task Type:\s*)(.+)$", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
+# Expected-output taxonomy (per-work-unit commit declaration).
+#
+# A work unit declares whether executing it is expected to produce a commit.
+# ``commit`` is the default when the section is absent, so every backlog
+# authored before this section existed keeps its current lifecycle exactly.
+# ``none`` names a unit that verifies, decides, or no-ops: it records its
+# evidence in ``## Comments`` and git-ops completes it without a commit, push,
+# PR, CI wait, or merge. See docs/backlog-contract.md and ADR-35.
+# ---------------------------------------------------------------------------
+EXPECTED_OUTPUT_COMMIT: str = "commit"
+EXPECTED_OUTPUT_NONE: str = "none"
+VALID_EXPECTED_OUTPUTS: frozenset[str] = frozenset({EXPECTED_OUTPUT_COMMIT, EXPECTED_OUTPUT_NONE})
+DEFAULT_EXPECTED_OUTPUT: str = EXPECTED_OUTPUT_COMMIT
+EXPECTED_OUTPUT_SECTION_PREFIX: str = "## Expected Output:"
+EXPECTED_OUTPUT_LINE_RE = re.compile(r"^(##\s*Expected Output:\s*)(.+)$", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
 # Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------

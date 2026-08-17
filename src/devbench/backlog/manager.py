@@ -56,6 +56,8 @@ from devbench.constants import (
     DEPENDENCY_NONE_VALUES,
     EM_DASH,
     EPIC_ID_RE,
+    EXPECTED_OUTPUT_LINE_RE,
+    EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_RE,
     GATED_TASK_TYPES,
     RED_OBSERVED_ENTRY_LINE_RE,
@@ -82,6 +84,7 @@ from devbench.constants import (
     TDD_CYCLE_LOG_SECTION_HEADER,
     TDD_ENTRY_TEMPLATE,
     TRACEABILITY_MATRIX_HEADER,
+    VALID_EXPECTED_OUTPUTS,
     VALID_STATUSES,
     VALID_TASK_TYPES,
 )
@@ -926,6 +929,7 @@ class BacklogManager:
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
         self._check_task_type_taxonomy(rows, workspace_root, errors)
+        self._check_expected_output(rows, workspace_root, errors)
         self._check_required_sections(rows, workspace_root, errors)
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
@@ -3175,6 +3179,78 @@ class BacklogManager:
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
 
+    def _check_expected_output(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 28: the ``## Expected Output:`` declaration agrees with the Manifest.
+
+        ``commit`` (the default when the section is absent) is the pre-existing
+        lifecycle: git-ops commits, pushes, opens a PR, waits for CI, merges.
+        ``none`` declares a unit that modifies no source file -- a verification,
+        decision, or no-op unit that records its evidence in ``## Comments``.
+
+        The cross-check exists because the two failure directions are both
+        silent at authoring time and expensive at execution time:
+
+        - ``none`` alongside a real Manifest path means the unit intends to
+          change a file, so skipping the commit would discard that work.
+        - ``none`` alongside ``<source-drift-fix-targets-determined-at-execution>``
+          is contradictory: deferred resolution enumerates real paths via
+          manifest_amendment mid-execution, which is precisely a commit.
+
+        Only the no-output sentinels (``<verification-only>``,
+        ``<decision-only>``, ``<no changes>``, ``<no-op>`` and their per-task
+        ``<name:ID>`` variants) satisfy ``none``.
+
+        A Task whose Manifest cannot be parsed is skipped rather than crashing
+        validate(), matching the ``except ManifestParseError: continue``
+        pattern used by every other Manifest-consuming rule in this module.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        for row_id, row_status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            if row_status in _TERMINAL_CHILD_STATUSES:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            declared = self._extract_expected_output(content)
+            if declared is None:
+                continue
+            if declared not in VALID_EXPECTED_OUTPUTS:
+                allowed = ", ".join(sorted(VALID_EXPECTED_OUTPUTS))
+                errors.append(
+                    f"{row_id}: '## Expected Output: {declared}' is not a recognised value; "
+                    f"allowed values are: {allowed}."
+                )
+                continue
+            if declared != EXPECTED_OUTPUT_NONE:
+                continue
+            try:
+                manifest_files = [r.file for r in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            if is_no_output_manifest(manifest_files):
+                continue
+            offenders = ", ".join(repr(f) for f in manifest_files) or "(empty Manifest)"
+            errors.append(
+                f"{row_id}: declares '## Expected Output: none' but its Changes Manifest is not "
+                f"exclusively no-output sentinels (got {offenders}). A unit that produces no commit "
+                f"must declare only <verification-only>, <decision-only>, <no changes>, or <no-op>; "
+                f"any real path -- or <source-drift-fix-targets-determined-at-execution>, which "
+                f"resolves to real paths mid-execution -- will produce a commit, so declare "
+                f"'## Expected Output: commit' instead."
+            )
+
     def _check_task_type_taxonomy(
         self,
         rows: list[tuple[str, str, str]],
@@ -4102,6 +4178,21 @@ class BacklogManager:
         the taxonomy check.
         """
         m = TASK_TYPE_LINE_RE.search(content)
+        if not m:
+            return None
+        return m.group(2).strip().lower()
+
+    @staticmethod
+    def _extract_expected_output(content: str) -> str | None:
+        """Extract the declared ``## Expected Output:`` value from a work-unit body.
+
+        Returns the lowercased, whitespace-trimmed value, or ``None`` when the
+        section is absent. A ``None`` result resolves to
+        ``DEFAULT_EXPECTED_OUTPUT`` (``commit``) -- the pre-existing lifecycle --
+        so a backlog authored before this section existed is never
+        retroactively reinterpreted. Mirrors ``_extract_task_type``.
+        """
+        m = EXPECTED_OUTPUT_LINE_RE.search(content)
         if not m:
             return None
         return m.group(2).strip().lower()

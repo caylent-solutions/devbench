@@ -95,6 +95,8 @@ Note: use the output of `devbench get-diff` (the scope contract source) as the p
 27. Dockerfiles maintain non-root user, minimal images, no secrets baked in.
 
 ## TASK-TYPE INVARIANT DETECTION (FR-4.4)
+28a. Compare the work unit's declared `## Expected Output:` value against its Changes Manifest. When the unit declares `none`, every Manifest row MUST be a no-output sentinel (`<verification-only>`, `<decision-only>`, `<no changes>`, `<no-op>`, or a per-task `<name:ID>` variant) and the unit's diff MUST be empty -- `none` means git-ops completes it without a commit, so any real path or any actual diff content is work that would be silently discarded. REVIEW_FAIL naming the offending row or diff path. `<source-drift-fix-targets-determined-at-execution>` is NOT a no-output sentinel: it resolves to real paths mid-execution and therefore contradicts `none`. When the section is absent it defaults to `commit`; do not treat an absent declaration as `none`.
+
 28. Compare the work unit's declared `## Task Type:` value against the FR-4.1 manifest invariant it is bound to. REVIEW_FAIL when the declared type contradicts its own invariant -- for example, a `docs` task whose Changes Manifest (or actual diff) touches `src/` is a type contradiction: `docs` rows must be documentation/markdown only, never production source under `src/`.
 
 | Type | Manifest invariant |

@@ -395,9 +395,15 @@ class GitOpsService:
         if not concrete:
             raise RuntimeError(
                 "commit staging: the Changes Manifest contains no concrete file paths "
-                f"(got {manifest_files!r}); every entry is an execution-time sentinel, so there is no "
-                "pathspec to scope the commit by. Resolve the sentinel to real paths via a manifest "
-                "amendment before committing."
+                f"(got {manifest_files!r}), so there is no pathspec to scope the commit by. "
+                "Two different Manifests reach this point and they need opposite fixes. If every "
+                "entry is a no-output sentinel (<verification-only>, <decision-only>, <no changes>, "
+                "<no-op>), the unit produces no commit by design -- declare "
+                "'## Expected Output: none' in the work unit so git-ops completes it without "
+                "committing (validate-backlog rule 28, ADR-35). If the entry is "
+                "<source-drift-fix-targets-determined-at-execution>, the paths are meant to be "
+                "enumerated at execution time -- resolve it to real paths via a manifest amendment "
+                "before committing."
             )
         to_add = self._exclude_already_staged_deletions(repo_path, concrete)
         if not to_add:

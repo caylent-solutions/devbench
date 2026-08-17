@@ -230,6 +230,7 @@ from devbench.constants import (
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
+    EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_MAX_LENGTH,
     FAILURE_DIGEST_MIN_LENGTH,
     FAILURE_DIGEST_RE,
@@ -5446,6 +5447,12 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
     manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
     manifest_files = [r.file for r in manifest_rows]
+
+    # A unit declaring '## Expected Output: none' produces no commit; skip the
+    # whole commit/PR/CI/merge sequence rather than failing to stage nothing.
+    if _unit_expects_no_output(wu_file, manifest_files):
+        return _complete_no_output_unit(unit_id, wu_file, repo_path, manifest_files)
+
     assert_staged_matches_manifest(repo_path, manifest_files)
 
     ops.commit_local(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
@@ -6326,6 +6333,97 @@ def _refuse_unscoped_commit(unit_id: str, wu_file: Path | None) -> bool:
     return True
 
 
+def _unit_expects_no_output(wu_file: Path | None, manifest_files: list[str]) -> bool:
+    """Return ``True`` when this unit declares it produces no commit.
+
+    Requires BOTH the explicit ``## Expected Output: none`` declaration and a
+    Manifest of only no-output sentinels. Requiring both means a Manifest that
+    happens to be sentinel-only never silently changes a legacy unit's
+    lifecycle: a backlog authored before this section existed declares nothing,
+    resolves to the ``commit`` default, and keeps its current behaviour exactly.
+    validate-backlog rule 28 rejects any disagreement between the two at
+    authoring time.
+    """
+    if wu_file is None:
+        return False
+    from devbench.backlog.sentinels import is_no_output_manifest
+
+    declared = BacklogManager._extract_expected_output(wu_file.read_text(encoding="utf-8"))
+    return declared == EXPECTED_OUTPUT_NONE and is_no_output_manifest(manifest_files)
+
+
+def _git_ops_pre_commit_outcome(unit_id: str, unit: WorkUnit, wu_file: Path | None, repo_path: Path) -> int | None:
+    """Return an exit code when git-ops must stop before committing, else ``None``.
+
+    Collapses the three independent pre-commit outcomes into one decision so the
+    caller has a single early exit:
+
+    - orphan-pattern pollution in the target repo (emits a cleanup proposal)
+    - an unscopeable commit (no resolvable Changes Manifest)
+    - a unit declaring ``## Expected Output: none``, which completes with no
+      commit, push, PR, CI wait, or merge (rule 28, ADR-35)
+    """
+    from devbench.backlog.manifest import parse_manifest
+
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path) or _refuse_unscoped_commit(unit_id, wu_file):
+        return 1
+    assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
+    manifest_files = [r.file for r in parse_manifest(wu_file.read_text(encoding="utf-8"))]
+    if _unit_expects_no_output(wu_file, manifest_files):
+        return _complete_no_output_unit(unit_id, wu_file, repo_path, manifest_files)
+    return None
+
+
+def _complete_no_output_unit(unit_id: str, wu_file: Path | None, repo_path: Path, manifest_files: list[str]) -> int:
+    """Complete a ``## Expected Output: none`` unit without a commit (ADR-35).
+
+    A verification / decision / no-op unit declares that it modifies no source
+    file and records its evidence in ``## Comments``. There is nothing to stage,
+    so commit, push, PR, CI and merge are all skipped and the unit completes.
+
+    One refusal guards the dangerous direction: if anything is already STAGED,
+    the unit contradicts its own declaration and completing would silently
+    discard real work, so this returns 1 loudly instead. The check is on the
+    staged set rather than a clean working tree on purpose -- tooling that
+    rewrites a lockfile on any invocation (``uv run`` rewriting ``uv.lock``, for
+    example) leaves unstaged drift that is a pre-existing repository condition,
+    not this unit's output, and must not block it.
+
+    The working-tree state is recorded in the audit comment either way, so the
+    path taken is always observable rather than silent.
+    """
+    _, staged_out, _ = run_command(["git", "diff", "--cached", "--name-only"], cwd=repo_path)
+    if staged_out.strip():
+        staged_list = ", ".join(staged_out.split())
+        print(
+            f"ERROR: {unit_id} declares '## Expected Output: none' but has staged changes "
+            f"({staged_list}). Completing it without a commit would discard them. Either unstage "
+            f"them, or declare '## Expected Output: commit' and list the paths in the Changes "
+            f"Manifest.",
+            file=sys.stderr,
+        )
+        return 1
+
+    _, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_path)
+    tree_state = "dirty" if status_out.strip() else "clean"
+    declared = ", ".join(manifest_files) or "(empty)"
+    logger.info(
+        "[GIT_OPS_NO_OUTPUT] %s completed without a commit; Manifest declares %s; working tree %s",
+        unit_id,
+        declared,
+        tree_state,
+    )
+    if wu_file is not None:
+        BacklogManager()._append_agent_comment(
+            wu_file,
+            "git_ops",
+            f"[GIT_OPS_NO_OUTPUT] completed without a commit, push, PR, or merge; "
+            f"Manifest declares {declared}; working tree {tree_state}; "
+            f"evidence recorded in ## Comments.",
+        )
+    return 0
+
+
 def cmd_git_ops(unit_id: str) -> int:
     """Run the full git operations sequence for a completed work unit.
 
@@ -6368,17 +6466,18 @@ def cmd_git_ops(unit_id: str) -> int:
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
 
-    # Two pre-commit refusals: orphan-pattern pollution (see _git_ops_deferred
-    # for rationale, auto-emits a cleanup proposal) and an unscopeable commit.
-    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path) or _refuse_unscoped_commit(unit_id, wu_file):
-        return 1
+    # Every reason git-ops stops before committing, resolved in one place: orphan-pattern
+    # pollution (see _git_ops_deferred for rationale, auto-emits a cleanup proposal), an
+    # unscopeable commit, and a unit that declares it produces no commit at all.
+    pre_commit_rc = _git_ops_pre_commit_outcome(unit_id, unit, wu_file, repo_path)
+    if pre_commit_rc is not None:
+        return pre_commit_rc
 
     # Manifest-scope check: every staged path must be in the work unit's Changes
     # Manifest. Catches scope-violation pollution deterministically before the
     # commit, and supplies the pathspec that scopes the commit itself.
-    assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
-    manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-    manifest_files = [r.file for r in manifest_rows]
+    assert wu_file is not None  # narrowed by _git_ops_pre_commit_outcome above
+    manifest_files = [r.file for r in parse_manifest(wu_file.read_text(encoding="utf-8"))]
     assert_staged_matches_manifest(repo_path, manifest_files)
 
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)

@@ -70,3 +70,48 @@ def is_sentinel_manifest_value(path: str) -> bool:
     if stripped in BACKLOG_SENTINEL_VALUES:
         return True
     return bool(SENTINEL_PATTERN.fullmatch(stripped))
+
+
+# The subset of sentinels meaning "this unit will never produce a commit".
+# Distinct from <source-drift-fix-targets-determined-at-execution>, whose
+# concrete paths ARE enumerated mid-execution via manifest_amendment. See
+# docs/backlog-contract.md, "Accepted sentinel values".
+NO_OUTPUT_SENTINEL_VALUES: frozenset[str] = frozenset(
+    {
+        "<verification-only>",
+        "<decision-only>",
+        "<no changes>",
+        "<no-op>",
+    }
+)
+
+
+def is_no_output_sentinel(value: str) -> bool:
+    """Return ``True`` when *value* declares a unit that modifies no source file.
+
+    Accepts the per-task variant form documented alongside ``SENTINEL_PATTERN``
+    (``<verification-only:E15-F5-S1-T2>``) by matching on the portion before
+    the colon, so operators get the same treatment without registering each
+    variant here.
+    """
+    if not value:
+        return False
+    stripped = value.strip().strip("`").strip()
+    if stripped in NO_OUTPUT_SENTINEL_VALUES:
+        return True
+    if SENTINEL_PATTERN.match(stripped) and ":" in stripped:
+        return f"{stripped.split(':', 1)[0]}>" in NO_OUTPUT_SENTINEL_VALUES
+    return False
+
+
+def is_no_output_manifest(values: list[str]) -> bool:
+    """Return ``True`` when every Manifest entry is a no-output sentinel.
+
+    Used by the git-ops path to complete a verification/decision unit without
+    a commit or PR. Returns ``False`` for an empty Manifest: that is an
+    unscopeable commit, which is a separate and deliberate refusal.
+    """
+    populated = [v for v in values if v and v.strip()]
+    if not populated:
+        return False
+    return all(is_no_output_sentinel(v) for v in populated)

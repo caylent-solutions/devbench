@@ -31,6 +31,7 @@ actionable message.
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from devbench.constants import (
@@ -111,6 +112,21 @@ def _resolve_session_log_file() -> Path | None:
     return Path(workspace) / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME
 
 
+def build_log_formatter() -> logging.Formatter:
+    """Return the shared formatter, stamping real UTC.
+
+    ``LOG_DATE_FORMAT`` ends in a literal ``Z``. ``logging.Formatter`` formats
+    times with ``time.localtime`` by default, so without this converter every
+    line advertises UTC while carrying local wall-clock. Consumers that parse
+    the ``Z`` honestly -- notably the report liveness banner, which diffs the
+    stamp against ``datetime.now(UTC)`` -- then read the local/UTC offset as
+    idle time (4h in America/New_York) for a fully busy orchestrator.
+    """
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    formatter.converter = time.gmtime
+    return formatter
+
+
 def setup_logging(level: int | None = None) -> Path:
     """Configure logging with stdout and file handlers.
 
@@ -154,7 +170,7 @@ def setup_logging(level: int | None = None) -> Path:
     # Clear any existing handlers (prevents duplicates on re-import)
     root_logger.handlers.clear()
 
-    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    formatter = build_log_formatter()
 
     # Stderr handler -- real-time visibility in Claude Code terminal without
     # polluting stdout for commands that emit data (report, get-diff, status).

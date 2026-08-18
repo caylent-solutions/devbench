@@ -28,7 +28,7 @@ import logging
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -1395,6 +1395,35 @@ DRAFT_TEMPLATE: str = """\
 """
 
 
+def manifest_change_verb(repo: str, path: str) -> str:
+    """Return the Changes Manifest change verb for *path* in *repo*.
+
+    Derived from the target repository itself rather than declared by the
+    proposer: a path that already exists in the checkout is a ``modify``, a
+    path that does not is an ``add``. That keeps the factory backlog- and
+    application-agnostic -- it needs no knowledge of any particular repo
+    layout, language, or naming convention.
+
+    ``delete`` is never inferred. A proposer that means to delete a file says
+    so through the amendment workflow, where the intent is explicit; guessing
+    it from absence would turn every not-yet-created file into a deletion.
+
+    Falls back to ``modify`` when the repository has no resolvable local
+    checkout, because with no evidence either way ``modify`` is the verb that
+    asserts the least: it claims the file is expected to exist, which
+    validate-backlog and the review judges then check against reality.
+    """
+    from devbench.config import REPO_LOCAL_PATHS
+
+    repo_path = REPO_LOCAL_PATHS.get(repo)
+    if repo_path is None:
+        return "modify"
+    try:
+        return "modify" if (repo_path / path).exists() else "add"
+    except OSError:
+        return "modify"
+
+
 def generate_draft_md(
     proposed: ProposedTask,
     *,
@@ -1415,9 +1444,12 @@ def generate_draft_md(
         else "- [ ] AC-TODO-001 human must author AC"
     )
     manifest_lines = (
-        "\n".join(f"| `{path}` | TODO -- describe change |" for path in proposed.files_to_own)
+        "\n".join(f"| `{path}` | {manifest_change_verb(repo, path)} |" for path in proposed.files_to_own)
         if proposed.files_to_own
-        else "| `TODO` | TODO -- describe change |"
+        # No known file set yet: use the documented deferred-resolution
+        # sentinel so the row is a valid Manifest entry the amendment workflow
+        # can concretise, rather than a file literally named "TODO".
+        else "| `<source-drift-fix-targets-determined-at-execution>` | modify |"
     )
     return DRAFT_TEMPLATE.format(
         task_id=proposed.suggested_id,
@@ -2176,6 +2208,29 @@ def add_dep(
         raise ProposalError(
             f"add-dep: blocker task '{blocker_task_id}' is already terminal "
             f"(status={blocker_unit.status.value}); wiring a dep on a terminal task is a no-op."
+        )
+
+    # Acyclicity: refuse an edge that would close a cycle. Two callers reach
+    # here without knowing the rest of the graph -- the task factory wiring a
+    # promoted child as a dependency of the parent that proposed it, and an
+    # operator following the Manifest Conflict Rule remedy, which prints one
+    # add-dep per conflicting pair without checking whether the reverse edge
+    # already exists. Left unguarded, either writes a cycle that only surfaces
+    # much later as a validate-backlog error with nothing in the work-unit file
+    # naming the edge responsible. Reuses the same detector `devbench next`
+    # runs rather than introducing a second cycle implementation.
+    from devbench.cli import _detect_units_dependency_cycle
+
+    probe = [
+        replace(u, dependencies=[*u.dependencies, blocker_task_id]) if u.id == blocked_task_id else u for u in units
+    ]
+    chain = _detect_units_dependency_cycle(probe)
+    if chain:
+        raise ProposalError(
+            f"add-dep: wiring '{blocked_task_id}' to depend on '{blocker_task_id}' would create a "
+            f"dependency cycle: {chain}. Wire the edge in the other direction, or break the existing "
+            f"path first. See docs/backlog-contract.md 'Manifest Conflict Rule' for how to order a "
+            f"conflicting set without closing a loop."
         )
 
     wrote_row = False

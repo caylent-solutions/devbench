@@ -738,12 +738,13 @@ class PreFilter:
     ) -> None:
         """Run every check in a fixed order. Raise ``AmendmentError`` on the first failure.
 
-        ``staged_files`` is the set of file paths the executor has staged in
-        git against the base branch; pass ``None`` to skip the in-diff check
-        (for contexts where git access is unavailable, such as unit tests of
-        earlier checks). ``changed_files`` is the union of staged, unstaged, and
-        untracked paths used to prove a removal candidate really has no changes;
-        pass ``None`` to skip that check on the same terms.
+        ``changed_files`` is the union of staged, unstaged, and untracked
+        paths. It proves both that an added path really was modified and that a
+        removal candidate really has no changes; pass ``None`` to skip both
+        checks (for contexts where git access is unavailable, such as unit
+        tests of earlier checks). ``staged_files`` is accepted for backward
+        compatibility and no longer gates additions -- staging is precisely what
+        the executor cannot do for a path the Manifest does not yet declare.
         ``prior_applied_count`` is the number of amendments
         already applied to this task in the current executor run.
         """
@@ -754,9 +755,8 @@ class PreFilter:
         self.check_linked_acs_exist(request, unit)
         self.check_files_not_already_in_manifest(request, unit)
         self.check_files_to_remove_are_declared(request, unit)
-        if staged_files is not None:
-            self.check_files_in_staged_diff(request, staged_files)
         if changed_files is not None:
+            self.check_files_in_changed_set(request, changed_files)
             self.check_files_to_remove_have_no_diff(request, changed_files)
 
     def check_enabled(self) -> None:
@@ -830,13 +830,28 @@ class PreFilter:
         if duplicates:
             raise AmendmentError(f"Amendment lists file(s) already declared in Changes Manifest: {duplicates}")
 
-    def check_files_in_staged_diff(self, request: AmendmentRequest, staged_files: frozenset[str]) -> None:
-        """Every path in ``files_to_add`` must appear in the provided staged-diff file set."""
-        missing = [f.path for f in request.files_to_add if f.path not in staged_files]
+    def check_files_in_changed_set(self, request: AmendmentRequest, changed_files: frozenset[str]) -> None:
+        """Every path in ``files_to_add`` must have a real change somewhere in the worktree.
+
+        Tests against the CHANGED set (staged + unstaged + untracked) rather
+        than the staged set alone, because staging is exactly what the executor
+        cannot do for these paths. ``guard-git-stage.sh`` rejects ``git add``
+        for any path absent from the Changes Manifest and directs the executor
+        to request an amendment; requiring the path to be staged first made the
+        two controls mutually blocking, so a file that needed an amendment
+        could never be staged and could never be amended. The executor's only
+        escapes were bypassing a guard hook, which the no-hook-bypass rule
+        forbids, or blocking the work unit.
+
+        The anti-fabrication intent is unchanged: a path with no diff anywhere
+        in the worktree is still rejected, so the executor cannot amend in a
+        file it has not actually touched.
+        """
+        missing = [f.path for f in request.files_to_add if f.path not in changed_files]
         if missing:
             raise AmendmentError(
-                f"Amendment lists file(s) not in the staged diff: {missing}. "
-                "Executor cannot request amendment for files it hasn't staged."
+                f"Amendment lists file(s) that the worktree has not been modified to contain: {missing}. "
+                "Executor cannot request amendment for files it hasn't changed."
             )
 
     def check_files_to_remove_are_declared(self, request: AmendmentRequest, unit: WorkUnit) -> None:

@@ -6469,12 +6469,21 @@ class TestCheckDepCyclesUnionOfChannels:
         errors = BacklogManager().validate(index, tmp_path)
         assert any("dependency cycle detected" in e for e in errors), errors
 
-    def test_add_dep_x2_makes_validate_report_cycle(self, tmp_path: Path) -> None:
-        """AC-3: `add_dep(T1,T4)` then `add_dep(T4,T1)` makes `validate()`
-        report a cycle end-to-end, because the union reads the
-        `## Dependencies` tables and markers that `add_dep` writes.
+    def test_add_dep_refuses_the_edge_that_would_close_a_cycle(self, tmp_path: Path) -> None:
+        """AC-3: `add_dep(T1,T4)` then `add_dep(T4,T1)` is refused at write time.
+
+        This pair used to be written without complaint, and the resulting cycle
+        surfaced only on the next `validate()` sweep -- by which point nothing
+        in either work-unit file named the edge responsible. `add_dep` now runs
+        the same cycle detector `devbench next` uses against the prospective
+        graph and refuses, naming the chain, while the caller still has the
+        context to pick the other direction.
+
+        `validate()`'s own union-of-channels cycle detection is unchanged and
+        stays covered by the sibling tests in this class, which build the cycle
+        directly in the work-unit files rather than through `add_dep`.
         """
-        from devbench.backlog.proposal import add_dep
+        from devbench.backlog.proposal import ProposalError, add_dep
 
         t1 = _unit_body("E0-F1-S1-T1", "in-queue")
         t4 = _unit_body("E0-F1-S1-T4", "in-queue")
@@ -6489,14 +6498,16 @@ class TestCheckDepCyclesUnionOfChannels:
             blocked_task_id="E0-F1-S1-T1",
             blocker_task_id="E0-F1-S1-T4",
         )
-        add_dep(
-            backlog_root=tmp_path / "backlog",
-            backlog_index=index,
-            blocked_task_id="E0-F1-S1-T4",
-            blocker_task_id="E0-F1-S1-T1",
-        )
+        with pytest.raises(ProposalError, match="cycle"):
+            add_dep(
+                backlog_root=tmp_path / "backlog",
+                backlog_index=index,
+                blocked_task_id="E0-F1-S1-T4",
+                blocker_task_id="E0-F1-S1-T1",
+            )
+        # And the refusal left the graph acyclic rather than half-written.
         errors = BacklogManager().validate(index, tmp_path)
-        assert any("dependency cycle detected" in e for e in errors), errors
+        assert not any("dependency cycle detected" in e for e in errors), errors
 
     def test_terminal_unit_stale_marker_not_a_cycle(self, tmp_path: Path) -> None:
         """AC-4: a done/declined task's stale marker contributes no edge, so

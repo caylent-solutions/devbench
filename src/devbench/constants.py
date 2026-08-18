@@ -420,6 +420,61 @@ EXPECTED_OUTPUT_SECTION_PREFIX: str = "## Expected Output:"
 EXPECTED_OUTPUT_LINE_RE = re.compile(r"^(##\s*Expected Output:\s*)(.+)$", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
+# Orphan-path patterns: build/state artifacts that no production workflow
+# commits. fnmatch-style globs matched against POSIX-relative repo paths;
+# ``**/`` matches both repo-root and nested locations.
+#
+# Dependency LOCK files are deliberately absent. A lock file pins resolved
+# dependency versions and belongs in version control -- devbench treats
+# uv.lock, package-lock.json, poetry.lock, Cargo.lock and go.sum as ordinary
+# tracked files, and .terraform.lock.hcl is the same category. Listing one
+# here makes git-ops ``git rm --cached`` it as a build artifact, which is a
+# reproducibility regression, not cleanup.
+#
+# Override per workspace with ``git_ops.orphan_patterns`` in devbench.yaml, or
+# ``DEVBENCH_ORPHAN_IGNORE_PATTERNS`` (comma-separated) in the environment.
+# Either replaces this list wholesale.
+# ---------------------------------------------------------------------------
+DEFAULT_ORPHAN_PATTERNS: tuple[str, ...] = (
+    # Terraform state and module cache. ``**/`` prefix matches both
+    # repo-root and nested locations.
+    "**/*.tfstate",
+    "**/*.tfstate.backup",
+    "**/*.tfstate.lock.info",
+    "**/.terraform/**",
+    "**/.terragrunt-cache/**",
+    # Python build / test caches
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    # Coverage. ``**/.coverage*`` (no separator) is the catch-all that
+    # covers ``.coverage``, ``.coverage.<ext>``, and the stray
+    # ``.coverage (1)`` form pytest-cov writes when the canonical file
+    # is locked. The narrower variants below stay for documentation but
+    # are subsumed by the catch-all on this line.
+    "**/.coverage*",
+    "**/htmlcov/**",
+    # Ansible: ansible-playbook writes a .retry file listing failed hosts.
+    "**/*.retry",
+    # Helm: `helm dependency update` vendors dependency charts as archives
+    # under a chart's charts/ directory. Chart.lock pins their versions and
+    # IS committed, so only the archives are listed here.
+    "**/charts/*.tgz",
+    # Terraform binary plan output (`terraform plan -out`).
+    "**/*.tfplan",
+    # Python virtualenv and build metadata
+    "**/.venv/**",
+    "**/*.egg-info/**",
+    # Node
+    "**/node_modules/**",
+    # macOS
+    "**/.DS_Store",
+)
+
+# ---------------------------------------------------------------------------
 # Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------

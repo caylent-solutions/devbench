@@ -217,6 +217,14 @@ Ask the operator:
 >                         Use only when target repos are git submodules. [true/false, default: false]
 >   inline_orphan_cleanup -- Run orphan-path cleanup as a chore commit before the task commit.
 >                            [true/false, default: true]
+>   orphan_patterns    -- fnmatch globs identifying build/state artifacts to untrack.
+>                         REPLACES the built-in list wholesale when non-empty (the env var
+>                         DEVBENCH_ORPHAN_IGNORE_PATTERNS wins over it), so a workspace that
+>                         sets it owns the complete set and a devbench upgrade cannot
+>                         reintroduce a pattern it removed on purpose. Dependency LOCK files
+>                         (uv.lock, package-lock.json, .terraform.lock.hcl, Chart.lock) are
+>                         deliberately absent from the built-in list -- they pin versions and
+>                         belong in git. [list of globs, default: [] = built-in list]
 >   ci_failure_retry   -- Return rc=2 on CI failure to trigger an executor retry. [true/false, default: true]
 >   local_only         -- Target repos have no origin remote; never push or create PRs.
 >                         Requires defer_pr: true. [true/false, default: false]"

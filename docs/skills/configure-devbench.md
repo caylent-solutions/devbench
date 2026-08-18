@@ -102,7 +102,7 @@ The skill walks through 17 sections, validating each before moving to the next:
 5. **limits section** -- threshold and limit values.
 6. **agents section** -- per-agent model overrides (executor, judges, workflow agents).
 7. **git_ops section** -- `single_branch`, `defer_pr`, `auto_finalize`, `auto_merge`,
-   `pause_before_merge`, `update_submodule`, `inline_orphan_cleanup`,
+   `pause_before_merge`, `update_submodule`, `inline_orphan_cleanup`, `orphan_patterns`,
    `ci_failure_retry`, `local_only`.
 8. **task_factory section** -- `enabled`, `auto_accept_proposals`.
 9. **manifest_amendment section** -- `enabled`, `allowed_reasons`,

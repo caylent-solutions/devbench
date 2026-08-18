@@ -259,19 +259,19 @@ class TestCheckFilesNotAlreadyInManifest:
 
 
 # ---------------------------------------------------------------------------
-# check_files_in_staged_diff
+# check_files_in_changed_set
 # ---------------------------------------------------------------------------
 
 
-class TestCheckFilesInStagedDiff:
+class TestCheckFilesInChangedSet:
     def test_all_files_present_passes(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
-        pf.check_files_in_staged_diff(_make_request(), frozenset({"src/example/parser.py"}))
+        pf.check_files_in_changed_set(_make_request(), frozenset({"src/example/parser.py"}))
 
     def test_missing_file_rejects(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
-        with pytest.raises(AmendmentError, match="not in the staged diff"):
-            pf.check_files_in_staged_diff(_make_request(), frozenset({"other/file.py"}))
+        with pytest.raises(AmendmentError, match="has not been modified"):
+            pf.check_files_in_changed_set(_make_request(), frozenset({"other/file.py"}))
 
 
 # ---------------------------------------------------------------------------
@@ -413,3 +413,48 @@ class TestCheckFilesToRemoveHaveNoDiff:
         pf = PreFilter(tmp_backlog, _default_config())
         request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
         pf.run_all(request, staged_files=frozenset(), changed_files=frozenset())
+
+
+# ---------------------------------------------------------------------------
+# Amendment / staging deadlock (guard-git-stage.sh <-> check_files_in_staged_diff)
+# ---------------------------------------------------------------------------
+
+
+class TestUnstagedFileCanBeAmended:
+    """An amendment must be requestable for a file the guard refuses to stage.
+
+    Two harness controls formed a circular precondition:
+
+    1. ``guard-git-stage.sh`` rejects ``git add`` for any path absent from the
+       Changes Manifest, naming ``devbench request-amendment`` as the remedy.
+    2. ``check_files_in_staged_diff`` rejected any amendment whose files were
+       not ALREADY staged.
+
+    Each required the other's postcondition as its own precondition, so a file
+    that needed a Manifest amendment could never be staged and could never be
+    amended. The executor's only escapes were bypassing a guard hook (forbidden)
+    or blocking. Widening the check to ``changed_files`` -- the union of staged,
+    unstaged and untracked, which the caller already computes and passes --
+    breaks the cycle while preserving the intent: the executor still cannot
+    request an amendment for a file it has not actually touched.
+    """
+
+    def test_unstaged_but_modified_file_passes(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        # Modified in the working tree, unstaged because the guard blocked `git add`.
+        pf.check_files_in_changed_set(_make_request(), frozenset({"src/example/parser.py"}))
+
+    def test_untouched_file_still_rejects(self, tmp_backlog: Path) -> None:
+        """The anti-fabrication intent survives: no diff anywhere means no amendment."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        with pytest.raises(AmendmentError, match="has not been modified"):
+            pf.check_files_in_changed_set(_make_request(), frozenset({"other/file.py"}))
+
+    def test_run_all_accepts_an_unstaged_change(self, tmp_backlog: Path) -> None:
+        """End to end: the deadlock case now clears the pre-filter."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        pf.run_all(
+            _make_request(),
+            staged_files=frozenset(),  # guard refused to stage it
+            changed_files=frozenset({"src/example/parser.py"}),
+        )

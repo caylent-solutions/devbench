@@ -134,6 +134,10 @@ git_ops:
   # Operator override of the built-in orphan-pattern fnmatch list. Empty =
   # use the built-in list (terraform state, terragrunt cache, Python
   # pycache, coverage, etc.). Non-empty REPLACES the built-in entirely.
+  # Dependency LOCK files (uv.lock, package-lock.json, .terraform.lock.hcl)
+  # are deliberately NOT in the built-in list: they pin resolved versions and
+  # belong in version control, so untracking them is a reproducibility
+  # regression rather than cleanup.
   orphan_patterns: []
   # When true, the orchestrate skill automatically invokes
   # `devbench git-ops-finalize <repo>` once all work units for the repo

@@ -31,37 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-# fnmatch-style patterns matched against POSIX-relative repo paths.
-# Patterns are intentionally specific: they cover known build/state
-# artifacts that no production workflow legitimately commits.
-_DEFAULT_ORPHAN_PATTERNS: tuple[str, ...] = (
-    # Terraform state and module cache. ``**/`` prefix matches both
-    # repo-root and nested locations.
-    "**/*.tfstate",
-    "**/*.tfstate.backup",
-    "**/*.tfstate.lock.info",
-    "**/.terraform/**",
-    "**/.terraform.lock.hcl",
-    "**/.terragrunt-cache/**",
-    # Python build / test caches
-    "**/__pycache__/**",
-    "**/*.pyc",
-    "**/*.pyo",
-    "**/.pytest_cache/**",
-    "**/.mypy_cache/**",
-    "**/.ruff_cache/**",
-    # Coverage. ``**/.coverage*`` (no separator) is the catch-all that
-    # covers ``.coverage``, ``.coverage.<ext>``, and the stray
-    # ``.coverage (1)`` form pytest-cov writes when the canonical file
-    # is locked. The narrower variants below stay for documentation but
-    # are subsumed by the catch-all on this line.
-    "**/.coverage*",
-    "**/htmlcov/**",
-    # Node
-    "**/node_modules/**",
-    # macOS
-    "**/.DS_Store",
-)
+from devbench.constants import DEFAULT_ORPHAN_PATTERNS
 
 # Canonical ``.gitignore`` lines written under the devbench-managed
 # header. One canonical form per pattern category, so future commits
@@ -72,7 +42,6 @@ _DEFAULT_GITIGNORE_ENTRIES: tuple[str, ...] = (
     "*.tfstate.backup",
     "*.tfstate.lock.info",
     ".terraform/",
-    ".terraform.lock.hcl",
     ".terragrunt-cache/",
     "",
     "# Python build / test caches",
@@ -91,6 +60,15 @@ _DEFAULT_GITIGNORE_ENTRIES: tuple[str, ...] = (
     "# in the same directory match.",
     ".coverage*",
     "htmlcov/",
+    "",
+    "# Ansible / Helm / Terraform build artifacts",
+    "*.retry",
+    "charts/*.tgz",
+    "*.tfplan",
+    "",
+    "# Python virtualenv and build metadata",
+    ".venv/",
+    "*.egg-info/",
     "",
     "# Node",
     "node_modules/",
@@ -114,16 +92,35 @@ class OrphanReport:
     dry_run: bool
 
 
-def configured_patterns() -> tuple[str, ...]:
-    """Return the active orphan patterns, honoring the override env var.
+def _yaml_orphan_patterns() -> tuple[str, ...] | None:
+    """Return ``git_ops.orphan_patterns`` from devbench.yaml, or ``None``.
 
-    ``DEVBENCH_ORPHAN_IGNORE_PATTERNS`` is a comma-separated list; an
-    empty / unset value yields :data:`_DEFAULT_ORPHAN_PATTERNS`.
+    Imported lazily so a workspace that never sets the key -- and any caller
+    that has no runtime config loaded at all -- pays no import cost.
+    """
+    try:
+        from devbench.config import RUNTIME_CONFIG
+    except Exception:
+        return None
+    patterns = getattr(getattr(RUNTIME_CONFIG, "git_ops", None), "orphan_patterns", None)
+    if not patterns:
+        return None
+    return tuple(str(p).strip() for p in patterns if str(p).strip())
+
+
+def configured_patterns() -> tuple[str, ...]:
+    """Return the active orphan patterns: env > devbench.yaml > default.
+
+    ``DEVBENCH_ORPHAN_IGNORE_PATTERNS`` is a comma-separated list.
+    ``git_ops.orphan_patterns`` in devbench.yaml is a YAML list. Either
+    REPLACES :data:`DEFAULT_ORPHAN_PATTERNS` wholesale rather than extending
+    it, so a workspace declaring the key owns the complete set and a devbench
+    upgrade can never silently reintroduce a pattern it removed on purpose.
     """
     override = os.environ.get("DEVBENCH_ORPHAN_IGNORE_PATTERNS", "").strip()
-    if not override:
-        return _DEFAULT_ORPHAN_PATTERNS
-    return tuple(p.strip() for p in override.split(",") if p.strip())
+    if override:
+        return tuple(p.strip() for p in override.split(",") if p.strip())
+    return _yaml_orphan_patterns() or DEFAULT_ORPHAN_PATTERNS
 
 
 def _pattern_to_regex(pattern: str) -> str:

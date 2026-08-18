@@ -2676,7 +2676,11 @@ class BacklogManager:
 
     @classmethod
     def _is_test_source_path(cls, path: str) -> bool:
-        """Return True if the path is a Python file located under a ``tests/`` dir.
+        """Return True if the path is a Python test file.
+
+        Recognised two ways: a ``tests/`` directory segment, or pytest's default
+        discovery convention (``test_*.py`` / ``*_test.py``) for repositories
+        that colocate tests beside the code they exercise.
 
         This is the single shared authority for "is this path a Python test
         file" used both by ``_is_production_source`` (Rule 14, source-test
@@ -2687,7 +2691,17 @@ class BacklogManager:
         """
         if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
-        return path.startswith("tests/") or "/tests/" in path
+        if path.startswith("tests/") or "/tests/" in path:
+            return True
+        # pytest's default discovery convention (``python_files = test_*.py
+        # *_test.py``). A repository that colocates tests beside the code they
+        # exercise has no ``tests/`` segment to key on, and treating those files
+        # as production source makes Rule 14 demand a test for the test --
+        # ``test_render.py`` requiring ``test_test_render.py`` -- which is
+        # unsatisfiable by construction.
+        basename = path.rsplit("/", 1)[-1]
+        stem = basename.rsplit(".", 1)[0]
+        return basename.startswith("test_") or stem.endswith("_test")
 
     @classmethod
     def _is_production_source(cls, path: str) -> bool:

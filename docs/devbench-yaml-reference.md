@@ -176,6 +176,9 @@ git_ops:
   auto_finalize: false          # auto-run git-ops-finalize when all WUs terminal
   auto_merge: false             # auto-merge after CI green (requires auto_finalize + defer_pr)
   orphan_patterns: []           # replaces built-in orphan fnmatch list when non-empty
+                                # built-in list covers terraform state/plan, terragrunt
+                                # cache, python caches/venv/egg-info, ansible *.retry, helm
+                                # charts/*.tgz, node_modules, .DS_Store. LOCK FILES ARE EXCLUDED.
   pr_review_resolution:
     enabled: false
     agents: []

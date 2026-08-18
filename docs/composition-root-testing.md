@@ -131,7 +131,7 @@ test infrastructure.
   render with hand-supplied props/mocked store/DI container, and emits
   the structured rejection code `test_review:COMPOSITION_ROOT_MISSING`
   (see `docs/review-feedback-vocabulary.md`).
-- `spec-to-backlog` (Step 1b item 13 and Step 5b item 13) requires the
+- `spec-to-backlog` (Step 1b item 13 and Step 5b item 15) requires the
   generated task's `## Definition of Done` to include an explicit
   composition-root item whenever the task's Changes Manifest adds or
   modifies a state-consuming UI component, so `test-reviewer` is

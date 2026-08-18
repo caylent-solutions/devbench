@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_REVIEWER_PATH = REPO_ROOT / "plugin" / "devbench-orchestrate" / "agents" / "review_team" / "test-reviewer.md"
 CODE_REVIEWER_PATH = REPO_ROOT / "plugin" / "devbench-orchestrate" / "agents" / "review_team" / "code-reviewer.md"
 SKILL_PATH = REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / "spec-to-backlog" / "SKILL.md"
+COMPOSITION_ROOT_DOC_PATH = REPO_ROOT / "docs" / "composition-root-testing.md"
 
 _ITEM_RE = re.compile(r"^(\d+)\.\s")
 _HEADING_RE = re.compile(r"^(#{2,3})\s+(.*)$")
@@ -149,6 +150,31 @@ def _section_text(text: str, heading_substring: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _resolve_item_number_by_content(section_text: str, content_substring: str) -> int:
+    """Return the item number of the top-level rubric line in `section_text`
+    whose text contains `content_substring`. Reuses `extract_rubric_items`
+    (no second rubric parser is introduced here) to locate every top-level
+    item, then matches on line content. Raises `AssertionError` naming the
+    substring if no matching item is found."""
+    groups = extract_rubric_items(section_text, reset_per_heading=False)
+    lines = section_text.splitlines()
+    for items in groups.values():
+        for item in items:
+            if content_substring in lines[item.line_no - 1]:
+                return item.number
+    raise AssertionError(f"no top-level rubric item containing {content_substring!r} found in the given section text")
+
+
+def assert_doc_cites_rubric_item(doc_text: str, *, citation_prefix: str, item_number: int) -> None:
+    """Assert `doc_text` contains the literal citation
+    `'<citation_prefix> item <item_number>'`. Raises `AssertionError` naming
+    the expected citation and the doc text searched otherwise -- used both
+    by the live cross-file pin and its seeded negative control."""
+    expected_citation = f"{citation_prefix} item {item_number}"
+    if expected_citation not in doc_text:
+        raise AssertionError(f"expected citation {expected_citation!r} not found in doc text: {doc_text!r}")
+
+
 @pytest.mark.unit
 class TestRubricNumberingIsSound:
     """AC-E2-F7-S1-T1-1 / AC-E2-F7-S1-T1-2 (spec 4.11; AC-12): the shipped
@@ -268,3 +294,30 @@ class TestExtractorDetectsSeededViolations:
         groups = extract_rubric_items(synthetic, reset_per_heading=True)
         assert_numbering_sound(groups, file_label="synthetic.md")
         assert len(groups) == 2
+
+
+@pytest.mark.unit
+class TestCrossFileDocCitationStaysInSync:
+    """AC-E2-F7-S1-T3-1 / AC-E2-F7-S1-T3-3 / AC-E2-F7-S1-T3-4 (AC-E2-F7-S1-T1-6):
+    `docs/composition-root-testing.md` cites the Step 5b composition-root
+    rubric item by its real, run-time-resolved position in `SKILL.md`
+    rather than a hard-coded number, so a future renumbering that forgets
+    this doc fails loudly naming the expected citation and the stale text."""
+
+    def test_doc_cites_the_resolved_step_5b_item_number(self) -> None:
+        skill_text = SKILL_PATH.read_text(encoding="utf-8")
+        section_text = _section_text(skill_text, "5b -- Self-critique at per-Task granularity")
+        expected_number = _resolve_item_number_by_content(
+            section_text, "Composition-root DoD item present when required"
+        )
+        doc_text = COMPOSITION_ROOT_DOC_PATH.read_text(encoding="utf-8")
+        assert_doc_cites_rubric_item(doc_text, citation_prefix="Step 5b", item_number=expected_number)
+
+    def test_seeded_wrong_citation_fails_the_shared_assertion(self) -> None:
+        """Seeded negative control (Approach step 2): a synthetic doc string
+        carrying a deliberately wrong item number must raise, proving the
+        pin cannot pass by construction if the doc were emptied, renamed, or
+        the sentence deleted."""
+        synthetic_doc = "`spec-to-backlog` (Step 1b item 13 and Step 5b item 13) requires the ..."
+        with pytest.raises(AssertionError, match=r"expected citation 'Step 5b item 15' not found"):
+            assert_doc_cites_rubric_item(synthetic_doc, citation_prefix="Step 5b", item_number=15)

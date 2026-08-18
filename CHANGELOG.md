@@ -855,6 +855,52 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   five required columns. JSON config surfaces such as
   `src/devbench/config-schema.json` are outside the walked six pairs.
 
+- **`configure-devbench` rewritten as a full-config, every-invocation
+  interview with a schema-coverage pin** (spec
+  `integration-reality-gates-hardening.md` section 4.15, D-16, G12; AC-28,
+  AC-29; AC-E2-F8-S1-T1-1 through -6).
+  `plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`
+  now interviews the operator about EVERY setting in
+  `src/devbench/config-schema.json` -- 130 static leaf settings, plus the
+  dynamic per-entry maps collected through bounded free-text loops, across
+  21 steps, each with its own recommended value marked as such, every alternative,
+  and a free-form entry path, plus a full explanation of the setting and the
+  consequence of each choice. The interview runs in full on every
+  invocation; prior values are shown as the current value but never
+  silently reused without being re-asked. The `gates:` block added by E2-F1
+  (all eight gates, their tunables, `fixture_consistency.canonical_sources`
+  / `.scan`, and the `gates.repos.<org/repo>` per-repo override map) is
+  interviewed for the first time, alongside `orchestrate.max_cascade_depth`,
+  the `quota_handling:` block, the `skills:` block,
+  `git_ops.branch_prefix` / `.orphan_patterns` / `.pr_review_resolution`,
+  `repos.<org/repo>.branch_prefix`, `allowed_orgs`, `display_timezone`
+  (top-level and `report.display_timezone`), and
+  `backlog.bulk_update_confirm_threshold` / `.bulk_update_audit_path` --
+  every one of which the pre-rewrite skill either silently emitted at its
+  built-in default without asking, or never emitted at all. The Step 21
+  final-write step now validates the assembled yaml via
+  `load_runtime_config` strictly before writing
+  `backlog/config/devbench.yaml` and reporting `[CONFIGURE_DEVBENCH_DONE]`
+  success (AC-29), structurally pinned by file-order rather than by
+  inspection.
+
+  New `tests/test_plugin/test_configure_devbench_schema_coverage.py` is the
+  anti-drift mechanism: `walk_schema_settings` recursively walks
+  `config-schema.json` (including every `gates.*` key) and
+  `assert_skill_names_every_setting` fails naming any property the SKILL
+  text does not name; a companion `assert_interview_blocks_complete` parses
+  every `#### \`dotted.path\`` interview block and fails naming the setting
+  and the missing element when the Recommended, Alternatives, or Free-form
+  marker is absent. Both helpers, plus the AC-29 output-contract ordering
+  check, carry seeded-mutation and seeded-omission controls over synthetic
+  in-memory fixtures (never the real schema or SKILL file) proving every
+  assertion is genuinely falsifiable rather than vacuously true. A future
+  config key added without matching interview coverage now breaks this test
+  immediately instead of surviving as a silent one-time gap.
+  `docs/skills/configure-devbench.md` documents the every-invocation
+  contract, the 21-step walkthrough, and the schema-coverage regression
+  guard.
+
 ### Fixed
 
 - **A single Claude Agent SDK transport hiccup ended a multi-hour unattended

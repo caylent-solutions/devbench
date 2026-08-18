@@ -143,10 +143,14 @@ devbench promote --all --yes
 
 ## Step 3: configure-devbench -- author backlog/config/devbench.yaml
 
-The `configure-devbench` skill walks you through every `RuntimeConfig` section and
-produces a valid `backlog/config/devbench.yaml`. Each value is round-tripped through
-`RuntimeConfig` parsing immediately after entry; invalid values are rejected with the
-parser's error message and you are re-prompted.
+The `configure-devbench` skill interviews you about EVERY setting in
+`src/devbench/config-schema.json` -- every existing section and the `gates:` block
+alike -- and produces a valid `backlog/config/devbench.yaml`. This interview
+runs in full on every invocation: it never silently reuses a prior answer.
+When `backlog/config/devbench.yaml` already exists, its values are read and
+shown as the CURRENT VALUE in every menu below, but every single question is
+still asked again -- there is no skip-because-unchanged path anywhere in
+this skill.
 
 **Invoke:**
 
@@ -156,18 +160,27 @@ claude run devbench:configure-devbench
 
 **What happens:**
 
-1. If `devbench.yaml` already exists, the skill reads it and pre-populates defaults.
-   Enter a blank line to accept a shown default.
-2. The skill walks through 16 sections: `repos`, top-level scalars, `timeouts`,
-   `limits`, `agents`, `git_ops`, `task_factory`, `manifest_amendment`, `validate`,
-   `stop_hook`, `hook_tail`, `debug`, `backlog`, `notifications`, `report`, and a
-   final write.
+1. The skill walks through 21 steps: reading the existing config (if
+   present), then one interview per schema section -- `repos`, top-level
+   scalars, `timeouts`, `limits`, `agents`, `git_ops`, `task_factory`,
+   `manifest_amendment`, `validate`, `stop_hook`, `hook_tail`, `orchestrate`,
+   `debug`, `backlog`, `gates`, `skills`, `notifications`, `report`,
+   `quota_handling` -- and a final validation-and-write step. The `gates:` section
+   (the eight integration-reality gates), `skills:`, `quota_handling:`, and
+   `orchestrate.max_cascade_depth` are interviewed alongside every pre-existing
+   section -- none of them is silently emitted at a built-in default without asking.
+2. Each leaf setting's menu shows the recommended value marked as such, every
+   alternative with its own consequence, and a free-form entry path, plus a full
+   explanation of what the setting does; entering a blank line accepts the
+   recommended (or, if the config already exists, the current) value.
 3. Each section validates against `RuntimeConfig` before moving to the next.
-4. The final write step emits every remaining `RuntimeConfig` section at its
-   built-in default (with the annotated `sample-config.yaml` comment) so the
-   written file is self-documenting, then runs a round-trip equivalence check
-   against a minimal config before the `devbench.yaml` is written (issue #260,
-   spec FR-3.6).
+4. In the final step, the assembled yaml (including every remaining tuning section
+   at its resolved value) is validated by `load_runtime_config` -- the skill fails
+   fast and returns you to the relevant step if validation fails, rather than
+   writing a file that would break at the next command -- and only then runs a
+   round-trip equivalence check against a minimal config before
+   `backlog/config/devbench.yaml` is written and success is reported (issue #260,
+   spec FR-3.6, spec section 4.15, AC-29).
 
 **Minimum required input:** the `repos:` section -- `org/repo` key,
 `checkout_directory` (workspace-relative), and `default_branch`.

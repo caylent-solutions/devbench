@@ -1,8 +1,48 @@
 # ADR-34: Transport-error bounded restart (#331)
 
-**Status:** Accepted
+**Status:** Accepted; **amended 2026-08-18** -- decision D-3 (shared cap) is
+superseded, and the alternative "A dedicated transport-restart cap / config
+key" it rejected is now adopted. See [Amendment](#amendment-2026-08-18-dedicated-cap-and-backoff-d-3-superseded).
 **Date:** 2026-08-13
 **Issue:** #331
+
+## Amendment (2026-08-18): dedicated cap and backoff, D-3 superseded
+
+The shared-cap decision below was made on the assumption -- stated in the
+original Consequences and in `constants.py` -- that a transport fault is rare
+and self-throttling. Production disproved it.
+
+A persistent transport fault produced ~1000 restarts in 39 minutes: the loop
+retried with **no delay at all**, so the 1000-restart budget sized for quota
+windows was consumed as fast as the SDK could reject a session. The cap was
+exhausted, the run ended, and the daemon exited with no operator signal until
+someone read the log three days later. The failure mode the bounded restart was
+designed to survive is exactly what killed the run.
+
+Two changes follow:
+
+1. **Transport restarts get their own cap.** `MAX_TRANSPORT_RESTARTS`
+   (`DEVBENCH_MAX_TRANSPORT_RESTARTS` / `orchestrate.max_transport_restarts`,
+   default **10**) replaces the borrowed `_resolve_max_quota_resumes()`
+   ceiling. It follows `DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS`'s cost-guard
+   reasoning: a fault that repeats ten times consecutively is not flapping, it
+   is down, and the correct response is to fail fast and loudly.
+2. **Restarts are paced by exponential backoff.**
+   `base * 2 ** restarts_already_done`, clamped to a ceiling
+   (`orchestrate.transport_restart_backoff_base_seconds` /
+   `..._max_seconds`, defaults 1.0s and 60.0s). The chosen delay is recorded
+   in the audit line as `backoff=<n>s`.
+
+The premise that made the shared cap defensible -- that all three failure modes
+self-throttle -- was simply false for transport. A quota window must elapse and
+an inactivity restart costs a full timeout window; a transport fault costs
+nothing and can recur immediately. The cap was never the safeguard; the absence
+of a delay was the defect.
+
+The counter-independence property from D-3 is retained unchanged: transport,
+quota, and inactivity restarts still count separately and never consume each
+other's budget. What changed is that the transport counter now has its own
+ceiling and its own pacing.
 
 ## Context
 
@@ -54,9 +94,13 @@ already fires unconditionally -- names the case instead of an unlabelled
 crash. `devbench report` renders a `Transport restarts <n>` row
 (`report.transport_restarts_line`, counting genuine
 `[ORCHESTRATOR_TRANSPORT_RESTART]` audit lines) only when `n > 0`, so a clean
-run's report stays byte-identical to today.
+run's report stays byte-identical to today. *(Amended 2026-08-18: the row now
+counts per window and labels each count -- `<n> all-time / <n> session /
+<n> this run` -- because a single lifetime total sitting above windowed
+columns was read as a run-scoped number. The `n > 0` suppression rule is
+unchanged.)*
 
-**2. The cap is shared, not duplicated (D-3).** `_should_restart_after_transport_error`
+**2. The cap is shared, not duplicated (D-3).** *(Superseded by the 2026-08-18 amendment above -- the cap is now dedicated and the restarts are paced. Retained for the record.)* `_should_restart_after_transport_error`
 reuses `_resolve_max_quota_resumes()` -- the same `DEVBENCH_MAX_QUOTA_RESUMES`
 resolver (default 1000) that already bounds quota resumes and inactivity
 restarts -- rather than introducing a second config key. The transport
@@ -95,18 +139,23 @@ SIGTERM / operator-interrupt behaviour is unchanged.
 ### Positive
 
 - A transient upstream transport hiccup no longer ends an unattended
-  overnight run: the loop restarts a fresh SDK session, bounded by the same
-  cap operators already tune for quota and inactivity restarts.
+  overnight run: the loop restarts a fresh SDK session, bounded by its own
+  cap and spaced by exponential backoff (amended 2026-08-18; originally the
+  shared quota/inactivity cap with no delay).
 - A permanent failure still fails fast: the cap is exhausted in a bounded
   number of attempts and `devbench start` exits non-zero with the verbatim
   final exception, exactly as an uncaught exception did before this ADR --
   no infinite retry loop, no swallowed defect.
 - Operators gain visibility on two independent surfaces: the
   `orchestrator_stop` notification's `transport-error-restart-cap-exhausted`
-  label, and `devbench report`'s conditional `Transport restarts <n>` row.
-- No new configuration surface: the classification boundary is a code-level
-  invariant and the cap is an existing resolver, so there is nothing new to
-  set wrong.
+  label, and `devbench report`'s conditional `Transport restarts` row, which
+  counts per window (all-time / session / this run) and labels each count.
+- ~~No new configuration surface~~ (amended 2026-08-18): the classification
+  boundary remains a code-level invariant, but the cap and its backoff are now
+  three optional `orchestrate.*` keys. The added surface is judged worth it --
+  the field failure was not something an operator could tune their way out of,
+  because the only knob was shared with quota resumes and moving it would have
+  broken those. Every key is optional and resolves env > YAML > default.
 
 ### Negative
 
@@ -136,10 +185,14 @@ genuine bugs behind a bounded-restart mask.
 
 ### A dedicated transport-restart cap / config key
 
-Rejected (D-3). Three independent counters bounded by one operator-visible
-cap (`DEVBENCH_MAX_QUOTA_RESUMES`) is simpler to reason about and operate
-than three separate knobs, and the workspace standard discourages
-configuration surface that can only be set wrong.
+Originally rejected (D-3); **adopted in the 2026-08-18 amendment.** The
+original reasoning -- that one operator-visible cap is simpler than three
+knobs, and that configuration surface can only be set wrong -- held only while
+the shared cap was actually a safeguard for transport faults. It was not: with
+no delay between attempts the ceiling was reachable in minutes, so the single
+knob offered no protection and could not be lowered without also shortening
+genuine quota recovery. Simplicity that does not bound the failure it names is
+not simplicity.
 
 ## References
 

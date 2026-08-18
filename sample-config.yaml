@@ -205,6 +205,39 @@ orchestrate:
   # layer. Override via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
   max_cascade_depth: 2
 
+  # Bound on consecutive in-process restarts after an SDK TRANSPORT error
+  # (the orchestrator reopening a fresh SDK session because the previous one
+  # failed at the transport boundary).
+  #
+  # Deliberately separate from, and far below, max_quota_resumes: a quota
+  # window must elapse and an inactivity restart costs a full timeout window,
+  # so both self-throttle. A transport fault does not -- it can recur as fast
+  # as the SDK can reject a session. Exhausting this bound means the transport
+  # is down rather than flapping, and the run fails fast and loudly instead of
+  # grinding through a four-figure budget unattended.
+  #
+  # Sized as a TIME budget, not an attempt count. Each restart costs one SDK
+  # session lifetime plus one backoff wait; measured against a live Anthropic
+  # 529 'overloaded' outage a session raises after ~199s, so 14 restarts
+  # (15 sessions + ~9 min of backoff) is ~59 min before the run halts. Change
+  # the wall-clock window you want and re-derive rather than nudging this.
+  # Override via DEVBENCH_MAX_TRANSPORT_RESTARTS env var.
+  max_transport_restarts: 14
+
+  # Exponential backoff applied BETWEEN those transport restarts:
+  #   delay = transport_restart_backoff_base_seconds * 2 ** restarts_already_done
+  # clamped to transport_restart_backoff_max_seconds. With the defaults below
+  # the waits run 1s, 2s, 4s, 8s, 16s, 32s, then 60s thereafter.
+  #
+  # Without this envelope the bound above is spent as fast as the SDK can fail,
+  # which is the whole failure mode it exists to prevent. Both values must be
+  # > 0; the ceiling also bounds how long a `devbench stop` can be delayed by
+  # an in-flight wait.
+  # Override via DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS and
+  # DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS env vars.
+  transport_restart_backoff_base_seconds: 1.0
+  transport_restart_backoff_max_seconds: 60.0
+
 # ---------------------------------------------------------------------------
 # Report / cost estimation
 # ---------------------------------------------------------------------------

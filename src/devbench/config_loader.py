@@ -562,12 +562,24 @@ class OrchestrateConfig:
     task transitions to ``NEEDS_OPERATOR_ATTENTION`` instead of
     materialising another recovery layer.
 
-    Field is ``None`` when absent from YAML; ``config.py`` resolves
-    env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``
-    constant.
+    ``max_transport_restarts`` bounds consecutive in-process restarts after
+    an SDK transport error, and the two ``transport_restart_backoff_*``
+    fields shape the exponential delay between those restarts
+    (delay = ``base * 2 ** restarts_used``, clamped to ``max``). Transport
+    faults impose no natural delay of their own, so without this envelope a
+    persistently failing transport exhausts its whole restart budget in
+    seconds; see ``DEFAULT_MAX_TRANSPORT_RESTARTS`` in ``constants.py``.
+
+    Every field is ``None`` when absent from YAML; ``config.py`` resolves
+    env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``,
+    ``MAX_TRANSPORT_RESTARTS``, ``TRANSPORT_RESTART_BACKOFF_BASE_SECONDS``
+    and ``TRANSPORT_RESTART_BACKOFF_MAX_SECONDS`` constants.
     """
 
     max_cascade_depth: int | None = None
+    max_transport_restarts: int | None = None
+    transport_restart_backoff_base_seconds: float | None = None
+    transport_restart_backoff_max_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1982,6 +1994,19 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     orchestrate = OrchestrateConfig(
         max_cascade_depth=(
             int(orchestrate_raw["max_cascade_depth"]) if "max_cascade_depth" in orchestrate_raw else None
+        ),
+        max_transport_restarts=(
+            int(orchestrate_raw["max_transport_restarts"]) if "max_transport_restarts" in orchestrate_raw else None
+        ),
+        transport_restart_backoff_base_seconds=(
+            float(orchestrate_raw["transport_restart_backoff_base_seconds"])
+            if "transport_restart_backoff_base_seconds" in orchestrate_raw
+            else None
+        ),
+        transport_restart_backoff_max_seconds=(
+            float(orchestrate_raw["transport_restart_backoff_max_seconds"])
+            if "transport_restart_backoff_max_seconds" in orchestrate_raw
+            else None
         ),
     )
 

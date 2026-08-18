@@ -8001,23 +8001,23 @@ class TestShouldRestartAfterTransportError:
     @pytest.mark.unit
     def test_permitted_restart_emits_marker_and_returns_true(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(0, 3)
+            result = cli._should_restart_after_transport_error(0, 3, 1.0)
 
         assert result is True
-        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=3" in caplog.text
+        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=3 backoff=1.0s" in caplog.text
 
     @pytest.mark.unit
     def test_second_permitted_restart_increments_the_attempt_number(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(1, 3)
+            result = cli._should_restart_after_transport_error(1, 3, 2.0)
 
         assert result is True
-        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=2 max=3" in caplog.text
+        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=2 max=3 backoff=2.0s" in caplog.text
 
     @pytest.mark.unit
     def test_bound_exhausted_emits_marker_and_returns_false(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(3, 3)
+            result = cli._should_restart_after_transport_error(3, 3, 8.0)
 
         assert result is False
         assert "[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED] max=3" in caplog.text
@@ -8025,9 +8025,68 @@ class TestShouldRestartAfterTransportError:
     @pytest.mark.unit
     def test_bound_already_exceeded_still_refuses(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(5, 3)
+            result = cli._should_restart_after_transport_error(5, 3, 8.0)
 
         assert result is False
+
+
+class TestTransportRestartBackoffSeconds:
+    """Direct unit tests for ``_transport_restart_backoff_seconds``.
+
+    A transport fault imposes no delay of its own, so this envelope is the only
+    thing standing between one persistent fault and a restart budget spent in
+    seconds. Its arithmetic and its guard rails are pinned here.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("restarts_used", "expected"),
+        [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0), (5, 32.0)],
+    )
+    def test_delay_doubles_per_restart(self, restarts_used: int, expected: float) -> None:
+        assert cli._transport_restart_backoff_seconds(restarts_used, 1.0, 60.0) == expected
+
+    @pytest.mark.unit
+    def test_first_restart_waits_exactly_the_base(self) -> None:
+        """``restarts_used`` counts restarts ALREADY performed, so the first
+        wait is the base and not double it."""
+        assert cli._transport_restart_backoff_seconds(0, 2.5, 60.0) == 2.5
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("restarts_used", [6, 7, 10, 50])
+    def test_delay_is_clamped_to_the_ceiling(self, restarts_used: int) -> None:
+        assert cli._transport_restart_backoff_seconds(restarts_used, 1.0, 60.0) == 60.0
+
+    @pytest.mark.unit
+    def test_enormous_restart_count_clamps_instead_of_overflowing(self) -> None:
+        """The exponent guard: ``2 ** restarts_used`` for an operator-set cap in
+        the thousands would raise OverflowError on the float multiply before
+        ``min()`` could clamp it."""
+        assert cli._transport_restart_backoff_seconds(100_000, 1.0, 60.0) == 60.0
+
+    @pytest.mark.unit
+    def test_ceiling_below_base_yields_the_ceiling(self) -> None:
+        assert cli._transport_restart_backoff_seconds(0, 30.0, 5.0) == 5.0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("base", [0.0, -1.0])
+    def test_non_positive_base_raises(self, base: float) -> None:
+        """Fail fast: a zero or negative delay is precisely the busy-loop defect
+        this function exists to prevent, and the env-var path bypasses the YAML
+        schema that would otherwise reject it."""
+        with pytest.raises(ValueError, match="base must be > 0"):
+            cli._transport_restart_backoff_seconds(0, base, 60.0)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("ceiling", [0.0, -5.0])
+    def test_non_positive_ceiling_raises(self, ceiling: float) -> None:
+        with pytest.raises(ValueError, match="ceiling must be > 0"):
+            cli._transport_restart_backoff_seconds(0, 1.0, ceiling)
+
+    @pytest.mark.unit
+    def test_negative_restarts_used_raises(self) -> None:
+        with pytest.raises(ValueError, match="restarts_used must be >= 0"):
+            cli._transport_restart_backoff_seconds(-1, 1.0, 60.0)
 
 
 class TestTransportErrorClassificationAndRestart:
@@ -8240,10 +8299,10 @@ class TestTransportErrorClassificationAndRestart:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """AC-6: each restart logs the verbatim upstream exception at ERROR,
-        including the restart ordinal and the cap."""
+        including the restart ordinal and the transport-specific cap."""
         import sys
 
-        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "3")
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 3)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -8273,14 +8332,95 @@ class TestTransportErrorClassificationAndRestart:
         assert "Claude Code returned an error result: success" in message
 
     @pytest.mark.unit
+    @pytest.mark.unit
+    def test_loop_applies_exponential_backoff_between_restarts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The restart arm must WAIT between attempts, with the delay doubling.
+
+        This is the regression guard for the field failure that motivated the
+        change: with no delay, a persistent transport fault spent a
+        1000-restart budget in 39 minutes and killed the daemon. Asserting the
+        recorded delays (rather than elapsed wall-clock) keeps the test fast
+        and deterministic.
+        """
+        import sys
+
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 5)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_BASE_SECONDS", 1.0)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_MAX_SECONDS", 60.0)
+        slept: list[float] = []
+        # Re-patch the seam the autouse fixture neutralised, this time recording.
+        monkeypatch.setattr(cli, "_sleep_between_transport_restarts", slept.append)
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx < 3:
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        # Three failures -> three restarts, each waiting twice the last.
+        assert slept == [1.0, 2.0, 4.0]
+
+    @pytest.mark.unit
+    def test_backoff_delay_is_clamped_by_the_configured_ceiling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A low ceiling caps the doubling, so a long outage settles into a
+        steady retry cadence rather than growing without bound."""
+        import sys
+
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 5)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_BASE_SECONDS", 1.0)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_MAX_SECONDS", 2.0)
+        slept: list[float] = []
+        monkeypatch.setattr(cli, "_sleep_between_transport_restarts", slept.append)
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx < 3:
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert slept == [1.0, 2.0, 2.0]
+
     def test_permanent_error_exhausts_the_cap_and_restart_count_equals_cap(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """AC-7: a permanent transport error exhausts the cap and re-raises;
-        the restart count equals the cap -- no infinite loop."""
+        the restart count equals the cap -- no infinite loop. The cap is the
+        transport-specific one, not the quota ceiling."""
         import sys
 
-        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "2")
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 2)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -8307,14 +8447,16 @@ class TestTransportErrorClassificationAndRestart:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """AC-8: the transport restart counter is tracked independently of
-        the inactivity-restart counter, even though both are bounded by the
-        SAME ``_resolve_max_quota_resumes()`` cap. With cap=1, an inactivity
-        restart followed by a transport restart must both be permitted (a
-        shared counter would refuse the second one)."""
+        the inactivity-restart counter. The two are now bounded by SEPARATE
+        caps (inactivity by ``_resolve_max_quota_resumes()``, transport by
+        ``MAX_TRANSPORT_RESTARTS``), so both are pinned to 1 here: an
+        inactivity restart followed by a transport restart must both be
+        permitted, which a shared counter would refuse."""
         import sys
 
         monkeypatch.setattr(cli, "_ORCH_INACTIVITY_TIMEOUT", 0.02)
         monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 1)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -8487,7 +8629,7 @@ class TestIssue331RegressionFixture:
         import sys
 
         cap = 2
-        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", str(cap))
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", cap)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:

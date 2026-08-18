@@ -224,8 +224,63 @@ hook_tail:
 
 ```yaml
 orchestrate:
-  max_cascade_depth: 2  # recovery-of-recovery cascade depth cap
+  max_cascade_depth: 2                        # recovery-of-recovery cascade depth cap
+  max_transport_restarts: 14                  # bounded restarts after an SDK transport error (~1h budget)
+  transport_restart_backoff_base_seconds: 1.0 # first wait; doubles per restart
+  transport_restart_backoff_max_seconds: 60.0 # ceiling on that doubling
 ```
+
+All four keys are optional; each resolves **env > YAML > built-in default**.
+
+| Key | Env override | Default |
+| --- | --- | --- |
+| `max_cascade_depth` | `DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH` | `2` |
+| `max_transport_restarts` | `DEVBENCH_MAX_TRANSPORT_RESTARTS` | `14` |
+| `transport_restart_backoff_base_seconds` | `DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS` | `1.0` |
+| `transport_restart_backoff_max_seconds` | `DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS` | `60.0` |
+
+**Transport restarts.** When the Claude Agent SDK fails at its transport
+boundary, the orchestrator opens a fresh SDK session on the remaining backlog
+rather than exiting. `max_transport_restarts` bounds how many times in a row it
+will do that, and the two backoff keys space the attempts:
+
+```text
+delay = transport_restart_backoff_base_seconds * 2 ** restarts_already_done
+        clamped to transport_restart_backoff_max_seconds
+```
+
+With the defaults the waits run 1s, 2s, 4s, 8s, 16s, 32s, then 60s thereafter.
+
+`max_transport_restarts` is sized as a **time budget**, not an attempt count.
+Each restart costs one full SDK session lifetime plus one backoff wait.
+Measured against a live Anthropic 529 `overloaded` outage, an SDK session burns
+its own internal retries and raises after ~199s, so the default 14 restarts
+(15 sessions + ~9 min of backoff) gives **roughly one hour** of riding out a
+provider outage before the run halts with
+`transport-error-restart-cap-exhausted`.
+
+That ~199s figure is a property of the SDK's retry schedule under one observed
+failure mode, not a constant -- a fault that rejects instantly makes each cycle
+much shorter and the same cap exhausts far sooner. Decide the wall-clock window
+you want and re-derive the count; do not nudge the integer blindly.
+
+This bound is deliberately separate from -- and far below --
+`DEVBENCH_MAX_QUOTA_RESUMES` (default 1000), which bounds quota resumes and
+inactivity restarts. A quota window must elapse and an inactivity restart costs
+a full timeout window, so both self-throttle. A transport fault does not: it
+recurs as fast as the SDK can reject a session. Sharing a 1000-restart budget
+with no delay meant one persistent fault could spend the entire budget in
+minutes and end the run unattended. Exhausting this smaller bound is the
+intended signal that the transport is down rather than flapping.
+
+Both backoff values must be greater than zero; the schema rejects zero or
+negative values at load time, and the env-var path raises rather than degrading
+into a busy retry loop. The ceiling also bounds how long an in-flight wait can
+delay a `devbench stop`.
+
+Each restart is recorded in the orchestrator log as
+`[ORCHESTRATOR_TRANSPORT_RESTART] attempt=<n> max=<cap> backoff=<n>s` and
+surfaced by the `Transport restarts` row in `devbench report`.
 
 ---
 

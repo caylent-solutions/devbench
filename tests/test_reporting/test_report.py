@@ -5840,14 +5840,27 @@ class TestReadAllDrainStates:
             read_all_drain_states(tmp_path)
 
 
-def _transport_restart_log_line(attempt: int, cap: int = 5) -> str:
+def _transport_restart_log_line(attempt: int, cap: int = 5, *, timestamp: str | None = None) -> str:
     """Build one raw ``[ORCHESTRATOR_TRANSPORT_RESTART]`` audit line, matching
     the exact literal shape ``cli.py``'s ``_should_restart_after_transport_error``
-    logs via ``logger.info("%s attempt=%d max=%d", ...)`` under the
+    logs via ``logger.info("%s attempt=%d max=%d backoff=%.1fs", ...)`` under the
     ``"%(asctime)s [%(name)s] %(levelname)s %(message)s"`` formatter
-    (``LOG_FORMAT`` / ``LOG_DATE_FORMAT`` in ``devbench.constants``)."""
+    (``LOG_FORMAT`` / ``LOG_DATE_FORMAT`` in ``devbench.constants``).
+
+    ``timestamp`` overrides the default so window-scoping tests can place
+    restarts on either side of a boundary. Emitted WITHOUT the ``backoff=``
+    suffix so the historical (pre-backoff) log shape stays covered; the
+    suffixed shape has its own test below.
+    """
+    stamp = timestamp if timestamp is not None else f"2026-08-12T18:38:0{attempt}Z"
+    return f"{stamp} [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] attempt={attempt} max={cap}"
+
+
+def _transport_restart_log_line_with_backoff(attempt: int, cap: int, backoff: float, timestamp: str) -> str:
+    """The post-backoff line shape cli.py emits once transport restarts are paced."""
     return (
-        f"2026-08-12T18:38:0{attempt}Z [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] attempt={attempt} max={cap}"
+        f"{timestamp} [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] "
+        f"attempt={attempt} max={cap} backoff={backoff:.1f}s"
     )
 
 
@@ -5855,7 +5868,9 @@ class TestTransportRestartsLine:
     """Tests for ``transport_restarts_line()`` (#331 FR-4, AC-11).
 
     A standalone row-rendering function that returns ``None`` when there is
-    nothing to say.
+    nothing to say. Every count it renders is labelled with the window it
+    measures, so the row cannot be misread as belonging to the narrowest
+    column of the table it sits above.
     """
 
     def test_returns_none_when_log_missing(self, tmp_path: Path) -> None:
@@ -5878,7 +5893,9 @@ class TestTransportRestartsLine:
 
         assert transport_restarts_line(log_file) is None
 
-    def test_renders_row_for_single_restart(self, tmp_path: Path) -> None:
+    def test_renders_labelled_all_time_count_for_single_restart(self, tmp_path: Path) -> None:
+        """With no window boundaries supplied the row still names its window,
+        so a bare number can never be mistaken for a run-scoped count."""
         from devbench.reporting.report import transport_restarts_line
 
         log_file = tmp_path / "test.log"
@@ -5886,10 +5903,10 @@ class TestTransportRestartsLine:
 
         line = transport_restarts_line(log_file)
 
-        assert line == "Transport restarts        1"
+        assert line == "Transport restarts        1 all-time"
 
     @pytest.mark.parametrize("restart_count", [2, 3, 5])
-    def test_renders_row_for_multiple_restarts(self, tmp_path: Path, restart_count: int) -> None:
+    def test_renders_labelled_all_time_count_for_multiple_restarts(self, tmp_path: Path, restart_count: int) -> None:
         from devbench.reporting.report import transport_restarts_line
 
         log_file = tmp_path / "test.log"
@@ -5899,7 +5916,95 @@ class TestTransportRestartsLine:
 
         line = transport_restarts_line(log_file)
 
-        assert line == f"Transport restarts        {restart_count}"
+        assert line == f"Transport restarts        {restart_count} all-time"
+
+    def test_counts_lines_carrying_the_backoff_suffix(self, tmp_path: Path) -> None:
+        """The paced line shape cli.py emits once backoff is applied must count
+        exactly like the historical unsuffixed shape."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 10, 1.0, "2026-08-12T18:38:01Z"),
+                    _transport_restart_log_line_with_backoff(2, 10, 2.0, "2026-08-12T18:38:03Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_mixed_historical_and_paced_lines_are_both_counted(self, tmp_path: Path) -> None:
+        """A log spanning the change must not silently drop its older half --
+        the regression the optional ``backoff=`` suffix exists to prevent."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T18:38:01Z"),
+                    _transport_restart_log_line_with_backoff(2, 10, 2.0, "2026-08-12T18:38:05Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_session_window_excludes_restarts_before_the_session_started(self, tmp_path: Path) -> None:
+        """The defect this row's labelling fixes: an old restart storm must not
+        be attributed to the current session."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    _transport_restart_log_line(2, timestamp="2026-08-12T02:00:00Z"),
+                    _transport_restart_log_line(3, timestamp="2026-08-12T10:00:00Z"),
+                ]
+            )
+        )
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        3 all-time / 1 session"
+
+    def test_session_window_counts_a_restart_exactly_on_the_boundary(self, tmp_path: Path) -> None:
+        """The window is inclusive of its start instant."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([_transport_restart_log_line(1, timestamp="2026-08-12T09:00:00Z")]))
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        1 all-time / 1 session"
+
+    def test_renders_all_three_windows_in_watch_mode(self, tmp_path: Path) -> None:
+        """A healthy current run beside an old storm: the whole point of the row."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    _transport_restart_log_line(2, timestamp="2026-08-12T01:00:05Z"),
+                    _transport_restart_log_line(3, timestamp="2026-08-12T09:30:00Z"),
+                ]
+            )
+        )
+
+        line = transport_restarts_line(
+            log_file,
+            session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC),
+            report_started_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+        )
+
+        assert line == "Transport restarts        3 all-time / 1 session / 0 this run"
 
     def test_ignores_marker_text_echoed_mid_line(self, tmp_path: Path) -> None:
         """A restart marker quoted inside an unrelated SDK payload line (not
@@ -5924,20 +6029,72 @@ class TestTransportRestartsLine:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         """Task-specific error path: a negative count is impossible by
-        construction (``_count_transport_restarts`` is a match-list length,
-        which the ``len`` builtin itself guarantees is never negative) and is
+        construction (``_count_transport_restarts_since`` returns either a
+        ``len`` or a ``sum`` of ones, neither of which can be negative) and is
         documented by an assertion at the rendering boundary rather than a
-        defensive clamp. ``_count_transport_restarts`` is monkeypatched
-        (a legitimate, mockable seam) rather than trying to coerce ``len``
-        itself to return a negative number, which the interpreter refuses."""
+        defensive clamp. The counter is monkeypatched (a legitimate, mockable
+        seam) rather than trying to coerce ``len`` itself to return a negative
+        number, which the interpreter refuses."""
         from devbench.reporting import report as report_module
 
         log_file = tmp_path / "test.log"
         log_file.write_text(_make_log(["irrelevant"]))
-        monkeypatch.setattr(report_module, "_count_transport_restarts", lambda log_text: -1)
+        monkeypatch.setattr(report_module, "_count_transport_restarts_since", lambda timestamps, start: -1)
 
         with pytest.raises(AssertionError, match="negative"):
             report_module.transport_restarts_line(log_file)
+
+
+class TestCountTransportRestartsSince:
+    """Direct unit tests for the pure windowing function, independent of file I/O."""
+
+    @pytest.mark.parametrize(
+        ("start", "expected"),
+        [
+            (None, 3),
+            (datetime(2026, 8, 12, 0, 0, tzinfo=UTC), 3),
+            (datetime(2026, 8, 12, 2, 0, tzinfo=UTC), 2),
+            (datetime(2026, 8, 12, 10, 0, tzinfo=UTC), 0),
+        ],
+    )
+    def test_counts_only_timestamps_at_or_after_start(self, start: datetime | None, expected: int) -> None:
+        from devbench.reporting.report import _count_transport_restarts_since
+
+        stamps = [
+            datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 3, 0, tzinfo=UTC),
+        ]
+
+        assert _count_transport_restarts_since(stamps, start) == expected
+
+    def test_empty_timestamps_count_zero(self) -> None:
+        from devbench.reporting.report import _count_transport_restarts_since
+
+        assert _count_transport_restarts_since([], datetime(2026, 8, 12, tzinfo=UTC)) == 0
+
+
+class TestTransportRestartTimestamps:
+    """The streaming reader that replaced a whole-file ``read_text()``."""
+
+    def test_returns_timestamps_in_file_order_as_utc(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _transport_restart_timestamps
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    "2026-08-12T01:30:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    _transport_restart_log_line(2, timestamp="2026-08-12T02:00:00Z"),
+                ]
+            )
+        )
+
+        assert _transport_restart_timestamps(log_file) == [
+            datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+        ]
 
 
 class TestGenerateReportTransportRestartsRow:
@@ -5957,6 +6114,8 @@ class TestGenerateReportTransportRestartsRow:
         return log_file
 
     def test_row_renders_when_restarts_present(self, tmp_path: Path) -> None:
+        """Non-watch mode: All-time and Session are rendered (the table shows
+        both), This run is not (there is no watch loop to scope it to)."""
         restarts = [_transport_restart_log_line(1), _transport_restart_log_line(2)]
         log_file = self._write_log(tmp_path, extra_entries=restarts)
 
@@ -5964,8 +6123,27 @@ class TestGenerateReportTransportRestartsRow:
         report_lines = report.split("\n")
 
         # The transport-restarts row is the first line after the banner.
-        assert report_lines[1] == "Transport restarts        2"
+        assert report_lines[1] == "Transport restarts        2 all-time / 2 session"
         assert report_lines[2] == ""
+
+    def test_row_scopes_each_window_independently_in_watch_mode(self, tmp_path: Path) -> None:
+        """The reported defect: restarts that predate the current watch loop
+        must render as 0 for This run rather than inflating it, so a stale
+        storm can no longer read as an in-progress failure."""
+        restarts = [
+            _transport_restart_log_line(1, timestamp="2026-03-05T09:00:00Z"),
+            _transport_restart_log_line(2, timestamp="2026-03-05T09:00:05Z"),
+        ]
+        log_file = self._write_log(tmp_path, extra_entries=restarts)
+
+        report = generate_report(
+            log_path=log_file,
+            report_started_at=datetime(2026, 3, 5, 11, 0, tzinfo=UTC),
+        )
+        report_lines = report.split("\n")
+
+        assert report_lines[1].startswith("Transport restarts        2 all-time")
+        assert report_lines[1].endswith("0 this run")
 
     def test_row_omitted_when_no_restarts_byte_identical(self, tmp_path: Path) -> None:
         """Spec D-6 / AC-11: a clean run (zero restarts) renders nothing for

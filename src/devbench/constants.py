@@ -918,15 +918,62 @@ DEFAULT_MAX_QUOTA_RESUMES: int = 1000
 # ``_resolve_max_premature_turn_end_restarts``'s fail-safe parse, mirroring
 # ``DEFAULT_MAX_QUOTA_RESUMES``.
 #
-# Deliberately far lower than the quota / inactivity / transport cap: those
-# three failure modes each self-throttle (a quota window must elapse, an
-# inactivity restart costs a full timeout window, a transport fault is rare),
-# whereas a model that ends its turn immediately can do so again immediately.
+# Deliberately far lower than the quota / inactivity cap: those two failure
+# modes each self-throttle (a quota window must elapse, an inactivity restart
+# costs a full timeout window), whereas a model that ends its turn immediately
+# can do so again immediately. A transport fault does NOT self-throttle -- it
+# can recur as fast as the SDK can fail -- so it carries its own bound
+# (``DEFAULT_MAX_TRANSPORT_RESTARTS``) and its own backoff below, rather than
+# sharing the 1000 ceiling.
 # Sharing the 1000 ceiling would let one reproducible prompt-following failure
 # burn a thousand consecutive sessions with no operator in the loop. This cap
 # is a cost guard, not a correctness bound: exhausting it is itself the signal
 # that the loop is not making progress and needs a human.
 DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS: int = 10
+
+# Bound on the number of consecutive in-process restarts
+# ``_drive_orchestrate_with_quota_resume`` performs after an SDK TRANSPORT
+# error, and the exponential-backoff envelope applied between those restarts.
+#
+# Transport restarts previously borrowed ``DEFAULT_MAX_QUOTA_RESUMES`` (1000)
+# and retried with no delay at all. That pairing is unsound: unlike a quota
+# window or an inactivity timeout, a transport fault imposes no natural delay,
+# so a persistently failing transport spends the entire 1000-restart budget as
+# fast as the SDK can reject a session -- observed in the field as ~1000
+# restarts inside 39 minutes, after which the run ended and the daemon exited
+# with no operator signal until someone read the log.
+#
+# The cap is therefore separate from the quota ceiling, and sized as a TIME
+# budget rather than a raw attempt count: a transport that is still failing
+# after roughly an hour is down, not flapping, and the run must fail loudly
+# rather than grind. Backoff spaces the attempts so a transient fault still
+# recovers without burning the budget in seconds: delay =
+# ``base * 2 ** restarts_used``, clamped to ``max``.
+#
+# Why 14 specifically. Each restart costs one full SDK session lifetime plus
+# one backoff wait. Measured against a live Anthropic 529 'overloaded' outage,
+# an SDK session burns its own ``max_retries`` and raises after ~199s, and the
+# backoff ladder (1, 2, 4, 8, 16, 32, then 60s) adds ~9 min across 14
+# restarts. 15 sessions x 199s + 9.1 min => ~59 min to cap exhaustion, i.e. a
+# provider outage is ridden out for about an hour before the run halts.
+#
+# That ~199s session lifetime is a property of the SDK's own retry schedule
+# under one observed failure mode, not a constant. A different fault (instant
+# rejection, say) makes each cycle far shorter and the same cap exhausts much
+# sooner. The hour is the intent; the number is the calibration. Operators who
+# need a different window should set the wall-clock they want and re-derive,
+# not nudge this integer blindly.
+#
+# All three are overridable, precedence env > yaml > built-in default:
+#   ``DEVBENCH_MAX_TRANSPORT_RESTARTS``
+#     / ``orchestrate.max_transport_restarts``
+#   ``DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS``
+#     / ``orchestrate.transport_restart_backoff_base_seconds``
+#   ``DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS``
+#     / ``orchestrate.transport_restart_backoff_max_seconds``
+DEFAULT_MAX_TRANSPORT_RESTARTS: int = 14
+DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = 1.0
+DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS: float = 60.0
 
 # Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
 # permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]

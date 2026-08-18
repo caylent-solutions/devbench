@@ -969,6 +969,124 @@ class TestConfigLoaderNoEnvVars:
 
 
 # ---------------------------------------------------------------------------
+# orchestrate: transport-restart bound and backoff envelope
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrchestrateTransportRestartConfig:
+    """The ``orchestrate.*`` transport-restart knobs load from YAML.
+
+    These are optional: a workspace that never sets them must keep ``None`` so
+    ``config.py``'s env > YAML > default chain still reaches the built-in
+    default rather than being pinned by a stray zero.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_orchestrate_block_leaves_every_field_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts is None
+        assert result.orchestrate.transport_restart_backoff_base_seconds is None
+        assert result.orchestrate.transport_restart_backoff_max_seconds is None
+
+    def test_values_are_read_from_the_orchestrate_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restarts: 4
+              transport_restart_backoff_base_seconds: 0.5
+              transport_restart_backoff_max_seconds: 30
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts == 4
+        assert result.orchestrate.transport_restart_backoff_base_seconds == 0.5
+        # An int in YAML must still surface as a float for the arithmetic.
+        assert result.orchestrate.transport_restart_backoff_max_seconds == 30.0
+        assert isinstance(result.orchestrate.transport_restart_backoff_max_seconds, float)
+
+    def test_partial_block_leaves_the_unset_siblings_none(self, tmp_path: Path) -> None:
+        """Setting one knob must not silently pin the other two."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restarts: 7
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts == 7
+        assert result.orchestrate.transport_restart_backoff_base_seconds is None
+        assert result.orchestrate.transport_restart_backoff_max_seconds is None
+
+    @pytest.mark.parametrize(
+        ("key", "bad_value"),
+        [
+            ("max_transport_restarts", 0),
+            ("transport_restart_backoff_base_seconds", 0),
+            ("transport_restart_backoff_max_seconds", -1),
+        ],
+    )
+    def test_schema_rejects_non_positive_values(self, tmp_path: Path, key: str, bad_value: object) -> None:
+        """Fail fast at load time: a zero or negative delay is the busy-loop
+        defect the backoff exists to prevent."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              {key}: {bad_value}
+            """,
+        )
+
+        with pytest.raises((ValueError, jsonschema.ValidationError)):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_orchestrate_key(self, tmp_path: Path) -> None:
+        """``additionalProperties: false`` -- a typo must be loud, not ignored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restart: 4
+            """,
+        )
+
+        with pytest.raises((ValueError, jsonschema.ValidationError)):
+            load_runtime_config(cfg, {})
+
+
+# ---------------------------------------------------------------------------
 # AC-7: checkout_directory path safety enforced post-schema
 # AC-8: allowed_orgs vs repos cross-validation enforced post-schema
 # ---------------------------------------------------------------------------

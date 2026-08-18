@@ -56,6 +56,7 @@ from devbench.constants import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
+    DEFAULT_MAX_TRANSPORT_RESTARTS,
     DEFAULT_MODEL_RATES,
     DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
@@ -72,6 +73,8 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
     ModelRates,
 )
 
@@ -513,6 +516,25 @@ MAX_CASCADE_DEPTH: int = _resolve_int(
     "DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH",
     RUNTIME_CONFIG.orchestrate.max_cascade_depth,
     DEFAULT_MAX_CASCADE_DEPTH,
+)
+# SDK-transport restart bound and its exponential-backoff envelope.
+# env > YAML > default, matching MAX_CASCADE_DEPTH above. Kept separate from
+# DEVBENCH_MAX_QUOTA_RESUMES because a transport fault, unlike a quota window,
+# imposes no delay of its own -- see DEFAULT_MAX_TRANSPORT_RESTARTS.
+MAX_TRANSPORT_RESTARTS: int = _resolve_int(
+    "DEVBENCH_MAX_TRANSPORT_RESTARTS",
+    RUNTIME_CONFIG.orchestrate.max_transport_restarts,
+    DEFAULT_MAX_TRANSPORT_RESTARTS,
+)
+TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = _resolve_float(
+    "DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS",
+    RUNTIME_CONFIG.orchestrate.transport_restart_backoff_base_seconds,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+)
+TRANSPORT_RESTART_BACKOFF_MAX_SECONDS: float = _resolve_float(
+    "DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS",
+    RUNTIME_CONFIG.orchestrate.transport_restart_backoff_max_seconds,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "DEVBENCH_STOP_MAX_BLOCKS",

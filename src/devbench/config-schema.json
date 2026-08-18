@@ -308,6 +308,21 @@
           "type": "integer",
           "minimum": 1,
           "description": "Cap on recovery-of-a-recovery cascade depth. When a proposal would land at depth >= this cap, the source task transitions to NEEDS_OPERATOR_ATTENTION instead of materialising another recovery layer. Default: 2."
+        },
+        "max_transport_restarts": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Cap on consecutive in-process restarts after an SDK transport error. Unlike a quota window or an inactivity timeout, a transport fault imposes no natural delay, so this bound is deliberately low and separate from max_quota_resumes: exhausting it means the transport is down, not flapping, and the run fails fast. Default: 10."
+        },
+        "transport_restart_backoff_base_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "First delay, in seconds, before the initial transport restart. Each subsequent restart doubles it (base * 2 ** restarts_used) up to transport_restart_backoff_max_seconds. Default: 1.0."
+        },
+        "transport_restart_backoff_max_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Ceiling, in seconds, on the exponential transport-restart delay. Must be >= transport_restart_backoff_base_seconds. Default: 60.0."
         }
       }
     },

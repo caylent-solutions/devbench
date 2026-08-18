@@ -194,8 +194,11 @@ from devbench.config import (
     BACKLOG_ROOT,
     BLOCKED_RECOVERY_WINDOW_SECONDS,
     MAX_CASCADE_DEPTH,
+    MAX_TRANSPORT_RESTARTS,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
+    TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+    TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
     UPDATE_SUBMODULE,
     WORKSPACE_ROOT,
     _read_env,
@@ -8433,17 +8436,99 @@ _ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_RES
 _ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED]"
 
 
-def _should_restart_after_transport_error(restarts_used: int, max_resumes: int) -> bool:
+# Arithmetic overflow guard for the doubling below -- NOT an operator tunable.
+# ``base * 2 ** restarts_used`` with an operator-set cap in the thousands would
+# build an integer wide enough to raise OverflowError on the float multiply
+# before ``min()`` ever clamps it. Any exponent past this point is already
+# astronomically beyond every reachable ``max_seconds``, so clamping the
+# exponent changes no observable delay.
+_TRANSPORT_RESTART_BACKOFF_EXPONENT_CAP: int = 32
+
+
+def _sleep_between_transport_restarts(seconds: float) -> None:
+    """Pause *seconds* before reopening the SDK session after a transport error.
+
+    Isolated as its own module-level function so the pacing is a patchable
+    seam. Driving the restart loop in a test must not burn real wall-clock
+    time, and patching this one call is far narrower -- and far less likely to
+    mask an unrelated regression -- than patching the global ``time.sleep``,
+    which the report watch loop and the process-readiness poller also use.
+
+    Args:
+        seconds: Delay from :func:`_transport_restart_backoff_seconds`.
+    """
+    import time
+
+    time.sleep(seconds)
+
+
+def _transport_restart_backoff_seconds(restarts_used: int, base_seconds: float, max_seconds: float) -> float:
+    """Return how long to wait before the next SDK-transport restart.
+
+    Exponential with a ceiling: ``base_seconds * 2 ** restarts_used``, clamped
+    to ``max_seconds``. ``restarts_used`` counts restarts already performed, so
+    the first restart waits exactly ``base_seconds``.
+
+    Why this exists: a quota window must elapse and an inactivity restart costs
+    a full timeout window, so both self-throttle. A transport fault does not --
+    it recurs as fast as the SDK can reject a session. Retrying with no delay
+    therefore spends the entire restart budget in seconds (observed in the
+    field: ~1000 restarts in 39 minutes) and converts a transient fault into a
+    dead daemon. Spacing the attempts lets a genuinely transient fault recover
+    while keeping a persistent one inside its bound.
+
+    Args:
+        restarts_used: Transport restarts already performed this run (0 before
+            the first).
+        base_seconds: Delay before the first restart. Must be > 0.
+        max_seconds: Ceiling on the delay. Must be > 0.
+
+    Returns:
+        The delay in seconds: ``min(base_seconds * 2 ** restarts_used, max_seconds)``.
+
+    Raises:
+        ValueError: If ``restarts_used`` is negative, or either bound is not
+            positive. The YAML schema already enforces positivity, but the
+            environment-variable path bypasses the schema, so the invariant is
+            enforced here and fails fast rather than silently degrading into a
+            busy loop (a zero or negative delay is exactly the defect this
+            function exists to prevent).
+    """
+    if restarts_used < 0:
+        raise ValueError(f"restarts_used must be >= 0, got {restarts_used}")
+    if base_seconds <= 0:
+        raise ValueError(
+            "transport restart backoff base must be > 0 seconds, got "
+            f"{base_seconds} -- check DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS "
+            "or orchestrate.transport_restart_backoff_base_seconds"
+        )
+    if max_seconds <= 0:
+        raise ValueError(
+            "transport restart backoff ceiling must be > 0 seconds, got "
+            f"{max_seconds} -- check DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS "
+            "or orchestrate.transport_restart_backoff_max_seconds"
+        )
+    exponent = min(restarts_used, _TRANSPORT_RESTART_BACKOFF_EXPONENT_CAP)
+    return min(base_seconds * (2**exponent), max_seconds)
+
+
+def _should_restart_after_transport_error(restarts_used: int, max_restarts: int, backoff_seconds: float) -> bool:
     """Decide whether ``cmd_start`` may reopen a fresh SDK session after a transport error.
 
     Mirrors :func:`_should_restart_after_inactivity_timeout`'s bounded-restart
     shape but for :class:`_OrchestrateTransportError` instead of an inactivity
-    timeout (spec FR-2, decision D-3): reuses the SAME
-    :func:`_resolve_max_quota_resumes` cap so a flapping SDK transport boundary
-    is bounded by the same operator-tunable ceiling, while counting its own
-    restarts independently of quota resumes and inactivity restarts (a
-    transport restart never consumes quota-resume or inactivity-restart budget
-    and vice versa).
+    timeout (spec FR-2, decision D-3), counting its own restarts independently
+    of quota resumes and inactivity restarts (a transport restart never
+    consumes quota-resume or inactivity-restart budget and vice versa).
+
+    The cap is :data:`~devbench.config.MAX_TRANSPORT_RESTARTS`, which is
+    deliberately its own setting rather than the shared
+    :func:`_resolve_max_quota_resumes` ceiling: a transport fault self-throttles
+    no more than a busy loop does, so pairing a 1000-restart budget with an
+    immediate retry let one persistent fault burn the whole budget in minutes
+    and end the run. *backoff_seconds* (from
+    :func:`_transport_restart_backoff_seconds`) is recorded in the audit line so
+    the pacing is visible in the log and in ``devbench report``.
 
     - When *restarts_used* (restarts already performed, BEFORE this one) is
       below *max_resumes*, emits
@@ -8458,20 +8543,25 @@ def _should_restart_after_transport_error(restarts_used: int, max_resumes: int) 
         restarts_used: Number of in-process transport restarts already
             performed during this ``cmd_start`` invocation (0 on the first
             transport error).
-        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+        max_restarts: The transport-specific cap
+            (:data:`~devbench.config.MAX_TRANSPORT_RESTARTS`; env > YAML >
+            :data:`~devbench.constants.DEFAULT_MAX_TRANSPORT_RESTARTS`).
+        backoff_seconds: The delay the caller will observe before the restart,
+            recorded in the audit line for operator visibility.
 
     Returns:
         ``True`` when another in-process restart is permitted; ``False`` when
         the cap is exhausted and the run must fail fast.
     """
-    if restarts_used >= max_resumes:
-        logger.info("%s max=%d", _ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+    if restarts_used >= max_restarts:
+        logger.info("%s max=%d", _ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_restarts)
         return False
     logger.info(
-        "%s attempt=%d max=%d",
+        "%s attempt=%d max=%d backoff=%.1fs",
         _ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX,
         restarts_used + 1,
-        max_resumes,
+        max_restarts,
+        backoff_seconds,
     )
     return True
 
@@ -8658,6 +8748,10 @@ def _drive_orchestrate_with_quota_resume(
     premature_restarts_used = 0
     max_resumes = _resolve_max_quota_resumes()
     max_premature_restarts = _resolve_max_premature_turn_end_restarts()
+    # Bound once at loop entry. The name resolves through this module's
+    # globals at call time, so a test (or an operator override applied before
+    # the loop starts) that rebinds ``cli.MAX_TRANSPORT_RESTARTS`` is honoured.
+    max_transport_restarts = MAX_TRANSPORT_RESTARTS
     while True:
         try:
             asyncio.run(run())
@@ -8685,11 +8779,22 @@ def _drive_orchestrate_with_quota_resume(
                 "%s restart=%d max=%d: %s",
                 _ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX,
                 transport_restarts_used + 1,
-                max_resumes,
+                max_transport_restarts,
                 exc,
             )
-            if _should_restart_after_transport_error(transport_restarts_used, max_resumes):
+            backoff_seconds = _transport_restart_backoff_seconds(
+                transport_restarts_used,
+                TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+                TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+            )
+            if _should_restart_after_transport_error(transport_restarts_used, max_transport_restarts, backoff_seconds):
                 transport_restarts_used += 1
+                # Space the retries. A transport fault imposes no delay of its
+                # own, so without this the bounded budget is spent as fast as
+                # the SDK can reject a session -- the failure mode this arm
+                # exists to survive. SIGTERM during the wait is delivered
+                # normally; the ceiling bounds how long a stop can be delayed.
+                _sleep_between_transport_restarts(backoff_seconds)
                 continue
             raise
         except _OrchestratePrematureTurnEnd as exc:

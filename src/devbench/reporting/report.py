@@ -78,6 +78,7 @@ from devbench.config import (
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     DEFAULT_SESSION_GAP_MINUTES,
+    LOG_DATE_FORMAT,
     LOG_NOISE_LOGGER_NAME,
     MIN_PACE_SAMPLES,
     MINUTES_PER_HOUR,
@@ -1609,56 +1610,111 @@ def _liveness_body_not_running(
 # unrelated SDK message -- the same echoed-text hazard
 # ``event_index.py``'s ``_TASK_TRANSITION_RE`` already guards against for
 # task transitions -- cannot inflate the count.
+# The ``backoff=<n>s`` suffix is OPTIONAL on purpose: cli.py started recording
+# the restart delay only when transport restarts gained their own backoff, and
+# a log that predates that change still carries genuine restart lines without
+# it. Making the suffix required would silently drop every historical restart
+# from the count -- the exact class of silent-miscount bug this anchored regex
+# exists to prevent.
 _TRANSPORT_RESTART_LOG_LINE_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[[^\]]+\] \w+ \[ORCHESTRATOR_TRANSPORT_RESTART\] attempt=\d+ max=\d+$",
-    re.MULTILINE,
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) \[[^\]]+\] \w+ "
+    r"\[ORCHESTRATOR_TRANSPORT_RESTART\] attempt=\d+ max=\d+(?: backoff=[\d.]+s)?$"
 )
 
 
-def _count_transport_restarts(log_text: str) -> int:
-    """Count genuine ``[ORCHESTRATOR_TRANSPORT_RESTART]`` audit lines in raw log text.
+def _transport_restart_timestamps(log_path: Path) -> list[datetime]:
+    """Return the timestamp of every genuine transport-restart audit line.
 
-    Pure function over already-read log text so ``transport_restarts_line``'s
-    file I/O and this counting logic stay independently testable.
+    Streams the file a line at a time rather than materialising it: the
+    orchestrator log is append-only and unrotated, and on a long-lived
+    workspace it reaches hundreds of megabytes, all of which the previous
+    ``read_text()`` pulled into memory on every single report refresh.
+
+    Only line-initial logger records count. A restart marker quoted inside an
+    unrelated SDK payload is not a restart -- the same echoed-text hazard
+    ``event_index.py``'s ``_TASK_TRANSITION_RE`` guards against.
+
+    Args:
+        log_path: Path to the orchestrator log.
 
     Returns:
-        The number of matching lines (``len`` of a match list, which the
-        ``len`` builtin itself guarantees is never negative).
+        Timestamps in file order (chronological for an append-only log), each
+        timezone-aware in UTC. Empty when the log holds no restart lines.
     """
-    return len(_TRANSPORT_RESTART_LOG_LINE_RE.findall(log_text))
+    timestamps: list[datetime] = []
+    with log_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            match = _TRANSPORT_RESTART_LOG_LINE_RE.match(raw_line.rstrip("\n"))
+            if match is not None:
+                timestamps.append(datetime.strptime(match.group("timestamp"), LOG_DATE_FORMAT).replace(tzinfo=UTC))
+    return timestamps
 
 
-def transport_restarts_line(log_path: Path) -> str | None:
-    """Render the transport-restart-count row for ``devbench report`` (#331 FR-4).
+def _count_transport_restarts_since(timestamps: Sequence[datetime], start: datetime | None) -> int:
+    """Count restarts at or after *start*; all of them when *start* is ``None``.
 
-    Reads the orchestrator log directly (a fresh, uncached read) and counts
-    every ``[ORCHESTRATOR_TRANSPORT_RESTART]`` line cli.py's restart arm
-    (``_should_restart_after_transport_error``) has logged. Returns ``None``
-    when the log does not exist yet or contains no restarts, so a clean
-    run's report stays byte-identical to today (spec D-6, AC-11) -- a
-    "no row when it wouldn't say anything" contract.
+    Pure function over already-read timestamps so the windowing logic stays
+    independently testable from the file I/O in
+    :func:`_transport_restart_timestamps`.
 
-    A negative count is impossible by construction (``_count_transport_restarts``
-    is a match-list length) but is asserted rather than defensively clamped
-    at this rendering boundary, per this task's fail-fast contract: a defect
-    that somehow produced a negative count must crash loudly here rather than
-    silently render a nonsensical row.
+    Args:
+        timestamps: Restart timestamps, as returned by
+            :func:`_transport_restart_timestamps`.
+        start: Inclusive window start, or ``None`` for "no lower bound".
+
+    Returns:
+        The number of timestamps in the window.
+    """
+    if start is None:
+        return len(timestamps)
+    return sum(1 for stamp in timestamps if stamp >= start)
+
+
+def transport_restarts_line(
+    log_path: Path,
+    session_start: datetime | None = None,
+    report_started_at: datetime | None = None,
+) -> str | None:
+    """Render the transport-restart row for ``devbench report`` (#331 FR-4).
+
+    Every count is explicitly labelled with the window it measures. The row
+    previously rendered a single bare number counted over the WHOLE log while
+    sitting directly above a table whose columns are All-time / Session / This
+    run, so a reader attached it to the narrowest column. On a long-lived
+    workspace that is badly misleading: a five-day-old restart storm renders as
+    a four-figure number beside a healthy current run, which reads as an
+    in-progress failure. The windows here are the same ones the table uses, so
+    the two now agree by construction.
+
+    The all-time count decides whether the row appears at all, preserving the
+    "no row when it would say nothing" contract (spec D-6, AC-11): a workspace
+    that has never had a transport restart renders no row.
 
     Args:
         log_path: Path to the orchestrator log (``generate_report``'s own
             ``log_path`` parameter).
+        session_start: Start of the current orchestrator session, or ``None``
+            to omit the session count.
+        report_started_at: Start of the report watch loop, or ``None`` (the
+            non-watch case) to omit the this-run count.
 
     Returns:
-        ``"Transport restarts        <n>"`` when at least one restart has
-        been logged; ``None`` otherwise.
+        The rendered row, or ``None`` when the log does not exist or holds no
+        restarts at all.
     """
     if not log_path.is_file():
         return None
-    count = _count_transport_restarts(log_path.read_text(encoding="utf-8"))
-    assert count >= 0, f"transport restart count is negative: {count} -- impossible by construction"
-    if count == 0:
+    timestamps = _transport_restart_timestamps(log_path)
+    all_time = _count_transport_restarts_since(timestamps, None)
+    assert all_time >= 0, f"transport restart count is negative: {all_time} -- impossible by construction"
+    if all_time == 0:
         return None
-    return f"Transport restarts        {count}"
+    parts = [f"{all_time} all-time"]
+    if session_start is not None:
+        parts.append(f"{_count_transport_restarts_since(timestamps, session_start)} session")
+    if report_started_at is not None:
+        parts.append(f"{_count_transport_restarts_since(timestamps, report_started_at)} this run")
+    return f"Transport restarts        {' / '.join(parts)}"
 
 
 def _optional_banner_rows(*rows: str | None) -> list[str]:
@@ -3261,11 +3317,6 @@ def generate_report(
         display_tz=banner_display_tz,
     )
 
-    # Transport-restart count row (issue #331 FR-4). Rendered only when
-    # non-None so a clean run (no in-process SDK-transport restarts logged)
-    # stays byte-identical to today (spec D-6, AC-11).
-    transport_restarts_row = transport_restarts_line(log_path)
-
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
     # cost-rate config (``REPORT_MODEL_RATES``, the cache + residency +
@@ -3349,6 +3400,22 @@ def generate_report(
     )
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
+
+    # Current-session boundary, resolved ONCE here and reused by both the
+    # transport-restart row below and the windowed table further down, so the
+    # row and the table's "Session" column can never disagree.
+    detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
+    session_start = detected_session if detected_session is not None else log_start_for_window
+
+    # Transport-restart row (issue #331 FR-4), counted per window against the
+    # same boundaries the table uses. Rendered only when the log holds at least
+    # one restart, so a clean workspace stays byte-identical to today
+    # (spec D-6, AC-11).
+    transport_restarts_row = transport_restarts_line(
+        log_path,
+        session_start=session_start,
+        report_started_at=report_started_at,
+    )
 
     # Issue #326 (FR-5): compute the full session segmentation ONCE, from the
     # same non-noise timestamp source the current-session detector already
@@ -3454,8 +3521,6 @@ def generate_report(
         windows: list[WindowSpec] = [
             WindowSpec(label="All-time", start=log_start_for_window, is_log_started=True),
         ]
-        detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
-        session_start = detected_session if detected_session is not None else log_start_for_window
         windows.append(WindowSpec(label="Session", start=session_start, is_log_started=False))
         if report_started_at is not None:
             windows.append(WindowSpec(label="This run", start=report_started_at, is_log_started=False))

@@ -823,6 +823,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   genuinely detects a duplicate and a gap rather than passing by
   construction.
 
+- **`docs/issue-provenance.md` -- the provenance map tying every integration-
+  reality gate to its issue and PR history** (spec
+  `integration-reality-gates-hardening.md` section 4.12, PM-secondary-2,
+  section 4.13; AC-3, AC-23, AC-24; AC-E2-F7-S1-T2-1 through -5). A single
+  five-column table (Gate, Internal Issue, Source PR, Devbench Issues, Spec
+  Section) maps each of the eight gates to its
+  `caylent-solutions/devbench-internal-backlog#10`-`#17` issue, its source
+  pull request `caylent-solutions/devbench#315`-`#322`, and its defining spec
+  section, plus rows for the `caylent-solutions/devbench#335`/`#336` harness
+  guard fixes and the five Section 15 follow-ups still awaiting an E11-filed
+  issue number. This table is the input E11's closure work units read to know
+  which issues, in which repo, to close. New
+  `tests/test_docs/test_issue_provenance.py` walks exactly six root/extension
+  pairs -- `docs/*.md`, `plugin/*.md`, `plugin/*.sh`, `plugin-authoring/*.md`,
+  `src/devbench/*.py` and `tests/*.py` -- plus `CHANGELOG.md` (a
+  directory-walk discovery, not a hard-coded file list, so a file a later
+  epic adds under one of those six pairs is covered automatically) for the
+  fully-qualified `devbench-internal-backlog#<N>` citation form and the
+  bare, zero-padded two-digit placeholder form the source PRs originally
+  carried, and asserts every one resolves against a row in the map,
+  confirming zero fabricated or unmapped internal-backlog citations remain
+  in the walked file set (AC-3); a seeded fabricated bare zero-padded
+  two-digit citation fails `find_unresolvable_citations`, and a seeded map
+  row citing a nonexistent spec section fails the new
+  `find_invalid_spec_sections` detector, proving both failure shapes the
+  source PRs and a drifted map row could produce are actually caught rather
+  than merely asserted. `parse_provenance_map` is the single annotated
+  helper every test case in the module uses to read the table, and it
+  raises naming the offending line when a data row is missing one of the
+  five required columns. JSON config surfaces such as
+  `src/devbench/config-schema.json` are outside the walked six pairs.
+
 ### Fixed
 
 - **A single Claude Agent SDK transport hiccup ended a multi-hour unattended

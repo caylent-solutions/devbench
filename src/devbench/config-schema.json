@@ -613,7 +613,7 @@
         },
         "newly_reachable_paths": {
           "type": "object",
-          "description": "newly-reachable-paths gate (caylent-solutions/devbench-internal-backlog#14). No gate-specific tunables beyond enabled.",
+          "description": "newly-reachable-paths gate (caylent-solutions/devbench-internal-backlog#15). No gate-specific tunables beyond enabled.",
           "additionalProperties": false,
           "properties": {
             "enabled": {
@@ -635,7 +635,7 @@
         },
         "layout_geometry": {
           "type": "object",
-          "description": "layout-geometry gate (caylent-solutions/devbench-internal-backlog#15). No gate-specific tunables beyond enabled.",
+          "description": "layout-geometry gate (caylent-solutions/devbench-internal-backlog#14). No gate-specific tunables beyond enabled.",
           "additionalProperties": false,
           "properties": {
             "enabled": {

@@ -409,11 +409,11 @@ validate:
 #     extract_source_literals: false    # reserved for a future literal-extraction scan mode
 #   write_path_audit:                   # caylent-solutions/devbench-internal-backlog#16
 #     enabled: false
-#   newly_reachable_paths:              # caylent-solutions/devbench-internal-backlog#14
+#   newly_reachable_paths:              # caylent-solutions/devbench-internal-backlog#15
 #     enabled: false
 #   composition_root:                   # caylent-solutions/devbench-internal-backlog#11
 #     enabled: false
-#   layout_geometry:                    # caylent-solutions/devbench-internal-backlog#15
+#   layout_geometry:                    # caylent-solutions/devbench-internal-backlog#14
 #     enabled: false
 #   repos:                              # optional per-repo override, field-wise merged over the project level
 #     caylent-solutions/devbench:

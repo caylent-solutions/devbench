@@ -781,6 +781,48 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
   the anchor contract and both suffixes.
 
+- **Rubric item numbering in `test-reviewer.md`, `code-reviewer.md` and the
+  `spec-to-backlog` SKILL renumbered once against the post-0.4.0 baseline,
+  and pinned structurally** (spec `integration-reality-gates-hardening.md`
+  section 4.11, PM-secondary-1; AC-12). The E1 cherry-pick tasks preserved
+  each source PR's own rubric item numbers verbatim (section 4.14: E1
+  preserves content, not numbering coherence), and since every PR was cut
+  from a pre-0.4.0 base, several insertions collided with each other and
+  with the shipped baseline: `test-reviewer.md`'s `COMPOSITION-ROOT /
+  REAL-ENTRY-POINT VERIFICATION` (issue #11) and `LAYOUT / VISUAL AC
+  VERIFICATION` (issue #14) sections both restarted at item 50, colliding
+  with the pre-existing `RED-GATE EVIDENCE` block; `code-reviewer.md`'s
+  `REACHABILITY` section (issue #10) restarted at item 53, colliding with
+  the pre-existing `BUG-FIX COMPLETENESS` block; and the `spec-to-backlog`
+  SKILL had duplicate items in Step 4b (issue #12 ancestry vs issue #16
+  write-path-audit), Step 5b (issue #228 baseline, issue #15
+  newly-reachable-paths, issue #16 write-path-audit, issue #11
+  composition-root and issue #14 layout all competing for items 12/13),
+  and its "Self-critique rubric for spec-to-backlog" reference section
+  (issue #12 vs issue #16, item 12). Every duplicate is renumbered forward
+  to the next free integer in file order; `test-reviewer.md`'s
+  `FIXTURE-CATALOG CONSISTENCY` block (already correctly at items 54-56)
+  and `code-reviewer.md`'s `BUG-FIX COMPLETENESS` block (already correctly
+  at items 53-56) are left untouched, matching the allocation table's
+  `test-reviewer items 54-56` / `code-reviewer items 53-55` anchors; the
+  SKILL's Step 4b, Step 5b and Step 7/self-critique-rubric duplicates
+  resolve to items 8-9, 13-15 (three of the five competing entries) and
+  12-13 respectively. Every internal cross-reference to a renumbered item
+  within these three files is updated in the same change; the external
+  `docs/composition-root-testing.md` "Step 5b item" citation is a
+  separate follow-up (E2-F7-S1-T3), since that file is outside this
+  change's Changes Manifest. Exit conditions that stated a bare item
+  count (`SKILL.md`'s "all 13 items scored PASS in Step 5b") now reference
+  "every item" generically, so a future rubric append cannot silently
+  leave a stale count behind. New structural test
+  `tests/test_plugin/test_rubric_numbering.py` asserts every rubric list
+  in the three files is unique, contiguous from 1 and monotonic in file
+  order, asserts the allocation-table anchors land on the correct content
+  (not just the correct number), asserts no exit condition states a bare
+  item count, and includes seeded-violation cases proving the extractor
+  genuinely detects a duplicate and a gap rather than passing by
+  construction.
+
 ### Fixed
 
 - **A single Claude Agent SDK transport hiccup ended a multi-hour unattended

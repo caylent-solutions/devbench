@@ -81,7 +81,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8832,6 +8832,127 @@ class _CmdStartArgs:
     daemon: bool = False
 
 
+def _assert_running_package_matches_its_venv() -> None:
+    """Fail fast when the venv in use is serving a DIFFERENT checkout's package.
+
+    Self-hosting means two checkouts publish a package named ``devbench``: the
+    harness that RUNS the orchestration and the target that it EDITS. A venv
+    records which one is importable in a single-line editable ``.pth``, so
+    installing one into the other's environment silently swaps which codebase
+    executes. :func:`_agent_environment` removes the usual cause; it cannot
+    remove the collision, because an operator, a Makefile or a future tool can
+    still re-point the install.
+
+    The invariant checked is "a venv serves the checkout it lives inside":
+    ``<checkout>/.venv`` should import ``<checkout>/src/devbench``. Comparing
+    the imported package against ``__file__`` instead would be circular -- this
+    module IS the package, so a re-pointed install relocates both and the
+    comparison always passes. ``sys.prefix`` is the one anchor that does not
+    move with the swap.
+
+    Silent when the layout does not apply (no ``src/devbench`` beside the venv,
+    e.g. a non-editable install or a packaged deployment): this exists to catch
+    one specific, well-understood corruption, not to police every install shape.
+    A false positive here would block startup for a workspace doing nothing
+    wrong, which is worse than the miss it guards against.
+
+    Raises:
+        RuntimeError: When both paths resolve and disagree, naming each one and
+            the repair, because the symptoms are otherwise nearly
+            undiagnosable: the harness begins running the target's code, so
+            config keys, CLI verbs and schemas silently disagree with the files
+            on disk.
+    """
+    checkout = Path(sys.prefix).resolve().parent
+    expected = checkout / "src" / "devbench"
+    if not expected.is_dir():
+        return
+    actual = Path(__file__).resolve().parent
+    if actual != expected:
+        raise RuntimeError(
+            f"devbench package re-point detected: the active environment lives in {checkout}, "
+            f"whose package is {expected}, but the code now running is {actual}. "
+            "Both checkouts in this self-hosted workspace publish a package named 'devbench', "
+            "so an install into the wrong environment rewrites the editable pointer and swaps "
+            f"which codebase executes. Repair: uv pip install -e {checkout} against that venv, "
+            "then restart. Prevention: see _agent_environment."
+        )
+
+
+#: Environment variables stripped from the environment handed to spawned agents.
+#: ``VIRTUAL_ENV`` is the load-bearing one -- see
+#: :func:`_agent_environment` for why it cannot be inherited.
+_AGENT_ENV_STRIPPED_VARS: tuple[str, ...] = ("VIRTUAL_ENV",)
+
+
+def _agent_environment(base_env: Mapping[str, str]) -> dict[str, str]:
+    """Return the environment for spawned agents, with unsafe vars removed.
+
+    The orchestrator is normally launched as ``uv run --project
+    harness/devbench ...``, and ``uv run`` EXPORTS ``VIRTUAL_ENV`` pointing at
+    the harness venv to its child. The daemon then hands its own environment to
+    the SDK unchanged, so every agent shell inherits it -- including agents
+    whose working directory is the TARGET repo.
+
+    That combination is destructive because this project is developed with
+    itself: the harness checkout and the target checkout both publish a package
+    named ``devbench``, and the harness venv records which one is importable in
+    a single-line ``_editable_impl_devbench.pth``. Any command that installs
+    into the ACTIVE environment (``uv pip install``, ``uv pip sync``, the
+    ``--active`` variants) therefore rewrites that pointer to the target's
+    ``src`` while an agent is merely doing ordinary work in the target repo.
+    The harness CLI then fails in a way that looks nothing like its cause: the
+    observed symptom was an ``orchestrate`` schema mismatch on
+    ``max_transport_restarts``, a key only the harness checkout defines. It was
+    hit and hand-repaired twice inside a single run before anyone connected it
+    to ``uv``.
+
+    Stripping ``VIRTUAL_ENV`` does not restrict agents. Project commands --
+    ``uv run pytest``, ``uv run ruff``, ``make validate`` -- resolve the
+    project's own ``.venv`` from the working directory, which is what an agent
+    in the target repo should be using anyway. Only the install-into-the-active
+    -environment commands change behaviour, and those now land in the target's
+    own venv instead of the harness's.
+
+    Preferred over a ``PreToolUse`` hook that blocks the dangerous verbs: this
+    removes the cause rather than policing the symptom, cannot block legitimate
+    work, and cannot be sidestepped by a command shape nobody enumerated
+    (``pip install``, ``python -m pip``, ``uv pip --python``, and so on).
+
+    Args:
+        base_env: The environment to derive from, normally ``os.environ``.
+
+    Returns:
+        A plain ``dict`` copy with :data:`_AGENT_ENV_STRIPPED_VARS` removed.
+        Absent names are not an error -- a directly-invoked interpreter never
+        sets ``VIRTUAL_ENV`` in the first place.
+    """
+    return {key: value for key, value in base_env.items() if key not in _AGENT_ENV_STRIPPED_VARS}
+
+
+def _drop_console_log_handlers_after_redirect() -> None:
+    """Detach console log handlers once std streams point at the log file.
+
+    Called by :func:`_daemonize_to_background` immediately after its ``dup2``
+    redirect. A ``StreamHandler`` on ``sys.stderr`` and the ``FileHandler`` on
+    the aggregate log are two handlers writing one file once fd 2 has been
+    pointed at that file, so every record is emitted twice.
+
+    ``logging.FileHandler`` subclasses ``logging.StreamHandler``, so the
+    isinstance test must exclude it explicitly -- removing file handlers here
+    would silence the daemon's log entirely rather than merely de-duplicate it.
+
+    Nothing stops being captured: genuine writes to fd 2 (uncaught tracebacks,
+    subprocess stderr) still reach the log through the redirect itself. Only
+    the logging module's second copy is dropped.
+    """
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            root_logger.removeHandler(handler)
+            handler.close()
+
+
 def _daemonize_to_background(workspace_root: Path) -> None:
     """Double-fork the current process into the background (#209 ``--daemon``).
 
@@ -8892,6 +9013,24 @@ def _daemonize_to_background(workspace_root: Path) -> None:
     os.dup2(log_fd, 2)
     os.close(null_fd)
     os.close(log_fd)
+
+    # fd 2 now points AT the log file, so the stderr StreamHandler that
+    # ``setup_logging`` attached and the FileHandler writing ``log_path`` have
+    # become two handlers on one file -- and every record is emitted twice.
+    # ``setup_logging`` runs at CLI entry, before this redirect, so it cannot
+    # see the collision coming; it already refuses to attach the per-session
+    # handler when that path equals the aggregate log, for exactly this reason.
+    # This is the same guard, applied to the case the redirect creates.
+    #
+    # Measured before the fix: 152,276 lines in one workspace's log against
+    # 78,191 distinct, i.e. ~1.93x, every day since the log began. One-shot CLI
+    # invocations were never affected (their stderr is the terminal), which is
+    # why the doubling only ever appeared under ``--daemon``.
+    #
+    # Only the logging module's duplicate copy goes away. Genuine writes to
+    # fd 2 -- uncaught tracebacks, subprocess stderr -- still land in the log
+    # through the dup2 above, so nothing stops being captured.
+    _drop_console_log_handlers_after_redirect()
 
 
 def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
@@ -9333,6 +9472,11 @@ def _setup_daemon_and_pid_file(parsed: _CmdStartArgs) -> None:
     """
     from devbench.instances import write_pid_file
 
+    # Checked BEFORE daemonising, so a re-pointed install fails on the
+    # operator's terminal rather than disappearing into the log of a run that
+    # is already executing the wrong codebase.
+    _assert_running_package_matches_its_venv()
+
     if parsed.daemon:
         _daemonize_to_background(WORKSPACE_ROOT)
     try:
@@ -9702,6 +9846,7 @@ def cmd_start(*argv: str) -> int:
                 options=ClaudeAgentOptions(
                     plugins=[{"type": "local", "path": str(plugin_path)}],
                     permission_mode="bypassPermissions",
+                    env=_agent_environment(os.environ),
                 ),
             ),
         )

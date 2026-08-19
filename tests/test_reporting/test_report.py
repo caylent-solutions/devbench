@@ -6045,6 +6045,89 @@ class TestTransportRestartsLine:
             report_module.transport_restarts_line(log_file)
 
 
+class TestTransportRestartDeduplication:
+    """The orchestrator log emits every record twice (~1.93x measured across
+    five days of one workspace's log), so raw match counting reported roughly
+    double the real restarts. That is read against a cap, so an inflated count
+    misleads about how close a run is to halting."""
+
+    def test_byte_identical_duplicate_emission_counts_once(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        line = _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([line, line]))  # the doubling the orchestrator actually produces
+
+        assert transport_restarts_line(log_file) == "Transport restarts        1 all-time"
+
+    def test_the_real_world_doubling_pattern_is_halved(self, tmp_path: Path) -> None:
+        """Reproduces the observed shape: each restart written twice, in order."""
+        from devbench.reporting.report import transport_restarts_line
+
+        entries = []
+        for attempt, stamp in ((1, "2026-08-18T17:41:28Z"), (2, "2026-08-18T17:44:49Z")):
+            line = _transport_restart_log_line_with_backoff(attempt, 14, float(2 ** (attempt - 1)), stamp)
+            entries.extend([line, line])
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(entries))
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_distinct_restarts_sharing_a_second_are_both_counted(self, tmp_path: Path) -> None:
+        """De-duplication keys on the WHOLE record, not the timestamp: two
+        restarts in the same second with different ordinals are two restarts."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z"),
+                    _transport_restart_log_line_with_backoff(2, 14, 2.0, "2026-08-18T17:41:28Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_same_ordinal_in_a_later_second_is_a_separate_restart(self, tmp_path: Path) -> None:
+        """A fresh run restarts at attempt=1 again; a different timestamp keeps
+        it distinct, so a long-lived log does not collapse runs together."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z"),
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-19T03:10:00Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_dedup_applies_within_each_window_not_just_all_time(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        dupe = _transport_restart_log_line_with_backoff(3, 14, 4.0, "2026-08-18T18:00:00Z")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T01:00:00Z"),
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T01:00:00Z"),
+                    dupe,
+                    dupe,
+                ]
+            )
+        )
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 18, 12, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        2 all-time / 1 session"
+
+
 class TestCountTransportRestartsSince:
     """Direct unit tests for the pure windowing function, independent of file I/O."""
 

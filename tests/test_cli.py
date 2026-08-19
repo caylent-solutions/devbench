@@ -8030,6 +8030,185 @@ class TestShouldRestartAfterTransportError:
         assert result is False
 
 
+class TestAgentEnvironment:
+    """Agents must not inherit the orchestrator's VIRTUAL_ENV.
+
+    `uv run --project harness/devbench` exports VIRTUAL_ENV pointing at the
+    harness venv, and the daemon hands its environment to the SDK unchanged.
+    An agent then working in the TARGET repo runs with the HARNESS venv active,
+    so any install-into-active-env command rewrites the harness's editable
+    pointer -- both checkouts publish a package named `devbench`.
+    """
+
+    @pytest.mark.unit
+    def test_virtual_env_is_stripped(self) -> None:
+        result = cli._agent_environment({"VIRTUAL_ENV": "/harness/.venv", "PATH": "/usr/bin"})
+
+        assert "VIRTUAL_ENV" not in result
+
+    @pytest.mark.unit
+    def test_every_other_variable_is_preserved(self) -> None:
+        """Stripping must be surgical: agents need the rest of the environment,
+        notably GH_TOKEN and the devbench workspace vars."""
+        base = {
+            "VIRTUAL_ENV": "/harness/.venv",
+            "PATH": "/usr/bin",
+            "GH_TOKEN": "secret",
+            "DEVBENCH_WORKSPACE_ROOT": "/ws",
+            "HOME": "/home/vscode",
+        }
+
+        result = cli._agent_environment(base)
+
+        assert result == {k: v for k, v in base.items() if k != "VIRTUAL_ENV"}
+
+    @pytest.mark.unit
+    def test_absent_virtual_env_is_not_an_error(self) -> None:
+        """A directly-invoked interpreter never sets VIRTUAL_ENV."""
+        base = {"PATH": "/usr/bin"}
+
+        assert cli._agent_environment(base) == base
+
+    @pytest.mark.unit
+    def test_returns_a_plain_dict_copy_not_the_original(self) -> None:
+        """The SDK takes dict[str, str]; mutating the result must not touch os.environ."""
+        base = {"PATH": "/usr/bin"}
+
+        result = cli._agent_environment(base)
+        result["INJECTED"] = "x"
+
+        assert "INJECTED" not in base
+
+
+class TestAssertRunningPackageMatchesItsVenv:
+    """A venv serves the checkout it lives inside. When it stops doing so, the
+    harness silently begins running the target's code and every schema, config
+    key and CLI verb disagrees with the files on disk."""
+
+    @pytest.mark.unit
+    def test_passes_on_the_real_install(self) -> None:
+        """The suite itself runs from a correctly-installed harness venv."""
+        cli._assert_running_package_matches_its_venv()
+
+    @pytest.mark.unit
+    def test_raises_when_the_venv_belongs_to_another_checkout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other = tmp_path / "other-checkout"
+        (other / "src" / "devbench").mkdir(parents=True)
+        monkeypatch.setattr(cli.sys, "prefix", str(other / ".venv"))
+
+        with pytest.raises(RuntimeError, match="re-point detected"):
+            cli._assert_running_package_matches_its_venv()
+
+    @pytest.mark.unit
+    def test_error_names_both_paths_and_the_repair(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The symptoms are undiagnosable, so the message has to carry the diagnosis."""
+        other = tmp_path / "other-checkout"
+        (other / "src" / "devbench").mkdir(parents=True)
+        monkeypatch.setattr(cli.sys, "prefix", str(other / ".venv"))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            cli._assert_running_package_matches_its_venv()
+
+        message = str(excinfo.value)
+        assert str(other / "src" / "devbench") in message
+        assert str(Path(cli.__file__).resolve().parent) in message
+        assert "uv pip install -e" in message
+
+    @pytest.mark.unit
+    def test_silent_when_the_layout_does_not_apply(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-editable or packaged install has no src/devbench beside the
+        venv. Blocking startup there would fail a workspace doing nothing wrong."""
+        monkeypatch.setattr(cli.sys, "prefix", str(tmp_path / "no-src" / ".venv"))
+
+        cli._assert_running_package_matches_its_venv()
+
+
+class TestDropConsoleLogHandlersAfterRedirect:
+    """Daemon mode redirects fd 2 at the aggregate log, which turns the stderr
+    StreamHandler and the aggregate FileHandler into two handlers on one file.
+
+    Every record was therefore written twice under ``--daemon``: one workspace's
+    log measured 152,276 lines against 78,191 distinct (~1.93x) on every day
+    since it began. One-shot CLI invocations were never affected, their stderr
+    being a terminal, which is why the doubling only ever showed under daemon.
+    """
+
+    @staticmethod
+    def _isolated_root(monkeypatch: pytest.MonkeyPatch) -> logging.Logger:
+        """Give the test its own root-logger handler list to mutate."""
+        root = logging.getLogger()
+        monkeypatch.setattr(root, "handlers", [], raising=False)
+        return root
+
+    @pytest.mark.unit
+    def test_stderr_stream_handler_is_removed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._isolated_root(monkeypatch)
+        stderr_handler = logging.StreamHandler()
+        root.addHandler(stderr_handler)
+
+        cli._drop_console_log_handlers_after_redirect()
+
+        assert stderr_handler not in root.handlers
+
+    @pytest.mark.unit
+    def test_file_handler_survives(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FileHandler subclasses StreamHandler, so a naive isinstance check
+        would strip it and silence the daemon's log completely."""
+        root = self._isolated_root(monkeypatch)
+        file_handler = logging.FileHandler(str(tmp_path / "orchestrator.log"), encoding="utf-8")
+        root.addHandler(file_handler)
+        try:
+            cli._drop_console_log_handlers_after_redirect()
+
+            assert file_handler in root.handlers, "the log's own file handler must never be dropped"
+        finally:
+            file_handler.close()
+
+    @pytest.mark.unit
+    def test_mixed_handler_set_keeps_exactly_the_file_handlers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real daemon shape: stderr console handler plus the aggregate and
+        per-session file handlers. Only the console one goes."""
+        root = self._isolated_root(monkeypatch)
+        stderr_handler = logging.StreamHandler()
+        aggregate = logging.FileHandler(str(tmp_path / "orchestrator.log"), encoding="utf-8")
+        session = logging.FileHandler(str(tmp_path / "session.log"), encoding="utf-8")
+        for handler in (stderr_handler, aggregate, session):
+            root.addHandler(handler)
+        try:
+            cli._drop_console_log_handlers_after_redirect()
+
+            assert root.handlers == [aggregate, session]
+        finally:
+            aggregate.close()
+            session.close()
+
+    @pytest.mark.unit
+    def test_is_idempotent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._isolated_root(monkeypatch)
+        aggregate = logging.FileHandler(str(tmp_path / "orchestrator.log"), encoding="utf-8")
+        root.addHandler(logging.StreamHandler())
+        root.addHandler(aggregate)
+        try:
+            cli._drop_console_log_handlers_after_redirect()
+            cli._drop_console_log_handlers_after_redirect()
+
+            assert root.handlers == [aggregate]
+        finally:
+            aggregate.close()
+
+    @pytest.mark.unit
+    def test_no_console_handler_present_is_a_no_op(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._isolated_root(monkeypatch)
+
+        cli._drop_console_log_handlers_after_redirect()
+
+        assert root.handlers == []
+
+
 class TestTransportRestartBackoffSeconds:
     """Direct unit tests for ``_transport_restart_backoff_seconds``.
 

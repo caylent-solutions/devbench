@@ -1634,19 +1634,43 @@ def _transport_restart_timestamps(log_path: Path) -> list[datetime]:
     unrelated SDK payload is not a restart -- the same echoed-text hazard
     ``event_index.py``'s ``_TASK_TRANSITION_RE`` guards against.
 
+    **Byte-identical records are counted once.** The orchestrator log carries
+    every record twice: measured across five separate days of one workspace's
+    log, line-initial ``[devbench.*]`` records ran ~1.93x their distinct count
+    on every day. Counting raw matches therefore reported roughly double the
+    restarts that actually happened -- which is worse than a cosmetic error now
+    that the number is read against a cap: a reader seeing "12 of 14" would
+    believe the run was two restarts from halting when it was six from it.
+    De-duplication lives here, at the read, because the doubling is already
+    baked into hundreds of megabytes of existing log; fixing whatever emits
+    twice cannot retroactively correct a single historical count.
+
+    The de-duplication key is the whole record -- timestamp, attempt ordinal,
+    cap and backoff. Two GENUINE restarts collide only if they share a
+    wall-clock second AND an attempt ordinal, which within one run is
+    impossible (the ordinal strictly increments) and across concurrent runs on
+    one workspace is vanishingly unlikely. That residual risk undercounts by
+    one in a case that should not occur; the alternative overcounts by 2x in
+    the case that always occurs.
+
     Args:
         log_path: Path to the orchestrator log.
 
     Returns:
         Timestamps in file order (chronological for an append-only log), each
-        timezone-aware in UTC. Empty when the log holds no restart lines.
+        timezone-aware in UTC, one per distinct restart record. Empty when the
+        log holds no restart lines.
     """
     timestamps: list[datetime] = []
+    seen_records: set[str] = set()
     with log_path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
-            match = _TRANSPORT_RESTART_LOG_LINE_RE.match(raw_line.rstrip("\n"))
-            if match is not None:
-                timestamps.append(datetime.strptime(match.group("timestamp"), LOG_DATE_FORMAT).replace(tzinfo=UTC))
+            record = raw_line.rstrip("\n")
+            match = _TRANSPORT_RESTART_LOG_LINE_RE.match(record)
+            if match is None or record in seen_records:
+                continue
+            seen_records.add(record)
+            timestamps.append(datetime.strptime(match.group("timestamp"), LOG_DATE_FORMAT).replace(tzinfo=UTC))
     return timestamps
 
 

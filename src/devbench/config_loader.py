@@ -1421,8 +1421,12 @@ class RuntimeConfig:
         max_executor_retries: Maximum executor retry attempts per work unit
             when judge reviews fail.
         display_timezone: IANA timezone name applied by every devbench
-            command that renders timestamps (report, hook-tail, watch).
-            ``None`` means OS local timezone. Per-command overrides
+            command that renders timestamps (report, hook-tail, watch) and
+            by work-unit audit comments. ``None`` means OS local timezone
+            for the terminal-rendering commands, and UTC for work-unit
+            comments -- those are committed and read on other machines, so
+            following the runner's local zone would make one file's
+            timestamps depend on who wrote each line. Per-command overrides
             (env vars, CLI flags, or the legacy ``report.display_timezone``)
             take precedence over this top-level setting.
         log_file: Workspace-relative path to the orchestrator's

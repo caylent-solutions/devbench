@@ -21,7 +21,7 @@ see the [Glossary section in docs/architecture.md](architecture.md#12-glossary).
 | `session` | lower-case | A named orchestrator process with its own scope, drain marker, log file, report cache, and PID file under `<workspace>/.devbench/sessions/<name>/`. The implicit session name when `--name` is omitted is `default`. |
 | `marketplace plugin` | two words, lower-case | The `devbench` Claude Code plugin published with a manifest sufficient for discovery via `claude plugin marketplace`. Hosts the four onboarding skills. |
 | `skill` | lower-case | A single conversational capability inside the marketplace plugin (e.g., `create-spec`, `spec-to-backlog`, `bootstrap-environment`, `configure-devbench`). |
-| `audit comment` | two words, lower-case | A timestamped row appended to a work-unit file's `## Comments` section. Used by classifiers, reports, and the done-gate. Format: `[YYYY-MM-DD HH:MM UTC] [author] [TAG] message`. |
+| `audit comment` | two words, lower-case | A timestamped row appended to a work-unit file's `## Comments` section. Used by classifiers, reports, and the done-gate. Format: `[YYYY-MM-DD HH:MM ZONE] [author] [TAG] message`, where ZONE is the workspace's `display_timezone` abbreviation, or `UTC` when unset. |
 
 ---
 

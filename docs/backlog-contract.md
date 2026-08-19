@@ -253,6 +253,41 @@ value `behavior-fix` into every newly created Task, so the default
 path and the explicit declaration converge on the same value for
 freshly authored Tasks.
 
+**Task-factory drafts declare an inferred type.** A Task materialised
+from a proposal cannot rely on the `behavior-fix` default, because the
+proposal that produced it may well be a test-only, docs-only or
+chore-only remediation -- and the default's production-source
+invariant would then reject a Task that is correct as written. Nothing
+in devbench writes a `## Task Type:` section after materialisation, so
+such a Task would stay stuck until a human edited the file by hand.
+`infer_task_type` in `src/devbench/backlog/proposal.py` closes that:
+it derives the declaration from the Changes Manifest the factory is
+about to write, and the draft carries it from the moment it is
+created.
+
+Inference reuses `BacklogManager`'s own classifiers and its
+`_TASK_TYPE_ROW_INVARIANTS` table rather than restating the rules, so
+the factory and the validator cannot drift apart -- the same
+prohibition on a second, independent path classifier that
+`_is_test_source_path` documents. Because those classifiers read
+`validate.production_source_paths` and
+`validate.production_source_extensions`, the inferred type follows
+whatever layout the workspace declares and assumes nothing about any
+particular repository. Resolution order:
+
+1. Any production-source row keeps the gated `behavior-fix` default.
+   Inference never moves a Task out of the RED gate.
+2. Otherwise the first non-gated type whose per-row invariant accepts
+   every row wins, checked in the order the taxonomy narrows:
+   `test-only`, `docs`, `chore`.
+3. With no real rows to judge -- a sentinel-only Manifest whose paths
+   the amendment workflow concretises at execution time -- no row
+   claim can be made honestly, so `refactor` is declared. It is the
+   one type with no Manifest invariant, and therefore the only
+   declaration that stays valid both before and after those paths
+   resolve. The draft's "review and edit before promoting" banner is
+   what asks a human to revisit it once the real file list exists.
+
 Terminal Tasks (`done` or `declined`) are skipped by rule 21
 entirely, regardless of whether they declare a `## Task Type:`
 section: a Task that has already reached a terminal status cannot be

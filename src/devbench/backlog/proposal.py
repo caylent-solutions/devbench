@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
+from devbench.comment_time import comment_timestamp
 from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     DEPENDENCY_NONE_VALUES,
@@ -52,6 +52,11 @@ from devbench.constants import (
     STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
+    TASK_TYPE_BEHAVIOR_FIX,
+    TASK_TYPE_CHORE,
+    TASK_TYPE_DOCS,
+    TASK_TYPE_REFACTOR,
+    TASK_TYPE_TEST_ONLY,
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
@@ -1350,6 +1355,8 @@ DRAFT_TEMPLATE: str = """\
 
 ## Status: {status}
 
+## Task Type: {task_type}
+
 ## Target Repository
 
 - **Repo:** `{repo}`
@@ -1424,6 +1431,72 @@ def manifest_change_verb(repo: str, path: str) -> str:
         return "modify"
 
 
+def infer_task_type(manifest_paths: Sequence[str]) -> str:
+    """Return the task type whose Manifest invariant ``manifest_paths`` satisfies.
+
+    A materialised draft that declares no ``## Task Type:`` section is not
+    neutral: ``validate-backlog`` defaults an absent declaration to
+    ``behavior-fix``, the strictest type, which requires at least one
+    production-source row. A proposal whose remediation is test-only,
+    documentation-only or chore-only therefore materialises into a work unit
+    that can never validate, and no command writes the section after the fact,
+    so the unit stays stuck until a human edits the file by hand.
+
+    Inference removes that failure mode by deriving the declaration from the
+    Changes Manifest the factory is about to write. It reuses
+    :class:`~devbench.backlog.manager.BacklogManager`'s own classifiers and its
+    ``_TASK_TYPE_ROW_INVARIANTS`` table rather than restating the rules, so the
+    factory and the validator cannot drift apart -- the same prohibition on a
+    second, independent path classifier that ``_is_test_source_path`` documents.
+    Because those classifiers read ``validate.production_source_paths`` and
+    ``validate.production_source_extensions``, inference follows whatever layout
+    the workspace declares and assumes nothing about any particular repository.
+
+    Resolution order:
+
+    1. Any production-source row means the work changes shipped behaviour, so
+       the gated ``behavior-fix`` default stands. Inference never moves a task
+       out of the RED gate.
+    2. Otherwise the first non-gated type whose per-row invariant accepts every
+       row wins, checked in the order the taxonomy narrows: ``test-only``,
+       ``docs``, ``chore``.
+    3. With no real rows to judge -- a Manifest holding only sentinels, whose
+       paths the amendment workflow concretises at execution time -- no row
+       claim can be made honestly. ``refactor`` is the one type the validator
+       exempts from a Manifest invariant entirely, so it is the only
+       declaration that stays valid both before and after those paths resolve.
+       The draft's own "review and edit before promoting" banner is what asks a
+       human to revisit it once the real file list exists.
+
+    Args:
+        manifest_paths: The Changes Manifest rows about to be written. Sentinel
+            rows are ignored, since they name no file to classify.
+
+    Returns:
+        One member of :data:`~devbench.constants.VALID_TASK_TYPES`.
+    """
+    from devbench.backlog.manager import BacklogManager
+
+    real_paths = [path for path in manifest_paths if BacklogManager._is_real_manifest_path(path)]
+    if not real_paths:
+        return TASK_TYPE_REFACTOR
+    if any(BacklogManager._is_production_source(path) for path in real_paths):
+        return TASK_TYPE_BEHAVIOR_FIX
+
+    for candidate in (TASK_TYPE_TEST_ONLY, TASK_TYPE_DOCS, TASK_TYPE_CHORE):
+        classifier_names, _description = BacklogManager._TASK_TYPE_ROW_INVARIANTS[candidate]
+        classifiers = [getattr(BacklogManager, name) for name in classifier_names]
+        if all(any(classifier(path) for classifier in classifiers) for path in real_paths):
+            return candidate
+
+    # Rows that are neither production source nor accepted by any non-gated
+    # type's invariant -- a Manifest mixing, say, a documentation file with a
+    # lockfile. No per-row type fits, and claiming a gated one would fail the
+    # production-source check, so the invariant-free type is again the only
+    # declaration that validates.
+    return TASK_TYPE_REFACTOR
+
+
 def generate_draft_md(
     proposed: ProposedTask,
     *,
@@ -1463,6 +1536,7 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=manifest_lines,
+        task_type=infer_task_type(proposed.files_to_own),
     )
 
 
@@ -2080,7 +2154,7 @@ def _append_promote_comment(
     accept path to record that no human pressed the button. Default empty
     preserves pre-ADR-11 byte-identical audit output.
     """
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     suffix = f" {audit_suffix.strip()}" if audit_suffix.strip() else ""
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
@@ -2116,7 +2190,7 @@ def _append_manual_dep_comment(
     Idempotent: callers pass a source file already verified to not contain
     the marker; this helper only does the write.
     """
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     reason_body = f": {reason}" if reason else ""
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
@@ -2447,7 +2521,7 @@ def _reject_unmaterialised_proposal(
 
     source_file = _find_source_task_file(backlog_root, backlog_index, source_task_id)
     if source_file is not None:
-        timestamp_human = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        timestamp_human = comment_timestamp()
         message = f"[PROPOSAL_JSON_REJECTED] {source_task_id} rejected (un-materialised): {reason}"
         entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp_human, name="task_factory", message=message)
         content = source_file.read_text(encoding="utf-8")
@@ -2462,7 +2536,7 @@ def _reject_unmaterialised_proposal(
 
 def _append_reject_audit_comment(source_file: Path, task_id: str, reason: str) -> None:
     """Write a ``[PROPOSAL_REJECTED]`` audit line to the source task."""
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     message = f"[PROPOSAL_REJECTED] {task_id} rejected: {reason}"
     entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp, name="task_factory", message=message)
     content = source_file.read_text(encoding="utf-8")

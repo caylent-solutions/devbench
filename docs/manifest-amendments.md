@@ -107,9 +107,9 @@ Removing every row is refused -- a unit that declares no files has nothing to ve
 
 Every amendment action leaves a timestamped entry in the work-unit `## Comments` section:
 
-- On apply: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_APPLIED] <reason>; added N file(s); justification: <...>`
+- On apply: `[YYYY-MM-DD HH:MM ZONE] [agent/manifest-amender] [AMENDMENT_APPLIED] <reason>; added N file(s); justification: <...>`
 - On apply with removals, the same row also names them: `... added N file(s); removed M row(s): <paths>; justification: <...>`. A dropped row changes what the unit is allowed to commit, so it is never invisible in the audit trail.
-- On reject: `[YYYY-MM-DD HH:MM UTC] [agent/manifest-amender] [AMENDMENT_REJECTED] <reason>; rejected: <...>`
+- On reject: `[YYYY-MM-DD HH:MM ZONE] [agent/manifest-amender] [AMENDMENT_REJECTED] <reason>; rejected: <...>`
 
 The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent.
 

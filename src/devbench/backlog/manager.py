@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from devbench.backlog.work_unit import WorkUnitType
+from devbench.comment_time import comment_timestamp
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
@@ -50,7 +51,6 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
@@ -1813,7 +1813,7 @@ class BacklogManager:
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
         # Write audit comment to parent work unit
-        timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        timestamp = comment_timestamp()
         rollup_comment = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name="orchestrator",
@@ -2198,7 +2198,9 @@ class BacklogManager:
     def _append_agent_comment(self, work_unit_path: Path, agent_name: str, message: str) -> None:
         """Append an agent comment using COMMENT_AGENT_TEMPLATE format.
 
-        Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<agent_name>] <message>``
+        Writes: ``[YYYY-MM-DD HH:MM ZONE] [agent/<agent_name>] <message>``, where
+        ZONE is the workspace's ``display_timezone`` abbreviation, or ``UTC``
+        when unset.
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.

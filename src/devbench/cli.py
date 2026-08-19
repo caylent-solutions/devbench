@@ -188,6 +188,7 @@ from devbench.backlog.work_unit import (
     WorkUnitStatus,
     WorkUnitType,
 )
+from devbench.comment_time import comment_timestamp
 from devbench.config import (
     AGENT_MODELS,
     BACKLOG_INDEX,
@@ -226,7 +227,6 @@ from devbench.constants import (
     BACKLOG_STATUS_RE,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
@@ -912,8 +912,14 @@ _LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
 )
 # Fallback: agent-comment audit row of the form
 #   [2026-05-02 12:34 UTC] [agent/orchestrator] Set <id> to 'in-progress'
+# The zone token is captured rather than pinned to "UTC": comments are stamped
+# in the workspace's ``display_timezone`` when one is set, so a workspace that
+# configures it would otherwise stop matching here and lose the duration
+# readout entirely. Files written before that setting existed still carry
+# "UTC" and keep matching unchanged.
 _AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
-    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+UTC\][^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(?P<zone>[A-Za-z0-9_+\-]+)\]"
+    r"[^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
 )
 
 
@@ -959,6 +965,39 @@ def _latest_log_in_progress_ts(task_id: str, log_path: Path | None) -> datetime 
     return latest
 
 
+def _audit_timestamp_to_utc(raw: str, zone_token: str) -> datetime:
+    """Convert one audit-comment timestamp to UTC, honouring the zone it names.
+
+    The comment header carries a zone abbreviation rather than an offset, and
+    abbreviations are not globally unique, so this resolves it the only way
+    that is sound: ``UTC`` means UTC, and anything else is read in the
+    workspace's configured comment zone, which is the zone that wrote it. That
+    keeps files written before ``display_timezone`` was honoured -- all of them
+    stamped ``UTC`` -- parsing correctly regardless of what the workspace
+    configures later.
+
+    Args:
+        raw: The ``YYYY-MM-DD HH:MM`` portion of the header.
+        zone_token: The zone abbreviation that followed it.
+
+    Returns:
+        The instant as an aware UTC datetime.
+
+    Raises:
+        ValueError: ``raw`` is not in the expected shape. Callers skip the row
+            rather than failing, matching the surrounding best-effort reads.
+    """
+    # ``fromisoformat`` rather than ``strptime``: the header portion is already
+    # an ISO-8601 date-time, and parsing it as one keeps the value naive without
+    # a format string that claims an offset the text does not carry.
+    naive = datetime.fromisoformat(raw)
+    if zone_token.upper() == "UTC":
+        return naive.replace(tzinfo=UTC)
+    from devbench.comment_time import resolve_comment_timezone
+
+    return naive.replace(tzinfo=resolve_comment_timezone()).astimezone(UTC)
+
+
 def _latest_audit_in_progress_ts(task_id: str) -> datetime | None:
     """Return the most recent in-progress audit-comment timestamp for the task."""
     wu_file = _resolve_unit_file_by_id(task_id)
@@ -973,7 +1012,7 @@ def _latest_audit_in_progress_ts(task_id: str) -> datetime | None:
         if match.group("id") != task_id:
             continue
         try:
-            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+            ts = _audit_timestamp_to_utc(match.group("ts"), match.group("zone"))
         except ValueError:
             continue
         if latest is None or ts > latest:
@@ -4790,7 +4829,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
 
     action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
     agent_id = f"judge/{judge_name}"
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     entry = COMMENT_ENTRY_TEMPLATE.format(
         timestamp=timestamp,
         agent_id=agent_id,
@@ -4834,7 +4873,8 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
 def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
     """Append a non-verdict agent comment to the work unit's Comments section.
 
-    Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<name>] <message>``
+    Writes: ``[YYYY-MM-DD HH:MM ZONE] [agent/<name>] <message>``, where ZONE
+    is the workspace's ``display_timezone`` abbreviation, or ``UTC`` when unset.
 
     Use for non-judge actors (executor, blocker-resolver, review-supervisor summary)
     that need to log progress without emitting a REVIEW_PASS/REVIEW_FAIL token.
@@ -4859,7 +4899,7 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
 
     wu_file = _resolve_work_unit_file(unit)
 
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
         name=agent_name,

@@ -145,7 +145,7 @@ class WorkUnit:
 
         Format::
 
-            <!-- [YYYY-MM-DD HH:MM UTC] [agent_id] [action] message -->
+            <!-- [YYYY-MM-DD HH:MM ZONE] [agent_id] [action] message -->
 
         If the ``## Comments`` section does not exist it is created at the
         end of the file.

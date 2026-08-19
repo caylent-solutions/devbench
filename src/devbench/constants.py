@@ -834,7 +834,11 @@ DEFAULT_LOG_FILENAME: str = "orchestrator.log"
 # ---------------------------------------------------------------------------
 # Comment timestamp format (used in work-unit Comments entries)
 # ---------------------------------------------------------------------------
-COMMENT_TIMESTAMP_FORMAT: str = "%Y-%m-%d %H:%M UTC"
+# ``%Z`` rather than a literal "UTC": comments are stamped in the workspace's
+# ``display_timezone`` when one is set, so the header has to name the zone it
+# actually used. Unset, the zone resolves to UTC and the rendered text is
+# byte-identical to what earlier versions wrote.
+COMMENT_TIMESTAMP_FORMAT: str = "%Y-%m-%d %H:%M %Z"
 
 # ---------------------------------------------------------------------------
 # Git message templates for finalize operations

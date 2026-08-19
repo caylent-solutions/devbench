@@ -35,6 +35,7 @@ from devbench.backlog.proposal import (
     allocate_next_ids,
     delete_proposal,
     generate_draft_md,
+    infer_task_type,
     list_proposals,
     materialise_proposal,
     promote_all_from_source,
@@ -45,7 +46,15 @@ from devbench.backlog.proposal import (
     scan_story_for_task_ids,
     write_proposal,
 )
-from devbench.constants import STATUS_PROPOSED
+from devbench.constants import (
+    STATUS_PROPOSED,
+    TASK_TYPE_BEHAVIOR_FIX,
+    TASK_TYPE_CHORE,
+    TASK_TYPE_DOCS,
+    TASK_TYPE_REFACTOR,
+    TASK_TYPE_TEST_ONLY,
+    VALID_TASK_TYPES,
+)
 
 # ---------------------------------------------------------------------------
 # Shared fixture builders
@@ -4773,3 +4782,120 @@ class TestFindDraftFileResolvesAnywhere:
         assert "duplicate work-unit file" in msg
         assert "2 files carry this ID" in msg
         assert "validate-backlog" in msg
+
+
+# ---------------------------------------------------------------------------
+# infer_task_type / the materialised draft's Task Type declaration
+# ---------------------------------------------------------------------------
+
+
+class TestInferTaskType:
+    """The factory must declare a type whose Manifest invariant the draft satisfies.
+
+    An absent ``## Task Type:`` defaults to ``behavior-fix``, which is gated and
+    demands at least one production-source row. A proposal whose remediation is
+    test-only, docs-only or chore-only therefore materialises into a task that
+    can never pass ``validate-backlog``, and no CLI writes the section
+    afterwards. Inference closes that by deriving the type from the Manifest
+    devbench is about to write, reusing the validator's own classifiers so the
+    two can never disagree.
+    """
+
+    def test_production_source_yields_the_gated_default(self) -> None:
+        """A real production change must stay gated -- inference never weakens the RED gate."""
+        assert infer_task_type(["src/devbench/thing.py"]) == TASK_TYPE_BEHAVIOR_FIX
+
+    def test_production_source_wins_over_accompanying_tests(self) -> None:
+        assert infer_task_type(["src/devbench/thing.py", "tests/test_thing.py"]) == TASK_TYPE_BEHAVIOR_FIX
+
+    def test_test_only_manifest_yields_test_only(self) -> None:
+        assert infer_task_type(["tests/test_thing.py"]) == TASK_TYPE_TEST_ONLY
+
+    def test_several_test_rows_yield_test_only(self) -> None:
+        assert infer_task_type(["tests/conftest.py", "tests/test_a.py", "tests/test_b.py"]) == TASK_TYPE_TEST_ONLY
+
+    def test_documentation_only_manifest_yields_docs(self) -> None:
+        assert infer_task_type(["docs/guide.md"]) == TASK_TYPE_DOCS
+
+    def test_chore_only_manifest_yields_chore(self) -> None:
+        assert infer_task_type(["pyproject.toml"]) == TASK_TYPE_CHORE
+
+    def test_unknown_file_set_yields_the_type_with_no_manifest_invariant(self) -> None:
+        """A deferred sentinel resolves its paths at execution, so no row claim can be made.
+
+        ``refactor`` is the only type the validator exempts from a Manifest
+        invariant, so it is the one declaration that stays valid both before and
+        after the amendment workflow concretises the real file list.
+        """
+        assert infer_task_type([]) == TASK_TYPE_REFACTOR
+
+    def test_sentinel_rows_are_not_mistaken_for_real_paths(self) -> None:
+        assert infer_task_type(["<source-drift-fix-targets-determined-at-execution>"]) == TASK_TYPE_REFACTOR
+
+    def test_every_inferred_type_is_a_recognised_taxonomy_value(self) -> None:
+        """Whatever is inferred must be a value validate-backlog accepts."""
+        manifests = [
+            ["src/devbench/thing.py"],
+            ["tests/test_thing.py"],
+            ["docs/guide.md"],
+            ["pyproject.toml"],
+            [],
+        ]
+        for manifest in manifests:
+            assert infer_task_type(manifest) in VALID_TASK_TYPES
+
+
+class TestGeneratedDraftDeclaresATaskType:
+    """End-to-end: the rendered draft carries a type the validator will accept."""
+
+    @staticmethod
+    def _task(files: list[str]) -> ProposedTask:
+        return ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="My Task",
+            files_to_own=files,
+            linked_scenarios=[],
+            suggested_acs=["AC-FUNC-001 foo"],
+            suggested_approach="Do the thing.",
+        )
+
+    def test_draft_declares_a_task_type_section(self) -> None:
+        md = generate_draft_md(
+            self._task(["tests/test_thing.py"]),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
+        )
+        assert any(line.startswith("## Task Type:") for line in md.splitlines())
+
+    def test_test_only_proposal_declares_test_only(self) -> None:
+        """The regression this fix exists for: previously this rendered no type at
+        all, defaulted to behavior-fix, and failed the production-source invariant."""
+        md = generate_draft_md(
+            self._task(["tests/test_thing.py"]),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
+        )
+        assert f"## Task Type: {TASK_TYPE_TEST_ONLY}" in md
+
+    def test_production_proposal_declares_the_gated_type(self) -> None:
+        md = generate_draft_md(
+            self._task(["src/devbench/thing.py"]),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
+        )
+        assert f"## Task Type: {TASK_TYPE_BEHAVIOR_FIX}" in md
+
+    def test_task_type_is_declared_directly_beneath_status(self) -> None:
+        """The canonical section order the backlog contract specifies."""
+        md = generate_draft_md(
+            self._task(["tests/test_thing.py"]),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
+        )
+        headings = [line for line in md.splitlines() if line.startswith("## ")]
+        assert headings[0].startswith("## Status:")
+        assert headings[1].startswith("## Task Type:")

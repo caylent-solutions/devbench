@@ -31,6 +31,12 @@ Every assertion helper is exercised against BOTH the real, shipped SKILL.md
 SKILL was rewritten in the same task) and synthetic seeded-violation fixtures
 built entirely in-memory (never mutating the real schema or SKILL files),
 proving each helper is genuinely falsifiable rather than vacuously true.
+
+The `#### \\`key\\`` block-heading regexes, the required-marker tuple, the
+`parse_interview_blocks` parser and the `assert_interview_blocks_complete`
+completeness check are shared with the `bootstrap-environment` skill's own
+structural pin (E2-F8-S1-T2) via `fixtures.interview_block_helpers` rather
+than duplicated in both test modules (test_review DRY_VIOLATION).
 """
 
 from __future__ import annotations
@@ -42,6 +48,10 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from fixtures.interview_block_helpers import (
+    assert_interview_blocks_complete,
+    parse_interview_blocks,
+)
 
 from devbench.constants import GATE_NAMES
 
@@ -51,8 +61,6 @@ CONFIG_SCHEMA_PATH = REPO_ROOT / "src" / "devbench" / "config-schema.json"
 SKILL_PATH = REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills" / "configure-devbench" / "SKILL.md"
 DOC_PATH = REPO_ROOT / "docs" / "skills" / "configure-devbench.md"
 ONBOARDING_DOC_PATH = REPO_ROOT / "docs" / "onboarding.md"
-
-_REQUIRED_BLOCK_MARKERS: tuple[str, ...] = ("**Recommended:**", "**Alternatives:**", "**Free-form:**")
 
 # The literal sentence the rewritten SKILL.md carries in its Step 21 output
 # contract, and the two markers that must follow it in file order (AC-29):
@@ -65,12 +73,6 @@ _SUCCESS_MARKER = "CONFIGURE_DEVBENCH_DONE"
 # (AC-E2-F8-S1-T1-5) carries.
 _EVERY_INVOCATION_PHRASE = "runs in full on every invocation"
 _NEVER_REUSE_PHRASE = "never silently reuses a prior answer"
-
-# Heading marker every leaf interview block starts with, followed immediately
-# by the dotted path in backticks, e.g. "#### `timeouts.gh_api` -- ...".
-_BLOCK_HEADING_RE = re.compile(r"^####\s+`([^`]+)`", re.MULTILINE)
-# Any heading (## / ### / ####) marks the end of the current block's body.
-_ANY_HEADING_RE = re.compile(r"^#{2,4}\s", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -343,48 +345,11 @@ def assert_skill_names_every_setting(
 
 
 # ---------------------------------------------------------------------------
-# Shared helper: interview-block parser (Approach step 7).
+# Shared helper: interview-block parser (Approach step 7). `parse_interview_
+# blocks` and `assert_interview_blocks_complete` now live in
+# `fixtures.interview_block_helpers`, shared with the bootstrap-environment
+# skill's own structural pin (E2-F8-S1-T2, test_review DRY_VIOLATION).
 # ---------------------------------------------------------------------------
-
-
-def parse_interview_blocks(skill_text: str) -> dict[str, str]:
-    """Split `skill_text` into `{dotted_path: block_body}` for every
-    `#### \\`dotted.path\\`` heading. `block_body` runs from immediately after
-    the heading line to the next `##`/`###`/`####` heading (or end of file).
-    Later headings for the same path (should never happen in a well-formed
-    SKILL, but the parser does not assume uniqueness) overwrite earlier ones.
-    """
-    headings = list(_BLOCK_HEADING_RE.finditer(skill_text))
-    blocks: dict[str, str] = {}
-    for match in headings:
-        path = match.group(1)
-        body_start = match.end()
-        next_heading = _ANY_HEADING_RE.search(skill_text, body_start)
-        body_end = next_heading.start() if next_heading else len(skill_text)
-        blocks[path] = skill_text[body_start:body_end]
-    return blocks
-
-
-def assert_interview_blocks_complete(blocks: dict[str, str], static_leaf_paths: list[str]) -> None:
-    """AC-E2-F8-S1-T1-3: every path in `static_leaf_paths` must have a block
-    in `blocks` carrying every marker in `_REQUIRED_BLOCK_MARKERS`. Raises
-    `AssertionError` naming the setting and the specific missing element (or
-    'entire block' when the heading itself is absent) on the FIRST violation
-    found, in `static_leaf_paths` order.
-    """
-    for path in static_leaf_paths:
-        body = blocks.get(path)
-        if body is None:
-            raise AssertionError(
-                f"configure-devbench SKILL.md has no '#### `{path}`' interview block at all "
-                "(setting, missing element: entire block)"
-            )
-        missing_markers = [marker for marker in _REQUIRED_BLOCK_MARKERS if marker not in body]
-        if missing_markers:
-            raise AssertionError(
-                f"configure-devbench SKILL.md's interview block for '{path}' is missing: "
-                f"{', '.join(missing_markers)} (setting: {path!r}, missing element(s): {missing_markers!r})"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +527,7 @@ class TestRealSkillInterviewBlocksComplete:
             f"expected well over 50 static leaf settings in the real schema, got {len(static_leaf_paths)}"
         )
         blocks = parse_interview_blocks(_skill_text())
-        assert_interview_blocks_complete(blocks, static_leaf_paths)
+        assert_interview_blocks_complete(blocks, static_leaf_paths, skill_label="configure-devbench SKILL.md")
 
     def test_parsed_block_count_matches_heading_count(self) -> None:
         """Sanity: the parser finds at least one block per static leaf (a

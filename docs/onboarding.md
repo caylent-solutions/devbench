@@ -193,9 +193,17 @@ claude run devbench:configure-devbench
 
 ## Step 4: bootstrap-environment -- clone repos and run make validate
 
-The `bootstrap-environment` skill prepares every target repository listed in
-`backlog/config/devbench.yaml` so that `make validate` passes without manual
-intervention beyond yes/no confirmations.
+The `bootstrap-environment` skill first interviews you about every environment
+decision it owns -- the LLM credential source and Bedrock region, the Anthropic
+OAuth credentials file path, the model the orchestrate skill's own coordination
+calls run on, and the GitHub token source and org restriction -- then prepares
+every target repository listed in `backlog/config/devbench.yaml` so that
+`make validate` passes without manual intervention beyond yes/no confirmations.
+This Step 0 interview runs in full on every invocation: it never silently
+reuses a prior answer. The current session's already-exported value for each
+variable is shown as the current value in every menu, but every single
+question is still asked again -- there is no skip-because-unchanged path
+anywhere in this skill.
 
 **Invoke:**
 
@@ -205,18 +213,27 @@ claude run devbench:bootstrap-environment
 
 **What happens:**
 
-1. Reads the `repos:` section from `backlog/config/devbench.yaml`. If the config is
+1. Step 0 interviews you about every environment decision the skill owns
+   (`DEVBENCH_USE_BEDROCK`, `DEVBENCH_BEDROCK_REGION`,
+   `DEVBENCH_CLAUDE_CREDENTIALS_FILE`, `DEVBENCH_CLAUDE_MODEL`, the `GH_TOKEN` /
+   `DEVBENCH_GH_TOKEN_FILE` token source, and `DEVBENCH_GH_ORG`), each with a
+   recommended value marked as such, every alternative, and a free-form entry
+   path.
+2. Reads the `repos:` section from `backlog/config/devbench.yaml`. If the config is
    absent, the skill asks interactively.
-2. For each repo: clone to `checkout_directory` if not already present; install the
+3. For each repo: clone to `checkout_directory` if not already present; install the
    asdf toolchain from `.tool-versions` if the file exists; run `make validate` as a
    baseline check.
-3. Each step (clone, asdf install, make validate) self-verifies immediately after the
-   operation. On first failure the skill logs `[RETRY_*]` and retries once. On a second
-   failure it escalates with a clear diagnostic and asks whether to skip this repo.
-4. Prints a final summary table showing clone, toolchain, and validate status per repo.
+4. Each step (Step 0's environment verification, clone, asdf install, make
+   validate) self-verifies immediately after the operation. On first failure the
+   skill logs `[RETRY_*]` and retries once. On a second failure it escalates with a
+   clear diagnostic and asks whether to skip this repo (or, for Step 0, whether to
+   continue without full environment verification).
+5. Prints a final summary table showing clone, toolchain, and validate status per repo.
 
-**Output:** each `checkout_directory` has a valid `.git`, the toolchain is installed,
-and `make validate` exits 0 for every non-escalated repo.
+**Output:** a verified LLM credential source and GitHub token source, each
+`checkout_directory` has a valid `.git`, the toolchain is installed, and
+`make validate` exits 0 for every non-escalated repo.
 
 **Reference:** [`docs/skills/bootstrap-environment.md`](skills/bootstrap-environment.md)
 
@@ -298,7 +315,11 @@ Enter: `org/repo` = `myorg/payment-service`, `checkout_directory` = `payment-ser
 run devbench:bootstrap-environment
 ```
 
-The skill clones `github.com/myorg/payment-service` to
+Step 0 interviews you about the environment: accept the recommended
+`DEVBENCH_USE_BEDROCK` (unset/false, Anthropic API) and `DEVBENCH_CLAUDE_MODEL`
+(e.g. `claude-opus-4-7`, the Anthropic API id form -- see
+`docs/llm-authentication.md`), then confirm the GitHub token source.
+The skill then clones `github.com/myorg/payment-service` to
 `~/payment-service-ws/payment-service`, installs the Go toolchain, and runs
 `make validate`. Reports `PASS` when done.
 

@@ -5,6 +5,67 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`bootstrap-environment` gains a Step 0 every-invocation interview over the
+  environment decisions it owns: LLM credential source, model selection, and
+  GitHub credential source** (spec `integration-reality-gates-hardening.md`
+  section 4.15, D-16, G12; AC-E2-F8-S1-T2-1 through -5).
+  `plugin-authoring/devbench-authoring/skills/bootstrap-environment/SKILL.md`
+  now opens with a Step 0 that interviews the operator, one menu per variable,
+  before the pre-existing clone / asdf / `make validate` bootstrap steps (which
+  are unchanged): `DEVBENCH_USE_BEDROCK` and `DEVBENCH_BEDROCK_REGION` (LLM
+  credential source, the env-var form of the `use_bedrock` / `bedrock_region`
+  keys `configure-devbench` already interviews), `DEVBENCH_CLAUDE_CREDENTIALS_FILE`
+  (Anthropic OAuth credentials file path, no YAML equivalent),
+  `DEVBENCH_CLAUDE_MODEL` (the orchestrate skill's own required coordination-call
+  model, distinct from the per-agent `agents:` block), and the `GH_TOKEN` /
+  `DEVBENCH_GH_TOKEN_FILE` GitHub token source and `DEVBENCH_GH_ORG` single-org
+  restriction (both pure env vars with no YAML equivalent). Each menu carries a
+  recommended value marked as such, every alternative, a free-form entry path,
+  and a full explanation of the setting and the consequence of each choice,
+  matching the `configure-devbench` interview-block format (AC-E2-F8-S1-T1-3).
+  The interview runs in full on every invocation: the
+  current session's already-exported value is shown as the current value, but
+  every question is still asked again -- there is no "skip because unchanged"
+  path. A new self-verify step confirms the chosen credential sources actually
+  work (`aws sts get-caller-identity` for Bedrock, the credentials file for the
+  Anthropic API, the GitHub token source, and that `DEVBENCH_CLAUDE_MODEL` is
+  non-empty), retrying the failing check once before escalating with a
+  diagnostic and suggested fix, mirroring the file's existing per-repo
+  retry-once/escalate idiom.
+
+  `docs/skills/bootstrap-environment.md` documents the every-invocation
+  contract, the new Step 0 entry, and the expanded output contract and
+  troubleshooting table; `docs/zero-to-ready.md`'s "Two setup paths" table,
+  Step 4 (Authenticate Claude / Bedrock), and Cross-references section now
+  point at the skill-driven interview equivalent and link
+  `docs/skills/bootstrap-environment.md` / `docs/skills/configure-devbench.md`
+  directly, keeping the manual walkthrough and the skill-driven path in sync
+  (`docs/zero-to-ready.md` was deferred from the `configure-devbench` rewrite
+  to this unit). `docs/onboarding.md` Step 4 (intro, "What happens" list, and
+  the worked-example walkthrough) now describes the same every-invocation
+  Step 0 interview and its retry-once/escalate self-verify, matching how
+  E2-F8-S1-T1 updated Step 3 for `configure-devbench`. `SKILL.md`'s
+  `DEVBENCH_BEDROCK_REGION` block now documents the full four-layer
+  precedence (env var over the YAML `bedrock_region` key over `AWS_REGION`
+  over the built-in `us-east-1` default), matching `src/devbench/config.py`,
+  and its session-value read loop uses bash indirect expansion (`${!v}`)
+  instead of `eval`.
+
+  `tests/test_plugin/test_bootstrap_environment_interview.py` is the new
+  structural pin: for each of the six owned variables it parses the
+  `#### \`VAR\`` interview block and asserts the Recommended/Alternatives/
+  Free-form markers and a current-value line are present, asserts the
+  every-invocation contract is stated in both the SKILL and its doc, asserts
+  `docs/skills/bootstrap-environment.md` carries an "## Every-invocation
+  contract" section and opens its step-by-step list with the Step 0
+  interview, and asserts `docs/onboarding.md` Step 4 states the
+  every-invocation phrase and references the Step 0 interview both when
+  introducing it and in the self-verify description -- proven by mutation
+  (deleting Step 0 from the real SKILL.md now fails the pin). The block
+  parser and marker-completeness helpers are shared with
+  `configure-devbench`'s pin via the new
+  `tests/fixtures/interview_block_helpers.py` module rather than duplicated.
+
 - **`src/devbench/source_classification.py` -- the single source/test-path/
   entry-point classification module** (spec
   `integration-reality-gates-hardening.md` section 4.3, D-3, PM-3;

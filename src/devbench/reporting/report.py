@@ -2262,19 +2262,23 @@ def _stats_to_rows_single(stats: WindowStats, display_tz: tzinfo | None = None) 
     return list(zip(_METRIC_LABELS, values, strict=True))
 
 
-def _resolve_window_endpoints(log_timestamps: list[datetime]) -> tuple[datetime, datetime, datetime | None]:
+def _resolve_window_endpoints(
+    log_timestamps: list[datetime], now: datetime | None = None
+) -> tuple[datetime, datetime, datetime | None]:
     """Return (log_start_for_window, window_end, log_started) for an empty or non-empty log.
 
-    ``window_end`` is the report-generation moment, bounded below by
-    ``datetime.now(UTC)``. Without that bound, a "This run" window whose
-    ``start`` post-dates every log entry (common in watch mode when no new
-    log lines have arrived yet) yields a negative span and an n/a cascade
-    across every derived metric.
+    ``window_end`` is the report-generation moment, bounded below by ``now``
+    (defaults to ``datetime.now(UTC)`` when not provided -- this is a test-
+    injection point, mirroring ``_orchestrator_liveness_banner``'s own ``now``
+    parameter elsewhere in this module). Without that bound, a "This run"
+    window whose ``start`` post-dates every log entry (common in watch mode
+    when no new log lines have arrived yet) yields a negative span and an
+    n/a cascade across every derived metric.
 
-    For an empty log, both window endpoints fall back to ``datetime.now(UTC)``
-    and ``log_started`` is None.
+    For an empty log, both window endpoints fall back to the resolved
+    ``now`` and ``log_started`` is None.
     """
-    now = datetime.now(UTC)
+    now = now if now is not None else datetime.now(UTC)
     if log_timestamps:
         log_started = min(log_timestamps)
         return log_started, max(*log_timestamps, now), log_started
@@ -3188,6 +3192,7 @@ def generate_report(
     session_name: str | None = None,
     *,
     by_role: bool = False,
+    now: datetime | None = None,
 ) -> str:
     """Generate a formatted progress report.
 
@@ -3215,6 +3220,12 @@ def generate_report(
             listed in the report.  Pass ``None`` (default) to aggregate across
             all sessions.  Composes with ``scope_filter``: both filters are
             applied in sequence (session filter first, then scope filter).
+        now: Override for the current wall-clock used to bound
+            ``window_end`` in ``_resolve_window_endpoints`` (test-injection
+            point, mirroring ``_orchestrator_liveness_banner``'s own ``now``
+            parameter). ``None`` (default) reads ``datetime.now(UTC)``, so
+            every existing caller (``cmd_report``, watch mode) keeps its
+            current behaviour byte-for-byte.
 
     Returns:
         Formatted report string ready for terminal output.
@@ -3326,7 +3337,7 @@ def generate_report(
         WORKSPACE_ROOT, log_path, "in-progress"
     )
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
-    log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
+    log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps, now=now)
 
     # Issue #326 (FR-5): compute the full session segmentation ONCE, from the
     # same non-noise timestamp source the current-session detector already

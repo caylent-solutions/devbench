@@ -71,3 +71,34 @@ def comment_timestamp(moment: datetime | None = None) -> str:
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=UTC)
     return instant.astimezone(resolve_comment_timezone()).strftime(COMMENT_TIMESTAMP_FORMAT)
+
+
+def audit_timestamp_to_utc(raw: str, zone_token: str) -> datetime:
+    """Convert one audit-comment timestamp to UTC, honouring the zone it names.
+
+    The comment header carries a zone abbreviation rather than a numeric
+    offset, and abbreviations are not globally unique, so this resolves it the
+    only way that is sound: ``UTC`` means UTC, and anything else is read in the
+    workspace's configured comment zone, which is the zone that wrote it. Every
+    file written before ``display_timezone`` was honoured is stamped ``UTC``
+    and therefore keeps parsing correctly no matter what the workspace
+    configures later.
+
+    Args:
+        raw: The ``YYYY-MM-DD HH:MM`` portion of the header.
+        zone_token: The zone abbreviation that followed it.
+
+    Returns:
+        The instant as an aware UTC datetime.
+
+    Raises:
+        ValueError: ``raw`` is not in the expected shape. Callers skip the row
+            rather than failing, matching the best-effort reads around them.
+    """
+    # ``fromisoformat`` rather than ``strptime``: the header portion is already
+    # an ISO-8601 date-time, and parsing it as one keeps the value naive
+    # without a format string that claims an offset the text does not carry.
+    naive = datetime.fromisoformat(raw)
+    if zone_token.upper() == "UTC":
+        return naive.replace(tzinfo=UTC)
+    return naive.replace(tzinfo=resolve_comment_timezone()).astimezone(UTC)

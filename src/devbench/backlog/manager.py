@@ -693,7 +693,7 @@ class BacklogManager:
             self._update_status_summary(backlog_index)
 
             audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+            timestamp = comment_timestamp()
             audit_row = f"[{timestamp}] [WU_REMOVED] {unit_id} -- {reason}\n"
             with audit_log_path.open("a", encoding="utf-8") as fh:
                 fh.write(audit_row)
@@ -803,7 +803,7 @@ class BacklogManager:
 
         count = len(unit_ids)
         audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         audit_row = f"[{timestamp}] [BULK_STATUS_UPDATE] {count} WUs set to '{canonical}' by {audit_meta}\n"
         with audit_log_path.open("a", encoding="utf-8") as fh:
             fh.write(audit_row)
@@ -1097,7 +1097,7 @@ class BacklogManager:
             ``(fix_count, files_fixed)`` -- total individual corrections applied
             and the count of distinct files that were modified.
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         fix_count = 0
         files_fixed: set[Path] = set()
 
@@ -1579,7 +1579,7 @@ class BacklogManager:
             spec_ref: Specification reference (e.g. ``AC-FUNC-001``).
             test_ref: Test reference (e.g. ``test_user_creation``).
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
 
         if not matrix_path.exists():
             header = TRACEABILITY_MATRIX_HEADER
@@ -2177,7 +2177,7 @@ class BacklogManager:
 
     def _append_comment(self, work_unit_path: Path, action: str, message: str) -> None:
         """Append a comment entry to the Comments section of a work-unit file."""
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_ENTRY_TEMPLATE.format(
             timestamp=timestamp,
             agent_id="backlog_manager",
@@ -2207,7 +2207,7 @@ class BacklogManager:
             agent_name: Agent name (e.g. ``git_ops``, ``orchestrator``).
             message: Message to append (may contain token and detail).
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name=agent_name,

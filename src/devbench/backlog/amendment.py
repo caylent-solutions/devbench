@@ -57,6 +57,7 @@ from devbench.backlog.manifest import (
 )
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
+from devbench.comment_time import comment_timestamp
 from devbench.utils.io import atomic_write_text
 
 if TYPE_CHECKING:
@@ -643,7 +644,7 @@ def _build_audit_entry(
     rejection_reason: str = "",
 ) -> str:
     """Render a one-line audit entry for the Comments section."""
-    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = comment_timestamp()
     if action == AMENDMENT_APPLIED_ACTION:
         # Both directions are reported so a removal is never invisible in the
         # audit trail: a dropped Manifest row changes what the unit is allowed

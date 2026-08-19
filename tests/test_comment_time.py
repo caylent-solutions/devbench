@@ -14,6 +14,7 @@ timestamps depend on who wrote each line.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -89,3 +90,72 @@ class TestCommentTimestamp:
         assert match is not None
         assert match.group("id") == "E1-F1-S1-T1"
         assert match.group("zone") == "EDT"
+
+
+class TestEveryCommentWriterHonoursTheZone:
+    """Regression: the first fix migrated only the sites using the format constant.
+
+    Eight further writers inlined the literal ``"%Y-%m-%d %H:%M UTC"`` format
+    string instead, so a configured workspace still got UTC from them --
+    including ``_append_agent_comment``, which writes the ``[WU_CLAIMED]`` line
+    on every single claim. A grep for the constant found none of them.
+    """
+
+    def test_no_writer_inlines_a_literal_utc_format(self) -> None:
+        """The literal format string must exist nowhere in the package."""
+        import devbench
+
+        package_root = Path(devbench.__file__).resolve().parent
+        offenders = [
+            f"{path.relative_to(package_root)}:{n}"
+            for path in package_root.rglob("*.py")
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if 'strftime("%Y-%m-%d %H:%M UTC")' in line
+        ]
+        assert offenders == [], (
+            "these writers bypass comment_timestamp() and would emit UTC in a "
+            f"workspace that configures display_timezone: {offenders}"
+        )
+
+    def test_no_parser_assumes_a_literal_utc_stamp(self) -> None:
+        """A parser pinned to UTC goes blind exactly where the writer is configured."""
+        import devbench
+
+        package_root = Path(devbench.__file__).resolve().parent
+        offenders = [
+            f"{path.relative_to(package_root)}:{n}"
+            for path in package_root.rglob("*.py")
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if "strptime(" in line and "%Y-%m-%d %H:%M UTC" in line
+        ]
+        assert offenders == [], f"these parsers cannot read a zoned comment: {offenders}"
+
+    def test_append_agent_comment_uses_the_configured_zone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The writer behind [WU_CLAIMED], which leaked UTC in the first pass."""
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/Detroit", raising=False)
+        wu = tmp_path / "E1-F1-S1-T1.md"
+        wu.write_text("# E1-F1-S1-T1: T\n\n## Status: in-queue\n\n## Comments\n", encoding="utf-8")
+
+        BacklogManager()._append_agent_comment(wu, "orchestrator", "[WU_CLAIMED] Set E1-F1-S1-T1")
+
+        written = wu.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED]" in written
+        assert " UTC]" not in written, f"comment still stamped UTC: {written!r}"
+
+    def test_append_agent_comment_still_writes_utc_when_unconfigured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset config must stay byte-identical to the historical behaviour."""
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        wu = tmp_path / "E1-F1-S1-T1.md"
+        wu.write_text("# E1-F1-S1-T1: T\n\n## Status: in-queue\n\n## Comments\n", encoding="utf-8")
+
+        BacklogManager()._append_agent_comment(wu, "orchestrator", "[WU_CLAIMED] Set E1-F1-S1-T1")
+
+        assert " UTC] [agent/orchestrator] [WU_CLAIMED]" in wu.read_text(encoding="utf-8")

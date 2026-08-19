@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
-from devbench.comment_time import comment_timestamp
+from devbench.comment_time import audit_timestamp_to_utc, comment_timestamp
 from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENTS_SECTION_HEADER,
@@ -281,8 +281,14 @@ _REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
 # there is nothing left to try". Case-sensitive for the same reason as
 # ``_REJECTION_TAG_RE``: a lower-case occurrence is prose quoting the tag.
 _RETRY_EXHAUSTED_TAG_RE: re.Pattern[str] = re.compile(r"\[RETRY_BUDGET_EXHAUSTED\]")
+# The zone token is captured rather than pinned to "UTC": comments are stamped
+# in the workspace's ``display_timezone`` when one is set, so pinning it would
+# make every one of these scans blind in exactly the workspaces that configure
+# it. Files written before that setting was honoured carry "UTC" and still
+# match.
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
-    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(?P<zone>[A-Za-z0-9_+\-]+)\]"
+    r"\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
 # Issue #183(d): structured payloads that used to be emitted by
 # review-supervisor's Step 0 self-check when the Agent tool dropped out
@@ -428,7 +434,7 @@ def _has_runtime_degradation_signal(
         if not _RUNTIME_DEGRADATION_BODY_RE.search(match.group("body")):
             continue
         try:
-            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+            ts = audit_timestamp_to_utc(match.group("ts"), match.group("zone"))
         except ValueError:
             continue
         if since is not None and ts < since:
@@ -468,7 +474,7 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
         if match is None:
             continue
         try:
-            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+            ts = audit_timestamp_to_utc(match.group("ts"), match.group("zone"))
         except ValueError:
             continue
         if most_recent is None or ts > most_recent[0]:

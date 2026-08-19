@@ -7,10 +7,10 @@ a single unit of work parsed from the backlog.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
+from devbench.comment_time import comment_timestamp
 from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER, EM_DASH, STATUS_LINE_RE
 from devbench.utils.io import atomic_write_text
 
@@ -150,7 +150,7 @@ class WorkUnit:
         If the ``## Comments`` section does not exist it is created at the
         end of the file.
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_ENTRY_TEMPLATE.format(timestamp=timestamp, agent_id=agent_id, action=action, message=message)
 
         content = self.file_path.read_text()

@@ -700,9 +700,27 @@ class TestParseResetAtFromText:
         """Minute 60 is invalid -> None."""
         assert _parse_reset_at_from_text("resets 4:60pm (UTC)") is None
 
-    def test_none_on_non_utc_timezone(self) -> None:
-        """Non-(UTC) timezone label -> None (the (UTC) literal is required, D-8)."""
-        assert _parse_reset_at_from_text("resets 4:10pm (EST)") is None
+    def test_resolvable_iana_timezone_is_converted_to_utc(self) -> None:
+        """A resolvable IANA label is interpreted in that zone, then converted.
+
+        Claude Code renders the reset in the operator's own zone, so pinning the
+        parser to a literal ``(UTC)`` discarded every real message and left the
+        wait blind-polling with ``reset_at=None``.
+        """
+        parsed = _parse_reset_at_from_text("resets 4:10pm (America/New_York)")
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == timedelta(0)
+        # 16:10 in New York is 20:10 or 21:10 UTC depending on DST; either way
+        # the wall clock must not survive the conversion unchanged.
+        assert (parsed.hour, parsed.minute) in {(20, 10), (21, 10)}
+
+    def test_none_on_unresolvable_timezone(self) -> None:
+        """A label the platform zone database cannot resolve -> None.
+
+        Falling back to probing is correct; acting on a misread instant is not.
+        """
+        assert _parse_reset_at_from_text("resets 4:10pm (Narnia/Cair_Paravel)") is None
 
     def test_none_on_missing_utc_literal_entirely(self) -> None:
         """No timezone label at all -> None."""
@@ -2080,7 +2098,7 @@ class TestRecoveryProbeExceptionOrdering:
         anthropic_ctor = MagicMock(return_value=fake_client)
         with (
             patch_anthropic(fake_anthropic_hierarchy, anthropic_ctor=anthropic_ctor),
-            pytest.raises(RecoveryProbeUnavailableError, match="no usable Anthropic API credential"),
+            pytest.raises(RecoveryProbeUnavailableError, match="no usable anthropic-api credential"),
         ):
             recovery_probe(timeout_seconds=5.0, request_size_tokens=1)
 

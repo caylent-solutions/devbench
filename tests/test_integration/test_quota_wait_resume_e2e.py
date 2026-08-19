@@ -267,7 +267,7 @@ class TestSyntheticQuotaCycleMarkerSequence:
         )
         probe_calls = {"n": 0}
 
-        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int, source: str = "") -> bool:
             probe_calls["n"] += 1
             return True
 
@@ -337,7 +337,7 @@ class TestJourneyJ1UnattendedOvernight:
             ]
         )
 
-        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int, source: str = "") -> bool:
             return True
 
         with (
@@ -388,7 +388,7 @@ class TestJourneyJ2OperatorInterrupts:
         # small so the sleep window is short but still long enough for the
         # background thread below to detect the checkpoint and deliver the
         # signal well before the sleep would otherwise elapse).
-        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int, source: str = "") -> bool:
             return False
 
         pid = os.getpid()
@@ -478,7 +478,7 @@ class TestJourneyJ3OperatorInspects:
         inspection_done = threading.Event()
         captured: dict[str, str] = {}
 
-        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+        def fake_recovery_probe(*, timeout_seconds: float, request_size_tokens: int, source: str = "") -> bool:
             release_probe.wait(timeout=_READINESS_TIMEOUT_SECONDS)
             return True
 

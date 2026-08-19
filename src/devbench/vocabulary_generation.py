@@ -148,8 +148,9 @@ CATEGORY_DESCRIPTIONS: Final[dict[str, dict[str, tuple[str, str]]]] = {
         "UNREACHABLE_ARTIFACT": (
             "New component/hook/slice/function has zero non-test importers per `devbench check-reachability` evidence",
             "Import and wire the artifact into its real composition root (route table, parent "
-            "container, shell), or add a `devbench-defer-reachability: <reason>` comment if "
-            "intentionally deferred.",
+            "container, shell), or record a legitimate deferral with `uv run devbench log-waiver "
+            "<judge> <unit-id> --gate reachability --target <t> --reason <r> --operator` "
+            "(the operator is the only waiver authority for the reachability gate).",
         ),
     },
     "test_review": {

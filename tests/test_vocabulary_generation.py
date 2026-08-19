@@ -282,6 +282,49 @@ class TestRenderDocTable:
 
 
 # ---------------------------------------------------------------------------
+# CATEGORY_DESCRIPTIONS content pin -- UNREACHABLE_ARTIFACT remediation (D-5)
+# ---------------------------------------------------------------------------
+
+
+class TestUnreachableArtifactRemediationPointsAtLogWaiver:
+    """The `devbench-defer-reachability` source-comment escape hatch (spec
+    D-5) must never again be the shipped remediation for a `code_review`
+    `UNREACHABLE_ARTIFACT` finding. E3-F1-S1-T1 deletes the source-comment
+    hatch from `cli.py`; once it lands, the audited `[GATE_WAIVER
+    reachability]` marker written by `uv run devbench log-waiver <judge>
+    <unit-id> --gate reachability --target <t> --reason <r> --operator` is
+    the only supported deferral. This pins the remediation string at the
+    CLI verb operators are actually supposed to run, not at the
+    source-comment marker E3-F1-S1-T1 is removing.
+
+    `reachability` is declared machine-blocking in `constants.GATE_TIERS`, so
+    `_validate_log_waiver_semantics` rejects the invocation with exit 2
+    whenever `--operator` is absent (spec Section 3.6: the operator is the
+    only waiver authority for a machine-blocking gate). The remediation must
+    therefore render `--operator` as required, not as the optional
+    `[--operator]` bracket notation that is only correct for the generic
+    (non-gate-pinned) `log-waiver` usage line.
+    """
+
+    @pytest.mark.unit
+    def test_remediation_has_no_defer_comment_marker(self, vg: ModuleType) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["UNREACHABLE_ARTIFACT"]
+        assert "devbench-defer-reachability" not in remediation
+
+    @pytest.mark.unit
+    def test_remediation_names_log_waiver_with_reachability_gate_flag(self, vg: ModuleType) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["UNREACHABLE_ARTIFACT"]
+        assert "log-waiver" in remediation
+        assert "--gate reachability" in remediation
+
+    @pytest.mark.unit
+    def test_remediation_requires_operator_flag_not_optional(self, vg: ModuleType) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["UNREACHABLE_ARTIFACT"]
+        assert "[--operator]" not in remediation
+        assert "--gate reachability --target <t> --reason <r> --operator" in remediation
+
+
+# ---------------------------------------------------------------------------
 # Module-internal consistency
 # ---------------------------------------------------------------------------
 

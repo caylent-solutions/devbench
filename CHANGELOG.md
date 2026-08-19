@@ -5,6 +5,44 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-reachability` reworked into the reachability gate: word-boundary
+  matching, source-classified scope, loud `git grep` semantics, and
+  `log-waiver` replacing the source-comment escape hatch** (spec
+  `integration-reality-gates-hardening.md` section 4.4; machine-blocking,
+  `constants.GATE_TIERS`; register findings 315-D01, 315-D02, and the
+  rc-swallowing / `[SKIPPED]` / defer-marker rows). Five defects in the PR
+  #315 cherry-pick made the command's verdict untrustworthy, all sharing the
+  same code path and fixed together: (1) the substring `--fixed-strings`
+  grep cleared an artifact exporting `Card` on any file containing
+  `Cardinal` or `discardCards` -- replaced with a word-boundary
+  `git grep --word-regexp --fixed-strings` search; (2) the grep ran
+  repo-wide, so a mention in `CHANGELOG.md` or a design doc cleared an
+  orphan -- matching now runs only over pathspecs derived from
+  `devbench.source_classification.SOURCE_EXTENSIONS`; (3) every `git grep`
+  rc besides 0 was treated as "no match" and swallowed by a `continue` --
+  rc=1 is still no-match data, but rc>=2 now exits 1 with
+  `ERROR: git grep failed: <stderr>` on stderr; (4) an unreadable candidate
+  file printed a silent `[SKIPPED]` token and passed -- it is now a counted
+  `[LOAD_ERROR]` finding that drives exit 1; (5) the `devbench-defer-reachability`
+  source-comment escape hatch is deleted everywhere in `src/devbench/cli.py`,
+  replaced by the structured `[GATE_WAIVER reachability]` marker `uv run
+  devbench log-waiver <judge> <unit-id> --gate reachability --target <t>
+  --reason <r> --operator` writes to the unit's audit trail. In the same
+  change, scope now comes from the shared
+  `devbench.work_unit_scope.resolve_changed_files` (the PR #315 near-copy
+  `_collect_reachability_new_files` is deleted with zero remaining callers),
+  a disabled/unconfigured gate prints `{"gate": "reachability", "status":
+  "disabled"}` and exits 0, and an enabled run prints the spec 5.2 status
+  line (`gate`, `tier`, `status`, `findings`, `scope_hash`) as the first
+  stdout line before any human-readable findings.
+  `plugin/devbench-orchestrate/agents/review_team/code-reviewer.md`'s
+  REACHABILITY rubric (item 57 and sub-items 57c/57e) is rewritten to match:
+  Manifest-scoped evidence, the `[GATE_WAIVER reachability]` waiver in place
+  of the deleted `[DEFERRED]` token, and `[LOAD_ERROR]` documented as a
+  blocking finding rather than an informational `[SKIPPED]`. Transitive
+  reachability and the `gates.reachability.entry_points` tunable are
+  deliberately left to a follow-up task on top of this corrected matcher.
+
 - **`git-ops-finalize` composes a provenance-driven PR body with a closing-keyword
   block instead of a plain body** (spec `integration-reality-gates-hardening.md`
   section 4.13, D-17; AC-E2-F9-S1-T1-1 through -6; issue #334). A new persistent
@@ -727,12 +765,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (a route mount, a parent container's prop list, a shell's child
   composition) ever happening -- `code-reviewer`'s rubric never checked
   cross-file usage. A new `devbench check-reachability <id>` command greps
-  the target repo, language-agnostically, for newly-added source files with
-  zero non-test references, and `code-reviewer` now surfaces that evidence
-  and fails with `UNREACHABLE_ARTIFACT` when an artifact is genuinely
-  orphaned rather than a grep false positive. A `devbench-defer-reachability:
-  <reason>` comment is the documented, logged escape hatch for legitimately
-  deferred code (feature-flagged, Storybook-only, explicit follow-up task).
+  the target repo, language-agnostically and restricted to source-classified
+  files, for artifacts in the unit's own Changes Manifest scope with zero
+  non-test references, and `code-reviewer` now surfaces that evidence and
+  fails with `UNREACHABLE_ARTIFACT` when an artifact is genuinely orphaned
+  rather than a grep false positive. A legitimate deferral (feature-flagged,
+  Storybook-only, explicit follow-up task) is recorded with `uv run devbench
+  log-waiver <judge> <unit-id> --gate reachability --target <t> --reason <r>
+  --operator`, the only documented, audited way to clear a finding without
+  fixing the wiring.
 
 - **Added `devbench check-ancestry`, the canonical git-ancestry gate for
   declared work-group dependencies**

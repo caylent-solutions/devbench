@@ -7119,28 +7119,12 @@ class TestReachabilityHelperFunctions:
         assert "helperA" in symbols
         assert "helperB" in symbols
 
-    def test_defer_reason_extracts_text_after_marker(self) -> None:
-        content = "// devbench-defer-reachability: waiting on flag ROLLOUT_X\nexport const x = 1;\n"
-        assert cli._reachability_defer_reason(content) == "waiting on flag ROLLOUT_X"
-
-    def test_defer_reason_returns_none_when_marker_absent(self) -> None:
-        assert cli._reachability_defer_reason("export const x = 1;\n") is None
-
-    def test_defer_reason_strips_trailing_comment_closer(self) -> None:
-        content = "/* devbench-defer-reachability: storybook only */\n"
-        assert cli._reachability_defer_reason(content) == "storybook only"
-
-    def test_parse_added_paths_keeps_only_status_a(self) -> None:
-        name_status = "A\tsrc/new.py\nM\tsrc/existing.py\nD\tsrc/removed.py\n"
-        assert cli._parse_reachability_added_paths(name_status) == ["src/new.py"]
-
-    def test_parse_added_paths_excludes_renames(self) -> None:
-        name_status = "R100\told.py\tnew.py\n"
-        assert cli._parse_reachability_added_paths(name_status) == []
-
-    def test_parse_added_paths_skips_blank_lines(self) -> None:
-        name_status = "\nA\tsrc/new.py\n\n"
-        assert cli._parse_reachability_added_paths(name_status) == ["src/new.py"]
+    def test_search_pathspecs_cover_every_shared_source_extension(self) -> None:
+        """AC-FUNC-003/315-D02: the importer search's pathspecs are derived from
+        the shared source-classification set, one ``*.<ext>`` glob apiece --
+        never a private, narrower copy."""
+        pathspecs = cli._reachability_search_pathspecs()
+        assert pathspecs == sorted(f"*.{ext.lstrip('.')}" for ext in _CLI_REACHABILITY_HISTORICAL_EXTENSIONS)
 
 
 def _gates_table_cells(line: str) -> list[str]:
@@ -7353,24 +7337,68 @@ class TestCmdGates:
 
 class TestCmdCheckReachability:
     """Tests for cmd_check_reachability (caylent-solutions/devbench-internal-backlog#10:
-    reachability-check task-completion gate).
+    reachability gate; spec `integration-reality-gates-hardening.md` 4.4).
 
-    Uses a real git repo (not a mocked ``run_command``) so the ``git grep``
-    based importer search exercises real git semantics end-to-end.
+    Scope is resolved through ``devbench.work_unit_scope.resolve_changed_files``
+    (spec 4.3, AC-9) against a real, on-disk Changes Manifest written by
+    ``_seed_scope_backlog`` -- never a mocked ``devbench.cli.BacklogParser``
+    return value alone, since that helper only serves ``cli.py``'s own
+    unit/repo lookup in ``_resolve_unit_repo_and_path`` and not
+    ``work_unit_scope``'s independent ``BacklogParser`` lookup (see that
+    helper's own docstring). Uses a real git repo (not a mocked
+    ``run_command``) so the ``git grep`` based importer search exercises
+    real git semantics end-to-end.
     """
 
     _REPO = "caylent-solutions/git-repo"
+    _ENABLED_GATES_BLOCK = "gates:\n  reachability:\n    enabled: true\n"
 
-    def _make_unit(self) -> WorkUnit:
+    def _make_unit(self, unit_id: str = "E0-F1-S1-T1") -> WorkUnit:
         return WorkUnit(
-            id="E0-F1-S1-T1",
+            id=unit_id,
             title="Test Task",
             status=WorkUnitStatus.IN_PROGRESS,
             unit_type=WorkUnitType.TASK,
-            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            file_path=Path(f"backlog/{unit_id}.md"),
             repo=self._REPO,
             dependencies=[],
         )
+
+    @pytest.fixture(autouse=True)
+    def _isolate_git_locator_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Clear git's repository-locator variables before every test method
+        body runs, including before ``_git_repo`` runs.
+
+        Git's repository-locator variables (``GIT_DIR``, ``GIT_WORK_TREE``,
+        ``GIT_INDEX_FILE``, ``GIT_CEILING_DIRECTORIES``,
+        ``GIT_OBJECT_DIRECTORY``) override ``cwd``-based discovery when set,
+        and git exports ``GIT_DIR``/``GIT_INDEX_FILE`` to every hook process
+        it spawns, so a leaked value from an outer wrapper/hook process is a
+        reachable condition, not an exotic one.
+
+        This MUST be an autouse fixture rather than a ``delenv`` inside
+        ``_run``: ``_run`` executes strictly after ``_git_repo`` has already
+        run ``git init``/``git config``/``git add -A``/``git commit`` under
+        the ambient environment, so clearing these variables only inside
+        ``_run`` cannot protect ``_git_repo``'s own subprocess calls.
+        Verified: with the variables cleared only inside ``_run`` (the prior
+        placement), an ambient ``GIT_DIR`` pointed at a foreign repository
+        left only 4 of this class's 22 collected cases passing -- the rest
+        failed inside ``_git_repo`` with ``CalledProcessError`` from ``git
+        commit``, because ``git init``/``git commit`` ran against the foreign
+        ``GIT_DIR`` before the ``_run`` delenv ever executed. With the same
+        five variables cleared here instead (an autouse fixture runs before
+        the test function body, i.e. before any call to ``_git_repo``), all
+        22 cases pass under the same ambient ``GIT_DIR``.
+        """
+        for git_locator_var in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_OBJECT_DIRECTORY",
+        ):
+            monkeypatch.delenv(git_locator_var, raising=False)
 
     def _git_repo(self, tmp_path: Path) -> Path:
         """Create a real git repo with one committed baseline file."""
@@ -7387,15 +7415,51 @@ class TestCmdCheckReachability:
         subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
         return repo
 
-    def _run(self, unit: WorkUnit, repo: Path) -> int:
+    @staticmethod
+    def _write_gate_config(tmp_path: Path, gates_block: str) -> Path:
+        """Write a scratch ``devbench.yaml`` resolving ``resolve_gate_config``'s
+        project layer, separate from the ``_seed_scope_backlog`` Manifest tree
+        and from the git fixture repo."""
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {TestCmdCheckReachability._REPO}:\n    default_branch: main\n{gates_block}")
+        return cfg_path
+
+    def _run(
+        self,
+        unit_id: str,
+        repo: Path,
+        backlog_root: Path,
+        backlog_index: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        gates_block: str = _ENABLED_GATES_BLOCK,
+    ) -> int:
+        unit = self._make_unit(unit_id)
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        cfg_path = self._write_gate_config(repo.parent, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        # The env layer is highest-precedence (spec 4.1, D-15): an ambient
+        # DEVBENCH_GATE_REACHABILITY_ENABLED left set by the host shell must
+        # never leak into a test that relies on the project-layer config above.
+        monkeypatch.delenv("DEVBENCH_GATE_REACHABILITY_ENABLED", raising=False)
+        # `_search_reachability_importers` passes `cwd=repo_path` to `git grep`
+        # but otherwise inherits the ambient environment unchanged
+        # (`run_command`'s `env=None` default). The class-level autouse
+        # `_isolate_git_locator_env` fixture clears git's repository-locator
+        # variables before this method (and before `_git_repo`) ever runs, so
+        # no additional clearing is needed here.
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
-            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
-            return cli.cmd_check_reachability(unit.id)
+            return cli.cmd_check_reachability(unit_id)
+
+    # -- unit/repo/config resolution failures ---------------------------
 
     def test_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
         mock_parser = MagicMock()
@@ -7420,17 +7484,147 @@ class TestCmdCheckReachability:
         assert result == 1
         assert "no local path" in capsys.readouterr().err.lower()
 
-    def test_no_new_files_reports_clean(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_config_load_failure_exits_1_with_loader_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
         repo = self._git_repo(tmp_path)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
 
-        result = self._run(unit, repo)
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+        ):
+            result = cli.cmd_check_reachability(unit.id)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+
+    def test_malformed_manifest_exits_1_without_status_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Error-handling contract: a ``ValueError``/``ManifestParseError`` from scope
+        resolution prints the raised ``ERROR:`` and exits 1 with NO status line."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path,
+            unit_id=unit_id,
+            manifest_body="| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |",
+        )
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+
+    # -- spec 4.1 disabled short-circuit / spec 5.2 status line ---------
+
+    def test_disabled_gate_prints_exact_status_line_and_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-007: with no `gates:` key in config, the gate is disabled."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/whatever.py",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block="")
+        captured = capsys.readouterr()
 
         assert result == 0
-        assert "No newly-added source files" in capsys.readouterr().out
+        assert json.loads(captured.out.strip()) == {"gate": "reachability", "status": "disabled"}
 
-    def test_orphaned_component_flagged_unreachable(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        unit = self._make_unit()
+    def test_status_line_is_first_stdout_line_with_all_fields(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-008: an enabled run's spec 5.2 status line is stdout line 1."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Wired.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+
+        assert result == 0
+        status_line = json.loads(out_lines[0])
+        assert status_line == {
+            "gate": "reachability",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+            "scope_hash": status_line["scope_hash"],
+        }
+        assert status_line["scope_hash"], "scope_hash must be a non-empty digest"
+
+    def test_empty_manifest_reports_no_classified_source_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FIX-007: the deleted `[SKIPPED]`/"No newly-added source files" wording
+        is replaced by the shipped empty-scope message about the Changes Manifest."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=())
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+
+        assert result == 0
+        assert json.loads(out_lines[0])["findings"] == 0
+        assert "No classified source files found in this work unit's Changes Manifest." in "\n".join(out_lines)
+        assert "No newly-added source files" not in "\n".join(out_lines)
+
+    # -- AC-FUNC-001/002/315-D01: word-boundary matching -----------------
+
+    def test_word_boundary_symbol_not_cleared_by_substring_match(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Card.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        (repo / "src/Other.tsx").write_text("// Cardinal points\nconst discardCards = 1;\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Card.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Card.tsx" in out
+
+    def test_standalone_identifier_clears_reachability(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Card.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Card } from './Card';\nexport function App() { return Card; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Card.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Card.tsx" in out
+        assert "src/App.tsx" in out
+
+    def test_orphaned_component_flagged_unreachable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
         repo = self._git_repo(tmp_path)
         (repo / "src").mkdir()
         # The exported symbol name ("Impl") differs from the file basename
@@ -7438,102 +7632,113 @@ class TestCmdCheckReachability:
         # (not even a self-match), exercising the "no match anywhere" path
         # distinct from the "only self-referenced" path covered elsewhere.
         (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
 
-        result = self._run(unit, repo)
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
         out = capsys.readouterr().out
 
-        assert result == 0
+        assert result == 1
         assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
-        assert "Summary: 1 candidate(s) examined, 1 flagged as potentially unreachable." in out
-
-    def test_defer_pr_mode_falls_back_to_git_show_head(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """In defer_pr mode with an empty staged/unstaged diff, new files come from `git show HEAD`."""
-        unit = self._make_unit()
-        repo = self._git_repo(tmp_path)
-        (repo / "src").mkdir()
-        (repo / "src/Committed.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
-        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "add Committed.tsx"], cwd=repo, check=True, capture_output=True)
-
-        with patch("devbench.config.DEFER_PR", True):
-            result = self._run(unit, repo)
-        out = capsys.readouterr().out
-
-        assert result == 0
-        assert "[POTENTIALLY UNREACHABLE] src/Committed.tsx" in out
-
-    def test_resolved_default_branch_diff_finds_new_file(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Non-defer_pr mode diffs against `origin/<default_branch>` to find branch-only new files."""
-        unit = self._make_unit()
-        upstream = tmp_path / "upstream.git"
-        subprocess.run(["git", "init", "--bare", str(upstream)], check=True, capture_output=True)
-        repo = self._git_repo(tmp_path)
-        subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "push", "origin", "HEAD:main"], cwd=repo, check=True, capture_output=True)
-
-        (repo / "src").mkdir()
-        (repo / "src/OnBranch.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
-        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "add OnBranch.tsx"], cwd=repo, check=True, capture_output=True)
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = [unit]
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
-            patch("devbench.cli.get_configured_default_branch", return_value="main"),
-        ):
-            result = cli.cmd_check_reachability(unit.id)
-        out = capsys.readouterr().out
-
-        assert result == 0
-        assert "[POTENTIALLY UNREACHABLE] src/OnBranch.tsx" in out
-
-    def test_wired_component_passes_with_importer_listed(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        unit = self._make_unit()
-        repo = self._git_repo(tmp_path)
-        (repo / "src").mkdir()
-        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
-        (repo / "src/App.tsx").write_text(
-            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
-        )
-
-        result = self._run(unit, repo)
-        out = capsys.readouterr().out
-
-        assert result == 0
-        assert "[OK] src/Wired.tsx" in out
-        assert "src/App.tsx" in out
-        assert "Summary: 1 candidate(s) examined, 0 flagged as potentially unreachable." in out
+        assert "Summary: 1 candidate(s) examined, 1 potentially unreachable, 0 load error(s)." in out
 
     def test_referenced_only_by_own_test_still_flagged_unreachable(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        unit = self._make_unit()
+        unit_id = "E0-F1-S1-T1"
         repo = self._git_repo(tmp_path)
         (repo / "src").mkdir()
         (repo / "src/Lonely.tsx").write_text("export function Lonely() { return null; }\n", encoding="utf-8")
         (repo / "src/Lonely.test.tsx").write_text(
             "import { Lonely } from './Lonely';\ntest('x', () => Lonely());\n", encoding="utf-8"
         )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Lonely.tsx",))
 
-        result = self._run(unit, repo)
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Lonely.tsx" in out
+
+    def test_importer_list_truncated_after_ten(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        for i in range(11):
+            (repo / f"src/Consumer{i}.tsx").write_text(
+                f"import {{ Widget }} from './Widget'; // consumer {i}\n", encoding="utf-8"
+            )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
         out = capsys.readouterr().out
 
         assert result == 0
-        assert "[POTENTIALLY UNREACHABLE] src/Lonely.tsx" in out
+        assert "[OK] src/Widget.tsx" in out
+        assert "Non-test importers found: 11" in out
+        assert "... and 1 more" in out
 
-    def test_unreadable_file_reported_as_skipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        unit = self._make_unit()
+    # -- AC-FUNC-003/315-D02: source-classified scope, prose never clears -
+
+    @pytest.mark.parametrize("prose_rel_path", ["CHANGELOG.md", "docs/architecture.md", "backlog/E9-F1-S1-T1.md"])
+    def test_prose_mention_does_not_clear_orphan(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        prose_rel_path: str,
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        prose_file = repo / prose_rel_path
+        prose_file.parent.mkdir(parents=True, exist_ok=True)
+        prose_file.write_text("See Orphan for background on this change.\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
+
+    # -- AC-FUNC-004/Section 7: git grep rc semantics ---------------------
+
+    def test_git_grep_failure_exits_loud_with_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            assert cmd[:2] == ["git", "grep"], f"unexpected subprocess routed through the mock: {cmd}"
+            return (2, "", "fatal: forced pathspec failure for the rc>=2 test")
+
+        with patch("devbench.cli.run_command", side_effect=fake_run_command):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert "ERROR: git grep failed:" in captured.err
+        assert "forced pathspec failure" in captured.err
+        assert captured.out == ""
+
+    # -- AC-FUNC-005: load_error replaces the silent [SKIPPED] branch -----
+
+    def test_unreadable_file_produces_load_error_finding_no_skipped_token(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
         repo = self._git_repo(tmp_path)
         (repo / "src").mkdir()
         (repo / "src/Broken.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Broken.tsx",))
 
         real_read_text: Callable[..., str] = Path.read_text
 
@@ -7543,50 +7748,137 @@ class TestCmdCheckReachability:
             return real_read_text(path_self, *args, **kwargs)
 
         with patch.object(Path, "read_text", fake_read_text):
-            result = self._run(unit, repo)
-        out = capsys.readouterr().out
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
 
-        assert result == 0
-        assert "[SKIPPED] src/Broken.tsx" in out
+        assert result == 1
+        assert "[LOAD_ERROR] src/Broken.tsx" in out
         assert "Could not read file" in out
+        assert "[SKIPPED]" not in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 1
+        assert status_line["status"] == "fail"
 
-    def test_importer_list_truncated_after_ten(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        unit = self._make_unit()
+    def test_non_utf8_candidate_produces_load_error_finding_no_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-005: ``Path.read_text(encoding="utf-8")`` raises ``UnicodeDecodeError``
+        (a ``ValueError`` subclass, not an ``OSError``) for a classified candidate whose
+        bytes are not valid UTF-8. The gate must catch that the same way it catches a
+        permission failure -- a counted ``[LOAD_ERROR]`` finding driving exit 1 -- and
+        must never let the exception escape as an unhandled traceback."""
+        unit_id = "E0-F1-S1-T1"
         repo = self._git_repo(tmp_path)
         (repo / "src").mkdir()
-        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
-        for i in range(11):
-            (repo / f"src/Consumer{i}.tsx").write_text(
-                f"import {{ Widget }} from './Widget'; // consumer {i}\n", encoding="utf-8"
-            )
+        (repo / "src/NonUtf8.tsx").write_bytes(b"export default function Impl() { return \xff\xfe; }\n")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/NonUtf8.tsx",))
 
-        result = self._run(unit, repo)
-        out = capsys.readouterr().out
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[LOAD_ERROR] src/NonUtf8.tsx" in out
+        assert "Could not read file" in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 1
+        assert status_line["status"] == "fail"
+
+    def test_deleted_manifest_path_is_not_a_finding(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-005/AC-FUNC-009: ``work_unit_scope._compute_files_scope_hash``
+        documents that ``scope.files`` legitimately carries a Manifest path with no
+        on-disk file, e.g. one a prior stage of this same unit deleted (mandatory
+        under the complete-replacement standard). A path absent from the work tree
+        is not a reachability candidate at all -- a deleted artifact cannot be an
+        orphan -- so it must never surface as a ``[LOAD_ERROR]`` finding."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        # `src/Broken.tsx` is declared in the Manifest but deliberately never
+        # written into the checkout, simulating a file this unit's own change
+        # deleted.
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Broken.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
 
         assert result == 0
-        assert "[OK] src/Widget.tsx" in out
-        assert "Non-test importers found: 11" in out
-        assert "... and 1 more" in out
+        assert "Broken.tsx" not in out
+        assert "[LOAD_ERROR]" not in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 0
+        assert status_line["status"] == "pass"
 
-    def test_defer_marker_excludes_from_unreachable_and_echoes_reason(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    # -- AC-FUNC-006: the devbench-defer-reachability escape hatch is gone -
+
+    def test_defer_marker_no_longer_clears_finding(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        unit = self._make_unit()
+        unit_id = "E0-F1-S1-T1"
         repo = self._git_repo(tmp_path)
         (repo / "src").mkdir()
         (repo / "src/Deferred.tsx").write_text(
-            "// devbench-defer-reachability: feature-flagged for Q3 launch\n"
-            "export function Deferred() { return null; }\n",
+            "// devbench-defer-reachability: legacy escape hatch, no longer honoured\n"
+            "export default function Impl() { return null; }\n",
             encoding="utf-8",
         )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Deferred.tsx",))
 
-        result = self._run(unit, repo)
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Deferred.tsx" in out
+        assert "[DEFERRED]" not in out
+
+    def test_defer_marker_string_absent_from_shipped_source_tree(self) -> None:
+        """AC-FIX-012/AC-FUNC-006: a repo-wide grep for the deleted escape-hatch
+        marker returns zero hits across every tracked file under ``src/``,
+        ``docs/`` and ``plugin/`` -- not merely inside ``src/devbench/cli.py``."""
+        repo_root = Path(__file__).resolve().parent.parent
+        listing = subprocess.run(
+            ["git", "ls-files", "--", "src", "docs", "plugin"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked_files = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+        marker = "devbench-defer-reachability"
+        offenders = sorted(
+            rel_path
+            for rel_path in tracked_files
+            if marker in (repo_root / rel_path).read_text(encoding="utf-8", errors="ignore")
+        )
+        assert offenders == [], f"deleted escape-hatch marker still referenced in: {offenders}"
+
+    # -- AC-FUNC-009: Manifest is the sole attribution boundary -----------
+
+    def test_file_outside_manifest_scope_never_named_in_finding(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/InScope.tsx").write_text("export function InScope() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { InScope } from './InScope';\nexport function App() { return InScope; }\n", encoding="utf-8"
+        )
+        # Orphaned, but deliberately NOT part of this unit's Changes Manifest
+        # -- a finding may only name a file inside `scope.files` (AC-FUNC-009).
+        (repo / "src/OutOfScopeOrphan.tsx").write_text(
+            "export default function Impl() { return null; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/InScope.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
         out = capsys.readouterr().out
 
         assert result == 0
-        assert "[DEFERRED] src/Deferred.tsx" in out
-        assert "feature-flagged for Q3 launch" in out
-        assert "Summary: 1 candidate(s) examined, 0 flagged as potentially unreachable." in out
+        assert "OutOfScopeOrphan" not in out
 
 
 class TestCmdGetDiffModeAware:

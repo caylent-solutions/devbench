@@ -228,9 +228,11 @@ orchestrate:
   max_transport_restarts: 14                  # bounded restarts after an SDK transport error (~1h budget)
   transport_restart_backoff_base_seconds: 1.0 # first wait; doubles per restart
   transport_restart_backoff_max_seconds: 60.0 # ceiling on that doubling
+  effort: high                                # reasoning effort for the orchestrator session
+  max_thinking_tokens: 16000                  # ceiling on one turn's reasoning
 ```
 
-All four keys are optional; each resolves **env > YAML > built-in default**.
+All six keys are optional; each resolves **env > YAML > built-in default**.
 
 | Key | Env override | Default |
 | --- | --- | --- |
@@ -238,6 +240,27 @@ All four keys are optional; each resolves **env > YAML > built-in default**.
 | `max_transport_restarts` | `DEVBENCH_MAX_TRANSPORT_RESTARTS` | `14` |
 | `transport_restart_backoff_base_seconds` | `DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS` | `1.0` |
 | `transport_restart_backoff_max_seconds` | `DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS` | `60.0` |
+| `effort` | `DEVBENCH_ORCHESTRATE_EFFORT` | `high` |
+| `max_thinking_tokens` | `DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS` | `16000` |
+
+**Effort and the thinking budget.** `effort` accepts `low`, `medium`, `high`,
+`xhigh` or `max`, and applies to the orchestrator SDK session and every agent
+it spawns. devbench pins it rather than inheriting it: an unset value means the
+session adopts whatever effort the ambient Claude Code configuration carries,
+so an unattended run's cost profile is decided by the operator's last
+interactive session.
+
+`max_thinking_tokens` bounds how much one turn may reason, and the reason it
+exists is not only cost. Prompt-cache entries have a limited lifetime. A turn
+that reasons for longer than that lifetime returns to a cold cache, so the
+whole prompt is re-uploaded and re-cached instead of being read back at cache
+rates, and the run reaches its quota limit sooner. Quota exhaustion is what
+interrupts units mid-flight, so an unbounded thinking budget is upstream of
+the interruption-and-recovery machinery described in
+[`git-ops-modes.md`](git-ops-modes.md).
+
+Raise `effort` deliberately, and when you do, check that turns still finish
+inside the cache window rather than assuming more reasoning is free.
 
 **Transport restarts.** When the Claude Agent SDK fails at its transport
 boundary, the orchestrator opens a fresh SDK session on the remaining backlog

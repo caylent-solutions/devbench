@@ -85,7 +85,7 @@ from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Seque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, NamedTuple, cast
+from typing import IO, TYPE_CHECKING, Any, NamedTuple, cast
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -195,6 +195,8 @@ from devbench.config import (
     BLOCKED_RECOVERY_WINDOW_SECONDS,
     MAX_CASCADE_DEPTH,
     MAX_TRANSPORT_RESTARTS,
+    ORCHESTRATE_EFFORT,
+    ORCHESTRATE_MAX_THINKING_TOKENS,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
     TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
@@ -279,7 +281,10 @@ from devbench.constants import (
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
 from devbench.git_orphans import OrphanReport
-from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord
+from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord, RestoreRecord
+
+if TYPE_CHECKING:
+    from claude_agent_sdk.types import EffortLevel
 from devbench.github.git_ops import GitOpsService
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
@@ -1335,9 +1340,16 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
 
     Quarantine is non-destructive. Each stash entry carries a discoverable
     ``devbench-quarantine:<owner-id>`` message and stays recoverable via
-    ``git stash list``. Nothing is auto-restored: a blocked unit re-executes
-    from its Changes Manifest when it unblocks, and re-injecting a superseded
-    attempt into a later run's tree would recreate the contamination.
+    ``git stash list``.
+
+    Displaced work is handed back before the scan runs: when the claiming unit
+    is itself a previously-displaced owner, ``restore_quarantine`` returns its
+    entry to the tree first, so the unit resumes from the attempt it already
+    paid for instead of re-executing from an empty checkout. The restore is
+    bounded by the unit's own Changes Manifest and refuses to overwrite a
+    newer attempt, so it cannot reintroduce the contamination the quarantine
+    removes; a refusal leaves the entry intact and blocks the claim rather
+    than silently discarding an expensive attempt.
 
     Re-claiming an ``in-progress`` unit is unaffected, because the unit's own
     manifest files are in scope and are never quarantined.
@@ -1361,7 +1373,7 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
         supposed to clear.
     """
     from devbench.backlog.manifest import list_changed_files, parse_manifest
-    from devbench.git_quarantine import quarantine_paths
+    from devbench.git_quarantine import quarantine_paths, restore_quarantine
 
     canonical_repo = resolve_repo(unit.repo)
     repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
@@ -1375,9 +1387,17 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
 
     manifest_files = {row.file for row in parse_manifest(wu_file.read_text(encoding="utf-8"))}
     try:
+        restored = restore_quarantine(repo_path, unit_id, manifest_files)
+    except RuntimeError as exc:
+        return f"ERROR: cannot prepare the checkout for {unit_id!r}: {exc}"
+    if restored is not None:
+        _log_quarantine_restore(restored)
+
+    try:
         foreign = [path for path in list_changed_files(repo_path) if path not in manifest_files]
         if not foreign:
             return None
+        _checkpoint_owners_before_quarantine(repo_path, foreign, canonical_repo)
         records = quarantine_paths(repo_path, foreign, _non_terminal_manifests(canonical_repo), unit_id)
         remaining = [path for path in list_changed_files(repo_path) if path not in manifest_files]
     except RuntimeError as exc:
@@ -1393,6 +1413,38 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
     for record in records:
         _log_quarantine(record, unit_id)
     return None
+
+
+def _checkpoint_owners_before_quarantine(repo_path: Path, foreign: list[str], canonical_repo: str) -> None:
+    """Snapshot the checkout before foreign work is stashed out of it.
+
+    One snapshot covers every displaced owner, because ``git stash create``
+    captures the whole tree rather than a path subset. That is deliberately
+    coarser than the per-owner stash entries: the checkpoint is a safety net
+    for the case where the stash stack is lost, not the primary recovery path,
+    and a single reachable commit holding everything is both cheaper and
+    harder to lose than one ref per owner.
+
+    Best-effort: a failed snapshot is logged and the quarantine proceeds. The
+    stash is still written, so refusing to continue here would stop an
+    unattended run to protect a backup of a backup.
+    """
+    from devbench.git_quarantine import checkpoint_work, group_paths_by_owner
+
+    owners = [
+        owner
+        for owner in group_paths_by_owner(foreign, _non_terminal_manifests(canonical_repo))
+        if owner != UNATTRIBUTED_OWNER
+    ]
+    if not owners:
+        return
+    try:
+        sha = checkpoint_work(repo_path, sorted(owners)[0])
+    except RuntimeError as exc:
+        logger.warning("[CHECKPOINT_SKIPPED] pre-quarantine snapshot failed: %s", exc)
+        return
+    if sha:
+        logger.info("[WORK_CHECKPOINTED] pre-quarantine snapshot %s covers %s", sha, sorted(owners))
 
 
 def _non_terminal_manifests(canonical_repo: str) -> dict[str, list[str]]:
@@ -1463,11 +1515,49 @@ def _log_quarantine(record: QuarantineRecord, claiming_unit_id: str) -> None:
             "orchestrator",
             f"[WORK_QUARANTINED] {len(paths)} uncommitted path(s) from this unit were displaced from the "
             f"shared checkout when {claiming_unit_id} claimed: {paths}. They are preserved in a git stash "
-            f"titled {stash_message!r} and are recoverable with 'git stash list'. Nothing was restored "
-            "automatically: re-execute from this unit's Changes Manifest when it unblocks.",
+            f"titled {stash_message!r} and are recoverable with 'git stash list'. They are restored "
+            "automatically the next time this unit claims the checkout, so resume from them rather than "
+            "re-executing this unit's Changes Manifest from scratch.",
         )
     except (OSError, ValueError) as exc:
         logger.warning("quarantine audit comment failed for %s: %s", owner_id, exc)
+
+
+def _log_quarantine_restore(record: RestoreRecord) -> None:
+    """Record that a unit's displaced work was handed back on its re-claim.
+
+    The counterpart to :func:`_log_quarantine`. The owning unit's next
+    executor reads this line to learn that its previous attempt is already in
+    the tree, which is the difference between resuming a finished attempt and
+    redoing every review round that produced it.
+
+    Comment-write failures are logged and not raised, matching the quarantine
+    side: the restore itself has already succeeded by this point, and losing
+    an audit line must not stop an unattended run.
+    """
+    owner_id = record.owner_id
+    paths = list(record.paths)
+    logger.info(
+        "[WORK_RESTORED] %d path(s) returned to %s from quarantine %r",
+        len(paths),
+        owner_id,
+        record.stash_message,
+    )
+    try:
+        owner_file = _resolve_unit_file_by_id(owner_id)
+        if owner_file is None:
+            return
+        BacklogManager()._append_agent_comment(
+            owner_file,
+            "orchestrator",
+            f"[WORK_RESTORED] {len(paths)} previously displaced path(s) were restored into the shared "
+            f"checkout for this claim: {paths}. They come from the quarantine stash titled "
+            f"{record.stash_message!r}, which has now been consumed. This is the attempt this unit had "
+            "already produced, so verify and continue from it rather than starting the Changes Manifest "
+            "over.",
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("quarantine restore audit comment failed for %s: %s", owner_id, exc)
 
 
 def _active_work_unit_marker_path(session_name: str | None) -> Path:
@@ -9589,18 +9679,18 @@ def cmd_start(*argv: str) -> int:
     os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
 
     # AC-192-9: Register a SIGTERM handler so that ``devbench stop --session``
-    # can force the in-flight work unit to ``blocked`` before this process exits.
+    # releases the in-flight work unit back to the queue before this process exits.
     # The handler reads the current backlog, finds the in-progress WU, sets it to
-    # ``blocked``, appends a ``[FORCED_BLOCKED_ON_STOP]`` audit comment, then
+    # ``in-queue``, appends an ``[INTERRUPTED_ON_STOP]`` audit comment, then
     # exits rc=0.  The previous handler is restored in the finally block.
     _session_name_for_sigterm = parsed.name
 
     def _sigterm_handler(_signum: int, _frame: object) -> None:
-        """SIGTERM handler: force in-flight WU to blocked then exit.
+        """SIGTERM handler: release the in-flight WU to the queue then exit.
 
         Reads the backlog, locates the single in-progress work unit (if any),
-        transitions it to ``blocked``, appends a
-        ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit entry, then calls
+        transitions it to ``in-queue``, appends an
+        ``[INTERRUPTED_ON_STOP] session=<name>`` audit entry, then calls
         ``raise SystemExit(0)`` so the ``finally`` block in ``cmd_start`` runs
         to restore ``DEVBENCH_SESSION_NAME``.
 
@@ -9617,9 +9707,9 @@ def cmd_start(*argv: str) -> int:
             parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
             units = parser.parse_index()
             wu = _find_in_flight_wu(units)
-            _force_block_in_flight_wu(wu, session_name=_session_name_for_sigterm)
+            _requeue_in_flight_wu(wu, session_name=_session_name_for_sigterm)
         except (OSError, ValueError) as exc:
-            logger.error("[SIGTERM_HANDLER_ERROR] could not force-block in-flight WU: %s", exc)
+            logger.error("[SIGTERM_HANDLER_ERROR] could not requeue in-flight WU: %s", exc)
         raise SystemExit(0)
 
     _prev_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -9703,6 +9793,14 @@ def cmd_start(*argv: str) -> int:
                 options=ClaudeAgentOptions(
                     plugins=[{"type": "local", "path": str(plugin_path)}],
                     permission_mode="bypassPermissions",
+                    # Pinned rather than inherited. Without these the session
+                    # picks up the ambient Claude Code effort, so an unattended
+                    # run's cost profile depends on whatever the operator's
+                    # last interactive session happened to be set to, and a
+                    # turn that reasons past the prompt-cache lifetime returns
+                    # to a cold cache and re-uploads the whole prompt.
+                    effort=cast("EffortLevel", ORCHESTRATE_EFFORT),
+                    max_thinking_tokens=ORCHESTRATE_MAX_THINKING_TOKENS,
                 ),
             ),
         )
@@ -10812,8 +10910,8 @@ def cmd_sessions(*argv: str) -> int:
 
 #: Audit-log prefix written when cmd_start intercepts SIGTERM and forces the
 #: in-flight work unit to ``blocked``.  Format:
-#: ``[FORCED_BLOCKED_ON_STOP] session=<name>``.
-_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX: str = "[FORCED_BLOCKED_ON_STOP] session="
+#: ``[INTERRUPTED_ON_STOP] session=<name>``.
+_INTERRUPTED_ON_STOP_AUDIT_PREFIX: str = "[INTERRUPTED_ON_STOP] session="
 
 
 def _parse_stop_argv(argv: tuple[str, ...]) -> tuple[str | None, int, str]:
@@ -10893,18 +10991,28 @@ def _find_in_flight_wu(units: list[WorkUnit]) -> WorkUnit | None:
     return None
 
 
-def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
-    """Set *wu* to ``blocked`` and append a ``[FORCED_BLOCKED_ON_STOP]`` audit comment.
+def _requeue_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
+    """Return *wu* to ``in-queue`` and append an ``[INTERRUPTED_ON_STOP]`` audit comment.
 
-    This is called by the SIGTERM handler in ``cmd_start`` to mark the
-    in-flight work unit as ``blocked`` with a session-tagged audit entry,
-    satisfying spec section 4.4.5 and AC-192-9.
+    Called by the SIGTERM handler in ``cmd_start`` to release the in-flight
+    work unit when the run stops, so the next run picks it up where it left
+    off (spec section 4.4.5, AC-192-9).
+
+    The unit goes to ``in-queue`` rather than ``blocked`` because a stop is
+    not a dependency problem, and ``blocked`` is how devbench encodes exactly
+    that. A unit parked in ``blocked`` waits for a dependency to go terminal;
+    when the stop happened after every dependency was already terminal, no
+    such event is ever coming and only a ``reconcile-cascade`` sweep can
+    release it. Interrupted work is immediately actionable, so it belongs in
+    the queue it was claimed from -- and pairing that with the quarantine
+    restore on the claim path means the unit resumes on the attempt it had
+    already produced.
 
     When *wu* is ``None`` (no in-flight unit found), this function is a no-op.
 
     Args:
         wu: The in-flight :class:`~devbench.backlog.work_unit.WorkUnit` to
-            force-block, or ``None`` for a no-op.
+            release, or ``None`` for a no-op.
         session_name: The session name to embed in the audit comment
             (e.g. ``"default"``).
 
@@ -10915,13 +11023,50 @@ def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
     if wu is None:
         return
 
+    checkpoint_sha = _checkpoint_in_flight_work(wu)
+
     mgr = BacklogManager()
-    mgr.force_status(wu.file_path, BACKLOG_INDEX, wu.id, STATUS_BLOCKED)
+    mgr.force_status(wu.file_path, BACKLOG_INDEX, wu.id, STATUS_IN_QUEUE)
+    detail = f" checkpoint={checkpoint_sha}" if checkpoint_sha else ""
     mgr._append_agent_comment(
         wu.file_path,
         "orchestrator",
-        f"{_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX}{session_name}",
+        f"{_INTERRUPTED_ON_STOP_AUDIT_PREFIX}{session_name}{detail}",
     )
+
+
+def _checkpoint_in_flight_work(wu: WorkUnit) -> str | None:
+    """Snapshot ``wu``'s in-flight work to its checkpoint ref before the run exits.
+
+    The stop path is the last moment devbench controls before an interrupted
+    unit's uncommitted work depends on something else keeping it safe. The
+    snapshot costs one git command, touches neither the worktree nor the
+    index, and gives the work a reachable ref that a later ``git stash clear``
+    cannot discard.
+
+    Best-effort by design: this runs inside a SIGTERM handler, so a repo that
+    cannot be resolved or a git call that fails is logged and passed over. The
+    unit is still released to the queue, and its work is still in the tree --
+    a missing checkpoint costs a safety net, whereas raising here would leave
+    the unit stuck ``in-progress`` with no run to advance it.
+
+    Returns:
+        The checkpoint commit SHA, or ``None`` when there was nothing in
+        flight or the snapshot could not be taken.
+    """
+    from devbench.git_quarantine import checkpoint_work
+
+    try:
+        repo_path = REPO_LOCAL_PATHS.get(resolve_repo(wu.repo))
+        if repo_path is None or not (repo_path / ".git").exists():
+            return None
+        sha = checkpoint_work(repo_path, wu.id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("[CHECKPOINT_SKIPPED] could not snapshot %s: %s", wu.id, exc)
+        return None
+    if sha:
+        logger.info("[WORK_CHECKPOINTED] %s snapshotted to %s", wu.id, sha)
+    return sha
 
 
 def _send_sigterm_to_session(session_name: str) -> tuple[int, str, str]:
@@ -11015,7 +11160,7 @@ def cmd_stop(*argv: str) -> int:
     Reads the PID from ``<workspace>/.devbench/sessions/<name>/pid`` and sends
     ``SIGTERM`` to that process.  The SIGTERM handler registered by ``cmd_start``
     catches the signal, forces any in-flight work unit to ``blocked`` with a
-    ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit comment, then exits rc=0.
+    ``[INTERRUPTED_ON_STOP] session=<name>`` audit comment, then exits rc=0.
 
     Exit codes:
 

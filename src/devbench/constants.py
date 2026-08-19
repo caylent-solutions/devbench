@@ -975,6 +975,32 @@ DEFAULT_MAX_TRANSPORT_RESTARTS: int = 14
 DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = 1.0
 DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS: float = 60.0
 
+# Reasoning effort and per-turn thinking budget for the orchestrator SDK
+# session, and through it every agent the session spawns.
+#
+# Left unset, the session inherits whatever effort the ambient Claude Code
+# configuration carries. That is how an unattended run ends up on ``xhigh``
+# without anyone choosing it, and effort is not a free dial: a turn that
+# reasons for longer than the prompt-cache lifetime returns to a cold cache,
+# so the whole prompt is re-uploaded and re-cached on the next turn instead of
+# being read back. The run then pays full price per turn and exhausts its
+# quota far sooner, and quota exhaustion is what interrupts units mid-flight.
+#
+# ``DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS`` is the guard rail: it bounds one
+# turn's reasoning so a turn cannot outlive the cache window. The value is a
+# budget, not a target -- turns that need less use less.
+#
+# Override:
+#   ``DEVBENCH_ORCHESTRATE_EFFORT`` / ``orchestrate.effort``
+#   ``DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS``
+#     / ``orchestrate.max_thinking_tokens``
+DEFAULT_ORCHESTRATE_EFFORT: str = "high"
+DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS: int = 16000
+
+# The effort levels the SDK accepts. An unrecognised value is rejected at
+# config load rather than passed through to fail deep inside a session.
+VALID_ORCHESTRATE_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
 # Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
 # permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]
 # resume=<n> max=<cap>`` (spec FR-2.10).

@@ -299,6 +299,15 @@ class GitOpsConfig:
             ``[AUTO_MERGE_SKIPPED] no_ci_watcher`` and skips. A marker
             file at ``<workspace>/.devbench/auto-merge-fired-<repo>.marker``
             prevents duplicate invocations. Defaults to ``False``.
+        isolate_worktrees: When ``True``, each work unit is claimed into its
+            own git worktree beside the primary checkout instead of sharing
+            one working tree. Two units that never share a tree never
+            collide, so an interrupted unit's uncommitted work is not
+            something the next claim has to displace. Mutually exclusive with
+            ``single_branch``: git allows a branch to be checked out in
+            exactly one worktree at a time, while single-branch mode exists
+            to land every unit on one shared branch, so the two models cannot
+            both hold (validated at config load). Defaults to ``False``.
         branch_prefix: Top-level task-branch prefix, overridden per-repo by
             ``RepoConfig.branch_prefix``.  When set, task branches are named
             ``backlog/<prefix>/<unit-id-lower>`` instead of
@@ -322,6 +331,7 @@ class GitOpsConfig:
     auto_finalize: bool = False
     auto_merge: bool = False
     branch_prefix: str | None = None
+    isolate_worktrees: bool = False
 
 
 @dataclass
@@ -570,16 +580,28 @@ class OrchestrateConfig:
     persistently failing transport exhausts its whole restart budget in
     seconds; see ``DEFAULT_MAX_TRANSPORT_RESTARTS`` in ``constants.py``.
 
+    ``effort`` sets the reasoning effort of the orchestrator SDK session, and
+    ``max_thinking_tokens`` bounds how much one turn may reason. Unset, the
+    session inherits the ambient Claude Code effort, which is how an
+    unattended run silently lands on ``xhigh``. That matters beyond cost: a
+    turn that reasons for longer than the prompt-cache lifetime comes back to
+    a cold cache and re-uploads the entire prompt, so token burn per turn
+    climbs sharply and the run reaches its quota limit sooner. Bounding the
+    thinking budget keeps a turn inside the cache window.
+
     Every field is ``None`` when absent from YAML; ``config.py`` resolves
     env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``,
-    ``MAX_TRANSPORT_RESTARTS``, ``TRANSPORT_RESTART_BACKOFF_BASE_SECONDS``
-    and ``TRANSPORT_RESTART_BACKOFF_MAX_SECONDS`` constants.
+    ``MAX_TRANSPORT_RESTARTS``, ``TRANSPORT_RESTART_BACKOFF_BASE_SECONDS``,
+    ``TRANSPORT_RESTART_BACKOFF_MAX_SECONDS``, ``ORCHESTRATE_EFFORT`` and
+    ``ORCHESTRATE_MAX_THINKING_TOKENS`` constants.
     """
 
     max_cascade_depth: int | None = None
     max_transport_restarts: int | None = None
     transport_restart_backoff_base_seconds: float | None = None
     transport_restart_backoff_max_seconds: float | None = None
+    effort: str | None = None
+    max_thinking_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1844,6 +1866,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     auto_merge = bool(git_ops_raw.get("auto_merge", False))
     _validate_auto_finalize_auto_merge(path, defer_pr, local_only, auto_finalize, auto_merge)
     branch_prefix_raw = _parse_branch_prefix(path, "git_ops.branch_prefix", git_ops_raw.get("branch_prefix"))
+    isolate_worktrees = bool(git_ops_raw.get("isolate_worktrees", False))
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
@@ -1857,7 +1880,17 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         auto_finalize=auto_finalize,
         auto_merge=auto_merge,
         branch_prefix=branch_prefix_raw,
+        isolate_worktrees=isolate_worktrees,
     )
+    if isolate_worktrees and single_branch_raw:
+        raise ValueError(
+            f"Config file '{path}': git_ops.isolate_worktrees: true is mutually exclusive with "
+            f"git_ops.single_branch: {single_branch_raw!r}. git allows a branch to be checked out in "
+            "exactly one worktree at a time, while single_branch exists to land every unit on one "
+            "shared branch, so the two cannot both hold. Single-branch workspaces get their "
+            "interrupted-work durability from checkpointing and quarantine restore instead; drop one "
+            "of the two keys."
+        )
     if local_only:
         missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]
         if missing_default_branch:
@@ -2007,6 +2040,10 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             float(orchestrate_raw["transport_restart_backoff_max_seconds"])
             if "transport_restart_backoff_max_seconds" in orchestrate_raw
             else None
+        ),
+        effort=(str(orchestrate_raw["effort"]) if "effort" in orchestrate_raw else None),
+        max_thinking_tokens=(
+            int(orchestrate_raw["max_thinking_tokens"]) if "max_thinking_tokens" in orchestrate_raw else None
         ),
     )
 

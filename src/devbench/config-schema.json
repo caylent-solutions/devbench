@@ -247,6 +247,10 @@
               "description": "Per-poll cadence in seconds inside the settle window. Default 5. Override via DEVBENCH_PR_REVIEW_POLL_INTERVAL."
             }
           }
+        },
+        "isolate_worktrees": {
+          "type": "boolean",
+          "description": "Claim each work unit into its own git worktree beside the primary checkout instead of sharing one working tree. Two units that never share a tree never collide, so an interrupted unit's uncommitted work is not something the next claim has to displace. Mutually exclusive with single_branch: git allows a branch to be checked out in exactly one worktree at a time. Default: false."
         }
       }
     },
@@ -323,6 +327,22 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Ceiling, in seconds, on the exponential transport-restart delay. Must be >= transport_restart_backoff_base_seconds. Default: 60.0."
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "description": "Reasoning effort for the orchestrator SDK session and every agent it spawns. Unset, the session inherits the ambient Claude Code effort, so an unattended run's cost profile depends on whatever the operator's last interactive session used. Default: high."
+        },
+        "max_thinking_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Ceiling on how many tokens one turn may spend reasoning. A turn that reasons for longer than the prompt-cache lifetime returns to a cold cache, so the whole prompt is re-uploaded and re-cached instead of read back, and the run reaches its quota limit sooner. Default: 16000."
         }
       }
     },

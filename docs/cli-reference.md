@@ -981,7 +981,7 @@ Send SIGTERM to a running session's orchestrator process, forcing it to exit aft
 
 1. `devbench stop` reads the session's `pid` file.
 2. Sends SIGTERM to the process.
-3. The SIGTERM handler in `cmd_start` intercepts the signal, writes a `[FORCED_BLOCKED_ON_STOP] session=<name>` audit comment to the in-flight work unit, marks the work unit `blocked`, and exits with rc=0.
+3. The SIGTERM handler in `cmd_start` intercepts the signal, writes an `[INTERRUPTED_ON_STOP] session=<name>` audit comment to the in-flight work unit, returns the work unit to `in-queue`, and exits with rc=0. The unit is released rather than blocked because a stop is not a dependency problem: the next run claims it again and the claim path restores whatever work was displaced, so an interrupted unit resumes instead of restarting.
 4. The session directory is NOT cleaned up automatically -- run `devbench sessions --cleanup` afterward to remove the stale entry.
 
 **Flags:**
@@ -1004,7 +1004,7 @@ Send SIGTERM to a running session's orchestrator process, forcing it to exit aft
 # Stop the session named "alpha" and block its in-flight work unit:
 uv run devbench stop --session alpha
 # The orchestrator for session "alpha" receives SIGTERM, blocks its WU, and exits.
-# The in-flight WU now carries: [FORCED_BLOCKED_ON_STOP] session=alpha
+# The in-flight WU now carries: [INTERRUPTED_ON_STOP] session=alpha
 
 # Clean up the stale session entry:
 uv run devbench sessions --cleanup

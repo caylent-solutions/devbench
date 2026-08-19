@@ -4230,3 +4230,185 @@ class TestSkillsConfig:
         rt = load_runtime_config(cfg, {})
         assert rt.skills.exemplar_backlog_path is None
         assert rt.skills.exemplar_spec_path is None
+
+
+# ---------------------------------------------------------------------------
+# orchestrate: reasoning effort and per-turn thinking budget
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrchestrateEffortAndThinkingBudget:
+    """The ``orchestrate.effort`` / ``max_thinking_tokens`` knobs load from YAML.
+
+    Left unset the SDK session adopts the ambient Claude Code effort, so an
+    unattended run's cost profile is decided by whatever the operator's last
+    interactive session happened to use. Both must stay ``None`` when absent
+    so ``config.py``'s env > YAML > default chain still reaches the built-in
+    default rather than being pinned by a stray zero.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_keys_leave_both_fields_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_cascade_depth: 3
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort is None
+        assert result.orchestrate.max_thinking_tokens is None
+
+    def test_values_are_read_from_the_orchestrate_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: medium
+              max_thinking_tokens: 8000
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "medium"
+        assert result.orchestrate.max_thinking_tokens == 8000
+
+    def test_the_new_keys_coexist_with_the_transport_restart_knobs(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: low
+              max_thinking_tokens: 4096
+              max_transport_restarts: 7
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "low"
+        assert result.orchestrate.max_thinking_tokens == 4096
+        assert result.orchestrate.max_transport_restarts == 7
+
+    def test_setting_one_key_leaves_its_sibling_none(self, tmp_path: Path) -> None:
+        """Pinning effort must not silently pin the thinking budget too."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: xhigh
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "xhigh"
+        assert result.orchestrate.max_thinking_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# git_ops: per-unit worktree isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGitOpsIsolateWorktrees:
+    """``git_ops.isolate_worktrees`` opts into per-unit checkouts.
+
+    The combination with ``single_branch`` is rejected at load rather than at
+    the first claim: git allows a branch to be checked out in exactly one
+    worktree at a time, so the pair would otherwise surface as an opaque git
+    error partway through an unattended run.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_defaults_to_false_when_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.isolate_worktrees is False
+
+    def test_opting_in_is_read_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              isolate_worktrees: true
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.isolate_worktrees is True
+
+    def test_combining_with_single_branch_is_rejected(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              isolate_worktrees: true
+              single_branch: feat/everything
+              defer_pr: true
+            """,
+        )
+
+        with pytest.raises(ValueError, match=re.escape("mutually exclusive with git_ops.single_branch")):
+            load_runtime_config(cfg, {})
+
+    def test_single_branch_alone_still_loads(self, tmp_path: Path) -> None:
+        """The guard must not reject the single-branch mode it coexists with."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: feat/everything
+              defer_pr: true
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.single_branch == "feat/everything"
+        assert result.git_ops.isolate_worktrees is False

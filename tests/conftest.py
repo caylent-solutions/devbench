@@ -60,6 +60,35 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 _WORKSPACE_ROOT = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
 
 
+@pytest.fixture(autouse=True)
+def _neutralise_transport_restart_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never spend real wall-clock time on SDK transport-restart backoff.
+
+    ``cli._sleep_between_transport_restarts`` paces the orchestrator's restarts
+    after an SDK transport error, doubling up to a ceiling. That pacing is
+    correct in production and ruinous in a test: any test driving the restart
+    loop to its cap sleeps for minutes. When the backoff was first added, two
+    such classes existed and the suite went from roughly six minutes to eleven.
+
+    Neutralised here, unconditionally and suite-wide, rather than per class.
+    Per-class opt-out is a list a future test can silently fail to join, and
+    that failure mode is not a red test -- it is a suite that quietly gets
+    slower, which nobody bisects. Same reasoning as the workspace isolation
+    above: not a configuration each test may honour, a hazard the suite closes
+    once.
+
+    Tests that assert the pacing itself (``TestTransportRestartBackoffSeconds``
+    for the arithmetic, ``test_loop_applies_exponential_backoff_between_restarts``
+    for the loop) re-patch this same seam with a recorder. A later
+    ``monkeypatch.setattr`` wins over this one, so those keep full coverage of
+    the delays without waiting for them.
+
+    Targeted by dotted path so importing ``devbench.cli`` stays lazy -- most of
+    the suite never touches the restart loop.
+    """
+    monkeypatch.setattr("devbench.cli._sleep_between_transport_restarts", lambda seconds: None)
+
+
 @pytest.fixture
 def tmp_work_unit_file(tmp_path: Path) -> Path:
     """Create a temporary .md file with valid work-unit format."""

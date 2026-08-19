@@ -277,7 +277,7 @@ What happens:
    `<workspace>/.devbench/sessions/late/pid`.
 2. SIGTERM is sent to that process.
 3. The SIGTERM handler in `cmd_start` forces the in-flight work unit to `blocked`
-   with a `[FORCED_BLOCKED_ON_STOP] session=late` audit comment.
+   with an `[INTERRUPTED_ON_STOP] session=late` audit comment.
 4. The orchestrator exits rc=0.
 5. The `late` session's state directory is cleaned up.
 

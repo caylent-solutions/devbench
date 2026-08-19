@@ -700,17 +700,30 @@ class TestBlockerResolverSuggestedApproachStructure:
 
 @pytest.mark.unit
 class TestTaskFactoryTodoRowRefusal:
-    """ADR-08 slice H: task-factory must warn about thin-approach and TODO-row refusal."""
+    """ADR-08 slice H: task-factory must warn about thin-approach and empty-file-set drafts."""
 
     _TASK_FACTORY_PATH = AGENTS_DIR / "task-factory.md"
 
-    def test_prompt_mentions_todo_row_refusal(self) -> None:
-        """The prompt must explain that literal 'TODO -- describe change' rows cause refusal."""
+    def test_prompt_explains_the_derived_change_verb(self) -> None:
+        """The prompt must describe how the Manifest change verb is produced.
+
+        The renderer no longer emits a literal 'TODO -- describe change' cell:
+        the verb is derived from the target repository (existing path renders
+        as modify, absent path as add), and an empty file set renders as the
+        deferred-resolution sentinel. The prompt has to describe what the
+        factory actually writes, or the agent reasons about a Manifest shape
+        that can no longer occur.
+        """
         content = self._TASK_FACTORY_PATH.read_text()
-        assert "TODO -- describe change" in content, (
-            "task-factory.md must warn that a literal 'TODO -- describe change' Changes Manifest row "
-            "will be refused by materialise-proposal so drafts never enter the backlog half-written."
+        assert "TODO -- describe change" not in content, (
+            "task-factory.md still describes the retired 'TODO -- describe change' row."
         )
+        assert "<source-drift-fix-targets-determined-at-execution>" in content, (
+            "task-factory.md must name the sentinel an empty files_to_own renders as, so the agent "
+            "can recognise the blocker-resolver drift it signals."
+        )
+        for verb in ("modify", "add"):
+            assert verb in content, f"task-factory.md must explain when a row renders as '{verb}'."
 
     def test_prompt_mentions_thin_approach_refusal(self) -> None:
         """The prompt must explain that a too-short suggested_approach causes refusal."""

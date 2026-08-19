@@ -259,19 +259,19 @@ class TestCheckFilesNotAlreadyInManifest:
 
 
 # ---------------------------------------------------------------------------
-# check_files_in_staged_diff
+# check_files_in_changed_set
 # ---------------------------------------------------------------------------
 
 
-class TestCheckFilesInStagedDiff:
+class TestCheckFilesInChangedSet:
     def test_all_files_present_passes(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
-        pf.check_files_in_staged_diff(_make_request(), frozenset({"src/example/parser.py"}))
+        pf.check_files_in_changed_set(_make_request(), frozenset({"src/example/parser.py"}))
 
     def test_missing_file_rejects(self, tmp_backlog: Path) -> None:
         pf = PreFilter(tmp_backlog, _default_config())
-        with pytest.raises(AmendmentError, match="not in the staged diff"):
-            pf.check_files_in_staged_diff(_make_request(), frozenset({"other/file.py"}))
+        with pytest.raises(AmendmentError, match="has not been modified"):
+            pf.check_files_in_changed_set(_make_request(), frozenset({"other/file.py"}))
 
 
 # ---------------------------------------------------------------------------
@@ -321,3 +321,140 @@ class TestExtractAcId:
 
     def test_single_token(self) -> None:
         assert _extract_ac_id("AC-ONLY-ID") == "AC-ONLY-ID"
+
+
+# ---------------------------------------------------------------------------
+# check_files_to_remove_are_declared
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFilesToRemoveAreDeclared:
+    def test_declared_path_passes(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        unit = pf.check_task_exists_and_in_progress(request)
+        pf.check_files_to_remove_are_declared(request, unit)
+
+    def test_undeclared_path_rejected(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/never_declared.py"])
+        unit = pf.check_task_exists_and_in_progress(request)
+        with pytest.raises(AmendmentError, match="not in the Changes Manifest"):
+            pf.check_files_to_remove_are_declared(request, unit)
+
+    def test_empty_list_is_a_noop(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request()
+        unit = pf.check_task_exists_and_in_progress(request)
+        pf.check_files_to_remove_are_declared(request, unit)
+
+    def test_adding_and_removing_same_path_rejected(self, tmp_backlog: Path) -> None:
+        """Self-contradictory: the outcome would depend on which list applies last."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(
+            files_to_add=[{"path": "tests/test_example.py", "change": "touch"}],
+            files_to_remove=["tests/test_example.py"],
+        )
+        unit = pf.check_task_exists_and_in_progress(request)
+        with pytest.raises(AmendmentError, match="both adds and removes"):
+            pf.check_files_to_remove_are_declared(request, unit)
+
+
+# ---------------------------------------------------------------------------
+# check_files_to_remove_have_no_diff -- the removal safety property
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFilesToRemoveHaveNoDiff:
+    """A Manifest row may only be dropped when its file provably has no changes.
+
+    The row is the only thing authorising a file to appear in the unit's commit,
+    so permitting removal for a file with real changes would let work leave the
+    unit's reviewed scope -- the violation
+    ``assert_staged_matches_manifest`` exists to stop.
+    """
+
+    def test_unchanged_path_passes(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        pf.check_files_to_remove_have_no_diff(request, frozenset({"some/other/file.py"}))
+
+    def test_staged_change_blocks_removal(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        with pytest.raises(AmendmentError, match="with changes"):
+            pf.check_files_to_remove_have_no_diff(request, frozenset({"tests/test_example.py"}))
+
+    def test_error_names_the_offending_path_only(self, tmp_backlog: Path) -> None:
+        """The message must name the dirty path so the executor can act precisely."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        with pytest.raises(AmendmentError) as exc:
+            pf.check_files_to_remove_have_no_diff(request, frozenset({"tests/test_example.py", "unrelated.py"}))
+        assert "tests/test_example.py" in str(exc.value)
+        assert "unrelated.py" not in str(exc.value)
+
+    def test_empty_list_is_a_noop(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        pf.check_files_to_remove_have_no_diff(_make_request(), frozenset({"anything.py"}))
+
+    def test_run_all_enforces_the_no_diff_rule(self, tmp_backlog: Path) -> None:
+        """The check is wired into run_all, not merely available to call."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        with pytest.raises(AmendmentError, match="with changes"):
+            pf.run_all(
+                request,
+                staged_files=frozenset(),
+                changed_files=frozenset({"tests/test_example.py"}),
+            )
+
+    def test_run_all_passes_for_a_clean_removal(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        request = _make_request(files_to_add=[], files_to_remove=["tests/test_example.py"])
+        pf.run_all(request, staged_files=frozenset(), changed_files=frozenset())
+
+
+# ---------------------------------------------------------------------------
+# Amendment / staging deadlock (guard-git-stage.sh <-> check_files_in_staged_diff)
+# ---------------------------------------------------------------------------
+
+
+class TestUnstagedFileCanBeAmended:
+    """An amendment must be requestable for a file the guard refuses to stage.
+
+    Two harness controls formed a circular precondition:
+
+    1. ``guard-git-stage.sh`` rejects ``git add`` for any path absent from the
+       Changes Manifest, naming ``devbench request-amendment`` as the remedy.
+    2. ``check_files_in_staged_diff`` rejected any amendment whose files were
+       not ALREADY staged.
+
+    Each required the other's postcondition as its own precondition, so a file
+    that needed a Manifest amendment could never be staged and could never be
+    amended. The executor's only escapes were bypassing a guard hook (forbidden)
+    or blocking. Widening the check to ``changed_files`` -- the union of staged,
+    unstaged and untracked, which the caller already computes and passes --
+    breaks the cycle while preserving the intent: the executor still cannot
+    request an amendment for a file it has not actually touched.
+    """
+
+    def test_unstaged_but_modified_file_passes(self, tmp_backlog: Path) -> None:
+        pf = PreFilter(tmp_backlog, _default_config())
+        # Modified in the working tree, unstaged because the guard blocked `git add`.
+        pf.check_files_in_changed_set(_make_request(), frozenset({"src/example/parser.py"}))
+
+    def test_untouched_file_still_rejects(self, tmp_backlog: Path) -> None:
+        """The anti-fabrication intent survives: no diff anywhere means no amendment."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        with pytest.raises(AmendmentError, match="has not been modified"):
+            pf.check_files_in_changed_set(_make_request(), frozenset({"other/file.py"}))
+
+    def test_run_all_accepts_an_unstaged_change(self, tmp_backlog: Path) -> None:
+        """End to end: the deadlock case now clears the pre-filter."""
+        pf = PreFilter(tmp_backlog, _default_config())
+        pf.run_all(
+            _make_request(),
+            staged_files=frozenset(),  # guard refused to stage it
+            changed_files=frozenset({"src/example/parser.py"}),
+        )

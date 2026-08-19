@@ -1005,6 +1005,124 @@ class TestConfigLoaderNoEnvVars:
 
 
 # ---------------------------------------------------------------------------
+# orchestrate: transport-restart bound and backoff envelope
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrchestrateTransportRestartConfig:
+    """The ``orchestrate.*`` transport-restart knobs load from YAML.
+
+    These are optional: a workspace that never sets them must keep ``None`` so
+    ``config.py``'s env > YAML > default chain still reaches the built-in
+    default rather than being pinned by a stray zero.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_orchestrate_block_leaves_every_field_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts is None
+        assert result.orchestrate.transport_restart_backoff_base_seconds is None
+        assert result.orchestrate.transport_restart_backoff_max_seconds is None
+
+    def test_values_are_read_from_the_orchestrate_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restarts: 4
+              transport_restart_backoff_base_seconds: 0.5
+              transport_restart_backoff_max_seconds: 30
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts == 4
+        assert result.orchestrate.transport_restart_backoff_base_seconds == 0.5
+        # An int in YAML must still surface as a float for the arithmetic.
+        assert result.orchestrate.transport_restart_backoff_max_seconds == 30.0
+        assert isinstance(result.orchestrate.transport_restart_backoff_max_seconds, float)
+
+    def test_partial_block_leaves_the_unset_siblings_none(self, tmp_path: Path) -> None:
+        """Setting one knob must not silently pin the other two."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restarts: 7
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts == 7
+        assert result.orchestrate.transport_restart_backoff_base_seconds is None
+        assert result.orchestrate.transport_restart_backoff_max_seconds is None
+
+    @pytest.mark.parametrize(
+        ("key", "bad_value"),
+        [
+            ("max_transport_restarts", 0),
+            ("transport_restart_backoff_base_seconds", 0),
+            ("transport_restart_backoff_max_seconds", -1),
+        ],
+    )
+    def test_schema_rejects_non_positive_values(self, tmp_path: Path, key: str, bad_value: object) -> None:
+        """Fail fast at load time: a zero or negative delay is the busy-loop
+        defect the backoff exists to prevent."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              {key}: {bad_value}
+            """,
+        )
+
+        with pytest.raises((ValueError, jsonschema.ValidationError)):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_orchestrate_key(self, tmp_path: Path) -> None:
+        """``additionalProperties: false`` -- a typo must be loud, not ignored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restart: 4
+            """,
+        )
+
+        with pytest.raises((ValueError, jsonschema.ValidationError)):
+            load_runtime_config(cfg, {})
+
+
+# ---------------------------------------------------------------------------
 # AC-7: checkout_directory path safety enforced post-schema
 # AC-8: allowed_orgs vs repos cross-validation enforced post-schema
 # ---------------------------------------------------------------------------
@@ -1648,7 +1766,9 @@ class TestManifestAmendmentConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.manifest_amendment.enabled is True
-        assert result.manifest_amendment.max_requests_per_execution == 1
+        # 2 admits one addition plus one row removal in a single execution, the
+        # combination AC-FINAL-015 can require when a declared row goes stale.
+        assert result.manifest_amendment.max_requests_per_execution == 2
         assert "tdd_green_production_fix" in result.manifest_amendment.allowed_reasons
 
     def test_enabled_from_yaml(self, tmp_path: Path) -> None:
@@ -1706,6 +1826,51 @@ class TestManifestAmendmentConfig:
             f"config-schema.json ({schema_path}) manifest_amendment.allowed_reasons.items.enum "
             f"must list exactly the two sanctioned reasons; got {enum}"
         )
+
+    def test_production_source_paths_from_yaml(self, tmp_path: Path) -> None:
+        """validate.production_source_paths is parsed into a tuple on ValidateConfig."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_paths:\n    - scripts/\n    - tools/\n"
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.validate.production_source_paths == ("scripts/", "tools/")
+
+    def test_production_source_paths_absent_defaults_to_none(self, tmp_path: Path) -> None:
+        """Absent means built-in behaviour, expressed as None rather than an empty tuple."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
+        assert load_runtime_config(cfg, {}).validate.production_source_paths is None
+
+    def test_production_source_extensions_supports_extensionless_names(self, tmp_path: Path) -> None:
+        """An entry is a filename SUFFIX, so an extensionless source file can be declared.
+        Inferring a leading dot would make `Makefile` unmatchable."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_extensions:\n    - .py\n    - Makefile\n"
+        )
+        assert load_runtime_config(cfg, {}).validate.production_source_extensions == (".py", "makefile")
+
+    def test_production_source_paths_rejects_non_list(self, tmp_path: Path) -> None:
+        """A scalar is a config error, not silently coerced."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\nvalidate:\n  production_source_paths: scripts/\n"
+        )
+        with pytest.raises(ValueError, match="production_source_paths"):
+            load_runtime_config(cfg, {})
+
+    def test_production_source_paths_rejects_empty_entry(self, tmp_path: Path) -> None:
+        """An empty entry would match every path; reject it loudly."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_paths:\n    - scripts/\n    - '  '\n"
+        )
+        with pytest.raises(ValueError, match="must not contain an empty entry"):
+            load_runtime_config(cfg, {})
 
     def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -5092,6 +5257,8 @@ class TestGatesReachabilityEntryPoints:
 # ---------------------------------------------------------------------------
 # resolve_gate_config -- four-layer field-wise precedence (spec 4.1, D-15; AC-27)
 # ---------------------------------------------------------------------------
+# orchestrate: reasoning effort and per-turn thinking budget
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -5321,3 +5488,179 @@ class TestResolveGateConfigSingleReadPathPin:
             "(enabled, auto_derive_registry, extract_source_literals); found direct access(es) "
             "outside config_loader.py:\n" + "\n".join(offenders)
         )
+
+
+class TestOrchestrateEffortAndThinkingBudget:
+    """The ``orchestrate.effort`` / ``max_thinking_tokens`` knobs load from YAML.
+
+    Left unset the SDK session adopts the ambient Claude Code effort, so an
+    unattended run's cost profile is decided by whatever the operator's last
+    interactive session happened to use. Both must stay ``None`` when absent
+    so ``config.py``'s env > YAML > default chain still reaches the built-in
+    default rather than being pinned by a stray zero.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_keys_leave_both_fields_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_cascade_depth: 3
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort is None
+        assert result.orchestrate.max_thinking_tokens is None
+
+    def test_values_are_read_from_the_orchestrate_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: medium
+              max_thinking_tokens: 8000
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "medium"
+        assert result.orchestrate.max_thinking_tokens == 8000
+
+    def test_the_new_keys_coexist_with_the_transport_restart_knobs(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: low
+              max_thinking_tokens: 4096
+              max_transport_restarts: 7
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "low"
+        assert result.orchestrate.max_thinking_tokens == 4096
+        assert result.orchestrate.max_transport_restarts == 7
+
+    def test_setting_one_key_leaves_its_sibling_none(self, tmp_path: Path) -> None:
+        """Pinning effort must not silently pin the thinking budget too."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: xhigh
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "xhigh"
+        assert result.orchestrate.max_thinking_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# git_ops: per-unit worktree isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGitOpsIsolateWorktrees:
+    """``git_ops.isolate_worktrees`` opts into per-unit checkouts.
+
+    The combination with ``single_branch`` is rejected at load rather than at
+    the first claim: git allows a branch to be checked out in exactly one
+    worktree at a time, so the pair would otherwise surface as an opaque git
+    error partway through an unattended run.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_defaults_to_false_when_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.isolate_worktrees is False
+
+    def test_opting_in_is_read_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              isolate_worktrees: true
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.isolate_worktrees is True
+
+    def test_combining_with_single_branch_is_rejected(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              isolate_worktrees: true
+              single_branch: feat/everything
+              defer_pr: true
+            """,
+        )
+
+        with pytest.raises(ValueError, match=re.escape("mutually exclusive with git_ops.single_branch")):
+            load_runtime_config(cfg, {})
+
+    def test_single_branch_alone_still_loads(self, tmp_path: Path) -> None:
+        """The guard must not reject the single-branch mode it coexists with."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: feat/everything
+              defer_pr: true
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.single_branch == "feat/everything"
+        assert result.git_ops.isolate_worktrees is False

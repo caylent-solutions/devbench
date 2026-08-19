@@ -75,3 +75,11 @@ The parser and writer live in `src/devbench/backlog/manifest.py`; malformed tabl
 ## Why this matters
 
 `AC-FINAL-015` -- "the Task's Changes Manifest matches exactly the files changed by git (no extra, no missing)" -- is one of the strongest invariants DevBench enforces. The pre-declared pattern keeps the judge's job mechanical (set comparison); the amendment pattern provides an audited escape hatch for cases the author could not foresee. Neither pattern weakens the invariant; they differ in when the declaration is made.
+
+## When a declared row goes stale
+
+`AC-FINAL-015` cuts both ways: "no extra" means a row the Task declares but never changes is as much a violation as an undeclared file that appears in the diff. The usual cause is benign -- the work that row was written for landed under a sibling unit first, leaving this Task's copy with a zero-line diff.
+
+`changes_manifest` fails the unit with `MANIFEST_MISMATCH` and prescribes an amendment. The remedy is `files_to_remove` on the amendment request, which drops the stale row. It is gated: a row may only be dropped once its file has **no staged, unstaged, or untracked changes**, so a removal can never quietly carry real work outside the reviewed Manifest. See [docs/manifest-amendments.md](manifest-amendments.md#removing-a-stale-row).
+
+Pre-declaring still beats correcting after the fact. If two sibling Tasks could each plausibly land the same file, decide which one owns it while authoring rather than leaving the loser to amend its way out.

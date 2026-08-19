@@ -134,6 +134,10 @@ git_ops:
   # Operator override of the built-in orphan-pattern fnmatch list. Empty =
   # use the built-in list (terraform state, terragrunt cache, Python
   # pycache, coverage, etc.). Non-empty REPLACES the built-in entirely.
+  # Dependency LOCK files (uv.lock, package-lock.json, .terraform.lock.hcl)
+  # are deliberately NOT in the built-in list: they pin resolved versions and
+  # belong in version control, so untracking them is a reproducibility
+  # regression rather than cleanup.
   orphan_patterns: []
   # When true, the orchestrate skill automatically invokes
   # `devbench git-ops-finalize <repo>` once all work units for the repo
@@ -215,6 +219,39 @@ orchestrate:
   # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
   # layer. Override via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
   max_cascade_depth: 2
+
+  # Bound on consecutive in-process restarts after an SDK TRANSPORT error
+  # (the orchestrator reopening a fresh SDK session because the previous one
+  # failed at the transport boundary).
+  #
+  # Deliberately separate from, and far below, max_quota_resumes: a quota
+  # window must elapse and an inactivity restart costs a full timeout window,
+  # so both self-throttle. A transport fault does not -- it can recur as fast
+  # as the SDK can reject a session. Exhausting this bound means the transport
+  # is down rather than flapping, and the run fails fast and loudly instead of
+  # grinding through a four-figure budget unattended.
+  #
+  # Sized as a TIME budget, not an attempt count. Each restart costs one SDK
+  # session lifetime plus one backoff wait; measured against a live Anthropic
+  # 529 'overloaded' outage a session raises after ~199s, so 14 restarts
+  # (15 sessions + ~9 min of backoff) is ~59 min before the run halts. Change
+  # the wall-clock window you want and re-derive rather than nudging this.
+  # Override via DEVBENCH_MAX_TRANSPORT_RESTARTS env var.
+  max_transport_restarts: 14
+
+  # Exponential backoff applied BETWEEN those transport restarts:
+  #   delay = transport_restart_backoff_base_seconds * 2 ** restarts_already_done
+  # clamped to transport_restart_backoff_max_seconds. With the defaults below
+  # the waits run 1s, 2s, 4s, 8s, 16s, 32s, then 60s thereafter.
+  #
+  # Without this envelope the bound above is spent as fast as the SDK can fail,
+  # which is the whole failure mode it exists to prevent. Both values must be
+  # > 0; the ceiling also bounds how long a `devbench stop` can be delayed by
+  # an in-flight wait.
+  # Override via DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS and
+  # DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS env vars.
+  transport_restart_backoff_base_seconds: 1.0
+  transport_restart_backoff_max_seconds: 60.0
 
 # ---------------------------------------------------------------------------
 # Report / cost estimation
@@ -322,7 +359,11 @@ manifest_amendment:
   allowed_reasons:
     - tdd_green_production_fix
     - doc_sync_review_fix
-  max_requests_per_execution: 1
+  # Built-in default is 2 (was 1): a unit correcting its Changes Manifest in
+  # both directions -- adding a file a review demanded and dropping a row
+  # that went stale -- needs two amendments to satisfy AC-FINAL-015 within
+  # one executor run; a limit of 1 made that combination impossible.
+  max_requests_per_execution: 2
 
 # ---------------------------------------------------------------------------
 # Task factory loop (on by default, ADR-32; requires manifest_amendment.enabled:
@@ -372,6 +413,38 @@ validate:
   # inline "(ref)" suffix to declare a token a read-only reference and
   # exempt it from the check. See docs/backlog-contract.md.
   check_orphan_path_tokens: true
+  # Path prefixes THIS workspace treats as production source, consumed by the
+  # task-type invariant (rule 21) and source-test atomicity (rule 14). Absent
+  # (the default) keeps the built-in prefixes `src/` and `infra/scripts/` plus
+  # any nested `/src/` segment. Set this when a repository keeps tested
+  # production modules somewhere else -- for example a monorepo whose control
+  # plane and per-service renderers live in `scripts/` -- otherwise a genuine
+  # behaviour fix in that tree cannot satisfy the invariant and cannot be
+  # authored at all. Declaring the key is authoritative: it REPLACES the
+  # built-in prefixes rather than adding to them. Test paths and `__init__.py`
+  # are excluded regardless.
+  # production_source_paths:
+  #   - scripts/
+  #   - tools/
+  #
+  # Filename SUFFIXES this workspace treats as production source (an entry is matched
+  # case-insensitively against the end of the path, so an extensionless file such as
+  # `Makefile` can be declared; no leading dot is inferred), consumed together
+  # with production_source_paths. Absent (the default) keeps the built-in
+  # Python-only behaviour. Declare it when behaviour lives in non-Python
+  # artefacts -- an infrastructure repository whose service specs are YAML, whose
+  # modules are HCL, and whose dashboards are JSON -- so those changes are
+  # RED-gated as `feature`/`behavior-fix` instead of being forced to `chore`,
+  # which would silently drop the TDD gate on the majority of the repo's work.
+  # Source-test atomicity (rule 14) then pairs, for example, `falco.yml` with
+  # `tests/test_falco.py`, which is exactly the convention such repos already use.
+  # production_source_extensions:
+  #   - .py
+  #   - .yml
+  #   - .yaml
+  #   - .tf
+  #   - .hcl
+  #   - .json
 
 # ---------------------------------------------------------------------------
 # Integration-reality gates (spec section 4.1; caylent-solutions/devbench-internal-backlog#10..#17).

@@ -98,6 +98,17 @@ print(d.get('tool_input', {}).get('content', ''))
   if [[ -n "$CONTENT" ]] && [[ -n "${DEVBENCH_WORKSPACE_ROOT:-}" ]]; then
     YAML_PATH="${DEVBENCH_WORKSPACE_ROOT}/backlog/config/devbench.yaml"
     if [[ -f "$YAML_PATH" ]]; then
+      # Fail loudly (exit 2 = block, with the fix on stderr) when the resolved
+      # python3 cannot import PyYAML. Without this check the heredoc below dies
+      # on `import yaml` with a traceback and exit 1, which Claude Code treats
+      # as a non-blocking hook error -- Rule 11 is then silently skipped.
+      # `make -C <devbench> install` (scripts/install-hook-deps.sh) provisions
+      # PyYAML for exactly this interpreter.
+      if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        echo "guard-work-unit-write: rule 11 needs PyYAML for $(command -v python3), which cannot 'import yaml'." >&2
+        echo "Fix: run 'make -C <devbench-checkout> install' (or: $(command -v python3) -m pip install --user pyyaml), then retry the write." >&2
+        exit 2
+      fi
       CHECKOUT_DIRS=$(python3 - "$YAML_PATH" <<'PYEOF'
 import sys, yaml
 try:

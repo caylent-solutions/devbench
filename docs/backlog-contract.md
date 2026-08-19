@@ -253,6 +253,41 @@ value `behavior-fix` into every newly created Task, so the default
 path and the explicit declaration converge on the same value for
 freshly authored Tasks.
 
+**Task-factory drafts declare an inferred type.** A Task materialised
+from a proposal cannot rely on the `behavior-fix` default, because the
+proposal that produced it may well be a test-only, docs-only or
+chore-only remediation -- and the default's production-source
+invariant would then reject a Task that is correct as written. Nothing
+in devbench writes a `## Task Type:` section after materialisation, so
+such a Task would stay stuck until a human edited the file by hand.
+`infer_task_type` in `src/devbench/backlog/proposal.py` closes that:
+it derives the declaration from the Changes Manifest the factory is
+about to write, and the draft carries it from the moment it is
+created.
+
+Inference reuses `BacklogManager`'s own classifiers and its
+`_TASK_TYPE_ROW_INVARIANTS` table rather than restating the rules, so
+the factory and the validator cannot drift apart -- the same
+prohibition on a second, independent path classifier that
+`_is_test_source_path` documents. Because those classifiers read
+`validate.production_source_paths` and
+`validate.production_source_extensions`, the inferred type follows
+whatever layout the workspace declares and assumes nothing about any
+particular repository. Resolution order:
+
+1. Any production-source row keeps the gated `behavior-fix` default.
+   Inference never moves a Task out of the RED gate.
+2. Otherwise the first non-gated type whose per-row invariant accepts
+   every row wins, checked in the order the taxonomy narrows:
+   `test-only`, `docs`, `chore`.
+3. With no real rows to judge -- a sentinel-only Manifest whose paths
+   the amendment workflow concretises at execution time -- no row
+   claim can be made honestly, so `refactor` is declared. It is the
+   one type with no Manifest invariant, and therefore the only
+   declaration that stays valid both before and after those paths
+   resolve. The draft's "review and edit before promoting" banner is
+   what asks a human to revisit it once the real file list exists.
+
 Terminal Tasks (`done` or `declined`) are skipped by rule 21
 entirely, regardless of whether they declare a `## Task Type:`
 section: a Task that has already reached a terminal status cannot be
@@ -413,6 +448,7 @@ All sections below are required unless noted as optional.
 
 ## Status: {status}
 
+## Expected Output: {commit|none}  ← optional; absent defaults to commit under rule 28; `none` skips commit/PR/CI/merge (the scaffolding template writes commit by default)
 ## Task Type: {type}         ← optional; one of behavior-fix / feature / test-only / refactor / docs / chore; absent defaults to behavior-fix under rule 21 (the scaffolding template also writes behavior-fix by default)
 
 ## Target Repository
@@ -516,16 +552,68 @@ MUST declare a non-gated `## Task Type:` value -- `test-only`,
 check never fires. See "Task-Type Taxonomy Rule (FR-4.1, rule 21)"
 above.
 
+#### Expected-Output Declaration (rule 28)
+
+A Task may declare whether executing it is expected to produce a commit:
+
+```markdown
+## Expected Output: none
+```
+
+| Value | Lifecycle |
+|-------|-----------|
+| `commit` | **Default when the section is absent.** git-ops commits, pushes, opens a PR, waits for CI, and merges. |
+| `none` | git-ops completes the Task with no commit, push, PR, CI wait, or merge. The Task records its evidence in `## Comments`. |
+
+Because an absent section resolves to `commit`, every backlog authored before
+this section existed keeps its current lifecycle exactly -- there is no
+migration and no configuration key.
+
+Rule 28 cross-checks the declaration against the Changes Manifest so an
+authoring mistake fails at `validate-backlog` time rather than surfacing at
+execution time as a Task that blocks after its review judges have already run:
+
+- `none` requires a Manifest of **only** no-output sentinels. Any real path is
+  rejected: the Task names a file to change, so skipping the commit would
+  discard that work.
+- `none` alongside `<source-drift-fix-targets-determined-at-execution>` is
+  rejected: deferred resolution enumerates real paths mid-execution, which is
+  precisely a commit.
+- An unrecognised value is rejected naming the allowed set.
+
+At execution time, git-ops refuses to complete a `none` Task that has **staged**
+changes, because staged content contradicts the declaration and completing
+would silently discard it. The check is deliberately on the staged set rather
+than a clean working tree: tooling that rewrites a lockfile on any invocation
+leaves unstaged drift that is a pre-existing repository condition, not the
+Task's output. Either way git-ops appends a `[GIT_OPS_NO_OUTPUT]` audit comment
+recording the Manifest declaration and the working-tree state, so the path
+taken is always observable.
+
+A `none` Task still needs a non-gated `## Task Type:` under rule 21, since a
+sentinel-only Manifest can never satisfy a gated type's production-source
+invariant.
+
+See ADR-35.
+
+
 Accepted sentinel values (canonical list in
 `src/devbench/backlog/sentinels.py`):
 
-| Sentinel | Semantics |
-|----------|-----------|
-| `<verification-only>` | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
-| `<decision-only>` | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
-| `<no changes>` | The task is a placeholder or audit-flip with no executor work. Rare. |
-| `<no-op>` | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |
-| `<source-drift-fix-targets-determined-at-execution>` | The task's concrete file list is enumerated at execution time via `manifest_amendment`. Acceptable when the surface depends on diagnostics that haven't run yet. |
+| Sentinel | Produces a commit? | Semantics |
+|----------|--------------------|-----------|
+| `<verification-only>` | No | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
+| `<decision-only>` | No | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
+| `<no changes>` | No | The task is a placeholder or audit-flip with no executor work. Rare. |
+| `<no-op>` | No | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |
+| `<source-drift-fix-targets-determined-at-execution>` | Yes | The task's concrete file list is enumerated at execution time via `manifest_amendment`. Acceptable when the surface depends on diagnostics that haven't run yet. |
+
+The four **no-output** sentinels and the one **deferred-resolution** sentinel
+are not interchangeable. A task whose Manifest is exclusively no-output
+sentinels may declare `## Expected Output: none` (see the Expected-Output Declaration section above) and will be
+completed by git-ops without a commit. A task carrying
+`<source-drift-fix-targets-determined-at-execution>` resolves to real paths
+mid-execution and therefore MUST NOT declare `none`.
 
 Additionally, **any** token shaped as ``<name>`` (single ``<``,
 no whitespace, single ``>``) is treated as a sentinel by the

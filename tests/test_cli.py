@@ -10,7 +10,8 @@ import os
 import re
 import subprocess
 import types
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -10105,6 +10106,172 @@ class TestCmdLogVerdict:
         assert "## Comments" in content
 
 
+class TestLogVerdictRetryBudget:
+    """Issue #122: cmd_log_verdict enforces the per-judge executor retry budget.
+
+    Before this, ``max_executor_retries_per_judge`` was parsed by
+    ``config_loader`` and consumed by nothing: enforcement lived only in
+    orchestrate SKILL.md prose that told the orchestrator to read the budget
+    via ``devbench config-resolve``, a verb that did not exist. Reviews could
+    reject the same unit without bound.
+    """
+
+    def _unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def _wu_file(self, tmp_path: Path, prior_fails: int, judge: str = "doc_review") -> Path:
+        """Write a work unit whose audit trail already holds *prior_fails* rows for *judge*."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        rows = "".join(
+            f"[2026-08-15 0{i}:00 UTC] [judge/{judge}] [REVIEW_FAIL] round {i}\n\n" for i in range(1, prior_fails + 1)
+        )
+        wu_file.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n\n{rows}",
+            encoding="utf-8",
+        )
+        return wu_file
+
+    def _run(self, tmp_path: Path, wu_file: Path, judge: str, per_judge: dict[str, int], global_budget: int) -> str:
+        """Invoke a failing verdict with a stubbed budget; return the resulting file content."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [self._unit()]
+        cfg = MagicMock()
+        cfg.max_executor_retries_per_judge = per_judge
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "| ID | Title | Type | Status | Repo | Deps | File |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| E0-F1-S1-T1 | Test Task | Task | in-progress | caylent-solutions/git-repo |  | "
+            "backlog/E0-F1-S1-T1.md |\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.config.RUNTIME_CONFIG", cfg),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", global_budget),
+            patch("devbench.notifications.notify_work_unit_blocked_operator") as notify,
+        ):
+            rc = cli.cmd_log_verdict(judge, "E0-F1-S1-T1", "fail", "still wrong")
+        assert rc == 0
+        self.last_notify = notify
+        return wu_file.read_text(encoding="utf-8")
+
+    def test_below_budget_does_not_block(self, tmp_path: Path) -> None:
+        """Round 2 of a 3-round budget records the failure and leaves the unit workable."""
+        wu_file = self._wu_file(tmp_path, prior_fails=1)
+        content = self._run(tmp_path, wu_file, "doc_review", {}, global_budget=3)
+
+        assert content.count("[REVIEW_FAIL]") == 2
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+        self.last_notify.assert_not_called()
+
+    def test_at_budget_blocks_and_tags(self, tmp_path: Path) -> None:
+        """The round that spends the budget tags, blocks, and alerts the operator."""
+        wu_file = self._wu_file(tmp_path, prior_fails=2)
+        content = self._run(tmp_path, wu_file, "doc_review", {}, global_budget=3)
+
+        assert content.count("[REVIEW_FAIL]") == 3
+        assert "[RETRY_BUDGET_EXHAUSTED]" in content
+        assert "[BLOCKED]" in content
+        assert "## Status: blocked" in content
+        self.last_notify.assert_called_once()
+
+    def test_per_judge_budget_overrides_global(self, tmp_path: Path) -> None:
+        """A per-judge budget of 1 trips on the first failure despite a global budget of 10."""
+        wu_file = self._wu_file(tmp_path, prior_fails=0)
+        content = self._run(tmp_path, wu_file, "doc_review", {"doc_review": 1}, global_budget=10)
+
+        assert "[RETRY_BUDGET_EXHAUSTED]" in content
+        assert "## Status: blocked" in content
+
+    def test_unlisted_judge_falls_back_to_global(self, tmp_path: Path) -> None:
+        """A judge absent from the per-judge map uses the global budget, not another judge's."""
+        wu_file = self._wu_file(tmp_path, prior_fails=0, judge="code_review")
+        content = self._run(tmp_path, wu_file, "code_review", {"doc_review": 1}, global_budget=10)
+
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+
+    def test_non_canonical_judge_does_not_charge_budget(self, tmp_path: Path) -> None:
+        """``manifest_amender`` writes audit-only verdicts and must never trip a review budget.
+
+        It logged 3 REVIEW_FAILs against a single real task, so this boundary
+        is load-bearing rather than theoretical.
+        """
+        wu_file = self._wu_file(tmp_path, prior_fails=5, judge="manifest_amender")
+        content = self._run(tmp_path, wu_file, "manifest_amender", {}, global_budget=1)
+
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+
+    def test_pass_verdict_never_blocks(self, tmp_path: Path) -> None:
+        """A REVIEW_PASS is not a rejection round even when prior failures exhausted the budget."""
+        wu_file = self._wu_file(tmp_path, prior_fails=5)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [self._unit()]
+        cfg = MagicMock()
+        cfg.max_executor_retries_per_judge = {}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.config.RUNTIME_CONFIG", cfg),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 1),
+        ):
+            rc = cli.cmd_log_verdict("doc_review", "E0-F1-S1-T1", "pass", "resolved")
+
+        assert rc == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RETRY_BUDGET_EXHAUSTED]" not in content
+        assert "## Status: in-progress" in content
+
+
+class TestCmdConfigResolve:
+    """Issue #122: the ``config-resolve`` verb orchestrate SKILL.md already referenced."""
+
+    def test_resolves_requested_fields(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Named scalar and mapping fields are returned as JSON."""
+        rc = cli.cmd_config_resolve("max_executor_retries", "max_executor_retries_per_judge")
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload) == {"max_executor_retries", "max_executor_retries_per_judge"}
+
+    def test_nested_dataclass_section_is_expanded(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A dataclass section resolves to an object, not a repr string."""
+        rc = cli.cmd_config_resolve("manifest_amendment")
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "enabled" in payload["manifest_amendment"]
+
+    def test_unknown_field_fails_fast(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """An unknown field is an error naming the valid choices, never a silent null."""
+        rc = cli.cmd_config_resolve("not_a_real_field")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not_a_real_field" in err
+        assert "max_executor_retries" in err
+
+    def test_no_field_fails_fast(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Calling with no field name is an error, not an empty success."""
+        rc = cli.cmd_config_resolve()
+        assert rc == 1
+        assert "at least one field" in capsys.readouterr().err
+
+
 class TestCmdLogCommentFileResolution:
     """Test cmd_log_comment file resolution fallback paths."""
 
@@ -10794,23 +10961,23 @@ class TestShouldRestartAfterTransportError:
     @pytest.mark.unit
     def test_permitted_restart_emits_marker_and_returns_true(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(0, 3)
+            result = cli._should_restart_after_transport_error(0, 3, 1.0)
 
         assert result is True
-        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=3" in caplog.text
+        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=3 backoff=1.0s" in caplog.text
 
     @pytest.mark.unit
     def test_second_permitted_restart_increments_the_attempt_number(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(1, 3)
+            result = cli._should_restart_after_transport_error(1, 3, 2.0)
 
         assert result is True
-        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=2 max=3" in caplog.text
+        assert "[ORCHESTRATOR_TRANSPORT_RESTART] attempt=2 max=3 backoff=2.0s" in caplog.text
 
     @pytest.mark.unit
     def test_bound_exhausted_emits_marker_and_returns_false(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(3, 3)
+            result = cli._should_restart_after_transport_error(3, 3, 8.0)
 
         assert result is False
         assert "[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED] max=3" in caplog.text
@@ -10818,9 +10985,247 @@ class TestShouldRestartAfterTransportError:
     @pytest.mark.unit
     def test_bound_already_exceeded_still_refuses(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="devbench.cli"):
-            result = cli._should_restart_after_transport_error(5, 3)
+            result = cli._should_restart_after_transport_error(5, 3, 8.0)
 
         assert result is False
+
+
+class TestAgentEnvironment:
+    """Agents must not inherit the orchestrator's VIRTUAL_ENV.
+
+    `uv run --project harness/devbench` exports VIRTUAL_ENV pointing at the
+    harness venv, and the daemon hands its environment to the SDK unchanged.
+    An agent then working in the TARGET repo runs with the HARNESS venv active,
+    so any install-into-active-env command rewrites the harness's editable
+    pointer -- both checkouts publish a package named `devbench`.
+    """
+
+    @pytest.mark.unit
+    def test_virtual_env_is_stripped(self) -> None:
+        result = cli._agent_environment({"VIRTUAL_ENV": "/harness/.venv", "PATH": "/usr/bin"})
+
+        assert "VIRTUAL_ENV" not in result
+
+    @pytest.mark.unit
+    def test_every_other_variable_is_preserved(self) -> None:
+        """Stripping must be surgical: agents need the rest of the environment,
+        notably GH_TOKEN and the devbench workspace vars."""
+        base = {
+            "VIRTUAL_ENV": "/harness/.venv",
+            "PATH": "/usr/bin",
+            "GH_TOKEN": "secret",
+            "DEVBENCH_WORKSPACE_ROOT": "/ws",
+            "HOME": "/home/vscode",
+        }
+
+        result = cli._agent_environment(base)
+
+        assert result == {k: v for k, v in base.items() if k != "VIRTUAL_ENV"}
+
+    @pytest.mark.unit
+    def test_absent_virtual_env_is_not_an_error(self) -> None:
+        """A directly-invoked interpreter never sets VIRTUAL_ENV."""
+        base = {"PATH": "/usr/bin"}
+
+        assert cli._agent_environment(base) == base
+
+    @pytest.mark.unit
+    def test_returns_a_plain_dict_copy_not_the_original(self) -> None:
+        """The SDK takes dict[str, str]; mutating the result must not touch os.environ."""
+        base = {"PATH": "/usr/bin"}
+
+        result = cli._agent_environment(base)
+        result["INJECTED"] = "x"
+
+        assert "INJECTED" not in base
+
+
+class TestAssertRunningPackageMatchesItsVenv:
+    """A venv serves the checkout it lives inside. When it stops doing so, the
+    harness silently begins running the target's code and every schema, config
+    key and CLI verb disagrees with the files on disk."""
+
+    @pytest.mark.unit
+    def test_passes_on_the_real_install(self) -> None:
+        """The suite itself runs from a correctly-installed harness venv."""
+        cli._assert_running_package_matches_its_venv()
+
+    @pytest.mark.unit
+    def test_raises_when_the_venv_belongs_to_another_checkout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other = tmp_path / "other-checkout"
+        (other / "src" / "devbench").mkdir(parents=True)
+        monkeypatch.setattr(cli.sys, "prefix", str(other / ".venv"))
+
+        with pytest.raises(RuntimeError, match="re-point detected"):
+            cli._assert_running_package_matches_its_venv()
+
+    @pytest.mark.unit
+    def test_error_names_both_paths_and_the_repair(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The symptoms are undiagnosable, so the message has to carry the diagnosis."""
+        other = tmp_path / "other-checkout"
+        (other / "src" / "devbench").mkdir(parents=True)
+        monkeypatch.setattr(cli.sys, "prefix", str(other / ".venv"))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            cli._assert_running_package_matches_its_venv()
+
+        message = str(excinfo.value)
+        assert str(other / "src" / "devbench") in message
+        assert str(Path(cli.__file__).resolve().parent) in message
+        assert "uv pip install -e" in message
+
+    @pytest.mark.unit
+    def test_silent_when_the_layout_does_not_apply(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-editable or packaged install has no src/devbench beside the
+        venv. Blocking startup there would fail a workspace doing nothing wrong."""
+        monkeypatch.setattr(cli.sys, "prefix", str(tmp_path / "no-src" / ".venv"))
+
+        cli._assert_running_package_matches_its_venv()
+
+
+class TestDropConsoleLogHandlersAfterRedirect:
+    """Daemon mode redirects fd 2 at the aggregate log, which turns the stderr
+    StreamHandler and the aggregate FileHandler into two handlers on one file.
+
+    Every record was therefore written twice under ``--daemon``: one workspace's
+    log measured 152,276 lines against 78,191 distinct (~1.93x) on every day
+    since it began. One-shot CLI invocations were never affected, their stderr
+    being a terminal, which is why the doubling only ever showed under daemon.
+    """
+
+    @staticmethod
+    def _isolated_root(monkeypatch: pytest.MonkeyPatch) -> logging.Logger:
+        """Give the test its own root-logger handler list to mutate."""
+        root = logging.getLogger()
+        monkeypatch.setattr(root, "handlers", [], raising=False)
+        return root
+
+    @pytest.mark.unit
+    def test_stderr_stream_handler_is_removed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._isolated_root(monkeypatch)
+        stderr_handler = logging.StreamHandler()
+        root.addHandler(stderr_handler)
+
+        cli._drop_console_log_handlers_after_redirect()
+
+        assert stderr_handler not in root.handlers
+
+    @pytest.mark.unit
+    def test_file_handler_survives(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FileHandler subclasses StreamHandler, so a naive isinstance check
+        would strip it and silence the daemon's log completely."""
+        root = self._isolated_root(monkeypatch)
+        file_handler = logging.FileHandler(str(tmp_path / "orchestrator.log"), encoding="utf-8")
+        root.addHandler(file_handler)
+        try:
+            cli._drop_console_log_handlers_after_redirect()
+
+            assert file_handler in root.handlers, "the log's own file handler must never be dropped"
+        finally:
+            file_handler.close()
+
+    @pytest.mark.unit
+    def test_mixed_handler_set_keeps_exactly_the_file_handlers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real daemon shape: stderr console handler plus the aggregate and
+        per-session file handlers. Only the console one goes."""
+        root = self._isolated_root(monkeypatch)
+        stderr_handler = logging.StreamHandler()
+        aggregate = logging.FileHandler(str(tmp_path / "orchestrator.log"), encoding="utf-8")
+        session = logging.FileHandler(str(tmp_path / "session.log"), encoding="utf-8")
+        for handler in (stderr_handler, aggregate, session):
+            root.addHandler(handler)
+        try:
+            cli._drop_console_log_handlers_after_redirect()
+
+            assert root.handlers == [aggregate, session]
+        finally:
+            aggregate.close()
+            session.close()
+
+    @pytest.mark.unit
+    def test_is_idempotent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._isolated_root(monkeypatch)
+        aggregate = logging.FileHandler(str(tmp_path / "orchestrator.log"), encoding="utf-8")
+        root.addHandler(logging.StreamHandler())
+        root.addHandler(aggregate)
+        try:
+            cli._drop_console_log_handlers_after_redirect()
+            cli._drop_console_log_handlers_after_redirect()
+
+            assert root.handlers == [aggregate]
+        finally:
+            aggregate.close()
+
+    @pytest.mark.unit
+    def test_no_console_handler_present_is_a_no_op(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = self._isolated_root(monkeypatch)
+
+        cli._drop_console_log_handlers_after_redirect()
+
+        assert root.handlers == []
+
+
+class TestTransportRestartBackoffSeconds:
+    """Direct unit tests for ``_transport_restart_backoff_seconds``.
+
+    A transport fault imposes no delay of its own, so this envelope is the only
+    thing standing between one persistent fault and a restart budget spent in
+    seconds. Its arithmetic and its guard rails are pinned here.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("restarts_used", "expected"),
+        [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0), (5, 32.0)],
+    )
+    def test_delay_doubles_per_restart(self, restarts_used: int, expected: float) -> None:
+        assert cli._transport_restart_backoff_seconds(restarts_used, 1.0, 60.0) == expected
+
+    @pytest.mark.unit
+    def test_first_restart_waits_exactly_the_base(self) -> None:
+        """``restarts_used`` counts restarts ALREADY performed, so the first
+        wait is the base and not double it."""
+        assert cli._transport_restart_backoff_seconds(0, 2.5, 60.0) == 2.5
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("restarts_used", [6, 7, 10, 50])
+    def test_delay_is_clamped_to_the_ceiling(self, restarts_used: int) -> None:
+        assert cli._transport_restart_backoff_seconds(restarts_used, 1.0, 60.0) == 60.0
+
+    @pytest.mark.unit
+    def test_enormous_restart_count_clamps_instead_of_overflowing(self) -> None:
+        """The exponent guard: ``2 ** restarts_used`` for an operator-set cap in
+        the thousands would raise OverflowError on the float multiply before
+        ``min()`` could clamp it."""
+        assert cli._transport_restart_backoff_seconds(100_000, 1.0, 60.0) == 60.0
+
+    @pytest.mark.unit
+    def test_ceiling_below_base_yields_the_ceiling(self) -> None:
+        assert cli._transport_restart_backoff_seconds(0, 30.0, 5.0) == 5.0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("base", [0.0, -1.0])
+    def test_non_positive_base_raises(self, base: float) -> None:
+        """Fail fast: a zero or negative delay is precisely the busy-loop defect
+        this function exists to prevent, and the env-var path bypasses the YAML
+        schema that would otherwise reject it."""
+        with pytest.raises(ValueError, match="base must be > 0"):
+            cli._transport_restart_backoff_seconds(0, base, 60.0)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("ceiling", [0.0, -5.0])
+    def test_non_positive_ceiling_raises(self, ceiling: float) -> None:
+        with pytest.raises(ValueError, match="ceiling must be > 0"):
+            cli._transport_restart_backoff_seconds(0, 1.0, ceiling)
+
+    @pytest.mark.unit
+    def test_negative_restarts_used_raises(self) -> None:
+        with pytest.raises(ValueError, match="restarts_used must be >= 0"):
+            cli._transport_restart_backoff_seconds(-1, 1.0, 60.0)
 
 
 class TestTransportErrorClassificationAndRestart:
@@ -11033,10 +11438,10 @@ class TestTransportErrorClassificationAndRestart:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """AC-6: each restart logs the verbatim upstream exception at ERROR,
-        including the restart ordinal and the cap."""
+        including the restart ordinal and the transport-specific cap."""
         import sys
 
-        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "3")
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 3)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -11066,14 +11471,95 @@ class TestTransportErrorClassificationAndRestart:
         assert "Claude Code returned an error result: success" in message
 
     @pytest.mark.unit
+    @pytest.mark.unit
+    def test_loop_applies_exponential_backoff_between_restarts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The restart arm must WAIT between attempts, with the delay doubling.
+
+        This is the regression guard for the field failure that motivated the
+        change: with no delay, a persistent transport fault spent a
+        1000-restart budget in 39 minutes and killed the daemon. Asserting the
+        recorded delays (rather than elapsed wall-clock) keeps the test fast
+        and deterministic.
+        """
+        import sys
+
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 5)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_BASE_SECONDS", 1.0)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_MAX_SECONDS", 60.0)
+        slept: list[float] = []
+        # Re-patch the seam the autouse fixture neutralised, this time recording.
+        monkeypatch.setattr(cli, "_sleep_between_transport_restarts", slept.append)
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx < 3:
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        # Three failures -> three restarts, each waiting twice the last.
+        assert slept == [1.0, 2.0, 4.0]
+
+    @pytest.mark.unit
+    def test_backoff_delay_is_clamped_by_the_configured_ceiling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A low ceiling caps the doubling, so a long outage settles into a
+        steady retry cadence rather than growing without bound."""
+        import sys
+
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 5)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_BASE_SECONDS", 1.0)
+        monkeypatch.setattr(cli, "TRANSPORT_RESTART_BACKOFF_MAX_SECONDS", 2.0)
+        slept: list[float] = []
+        monkeypatch.setattr(cli, "_sleep_between_transport_restarts", slept.append)
+
+        call_count = {"n": 0}
+
+        async def mock_query(**kwargs: object) -> object:
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx < 3:
+                raise RuntimeError("Claude Code returned an error result: success")
+                yield  # unreachable -- required so this stays an async generator function
+            yield types.SimpleNamespace(result="NO_ACTIONABLE -- 1/1 done, 0 blocked")
+
+        mock_sdk = self._install_fake_sdk(mock_query)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert slept == [1.0, 2.0, 2.0]
+
     def test_permanent_error_exhausts_the_cap_and_restart_count_equals_cap(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """AC-7: a permanent transport error exhausts the cap and re-raises;
-        the restart count equals the cap -- no infinite loop."""
+        the restart count equals the cap -- no infinite loop. The cap is the
+        transport-specific one, not the quota ceiling."""
         import sys
 
-        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "2")
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 2)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -11100,14 +11586,16 @@ class TestTransportErrorClassificationAndRestart:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """AC-8: the transport restart counter is tracked independently of
-        the inactivity-restart counter, even though both are bounded by the
-        SAME ``_resolve_max_quota_resumes()`` cap. With cap=1, an inactivity
-        restart followed by a transport restart must both be permitted (a
-        shared counter would refuse the second one)."""
+        the inactivity-restart counter. The two are now bounded by SEPARATE
+        caps (inactivity by ``_resolve_max_quota_resumes()``, transport by
+        ``MAX_TRANSPORT_RESTARTS``), so both are pinned to 1 here: an
+        inactivity restart followed by a transport restart must both be
+        permitted, which a shared counter would refuse."""
         import sys
 
         monkeypatch.setattr(cli, "_ORCH_INACTIVITY_TIMEOUT", 0.02)
         monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", "1")
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", 1)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -11280,7 +11768,7 @@ class TestIssue331RegressionFixture:
         import sys
 
         cap = 2
-        monkeypatch.setenv("DEVBENCH_MAX_QUOTA_RESUMES", str(cap))
+        monkeypatch.setattr(cli, "MAX_TRANSPORT_RESTARTS", cap)
         call_count = {"n": 0}
 
         async def mock_query(**kwargs: object) -> object:
@@ -12791,6 +13279,20 @@ class TestRejectEmDash:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _patched_amendment_cli(workspace: Path, repo: Path) -> Iterator[None]:
+    """Patch the module globals ``cmd_request_amendment`` resolves its target repo through."""
+    with (
+        patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+        patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/example": repo}),
+        patch("devbench.cli.resolve_repo", return_value="caylent-solutions/example"),
+        patch("devbench.cli.validate_repo", return_value=None),
+    ):
+        yield
+
+
 class TestCmdRequestAmendment:
     """cmd_request_amendment reads JSON from stdin and delegates to write_request."""
 
@@ -12806,13 +13308,56 @@ class TestCmdRequestAmendment:
 
         monkeypatch.setattr("sys.stdin", io.StringIO(text))
 
+    def _accepting_workspace(self, tmp_path: Path) -> AbstractContextManager[None]:
+        """Build a backlog + real repo so the Layer 1 pre-filter can pass.
+
+        ``cmd_request_amendment`` runs every pre-filter check before writing, so
+        an accepted request needs a resolvable in-progress task and a real git
+        repo in which the requested file is staged.
+        """
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| EX-F1-S1-T1 | Sample | Task | in-progress | None | caylent-solutions/example "
+            "| `backlog/EX-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        (backlog_dir / "EX-F1-S1-T1.md").write_text(
+            "# EX-F1-S1-T1: Sample\n\n## Status: in-progress\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 covers it\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `tests/test_example.py` | add tests |\n\n## Definition of Done\n",
+            encoding="utf-8",
+        )
+
+        repo = tmp_path / "target-repo"
+        repo.mkdir(exist_ok=True)
+        for cmd in (
+            ["git", "init"],
+            ["git", "config", "user.email", "t@ex.com"],
+            ["git", "config", "user.name", "Test"],
+        ):
+            subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+        (repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "baseline.txt"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+        staged = repo / "src/example/parser.py"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text("content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/example/parser.py"], cwd=repo, check=True, capture_output=True)
+
+        return _patched_amendment_cli(tmp_path, repo)
+
     def test_happy_path_writes_request(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+        with self._accepting_workspace(tmp_path):
             rc = cli.cmd_request_amendment("EX-F1-S1-T1")
-        assert rc == 0
+        assert rc == 0, capsys.readouterr().err
         out = capsys.readouterr().out
         summary = json.loads(out)
         assert summary["task_id"] == "EX-F1-S1-T1"
@@ -12860,12 +13405,14 @@ class TestCmdRequestAmendment:
     def test_duplicate_request_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # One workspace build, reused for both calls: re-running the setup would
+        # re-init the repo and drop the staged file the pre-filter requires.
+        ctx = self._accepting_workspace(tmp_path)
         self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            assert cli.cmd_request_amendment("EX-F1-S1-T1") == 0
-        # Second call with a fresh stdin attempts to write duplicate
-        self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+        with ctx:
+            assert cli.cmd_request_amendment("EX-F1-S1-T1") == 0, capsys.readouterr().err
+            # Second call with a fresh stdin attempts to write duplicate
+            self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
             rc = cli.cmd_request_amendment("EX-F1-S1-T1")
         assert rc == 1
         assert "already exists" in capsys.readouterr().err
@@ -19636,6 +20183,38 @@ class TestStatusPanelFiltersStaleBlockedAudits:
         content = "## Comments\n\n[2026-04-01 10:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] T9\n"
         assert cli._unsuperseded_blocked_audits(content) == []
 
+    def test_cascade_reconciled_supersedes_blocked(self) -> None:
+        """``reconcile-cascade`` records its re-queue with this tag.
+
+        Omitting it meant devbench wrote a tag its own reader ignored: the unit
+        went to ``in-queue`` while every blocked-audit consumer kept reporting
+        it as operator-blocked, so the report contradicted the lifecycle for
+        the rest of the unit's life.
+        """
+        content = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] operator decision required\n"
+            "[2026-04-01 11:00 UTC] [agent/backlog_manager] [CASCADE_RECONCILED] regular deps satisfied; re-queuing\n"
+        )
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+    def test_every_unblocking_tag_devbench_writes_is_recognised(self) -> None:
+        """Guard: a tag meaning "this block is over" must be read as such.
+
+        This is the invariant the bug broke. A new unblock tag added to a
+        writer without being added here would reintroduce it silently, so the
+        set is asserted rather than left implicit.
+        """
+        for tag in ("UNBLOCKED", "CASCADE_RESOLVED", "CASCADE_RECONCILED"):
+            content = (
+                "## Comments\n\n"
+                "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] something\n"
+                f"[2026-04-01 11:00 UTC] [agent/x] [{tag}] cleared\n"
+            )
+            assert cli._unsuperseded_blocked_audits(content) == [], (
+                f"[{tag}] is written by devbench but does not supersede a [BLOCKED] marker"
+            )
+
 
 class TestCmdSweepProposalsAutoPromotesPreExisting:
     """Issue #155: ``cmd_sweep_proposals`` also picks up pre-existing
@@ -26345,14 +26924,19 @@ class TestCmdStartSigtermHandler:
 
     @pytest.mark.unit
     def test_forced_blocked_on_stop_audit_constant_defined(self) -> None:
-        """_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX constant must be defined in cli."""
-        assert hasattr(cli, "_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX")
-        prefix = cli._FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX
-        assert "FORCED_BLOCKED_ON_STOP" in prefix
+        """_INTERRUPTED_ON_STOP_AUDIT_PREFIX constant must be defined in cli."""
+        assert hasattr(cli, "_INTERRUPTED_ON_STOP_AUDIT_PREFIX")
+        prefix = cli._INTERRUPTED_ON_STOP_AUDIT_PREFIX
+        assert "INTERRUPTED_ON_STOP" in prefix
 
     @pytest.mark.unit
-    def test_force_block_in_flight_wu_sets_status_blocked(self, tmp_path: Path) -> None:
-        """_force_block_in_flight_wu sets in-progress WU to blocked and appends audit."""
+    def test_requeue_in_flight_wu_returns_unit_to_the_queue(self, tmp_path: Path) -> None:
+        """_requeue_in_flight_wu sets in-progress WU to in-queue and appends audit.
+
+        A stop is not a dependency problem, so the unit must land somewhere the
+        next run will claim from. ``blocked`` waits on a dependency event that
+        never comes when the stop happened after every dependency was terminal.
+        """
         from devbench.backlog.manager import BacklogManager
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
@@ -26390,20 +26974,22 @@ class TestCmdStartSigtermHandler:
             patch.object(BacklogManager, "_append_agent_comment", _mock_append),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
         ):
-            cli._force_block_in_flight_wu(wu, session_name="myrun")
+            cli._requeue_in_flight_wu(wu, session_name="myrun")
 
-        assert ("E1-F1-S1-T1", "blocked") in forced, "force_status must be called with 'blocked'"
-        audit_messages = [msg for _, msg in appended]
-        assert any("FORCED_BLOCKED_ON_STOP" in m for m in audit_messages), (
-            "audit comment must contain FORCED_BLOCKED_ON_STOP"
+        assert ("E1-F1-S1-T1", "in-queue") in forced, "force_status must be called with 'in-queue'"
+        assert ("E1-F1-S1-T1", "blocked") not in forced, (
+            "an interrupted unit must not be blocked: nothing un-blocks it when its dependencies "
+            "were already terminal at the moment of the stop"
         )
+        audit_messages = [msg for _, msg in appended]
+        assert any("INTERRUPTED_ON_STOP" in m for m in audit_messages), "audit comment must contain INTERRUPTED_ON_STOP"
         assert any("myrun" in m for m in audit_messages), "audit comment must contain the session name"
 
     @pytest.mark.unit
-    def test_force_block_in_flight_wu_no_op_when_no_in_progress(self, tmp_path: Path) -> None:
-        """_force_block_in_flight_wu does nothing when no in-progress WU is provided (None)."""
+    def test_requeue_in_flight_wu_no_op_when_no_in_progress(self, tmp_path: Path) -> None:
+        """_requeue_in_flight_wu does nothing when no in-progress WU is provided (None)."""
         # Should not raise; calling with None is the no-op signal.
-        cli._force_block_in_flight_wu(None, session_name="myrun")
+        cli._requeue_in_flight_wu(None, session_name="myrun")
 
     @pytest.mark.unit
     def test_find_in_flight_wu_returns_in_progress_unit(self, tmp_path: Path) -> None:
@@ -28707,6 +29293,160 @@ class TestLogQuarantine:
         assert any("quarantine audit comment failed" in r.getMessage() for r in caplog.records)
 
 
+class TestLogQuarantineRestore:
+    """Each restore is recorded so the owning unit's next executor resumes, not restarts."""
+
+    @staticmethod
+    def _record(owner_id: str) -> cli.RestoreRecord:
+        return cli.RestoreRecord(
+            owner_id=owner_id,
+            paths=("src/a.py", "src/b.py"),
+            stash_message=f"devbench-quarantine:{owner_id}: displaced by claim of E0-F1-S1-T2",
+        )
+
+    def test_emits_a_work_restored_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            with patch("devbench.cli._resolve_unit_file_by_id", return_value=None):
+                cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        assert any("[WORK_RESTORED]" in r.getMessage() for r in caplog.records)
+
+    def test_owning_unit_is_told_to_resume_rather_than_restart(self, backlog_dir: Path) -> None:
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: in-progress\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        mock_mgr._append_agent_comment.assert_called_once()
+        message = mock_mgr._append_agent_comment.call_args[0][2]
+        assert "[WORK_RESTORED]" in message
+        assert "rather than starting the Changes Manifest" in message
+
+    def test_missing_owner_file_is_skipped(self) -> None:
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        mock_mgr._append_agent_comment.assert_not_called()
+
+    def test_comment_write_failure_warns_and_does_not_raise(
+        self, backlog_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The restore already succeeded; losing an audit line must not stop the run."""
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: in-progress\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        mock_mgr._append_agent_comment.side_effect = OSError("read-only filesystem")
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        assert any("quarantine restore audit comment failed" in r.getMessage() for r in caplog.records)
+
+
+class TestCheckpointOwnersBeforeQuarantine:
+    """The stash must never be the only copy of an interrupted attempt."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def test_no_attributable_owner_takes_no_snapshot(self, tmp_path: Path) -> None:
+        """Unattributed residue has no unit to checkpoint for."""
+        with (
+            patch("devbench.cli._non_terminal_manifests", return_value={}),
+            patch("devbench.git_quarantine.checkpoint_work") as snapshot,
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/orphan.py"], self._REPO)
+        snapshot.assert_not_called()
+
+    def test_snapshot_is_taken_for_an_attributed_owner(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+            patch("devbench.cli._non_terminal_manifests", return_value={"E0-F1-S1-T9": ["src/a.py"]}),
+            patch("devbench.git_quarantine.checkpoint_work", return_value="abc123") as snapshot,
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/a.py"], self._REPO)
+        snapshot.assert_called_once()
+        assert any("[WORK_CHECKPOINTED]" in r.getMessage() for r in caplog.records)
+
+    def test_clean_tree_logs_nothing(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A ``None`` SHA means there was nothing in flight to snapshot."""
+        with (
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+            patch("devbench.cli._non_terminal_manifests", return_value={"E0-F1-S1-T9": ["src/a.py"]}),
+            patch("devbench.git_quarantine.checkpoint_work", return_value=None),
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/a.py"], self._REPO)
+        assert not any("[WORK_CHECKPOINTED]" in r.getMessage() for r in caplog.records)
+
+    def test_snapshot_failure_warns_and_lets_the_quarantine_proceed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Refusing here would stop an unattended run to protect a backup of a backup."""
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch("devbench.cli._non_terminal_manifests", return_value={"E0-F1-S1-T9": ["src/a.py"]}),
+            patch("devbench.git_quarantine.checkpoint_work", side_effect=RuntimeError("git exploded")),
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/a.py"], self._REPO)
+        assert any("[CHECKPOINT_SKIPPED]" in r.getMessage() for r in caplog.records)
+
+
+class TestCheckpointInFlightWork:
+    """The stop path is the last moment devbench controls before work goes unreachable."""
+
+    @staticmethod
+    def _unit(repo: str = "caylent-solutions/devbench") -> MagicMock:
+        unit = MagicMock()
+        unit.id = "E0-F1-S1-T9"
+        unit.repo = repo
+        return unit
+
+    def test_unresolvable_repo_yields_no_checkpoint(self) -> None:
+        with patch.dict(cli.REPO_LOCAL_PATHS, {}, clear=True):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+
+    def test_non_git_path_yields_no_checkpoint(self, tmp_path: Path) -> None:
+        with patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+
+    def test_snapshot_sha_is_returned_and_logged(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        (tmp_path / ".git").mkdir()
+        with (
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+            patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True),
+            patch("devbench.git_quarantine.checkpoint_work", return_value="deadbeef"),
+        ):
+            assert cli._checkpoint_in_flight_work(self._unit()) == "deadbeef"
+        assert any("[WORK_CHECKPOINTED]" in r.getMessage() for r in caplog.records)
+
+    def test_clean_checkout_returns_none_without_logging(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        with (
+            patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True),
+            patch("devbench.git_quarantine.checkpoint_work", return_value=None),
+        ):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+
+    def test_failure_is_swallowed_so_the_unit_is_still_released(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Raising inside a SIGTERM handler would strand the unit ``in-progress``."""
+        (tmp_path / ".git").mkdir()
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True),
+            patch("devbench.git_quarantine.checkpoint_work", side_effect=RuntimeError("git exploded")),
+        ):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+        assert any("[CHECKPOINT_SKIPPED]" in r.getMessage() for r in caplog.records)
+
+
 class TestSessionScopeJsonShape:
     """Issue #270: the per-session scope.json must be readable by its readers.
 
@@ -28796,3 +29536,96 @@ class TestCmdInstancesDocstringMatchesResolvedDefault:
             "table output is the unconditional default and only --json "
             "changes the format."
         )
+
+
+def _seed_no_output_wu(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", sentinel: str = "<verification-only>") -> Path:
+    """Write a work-unit file declaring `## Expected Output: none`."""
+    wu = tmp_path / f"{unit_id}.md"
+    wu.write_text(
+        f"# {unit_id}: Test Task\n\n## Status: in-progress\n\n"
+        f"## Expected Output: none\n\n## Task Type: chore\n\n"
+        f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+        f"| `{sentinel}` | modify |\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    return wu
+
+
+@pytest.mark.unit
+class TestCmdGitOpsNoOutputUnit:
+    """`## Expected Output: none` completes a unit without a commit (ADR-29).
+
+    Before rule 28 existed, a Manifest of only `<verification-only>` reached
+    git_ops._stage_for_commit, which refused with "resolve the sentinel to real
+    paths via a manifest amendment" -- unsatisfiable for a unit that by
+    definition modifies nothing. Every verification unit therefore blocked
+    permanently after passing all four review judges.
+    """
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E202-F1-S1-T9",
+            title="Verify something",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E202-F1-S1-T9.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _run(self, tmp_path: Path, wu_file: Path, staged: str = "", tree: str = ""):
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd, **kwargs):
+            if cmd[:3] == ["git", "diff", "--cached"]:
+                return (0, staged, "")
+            if cmd[:2] == ["git", "status"]:
+                return (0, tree, "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+        ):
+            rc = cli.cmd_git_ops("E202-F1-S1-T9")
+        return rc, mock_ops
+
+    def test_completes_without_commit_or_pr(self, tmp_path: Path) -> None:
+        wu = _seed_no_output_wu(tmp_path)
+        rc, mock_ops = self._run(tmp_path, wu)
+
+        assert rc == 0
+        mock_ops.commit_and_push.assert_not_called()
+        mock_ops.create_pr.assert_not_called()
+        mock_ops.wait_for_checks_and_classify.assert_not_called()
+        mock_ops.merge_pr.assert_not_called()
+
+    def test_records_an_observable_audit_comment(self, tmp_path: Path) -> None:
+        """Never silent: the WU file states which path git-ops took."""
+        wu = _seed_no_output_wu(tmp_path)
+        self._run(tmp_path, wu)
+
+        assert "[GIT_OPS_NO_OUTPUT]" in wu.read_text(encoding="utf-8")
+
+    def test_refuses_when_changes_are_staged(self, tmp_path: Path) -> None:
+        """Staged changes contradict the declaration; completing would discard them."""
+        wu = _seed_no_output_wu(tmp_path)
+        rc, mock_ops = self._run(tmp_path, wu, staged="scripts/foo.py\n")
+
+        assert rc == 1
+        mock_ops.commit_and_push.assert_not_called()
+
+    def test_unstaged_tooling_drift_does_not_block(self, tmp_path: Path) -> None:
+        """uv.lock rewrites by tooling are a pre-existing repo condition, not this unit's work."""
+        wu = _seed_no_output_wu(tmp_path)
+        rc, _ = self._run(tmp_path, wu, tree=" M uv.lock\n")
+
+        assert rc == 0
+        assert "dirty" in wu.read_text(encoding="utf-8")

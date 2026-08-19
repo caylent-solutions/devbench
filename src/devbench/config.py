@@ -56,7 +56,10 @@ from devbench.constants import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
+    DEFAULT_MAX_TRANSPORT_RESTARTS,
     DEFAULT_MODEL_RATES,
+    DEFAULT_ORCHESTRATE_EFFORT,
+    DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS,
     DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
@@ -72,8 +75,11 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
     GATE_ENV_VAR_PREFIX,
     GATE_ENV_VAR_SUFFIX,
+    VALID_ORCHESTRATE_EFFORTS,
     ModelRates,
 )
 
@@ -552,6 +558,48 @@ MAX_CASCADE_DEPTH: int = _resolve_int(
     "DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH",
     RUNTIME_CONFIG.orchestrate.max_cascade_depth,
     DEFAULT_MAX_CASCADE_DEPTH,
+)
+# SDK-transport restart bound and its exponential-backoff envelope.
+# env > YAML > default, matching MAX_CASCADE_DEPTH above. Kept separate from
+# DEVBENCH_MAX_QUOTA_RESUMES because a transport fault, unlike a quota window,
+# imposes no delay of its own -- see DEFAULT_MAX_TRANSPORT_RESTARTS.
+MAX_TRANSPORT_RESTARTS: int = _resolve_int(
+    "DEVBENCH_MAX_TRANSPORT_RESTARTS",
+    RUNTIME_CONFIG.orchestrate.max_transport_restarts,
+    DEFAULT_MAX_TRANSPORT_RESTARTS,
+)
+ORCHESTRATE_EFFORT: str = _resolve_str(
+    "DEVBENCH_ORCHESTRATE_EFFORT",
+    RUNTIME_CONFIG.orchestrate.effort,
+    DEFAULT_ORCHESTRATE_EFFORT,
+)
+if ORCHESTRATE_EFFORT not in VALID_ORCHESTRATE_EFFORTS:
+    raise ValueError(
+        f"orchestrate.effort must be one of {list(VALID_ORCHESTRATE_EFFORTS)}; got {ORCHESTRATE_EFFORT!r}. "
+        "Set it in backlog/config/devbench.yaml under 'orchestrate:' or via DEVBENCH_ORCHESTRATE_EFFORT."
+    )
+
+ORCHESTRATE_MAX_THINKING_TOKENS: int = _resolve_int(
+    "DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS",
+    RUNTIME_CONFIG.orchestrate.max_thinking_tokens,
+    DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS,
+)
+if ORCHESTRATE_MAX_THINKING_TOKENS <= 0:
+    raise ValueError(
+        "orchestrate.max_thinking_tokens must be a positive number of tokens; got "
+        f"{ORCHESTRATE_MAX_THINKING_TOKENS}. Remove the key to accept the default of "
+        f"{DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS}."
+    )
+
+TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = _resolve_float(
+    "DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS",
+    RUNTIME_CONFIG.orchestrate.transport_restart_backoff_base_seconds,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+)
+TRANSPORT_RESTART_BACKOFF_MAX_SECONDS: float = _resolve_float(
+    "DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS",
+    RUNTIME_CONFIG.orchestrate.transport_restart_backoff_max_seconds,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "DEVBENCH_STOP_MAX_BLOCKS",

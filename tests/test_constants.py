@@ -128,6 +128,35 @@ class TestCascadeDepthConstant:
         assert DEFAULT_MAX_CASCADE_DEPTH == 2
 
 
+class TestTransportRestartConstants:
+    """The transport-restart bound and its backoff envelope.
+
+    These exist as their OWN settings rather than reusing the quota ceiling: a
+    quota window must elapse and an inactivity restart costs a full timeout
+    window, so both self-throttle, whereas a transport fault recurs as fast as
+    the SDK can reject a session.
+    """
+
+    def test_transport_restart_cap_is_far_below_the_quota_ceiling(self) -> None:
+        """The pairing that caused the field failure was a 1000-restart budget
+        with no delay. The transport cap must be a cost guard, not that."""
+        from devbench.constants import DEFAULT_MAX_QUOTA_RESUMES, DEFAULT_MAX_TRANSPORT_RESTARTS
+
+        assert DEFAULT_MAX_TRANSPORT_RESTARTS == 14
+        assert DEFAULT_MAX_TRANSPORT_RESTARTS < DEFAULT_MAX_QUOTA_RESUMES
+
+    def test_backoff_base_and_ceiling_are_positive_and_ordered(self) -> None:
+        from devbench.constants import (
+            DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+            DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+        )
+
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS == 1.0
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS == 60.0
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS > 0
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS < DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS
+
+
 class TestSessionConstants:
     """AC-T6-2: SESSION_* constants in constants.py have correct types and spec-mandated values (spec 4.4.1)."""
 

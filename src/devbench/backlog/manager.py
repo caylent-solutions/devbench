@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from devbench.backlog.work_unit import WorkUnitType
+from devbench.comment_time import comment_timestamp, tdd_timestamp
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
@@ -52,12 +53,13 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
     EM_DASH,
     EPIC_ID_RE,
+    EXPECTED_OUTPUT_LINE_RE,
+    EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_RE,
     GATE_TIER_MACHINE_BLOCKING,
     GATE_TIERS,
@@ -86,6 +88,7 @@ from devbench.constants import (
     TDD_CYCLE_LOG_SECTION_HEADER,
     TDD_ENTRY_TEMPLATE,
     TRACEABILITY_MATRIX_HEADER,
+    VALID_EXPECTED_OUTPUTS,
     VALID_STATUSES,
     VALID_TASK_TYPES,
 )
@@ -610,6 +613,57 @@ def _gate_check_command(gate: str) -> str:
     return f"check-{gate.replace('_', '-')}"
 
 
+def resolve_judge_retry_budget(judge_name: str) -> int:
+    """Return the executor retry budget that applies to *judge_name*.
+
+    Precedence (issue #122): the per-judge entry in
+    ``max_executor_retries_per_judge`` when present, else the global
+    ``max_executor_retries``. Both come from resolved config -- the global is
+    already env-overridable via ``DEVBENCH_MAX_RETRIES`` -- so no bound is
+    hard-coded here.
+
+    Single implementation shared by the enforcement in ``cli.cmd_log_verdict``
+    and the display in ``reporting.report.review_rejections_line``, so the
+    budget shown to an operator can never disagree with the budget applied.
+    Imported lazily to keep config import order out of this module's contract.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS, RUNTIME_CONFIG
+
+    per_judge = RUNTIME_CONFIG.max_executor_retries_per_judge.get(judge_name)
+    return per_judge if per_judge is not None else MAX_RETRY_ATTEMPTS
+
+
+def count_review_fails_for_judge(content: str, judge_name: str) -> int:
+    """Return how many ``[REVIEW_FAIL]`` verdicts *judge_name* has recorded in *content*.
+
+    The audit trail is the counter: every judge verdict already lands in the
+    work unit's Comments section as
+    ``[<ts>] [judge/<name>] [REVIEW_FAIL|REVIEW_PASS] <feedback>``, so the
+    number of rejection rounds a judge has spent is derivable from the file
+    with no new bookkeeping state to drift out of sync. Mirrors the audit-row
+    counting ``cli._count_ci_fail_attempts`` already does for ``[CI_FAIL]``.
+
+    Matching is per line and substring-based on both bracketed tokens, the
+    same idiom ``BacklogManager._last_round_all_passed`` uses, so a judge name
+    quoted inside another judge's prose feedback cannot inflate the count --
+    the ``[judge/<name>]`` agent-id token only appears at a verdict row's
+    structural position.
+
+    Unlike ``_last_round_all_passed`` this deliberately does NOT stop at a
+    round boundary: the budget bounds the TOTAL rounds a judge may spend on a
+    unit, so every historical failure counts.
+
+    Args:
+        content: Full text of a work-unit markdown file.
+        judge_name: Underscored judge identifier, e.g. ``doc_review``.
+
+    Returns:
+        The count of ``[REVIEW_FAIL]`` rows attributed to *judge_name*.
+    """
+    token = f"[judge/{judge_name}]"
+    return sum(1 for line in content.splitlines() if token in line and "[REVIEW_FAIL]" in line)
+
+
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
@@ -1081,7 +1135,7 @@ class BacklogManager:
             self._update_status_summary(backlog_index)
 
             audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+            timestamp = comment_timestamp()
             audit_row = f"[{timestamp}] [WU_REMOVED] {unit_id} -- {reason}\n"
             with audit_log_path.open("a", encoding="utf-8") as fh:
                 fh.write(audit_row)
@@ -1191,7 +1245,7 @@ class BacklogManager:
 
         count = len(unit_ids)
         audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         audit_row = f"[{timestamp}] [BULK_STATUS_UPDATE] {count} WUs set to '{canonical}' by {audit_meta}\n"
         with audit_log_path.open("a", encoding="utf-8") as fh:
             fh.write(audit_row)
@@ -1322,6 +1376,7 @@ class BacklogManager:
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
         self._check_task_type_taxonomy(rows, workspace_root, errors)
+        self._check_expected_output(rows, workspace_root, errors)
         self._check_required_sections(rows, workspace_root, errors)
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
@@ -1490,7 +1545,7 @@ class BacklogManager:
             ``(fix_count, files_fixed)`` -- total individual corrections applied
             and the count of distinct files that were modified.
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         fix_count = 0
         files_fixed: set[Path] = set()
 
@@ -1972,7 +2027,7 @@ class BacklogManager:
             spec_ref: Specification reference (e.g. ``AC-FUNC-001``).
             test_ref: Test reference (e.g. ``test_user_creation``).
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
 
         if not matrix_path.exists():
             header = TRACEABILITY_MATRIX_HEADER
@@ -2206,7 +2261,7 @@ class BacklogManager:
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
         # Write audit comment to parent work unit
-        timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        timestamp = comment_timestamp()
         rollup_comment = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name="orchestrator",
@@ -2570,7 +2625,7 @@ class BacklogManager:
 
     def _append_comment(self, work_unit_path: Path, action: str, message: str) -> None:
         """Append a comment entry to the Comments section of a work-unit file."""
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_ENTRY_TEMPLATE.format(
             timestamp=timestamp,
             agent_id="backlog_manager",
@@ -2591,14 +2646,16 @@ class BacklogManager:
     def _append_agent_comment(self, work_unit_path: Path, agent_name: str, message: str) -> None:
         """Append an agent comment using COMMENT_AGENT_TEMPLATE format.
 
-        Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<agent_name>] <message>``
+        Writes: ``[YYYY-MM-DD HH:MM ZONE] [agent/<agent_name>] <message>``, where
+        ZONE is the workspace's ``display_timezone`` abbreviation, or ``UTC``
+        when unset.
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
             agent_name: Agent name (e.g. ``git_ops``, ``orchestrator``).
             message: Message to append (may contain token and detail).
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name=agent_name,
@@ -2714,7 +2771,9 @@ class BacklogManager:
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
-        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``
+        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``, the
+        timestamp in the workspace's ``display_timezone`` carrying its
+        numeric offset, or UTC when unset.
 
         The entry is inserted immediately before the next ``## `` heading after
         ``## TDD Cycle Log``.  When ``## TDD Cycle Log`` is the last section in
@@ -2741,7 +2800,7 @@ class BacklogManager:
         Raises:
             ValueError: If the ``## TDD Cycle Log`` section does not exist in the file.
         """
-        timestamp = datetime.now(tz=UTC).isoformat()
+        timestamp = tdd_timestamp()
         entry = TDD_ENTRY_TEMPLATE.format(phase=phase, timestamp=timestamp, message=message)
 
         content = work_unit_path.read_text(encoding="utf-8")
@@ -3140,7 +3199,11 @@ class BacklogManager:
 
     @classmethod
     def _is_test_source_path(cls, path: str) -> bool:
-        """Return True if the path is a Python file located under a ``tests/`` dir.
+        """Return True if the path is a Python test file.
+
+        Recognised two ways: a ``tests/`` directory segment, or pytest's default
+        discovery convention (``test_*.py`` / ``*_test.py``) for repositories
+        that colocate tests beside the code they exercise.
 
         This is the single shared authority for "is this path a Python test
         file" used both by ``_is_production_source`` (Rule 14, source-test
@@ -3149,9 +3212,19 @@ class BacklogManager:
         classifier is prohibited -- both call sites must reuse this method
         so the production/test boundary can never drift out of sync.
         """
-        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+        if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
-        return path.startswith("tests/") or "/tests/" in path
+        if path.startswith("tests/") or "/tests/" in path:
+            return True
+        # pytest's default discovery convention (``python_files = test_*.py
+        # *_test.py``). A repository that colocates tests beside the code they
+        # exercise has no ``tests/`` segment to key on, and treating those files
+        # as production source makes Rule 14 demand a test for the test --
+        # ``test_render.py`` requiring ``test_test_render.py`` -- which is
+        # unsatisfiable by construction.
+        basename = path.rsplit("/", 1)[-1]
+        stem = basename.rsplit(".", 1)[0]
+        return basename.startswith("test_") or stem.endswith("_test")
 
     @classmethod
     def _is_production_source(cls, path: str) -> bool:
@@ -3163,7 +3236,7 @@ class BacklogManager:
         any ``tests/`` segment, per ``_is_test_source_path``) are excluded --
         they are not production source even when their extension is ``.py``.
         """
-        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+        if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
         # Exclude test files
         if cls._is_test_source_path(path):
@@ -3173,9 +3246,52 @@ class BacklogManager:
 
         if PurePosixPath(path).name == "__init__.py":
             return False
+        # A workspace whose production code lives outside src/ declares its own
+        # prefixes via validate.production_source_paths. Absent (the default),
+        # the built-in prefixes apply unchanged.
+        configured = cls._configured_production_source_paths()
+        if configured is not None:
+            return any(path.startswith(prefix) for prefix in configured)
         return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
             seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
         )
+
+    @staticmethod
+    def _configured_production_source_paths() -> tuple[str, ...] | None:
+        """Return the workspace's declared production-source prefixes, or None.
+
+        Isolated so the classifier stays import-light and so a workspace that
+        never configures the key pays no behavioural cost.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.production_source_paths
+        except Exception:
+            return None
+
+    @classmethod
+    def _production_source_extensions(cls) -> tuple[str, ...]:
+        """The effective source-file extensions: workspace-declared, else Python only.
+
+        Shared by ``_is_test_source_path`` and ``_is_production_source`` so the
+        production/test boundary can never drift between them.
+        """
+        return cls._configured_production_source_extensions() or cls._PYTHON_EXTS
+
+    @staticmethod
+    def _configured_production_source_extensions() -> tuple[str, ...] | None:
+        """Return the workspace's declared production-source extensions, or None.
+
+        None keeps the built-in Python-only behaviour, so a workspace that never
+        configures the key sees no change.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.production_source_extensions
+        except Exception:
+            return None
 
     @staticmethod
     def _is_documentation_path(path: str) -> bool:
@@ -3599,6 +3715,78 @@ class BacklogManager:
                         f"{source_stem!r}, e.g., tests/unit/test_{source_stem}.py). "
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
+
+    def _check_expected_output(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 28: the ``## Expected Output:`` declaration agrees with the Manifest.
+
+        ``commit`` (the default when the section is absent) is the pre-existing
+        lifecycle: git-ops commits, pushes, opens a PR, waits for CI, merges.
+        ``none`` declares a unit that modifies no source file -- a verification,
+        decision, or no-op unit that records its evidence in ``## Comments``.
+
+        The cross-check exists because the two failure directions are both
+        silent at authoring time and expensive at execution time:
+
+        - ``none`` alongside a real Manifest path means the unit intends to
+          change a file, so skipping the commit would discard that work.
+        - ``none`` alongside ``<source-drift-fix-targets-determined-at-execution>``
+          is contradictory: deferred resolution enumerates real paths via
+          manifest_amendment mid-execution, which is precisely a commit.
+
+        Only the no-output sentinels (``<verification-only>``,
+        ``<decision-only>``, ``<no changes>``, ``<no-op>`` and their per-task
+        ``<name:ID>`` variants) satisfy ``none``.
+
+        A Task whose Manifest cannot be parsed is skipped rather than crashing
+        validate(), matching the ``except ManifestParseError: continue``
+        pattern used by every other Manifest-consuming rule in this module.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        for row_id, row_status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            if row_status in _TERMINAL_CHILD_STATUSES:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            declared = self._extract_expected_output(content)
+            if declared is None:
+                continue
+            if declared not in VALID_EXPECTED_OUTPUTS:
+                allowed = ", ".join(sorted(VALID_EXPECTED_OUTPUTS))
+                errors.append(
+                    f"{row_id}: '## Expected Output: {declared}' is not a recognised value; "
+                    f"allowed values are: {allowed}."
+                )
+                continue
+            if declared != EXPECTED_OUTPUT_NONE:
+                continue
+            try:
+                manifest_files = [r.file for r in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            if is_no_output_manifest(manifest_files):
+                continue
+            offenders = ", ".join(repr(f) for f in manifest_files) or "(empty Manifest)"
+            errors.append(
+                f"{row_id}: declares '## Expected Output: none' but its Changes Manifest is not "
+                f"exclusively no-output sentinels (got {offenders}). A unit that produces no commit "
+                f"must declare only <verification-only>, <decision-only>, <no changes>, or <no-op>; "
+                f"any real path -- or <source-drift-fix-targets-determined-at-execution>, which "
+                f"resolves to real paths mid-execution -- will produce a commit, so declare "
+                f"'## Expected Output: commit' instead."
+            )
 
     def _check_task_type_taxonomy(
         self,
@@ -4586,6 +4774,21 @@ class BacklogManager:
         the taxonomy check.
         """
         m = TASK_TYPE_LINE_RE.search(content)
+        if not m:
+            return None
+        return m.group(2).strip().lower()
+
+    @staticmethod
+    def _extract_expected_output(content: str) -> str | None:
+        """Extract the declared ``## Expected Output:`` value from a work-unit body.
+
+        Returns the lowercased, whitespace-trimmed value, or ``None`` when the
+        section is absent. A ``None`` result resolves to
+        ``DEFAULT_EXPECTED_OUTPUT`` (``commit``) -- the pre-existing lifecycle --
+        so a backlog authored before this section existed is never
+        retroactively reinterpreted. Mirrors ``_extract_task_type``.
+        """
+        m = EXPECTED_OUTPUT_LINE_RE.search(content)
         if not m:
             return None
         return m.group(2).strip().lower()

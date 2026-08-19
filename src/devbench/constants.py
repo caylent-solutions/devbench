@@ -404,6 +404,78 @@ TASK_TYPE_SECTION_PREFIX: str = "## Task Type:"
 TASK_TYPE_LINE_RE = re.compile(r"^(##\s*Task Type:\s*)(.+)$", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
+# Expected-output taxonomy (per-work-unit commit declaration).
+#
+# A work unit declares whether executing it is expected to produce a commit.
+# ``commit`` is the default when the section is absent, so every backlog
+# authored before this section existed keeps its current lifecycle exactly.
+# ``none`` names a unit that verifies, decides, or no-ops: it records its
+# evidence in ``## Comments`` and git-ops completes it without a commit, push,
+# PR, CI wait, or merge. See docs/backlog-contract.md and ADR-35.
+# ---------------------------------------------------------------------------
+EXPECTED_OUTPUT_COMMIT: str = "commit"
+EXPECTED_OUTPUT_NONE: str = "none"
+VALID_EXPECTED_OUTPUTS: frozenset[str] = frozenset({EXPECTED_OUTPUT_COMMIT, EXPECTED_OUTPUT_NONE})
+DEFAULT_EXPECTED_OUTPUT: str = EXPECTED_OUTPUT_COMMIT
+EXPECTED_OUTPUT_SECTION_PREFIX: str = "## Expected Output:"
+EXPECTED_OUTPUT_LINE_RE = re.compile(r"^(##\s*Expected Output:\s*)(.+)$", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
+# Orphan-path patterns: build/state artifacts that no production workflow
+# commits. fnmatch-style globs matched against POSIX-relative repo paths;
+# ``**/`` matches both repo-root and nested locations.
+#
+# Dependency LOCK files are deliberately absent. A lock file pins resolved
+# dependency versions and belongs in version control -- devbench treats
+# uv.lock, package-lock.json, poetry.lock, Cargo.lock and go.sum as ordinary
+# tracked files, and .terraform.lock.hcl is the same category. Listing one
+# here makes git-ops ``git rm --cached`` it as a build artifact, which is a
+# reproducibility regression, not cleanup.
+#
+# Override per workspace with ``git_ops.orphan_patterns`` in devbench.yaml, or
+# ``DEVBENCH_ORPHAN_IGNORE_PATTERNS`` (comma-separated) in the environment.
+# Either replaces this list wholesale.
+# ---------------------------------------------------------------------------
+DEFAULT_ORPHAN_PATTERNS: tuple[str, ...] = (
+    # Terraform state and module cache. ``**/`` prefix matches both
+    # repo-root and nested locations.
+    "**/*.tfstate",
+    "**/*.tfstate.backup",
+    "**/*.tfstate.lock.info",
+    "**/.terraform/**",
+    "**/.terragrunt-cache/**",
+    # Python build / test caches
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    # Coverage. ``**/.coverage*`` (no separator) is the catch-all that
+    # covers ``.coverage``, ``.coverage.<ext>``, and the stray
+    # ``.coverage (1)`` form pytest-cov writes when the canonical file
+    # is locked. The narrower variants below stay for documentation but
+    # are subsumed by the catch-all on this line.
+    "**/.coverage*",
+    "**/htmlcov/**",
+    # Ansible: ansible-playbook writes a .retry file listing failed hosts.
+    "**/*.retry",
+    # Helm: `helm dependency update` vendors dependency charts as archives
+    # under a chart's charts/ directory. Chart.lock pins their versions and
+    # IS committed, so only the archives are listed here.
+    "**/charts/*.tgz",
+    # Terraform binary plan output (`terraform plan -out`).
+    "**/*.tfplan",
+    # Python virtualenv and build metadata
+    "**/.venv/**",
+    "**/*.egg-info/**",
+    # Node
+    "**/node_modules/**",
+    # macOS
+    "**/.DS_Store",
+)
+
+# ---------------------------------------------------------------------------
 # Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------
@@ -763,7 +835,11 @@ DEFAULT_LOG_FILENAME: str = "orchestrator.log"
 # ---------------------------------------------------------------------------
 # Comment timestamp format (used in work-unit Comments entries)
 # ---------------------------------------------------------------------------
-COMMENT_TIMESTAMP_FORMAT: str = "%Y-%m-%d %H:%M UTC"
+# ``%Z`` rather than a literal "UTC": comments are stamped in the workspace's
+# ``display_timezone`` when one is set, so the header has to name the zone it
+# actually used. Unset, the zone resolves to UTC and the rendered text is
+# byte-identical to what earlier versions wrote.
+COMMENT_TIMESTAMP_FORMAT: str = "%Y-%m-%d %H:%M %Z"
 
 # ---------------------------------------------------------------------------
 # Git message templates for finalize operations
@@ -809,6 +885,25 @@ ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reaso
 # paths=<n> stash=<message>``.
 ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX: str = "[BLOCK_QUARANTINE] "
 
+# Audit-row tag written by ``cli.cmd_log_verdict`` at the moment a review
+# judge's executor retry budget is spent, so the run stops re-litigating a
+# work unit no further executor round can fix.
+#
+# The tag text is load-bearing and must appear verbatim (issue #248):
+# ``backlog.proposal._RETRY_EXHAUSTED_TAG_RE`` matches it case-sensitively to
+# classify the unit as ``OPERATOR_ACTION_REQUIRED`` instead of
+# ``AWAITING_AMENDMENT_RECOVERY``, whose contract is "operator does nothing".
+# Without the tag a spent budget reads as a recovery signal and the run
+# stalls with no operator alert.
+#
+# Enforcement lives in code rather than in orchestrate SKILL.md prose because
+# the prose contract was unenforceable: it told the orchestrator to read the
+# budget via ``devbench config-resolve``, a verb that did not exist, so the
+# per-judge budget in ``max_executor_retries_per_judge`` was parsed by
+# ``config_loader`` and never consumed. Reviews could therefore repeat without
+# bound; the audit trail this tag lands in is the same one the counter reads.
+ORCHESTRATOR_RETRY_BUDGET_EXHAUSTED_AUDIT_TAG: str = "[RETRY_BUDGET_EXHAUSTED]"
+
 # Bound on the number of consecutive in-process quota-recovery resumes
 # ``_drive_orchestrate_with_quota_resume`` performs before stopping the
 # orchestrator (spec FR-2.8, AC-22). Overridable via
@@ -828,15 +923,88 @@ DEFAULT_MAX_QUOTA_RESUMES: int = 1000
 # ``_resolve_max_premature_turn_end_restarts``'s fail-safe parse, mirroring
 # ``DEFAULT_MAX_QUOTA_RESUMES``.
 #
-# Deliberately far lower than the quota / inactivity / transport cap: those
-# three failure modes each self-throttle (a quota window must elapse, an
-# inactivity restart costs a full timeout window, a transport fault is rare),
-# whereas a model that ends its turn immediately can do so again immediately.
+# Deliberately far lower than the quota / inactivity cap: those two failure
+# modes each self-throttle (a quota window must elapse, an inactivity restart
+# costs a full timeout window), whereas a model that ends its turn immediately
+# can do so again immediately. A transport fault does NOT self-throttle -- it
+# can recur as fast as the SDK can fail -- so it carries its own bound
+# (``DEFAULT_MAX_TRANSPORT_RESTARTS``) and its own backoff below, rather than
+# sharing the 1000 ceiling.
 # Sharing the 1000 ceiling would let one reproducible prompt-following failure
 # burn a thousand consecutive sessions with no operator in the loop. This cap
 # is a cost guard, not a correctness bound: exhausting it is itself the signal
 # that the loop is not making progress and needs a human.
 DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS: int = 10
+
+# Bound on the number of consecutive in-process restarts
+# ``_drive_orchestrate_with_quota_resume`` performs after an SDK TRANSPORT
+# error, and the exponential-backoff envelope applied between those restarts.
+#
+# Transport restarts previously borrowed ``DEFAULT_MAX_QUOTA_RESUMES`` (1000)
+# and retried with no delay at all. That pairing is unsound: unlike a quota
+# window or an inactivity timeout, a transport fault imposes no natural delay,
+# so a persistently failing transport spends the entire 1000-restart budget as
+# fast as the SDK can reject a session -- observed in the field as ~1000
+# restarts inside 39 minutes, after which the run ended and the daemon exited
+# with no operator signal until someone read the log.
+#
+# The cap is therefore separate from the quota ceiling, and sized as a TIME
+# budget rather than a raw attempt count: a transport that is still failing
+# after roughly an hour is down, not flapping, and the run must fail loudly
+# rather than grind. Backoff spaces the attempts so a transient fault still
+# recovers without burning the budget in seconds: delay =
+# ``base * 2 ** restarts_used``, clamped to ``max``.
+#
+# Why 14 specifically. Each restart costs one full SDK session lifetime plus
+# one backoff wait. Measured against a live Anthropic 529 'overloaded' outage,
+# an SDK session burns its own ``max_retries`` and raises after ~199s, and the
+# backoff ladder (1, 2, 4, 8, 16, 32, then 60s) adds ~9 min across 14
+# restarts. 15 sessions x 199s + 9.1 min => ~59 min to cap exhaustion, i.e. a
+# provider outage is ridden out for about an hour before the run halts.
+#
+# That ~199s session lifetime is a property of the SDK's own retry schedule
+# under one observed failure mode, not a constant. A different fault (instant
+# rejection, say) makes each cycle far shorter and the same cap exhausts much
+# sooner. The hour is the intent; the number is the calibration. Operators who
+# need a different window should set the wall-clock they want and re-derive,
+# not nudge this integer blindly.
+#
+# All three are overridable, precedence env > yaml > built-in default:
+#   ``DEVBENCH_MAX_TRANSPORT_RESTARTS``
+#     / ``orchestrate.max_transport_restarts``
+#   ``DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS``
+#     / ``orchestrate.transport_restart_backoff_base_seconds``
+#   ``DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS``
+#     / ``orchestrate.transport_restart_backoff_max_seconds``
+DEFAULT_MAX_TRANSPORT_RESTARTS: int = 14
+DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = 1.0
+DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS: float = 60.0
+
+# Reasoning effort and per-turn thinking budget for the orchestrator SDK
+# session, and through it every agent the session spawns.
+#
+# Left unset, the session inherits whatever effort the ambient Claude Code
+# configuration carries. That is how an unattended run ends up on ``xhigh``
+# without anyone choosing it, and effort is not a free dial: a turn that
+# reasons for longer than the prompt-cache lifetime returns to a cold cache,
+# so the whole prompt is re-uploaded and re-cached on the next turn instead of
+# being read back. The run then pays full price per turn and exhausts its
+# quota far sooner, and quota exhaustion is what interrupts units mid-flight.
+#
+# ``DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS`` is the guard rail: it bounds one
+# turn's reasoning so a turn cannot outlive the cache window. The value is a
+# budget, not a target -- turns that need less use less.
+#
+# Override:
+#   ``DEVBENCH_ORCHESTRATE_EFFORT`` / ``orchestrate.effort``
+#   ``DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS``
+#     / ``orchestrate.max_thinking_tokens``
+DEFAULT_ORCHESTRATE_EFFORT: str = "high"
+DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS: int = 16000
+
+# The effort levels the SDK accepts. An unrecognised value is rejected at
+# config load rather than passed through to fail deep inside a session.
+VALID_ORCHESTRATE_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 # Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
 # permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]

@@ -676,6 +676,44 @@ Per-poll cadence in seconds inside the settle window above. Overridable via the 
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
 
+#### `git_ops.isolate_worktrees` -- Per-unit git worktrees
+
+Claim each work unit into its own git worktree beside the primary checkout instead of sharing one working tree. Two units that never share a tree never collide, so an interrupted unit's uncommitted work is not something the next claim has to displace into quarantine. Mutually exclusive with `single_branch`.
+
+- **Recommended:** `false` -- matches the built-in default and the shared-tree model most workspaces expect.
+- **Alternatives:** `true` (isolates every claim, at the cost of one worktree per in-flight unit; do not combine with `single_branch`.)
+- **Free-form:** Enter `true` or `false`; any other value is rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+> "Section: git_ops
+>
+>   single_branch      -- Use one branch for all work units (blank = per-unit backlog/<id> branches).
+>                         Example: feat/my-feature
+>   defer_pr           -- When true, git-ops commits locally only; PR opens via git-ops-finalize.
+>                         Required when single_branch is set. [true/false, default: false]
+>   auto_finalize      -- When true, orchestrate skill pushes the branch + opens PR automatically
+>                         once all work units are terminal. Requires defer_pr: true. [true/false, default: false]
+>   auto_merge         -- When true, orchestrate skill merges the PR once CI is green.
+>                         Requires auto_finalize: true AND defer_pr: true. [true/false, default: false]
+>   pause_before_merge -- When true, work units transition to 'in-review' after CI passes;
+>                         the operator manually merges. Mutually exclusive with defer_pr. [true/false, default: false]
+>   update_submodule   -- Update parent repo's submodule reference after each PR merge.
+>                         Use only when target repos are git submodules. [true/false, default: false]
+>   inline_orphan_cleanup -- Run orphan-path cleanup as a chore commit before the task commit.
+>                            [true/false, default: true]
+>   orphan_patterns    -- fnmatch globs identifying build/state artifacts to untrack.
+>                         REPLACES the built-in list wholesale when non-empty (the env var
+>                         DEVBENCH_ORPHAN_IGNORE_PATTERNS wins over it), so a workspace that
+>                         sets it owns the complete set and a devbench upgrade cannot
+>                         reintroduce a pattern it removed on purpose. Dependency LOCK files
+>                         (uv.lock, package-lock.json, .terraform.lock.hcl, Chart.lock) are
+>                         deliberately absent from the built-in list -- they pin versions and
+>                         belong in git. [list of globs, default: [] = built-in list]
+>   ci_failure_retry   -- Return rc=2 on CI failure to trigger an executor retry. [true/false, default: true]
+>   local_only         -- Target repos have no origin remote; never push or create PRs.
+>                         Requires defer_pr: true. [true/false, default: false]"
+
 Validate incompatible combinations:
 - `defer_pr: true` requires `single_branch` to be set (`single_branch` alone, without `defer_pr`, is valid). Reject with:
   > "[INVALID] git_ops.defer_pr requires git_ops.single_branch to be set. Re-enter."
@@ -766,6 +804,13 @@ Maximum amendments applied to one task during one executor run. Prevents amendme
 - **Free-form:** Enter any integer >= 1; non-integers or values below 1 are rejected and re-prompted.
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+> "Section: manifest_amendment
+>
+>   enabled                    -- Enable the Changes Manifest amendment workflow. [true/false, default: true]
+>   allowed_reasons            -- List of amendment reasons accepted by the pre-filter.
+>                                 Default: [tdd_green_production_fix]
+>                                 (Enter comma-separated values, or leave blank for the default.)
+>   max_requests_per_execution -- Max amendments applied to one task per executor run. [integer >= 1, default: 2 -- one addition plus one row removal so a unit can satisfy AC-FINAL-015 in both directions within a single run]"
 
 ---
 
@@ -782,6 +827,27 @@ When true, cross-checks Acceptance Criteria and Definition of Done sections of e
 - **Free-form:** Type `true` or `false` directly; any other value is rejected and re-prompted.
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `validate.production_source_paths` -- Production-source path prefixes
+
+Path prefixes this workspace treats as production source for the task-type invariant (rule 21) and source-test atomicity (rule 14). Absent preserves the built-in prefixes `src/` and `infra/scripts/` plus any nested `/src/` segment. Set this when a repository keeps tested production modules elsewhere.
+
+- **Recommended:** Leave absent -- the built-in prefixes cover the conventional layout.
+- **Alternatives:** `['src/', 'lib/']` (declares an additional top-level production tree.)
+- **Free-form:** Enter a YAML list of path-prefix strings, or `skip` to leave the key absent and keep the built-in prefixes.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `validate.production_source_extensions` -- Production-source file extensions
+
+File extensions this workspace treats as production source, consumed together with `production_source_paths` by the task-type invariant (rule 21) and source-test atomicity (rule 14). Absent keeps the built-in Python-only behaviour. Declare it when behaviour lives in non-Python artefacts.
+
+- **Recommended:** Leave absent -- the built-in Python-only behaviour matches a Python workspace.
+- **Alternatives:** `['.py', '.tf']` (treats Terraform as production source alongside Python.)
+- **Free-form:** Enter a YAML list of extension strings including the leading dot, or `skip` to leave the key absent.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
 
 ---
 
@@ -880,6 +946,57 @@ Cap on recovery-of-a-recovery cascade depth (issue #144). When a proposal would 
 - **Free-form:** Enter any integer >= 1; non-integers or values below 1 are rejected and re-prompted.
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `orchestrate.max_transport_restarts` -- SDK transport-restart cap
+
+Cap on consecutive in-process restarts after an SDK transport error. Unlike a quota window or an inactivity timeout, a transport fault imposes no natural delay, so this bound is deliberately low and separate from the quota ceiling: exhausting it means the transport is down rather than flapping. Sized as a time budget -- with the backoff defaults below, 14 restarts is roughly an hour before the run halts. Overridable via the `DEVBENCH_MAX_TRANSPORT_RESTARTS` env var.
+
+- **Recommended:** `14` -- matches the built-in default, giving about an hour of riding out a provider outage.
+- **Alternatives:** `20` (extends the window for a provider known to have long outages.)
+- **Free-form:** Enter any integer >= 1; non-integers or values below 1 are rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `orchestrate.transport_restart_backoff_base_seconds` -- First transport-restart delay
+
+First delay, in seconds, before the initial transport restart. Each subsequent restart doubles it (`base * 2 ** restarts_used`) up to the ceiling below. Without this envelope the restart cap above is spent as fast as the SDK can reject a session. Overridable via the `DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS` env var.
+
+- **Recommended:** `1.0` -- matches the built-in default; recovers from a momentary fault without a perceptible stall.
+- **Alternatives:** `2.0` (backs off faster on a link known to be flaky.)
+- **Free-form:** Enter any number greater than 0 (seconds); zero or negative values are rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `orchestrate.transport_restart_backoff_max_seconds` -- Transport-restart delay ceiling
+
+Ceiling, in seconds, on the exponential transport-restart delay. Must be >= `transport_restart_backoff_base_seconds`. The ceiling also bounds how long an in-flight wait can delay a `devbench stop`. Overridable via the `DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS` env var.
+
+- **Recommended:** `60.0` -- matches the built-in default; settles a long outage into a steady one-minute retry cadence.
+- **Alternatives:** `120.0` (halves the retry volume during a long outage, at the cost of a less responsive stop.)
+- **Free-form:** Enter any number greater than 0 (seconds) that is at least the base above; smaller or non-positive values are rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `orchestrate.effort` -- Reasoning effort
+
+Reasoning effort for the orchestrator SDK session and every agent it spawns. Left unset the session inherits the ambient Claude Code effort, so an unattended run's cost profile depends on whatever the operator's last interactive session happened to use. Pinning it makes the run reproducible.
+
+- **Recommended:** `high` -- matches the built-in default and the effort the judge prompts were written against.
+- **Alternatives:** `medium` (cheaper per turn, at the cost of shallower review reasoning); `xhigh` or `max` (deeper reasoning, materially higher cost per turn.)
+- **Free-form:** Enter one of `low`, `medium`, `high`, `xhigh`, `max`; any other value is rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `orchestrate.max_thinking_tokens` -- Per-turn thinking budget
+
+Ceiling on how many tokens one turn may spend reasoning. A turn that reasons for longer than the prompt-cache lifetime returns to a cold cache, so the whole prompt is re-uploaded and re-cached rather than read back, and the run reaches its quota limit sooner.
+
+- **Recommended:** `16000` -- matches the built-in default, tuned to stay inside the prompt-cache lifetime.
+- **Alternatives:** `32000` (allows deeper single-turn reasoning; expect more cold-cache re-uploads.)
+- **Free-form:** Enter any integer >= 1; non-integers or values below 1 are rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
 
 ---
 
@@ -1683,6 +1800,34 @@ Current value shown to the operator: the existing config's value for this key if
 ## Step 21 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. In addition to the operator-supplied sections above, the assembled YAML must also emit every remaining FR-3.6 tuning section at its resolved built-in default, so a freshly configured workspace is self-documenting (issue #260, spec FR-3.6, AC-40, Journey J-7): `timeouts`, `limits`, `stop_hook`, `hook_tail`, `orchestrate`, `report` (including `models`, `default_model`, and every multiplier field), `backlog`, `validate`, `skills`, `max_executor_retries`, `max_executor_retries_per_judge`, and `log_file`. Unlike the pre-rewrite skill, every one of those sections is now also interactively interviewed in Steps 3-20 above (including the new `gates` and `quota_handling` sections), so "emit at resolved default" now means "emit the value the operator actually chose (or accepted as the recommended default) in its own Step," not a value the operator was never asked about. An operator who later wants to tune a knob sees it in the file with its resolved value and annotated comment already present, instead of discovering the knob only by reading `config_loader.py`.
+> **`orchestrate.*` transport-restart knobs -- what to tell the operator.**
+> These are emitted at their built-in defaults like every other FR-3.6 tuning
+> section, and most workspaces should leave them alone. Raise them only if the
+> operator explicitly asks, and explain the trade-off rather than just setting
+> the number:
+>
+> - `max_transport_restarts` (default `14`) bounds consecutive restarts after
+>   an SDK **transport** failure. It is deliberately NOT the quota ceiling
+>   (`max_quota_resumes`, default `1000`). Those two must not be conflated: a
+>   quota window must elapse before a resume can succeed, so quota resumes
+>   self-throttle, whereas a transport fault recurs as fast as the SDK can
+>   reject a session. Pairing a four-figure budget with transport faults is
+>   what previously let a single persistent fault burn ~1000 restarts in 39
+>   minutes and end an unattended run.
+> - `transport_restart_backoff_base_seconds` (default `1.0`) and
+>   `transport_restart_backoff_max_seconds` (default `60.0`) space those
+>   restarts as `base * 2 ** restarts_already_done`, clamped to the ceiling.
+>   Both must be `> 0`; the schema rejects zero or negative at load time.
+> - Operational caveat worth stating out loud: the ceiling also bounds how
+>   long an in-flight backoff wait can delay a `devbench stop`. An operator who
+>   raises the ceiling to many minutes is also making shutdown that much less
+>   responsive.
+> - If the operator is running unattended (`--daemon`) and wants to survive a
+>   longer upstream outage, the right lever is usually a **higher ceiling**
+>   (fewer, more spaced attempts), not a much higher cap -- a high cap with a
+>   low ceiling just retries a dead transport more often.
+
+Assemble the complete YAML from all collected sections. In addition to the operator-supplied sections above, the assembled YAML must also emit every remaining FR-3.6 tuning section at its resolved built-in default, so a freshly configured workspace is self-documenting (issue #260, spec FR-3.6, AC-40, Journey J-7): `timeouts`, `limits`, `stop_hook`, `hook_tail`, `orchestrate`, `report` (including `models`, `default_model`, and every multiplier field), `backlog`, `validate`, `skills`, `max_executor_retries`, `max_executor_retries_per_judge`, and `log_file`. An operator who later wants to tune a knob sees it in the file with its default value and annotated comment already present, instead of discovering the knob only by reading `config_loader.py`.
 
 Source every emitted default value and its comment from `sample-config.yaml` (ref) -- copy the value and comment verbatim; never restate a number by hand from memory. Written values must equal built-in defaults exactly; any drift between an emitted value and the corresponding built-in default in `src/devbench/constants.py` / `config_loader.py` is a defect (FR-3.6 error handling).
 
@@ -1762,6 +1907,8 @@ _MODULE_CONSTANTS = [
     \"STOP_HOOK_MAX_BLOCKS\", \"STOP_HOOK_WINDOW_SECONDS\", \"STOP_HOOK_STALE_TASK_MINUTES\",
     \"HOOK_TAIL_AGENT_WIDTH\", \"HOOK_TAIL_TOOL_WIDTH\", \"HOOK_TAIL_DESCRIPTION_MAX\",
     \"HOOK_TAIL_STDOUT_PREVIEW_MAX\", \"MAX_CASCADE_DEPTH\",
+    \"MAX_TRANSPORT_RESTARTS\", \"TRANSPORT_RESTART_BACKOFF_BASE_SECONDS\",
+    \"TRANSPORT_RESTART_BACKOFF_MAX_SECONDS\",
     \"REPORT_MODEL_RATES\", \"REPORT_DEFAULT_MODEL_RATES\", \"REPORT_CACHE_READ_MULTIPLIER\",
     \"REPORT_CACHE_WRITE_5MIN_MULTIPLIER\", \"REPORT_CACHE_WRITE_1HR_MULTIPLIER\",
     \"REPORT_DATA_RESIDENCY_MULTIPLIER\", \"REPORT_FAST_MODE_MULTIPLIER\",

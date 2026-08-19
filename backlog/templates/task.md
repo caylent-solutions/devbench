@@ -2,6 +2,28 @@
 
 ## Status: in-queue
 
+## Expected Output: commit
+
+<!--
+  Optional section. If omitted entirely, this task DEFAULTS to `commit` --
+  the pre-existing lifecycle -- under validate-backlog rule 28, so a backlog
+  authored before this section existed is never reinterpreted. Two values:
+
+  - `commit` -- executing this task produces a commit. git-ops commits,
+                pushes, opens a PR, waits for CI, and merges.
+  - `none`   -- executing this task produces NO commit. The task verifies,
+                decides, or no-ops, and records its evidence in
+                `## Comments`. git-ops completes it without a commit, push,
+                PR, CI wait, or merge.
+
+  `none` requires a Changes Manifest of only no-output sentinels
+  (`<verification-only>`, `<decision-only>`, `<no changes>`, `<no-op>`, or a
+  per-task `<name:ID>` variant). Rule 28 rejects `none` alongside any real
+  path, and alongside `<source-drift-fix-targets-determined-at-execution>`,
+  whose paths ARE resolved mid-execution and therefore do produce a commit.
+  See docs/backlog-contract.md 'Expected-Output Declaration' and ADR-35.
+-->
+
 ## Task Type: behavior-fix
 
 <!--

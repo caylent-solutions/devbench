@@ -124,13 +124,27 @@ The Status Summary per-epic table (also written to `BACKLOG.md` by `validate-bac
 
 **Drain banner (issue #188, db-306):** like `devbench status`, `devbench report` prepends one `DRAIN REQUESTED` line above the report body for every pending drain signal -- the workspace-root `drain.signal` (if present) AND every per-session `<workspace>/.devbench/sessions/<name>/drain.signal` (if present), regardless of `DEVBENCH_SESSION_NAME`. The line format, ordering, and session-qualifier rules (`[session=<name>]` on per-session lines, omitted on the workspace-root line) are identical to the `status` banner -- see [`status`](#status) for the exact wording and worked format. The banner is rendered LIVE, immediately before the report body, on all three of `report`'s emit paths: the cached-snapshot fast-path (a `read_snapshot` hit), the one-shot live path (`generate_report` invoked directly), and every frame of the streaming loop. In every case the banner text is produced by a fresh scan of the drain signals and is never baked into the cached snapshot string or memoised inside a streamed frame's report body, so a drain requested after a snapshot was written -- or between two streaming redraws -- is never hidden behind stale output.
 
-**Transport restarts row (issue #331):** rendered immediately below the banner line, via `report.transport_restarts_line()`. Reads the orchestrator log directly and counts every genuine `[ORCHESTRATOR_TRANSPORT_RESTART]` audit line that `start`'s transport-error recovery path (see [`start`](#start) above and [ADR-34](adr/34-orchestrator-transport-restart.md)) has logged, rendering:
+**Transport restarts row (issue #331):** rendered immediately below the banner line, via `report.transport_restarts_line()`. Streams the orchestrator log and counts every genuine `[ORCHESTRATOR_TRANSPORT_RESTART]` audit line that `start`'s transport-error recovery path (see [`start`](#start) above and [ADR-34](adr/34-orchestrator-transport-restart.md)) has logged, **counted separately per window and labelled with the window it measures**, rendering:
 
 ```
-Transport restarts        2
+Transport restarts        2134 all-time / 3 session / 0 this run
 ```
+
+The windows are the SAME boundaries the table below uses -- All-time, the current orchestrator session, and (watch mode only) the report run -- resolved once and shared, so the row and the table can never disagree. `session` is omitted when no session boundary is known and `this run` is omitted outside watch mode.
+
+Each count is labelled because the bare number was actively misleading: the orchestrator log is append-only and never rotated, so the row reported a lifetime total while sitting directly above columns headed All-time / Session / This run. A restart storm from days earlier therefore rendered as a four-figure number beside a perfectly healthy current run, which reads as an in-progress failure. The all-time count alone decides whether the row appears at all, so a workspace that has never had a transport restart still renders nothing.
 
 Rendered only when at least one transport restart has been logged (`n > 0`); omitted entirely on a clean run, so a run with no transport restarts stays byte-identical to the pre-#331 layout.
+
+**Review rejections row (issue #122):** rendered immediately below the transport-restarts row, via `report.review_rejections_line()`. For every non-terminal task (`in-progress` or `blocked`) carrying at least one `[REVIEW_FAIL]`, it lists the rejection rounds each canonical reviewer has spent against that judge's budget:
+
+```
+Review rejections        E2-F5-S1-T2 changes_manifest 1/10, doc_review 2/10
+```
+
+This row exists because a review-rejection loop is otherwise indistinguishable from steady progress: the process stays alive, the log keeps advancing, and no error is ever logged, while a single task can consume hours and a large token budget being rejected and reworked. A task showing `3/10` is not making progress in the way the rest of the report implies.
+
+The denominator is resolved by the same `backlog.manager.resolve_judge_retry_budget` that [`log-verdict`](#log-verdict) enforces, so the number displayed can never disagree with the budget actually applied. Audit-only workflow agents are excluded -- they own no review gate. Rendered only when some non-terminal task has a rejection; omitted entirely otherwise, so a clean run's report stays byte-identical.
 
 **Required environment variables (issue #221 B7):** every `devbench` subcommand -- including `report` -- requires both `DEVBENCH_WORKSPACE_ROOT` and `DEVBENCH_CLAUDE_MODEL` to be set before invocation. The check fires at module-import time (`src/devbench/config.py::_require_env`); when either variable is missing devbench prints a single actionable line to stderr (`devbench: DEVBENCH_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root.`) and exits with code 2. Before the issue #221 B7 fix this path raised a Python traceback to stderr instead, which stdout-only consumers (`devbench report > out.txt`) saw as "rc=0, empty output" -- the symptom that the issue is filed against. The current behaviour is fail-fast (CLAUDE.md): non-zero exit, no traceback, no silent fallback.
 
@@ -861,9 +875,15 @@ uv run devbench start [--daemon] [--include "<tokens>"] [--exclude "<tokens>"] [
 
 Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin.
 
-**Premature-turn-end recovery:** the orchestrate loop is designed to stop on exactly three conditions -- `ALL_DONE`, `NO_ACTIONABLE`, or an operator drain. A fourth path used to end it: the model ending its own turn while backlog work remained. The SDK generator reports `StopAsyncIteration`, and `start` used to treat that as a normal exit, so the fastest-firing failure mode was the only one with no recovery, while a model going *silent* for the inactivity window (a slower form of the same failure) already earned a bounded fresh-session restart. A genuine end-of-run never reaches this path: the loop returns the moment a terminal sentinel is observed. `start` now raises an internal `_OrchestratePrematureTurnEnd` carrying the model's last result text, logs it at ERROR with its restart ordinal and cap, and opens a brand-new SDK session on the remaining backlog. This restart is bounded by its own `DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS` cap (default 10), deliberately far below the shared 1000-resume ceiling: quota, inactivity, and transport faults each self-throttle, whereas a model that ends its turn immediately can do so again immediately, so this cap is a cost guard and its exhaustion is itself the signal that a human is needed. Once exhausted, `start` fails fast and the `orchestrator_stop` notification carries the premature-turn-end stop class.
+**Premature-turn-end recovery:** the orchestrate loop is designed to stop on exactly three conditions -- `ALL_DONE`, `NO_ACTIONABLE`, or an operator drain. A fourth path used to end it: the model ending its own turn while backlog work remained. The SDK generator reports `StopAsyncIteration`, and `start` used to treat that as a normal exit, so the fastest-firing failure mode was the only one with no recovery, while a model going *silent* for the inactivity window (a slower form of the same failure) already earned a bounded fresh-session restart. A genuine end-of-run never reaches this path: the loop returns the moment a terminal sentinel is observed. `start` now raises an internal `_OrchestratePrematureTurnEnd` carrying the model's last result text, logs it at ERROR with its restart ordinal and cap, and opens a brand-new SDK session on the remaining backlog. This restart is bounded by its own `DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS` cap (default 10), deliberately far below the shared 1000-resume ceiling: quota and inactivity faults each self-throttle, whereas a model that ends its turn immediately can do so again immediately, so this cap is a cost guard and its exhaustion is itself the signal that a human is needed. A transport fault does not self-throttle either, and carries its own cap and backoff for the same reason (see below). Once exhausted, `start` fails fast and the `orchestrator_stop` notification carries the premature-turn-end stop class.
 
-**Transport-error recovery (issue #331):** `start`'s SDK message loop treats a transient Claude Agent SDK transport failure as a bounded-restart case, joining drain, quota resume ([`docs/quota-handling.md`](quota-handling.md)), and the inactivity timeout (`timeouts.orchestrator_inactivity` -- see [`docs/devbench-yaml-reference.md`](devbench-yaml-reference.md)) as the orchestrator's named recovery paths. Any exception raised by the SDK generator boundary other than `StopAsyncIteration` or `TimeoutError` -- an upstream defect, a dropped connection, anything devbench does not already have a name for -- is classified structurally (by which call raised, never by the exception's message text) and re-raised as an internal `_OrchestrateTransportError`. `start` logs the verbatim upstream exception at ERROR with its restart ordinal and cap, then opens a brand-new SDK session on the remaining backlog (no conversation state is carried over, matching the quota-resume and inactivity-restart contract) rather than exiting. The restart is bounded by the SAME `DEVBENCH_MAX_QUOTA_RESUMES` cap (default 1000) that already bounds quota resumes and inactivity restarts, tracked with its own independent counter, so a transport restart never consumes quota-resume or inactivity-restart budget and vice versa. Once the cap is exhausted, `start` re-raises the final exception verbatim and exits non-zero, and the `orchestrator_stop` notification carries the `transport-error-restart-cap-exhausted` stop class (see [`report`](#report) below for the matching `Transport restarts` row). There is no configuration key for this cap and none is added -- it deliberately reuses the existing resolver. See [ADR-34](adr/34-orchestrator-transport-restart.md) for the full design record, including why classification must be structural rather than message-based.
+**Transport-error recovery (issue #331):** `start`'s SDK message loop treats a transient Claude Agent SDK transport failure as a bounded-restart case, joining drain, quota resume ([`docs/quota-handling.md`](quota-handling.md)), and the inactivity timeout (`timeouts.orchestrator_inactivity` -- see [`docs/devbench-yaml-reference.md`](devbench-yaml-reference.md)) as the orchestrator's named recovery paths. Any exception raised by the SDK generator boundary other than `StopAsyncIteration` or `TimeoutError` -- an upstream defect, a dropped connection, anything devbench does not already have a name for -- is classified structurally (by which call raised, never by the exception's message text) and re-raised as an internal `_OrchestrateTransportError`. `start` logs the verbatim upstream exception at ERROR with its restart ordinal and cap, then opens a brand-new SDK session on the remaining backlog (no conversation state is carried over, matching the quota-resume and inactivity-restart contract) rather than exiting. The restart is bounded by its own `DEVBENCH_MAX_TRANSPORT_RESTARTS` cap (default 14, `orchestrate.max_transport_restarts` in YAML), tracked with its own independent counter, so a transport restart never consumes quota-resume or inactivity-restart budget and vice versa.
+
+**Each restart is preceded by exponential backoff**: `orchestrate.transport_restart_backoff_base_seconds * 2 ** restarts_already_done`, clamped to `orchestrate.transport_restart_backoff_max_seconds` (defaults 1.0s and 60.0s, so the waits run 1s, 2s, 4s, 8s, 16s, 32s, 60s...). The delay is recorded in the audit line as `backoff=<n>s`.
+
+This cap and this pacing are deliberately NOT the shared 1000-resume ceiling they once were. That pairing was unsound: a quota window must elapse and an inactivity restart costs a full timeout window, so both self-throttle, but a transport fault imposes no delay of its own and recurs as fast as the SDK can reject a session. Retrying a 1000-restart budget with no delay spent it as fast as the transport could fail -- observed in the field as ~1000 restarts inside 39 minutes, after which the run ended and the daemon exited with no operator signal until someone read the log. A low bound plus spacing means a transient fault still recovers, while a persistent one fails fast and loudly, which is the intended signal.
+
+Once the cap is exhausted, `start` re-raises the final exception verbatim and exits non-zero, and the `orchestrator_stop` notification carries the `transport-error-restart-cap-exhausted` stop class (see [`report`](#report) below for the matching `Transport restarts` row). Note the backoff ceiling also bounds how long an in-flight wait can delay a `devbench stop`. See [ADR-34](adr/34-orchestrator-transport-restart.md) for the full design record, including why classification must be structural rather than message-based.
 
 **Daemon flag:**
 
@@ -1124,7 +1144,7 @@ Send SIGTERM to a running session's orchestrator process, forcing it to exit aft
 
 1. `devbench stop` reads the session's `pid` file.
 2. Sends SIGTERM to the process.
-3. The SIGTERM handler in `cmd_start` intercepts the signal, writes a `[FORCED_BLOCKED_ON_STOP] session=<name>` audit comment to the in-flight work unit, marks the work unit `blocked`, and exits with rc=0.
+3. The SIGTERM handler in `cmd_start` intercepts the signal, writes an `[INTERRUPTED_ON_STOP] session=<name>` audit comment to the in-flight work unit, returns the work unit to `in-queue`, and exits with rc=0. The unit is released rather than blocked because a stop is not a dependency problem: the next run claims it again and the claim path restores whatever work was displaced, so an interrupted unit resumes instead of restarting.
 4. The session directory is NOT cleaned up automatically -- run `devbench sessions --cleanup` afterward to remove the stale entry.
 
 **Flags:**
@@ -1147,7 +1167,7 @@ Send SIGTERM to a running session's orchestrator process, forcing it to exit aft
 # Stop the session named "alpha" and block its in-flight work unit:
 uv run devbench stop --session alpha
 # The orchestrator for session "alpha" receives SIGTERM, blocks its WU, and exits.
-# The in-flight WU now carries: [FORCED_BLOCKED_ON_STOP] session=alpha
+# The in-flight WU now carries: [INTERRUPTED_ON_STOP] session=alpha
 
 # Clean up the stale session entry:
 uv run devbench sessions --cleanup
@@ -1430,6 +1450,35 @@ Two enforcement layers prevent malformed audit rows:
 
 Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
 
+#### Retry-budget enforcement (issue #122)
+
+A `fail` verdict from one of the **canonical reviewers** also enforces that judge's executor retry budget, so a review-rejection loop is bounded instead of able to repeat indefinitely.
+
+- The count is the number of `[judge/<name>] [REVIEW_FAIL]` rows already in the work-unit file, so the audit trail is the counter -- there is no separate state to drift.
+- The budget is that judge's entry in [`max_executor_retries_per_judge`](devbench-yaml-reference.md) when listed, otherwise the global `max_executor_retries` (env override `DEVBENCH_MAX_RETRIES`).
+- On exhaustion the command appends a `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` audit row, forces the unit to `blocked`, and sends the operator-action-required notification. The tag is what makes [`block-types.md`](block-types.md) classify the unit `OPERATOR_ACTION_REQUIRED` rather than `AWAITING_AMENDMENT_RECOVERY`.
+- The emitted JSON carries `retry_budget_exhausted`. When `true` the unit is already blocked: do not re-invoke the executor for it and do not write a second `[RETRY_BUDGET_EXHAUSTED]` row.
+- **Audit-only workflow agents never charge a budget** -- they do not own a review gate, so their verdicts cannot block a unit.
+
+Below budget, behaviour is unchanged from a plain verdict write.
+
+### `config-resolve`
+
+```
+uv run devbench config-resolve <field> [<field>...]
+```
+
+Print fully-resolved runtime-config values (env > YAML > built-in default) as one-line JSON, so an agent can read a setting without re-deriving the precedence chain or assuming a default.
+
+`<field>` names are `RuntimeConfig` attributes, for example `max_executor_retries`, `max_executor_retries_per_judge`, `manifest_amendment`. Nested sections are returned as JSON objects.
+
+```
+$ uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge
+{"max_executor_retries": 10, "max_executor_retries_per_judge": {}}
+```
+
+An unknown field name exits non-zero and lists the valid choices; it never returns a silent `null`, which would read as "configured empty" and hide a typo. Calling with no field name is likewise an error.
+
 ### `log-comment`
 
 ```
@@ -1511,7 +1560,7 @@ Commit, push, create PR, wait for CI, merge. The full git-ops sequence runs afte
 Enforces three deterministic safety rails:
 - **Manifest-scope:** staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015). `git-ops` stages only the paths the work unit's own Changes Manifest declares -- it no longer runs a whole-tree `git add -A`. A caller that cannot resolve a Manifest for the unit, or whose Manifest holds only execution-time sentinels, is refused (exit 1) rather than silently given a whole-tree commit; previously this case warned and committed anyway. `git-ops-finalize`, which batches many units and legitimately has no single Manifest, opts into whole-tree staging explicitly via its `stage_all` behaviour -- this is the one intentional exception to Manifest-scoped staging.
 - **Branch-anchor:** HEAD must be on the expected branch (prevents orphan-branch commits).
-- **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state, terragrunt cache, Python pycache, coverage artefacts, `node_modules`, `.DS_Store`). The default behaviour (Phase 1 of the orphan-cascade fix) is **inline cleanup**: git-ops runs `cleanup_tracked_orphans` programmatically, commits the result as a devbench-authored chore commit (canonical message `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore`), then continues with the original task's commit on the same invocation. Two commits land on the task's branch; the executor's staging is preserved (filtered to exclude orphan paths). When the operator sets `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`, git-ops falls back to the legacy proposal flow (cleanup-as-task) with cross-task de-duplication so two parents detecting the same orphan set wire to the SAME cleanup task. Override the active pattern list per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs).
+- **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state and plan output, terragrunt cache, Python pycache / `.venv` / `*.egg-info`, coverage artefacts, ansible `*.retry`, helm `charts/*.tgz`, `node_modules`, `.DS_Store`). The default behaviour (Phase 1 of the orphan-cascade fix) is **inline cleanup**: git-ops runs `cleanup_tracked_orphans` programmatically, commits the result as a devbench-authored chore commit (canonical message `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore`), then continues with the original task's commit on the same invocation. Two commits land on the task's branch; the executor's staging is preserved (filtered to exclude orphan paths). When the operator sets `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`, git-ops falls back to the legacy proposal flow (cleanup-as-task) with cross-task de-duplication so two parents detecting the same orphan set wire to the SAME cleanup task. Override the active pattern list per backlog via `git_ops.orphan_patterns` in `devbench.yaml` (a YAML list) or `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs); the env var wins, and either REPLACES the built-in list wholesale rather than extending it, so a workspace that declares one owns the complete set. Dependency LOCK files (`uv.lock`, `package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`, `.terraform.lock.hcl`, `Chart.lock`) are deliberately NOT in the built-in list -- they pin resolved versions and belong in version control, so untracking one is a reproducibility regression rather than cleanup.
 
 Each rail exits 1 with a clear diagnostic when violated.
 
@@ -1664,14 +1713,23 @@ See [manifest-amendments.md](manifest-amendments.md) and [ADR-02](adr/02-manifes
 cat <<'EOF' | uv run devbench request-amendment <id>
 {
   "reason": "tdd_green_production_fix",
-  "files_to_add": ["src/path/to/file.py"],
+  "files_to_add": [{"path": "src/path/to/file.py", "change": "minimum fix for AC-TEST-001"}],
+  "files_to_remove": ["tests/test_stale.py"],
   "justification": "...",
   "linked_acs": ["AC-TEST-001"]
 }
 EOF
 ```
 
-Register an amendment request at `<workspace>/.devbench/amendments/<id>.json`. Payload is JSON on stdin; the four fields above are required. Invoked by the executor during TDD GREEN when a production fix is needed but out of manifest scope.
+Register an amendment request at `<workspace>/.devbench/amendments/<id>.json`. Payload is JSON on stdin. `reason`, `justification`, `files_to_add` and `linked_acs` are required (`files_to_add` entries are `{path, change}` objects, not bare strings); `files_to_remove` is optional. At least one of `files_to_add` / `files_to_remove` must be non-empty -- a request that changes nothing is rejected as a no-op.
+
+Invoked by the executor during TDD GREEN when a production fix is needed but out of manifest scope, and by the review-fix path when a judge requires a Manifest correction.
+
+**Every Layer 1 pre-filter check runs before the request is written**, so a request that cannot be approved never reaches disk and never occupies the single pending-request slot. The checks are deterministic: the workflow must be enabled, the `reason` must be in this backlog's configured [`manifest_amendment.allowed_reasons`](devbench-yaml-reference.md), the rate limit must allow it, the task must be `in-progress`, `linked_acs` must exist, added files must not already be declared and must be present in the staged diff, and removals must satisfy the rule below.
+
+**`files_to_remove` and `AC-FINAL-015`.** [`AC-FINAL-015`](acceptance-criteria-canonical.md) requires the Changes Manifest to match the files git changed *exactly* -- no extra, no missing -- so a declared row whose file ends up with a zero-line diff (its work having landed under a sibling unit, for instance) is a real violation that `changes_manifest` fails the unit for. `files_to_remove` is how a unit complies.
+
+A row may only be dropped when its file has **no staged, unstaged, or untracked changes**. That is the safety property: the Manifest row is the only thing authorising a file to appear in the unit's commit, so permitting removal for a file with real changes would let work leave the unit's reviewed scope. A dirty path is refused with an error naming it. Removals are also recorded in the `[AMENDMENT_APPLIED]` audit row, so a dropped row is never invisible to a reviewer.
 
 ### `apply-amendment`
 
@@ -1680,6 +1738,8 @@ uv run devbench apply-amendment <id>
 ```
 
 Atomically update the Changes Manifest after the `manifest-amender` judge approves. Runs a deterministic Layer 3 post-check (em-dash scan plus `validate-backlog`) and rolls back on any failure, so a failed post-check cannot leave the backlog half-updated.
+
+Removals and additions are applied inside the **same** atomic write and rollback envelope, so a post-check failure restores the Manifest whole rather than leaving it half-amended. The `reason` is re-checked here against the same configured `allowed_reasons` the request passed, so hand-editing a pending request on disk between `request-amendment` and this command cannot smuggle in a reason the backlog disallows.
 
 ### `reject-amendment`
 
@@ -1807,6 +1867,8 @@ Output JSON:
 ```
 uv run devbench add-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
 ```
+
+Refuses an edge that would close a dependency cycle, naming the offending chain (`A -> B -> A`), rather than writing it and letting `validate-backlog` report it on a later sweep with nothing in either work-unit file naming the edge responsible. The check runs the same detector `devbench next` uses, against the graph the edge would produce. Wire the edge in the other direction, or break the existing path first.
 
 Wire a canonical `## Dependencies` row -- the form `validate-backlog`'s Manifest Conflict Rule reads -- alongside the existing `[BLOCKED_PENDING_PROPOSAL] <blocker-task-id>` audit marker on `<blocked-task-id>`'s work-unit file (#330 FR-1). The row's Title and Status cells carry `<blocker-task-id>`'s real, current values as of this call, not a placeholder. The ADR-07 auto-requeue cascade still only auto-unblocks `<blocked-task-id>` when `<blocker-task-id>` reaches `done` / `declined` AND `<blocked-task-id>`'s own status is `blocked`; the `## Dependencies` row has no such restriction, so it is what satisfies the validator now, independent of `<blocked-task-id>`'s current status. See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md).
 

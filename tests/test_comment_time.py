@@ -1,0 +1,236 @@
+"""Tests for the timezone applied to work-unit comment timestamps.
+
+``display_timezone`` is documented as the zone every devbench command that
+renders timestamps uses. Work-unit audit comments were the one surface that
+ignored it and hard-coded UTC, so a run's own audit trail disagreed with the
+hook-tail and report output an operator reads beside it.
+
+Defaulting stays UTC on purpose: a work-unit file is committed and read by
+other people on other machines, so switching an unconfigured workspace to
+whatever local zone the runner happened to have would make one file's
+timestamps depend on who wrote each line.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from devbench.comment_time import comment_timestamp, resolve_comment_timezone, tdd_timestamp
+
+
+class TestResolveCommentTimezone:
+    def test_unset_config_resolves_to_utc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unchanged behaviour for every workspace that never sets the key."""
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        assert resolve_comment_timezone() == UTC
+
+    def test_configured_zone_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/Detroit", raising=False)
+        assert resolve_comment_timezone() == ZoneInfo("America/Detroit")
+
+    def test_explicit_utc_is_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "UTC", raising=False)
+        assert resolve_comment_timezone() == ZoneInfo("UTC")
+
+    def test_unknown_zone_falls_back_to_utc_rather_than_breaking_the_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An audit comment must still be written when the zone name is wrong.
+
+        Refusing to timestamp would stop an unattended run over a display
+        preference; the misconfiguration surfaces on hook-tail and report,
+        which do fail loudly on the same value.
+        """
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "Mars/Olympus_Mons", raising=False)
+        assert resolve_comment_timezone() == UTC
+
+
+class TestCommentTimestamp:
+    def test_renders_utc_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        moment = datetime(2026, 8, 19, 7, 21, tzinfo=UTC)
+        assert comment_timestamp(moment) == "2026-08-19 07:21 UTC"
+
+    def test_converts_the_instant_into_the_configured_zone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same instant, rendered where the operator actually is."""
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/Detroit", raising=False)
+        moment = datetime(2026, 8, 19, 7, 21, tzinfo=UTC)
+        assert comment_timestamp(moment) == "2026-08-19 03:21 EDT"
+
+    def test_abbreviation_follows_daylight_saving(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The zone token is read from the moment, so it is not frozen at EDT."""
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/Detroit", raising=False)
+        winter = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+        assert comment_timestamp(winter) == "2026-01-15 07:00 EST"
+
+    def test_a_naive_moment_is_treated_as_utc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every caller passes an aware UTC instant; a naive one must not shift silently."""
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        naive = datetime.fromisoformat("2026-08-19 07:21")
+        assert naive.tzinfo is None
+        assert comment_timestamp(naive) == "2026-08-19 07:21 UTC"
+
+    def test_defaults_to_now_when_no_moment_is_given(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        rendered = comment_timestamp()
+        assert rendered.endswith(" UTC")
+        # Same minute as a UTC "now", proving it is the real clock, not a constant.
+        assert rendered.startswith(datetime.now(tz=UTC).strftime("%Y-%m-%d %H:"))
+
+    def test_rendered_shape_is_parseable_by_the_audit_reader(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The in-progress duration helper reads this exact shape back."""
+        from devbench.cli import _AUDIT_PROGRESS_RE
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/Detroit", raising=False)
+        stamp = comment_timestamp(datetime(2026, 8, 19, 7, 21, tzinfo=UTC))
+        line = f"[{stamp}] [agent/orchestrator] Set E1-F1-S1-T1 to 'in-progress'"
+        match = _AUDIT_PROGRESS_RE.search(line)
+        assert match is not None
+        assert match.group("id") == "E1-F1-S1-T1"
+        assert match.group("zone") == "EDT"
+
+
+class TestEveryCommentWriterHonoursTheZone:
+    """Regression: the first fix migrated only the sites using the format constant.
+
+    Eight further writers inlined the literal ``"%Y-%m-%d %H:%M UTC"`` format
+    string instead, so a configured workspace still got UTC from them --
+    including ``_append_agent_comment``, which writes the ``[WU_CLAIMED]`` line
+    on every single claim. A grep for the constant found none of them.
+    """
+
+    def test_no_writer_inlines_a_literal_utc_format(self) -> None:
+        """The literal format string must exist nowhere in the package."""
+        import devbench
+
+        package_root = Path(devbench.__file__).resolve().parent
+        offenders = [
+            f"{path.relative_to(package_root)}:{n}"
+            for path in package_root.rglob("*.py")
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if 'strftime("%Y-%m-%d %H:%M UTC")' in line
+        ]
+        assert offenders == [], (
+            "these writers bypass comment_timestamp() and would emit UTC in a "
+            f"workspace that configures display_timezone: {offenders}"
+        )
+
+    def test_no_parser_assumes_a_literal_utc_stamp(self) -> None:
+        """A parser pinned to UTC goes blind exactly where the writer is configured."""
+        import devbench
+
+        package_root = Path(devbench.__file__).resolve().parent
+        offenders = [
+            f"{path.relative_to(package_root)}:{n}"
+            for path in package_root.rglob("*.py")
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if "strptime(" in line and "%Y-%m-%d %H:%M UTC" in line
+        ]
+        assert offenders == [], f"these parsers cannot read a zoned comment: {offenders}"
+
+    def test_append_agent_comment_uses_the_configured_zone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The writer behind [WU_CLAIMED], which leaked UTC in the first pass."""
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/Detroit", raising=False)
+        wu = tmp_path / "E1-F1-S1-T1.md"
+        wu.write_text("# E1-F1-S1-T1: T\n\n## Status: in-queue\n\n## Comments\n", encoding="utf-8")
+
+        BacklogManager()._append_agent_comment(wu, "orchestrator", "[WU_CLAIMED] Set E1-F1-S1-T1")
+
+        written = wu.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED]" in written
+        assert " UTC]" not in written, f"comment still stamped UTC: {written!r}"
+
+    def test_append_agent_comment_still_writes_utc_when_unconfigured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset config must stay byte-identical to the historical behaviour."""
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        wu = tmp_path / "E1-F1-S1-T1.md"
+        wu.write_text("# E1-F1-S1-T1: T\n\n## Status: in-queue\n\n## Comments\n", encoding="utf-8")
+
+        BacklogManager()._append_agent_comment(wu, "orchestrator", "[WU_CLAIMED] Set E1-F1-S1-T1")
+
+        assert " UTC] [agent/orchestrator] [WU_CLAIMED]" in wu.read_text(encoding="utf-8")
+
+
+class TestTddTimestamp:
+    """TDD Cycle Log entries are read by people too, so they follow the same zone.
+
+    Unlike the comment header, this one keeps a full ISO-8601 representation
+    with a numeric offset. That is what makes zoning it safe without touching a
+    single reader: an offset is unambiguous where a bare abbreviation is not,
+    and both TDD entry regexes match the timestamp as an opaque ``\\S+`` token.
+    """
+
+    def test_renders_utc_offset_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        moment = datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC)
+        assert tdd_timestamp(moment) == "2026-08-19T13:35:46.686344+00:00"
+
+    def test_converts_the_instant_into_the_configured_zone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        moment = datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC)
+        assert tdd_timestamp(moment) == "2026-08-19T09:35:46.686344-04:00"
+
+    def test_the_offset_keeps_the_instant_recoverable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Zoning must not lose information: the rendered text round-trips."""
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        moment = datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC)
+        assert datetime.fromisoformat(tdd_timestamp(moment)) == moment
+
+    def test_offset_follows_daylight_saving(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        winter = datetime(2026, 1, 15, 13, 0, tzinfo=UTC)
+        assert tdd_timestamp(winter).endswith("-05:00")
+
+    def test_a_naive_moment_is_treated_as_utc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        naive = datetime.fromisoformat("2026-08-19 13:35:46")
+        assert tdd_timestamp(naive) == "2026-08-19T13:35:46+00:00"
+
+    def test_rendered_token_still_matches_the_tdd_entry_regexes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both readers match the timestamp as an opaque token; prove it stays opaque."""
+        from devbench.constants import RED_OBSERVED_ENTRY_LINE_RE
+        from devbench.tdd_gate import _RED_ENTRY_LINE_RE
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        stamp = tdd_timestamp(datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC))
+        assert _RED_ENTRY_LINE_RE.search(f"- [RED] {stamp} -- failing test observed") is not None
+        assert RED_OBSERVED_ENTRY_LINE_RE.search(f"- [RED_OBSERVED] {stamp} -- node id") is not None
+
+    def test_append_tdd_entry_uses_the_configured_zone(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        wu = tmp_path / "E1-F1-S1-T1.md"
+        wu.write_text(
+            "# E1-F1-S1-T1: T\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._append_tdd_entry(wu, "RED", "failing test observed")
+
+        entry = next(l for l in wu.read_text(encoding="utf-8").splitlines() if "[RED]" in l)
+        assert "+00:00" not in entry, f"TDD entry still stamped UTC: {entry!r}"
+        assert "-04:00" in entry or "-05:00" in entry
+
+    def test_no_tdd_writer_hardcodes_a_utc_isoformat(self) -> None:
+        """Guard: the TDD writer bypassed the earlier sweep by using isoformat()."""
+        import devbench
+
+        package_root = Path(devbench.__file__).resolve().parent
+        manager = package_root / "backlog" / "manager.py"
+        offenders = [
+            n
+            for n, line in enumerate(manager.read_text(encoding="utf-8").splitlines(), 1)
+            if "datetime.now(tz=UTC).isoformat()" in line
+        ]
+        assert offenders == [], f"manager.py:{offenders} writes a UTC-pinned work-unit timestamp"

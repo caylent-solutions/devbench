@@ -16,7 +16,13 @@ import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
-from devbench.reporting.report import HookLogTotals, WindowStats, generate_report, read_all_drain_states
+from devbench.reporting.report import (
+    HookLogTotals,
+    WindowStats,
+    generate_report,
+    read_all_drain_states,
+    review_rejections_line,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -5889,14 +5895,27 @@ class TestReadAllDrainStates:
             read_all_drain_states(tmp_path)
 
 
-def _transport_restart_log_line(attempt: int, cap: int = 5) -> str:
+def _transport_restart_log_line(attempt: int, cap: int = 5, *, timestamp: str | None = None) -> str:
     """Build one raw ``[ORCHESTRATOR_TRANSPORT_RESTART]`` audit line, matching
     the exact literal shape ``cli.py``'s ``_should_restart_after_transport_error``
-    logs via ``logger.info("%s attempt=%d max=%d", ...)`` under the
+    logs via ``logger.info("%s attempt=%d max=%d backoff=%.1fs", ...)`` under the
     ``"%(asctime)s [%(name)s] %(levelname)s %(message)s"`` formatter
-    (``LOG_FORMAT`` / ``LOG_DATE_FORMAT`` in ``devbench.constants``)."""
+    (``LOG_FORMAT`` / ``LOG_DATE_FORMAT`` in ``devbench.constants``).
+
+    ``timestamp`` overrides the default so window-scoping tests can place
+    restarts on either side of a boundary. Emitted WITHOUT the ``backoff=``
+    suffix so the historical (pre-backoff) log shape stays covered; the
+    suffixed shape has its own test below.
+    """
+    stamp = timestamp if timestamp is not None else f"2026-08-12T18:38:0{attempt}Z"
+    return f"{stamp} [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] attempt={attempt} max={cap}"
+
+
+def _transport_restart_log_line_with_backoff(attempt: int, cap: int, backoff: float, timestamp: str) -> str:
+    """The post-backoff line shape cli.py emits once transport restarts are paced."""
     return (
-        f"2026-08-12T18:38:0{attempt}Z [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] attempt={attempt} max={cap}"
+        f"{timestamp} [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] "
+        f"attempt={attempt} max={cap} backoff={backoff:.1f}s"
     )
 
 
@@ -5904,7 +5923,9 @@ class TestTransportRestartsLine:
     """Tests for ``transport_restarts_line()`` (#331 FR-4, AC-11).
 
     A standalone row-rendering function that returns ``None`` when there is
-    nothing to say.
+    nothing to say. Every count it renders is labelled with the window it
+    measures, so the row cannot be misread as belonging to the narrowest
+    column of the table it sits above.
     """
 
     def test_returns_none_when_log_missing(self, tmp_path: Path) -> None:
@@ -5927,7 +5948,9 @@ class TestTransportRestartsLine:
 
         assert transport_restarts_line(log_file) is None
 
-    def test_renders_row_for_single_restart(self, tmp_path: Path) -> None:
+    def test_renders_labelled_all_time_count_for_single_restart(self, tmp_path: Path) -> None:
+        """With no window boundaries supplied the row still names its window,
+        so a bare number can never be mistaken for a run-scoped count."""
         from devbench.reporting.report import transport_restarts_line
 
         log_file = tmp_path / "test.log"
@@ -5935,10 +5958,10 @@ class TestTransportRestartsLine:
 
         line = transport_restarts_line(log_file)
 
-        assert line == "Transport restarts        1"
+        assert line == "Transport restarts        1 all-time"
 
     @pytest.mark.parametrize("restart_count", [2, 3, 5])
-    def test_renders_row_for_multiple_restarts(self, tmp_path: Path, restart_count: int) -> None:
+    def test_renders_labelled_all_time_count_for_multiple_restarts(self, tmp_path: Path, restart_count: int) -> None:
         from devbench.reporting.report import transport_restarts_line
 
         log_file = tmp_path / "test.log"
@@ -5948,7 +5971,95 @@ class TestTransportRestartsLine:
 
         line = transport_restarts_line(log_file)
 
-        assert line == f"Transport restarts        {restart_count}"
+        assert line == f"Transport restarts        {restart_count} all-time"
+
+    def test_counts_lines_carrying_the_backoff_suffix(self, tmp_path: Path) -> None:
+        """The paced line shape cli.py emits once backoff is applied must count
+        exactly like the historical unsuffixed shape."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 10, 1.0, "2026-08-12T18:38:01Z"),
+                    _transport_restart_log_line_with_backoff(2, 10, 2.0, "2026-08-12T18:38:03Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_mixed_historical_and_paced_lines_are_both_counted(self, tmp_path: Path) -> None:
+        """A log spanning the change must not silently drop its older half --
+        the regression the optional ``backoff=`` suffix exists to prevent."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T18:38:01Z"),
+                    _transport_restart_log_line_with_backoff(2, 10, 2.0, "2026-08-12T18:38:05Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_session_window_excludes_restarts_before_the_session_started(self, tmp_path: Path) -> None:
+        """The defect this row's labelling fixes: an old restart storm must not
+        be attributed to the current session."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    _transport_restart_log_line(2, timestamp="2026-08-12T02:00:00Z"),
+                    _transport_restart_log_line(3, timestamp="2026-08-12T10:00:00Z"),
+                ]
+            )
+        )
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        3 all-time / 1 session"
+
+    def test_session_window_counts_a_restart_exactly_on_the_boundary(self, tmp_path: Path) -> None:
+        """The window is inclusive of its start instant."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([_transport_restart_log_line(1, timestamp="2026-08-12T09:00:00Z")]))
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        1 all-time / 1 session"
+
+    def test_renders_all_three_windows_in_watch_mode(self, tmp_path: Path) -> None:
+        """A healthy current run beside an old storm: the whole point of the row."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    _transport_restart_log_line(2, timestamp="2026-08-12T01:00:05Z"),
+                    _transport_restart_log_line(3, timestamp="2026-08-12T09:30:00Z"),
+                ]
+            )
+        )
+
+        line = transport_restarts_line(
+            log_file,
+            session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC),
+            report_started_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+        )
+
+        assert line == "Transport restarts        3 all-time / 1 session / 0 this run"
 
     def test_ignores_marker_text_echoed_mid_line(self, tmp_path: Path) -> None:
         """A restart marker quoted inside an unrelated SDK payload line (not
@@ -5973,20 +6084,155 @@ class TestTransportRestartsLine:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         """Task-specific error path: a negative count is impossible by
-        construction (``_count_transport_restarts`` is a match-list length,
-        which the ``len`` builtin itself guarantees is never negative) and is
+        construction (``_count_transport_restarts_since`` returns either a
+        ``len`` or a ``sum`` of ones, neither of which can be negative) and is
         documented by an assertion at the rendering boundary rather than a
-        defensive clamp. ``_count_transport_restarts`` is monkeypatched
-        (a legitimate, mockable seam) rather than trying to coerce ``len``
-        itself to return a negative number, which the interpreter refuses."""
+        defensive clamp. The counter is monkeypatched (a legitimate, mockable
+        seam) rather than trying to coerce ``len`` itself to return a negative
+        number, which the interpreter refuses."""
         from devbench.reporting import report as report_module
 
         log_file = tmp_path / "test.log"
         log_file.write_text(_make_log(["irrelevant"]))
-        monkeypatch.setattr(report_module, "_count_transport_restarts", lambda log_text: -1)
+        monkeypatch.setattr(report_module, "_count_transport_restarts_since", lambda timestamps, start: -1)
 
         with pytest.raises(AssertionError, match="negative"):
             report_module.transport_restarts_line(log_file)
+
+
+class TestTransportRestartDeduplication:
+    """The orchestrator log emits every record twice (~1.93x measured across
+    five days of one workspace's log), so raw match counting reported roughly
+    double the real restarts. That is read against a cap, so an inflated count
+    misleads about how close a run is to halting."""
+
+    def test_byte_identical_duplicate_emission_counts_once(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        line = _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([line, line]))  # the doubling the orchestrator actually produces
+
+        assert transport_restarts_line(log_file) == "Transport restarts        1 all-time"
+
+    def test_the_real_world_doubling_pattern_is_halved(self, tmp_path: Path) -> None:
+        """Reproduces the observed shape: each restart written twice, in order."""
+        from devbench.reporting.report import transport_restarts_line
+
+        entries = []
+        for attempt, stamp in ((1, "2026-08-18T17:41:28Z"), (2, "2026-08-18T17:44:49Z")):
+            line = _transport_restart_log_line_with_backoff(attempt, 14, float(2 ** (attempt - 1)), stamp)
+            entries.extend([line, line])
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(entries))
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_distinct_restarts_sharing_a_second_are_both_counted(self, tmp_path: Path) -> None:
+        """De-duplication keys on the WHOLE record, not the timestamp: two
+        restarts in the same second with different ordinals are two restarts."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z"),
+                    _transport_restart_log_line_with_backoff(2, 14, 2.0, "2026-08-18T17:41:28Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_same_ordinal_in_a_later_second_is_a_separate_restart(self, tmp_path: Path) -> None:
+        """A fresh run restarts at attempt=1 again; a different timestamp keeps
+        it distinct, so a long-lived log does not collapse runs together."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z"),
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-19T03:10:00Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_dedup_applies_within_each_window_not_just_all_time(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        dupe = _transport_restart_log_line_with_backoff(3, 14, 4.0, "2026-08-18T18:00:00Z")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T01:00:00Z"),
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T01:00:00Z"),
+                    dupe,
+                    dupe,
+                ]
+            )
+        )
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 18, 12, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        2 all-time / 1 session"
+
+
+class TestCountTransportRestartsSince:
+    """Direct unit tests for the pure windowing function, independent of file I/O."""
+
+    @pytest.mark.parametrize(
+        ("start", "expected"),
+        [
+            (None, 3),
+            (datetime(2026, 8, 12, 0, 0, tzinfo=UTC), 3),
+            (datetime(2026, 8, 12, 2, 0, tzinfo=UTC), 2),
+            (datetime(2026, 8, 12, 10, 0, tzinfo=UTC), 0),
+        ],
+    )
+    def test_counts_only_timestamps_at_or_after_start(self, start: datetime | None, expected: int) -> None:
+        from devbench.reporting.report import _count_transport_restarts_since
+
+        stamps = [
+            datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 3, 0, tzinfo=UTC),
+        ]
+
+        assert _count_transport_restarts_since(stamps, start) == expected
+
+    def test_empty_timestamps_count_zero(self) -> None:
+        from devbench.reporting.report import _count_transport_restarts_since
+
+        assert _count_transport_restarts_since([], datetime(2026, 8, 12, tzinfo=UTC)) == 0
+
+
+class TestTransportRestartTimestamps:
+    """The streaming reader that replaced a whole-file ``read_text()``."""
+
+    def test_returns_timestamps_in_file_order_as_utc(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _transport_restart_timestamps
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    "2026-08-12T01:30:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    _transport_restart_log_line(2, timestamp="2026-08-12T02:00:00Z"),
+                ]
+            )
+        )
+
+        assert _transport_restart_timestamps(log_file) == [
+            datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+        ]
 
 
 class TestGenerateReportTransportRestartsRow:
@@ -6006,6 +6252,8 @@ class TestGenerateReportTransportRestartsRow:
         return log_file
 
     def test_row_renders_when_restarts_present(self, tmp_path: Path) -> None:
+        """Non-watch mode: All-time and Session are rendered (the table shows
+        both), This run is not (there is no watch loop to scope it to)."""
         restarts = [_transport_restart_log_line(1), _transport_restart_log_line(2)]
         log_file = self._write_log(tmp_path, extra_entries=restarts)
 
@@ -6013,8 +6261,27 @@ class TestGenerateReportTransportRestartsRow:
         report_lines = report.split("\n")
 
         # The transport-restarts row is the first line after the banner.
-        assert report_lines[1] == "Transport restarts        2"
+        assert report_lines[1] == "Transport restarts        2 all-time / 2 session"
         assert report_lines[2] == ""
+
+    def test_row_scopes_each_window_independently_in_watch_mode(self, tmp_path: Path) -> None:
+        """The reported defect: restarts that predate the current watch loop
+        must render as 0 for This run rather than inflating it, so a stale
+        storm can no longer read as an in-progress failure."""
+        restarts = [
+            _transport_restart_log_line(1, timestamp="2026-03-05T09:00:00Z"),
+            _transport_restart_log_line(2, timestamp="2026-03-05T09:00:05Z"),
+        ]
+        log_file = self._write_log(tmp_path, extra_entries=restarts)
+
+        report = generate_report(
+            log_path=log_file,
+            report_started_at=datetime(2026, 3, 5, 11, 0, tzinfo=UTC),
+        )
+        report_lines = report.split("\n")
+
+        assert report_lines[1].startswith("Transport restarts        2 all-time")
+        assert report_lines[1].endswith("0 this run")
 
     def test_row_omitted_when_no_restarts_byte_identical(self, tmp_path: Path) -> None:
         """Spec D-6 / AC-11: a clean run (zero restarts) renders nothing for
@@ -6149,3 +6416,142 @@ class TestReportWaiverCount:
         ]
 
         assert _gate_waiver_counts(tasks) == (1, 1)
+
+
+class TestReviewRejectionsLine:
+    """Tests for ``review_rejections_line()`` -- making a review stall visible.
+
+    A task can burn hours and a large token budget looping through review
+    rejections while every health signal reads green: process alive, log
+    advancing, zero errors logged. This row is what distinguishes that from
+    steady progress.
+    """
+
+    def _unit(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        status: WorkUnitStatus,
+        verdicts: str = "",
+    ) -> WorkUnit:
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}\n\n## Comments\n\n{verdicts}", encoding="utf-8")
+        return WorkUnit(
+            id=unit_id,
+            title="Sample",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/example",
+            dependencies=[],
+        )
+
+    def _fail_rows(self, judge: str, count: int) -> str:
+        return "".join(
+            f"[2026-08-15 0{i}:00 UTC] [judge/{judge}] [REVIEW_FAIL] round {i}\n\n" for i in range(1, count + 1)
+        )
+
+    def test_returns_none_when_no_units(self) -> None:
+        assert review_rejections_line([], lambda _judge: 10) is None
+
+    def test_returns_none_when_no_rejections(self, tmp_path: Path) -> None:
+        """The clean-run contract: no row when there is nothing to say."""
+        units = [self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS)]
+        assert review_rejections_line(units, lambda _judge: 10) is None
+
+    def test_reports_count_and_budget(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 3),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "E0-F1-S1-T1" in row
+        assert "doc_review 3/10" in row
+
+    def test_reports_only_the_judges_that_failed(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 2) + self._fail_rows("code_review", 1),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 5)
+        assert row is not None
+        assert "doc_review 2/5" in row
+        assert "code_review 1/5" in row
+        assert "test_review" not in row
+
+    def test_per_judge_budget_is_reflected(self, tmp_path: Path) -> None:
+        """The denominator comes from the resolver, so it tracks per-judge config."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 1),
+            )
+        ]
+        row = review_rejections_line(units, lambda judge: 2 if judge == "doc_review" else 99)
+        assert row is not None
+        assert "doc_review 1/2" in row
+
+    def test_done_units_are_ignored(self, tmp_path: Path) -> None:
+        """A completed task's rejection history is not actionable."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.DONE,
+                self._fail_rows("doc_review", 4),
+            )
+        ]
+        assert review_rejections_line(units, lambda _judge: 10) is None
+
+    def test_blocked_units_are_reported(self, tmp_path: Path) -> None:
+        """A blocked task with a spent budget is exactly what an operator must see."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.BLOCKED,
+                self._fail_rows("doc_review", 10),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "doc_review 10/10" in row
+
+    def test_multiple_units_are_all_listed(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS, self._fail_rows("doc_review", 1)),
+            self._unit(tmp_path, "E0-F1-S1-T2", WorkUnitStatus.BLOCKED, self._fail_rows("code_review", 2)),
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "E0-F1-S1-T1" in row
+        assert "E0-F1-S1-T2" in row
+
+    def test_unreadable_work_unit_does_not_break_the_report(self, tmp_path: Path) -> None:
+        """A missing file is surfaced by the checks that need it, not by killing the report."""
+        unit = self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS, self._fail_rows("doc_review", 1))
+        unit.file_path.unlink()
+        assert review_rejections_line([unit], lambda _judge: 10) is None
+
+    def test_non_canonical_judge_is_not_counted(self, tmp_path: Path) -> None:
+        """``manifest_amender`` writes audit-only verdicts and owns no review budget."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("manifest_amender", 3),
+            )
+        ]
+        assert review_rejections_line(units, lambda _judge: 10) is None

@@ -316,6 +316,15 @@ class GitOpsConfig:
             ``[AUTO_MERGE_SKIPPED] no_ci_watcher`` and skips. A marker
             file at ``<workspace>/.devbench/auto-merge-fired-<repo>.marker``
             prevents duplicate invocations. Defaults to ``False``.
+        isolate_worktrees: When ``True``, each work unit is claimed into its
+            own git worktree beside the primary checkout instead of sharing
+            one working tree. Two units that never share a tree never
+            collide, so an interrupted unit's uncommitted work is not
+            something the next claim has to displace. Mutually exclusive with
+            ``single_branch``: git allows a branch to be checked out in
+            exactly one worktree at a time, while single-branch mode exists
+            to land every unit on one shared branch, so the two models cannot
+            both hold (validated at config load). Defaults to ``False``.
         branch_prefix: Top-level task-branch prefix, overridden per-repo by
             ``RepoConfig.branch_prefix``.  When set, task branches are named
             ``backlog/<prefix>/<unit-id-lower>`` instead of
@@ -352,6 +361,7 @@ class GitOpsConfig:
     auto_merge: bool = False
     branch_prefix: str | None = None
     provenance_path: str | None = None
+    isolate_worktrees: bool = False
 
 
 @dataclass
@@ -447,9 +457,21 @@ class ValidateConfig:
             treated as a declared read-only reference and skipped. Catches
             spec drift where AC/DoD prose restates a path that disagrees
             with the Manifest. Default ``True`` (set ``false`` to opt out).
+        production_source_paths: Path prefixes this workspace treats as
+            production source for the task-type invariant (rule 21) and the
+            source-test atomicity rule (rule 14). ``None`` (the default)
+            preserves the built-in prefixes ``src/`` and ``infra/scripts/``
+            plus any nested ``/src/`` segment. Set this when a repository
+            keeps tested production modules somewhere else -- for example a
+            monorepo whose control-plane and per-service renderers live in
+            ``scripts/`` -- otherwise a genuine behaviour fix in that tree
+            cannot satisfy the invariant and cannot be authored at all.
+            Test paths and ``__init__.py`` are excluded regardless.
     """
 
     check_orphan_path_tokens: bool = True
+    production_source_paths: tuple[str, ...] | None = None
+    production_source_extensions: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -589,13 +611,18 @@ class AmendmentConfig:
             "doc_sync_review_fix"}`` (db-327 Leg A1).
         max_requests_per_execution: Upper bound on amendments applied to a
             single task during one executor run; prevents amendment loops.
+            Default 2 rather than 1 because a unit correcting its Changes
+            Manifest in both directions -- adding a file review demanded and
+            dropping a row that went stale -- needs two amendments to comply
+            with ``AC-FINAL-015``, and a limit of 1 made that combination
+            impossible to satisfy.
     """
 
     enabled: bool = True
     allowed_reasons: frozenset[str] = field(
         default_factory=lambda: frozenset({"tdd_green_production_fix", "doc_sync_review_fix"})
     )
-    max_requests_per_execution: int = 1
+    max_requests_per_execution: int = 2
 
 
 # The eight integration-reality gates (spec 4.1; caylent-solutions/devbench-internal-backlog#10..#17).
@@ -837,12 +864,36 @@ class OrchestrateConfig:
     task transitions to ``NEEDS_OPERATOR_ATTENTION`` instead of
     materialising another recovery layer.
 
-    Field is ``None`` when absent from YAML; ``config.py`` resolves
-    env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``
-    constant.
+    ``max_transport_restarts`` bounds consecutive in-process restarts after
+    an SDK transport error, and the two ``transport_restart_backoff_*``
+    fields shape the exponential delay between those restarts
+    (delay = ``base * 2 ** restarts_used``, clamped to ``max``). Transport
+    faults impose no natural delay of their own, so without this envelope a
+    persistently failing transport exhausts its whole restart budget in
+    seconds; see ``DEFAULT_MAX_TRANSPORT_RESTARTS`` in ``constants.py``.
+
+    ``effort`` sets the reasoning effort of the orchestrator SDK session, and
+    ``max_thinking_tokens`` bounds how much one turn may reason. Unset, the
+    session inherits the ambient Claude Code effort, which is how an
+    unattended run silently lands on ``xhigh``. That matters beyond cost: a
+    turn that reasons for longer than the prompt-cache lifetime comes back to
+    a cold cache and re-uploads the entire prompt, so token burn per turn
+    climbs sharply and the run reaches its quota limit sooner. Bounding the
+    thinking budget keeps a turn inside the cache window.
+
+    Every field is ``None`` when absent from YAML; ``config.py`` resolves
+    env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``,
+    ``MAX_TRANSPORT_RESTARTS``, ``TRANSPORT_RESTART_BACKOFF_BASE_SECONDS``,
+    ``TRANSPORT_RESTART_BACKOFF_MAX_SECONDS``, ``ORCHESTRATE_EFFORT`` and
+    ``ORCHESTRATE_MAX_THINKING_TOKENS`` constants.
     """
 
     max_cascade_depth: int | None = None
+    max_transport_restarts: int | None = None
+    transport_restart_backoff_base_seconds: float | None = None
+    transport_restart_backoff_max_seconds: float | None = None
+    effort: str | None = None
+    max_thinking_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -2144,8 +2195,12 @@ class RuntimeConfig:
         max_executor_retries: Maximum executor retry attempts per work unit
             when judge reviews fail.
         display_timezone: IANA timezone name applied by every devbench
-            command that renders timestamps (report, hook-tail, watch).
-            ``None`` means OS local timezone. Per-command overrides
+            command that renders timestamps (report, hook-tail, watch) and
+            by work-unit audit comments. ``None`` means OS local timezone
+            for the terminal-rendering commands, and UTC for work-unit
+            comments -- those are committed and read on other machines, so
+            following the runner's local zone would make one file's
+            timestamps depend on who wrote each line. Per-command overrides
             (env vars, CLI flags, or the legacy ``report.display_timezone``)
             take precedence over this top-level setting.
         log_file: Workspace-relative path to the orchestrator's
@@ -2409,6 +2464,73 @@ def _schema_error_message(path: Path, exc: jsonschema.ValidationError) -> str:
     return f"Config file '{path}' failed schema validation: {detail}"
 
 
+def _parse_production_source_paths(path: Path, validate_raw: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Parse ``validate.production_source_paths`` into a tuple, or ``None`` when absent.
+
+    ``None`` means "use the built-in prefixes", so a workspace that never declares
+    the key sees no behaviour change. A declared list REPLACES the built-ins: the
+    workspace is stating authoritatively where its production source lives.
+
+    Args:
+        path: Config file path, used only for error messages.
+        validate_raw: The raw ``validate`` mapping from the YAML.
+
+    Returns:
+        The declared prefixes as a tuple, or ``None`` when the key is absent.
+
+    Raises:
+        ValueError: When the value is not a list of non-empty strings.
+    """
+    raw = validate_raw.get("production_source_paths")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(
+            f"{path}: validate.production_source_paths must be a list of path-prefix strings "
+            f"(for example ['scripts/', 'tools/']), got {raw!r}."
+        )
+    stripped = [x.strip() for x in raw]
+    if any(not x for x in stripped):
+        raise ValueError(f"{path}: validate.production_source_paths must not contain an empty entry.")
+    return tuple(stripped)
+
+
+def _parse_production_source_extensions(path: Path, validate_raw: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Parse ``validate.production_source_extensions``, or ``None`` when absent.
+
+    ``None`` keeps the built-in Python-only behaviour. A declared list REPLACES it, so an
+    infrastructure repository whose behaviour lives in YAML specs, HCL modules or dashboard
+    JSON can have those changes recognised as production source and therefore RED-gated.
+
+    Args:
+        path: Config file path, used only for error messages.
+        validate_raw: The raw ``validate`` mapping from the YAML.
+
+    Each entry is a case-insensitive FILENAME SUFFIX, not strictly an extension, so an
+    extensionless source file can be declared too: ``.py`` matches ``a/b.py`` and
+    ``Makefile`` matches both ``Makefile`` and ``providers/x/Makefile``. No dot is
+    inferred, because inferring one would make an extensionless entry unmatchable.
+
+    Returns:
+        The declared suffixes, lowercased, or ``None`` when the key is absent.
+
+    Raises:
+        ValueError: When the value is not a list of non-empty strings.
+    """
+    raw = validate_raw.get("production_source_extensions")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(
+            f"{path}: validate.production_source_extensions must be a list of filename-suffix "
+            f"strings (for example ['.py', '.yml', 'Makefile']), got {raw!r}."
+        )
+    cleaned = [x.strip().lower() for x in raw]
+    if any(not x for x in cleaned):
+        raise ValueError(f"{path}: validate.production_source_extensions must not contain an empty entry.")
+    return tuple(cleaned)
+
+
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
 
@@ -2524,6 +2646,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     _validate_auto_finalize_auto_merge(path, defer_pr, local_only, auto_finalize, auto_merge)
     branch_prefix_raw = _parse_branch_prefix(path, "git_ops.branch_prefix", git_ops_raw.get("branch_prefix"))
     provenance_path_raw = git_ops_raw.get("provenance_path") or None
+    isolate_worktrees = bool(git_ops_raw.get("isolate_worktrees", False))
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
@@ -2538,7 +2661,17 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         auto_merge=auto_merge,
         branch_prefix=branch_prefix_raw,
         provenance_path=provenance_path_raw,
+        isolate_worktrees=isolate_worktrees,
     )
+    if isolate_worktrees and single_branch_raw:
+        raise ValueError(
+            f"Config file '{path}': git_ops.isolate_worktrees: true is mutually exclusive with "
+            f"git_ops.single_branch: {single_branch_raw!r}. git allows a branch to be checked out in "
+            "exactly one worktree at a time, while single_branch exists to land every unit on one "
+            "shared branch, so the two cannot both hold. Single-branch workspaces get their "
+            "interrupted-work durability from checkpointing and quarantine restore instead; drop one "
+            "of the two keys."
+        )
     if local_only:
         missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]
         if missing_default_branch:
@@ -2636,6 +2769,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         check_orphan_path_tokens=bool(
             validate_raw.get("check_orphan_path_tokens", default_validate.check_orphan_path_tokens)
         ),
+        production_source_paths=_parse_production_source_paths(path, validate_raw),
+        production_source_extensions=_parse_production_source_extensions(path, validate_raw),
     )
 
     # Populate GatesConfig from YAML gates block (spec 4.1; D-2, D-15, D-17).
@@ -2681,6 +2816,23 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     orchestrate = OrchestrateConfig(
         max_cascade_depth=(
             int(orchestrate_raw["max_cascade_depth"]) if "max_cascade_depth" in orchestrate_raw else None
+        ),
+        max_transport_restarts=(
+            int(orchestrate_raw["max_transport_restarts"]) if "max_transport_restarts" in orchestrate_raw else None
+        ),
+        transport_restart_backoff_base_seconds=(
+            float(orchestrate_raw["transport_restart_backoff_base_seconds"])
+            if "transport_restart_backoff_base_seconds" in orchestrate_raw
+            else None
+        ),
+        transport_restart_backoff_max_seconds=(
+            float(orchestrate_raw["transport_restart_backoff_max_seconds"])
+            if "transport_restart_backoff_max_seconds" in orchestrate_raw
+            else None
+        ),
+        effort=(str(orchestrate_raw["effort"]) if "effort" in orchestrate_raw else None),
+        max_thinking_tokens=(
+            int(orchestrate_raw["max_thinking_tokens"]) if "max_thinking_tokens" in orchestrate_raw else None
         ),
     )
 

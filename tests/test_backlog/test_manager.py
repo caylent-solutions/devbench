@@ -15,7 +15,7 @@ from test_tdd_gate import (
     write_scratch_file,
 )
 
-from devbench.backlog.manager import BacklogManager
+from devbench.backlog.manager import BacklogManager, count_review_fails_for_judge
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import (
@@ -746,6 +746,47 @@ class TestLogToTraceabilityMatrix:
         assert "AC-02" in content
         lines = [line for line in content.strip().splitlines() if line.startswith("|")]
         assert len(lines) >= 4
+
+
+class TestCountReviewFailsForJudge:
+    """Issue #122: the audit trail is the rejection-round counter."""
+
+    def test_counts_only_the_named_judge(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 02:00 UTC] [judge/code_review] [REVIEW_FAIL] b\n"
+            "[2026-08-15 03:00 UTC] [judge/doc_review] [REVIEW_FAIL] c\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 2
+        assert count_review_fails_for_judge(content, "code_review") == 1
+
+    def test_passes_are_not_counted(self) -> None:
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 02:00 UTC] [judge/doc_review] [REVIEW_PASS] b\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 1
+
+    def test_counts_across_round_boundaries(self) -> None:
+        """The budget bounds TOTAL rounds, so a REVIEW_REJECTED boundary must not reset it."""
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 01:30 UTC] [orchestrator] [REVIEW_REJECTED] round 1 rejected\n"
+            "[2026-08-15 02:00 UTC] [judge/doc_review] [REVIEW_FAIL] b\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 2
+
+    def test_judge_name_quoted_in_prose_does_not_inflate_count(self) -> None:
+        """A judge name inside another judge's feedback text is not a verdict row."""
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/code_review] [REVIEW_FAIL] "
+            "deferring to judge/doc_review on the CHANGELOG wording\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 0
+
+    def test_empty_content_is_zero(self) -> None:
+        assert count_review_fails_for_judge("", "doc_review") == 0
 
 
 class TestLastRoundAllPassed:
@@ -3878,6 +3919,67 @@ class TestIsProductionSource:
         # Random top-level .py is not classified as production source
         assert BacklogManager._is_production_source("setup.py") is False
 
+    def test_workspace_configured_prefix_is_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A workspace whose production code lives outside src/ declares its own prefixes,
+        so the task-type invariant recognises them. Without this, a repo that keeps tested
+        production modules in (for example) scripts/ cannot author a behavior-fix task."""
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/", "tools/"))
+        )
+        assert BacklogManager._is_production_source("scripts/observability.py") is True
+        assert BacklogManager._is_production_source("tools/audit_style.py") is True
+
+    def test_workspace_configured_prefix_still_excludes_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Configuring extra prefixes never reclassifies a test file or package marker."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
+        assert BacklogManager._is_production_source("scripts/tests/test_thing.py") is False
+        assert BacklogManager._is_production_source("scripts/__init__.py") is False
+        assert BacklogManager._is_production_source("scripts/notes.md") is False
+
+    def test_configured_prefixes_replace_builtins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Declaring prefixes is authoritative: the workspace states where its production
+        source lives, so an undeclared tree is not silently still counted."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
+        assert BacklogManager._is_production_source("src/foo/bar.py") is False
+
+    def test_configured_extensions_widen_production_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An infrastructure repo whose behaviour lives in YAML specs, HCL modules and
+        dashboard JSON can declare those extensions as production source. Without this,
+        rule 21 forces every such change to be typed `chore`, which drops the RED gate
+        that behavior-fix and feature exist to enforce."""
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/", "providers/"))
+        )
+        monkeypatch.setattr(
+            BacklogManager,
+            "_configured_production_source_extensions",
+            staticmethod(lambda: (".py", ".yml", ".yaml", ".tf", ".hcl", ".json")),
+        )
+        assert BacklogManager._is_production_source("servers/hp/k8s/addons/falco/falco.yml") is True
+        assert BacklogManager._is_production_source("providers/aws/references/x/main.tf") is True
+
+    def test_configured_extensions_still_exclude_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Widening extensions never reclassifies a test file as production source."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/",)))
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_extensions", staticmethod(lambda: (".py", ".yml"))
+        )
+        assert BacklogManager._is_production_source("servers/tests/test_thing.yml") is False
+
+    def test_unset_extensions_preserve_python_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Absent, only Python counts, exactly as before."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/",)))
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_extensions", staticmethod(lambda: None))
+        assert BacklogManager._is_production_source("servers/hp/k8s/addons/falco/falco.yml") is False
+        assert BacklogManager._is_production_source("servers/hp/thing.py") is True
+
+    def test_unset_config_preserves_built_in_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the workspace declares nothing, behaviour is exactly as before."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: None))
+        assert BacklogManager._is_production_source("src/foo/bar.py") is True
+        assert BacklogManager._is_production_source("services/api/src/handler.py") is True
+        assert BacklogManager._is_production_source("scripts/observability.py") is False
+
 
 class TestIsRealManifestPath:
     """Direct tests for the placeholder-string filter."""
@@ -6655,12 +6757,21 @@ class TestCheckDepCyclesUnionOfChannels:
         errors = BacklogManager().validate(index, tmp_path)
         assert any("dependency cycle detected" in e for e in errors), errors
 
-    def test_add_dep_x2_makes_validate_report_cycle(self, tmp_path: Path) -> None:
-        """AC-3: `add_dep(T1,T4)` then `add_dep(T4,T1)` makes `validate()`
-        report a cycle end-to-end, because the union reads the
-        `## Dependencies` tables and markers that `add_dep` writes.
+    def test_add_dep_refuses_the_edge_that_would_close_a_cycle(self, tmp_path: Path) -> None:
+        """AC-3: `add_dep(T1,T4)` then `add_dep(T4,T1)` is refused at write time.
+
+        This pair used to be written without complaint, and the resulting cycle
+        surfaced only on the next `validate()` sweep -- by which point nothing
+        in either work-unit file named the edge responsible. `add_dep` now runs
+        the same cycle detector `devbench next` uses against the prospective
+        graph and refuses, naming the chain, while the caller still has the
+        context to pick the other direction.
+
+        `validate()`'s own union-of-channels cycle detection is unchanged and
+        stays covered by the sibling tests in this class, which build the cycle
+        directly in the work-unit files rather than through `add_dep`.
         """
-        from devbench.backlog.proposal import add_dep
+        from devbench.backlog.proposal import ProposalError, add_dep
 
         t1 = _unit_body("E0-F1-S1-T1", "in-queue")
         t4 = _unit_body("E0-F1-S1-T4", "in-queue")
@@ -6675,14 +6786,16 @@ class TestCheckDepCyclesUnionOfChannels:
             blocked_task_id="E0-F1-S1-T1",
             blocker_task_id="E0-F1-S1-T4",
         )
-        add_dep(
-            backlog_root=tmp_path / "backlog",
-            backlog_index=index,
-            blocked_task_id="E0-F1-S1-T4",
-            blocker_task_id="E0-F1-S1-T1",
-        )
+        with pytest.raises(ProposalError, match="cycle"):
+            add_dep(
+                backlog_root=tmp_path / "backlog",
+                backlog_index=index,
+                blocked_task_id="E0-F1-S1-T4",
+                blocker_task_id="E0-F1-S1-T1",
+            )
+        # And the refusal left the graph acyclic rather than half-written.
         errors = BacklogManager().validate(index, tmp_path)
-        assert any("dependency cycle detected" in e for e in errors), errors
+        assert not any("dependency cycle detected" in e for e in errors), errors
 
     def test_terminal_unit_stale_marker_not_a_cycle(self, tmp_path: Path) -> None:
         """AC-4: a done/declined task's stale marker contributes no edge, so

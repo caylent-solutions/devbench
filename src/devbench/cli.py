@@ -8051,6 +8051,7 @@ async def _handle_quota_pause(
                 recovery_probe,
                 timeout_seconds=RECOVERY_PROBE_TIMEOUT_SECONDS,
                 request_size_tokens=RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+                source=exc.source,
             ),
             backoff_config=backoff,
             emit_structured_events=emit_structured_events,

@@ -38,12 +38,14 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from devbench.drain import request_drain
 
@@ -73,12 +75,17 @@ _BEDROCK_THROTTLE_CODES: frozenset[str] = frozenset(
     }
 )
 
-# Regex: matches "resets HH:MMam/pm (UTC)" -- case-insensitive meridiem.
-# Captures: hour (1-12), minute (00-59), meridiem (am/pm/AM/PM).
-# The (UTC) timezone label is required (D-8: no header parsing, CLI text
-# form only); any other label, or a missing label, returns None.
+# Regex: matches "resets HH:MMam/pm (<zone>)" -- case-insensitive meridiem.
+# Captures: hour (1-12), minute (00-59), meridiem (am/pm/AM/PM), zone label.
+#
+# The zone label is whatever the CLI emitted and is resolved dynamically. It
+# was previously pinned to the literal "(UTC)", which silently discarded every
+# real message: Claude Code renders the reset in the operator's own zone, so a
+# genuine "resets 12:50am (America/Detroit)" failed to match and the wait fell
+# back to blind polling with reset_at=None. D-8 still holds -- this parses the
+# CLI text form only, never a header.
 _RESET_AT_RE = re.compile(
-    r"resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(UTC\)",
+    r"resets\s+(\d{1,2}):(\d{2})(am|pm)\s+\(([^)]+)\)",
     re.IGNORECASE,
 )
 
@@ -231,21 +238,45 @@ def _convert_to_24h(raw_hour: int, meridiem: str) -> int:
     return raw_hour if raw_hour == 12 else raw_hour + 12
 
 
+def _resolve_reset_zone(label: str) -> ZoneInfo | None:
+    """Resolve a CLI-emitted timezone label to a tzinfo, or None if unknown.
+
+    The label is whatever Claude Code rendered: an IANA name such as
+    ``America/Detroit``, or the literal ``UTC``. Anything the platform's zone
+    database cannot resolve returns None, so the caller falls back to probing
+    rather than acting on a misread time.
+    """
+    cleaned = label.strip()
+    if not cleaned:
+        return None
+    if cleaned.upper() == "UTC":
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(cleaned)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
 def _parse_reset_at_from_text(text: object) -> datetime | None:
     """Parse the next-future UTC reset time from a CLI-emitted message.
 
-    Accepts strings of the form ``"resets H:MMam/pm (UTC)"`` embedded
-    anywhere in ``text``. Returns the next-future UTC-aware datetime whose
-    hour/minute match the parsed value. If the parsed time is at or before
-    the current clock, adds one day (next-day rollover).
+    Accepts strings of the form ``"resets H:MMam/pm (<zone>)"`` embedded
+    anywhere in ``text``, where ``<zone>`` is whatever the CLI rendered --
+    typically the operator's own IANA zone, sometimes ``UTC``. The wall-clock
+    time is interpreted in that zone and converted to UTC, so a reset stated as
+    ``12:50am (America/Detroit)`` resolves to the correct instant regardless of
+    where this process runs or what offset is in effect.
+
+    The returned datetime is the next future occurrence: if the parsed
+    wall-clock time is at or before now in that zone, it rolls to the next day.
 
     D-8: only the CLI text form is parsed; there is deliberately no header
     parsing.
 
     Returns None when:
     - ``text`` is not a str.
-    - No ``resets ... (UTC)`` pattern is found.
-    - The timezone label is not exactly ``(UTC)``.
+    - No ``resets ... (<zone>)`` pattern is found.
+    - The zone label cannot be resolved by the platform zone database.
     - The parsed hour/minute values are invalid (e.g. hour 13pm, minute 99).
     """
     if not isinstance(text, str):
@@ -260,12 +291,19 @@ def _parse_reset_at_from_text(text: object) -> datetime | None:
         return None
     if raw_minute < 0 or raw_minute > 59:
         return None
+    zone = _resolve_reset_zone(match.group(4))
+    if zone is None:
+        return None
     hour_24 = _convert_to_24h(raw_hour, meridiem)
-    now = _get_current_utc()
-    candidate = now.replace(hour=hour_24, minute=raw_minute, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
+    now_local = _get_current_utc().astimezone(zone)
+    # Construct against the target calendar date rather than replacing fields on
+    # an aware value: across a DST transition the offset belongs to that date,
+    # not to today's. ZoneInfo resolves it per-date, so this stays correct.
+    candidate = datetime(now_local.year, now_local.month, now_local.day, hour_24, raw_minute, tzinfo=zone)
+    if candidate <= now_local:
+        next_day = now_local + timedelta(days=1)
+        candidate = datetime(next_day.year, next_day.month, next_day.day, hour_24, raw_minute, tzinfo=zone)
+    return candidate.astimezone(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +969,76 @@ def remove_checkpoint(workspace_root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Quota sources, as recorded on QuotaExhaustedError.source. Each names a
+# distinct credential system, and a probe is only meaningful against the same
+# one that failed: an API-key probe cannot observe an OAuth session limit
+# clearing, and vice versa.
+PROBE_SOURCE_CLI = "claude-code-cli"
+PROBE_SOURCE_API = "anthropic-api"
+PROBE_SOURCE_BEDROCK = "bedrock"
+
+
+def _probe_cli_call(timeout_seconds: float) -> None:
+    """Probe the Claude Code CLI, which carries the session's OAuth credential.
+
+    Isolated as a thin shim so tests can patch it without spawning a process.
+
+    The orchestrator runs through the Agent SDK, which spawns this same CLI and
+    inherits whatever the operator is logged in as. Probing it therefore tests
+    the exact credential and the exact quota that stopped the run. Probing the
+    Anthropic API instead -- as this module did for every source -- asks a
+    different account about a different limit, and can never observe an OAuth
+    session limit clearing no matter how long it waits.
+
+    Raises:
+        RecoveryProbeUnavailableError: The CLI is absent from PATH. Waiting
+            cannot install it.
+        subprocess.SubprocessError / OSError: Transient failure; the caller
+            treats these as "not recovered yet".
+        RuntimeError: The CLI ran but exited non-zero, which includes the
+            still-throttled case.
+    """
+    executable = os.environ.get("DEVBENCH_RECOVERY_PROBE_CLI", "claude")
+    try:
+        completed = subprocess.run(
+            [executable, "-p", "x", "--max-turns", "1"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RecoveryProbeUnavailableError(
+            f"recovery probe cannot find the {executable!r} CLI on PATH. The orchestrator "
+            "authenticates through it, so quota recovery cannot be confirmed without it. "
+            "Install it, set DEVBENCH_RECOVERY_PROBE_CLI to its path, or rely on the "
+            "provider-supplied reset time."
+        ) from exc
+    if completed.returncode != 0:
+        raise RuntimeError(f"recovery probe CLI exited {completed.returncode}: {completed.stderr.strip()[:200]}")
+
+
+def _probe_bedrock_call(timeout_seconds: float, request_size_tokens: int) -> object:
+    """Issue a minimal Bedrock ``messages.create`` call for quota probing.
+
+    Credentials resolve the way every other AWS call in this workspace does,
+    from the environment, so the probe exercises the same path the run uses.
+    """
+    import anthropic
+
+    from devbench.config import RUNTIME_CONFIG
+    from devbench.constants import RECOVERY_PROBE_MODEL
+
+    region = os.environ.get("AWS_REGION") or getattr(RUNTIME_CONFIG, "bedrock_region", "") or None
+    client = anthropic.AnthropicBedrock(aws_region=region, timeout=timeout_seconds)
+    prompt = "x" * max(1, request_size_tokens)
+    return client.messages.create(
+        model=os.environ.get("DEVBENCH_RECOVERY_PROBE_BEDROCK_MODEL", RECOVERY_PROBE_MODEL),
+        max_tokens=1,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
 def _probe_api_call(timeout_seconds: float, request_size_tokens: int) -> object:
     """Issue a minimal Anthropic ``messages.create`` call for quota probing.
 
@@ -960,7 +1068,7 @@ def _probe_api_call(timeout_seconds: float, request_size_tokens: int) -> object:
     )
 
 
-def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
+def recovery_probe(*, timeout_seconds: float, request_size_tokens: int, source: str = PROBE_SOURCE_API) -> bool:
     """Issue a minimal probe API call to check whether the quota has recovered.
 
     The except-clause ORDER below is load-bearing and MUST NOT be reordered
@@ -1018,26 +1126,65 @@ def recovery_probe(*, timeout_seconds: float, request_size_tokens: int) -> bool:
     if request_size_tokens < 1:
         raise ValueError(f"recovery_probe: request_size_tokens must be >= 1; got {request_size_tokens!r}.")
 
+    # Route to the credential system that actually failed. Probing a different
+    # one can never observe this quota clearing.
+    if source == PROBE_SOURCE_CLI:
+        try:
+            _probe_cli_call(timeout_seconds)
+            return True
+        except RecoveryProbeUnavailableError:
+            raise
+        except Exception:
+            return False
+
+    return _recovery_probe_via_client(
+        timeout_seconds=timeout_seconds,
+        request_size_tokens=request_size_tokens,
+        source=source,
+    )
+
+
+def _recovery_probe_via_client(*, timeout_seconds: float, request_size_tokens: int, source: str) -> bool:
+    """Probe a credential-backed client (Anthropic API or Bedrock).
+
+    Split from :func:`recovery_probe` so that function stays a small router over
+    the three credential systems, and so the exception ladder below has one
+    place to live.
+    """
     import anthropic
 
     try:
-        _probe_api_call(timeout_seconds, request_size_tokens)
+        if source == PROBE_SOURCE_BEDROCK:
+            _probe_bedrock_call(timeout_seconds, request_size_tokens)
+        else:
+            _probe_api_call(timeout_seconds, request_size_tokens)
         return True
     except QuotaExhaustedError:
         return False
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
         raise RecoveryProbeUnavailableError(
-            f"recovery probe could not authenticate to the Anthropic API ({type(exc).__name__}). "
-            "Configure a valid API credential so quota recovery can be confirmed, "
+            f"recovery probe could not authenticate to {source} ({type(exc).__name__}). "
+            "Configure a valid credential so quota recovery can be confirmed, "
             "or rely on the provider-supplied reset time."
         ) from exc
     except anthropic.APIError:
         return False
     except anthropic.AnthropicError as exc:
         raise RecoveryProbeUnavailableError(
-            "recovery probe has no usable Anthropic API credential configured. "
+            f"recovery probe has no usable {source} credential configured. "
             "Quota recovery cannot be probed; configure a credential or rely on "
             "the provider-supplied reset time."
+        ) from exc
+    except TypeError as exc:
+        # The Anthropic client raises a bare TypeError from its constructor when
+        # no credential can be resolved at all. Without this branch it fell into
+        # the catch-all below and returned False, making "permanently
+        # unconfigured" indistinguishable from "still throttled" -- the wait
+        # then polled a credential that did not exist until max_wait_seconds.
+        raise RecoveryProbeUnavailableError(
+            f"recovery probe has no {source} credential to authenticate with "
+            f"({exc}). Quota recovery cannot be probed; configure a credential "
+            "or rely on the provider-supplied reset time."
         ) from exc
     except Exception:
         return False

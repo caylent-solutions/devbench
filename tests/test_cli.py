@@ -23707,14 +23707,19 @@ class TestCmdStartSigtermHandler:
 
     @pytest.mark.unit
     def test_forced_blocked_on_stop_audit_constant_defined(self) -> None:
-        """_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX constant must be defined in cli."""
-        assert hasattr(cli, "_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX")
-        prefix = cli._FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX
-        assert "FORCED_BLOCKED_ON_STOP" in prefix
+        """_INTERRUPTED_ON_STOP_AUDIT_PREFIX constant must be defined in cli."""
+        assert hasattr(cli, "_INTERRUPTED_ON_STOP_AUDIT_PREFIX")
+        prefix = cli._INTERRUPTED_ON_STOP_AUDIT_PREFIX
+        assert "INTERRUPTED_ON_STOP" in prefix
 
     @pytest.mark.unit
-    def test_force_block_in_flight_wu_sets_status_blocked(self, tmp_path: Path) -> None:
-        """_force_block_in_flight_wu sets in-progress WU to blocked and appends audit."""
+    def test_requeue_in_flight_wu_returns_unit_to_the_queue(self, tmp_path: Path) -> None:
+        """_requeue_in_flight_wu sets in-progress WU to in-queue and appends audit.
+
+        A stop is not a dependency problem, so the unit must land somewhere the
+        next run will claim from. ``blocked`` waits on a dependency event that
+        never comes when the stop happened after every dependency was terminal.
+        """
         from devbench.backlog.manager import BacklogManager
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
@@ -23752,20 +23757,22 @@ class TestCmdStartSigtermHandler:
             patch.object(BacklogManager, "_append_agent_comment", _mock_append),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
         ):
-            cli._force_block_in_flight_wu(wu, session_name="myrun")
+            cli._requeue_in_flight_wu(wu, session_name="myrun")
 
-        assert ("E1-F1-S1-T1", "blocked") in forced, "force_status must be called with 'blocked'"
-        audit_messages = [msg for _, msg in appended]
-        assert any("FORCED_BLOCKED_ON_STOP" in m for m in audit_messages), (
-            "audit comment must contain FORCED_BLOCKED_ON_STOP"
+        assert ("E1-F1-S1-T1", "in-queue") in forced, "force_status must be called with 'in-queue'"
+        assert ("E1-F1-S1-T1", "blocked") not in forced, (
+            "an interrupted unit must not be blocked: nothing un-blocks it when its dependencies "
+            "were already terminal at the moment of the stop"
         )
+        audit_messages = [msg for _, msg in appended]
+        assert any("INTERRUPTED_ON_STOP" in m for m in audit_messages), "audit comment must contain INTERRUPTED_ON_STOP"
         assert any("myrun" in m for m in audit_messages), "audit comment must contain the session name"
 
     @pytest.mark.unit
-    def test_force_block_in_flight_wu_no_op_when_no_in_progress(self, tmp_path: Path) -> None:
-        """_force_block_in_flight_wu does nothing when no in-progress WU is provided (None)."""
+    def test_requeue_in_flight_wu_no_op_when_no_in_progress(self, tmp_path: Path) -> None:
+        """_requeue_in_flight_wu does nothing when no in-progress WU is provided (None)."""
         # Should not raise; calling with None is the no-op signal.
-        cli._force_block_in_flight_wu(None, session_name="myrun")
+        cli._requeue_in_flight_wu(None, session_name="myrun")
 
     @pytest.mark.unit
     def test_find_in_flight_wu_returns_in_progress_unit(self, tmp_path: Path) -> None:
@@ -26067,6 +26074,160 @@ class TestLogQuarantine:
         ):
             cli._log_quarantine(self._record("E0-F1-S1-T9"), "E0-F1-S1-T2")
         assert any("quarantine audit comment failed" in r.getMessage() for r in caplog.records)
+
+
+class TestLogQuarantineRestore:
+    """Each restore is recorded so the owning unit's next executor resumes, not restarts."""
+
+    @staticmethod
+    def _record(owner_id: str) -> cli.RestoreRecord:
+        return cli.RestoreRecord(
+            owner_id=owner_id,
+            paths=("src/a.py", "src/b.py"),
+            stash_message=f"devbench-quarantine:{owner_id}: displaced by claim of E0-F1-S1-T2",
+        )
+
+    def test_emits_a_work_restored_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            with patch("devbench.cli._resolve_unit_file_by_id", return_value=None):
+                cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        assert any("[WORK_RESTORED]" in r.getMessage() for r in caplog.records)
+
+    def test_owning_unit_is_told_to_resume_rather_than_restart(self, backlog_dir: Path) -> None:
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: in-progress\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        mock_mgr._append_agent_comment.assert_called_once()
+        message = mock_mgr._append_agent_comment.call_args[0][2]
+        assert "[WORK_RESTORED]" in message
+        assert "rather than starting the Changes Manifest" in message
+
+    def test_missing_owner_file_is_skipped(self) -> None:
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        mock_mgr._append_agent_comment.assert_not_called()
+
+    def test_comment_write_failure_warns_and_does_not_raise(
+        self, backlog_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The restore already succeeded; losing an audit line must not stop the run."""
+        owner_file = backlog_dir / "E0-F1-S1-T9.md"
+        owner_file.write_text("# E0-F1-S1-T9: T\n\n## Status: in-progress\n\n## Comments\n")
+        mock_mgr = MagicMock()
+        mock_mgr._append_agent_comment.side_effect = OSError("read-only filesystem")
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch("devbench.cli._resolve_unit_file_by_id", return_value=owner_file),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli._log_quarantine_restore(self._record("E0-F1-S1-T9"))
+        assert any("quarantine restore audit comment failed" in r.getMessage() for r in caplog.records)
+
+
+class TestCheckpointOwnersBeforeQuarantine:
+    """The stash must never be the only copy of an interrupted attempt."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def test_no_attributable_owner_takes_no_snapshot(self, tmp_path: Path) -> None:
+        """Unattributed residue has no unit to checkpoint for."""
+        with (
+            patch("devbench.cli._non_terminal_manifests", return_value={}),
+            patch("devbench.git_quarantine.checkpoint_work") as snapshot,
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/orphan.py"], self._REPO)
+        snapshot.assert_not_called()
+
+    def test_snapshot_is_taken_for_an_attributed_owner(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+            patch("devbench.cli._non_terminal_manifests", return_value={"E0-F1-S1-T9": ["src/a.py"]}),
+            patch("devbench.git_quarantine.checkpoint_work", return_value="abc123") as snapshot,
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/a.py"], self._REPO)
+        snapshot.assert_called_once()
+        assert any("[WORK_CHECKPOINTED]" in r.getMessage() for r in caplog.records)
+
+    def test_clean_tree_logs_nothing(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A ``None`` SHA means there was nothing in flight to snapshot."""
+        with (
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+            patch("devbench.cli._non_terminal_manifests", return_value={"E0-F1-S1-T9": ["src/a.py"]}),
+            patch("devbench.git_quarantine.checkpoint_work", return_value=None),
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/a.py"], self._REPO)
+        assert not any("[WORK_CHECKPOINTED]" in r.getMessage() for r in caplog.records)
+
+    def test_snapshot_failure_warns_and_lets_the_quarantine_proceed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Refusing here would stop an unattended run to protect a backup of a backup."""
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch("devbench.cli._non_terminal_manifests", return_value={"E0-F1-S1-T9": ["src/a.py"]}),
+            patch("devbench.git_quarantine.checkpoint_work", side_effect=RuntimeError("git exploded")),
+        ):
+            cli._checkpoint_owners_before_quarantine(tmp_path, ["src/a.py"], self._REPO)
+        assert any("[CHECKPOINT_SKIPPED]" in r.getMessage() for r in caplog.records)
+
+
+class TestCheckpointInFlightWork:
+    """The stop path is the last moment devbench controls before work goes unreachable."""
+
+    @staticmethod
+    def _unit(repo: str = "caylent-solutions/devbench") -> MagicMock:
+        unit = MagicMock()
+        unit.id = "E0-F1-S1-T9"
+        unit.repo = repo
+        return unit
+
+    def test_unresolvable_repo_yields_no_checkpoint(self) -> None:
+        with patch.dict(cli.REPO_LOCAL_PATHS, {}, clear=True):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+
+    def test_non_git_path_yields_no_checkpoint(self, tmp_path: Path) -> None:
+        with patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+
+    def test_snapshot_sha_is_returned_and_logged(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        (tmp_path / ".git").mkdir()
+        with (
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+            patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True),
+            patch("devbench.git_quarantine.checkpoint_work", return_value="deadbeef"),
+        ):
+            assert cli._checkpoint_in_flight_work(self._unit()) == "deadbeef"
+        assert any("[WORK_CHECKPOINTED]" in r.getMessage() for r in caplog.records)
+
+    def test_clean_checkout_returns_none_without_logging(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        with (
+            patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True),
+            patch("devbench.git_quarantine.checkpoint_work", return_value=None),
+        ):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+
+    def test_failure_is_swallowed_so_the_unit_is_still_released(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Raising inside a SIGTERM handler would strand the unit ``in-progress``."""
+        (tmp_path / ".git").mkdir()
+        with (
+            caplog.at_level(logging.WARNING, logger="devbench.cli"),
+            patch.dict(cli.REPO_LOCAL_PATHS, {"caylent-solutions/devbench": tmp_path}, clear=True),
+            patch("devbench.git_quarantine.checkpoint_work", side_effect=RuntimeError("git exploded")),
+        ):
+            assert cli._checkpoint_in_flight_work(self._unit()) is None
+        assert any("[CHECKPOINT_SKIPPED]" in r.getMessage() for r in caplog.records)
 
 
 class TestSessionScopeJsonShape:

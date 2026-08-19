@@ -28,6 +28,41 @@ The schema rejects the illegal combinations at config load:
   pause before merging.
 - `local_only: true` + any `repos:` entry without an explicit
   `default_branch:` -- there is no `origin/HEAD` to fall back to.
+- `isolate_worktrees: true` + `single_branch: <name>` -- mutually
+  exclusive. git allows a branch to be checked out in exactly one worktree at
+  a time, while single-branch mode exists to land every unit on one shared
+  branch, so the two models cannot both hold.
+
+## Checkout isolation and interrupted work
+
+By default every work unit runs in one shared checkout. That is what makes an
+interruption expensive: a unit stopped mid-flight leaves uncommitted work in
+the tree, so the next unit to claim has to displace it before it can safely
+commit under its own message.
+
+devbench handles that displacement in three layers, in order:
+
+1. **Checkpoint.** Before work becomes unreachable -- at the stop handler and
+   again before any quarantine -- the checkout is snapshotted to a
+   `refs/devbench/checkpoint/<unit-id>` ref. A ref keeps its commit reachable,
+   so unlike a stash entry it survives `git stash clear` and garbage
+   collection. Inspect one with `git show refs/devbench/checkpoint/<unit-id>`.
+2. **Quarantine.** Foreign paths are stashed per owning unit under a
+   `devbench-quarantine:<owner-id>` message, clearing the tree for the
+   claiming unit.
+3. **Restore.** When a displaced unit is itself the one claiming, its entry is
+   returned to the tree before the claim proceeds, so it resumes on the
+   attempt it already produced instead of re-executing its Changes Manifest
+   from scratch. The restore is bounded by that unit's own Manifest and
+   refuses to overwrite a newer attempt; either refusal leaves the entry
+   intact and fails the claim rather than discarding work.
+
+`isolate_worktrees: true` removes the problem instead of managing it: each
+unit claims into its own git worktree under `.devbench-worktrees/<repo>/`,
+backed by the same object store, so two units never share a working tree and
+nothing has to be displaced. It requires per-unit branches, which is why it
+cannot combine with `single_branch`. Single-branch workspaces rely on the
+three layers above.
 
 ## Decision tree
 

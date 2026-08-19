@@ -58,6 +58,8 @@ from devbench.constants import (
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_MAX_TRANSPORT_RESTARTS,
     DEFAULT_MODEL_RATES,
+    DEFAULT_ORCHESTRATE_EFFORT,
+    DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS,
     DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
@@ -75,6 +77,7 @@ from devbench.constants import (
     DEFAULT_TEST_TIMEOUT,
     DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
     DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+    VALID_ORCHESTRATE_EFFORTS,
     ModelRates,
 )
 
@@ -526,6 +529,29 @@ MAX_TRANSPORT_RESTARTS: int = _resolve_int(
     RUNTIME_CONFIG.orchestrate.max_transport_restarts,
     DEFAULT_MAX_TRANSPORT_RESTARTS,
 )
+ORCHESTRATE_EFFORT: str = _resolve_str(
+    "DEVBENCH_ORCHESTRATE_EFFORT",
+    RUNTIME_CONFIG.orchestrate.effort,
+    DEFAULT_ORCHESTRATE_EFFORT,
+)
+if ORCHESTRATE_EFFORT not in VALID_ORCHESTRATE_EFFORTS:
+    raise ValueError(
+        f"orchestrate.effort must be one of {list(VALID_ORCHESTRATE_EFFORTS)}; got {ORCHESTRATE_EFFORT!r}. "
+        "Set it in backlog/config/devbench.yaml under 'orchestrate:' or via DEVBENCH_ORCHESTRATE_EFFORT."
+    )
+
+ORCHESTRATE_MAX_THINKING_TOKENS: int = _resolve_int(
+    "DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS",
+    RUNTIME_CONFIG.orchestrate.max_thinking_tokens,
+    DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS,
+)
+if ORCHESTRATE_MAX_THINKING_TOKENS <= 0:
+    raise ValueError(
+        "orchestrate.max_thinking_tokens must be a positive number of tokens; got "
+        f"{ORCHESTRATE_MAX_THINKING_TOKENS}. Remove the key to accept the default of "
+        f"{DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS}."
+    )
+
 TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = _resolve_float(
     "DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS",
     RUNTIME_CONFIG.orchestrate.transport_restart_backoff_base_seconds,

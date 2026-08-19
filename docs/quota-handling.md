@@ -40,7 +40,7 @@ than exiting with a non-zero code. This behaviour is controlled by the
 `wait_for_reset` never wraps its wait in `asyncio.shield`. A SIGTERM
 delivered mid-wait propagates naturally: the registered SIGTERM handler
 force-transitions the in-flight work unit to `blocked` (with a
-`[FORCED_BLOCKED_ON_STOP]` audit line) and the process exits promptly,
+`[INTERRUPTED_ON_STOP]` audit line) and the process exits promptly,
 instead of finishing out the wait first. The checkpoint written in step 2
 above is what makes this safe -- a restarted orchestrator (or an operator
 running `devbench quota-watcher`) can see the pause was in progress even
@@ -152,7 +152,7 @@ quota_handling:
 run at any point during a quota wait, including mid-sleep. Because the wait
 uses no `asyncio.shield`, the SIGTERM is handled immediately: the in-flight
 work unit is force-transitioned to `blocked` with a
-`[FORCED_BLOCKED_ON_STOP]` audit line, and the process exits. The quota
+`[INTERRUPTED_ON_STOP]` audit line, and the process exits. The quota
 checkpoint on disk is unaffected by the interrupt -- a subsequent
 `devbench quota-watcher` still reports the pause that was in progress, so
 the operator knows a known state (not an ambiguous one) was left behind.

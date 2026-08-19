@@ -192,14 +192,14 @@ class TestStopSessionFlag:
         )
 
     def test_stop_audit_comment_documented(self) -> None:
-        """The stop section must mention the [FORCED_BLOCKED_ON_STOP] audit comment."""
+        """The stop section must mention the [INTERRUPTED_ON_STOP] audit comment."""
         text = _read_doc()
         section = _extract_section(text, "### `stop`")
         assert section, "### `stop` section must exist"
-        has_audit = "FORCED_BLOCKED_ON_STOP" in section or "forced_blocked" in section.lower()
+        has_audit = "INTERRUPTED_ON_STOP" in section or "interrupted_on_stop" in section.lower()
         assert has_audit, (
             "docs/cli-reference.md '### `stop`' must mention the "
-            "'[FORCED_BLOCKED_ON_STOP] session=<name>' audit comment appended to the "
+            "'[INTERRUPTED_ON_STOP] session=<name>' audit comment appended to the "
             "in-flight work unit (spec section 4.4.5, AC-192-9)."
         )
 

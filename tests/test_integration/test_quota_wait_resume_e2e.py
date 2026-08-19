@@ -444,11 +444,15 @@ class TestJourneyJ2OperatorInterrupts:
         else:
             assert checkpoint.reset_at is not None
 
-        # The SIGTERM handler also force-blocks the in-flight WU -- expected
-        # behaviour of the handler's own contract, not a bug in this journey.
+        # The SIGTERM handler also releases the in-flight WU back to the queue
+        # -- expected behaviour of the handler's own contract, not a bug in
+        # this journey. It is deliberately not ``blocked``: an interrupt is not
+        # a dependency problem, and a unit blocked after its dependencies were
+        # already terminal has no event left that would ever release it.
         wu_content = (backlog_root / f"{_UNIT_ID}.md").read_text(encoding="utf-8")
-        assert "## Status: blocked" in wu_content
-        assert "[FORCED_BLOCKED_ON_STOP]" in wu_content
+        assert "## Status: in-queue" in wu_content
+        assert "## Status: blocked" not in wu_content
+        assert "[INTERRUPTED_ON_STOP]" in wu_content
 
 
 class TestJourneyJ3OperatorInspects:

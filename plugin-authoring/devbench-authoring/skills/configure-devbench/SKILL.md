@@ -983,6 +983,16 @@ Effective value at gate-check time resolves as: `DEVBENCH_GATE_REACHABILITY_ENAB
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
 
+#### `gates.reachability.entry_points` -- Reachability walk entry points
+
+Repo-relative paths seeding the transitive reachability walk (caylent-solutions/devbench-internal-backlog#10 AC2): a referrer only clears an orphan candidate when the referrer is itself reachable from one of these entry points. Absent or empty defaults to the built-in `source_classification`-derived entry-point stem set (`main`, `app`, `index`, `__init__`, `setup`, `conftest`, `wsgi`, `asgi`), matched against each candidate importer's own basename stem -- so leaving this unset still walks a non-empty, repo-agnostic graph instead of an always-empty one.
+
+- **Recommended:** leave unset (empty) -- inherits the built-in entry-point-stem default, which recognises conventional composition roots (`main.py`, `App.tsx`, `index.ts`, ...) by name across any target repo.
+- **Alternatives:** a list of explicit repo-relative paths (e.g. `["src/index.ts", "cmd/server/main.go"]`) to seed the walk from this workspace's actual composition roots instead of the generic stem convention; each configured path must exist in the repo checkout or `check-reachability` fails loudly naming the missing path.
+- **Free-form:** enter a comma-separated list of repo-relative paths, or leave blank to keep the built-in default. Each entry must be a non-empty string that is genuinely repo-relative; the schema and loader reject a scalar value, a non-string element, an empty-string element, an absolute path, or a path containing a `..` segment.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
 #### `gates.ancestry.enabled` -- Enable the check-ancestry gate
 
 Enables the check-ancestry gate for this workspace (caylent-solutions/devbench-internal-backlog#12). Every gate is disabled by default at the built-in level (D-17); this is the per-gate opt-in.

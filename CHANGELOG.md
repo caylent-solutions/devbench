@@ -5,6 +5,41 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-reachability` gains transitive reachability and the
+  `gates.reachability.entry_points` config tunable** (spec
+  `integration-reality-gates-hardening.md` section 4.4 bullet 2; issue #10
+  AC2). A referrer found by the word-boundary matcher now clears a
+  candidate only when the referrer is itself reachable from a configured
+  entry-point set, walked backward through `_search_reachability_importers`
+  with a cycle-safe visited set (`_is_reachable_from_entry_points`); a
+  candidate whose every referrer is itself unreachable is reported
+  `[POTENTIALLY UNREACHABLE via orphan-chain]`, distinct from the
+  no-referrer-at-all `[POTENTIALLY UNREACHABLE]` shape, and both count
+  toward the spec 5.2 status line's `findings` total.
+  `gates.reachability.entry_points`, a list of repo-relative paths, is
+  parsed by `_parse_gates_config` into the new `GateReachabilityConfig`
+  dataclass
+  with fail-fast `ValueError` (naming `gates.reachability.entry_points`
+  and the offending value) on a non-list value, a non-string element, an
+  empty-string element, an absolute path, or a path containing a `..`
+  segment (rejected at both the loader and the JSON schema's `entry_points`
+  item `pattern`, since `repo_path / entry_point` would otherwise silently
+  discard `repo_path` for an absolute `entry_point`); absent or empty
+  falls back to a built-in default derived from
+  `devbench.source_classification`'s entry-point-stem convention (`main`,
+  `app`, `index`, `__init__`, ...) rather than an empty walk, resolved
+  (with per-field provenance) exclusively through
+  `resolve_gate_config("reachability", repo)`. An explicit,
+  project-configured entry point that does not exist in the repo checkout
+  fails the run loudly before any candidate is examined. A referrer met
+  during the entry-point walk that itself cannot be read (permission
+  failure or non-UTF-8 decode failure) no longer silently resolves to an
+  "unreachable" verdict; it is rendered as a counted `[LOAD_ERROR]`
+  finding naming that referrer, and the candidate under examination yields
+  no `[OK]` / unreachable / orphan-chain verdict block in that run.
+  `src/devbench/config-schema.json` and `sample-config.yaml` gain the new
+  key with `additionalProperties: false` preserved at every level.
+
 - **`check-reachability` reworked into the reachability gate: word-boundary
   matching, source-classified scope, loud `git grep` semantics, and
   `log-waiver` replacing the source-comment escape hatch** (spec

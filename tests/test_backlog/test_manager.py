@@ -21,6 +21,7 @@ from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import (
     FixtureConsistencyConfig,
     GateEnabledConfig,
+    GateReachabilityConfig,
     GatesConfig,
     GateSharedFileImpactConfig,
     RepoConfig,
@@ -1035,7 +1036,7 @@ class TestMarkDoneGateRecords:
         judge-evidence gate.
         """
         return GatesConfig(
-            reachability=GateEnabledConfig(enabled="reachability" in enabled_gates),
+            reachability=GateReachabilityConfig(enabled="reachability" in enabled_gates),
             ancestry=GateEnabledConfig(enabled="ancestry" in enabled_gates),
             shared_file_impact=GateSharedFileImpactConfig(enabled="shared_file_impact" in enabled_gates),
             fixture_consistency=FixtureConsistencyConfig(enabled="fixture_consistency" in enabled_gates),

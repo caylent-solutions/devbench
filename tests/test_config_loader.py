@@ -4666,11 +4666,17 @@ class TestGatesConfigDefenseInDepthDirectCalls:
             _parse_fixture_consistency_config(fake_path, {"extract_source_literals": "yes"})
 
     def test_simple_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        """Uses ``gates.ancestry`` as the exemplar label, not ``gates.reachability``
+        (test_review round-2 STALE_LABEL finding): reachability moved off
+        ``_parse_simple_gate_enabled`` onto its own ``_parse_reachability_gate``
+        once ``entry_points`` was added (issue #10 AC2, E3-F1-S1-T2), matching
+        the same re-pointing already applied to
+        ``TestResolveGateConfigPrecedence`` for the identical reason."""
         from devbench.config_loader import _parse_simple_gate_enabled
 
         fake_path = tmp_path / "cfg.yaml"
-        with pytest.raises(ValueError, match=r"gates\.reachability must be a mapping"):
-            _parse_simple_gate_enabled(fake_path, "gates.reachability", ["not", "a", "mapping"])
+        with pytest.raises(ValueError, match=r"gates\.ancestry must be a mapping"):
+            _parse_simple_gate_enabled(fake_path, "gates.ancestry", ["not", "a", "mapping"])
 
     def test_shared_file_impact_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
         from devbench.config_loader import _parse_shared_file_impact_gate
@@ -4838,6 +4844,252 @@ class TestGatesMigrationRemovesPreReleaseKeys:
 
 
 # ---------------------------------------------------------------------------
+# gates.reachability.entry_points (spec 4.1, 4.4 bullet 2; issue #10 AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestGatesReachabilityEntryPoints:
+    """``gates.reachability.entry_points`` config parsing and resolution
+    (spec 4.1, 4.4 bullet 2; issue #10 AC2; AC-5, AC-FUNC-005, AC-FUNC-006,
+    AC-FUNC-007). Malformed-shape cases are exercised via a direct call to
+    the private parser (matching ``TestGatesConfigDefenseInDepthDirectCalls``'s
+    established pattern in this module): the JSON schema
+    (``config-schema.json``'s ``type: array`` / ``items.type: string`` /
+    ``items.minLength: 1``) already rejects every one of these shapes
+    before ``load_runtime_config`` ever reaches ``_parse_reachability_gate``,
+    so a direct call bypassing that layer is the only way to exercise --
+    and pin the messages of -- this module's own defense-in-depth
+    validation.
+    """
+
+    _REPO = "org/repo"
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    # -- valid list: parses, and resolves with 'project' provenance -------
+
+    def test_valid_list_parses_and_resolves_with_project_provenance(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: true
+                entry_points:
+                  - src/index.ts
+                  - cmd/server/main.go
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+
+        assert rt.gates.reachability.entry_points == ("src/index.ts", "cmd/server/main.go")
+
+        result = resolve_gate_config("reachability", self._REPO, rt)
+        assert result.values["entry_points"] == ("src/index.ts", "cmd/server/main.go")
+        assert result.provenance["entry_points"] == "project"
+
+    # -- AC-5/AC-FUNC-005: malformed entry_points fails naming the key ----
+    # Parametrised over exactly the Approach's four shapes (valid list,
+    # scalar value, a list containing an integer, a list containing an
+    # empty string) against the same direct-call parser, matching
+    # ``TestGatesConfigDefenseInDepthDirectCalls``'s established pattern in
+    # this module for exercising this module's own defense-in-depth
+    # validation (the JSON schema layer already rejects every one of these
+    # shapes before ``load_runtime_config`` ever reaches this parser -- see
+    # ``test_malformed_entry_points_fails_full_load_pipeline`` below for
+    # that layer).
+
+    @pytest.mark.parametrize(
+        ("raw", "expected", "match"),
+        [
+            pytest.param(
+                ["src/index.ts", "cmd/server/main.go"],
+                ("src/index.ts", "cmd/server/main.go"),
+                None,
+                id="valid_list",
+            ),
+            pytest.param(
+                "not-a-list", None, r"gates\.reachability\.entry_points must be a list.*not-a-list", id="scalar_value"
+            ),
+            pytest.param(
+                ["src/main.py", 1],
+                None,
+                r"gates\.reachability\.entry_points must contain only strings.*1",
+                id="list_containing_an_integer",
+            ),
+            pytest.param(
+                ["src/main.py", ""],
+                None,
+                r"gates\.reachability\.entry_points must not contain an empty string",
+                id="list_containing_an_empty_string",
+            ),
+            pytest.param(
+                ["src/main.py", "/etc/hostname"],
+                None,
+                r"gates\.reachability\.entry_points must contain only repo-relative paths.*etc/hostname",
+                id="absolute_path",
+            ),
+            pytest.param(
+                ["src/main.py", "../escape.py"],
+                None,
+                r"gates\.reachability\.entry_points must not contain parent traversal.*escape\.py",
+                id="parent_traversal_dotdot",
+            ),
+        ],
+    )
+    def test_entry_points_validation_matrix_direct(
+        self, tmp_path: Path, raw: object, expected: tuple[str, ...] | None, match: str | None
+    ) -> None:
+        """code_review round-2 MISSING_AC_EVIDENCE finding: an absolute path
+        or a ``..`` parent-traversal segment must be rejected here, at
+        ``_parse_reachability_entry_points``'s own defense-in-depth layer
+        (matching every other malformed shape in this matrix), because a
+        bare ``(repo_path / entry_point).is_file()`` existence check alone
+        is not a safe repo-relativity guard (pathlib's ``/`` operator
+        discards the left operand for an absolute right operand)."""
+        from devbench.config_loader import _parse_reachability_entry_points
+
+        fake_path = tmp_path / "cfg.yaml"
+        if match is None:
+            assert _parse_reachability_entry_points(fake_path, raw) == expected
+        else:
+            with pytest.raises(ValueError, match=match):
+                _parse_reachability_entry_points(fake_path, raw)
+
+    def test_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_reachability_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.reachability must be a mapping"):
+            _parse_reachability_gate(fake_path, ["not", "a", "mapping"])
+
+    def test_gate_raw_none_returns_defaults_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import GateReachabilityConfig, _parse_reachability_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        assert _parse_reachability_gate(fake_path, None) == GateReachabilityConfig()
+
+    @pytest.mark.parametrize(
+        ("entry_points_yaml", "match"),
+        [
+            pytest.param("not-a-list", r"gates\.reachability\.entry_points.*array", id="scalar_via_schema"),
+            pytest.param("[1]", r"gates\.reachability\.entry_points\.0.*string", id="non_string_element_via_schema"),
+            pytest.param('[""]', r"gates\.reachability\.entry_points\.0", id="empty_string_element_via_schema"),
+            pytest.param('["/etc/hostname"]', r"gates\.reachability\.entry_points\.0", id="absolute_path_via_schema"),
+            pytest.param('["../escape.py"]', r"gates\.reachability\.entry_points\.0", id="parent_traversal_via_schema"),
+        ],
+    )
+    def test_malformed_entry_points_fails_full_load_pipeline(
+        self, tmp_path: Path, entry_points_yaml: str, match: str
+    ) -> None:
+        """The full ``load_runtime_config`` pipeline also fails fast on every
+        malformed shape -- caught by the JSON schema layer before this
+        module's own parser ever runs, still naming
+        ``gates.reachability.entry_points`` in the raised ``ValueError``.
+        The absolute-path and parent-traversal shapes (code_review round-2
+        MISSING_AC_EVIDENCE finding) are rejected here by
+        ``config-schema.json``'s ``entry_points`` item ``pattern``, the
+        same layer that already rejects the other three shapes."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo: {{}}
+            gates:
+              reachability:
+                enabled: true
+                entry_points: {entry_points_yaml}
+            """,
+        )
+        with pytest.raises(ValueError, match=match):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_reachability_key(self, tmp_path: Path) -> None:
+        """AC-FUNC-008's second clause (test_review round-2 COVERAGE finding):
+        JSON Schema ``additionalProperties: false`` rejects an unknown
+        ``gates.reachability:`` key, mirroring
+        ``test_schema_rejects_unknown_fixture_consistency_key`` for the
+        sibling gate."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                unknown_field: foo
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*unknown_field"):
+            load_runtime_config(cfg, {})
+
+    # -- AC-FUNC-006: absent/empty entry_points resolves to the built-in --
+    # -- source_classification-derived default, provenance 'builtin' ------
+
+    def test_absent_entry_points_resolves_to_source_classification_default(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+        from devbench.source_classification import ENTRY_POINT_STEMS
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.reachability.entry_points == ()
+
+        result = resolve_gate_config("reachability", self._REPO, rt)
+        assert result.values["entry_points"] == tuple(sorted(ENTRY_POINT_STEMS))
+        assert result.provenance["entry_points"] == "builtin"
+
+    def test_explicit_empty_list_also_resolves_to_builtin_default(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+        from devbench.source_classification import ENTRY_POINT_STEMS
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: true
+                entry_points: []
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+
+        result = resolve_gate_config("reachability", self._REPO, rt)
+        assert result.values["entry_points"] == tuple(sorted(ENTRY_POINT_STEMS))
+        assert result.provenance["entry_points"] == "builtin"
+
+    # -- AC-FUNC-007: resolved values/provenance carry BOTH fields --------
+
+    def test_resolved_reachability_carries_both_enabled_and_entry_points(self) -> None:
+        """Proves the reachability-specific merge step runs ALONGSIDE the
+        generic 'enabled' layer rather than replacing its output."""
+        from devbench.config_loader import GateReachabilityConfig, GatesConfig, resolve_gate_config
+
+        gates = GatesConfig(reachability=GateReachabilityConfig(enabled=True, entry_points=("src/main.py",)))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "entry_points": ("src/main.py",)}
+        assert result.provenance == {"enabled": "project", "entry_points": "project"}
+
+
+# ---------------------------------------------------------------------------
 # resolve_gate_config -- four-layer field-wise precedence (spec 4.1, D-15; AC-27)
 # ---------------------------------------------------------------------------
 
@@ -4953,8 +5205,10 @@ class TestResolveGateConfigPrecedence:
         assert result.provenance == {"enabled": "builtin", "extract_source_literals": "project"}
 
     def test_simple_gate_with_only_enabled_field_resolves(self) -> None:
-        """A gate with no tunable beyond 'enabled' (e.g. reachability)
-        resolves with a single-field values/provenance mapping."""
+        """A gate with no tunable beyond 'enabled' (e.g. ancestry) resolves
+        with a single-field values/provenance mapping. (Not reachability:
+        since it gained the `entry_points` tunable, its own resolved shape
+        is covered separately by `TestGatesReachabilityEntryPoints`.)"""
         from devbench.config_loader import (
             GateEnabledConfig,
             GatesConfig,
@@ -4963,9 +5217,9 @@ class TestResolveGateConfigPrecedence:
             resolve_gate_config,
         )
 
-        gates = GatesConfig(reachability=GateEnabledConfig(enabled=True))
+        gates = GatesConfig(ancestry=GateEnabledConfig(enabled=True))
         runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
-        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+        result = resolve_gate_config("ancestry", self._REPO, runtime_config)
 
         assert result.values == {"enabled": True}
         assert result.provenance == {"enabled": "project"}
@@ -4984,11 +5238,11 @@ class TestResolveGateConfigPrecedence:
         )
 
         gates = GatesConfig(
-            reachability=GateEnabledConfig(enabled=True),
-            repos={self._REPO: GateRepoOverrides(ancestry=GateEnabledOverride(enabled=True))},
+            ancestry=GateEnabledConfig(enabled=True),
+            repos={self._REPO: GateRepoOverrides(write_path_audit=GateEnabledOverride(enabled=True))},
         )
         runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
-        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+        result = resolve_gate_config("ancestry", self._REPO, runtime_config)
 
         assert result.values == {"enabled": True}
         assert result.provenance == {"enabled": "project"}
@@ -5004,10 +5258,10 @@ class TestResolveGateConfigPrecedence:
             resolve_gate_config,
         )
 
-        gates = GatesConfig(reachability=GateEnabledConfig(enabled=True))
+        gates = GatesConfig(ancestry=GateEnabledConfig(enabled=True))
         runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
         assert runtime_config.gates.repos == {}
-        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+        result = resolve_gate_config("ancestry", self._REPO, runtime_config)
 
         assert result.values == {"enabled": True}
         assert result.provenance == {"enabled": "project"}
@@ -5026,13 +5280,14 @@ class TestResolveGateConfigPrecedence:
 class TestResolveGateConfigSingleReadPathPin:
     """AC-E2-F1-S1-T2-5 (AC-27): ``resolve_gate_config`` is the ONLY sanctioned
     read path for a gate's resolver-managed fields (``enabled``,
-    ``auto_derive_registry``, ``extract_source_literals``). Fails when a
-    module other than ``config_loader.py`` reads one of these fields
-    directly off the raw ``GatesConfig`` tree instead of calling the
-    resolver, so a later gate epic cannot quietly re-introduce a second,
-    potentially divergent interpretation of the precedence chain.
+    ``auto_derive_registry``, ``extract_source_literals``,
+    ``entry_points``). Fails when a module other than ``config_loader.py``
+    reads one of these fields directly off the raw ``GatesConfig`` tree
+    instead of calling the resolver, so a later gate epic cannot quietly
+    re-introduce a second, potentially divergent interpretation of the
+    precedence chain.
 
-    Scoped to the three resolver-managed field names rather than every
+    Scoped to the four resolver-managed field names rather than every
     ``.gates.`` access, because two pre-existing, sanctioned direct reads
     of *structural* (non-resolver) gate fields already exist in
     ``cli.py`` (``gates.repos.<repo>.shared_file_impact.patterns`` and
@@ -5044,7 +5299,7 @@ class TestResolveGateConfigSingleReadPathPin:
     _SRC_ROOT = Path(__file__).parent.parent / "src" / "devbench"
     _EXEMPT_MODULE = _SRC_ROOT / "config_loader.py"
     _RAW_GATE_FIELD_ACCESS_RE = re.compile(
-        r"\.gates\.[\w.\[\]\"' ()]*?\.(enabled|auto_derive_registry|extract_source_literals)\b"
+        r"\.gates\.[\w.\[\]\"' ()]*?\.(enabled|auto_derive_registry|extract_source_literals|entry_points)\b"
     )
 
     def _scanned_files(self) -> list[Path]:

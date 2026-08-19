@@ -68,6 +68,7 @@ naming the offending key rather than being silently ignored (D-2).
 gates:
   reachability:
     enabled: false
+    entry_points: []          # repo-relative paths; empty/absent uses the built-in stem-based default
   ancestry:
     enabled: false
   shared_file_impact:
@@ -99,8 +100,11 @@ gates:
 
 Every gate field resolves through four layers, in this order (lowest to highest precedence):
 
-1. **Built-in default** -- `constants.py`; every gate disabled, every tunable at its
-   documented default.
+1. **Built-in default** -- `constants.py`; every gate disabled, every boolean tunable at
+   its documented default. Structural (non-boolean) tunables source their built-in
+   default elsewhere: `gates.reachability.entry_points`, for example, defaults to
+   `config_loader._REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`, itself derived from
+   `source_classification.ENTRY_POINT_STEMS` rather than `constants.GATE_FIELD_DEFAULTS`.
 2. **Project level** -- `gates.<gate>.*` in the workspace `devbench.yaml`.
 3. **Per-repo override** -- `gates.repos.<org/repo>.<gate>.*`, field-wise merged OVER the
    project level, so a repo can flip `enabled` while inheriting every other tunable.
@@ -116,18 +120,20 @@ the `DEVBENCH_GATE_<NAME>_ENABLED` env layer through the existing `_resolve_bool
 value callers thread into `resolve_gate_config`'s `env_enabled_override` parameter --
 `config_loader.py` remains parse/validate-only and never reads environment variables itself. No
 consumer other than `resolve_gate_config` may read a gate's resolver-managed fields (`enabled`,
-`auto_derive_registry`, `extract_source_literals`) directly off `RuntimeConfig.gates` (AC-27).
-`devbench gates` (E2-F1-S2-T1) is the first consumer: it renders one row per declared gate with the
-resolved `enabled` status and per-field provenance for every row, calling `resolve_gate_config`
-once per gate rather than reading `RuntimeConfig.gates` directly. The per-gate check commands
-(`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later
-gate epics add) adopt the resolver in follow-up tasks.
+`auto_derive_registry`, `extract_source_literals`, `entry_points`) directly off `RuntimeConfig.gates`
+(AC-27). `devbench gates` (E2-F1-S2-T1) is the first consumer: it renders one row per declared gate
+with the resolved `enabled` status and per-field provenance for every row, calling
+`resolve_gate_config` once per gate rather than reading `RuntimeConfig.gates` directly. Each per-gate
+check command adopts the resolver as its own hardening epic lands: `check-reachability` already
+reads both `enabled` and `entry_points` exclusively through `resolve_gate_config` (spec 4.4,
+E3-F1-S1-T2); `check-shared-file-impact`, `check-fixture-consistency`, and the ones later gate
+epics add follow in their own tasks.
 
 ### Per-gate tunables
 
 | Gate | Tunables (beyond `enabled`) | Per-repo override tunables |
 |------|------------------------------|------------------------------|
-| `reachability` | none | `enabled` |
+| `reachability` | `entry_points` (issue #10 AC2) | `enabled` |
 | `ancestry` | none | `enabled` |
 | `shared_file_impact` | `auto_derive_registry` (reserved, unused v1) | `enabled`, `patterns` |
 | `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (reserved, unused v1) | `enabled` |
@@ -151,6 +157,37 @@ A config that still sets either retired key fails `load_runtime_config` with a s
 `ValueError` (`additionalProperties: false` at the top level and on `repos.<repo>.*`). An absent
 `gates:` block loads into the all-disabled built-in tree with no error and no warning, so a
 0.4.0-era config with neither key keeps working unmodified (AC-4, Section 6).
+
+### `gates.reachability.entry_points` -- transitive reachability walk (caylent-solutions/devbench-internal-backlog#10 AC2)
+
+A list of repo-relative paths seeding the transitive reachability walk that `devbench
+check-reachability` runs once the gate finds a candidate artifact's word-boundary referrer(s). A
+referrer clears the candidate (`[OK]`) only when the referrer is itself reachable from this
+entry-point set, walked with a cycle-safe visited set; when every referrer is itself unreachable,
+the candidate is reported `[POTENTIALLY UNREACHABLE via orphan-chain]` instead of `[OK]` -- distinct
+from the no-referrer-at-all `[POTENTIALLY UNREACHABLE]` shape, though both count toward the spec 5.2
+status line's `findings` total.
+
+Absent or an explicit empty list both mean "not overridden at the project level": the resolved
+value falls back to the built-in default derived from `devbench.source_classification`'s
+entry-point-stem convention (`main`, `app`, `index`, `__init__`, `setup`, `conftest`, `wsgi`,
+`asgi`), matched case-insensitively against each candidate importer's own basename stem -- so
+`src/App.tsx` or `cmd/main.go` are recognised as composition roots without any configuration at
+all. An explicit `entry_points` list instead names literal repo-relative paths matched exactly;
+each configured path must exist in the repo checkout, or `check-reachability` fails loudly with
+`ERROR: gates.reachability.entry_points names a path that is not present in the repo: <path>`
+before examining any candidate, rather than silently walking a graph with zero real roots. Every
+element must actually BE repo-relative: an absolute path or a path containing a `..`
+parent-traversal segment fails config load fast (naming `gates.reachability.entry_points` and the
+offending value), enforced at two independent layers -- the JSON schema's `entry_points` item
+`pattern`, and `_parse_reachability_entry_points`'s own validation -- because `repo_path /
+entry_point` would otherwise silently discard `repo_path` for an absolute `entry_point` and let a
+file outside the checkout satisfy the existence check above.
+
+`entry_points` is read exclusively through `resolve_gate_config("reachability", repo)` (AC-27) --
+no module reads `gates.reachability.entry_points` off `RuntimeConfig.gates` directly. There is no
+per-repo override layer for this field today (this campaign configures a single target repo, spec
+Section 9); the `enabled` field's four-layer precedence is unaffected.
 
 ### `gates.fixture_consistency` -- fixture-catalog cross-reference (caylent-solutions/devbench-internal-backlog#17)
 

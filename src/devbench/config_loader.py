@@ -104,6 +104,7 @@ from devbench.constants import (
 from devbench.constants import (
     GATE_NAMES as _GATE_NAMES_ORDERED,
 )
+from devbench.source_classification import ENTRY_POINT_STEMS
 
 _BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
 _VALID_DEFAULT_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
@@ -609,9 +610,11 @@ GATE_NAMES: frozenset[str] = frozenset(_GATE_NAMES_ORDERED)
 class GateEnabledConfig:
     """Project-level tunables for a gate with no tunable beyond ``enabled``.
 
-    Shared by the six gates whose spec-4.1 tunable set is exactly
-    ``{enabled}``: reachability, ancestry, write_path_audit,
-    newly_reachable_paths, composition_root, layout_geometry.
+    Shared by the five gates whose spec-4.1 tunable set is exactly
+    ``{enabled}``: ancestry, write_path_audit, newly_reachable_paths,
+    composition_root, layout_geometry. ``reachability`` moved to its own
+    :class:`GateReachabilityConfig` (spec 4.4 bullet 2, issue #10 AC2) once
+    it gained the ``entry_points`` tunable.
 
     Attributes:
         enabled: Whether this gate is enabled at the project level.
@@ -623,6 +626,32 @@ class GateEnabledConfig:
     """
 
     enabled: bool = GATE_ENABLED_DEFAULT
+
+
+@dataclass(frozen=True)
+class GateReachabilityConfig:
+    """Project-level ``gates.reachability:`` tunables (spec 4.1, 4.4; issue #10 AC2).
+
+    Attributes:
+        enabled: Whether this gate is enabled at the project level.
+            Default ``constants.GATE_ENABLED_DEFAULT`` (``False``). The
+            resolved value consumed by gate commands is computed by the
+            four-layer precedence resolver, ``resolve_gate_config``; this
+            dataclass only models the raw parsed project-level value.
+        entry_points: Repo-relative paths seeding the transitive
+            reachability walk (issue #10 AC2, spec 4.4 bullet 2). The empty
+            tuple -- the default, and also what an explicit empty YAML list
+            parses to -- means "not overridden at the project level"; both
+            cases resolve to the ``source_classification``-derived built-in
+            default substituted by ``resolve_gate_config`` (AC-FUNC-006),
+            never here. This dataclass only models the raw parsed
+            project-level value; no per-repo override layer exists for this
+            field (this campaign configures a single target repo, spec
+            Section 9).
+    """
+
+    enabled: bool = GATE_ENABLED_DEFAULT
+    entry_points: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -731,7 +760,8 @@ class GatesConfig:
     module reads its fields directly (AC-27).
 
     Attributes:
-        reachability: check-reachability gate tunables.
+        reachability: check-reachability gate tunables, including
+            ``entry_points`` (spec 4.4 bullet 2, issue #10 AC2).
         ancestry: check-ancestry gate tunables.
         shared_file_impact: check-shared-file-impact gate tunables.
         fixture_consistency: check-fixture-consistency gate tunables.
@@ -745,7 +775,7 @@ class GatesConfig:
             load-time error (AC-E2-F1-S1-T1-2).
     """
 
-    reachability: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    reachability: GateReachabilityConfig = field(default_factory=GateReachabilityConfig)
     ancestry: GateEnabledConfig = field(default_factory=GateEnabledConfig)
     shared_file_impact: GateSharedFileImpactConfig = field(default_factory=GateSharedFileImpactConfig)
     fixture_consistency: FixtureConsistencyConfig = field(default_factory=FixtureConsistencyConfig)
@@ -1280,12 +1310,12 @@ def _parse_gate_enabled_field(path: Path, key: str, raw: dict, default: bool = G
 
 
 def _parse_simple_gate_enabled(path: Path, key: str, gate_raw: object) -> GateEnabledConfig:
-    """Parse one of the six enabled-only gates (spec 4.1: everything except
-    shared_file_impact and fixture_consistency).
+    """Parse one of the five enabled-only gates (spec 4.1: everything except
+    reachability, shared_file_impact and fixture_consistency).
 
     Args:
         path: Config file path (used in error messages).
-        key: Dotted YAML key for this gate (e.g. ``gates.reachability``).
+        key: Dotted YAML key for this gate (e.g. ``gates.ancestry``).
         gate_raw: Raw value from YAML for this gate -- ``None`` when the
             gate key is absent from ``gates:``, otherwise a dict (schema-
             validated).
@@ -1303,6 +1333,97 @@ def _parse_simple_gate_enabled(path: Path, key: str, gate_raw: object) -> GateEn
     if not isinstance(gate_raw, dict):
         raise ValueError(f"Config file '{path}': {key} must be a mapping, got {type(gate_raw).__name__}.")
     return GateEnabledConfig(enabled=_parse_gate_enabled_field(path, key, gate_raw))
+
+
+def _parse_reachability_entry_points(path: Path, raw: object) -> tuple[str, ...]:
+    """Parse and validate ``gates.reachability.entry_points`` (spec 4.1, 4.4; AC-5, AC-FUNC-005).
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw value from YAML for ``entry_points`` -- ``None`` when the
+            key is absent from the ``gates.reachability`` block.
+
+    Returns:
+        A tuple of the configured repo-relative paths, in the order
+        supplied. The empty tuple when *raw* is ``None`` (absent) --
+        ``resolve_gate_config`` substitutes the
+        ``source_classification``-derived built-in default in that case
+        (AC-FUNC-006), never this function.
+
+    Raises:
+        ValueError: If *raw* is present but not a list; if any element is
+            not a string; if any element is an empty string; if any
+            element is an absolute path; or if any element contains a
+            parent-traversal (``..``) segment.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"Config file '{path}': gates.reachability.entry_points must be a list of repo-relative "
+            f"path strings, got {type(raw).__name__} ({raw!r})."
+        )
+    entry_points: list[str] = []
+    for element in raw:
+        if not isinstance(element, str):
+            raise ValueError(
+                f"Config file '{path}': gates.reachability.entry_points must contain only strings; "
+                f"found {type(element).__name__} ({element!r})."
+            )
+        if not element:
+            raise ValueError(f"Config file '{path}': gates.reachability.entry_points must not contain an empty string.")
+        # code_review round-2 MISSING_AC_EVIDENCE finding: an absolute path or a
+        # `..` escape defeats `cli._reachability_missing_entry_point`'s existence
+        # guard, because `repo_path / element` DISCARDS `repo_path` for an
+        # absolute right operand (pathlib's documented `/` behaviour), letting
+        # `.is_file()` pass for a file outside the checkout that can then never
+        # match `_matches_reachability_entry_point`'s repo-relative comparison --
+        # exactly the false-orphan-from-an-empty-root-set outcome the Error
+        # Handling Contract's missing-entry-point bullet exists to prevent.
+        # Rejected here, at the single parse boundary, so no caller can ever
+        # observe an unsafe path (spec 4.4's own "a list of repo-relative
+        # paths" contract).
+        if Path(element).is_absolute():
+            raise ValueError(
+                f"Config file '{path}': gates.reachability.entry_points must contain only repo-relative "
+                f"paths, got absolute path {element!r}."
+            )
+        if ".." in Path(element).parts:
+            raise ValueError(
+                f"Config file '{path}': gates.reachability.entry_points must not contain parent "
+                f"traversal ('..'), got {element!r}."
+            )
+        entry_points.append(element)
+    return tuple(entry_points)
+
+
+def _parse_reachability_gate(path: Path, gate_raw: object) -> GateReachabilityConfig:
+    """Parse the project-level ``gates.reachability:`` YAML section (spec 4.1, 4.4; issue #10 AC2).
+
+    Args:
+        path: Config file path (used in error messages).
+        gate_raw: Raw value from YAML -- ``None`` when the key is absent,
+            otherwise a dict (schema-validated).
+
+    Returns:
+        ``GateReachabilityConfig`` populated from *gate_raw*, or the
+        built-in default (``enabled=False``, ``entry_points=()``) when
+        *gate_raw* is ``None``.
+
+    Raises:
+        ValueError: If *gate_raw* is present but not a mapping; if its
+            ``enabled`` field is not a boolean; or per
+            :func:`_parse_reachability_entry_points`'s ``entry_points``
+            validation.
+    """
+    defaults = GateReachabilityConfig()
+    if gate_raw is None:
+        return defaults
+    if not isinstance(gate_raw, dict):
+        raise ValueError(f"Config file '{path}': gates.reachability must be a mapping, got {type(gate_raw).__name__}.")
+    enabled = _parse_gate_enabled_field(path, "gates.reachability", gate_raw, defaults.enabled)
+    entry_points = _parse_reachability_entry_points(path, gate_raw.get("entry_points"))
+    return GateReachabilityConfig(enabled=enabled, entry_points=entry_points)
 
 
 def _parse_shared_file_impact_gate(path: Path, gate_raw: object) -> GateSharedFileImpactConfig:
@@ -1527,7 +1648,7 @@ def _parse_gates_config(path: Path, gates_raw: dict, repos: dict[str, RepoConfig
             f"gate names are {sorted(GATE_NAMES)} (plus the optional 'repos' override map)."
         )
     return GatesConfig(
-        reachability=_parse_simple_gate_enabled(path, "gates.reachability", gates_raw.get("reachability")),
+        reachability=_parse_reachability_gate(path, gates_raw.get("reachability")),
         ancestry=_parse_simple_gate_enabled(path, "gates.ancestry", gates_raw.get("ancestry")),
         shared_file_impact=_parse_shared_file_impact_gate(path, gates_raw.get("shared_file_impact")),
         fixture_consistency=_parse_fixture_consistency_config(path, gates_raw.get("fixture_consistency") or {}),
@@ -2706,7 +2827,11 @@ class ResolvedGateConfig:
         values: Resolved field values by field name. Always includes
             ``"enabled"``, plus any gate-specific tunable(s) declared for
             *gate* in ``constants.GATE_FIELD_DEFAULTS`` (for example
-            ``"auto_derive_registry"`` for ``shared_file_impact``).
+            ``"auto_derive_registry"`` for ``shared_file_impact``) or merged
+            by a gate-specific step in this function (``"entry_points"``
+            for ``reachability``, spec 4.4 bullet 2). Every value is a
+            ``bool`` except ``reachability``'s ``entry_points``, which is a
+            ``tuple[str, ...]``.
         provenance: The layer that set each field in ``values`` -- one of
             ``constants.GATE_PROVENANCE_BUILTIN`` / ``_PROJECT`` /
             ``_REPO`` / ``_ENV`` (spec 4.1; rendered as the ``devbench
@@ -2714,11 +2839,13 @@ class ResolvedGateConfig:
     """
 
     gate: str
-    values: Mapping[str, bool]
+    values: Mapping[str, bool | tuple[str, ...]]
     provenance: Mapping[str, str]
 
 
-def _merge_gate_project_layer(gate: str, runtime_config: RuntimeConfig) -> tuple[dict[str, bool], dict[str, str]]:
+def _merge_gate_project_layer(
+    gate: str, runtime_config: RuntimeConfig
+) -> tuple[dict[str, bool | tuple[str, ...]], dict[str, str]]:
     """Merge the built-in and project-level layers for *gate*, field-wise.
 
     Generic over every gate's field set (``constants.GATE_FIELD_DEFAULTS``)
@@ -2737,7 +2864,7 @@ def _merge_gate_project_layer(gate: str, runtime_config: RuntimeConfig) -> tuple
         any project-level value that differs from the built-in default.
     """
     defaults = GATE_FIELD_DEFAULTS[gate]
-    values: dict[str, bool] = dict(defaults)
+    values: dict[str, bool | tuple[str, ...]] = dict(defaults)
     provenance: dict[str, str] = dict.fromkeys(defaults, GATE_PROVENANCE_BUILTIN)
 
     project_gate = getattr(runtime_config.gates, gate)
@@ -2753,7 +2880,7 @@ def _merge_gate_repo_layer(
     gate: str,
     repo: str,
     runtime_config: RuntimeConfig,
-    values: dict[str, bool],
+    values: dict[str, bool | tuple[str, ...]],
     provenance: dict[str, str],
 ) -> None:
     """Field-wise merge *repo*'s override for *gate* over *values*/*provenance*, in place.
@@ -2785,6 +2912,60 @@ def _merge_gate_repo_layer(
         if override_value is not None:
             values[field_name] = override_value
             provenance[field_name] = GATE_PROVENANCE_REPO
+
+
+#: ``reachability.entry_points``'s built-in default (spec 4.4 bullet 2,
+#: D-17; AC-FUNC-006): the source_classification-derived entry-point-stem
+#: convention (``main``, ``app``, ``index``, ``__init__``, ...), sorted for
+#: a deterministic resolved value. Not itself a repo-relative path list --
+#: these are bare filename-stem conventions that
+#: ``cli._matches_reachability_entry_point`` matches against a candidate
+#: importer's own basename stem, so an operator who enables the gate
+#: without configuring ``entry_points`` still walks a non-empty,
+#: repo-agnostic graph instead of an always-empty one. An explicit
+#: project-level ``entry_points`` value (spec 4.4's "a list of
+#: repo-relative paths" contract) replaces this default wholesale. Derived
+#: from the shared ``source_classification.ENTRY_POINT_STEMS`` set rather
+#: than a new frozenset declared in this module (DoR bullet 3).
+_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT: tuple[str, ...] = tuple(sorted(ENTRY_POINT_STEMS))
+
+
+def _merge_reachability_entry_points(
+    runtime_config: RuntimeConfig,
+    values: dict[str, bool | tuple[str, ...]],
+    provenance: dict[str, str],
+) -> None:
+    """Merge the project layer for reachability's ``entry_points`` field, in place (spec 4.4 bullet 2).
+
+    Not folded into the generic ``GATE_FIELD_DEFAULTS``-driven merge in
+    :func:`_merge_gate_project_layer`/:func:`_merge_gate_repo_layer`: those
+    are typed (and, per D-17, populated) for boolean tunables only --
+    structural, list-valued fields have no built-in default to merge
+    against there (see ``constants.GATE_FIELD_DEFAULTS``'s own docstring).
+    ``entry_points`` is the first gate-specific tunable that DOES carry a
+    real built-in default (:data:`_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`,
+    AC-FUNC-006), so it gets its own narrow merge step here rather than
+    widening the generic mechanism for a single field.
+
+    No per-repo override layer is merged: this campaign configures a
+    single target repo (spec Section 9) and no acceptance criterion
+    requires a per-repo ``entry_points`` override, so
+    ``GateRepoOverrides.reachability`` (``GateEnabledOverride``) carries no
+    ``entry_points`` field at all -- there is no override layer to read.
+
+    Args:
+        runtime_config: Loaded runtime configuration.
+        values: The already project/repo/env-merged ``values`` dict for the
+            ``enabled`` field, updated in place with ``entry_points``.
+        provenance: Companion provenance dict, updated in place.
+    """
+    project_value = runtime_config.gates.reachability.entry_points
+    if project_value:
+        values["entry_points"] = project_value
+        provenance["entry_points"] = GATE_PROVENANCE_PROJECT
+    else:
+        values["entry_points"] = _REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT
+        provenance["entry_points"] = GATE_PROVENANCE_BUILTIN
 
 
 def resolve_gate_config(
@@ -2819,6 +3000,14 @@ def resolve_gate_config(
        precedence. Only ``enabled`` has an env layer (spec Section 7);
        gate-specific tunables have none.
 
+    ``reachability``'s ``entry_points`` field (spec 4.4 bullet 2, issue #10
+    AC2) is merged by an additional, gate-specific step
+    (:func:`_merge_reachability_entry_points`) after the four generic
+    layers above: built-in default
+    (:data:`_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`, source_classification-
+    derived) or project-level override, with provenance recorded the same
+    way (AC-FUNC-006).
+
     Pure function -- no I/O, no env reads; directly testable with an
     in-memory ``RuntimeConfig`` and a plain ``bool | None``.
 
@@ -2850,6 +3039,8 @@ def resolve_gate_config(
     if env_enabled_override is not None:
         values["enabled"] = env_enabled_override
         provenance["enabled"] = GATE_PROVENANCE_ENV
+    if gate == "reachability":
+        _merge_reachability_entry_points(runtime_config, values, provenance)
 
     return ResolvedGateConfig(gate=gate, values=values, provenance=provenance)
 

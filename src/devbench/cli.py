@@ -237,6 +237,7 @@ from devbench.constants import (
     FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    GATE_PROVENANCE_BUILTIN,
     GATE_TIER_MACHINE_BLOCKING,
     GATE_TIERS,
     KNOWN_JUDGE_NAMES,
@@ -4633,6 +4634,16 @@ def cmd_run_tests(unit_id: str) -> int:
 # is gone; `uv run devbench log-waiver ... --gate reachability` (spec 4.9,
 # PM-5) is the only way to clear a finding without fixing the wiring, and it
 # always leaves an audited record.
+#
+# Transitive reachability (issue #10 AC2, spec 4.4 bullet 2): a referrer
+# clears the candidate only when the referrer is itself reachable from the
+# configured `gates.reachability.entry_points` set
+# (`_is_reachable_from_entry_points`, cycle-safe via a visited set); a
+# candidate whose every referrer is itself unreachable is reported
+# `[POTENTIALLY UNREACHABLE via orphan-chain]`, distinct from the
+# no-referrer-at-all `[POTENTIALLY UNREACHABLE]` shape. `entry_points`
+# defaults, when unconfigured, to `source_classification`'s entry-point
+# stem convention rather than an empty walk (D-17, AC-FUNC-006).
 
 _REACHABILITY_GATE_NAME: str = "reachability"
 _REACHABILITY_STATUS_DISABLED: str = "disabled"
@@ -4790,6 +4801,128 @@ def _search_reachability_importers(repo_path: Path, rel_path: str, symbols: list
     return sorted(importers)
 
 
+def _matches_reachability_entry_point(rel_path: str, entry_points: tuple[str, ...]) -> bool:
+    """Return True when *rel_path* is one of the resolved ``entry_points`` roots.
+
+    Two independent match shapes share one predicate (issue #10 AC2, spec
+    4.4 bullet 2): an explicit, operator-configured ``entry_points`` value
+    (``gates.reachability.entry_points``, spec 4.1's "a list of
+    repo-relative paths" contract) matches *rel_path* literally, case-
+    sensitively, exactly like a real filesystem path. The
+    ``source_classification``-derived built-in default
+    (``config_loader.resolve_gate_config``'s ``entry_points`` field when
+    absent from config, AC-FUNC-006) instead carries bare filename-stem
+    conventions (``main``, ``app``, ``index``, ...) and matches against
+    *rel_path*'s own basename stem, lower-cased to match
+    :func:`devbench.source_classification.is_entry_point_stem`'s existing
+    case-insensitive convention (a component named ``App.tsx`` is a
+    recognised composition root regardless of case). The caller never needs
+    to know which of the two shapes applies -- both resolve through the
+    same ``entry_points`` tuple returned by ``resolve_gate_config``.
+    """
+    normalized = rel_path.replace("\\", "/")
+    if normalized in entry_points:
+        return True
+    filename = normalized.rsplit("/", 1)[-1]
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return stem.lower() in entry_points
+
+
+class _ReachabilityReferrerReadError(Exception):
+    """Raised when a referrer file cannot be read during the entry-point
+    reachability walk (:func:`_is_reachable_from_entry_points`).
+
+    Carries the referrer's own repo-relative path and the original read
+    failure so :func:`_reachability_scan_candidates` can render a
+    ``[LOAD_ERROR]`` finding naming the ACTUAL unreadable file (code_review
+    round-2 FAIL_FAST finding: cli.py:4888-4891 used to catch the read
+    failure unbound and return the default value ``False``, silently
+    converting "this referrer could not be read" into "this referrer is
+    unreachable"). This mirrors the only other ``except (OSError,
+    UnicodeDecodeError))`` site in this module -- the top-level candidate
+    read at the head of :func:`_reachability_scan_candidates`, which
+    already renders a counted ``[LOAD_ERROR]`` block instead of guessing a
+    verdict -- so a referrer that cannot be read gets the identical
+    fail-loud contract instead of a silent, wrong ``False``.
+    """
+
+    def __init__(self, rel_path: str, cause: OSError | UnicodeDecodeError) -> None:
+        super().__init__(f"{rel_path}: {cause}")
+        self.rel_path = rel_path
+        self.cause = cause
+
+
+def _is_reachable_from_entry_points(
+    repo_path: Path, rel_path: str, entry_points: tuple[str, ...], visited: set[str] | None = None
+) -> bool:
+    """Return True when *rel_path* is transitively reachable from *entry_points*.
+
+    Issue #10 AC2 / spec 4.4 bullet 2: a referencing file counts toward
+    clearing an orphan candidate only when the referencing file is ITSELF
+    reachable from the configured entry-point set. Reachability is defined
+    recursively over the same import-edge relation
+    :func:`_search_reachability_importers` already computes for the
+    top-level candidate: *rel_path* is reachable when it IS a configured
+    entry point (:func:`_matches_reachability_entry_point`), or when at
+    least one of ITS OWN non-test importers is itself reachable. Walking
+    "importers of X" back toward the entry-point set is equivalent to
+    walking "imports" forward from the entry-point set (spec 4.4 bullet 2's
+    "follow import and require edges") without a second, forward
+    graph-construction implementation.
+
+    *visited* bounds the walk against a mutual-import cycle (AC-FUNC-004):
+    every path visited in the current walk is recorded before recursing, so
+    a cycle terminates as "not reachable via this branch" rather than
+    recursing forever. Callers never pass *visited* explicitly -- it exists
+    so the function can thread the same set through its own recursive
+    calls; a fresh, empty set is created per top-level call.
+
+    Args:
+        repo_path: Absolute path to the target repo checkout.
+        rel_path: Repo-relative path being tested for reachability.
+        entry_points: The resolved ``gates.reachability.entry_points``
+            value (``resolve_gate_config("reachability", repo).values
+            ["entry_points"]``).
+        visited: Internal recursion state; leave at the default.
+
+    Returns:
+        True when *rel_path* is an entry point, or is (transitively)
+        imported by one. False when the walk exhausts every referrer
+        without reaching an entry point, or when *rel_path* does not exist
+        on disk.
+
+    Raises:
+        _ReachabilityReferrerReadError: *rel_path* exists on disk but
+            cannot be read (permission failure or non-UTF-8 decode
+            failure). The caller must not treat this as "unreachable" --
+            see the exception's own docstring.
+        RuntimeError: ``git grep`` exited rc>=2 while searching for one of
+            *rel_path*'s own importers (propagated from
+            :func:`_search_reachability_importers`, same fail-loud contract
+            as the top-level candidate search).
+    """
+    if visited is None:
+        visited = set()
+    if rel_path in visited:
+        return False
+    visited.add(rel_path)
+
+    if _matches_reachability_entry_point(rel_path, entry_points):
+        return True
+
+    abs_path = repo_path / rel_path
+    if not abs_path.is_file():
+        return False
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _ReachabilityReferrerReadError(rel_path, exc) from exc
+
+    symbols = _extract_reachability_symbols(content, rel_path)
+    importers = _search_reachability_importers(repo_path, rel_path, symbols)
+    return any(_is_reachable_from_entry_points(repo_path, importer, entry_points, visited) for importer in importers)
+
+
 def _reachability_ok_block(rel_path: str, symbols: list[str], importers: list[str]) -> str:
     """Render the ``[OK]`` report block for a candidate with at least one importer."""
     lines = [
@@ -4823,6 +4956,72 @@ def _reachability_unreachable_block(rel_path: str, symbols: list[str], canonical
             "--target <path> --reason <reason> --operator'.",
         ]
     )
+
+
+def _reachability_orphan_chain_block(
+    rel_path: str, symbols: list[str], importers: list[str], canonical_repo: str
+) -> str:
+    """Render the ``[POTENTIALLY UNREACHABLE via orphan-chain]`` report block (issue #10 AC2, spec 4.4 bullet 2).
+
+    Distinct from :func:`_reachability_unreachable_block`: *rel_path* DOES
+    have at least one non-test importer -- unlike the no-referrer-at-all
+    shape -- but every one of those importers is itself unreachable from
+    ``gates.reachability.entry_points``
+    (:func:`_is_reachable_from_entry_points`), so the reference chain never
+    actually terminates at a real composition root.
+    """
+    lines = [
+        f"[POTENTIALLY UNREACHABLE via orphan-chain] {rel_path}",
+        f"  Symbols checked: {', '.join(symbols)}",
+        f"  Non-test importers found: {len(importers)} (none reachable from a configured entry point)",
+    ]
+    for importer in importers[:_REACHABILITY_IMPORTER_DISPLAY_LIMIT]:
+        lines.append(f"    - {importer}")
+    if len(importers) > _REACHABILITY_IMPORTER_DISPLAY_LIMIT:
+        lines.append(f"    ... and {len(importers) - _REACHABILITY_IMPORTER_DISPLAY_LIMIT} more")
+    lines.append(
+        "  Every referrer above is itself unreachable from a configured entry point "
+        f"('gates.reachability.entry_points') in '{canonical_repo}'. Wire one of the referrers into "
+        "the app's real composition root (route table, parent container, shell), or record a "
+        "legitimate deferral with 'uv run devbench log-waiver <judge> <unit-id> --gate reachability "
+        "--target <path> --reason <reason> --operator'."
+    )
+    return "\n".join(lines)
+
+
+def _reachability_missing_entry_point(repo_path: Path, entry_points: tuple[str, ...], provenance: str) -> str | None:
+    """Return the first configured ``entry_points`` path missing from *repo_path*, or None.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    branch/return count within ruff's thresholds. Always returns ``None``
+    for the built-in (stem-based) default (*provenance* ==
+    :data:`GATE_PROVENANCE_BUILTIN`): those entries are matching
+    conventions, not literal paths, so no existence check applies to them
+    (spec Section 7 fail-fast rule, AC-FUNC-005 error path).
+
+    Defense-in-depth containment check (code_review round-2
+    MISSING_AC_EVIDENCE finding), independent of
+    :func:`devbench.config_loader._parse_reachability_entry_points`'s own
+    absolute/``..`` rejection at the config-parse boundary: a bare
+    ``(repo_path / entry_point).is_file()`` check is not by itself a safe
+    existence guard, because pathlib's ``/`` operator DISCARDS
+    *repo_path* whenever *entry_point* is absolute
+    (``Path('/tmp/x') / '/etc/hostname' == Path('/etc/hostname')``), so an
+    absolute or ``..``-escaping path could otherwise satisfy ``.is_file()``
+    against a file OUTSIDE the checkout and defeat the very guard this
+    function exists to provide. Every candidate is therefore resolved and
+    required to stay inside *repo_path* before the existence check runs.
+    """
+    if provenance == GATE_PROVENANCE_BUILTIN:
+        return None
+    resolved_repo_path = repo_path.resolve()
+    for entry_point in entry_points:
+        candidate = (repo_path / entry_point).resolve()
+        if not candidate.is_relative_to(resolved_repo_path):
+            return entry_point
+        if not candidate.is_file():
+            return entry_point
+    return None
 
 
 def _reachability_load_error_block(rel_path: str, exc: OSError | UnicodeDecodeError) -> str:
@@ -4981,6 +5180,102 @@ def cmd_gates() -> int:
     return 0
 
 
+def _load_reachability_gate_config_or_report(canonical_repo: str) -> "ResolvedGateConfig | int":
+    """Load config and resolve the reachability gate's config for *canonical_repo*.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    return/branch count within ruff's thresholds. Folds two of that
+    function's early-exit branches (config load failure, disabled gate)
+    into one caller-side check via the union return type: an ``int``
+    result means "already handled -- return this exit code as-is" (the
+    loader's own fail-fast ``ERROR:`` message, or the spec 5.2
+    ``{"gate":"reachability","status":"disabled"}`` line, is already
+    printed); a ``ResolvedGateConfig`` result means the gate is enabled and
+    the caller should proceed.
+    """
+    from devbench.config import resolve_gate_env_override
+    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
+
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    try:
+        runtime_config = load_runtime_config(cfg_path, os.environ)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    gate_config = resolve_gate_config(
+        _REACHABILITY_GATE_NAME,
+        canonical_repo,
+        runtime_config,
+        resolve_gate_env_override(_REACHABILITY_GATE_NAME),
+    )
+    if not gate_config.values["enabled"]:
+        print(json.dumps({"gate": _REACHABILITY_GATE_NAME, "status": _REACHABILITY_STATUS_DISABLED}))
+        return 0
+    return gate_config
+
+
+def _reachability_scan_candidates(
+    repo_path: Path, candidates: list[str], entry_points: tuple[str, ...], canonical_repo: str
+) -> tuple[list[str], int, int] | None:
+    """Scan *candidates* for reachability, rendering one report block per file.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    return/branch count within ruff's thresholds.
+
+    Returns:
+        ``(report_lines, unreachable_count, load_error_count)`` on success.
+        ``None`` after printing the loud ``git grep`` failure message (spec
+        Section 7) when :func:`_search_reachability_importers` raises
+        ``RuntimeError`` for any candidate -- the caller exits 1 in that
+        case with no further output.
+
+    A referrer that cannot be read during the entry-point walk
+    (:class:`_ReachabilityReferrerReadError`, raised by
+    :func:`_is_reachable_from_entry_points`) is rendered as a counted
+    ``[LOAD_ERROR]`` block naming the REFERRER that failed to read -- not
+    folded into a false ``[OK]``/orphan-chain verdict for *rel_path* --
+    matching the identical fail-loud contract already used for the
+    top-level candidate read a few lines above.
+    """
+    report_lines: list[str] = []
+    unreachable_count = 0
+    load_error_count = 0
+    for rel_path in candidates:
+        abs_path = repo_path / rel_path
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            load_error_count += 1
+            report_lines.append(_reachability_load_error_block(rel_path, exc))
+            continue
+
+        symbols = _extract_reachability_symbols(content, rel_path)
+        try:
+            importers = _search_reachability_importers(repo_path, rel_path, symbols)
+            reachable_importers = [
+                importer for importer in importers if _is_reachable_from_entry_points(repo_path, importer, entry_points)
+            ]
+        except _ReachabilityReferrerReadError as exc:
+            load_error_count += 1
+            report_lines.append(_reachability_load_error_block(exc.rel_path, exc.cause))
+            continue
+        except RuntimeError as exc:
+            print(f"ERROR: git grep failed: {exc}", file=sys.stderr)
+            return None
+
+        if not importers:
+            unreachable_count += 1
+            report_lines.append(_reachability_unreachable_block(rel_path, symbols, canonical_repo))
+        elif reachable_importers:
+            report_lines.append(_reachability_ok_block(rel_path, symbols, importers))
+        else:
+            unreachable_count += 1
+            report_lines.append(_reachability_orphan_chain_block(rel_path, symbols, importers, canonical_repo))
+
+    return report_lines, unreachable_count, load_error_count
+
+
 def cmd_check_reachability(unit_id: str) -> int:
     """Reachability gate: does *unit_id*'s Changes Manifest carry an orphaned source file?
 
@@ -4998,7 +5293,24 @@ def cmd_check_reachability(unit_id: str) -> int:
     target repo -- tracked and untracked, restricted to
     :func:`_reachability_search_pathspecs`'s source-classified pathspecs --
     for a word-boundary reference (register 315-D01/315-D02). A file
-    outside the unit's scope is never named in a finding (AC-FUNC-009).
+    outside the unit's Changes Manifest is never itself a *candidate*
+    (candidates come solely from :func:`resolve_changed_files`), but such
+    a file IS named as a referrer inside an ``[OK]``, orphan-chain or
+    ``[LOAD_ERROR]`` finding (AC-FUNC-009 governs candidate selection
+    only, not referrer naming).
+
+    Transitive reachability (issue #10 AC2, spec 4.4 bullet 2): a referrer
+    found by the search above clears the candidate only when the referrer
+    is ITSELF reachable from the resolved ``gates.reachability.entry_points``
+    set (:func:`_is_reachable_from_entry_points`), walked with a
+    cycle-safe visited set. A candidate with a referrer, but where every
+    referrer is unreachable, is reported ``[POTENTIALLY UNREACHABLE via
+    orphan-chain]`` rather than ``[OK]``. ``entry_points`` is read
+    exclusively through ``resolve_gate_config("reachability", repo)``
+    (AC-FUNC-007); an explicit, project-configured entry point that does
+    not exist in the repo checkout fails the whole run loudly before any
+    candidate is examined (spec Section 7 fail-fast rule) rather than
+    silently walking an empty graph.
 
     This is deliberately a heuristic, not a final verdict: a grep miss can
     be a false positive (dynamic ``import()``, barrel re-export the regex
@@ -5018,43 +5330,42 @@ def cmd_check_reachability(unit_id: str) -> int:
     ``{"gate":"reachability","tier":"machine-blocking","status":"pass"|"fail",
     "findings":<int>,"scope_hash":"<sha256>"}`` (AC-FUNC-008) followed by
     the human-readable findings. ``findings`` counts both
-    ``[POTENTIALLY UNREACHABLE]`` orphans and ``[LOAD_ERROR]`` unreadable
-    candidates -- a permission failure or a non-UTF-8 decode failure alike
-    (spec 4.4 bullet 4, AC-FUNC-005) -- the old silent ``[SKIPPED]`` branch
-    is gone.
+    ``[POTENTIALLY UNREACHABLE]`` orphans (including the orphan-chain
+    shape) and ``[LOAD_ERROR]`` unreadable candidates -- a permission
+    failure or a non-UTF-8 decode failure alike (spec 4.4 bullet 4,
+    AC-FUNC-005) -- the old silent ``[SKIPPED]`` branch is gone.
 
     Returns:
         0 when the gate is disabled, or an enabled run finds zero findings.
         1 when the work unit or repo cannot be resolved, when the config
-        file fails to load, when scope resolution fails (no status line
-        printed in that case), when ``git grep`` fails loudly (rc>=2, no
-        status line printed), or when an enabled run has at least one
-        finding.
+        file fails to load, when a configured (non-built-in)
+        ``gates.reachability.entry_points`` path does not exist in the repo
+        checkout, when scope resolution fails (no status line printed in
+        that case), when ``git grep`` fails loudly (rc>=2, no status line
+        printed), or when an enabled run has at least one finding.
     """
-    from devbench.config import DEFER_PR, resolve_gate_env_override
-    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
+    from devbench.config import DEFER_PR
 
     resolved = _resolve_unit_repo_and_path(unit_id)
     if resolved is None:
         return 1
     unit, canonical_repo, repo_path = resolved
 
-    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
-    try:
-        runtime_config = load_runtime_config(cfg_path, os.environ)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    gate_config = _load_reachability_gate_config_or_report(canonical_repo)
+    if isinstance(gate_config, int):
+        return gate_config
 
-    gate_config = resolve_gate_config(
-        _REACHABILITY_GATE_NAME,
-        canonical_repo,
-        runtime_config,
-        resolve_gate_env_override(_REACHABILITY_GATE_NAME),
+    entry_points = cast("tuple[str, ...]", gate_config.values["entry_points"])
+    missing_entry_point = _reachability_missing_entry_point(
+        repo_path, entry_points, gate_config.provenance["entry_points"]
     )
-    if not gate_config.values["enabled"]:
-        print(json.dumps({"gate": _REACHABILITY_GATE_NAME, "status": _REACHABILITY_STATUS_DISABLED}))
-        return 0
+    if missing_entry_point is not None:
+        print(
+            f"ERROR: gates.reachability.entry_points names a path that is not present in the repo: "
+            f"{missing_entry_point}",
+            file=sys.stderr,
+        )
+        return 1
 
     mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
     scope = _resolve_scope_or_report(unit_id, repo_path, mode)
@@ -5076,36 +5387,16 @@ def cmd_check_reachability(unit_id: str) -> int:
         if _is_reachability_candidate(rel_path) and (repo_path / rel_path).is_file()
     ]
 
-    report_lines: list[str] = []
-    unreachable_count = 0
-    load_error_count = 0
-
     if not candidates:
-        report_lines.append("No classified source files found in this work unit's Changes Manifest.")
+        report_lines = ["No classified source files found in this work unit's Changes Manifest."]
+        unreachable_count = 0
+        load_error_count = 0
     else:
-        report_lines.append(f"Candidate artifacts examined: {len(candidates)}")
-        for rel_path in candidates:
-            abs_path = repo_path / rel_path
-            try:
-                content = abs_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                load_error_count += 1
-                report_lines.append(_reachability_load_error_block(rel_path, exc))
-                continue
-
-            symbols = _extract_reachability_symbols(content, rel_path)
-            try:
-                importers = _search_reachability_importers(repo_path, rel_path, symbols)
-            except RuntimeError as exc:
-                print(f"ERROR: git grep failed: {exc}", file=sys.stderr)
-                return 1
-
-            if importers:
-                report_lines.append(_reachability_ok_block(rel_path, symbols, importers))
-            else:
-                unreachable_count += 1
-                report_lines.append(_reachability_unreachable_block(rel_path, symbols, canonical_repo))
-
+        scanned = _reachability_scan_candidates(repo_path, candidates, entry_points, canonical_repo)
+        if scanned is None:
+            return 1
+        candidate_lines, unreachable_count, load_error_count = scanned
+        report_lines = [f"Candidate artifacts examined: {len(candidates)}", *candidate_lines]
         report_lines.append(
             f"Summary: {len(candidates)} candidate(s) examined, {unreachable_count} potentially "
             f"unreachable, {load_error_count} load error(s)."

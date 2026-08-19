@@ -385,14 +385,26 @@ validate:
 # gates.repos.<org/repo>.shared_file_impact.patterns) and PR #322's bare
 # top-level opt-in block (now gates.fixture_consistency). See
 # docs/devbench-yaml-reference.md for the full four-layer precedence model
-# (built-in -> project -> per-repo override
-# -> env, D-15) -- the resolver that reads this precedence chain
-# (resolve_gate_config) ships in a follow-up task; this config model landing
-# alone does not yet change any gate command's behaviour.
+# (built-in -> project -> per-repo override -> env, D-15), read exclusively
+# through `config_loader.resolve_gate_config`; each per-gate check command
+# adopts the resolver as its own epic lands (check-reachability already
+# does, spec 4.4).
 # ---------------------------------------------------------------------------
 # gates:
 #   reachability:                       # caylent-solutions/devbench-internal-backlog#10
 #     enabled: false
+#     # Repo-relative paths seeding the transitive reachability walk (issue
+#     # #10 AC2). Absent/empty defaults to the source_classification-derived
+#     # entry-point stem set (main, app, index, __init__, ...), which is the
+#     # built-in default shown here -- an explicit list (e.g. entry_points:
+#     # [src/index.ts, cmd/server/main.go]) replaces it wholesale, and each
+#     # path must exist in the repo checkout or `devbench check-reachability`
+#     # fails loudly at run time naming the missing path, checked before any
+#     # candidate is examined. Config load itself performs no existence
+#     # check -- it only rejects (fails fast) an absolute path or a path
+#     # containing a `..` segment, naming gates.reachability.entry_points
+#     # and the offending value.
+#     entry_points: []
 #   ancestry:                           # caylent-solutions/devbench-internal-backlog#12
 #     enabled: false
 #   shared_file_impact:                 # caylent-solutions/devbench-internal-backlog#13

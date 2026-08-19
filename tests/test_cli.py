@@ -3340,11 +3340,11 @@ class TestCmdMarkDoneGateRefusal:
         return backlog_index, wu_file, mock_parser
 
     def _reachability_enabled_runtime_config(self) -> object:
-        from devbench.config_loader import GateEnabledConfig, GatesConfig, RepoConfig, RuntimeConfig
+        from devbench.config_loader import GateReachabilityConfig, GatesConfig, RepoConfig, RuntimeConfig
 
         return RuntimeConfig(
             repos={self._REPO: RepoConfig()},
-            gates=GatesConfig(reachability=GateEnabledConfig(enabled=True)),
+            gates=GatesConfig(reachability=GateReachabilityConfig(enabled=True)),
         )
 
     def test_enabled_gate_without_record_refuses_and_writes_nothing(
@@ -7126,6 +7126,120 @@ class TestReachabilityHelperFunctions:
         pathspecs = cli._reachability_search_pathspecs()
         assert pathspecs == sorted(f"*.{ext.lstrip('.')}" for ext in _CLI_REACHABILITY_HISTORICAL_EXTENSIONS)
 
+    # -- _matches_reachability_entry_point (issue #10 AC2) ----------------
+
+    def test_matches_entry_point_literal_path_match(self) -> None:
+        assert cli._matches_reachability_entry_point("src/main.py", ("src/main.py",)) is True
+
+    def test_matches_entry_point_stem_match_is_case_insensitive(self) -> None:
+        """The built-in stem-based default (bare lower-case stems) matches a
+        candidate like ``App.tsx`` regardless of the file's own casing."""
+        assert cli._matches_reachability_entry_point("src/App.tsx", ("app",)) is True
+
+    def test_matches_entry_point_no_match_returns_false(self) -> None:
+        assert cli._matches_reachability_entry_point("src/Consumer.tsx", ("main", "app")) is False
+
+    # -- _is_reachable_from_entry_points (issue #10 AC2) -------------------
+
+    def test_is_reachable_true_when_path_itself_is_an_entry_point(self, tmp_path: Path) -> None:
+        assert cli._is_reachable_from_entry_points(tmp_path, "src/main.py", ("main",)) is True
+
+    def test_is_reachable_false_when_already_visited(self, tmp_path: Path) -> None:
+        """AC-FUNC-004: the visited-set cycle guard short-circuits a path
+        already in the current walk. The file is created on disk with real,
+        importable content -- and is itself an entry point by stem -- so
+        that only the ``if rel_path in visited: return False`` guard can
+        produce ``False`` here; without it, the function would instead
+        reach ``_matches_reachability_entry_point`` and return ``True``,
+        which is what makes this test able to fail if the guard is
+        deleted (test_review round-2 non-discriminating-assertion finding:
+        the old version pointed at a nonexistent path, so the surviving
+        ``if not abs_path.is_file(): return False`` branch produced the
+        identical result and the mutated (guard-deleted) code stayed
+        green)."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src/Already.tsx").write_text("export function Already() { return null; }\n", encoding="utf-8")
+        visited = {"src/Already.tsx"}
+        assert cli._is_reachable_from_entry_points(tmp_path, "src/Already.tsx", ("already",), visited) is False
+
+    def test_is_reachable_false_when_path_does_not_exist_on_disk(self, tmp_path: Path) -> None:
+        assert cli._is_reachable_from_entry_points(tmp_path, "src/does-not-exist.tsx", ()) is False
+
+    def test_is_reachable_raises_when_file_unreadable(self, tmp_path: Path) -> None:
+        """code_review round-2 FAIL_FAST finding: a referrer that cannot be
+        read must not silently degrade to a ``False`` ('unreachable')
+        verdict -- the old behaviour this test used to pin. The read
+        failure must propagate as ``_ReachabilityReferrerReadError``,
+        carrying the referrer's own path and the original cause, so the
+        caller (``_reachability_scan_candidates``) is the one that decides
+        how to report it (a counted ``[LOAD_ERROR]`` finding naming the
+        REFERRER, matching the identical top-level-candidate contract --
+        see ``TestCmdCheckReachabilityOrphanChain
+        ::test_unreadable_referrer_produces_load_error_finding_naming_referrer``
+        for the end-to-end assertion)."""
+        (tmp_path / "src").mkdir()
+        target = tmp_path / "src/Broken.tsx"
+        target.write_text("export function Broken() { return null; }\n", encoding="utf-8")
+        real_read_text: Callable[..., str] = Path.read_text
+
+        def fake_read_text(path_self: Path, *args: object, **kwargs: object) -> str:
+            if path_self.name == "Broken.tsx":
+                raise OSError("permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        with (
+            patch.object(Path, "read_text", fake_read_text),
+            pytest.raises(cli._ReachabilityReferrerReadError) as exc_info,
+        ):
+            cli._is_reachable_from_entry_points(tmp_path, "src/Broken.tsx", ())
+
+        assert exc_info.value.rel_path == "src/Broken.tsx"
+        assert isinstance(exc_info.value.cause, OSError)
+        assert "permission denied" in str(exc_info.value.cause)
+
+    # -- _reachability_missing_entry_point (code_review round-2 -----------
+    # -- MISSING_AC_EVIDENCE finding: containment defense-in-depth) -------
+
+    def test_missing_entry_point_none_for_builtin_provenance_without_touching_disk(self, tmp_path: Path) -> None:
+        assert cli._reachability_missing_entry_point(tmp_path, ("main", "app"), "builtin") is None
+
+    def test_missing_entry_point_none_when_project_path_exists(self, tmp_path: Path) -> None:
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src/main.py").write_text("print('hi')\n", encoding="utf-8")
+        assert cli._reachability_missing_entry_point(tmp_path, ("src/main.py",), "project") is None
+
+    def test_missing_entry_point_names_path_absent_from_repo(self, tmp_path: Path) -> None:
+        assert cli._reachability_missing_entry_point(tmp_path, ("src/does-not-exist.py",), "project") == (
+            "src/does-not-exist.py"
+        )
+
+    def test_missing_entry_point_names_absolute_path_outside_repo_even_though_it_exists_on_disk(
+        self, tmp_path: Path
+    ) -> None:
+        """Reproduces the reviewer's direct pathlib finding
+        (``Path('/tmp/somerepo') / '/etc/hostname' == Path('/etc/hostname')``):
+        an absolute *entry_point* that genuinely exists on disk, but OUTSIDE
+        *repo_path*, must still be reported as 'missing' -- the containment
+        check runs before ``.is_file()`` is trusted, so a real file outside
+        the checkout can never silently satisfy this guard."""
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        outside_file = tmp_path / "outside.py"
+        outside_file.write_text("print('not in the checkout')\n", encoding="utf-8")
+        assert str(outside_file).startswith("/")
+
+        assert cli._reachability_missing_entry_point(repo_path, (str(outside_file),), "project") == str(outside_file)
+
+    def test_missing_entry_point_names_dotdot_path_escaping_repo_even_though_it_exists_on_disk(
+        self, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        outside_file = tmp_path / "outside.py"
+        outside_file.write_text("print('not in the checkout')\n", encoding="utf-8")
+
+        assert cli._reachability_missing_entry_point(repo_path, ("../outside.py",), "project") == "../outside.py"
+
 
 def _gates_table_cells(line: str) -> list[str]:
     """Split one rendered ``devbench gates`` line back into its cells.
@@ -7335,19 +7449,18 @@ class TestCmdGates:
         assert "not found" in captured.err
 
 
-class TestCmdCheckReachability:
-    """Tests for cmd_check_reachability (caylent-solutions/devbench-internal-backlog#10:
-    reachability gate; spec `integration-reality-gates-hardening.md` 4.4).
+class _ReachabilityCmdFixtures:
+    """Shared git-fixture / config-fixture helpers for
+    ``cmd_check_reachability`` test classes (caylent-solutions/devbench-internal-backlog#10).
 
-    Scope is resolved through ``devbench.work_unit_scope.resolve_changed_files``
-    (spec 4.3, AC-9) against a real, on-disk Changes Manifest written by
-    ``_seed_scope_backlog`` -- never a mocked ``devbench.cli.BacklogParser``
-    return value alone, since that helper only serves ``cli.py``'s own
-    unit/repo lookup in ``_resolve_unit_repo_and_path`` and not
-    ``work_unit_scope``'s independent ``BacklogParser`` lookup (see that
-    helper's own docstring). Uses a real git repo (not a mocked
-    ``run_command``) so the ``git grep`` based importer search exercises
-    real git semantics end-to-end.
+    Deliberately NOT ``Test``-prefixed so pytest never collects it directly
+    (code_review/test_review round-2 DRY finding): the two concrete classes
+    below used to be related by subclassing one collected ``Test*`` class
+    from the other, which made pytest re-collect and re-execute every
+    parent test method under the subclass as well (30 collected node ids,
+    only 8 genuinely new). Both ``TestCmdCheckReachability`` and
+    ``TestCmdCheckReachabilityOrphanChain`` inherit from this mixin
+    instead, so each test method executes exactly once.
     """
 
     _REPO = "caylent-solutions/git-repo"
@@ -7415,15 +7528,15 @@ class TestCmdCheckReachability:
         subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
         return repo
 
-    @staticmethod
-    def _write_gate_config(tmp_path: Path, gates_block: str) -> Path:
+    @classmethod
+    def _write_gate_config(cls, tmp_path: Path, gates_block: str) -> Path:
         """Write a scratch ``devbench.yaml`` resolving ``resolve_gate_config``'s
         project layer, separate from the ``_seed_scope_backlog`` Manifest tree
         and from the git fixture repo."""
         cfg_dir = tmp_path / "cfgdir"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         cfg_path = cfg_dir / "devbench.yaml"
-        cfg_path.write_text(f"repos:\n  {TestCmdCheckReachability._REPO}:\n    default_branch: main\n{gates_block}")
+        cfg_path.write_text(f"repos:\n  {cls._REPO}:\n    default_branch: main\n{gates_block}")
         return cfg_path
 
     def _run(
@@ -7458,6 +7571,24 @@ class TestCmdCheckReachability:
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             return cli.cmd_check_reachability(unit_id)
+
+
+class TestCmdCheckReachability(_ReachabilityCmdFixtures):
+    """Tests for cmd_check_reachability (caylent-solutions/devbench-internal-backlog#10:
+    reachability gate; spec `integration-reality-gates-hardening.md` 4.4).
+
+    Scope is resolved through ``devbench.work_unit_scope.resolve_changed_files``
+    (spec 4.3, AC-9) against a real, on-disk Changes Manifest written by
+    ``_seed_scope_backlog`` -- never a mocked ``devbench.cli.BacklogParser``
+    return value alone, since that helper only serves ``cli.py``'s own
+    unit/repo lookup in ``_resolve_unit_repo_and_path`` and not
+    ``work_unit_scope``'s independent ``BacklogParser`` lookup (see that
+    helper's own docstring). Uses a real git repo (not a mocked
+    ``run_command``) so the ``git grep`` based importer search exercises
+    real git semantics end-to-end. Fixture helpers live on
+    ``_ReachabilityCmdFixtures`` (shared with
+    ``TestCmdCheckReachabilityOrphanChain``).
+    """
 
     # -- unit/repo/config resolution failures ---------------------------
 
@@ -7662,11 +7793,19 @@ class TestCmdCheckReachability:
     def test_importer_list_truncated_after_ten(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """AC-FUNC-002: one of the 11 importers (`App.tsx`) is itself reachable
+        from the built-in entry-point-stem default, so `[OK]` still clears the
+        candidate under the orphan-chain layer -- the other 10 (`Consumer*.tsx`,
+        none of them entry points) exist purely to exercise the display-limit
+        truncation this test pins."""
         unit_id = "E0-F1-S1-T1"
         repo = self._git_repo(tmp_path)
         (repo / "src").mkdir()
         (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
-        for i in range(11):
+        (repo / "src/App.tsx").write_text(
+            "import { Widget } from './Widget'; // entry-point importer\n", encoding="utf-8"
+        )
+        for i in range(10):
             (repo / f"src/Consumer{i}.tsx").write_text(
                 f"import {{ Widget }} from './Widget'; // consumer {i}\n", encoding="utf-8"
             )
@@ -7868,7 +8007,11 @@ class TestCmdCheckReachability:
             "import { InScope } from './InScope';\nexport function App() { return InScope; }\n", encoding="utf-8"
         )
         # Orphaned, but deliberately NOT part of this unit's Changes Manifest
-        # -- a finding may only name a file inside `scope.files` (AC-FUNC-009).
+        # -- a *candidate* may only come from `scope.files` (AC-FUNC-009);
+        # this file has no importer at all, so it is never named as a
+        # referrer either (referrer naming, unlike candidate selection, is
+        # not Manifest-scoped -- see the [OK]/orphan-chain/[LOAD_ERROR]
+        # importer lists).
         (repo / "src/OutOfScopeOrphan.tsx").write_text(
             "export default function Impl() { return null; }\n", encoding="utf-8"
         )
@@ -7879,6 +8022,329 @@ class TestCmdCheckReachability:
 
         assert result == 0
         assert "OutOfScopeOrphan" not in out
+
+
+class TestCmdCheckReachabilityOrphanChain(_ReachabilityCmdFixtures):
+    """Transitive reachability / `gates.reachability.entry_points` tests
+    (caylent-solutions/devbench-internal-backlog#10 AC2; spec
+    `integration-reality-gates-hardening.md` 4.4 bullet 2; AC-FUNC-001
+    through AC-FUNC-007).
+
+    Inherits from ``_ReachabilityCmdFixtures`` (shared with
+    ``TestCmdCheckReachability``, not a ``Test*``-collected class) to get
+    its git-fixture helpers (``_git_repo``, ``_write_gate_config``, ``_run``,
+    ``_make_unit``) and, critically, its autouse ``_isolate_git_locator_env``
+    fixture -- every test method here shells out to ``git init``/``git
+    commit`` via the inherited ``_git_repo``, so it needs the exact same
+    repository-locator isolation as ``TestCmdCheckReachability``. Neither
+    class re-collects the other's test methods (test_review round-2 DRY
+    finding).
+    """
+
+    # -- AC-FUNC-001: every referrer itself unreachable -> orphan-chain ---
+
+    def test_referrer_unreachable_from_any_entry_point_reports_orphan_chain(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/legacy").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/legacy/unused_panel.py").write_text(
+            "# refers to Widget, but nothing imports this module\nWidget = None\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+        assert "src/legacy/unused_panel.py" in out
+        assert "[OK] src/Widget.tsx" not in out
+
+    # -- code_review round-2 FAIL_FAST fix: unreadable referrer ------------
+
+    def test_unreadable_referrer_produces_load_error_finding_naming_referrer(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A referrer that cannot be read during the entry-point walk must
+        become a counted ``[LOAD_ERROR]`` finding naming the REFERRER, not a
+        silent ``False`` 'unreachable' verdict that would wrongly flip the
+        candidate to ``[POTENTIALLY UNREACHABLE via orphan-chain]``
+        (code_review round-2 FAIL_FAST finding, cli.py:4888-4891 --
+        pinned at the helper level by
+        ``TestReachabilityHelperFunctions::test_is_reachable_raises_when_file_unreadable``;
+        this is the end-to-end assertion that the caller renders the loud
+        finding rather than swallowing the exception)."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/Broken.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function Broken() { return Widget; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        real_read_text: Callable[..., str] = Path.read_text
+
+        def fake_read_text(path_self: Path, *args: object, **kwargs: object) -> str:
+            if path_self.name == "Broken.tsx":
+                raise OSError("permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", fake_read_text):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[LOAD_ERROR] src/Broken.tsx" in out
+        assert "Could not read file" in out
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" not in out
+        assert "[OK] src/Widget.tsx" not in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 1
+        assert status_line["status"] == "fail"
+
+    # -- AC-FUNC-002: referrer reachable through one intermediate module ---
+
+    def test_referrer_reachable_through_intermediate_module_clears_candidate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/Mid.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function Mid() { return Widget; }\n", encoding="utf-8"
+        )
+        (repo / "src/App.tsx").write_text(
+            "import { Mid } from './Mid';\nexport function App() { return Mid; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Widget.tsx" in out
+        assert "orphan-chain" not in out
+
+    # -- AC-FUNC-004: mutual-import cycle terminates, orphan-chain finding -
+
+    def test_mutual_import_cycle_terminates_and_reports_orphan_chain(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/CycleA.tsx").write_text(
+            "import { Widget } from './Widget';\n"
+            "import { CycleB } from './CycleB';\n"
+            "export function CycleA() { return Widget && CycleB; }\n",
+            encoding="utf-8",
+        )
+        (repo / "src/CycleB.tsx").write_text(
+            "import { CycleA } from './CycleA';\nexport function CycleB() { return CycleA; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+
+    # -- AC-FUNC-003: both orphan shapes counted in the same findings total
+
+    def test_both_orphan_shapes_counted_in_findings_total(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/NoReferrer.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        (repo / "src/ChainedOrphan.tsx").write_text(
+            "export function ChainedOrphan() { return null; }\n", encoding="utf-8"
+        )
+        (repo / "src/DeadReferrer.tsx").write_text(
+            "import { ChainedOrphan } from './ChainedOrphan';\nChainedOrphan();\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path, unit_id=unit_id, files=("src/NoReferrer.tsx", "src/ChainedOrphan.tsx")
+        )
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/NoReferrer.tsx" in out
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/ChainedOrphan.tsx" in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 2
+
+    # -- orphan-chain importer list truncation (display-limit coverage) ---
+
+    def test_orphan_chain_importer_list_truncated_after_ten(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        for i in range(11):
+            (repo / f"src/DeadConsumer{i}.tsx").write_text(
+                f"import {{ Widget }} from './Widget'; // dead consumer {i}\n", encoding="utf-8"
+            )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+        assert "Non-test importers found: 11 (none reachable from a configured entry point)" in out
+        assert "... and 1 more" in out
+
+    # -- gates.reachability.entry_points: explicit config, positive path --
+
+    def test_explicit_entry_points_config_clears_via_literal_path_match(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A referrer named outside the built-in entry-point-stem convention
+        (``CustomRoot`` is not one of ``main``/``app``/``index``/...) still
+        clears the candidate once it is explicitly configured via
+        ``gates.reachability.entry_points`` -- proving the literal-path
+        match branch, distinct from every other test in this module (which
+        exercises the built-in stem-based default via ``App.tsx``)."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/CustomRoot.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function CustomRoot() { return Widget; }\n",
+            encoding="utf-8",
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = "gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - src/CustomRoot.tsx\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Widget.tsx" in out
+
+    def test_explicit_entry_points_config_replaces_default_not_merges(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once ``entry_points`` is explicitly configured, the built-in
+        stem-based default no longer applies: ``App.tsx`` (a default entry
+        point) does NOT clear the candidate when the resolved config
+        carries only the explicit, unrelated path."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function App() { return Widget; }\n", encoding="utf-8"
+        )
+        (repo / "src/CustomRoot.tsx").write_text("export function CustomRoot() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = "gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - src/CustomRoot.tsx\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+
+    # -- gates.reachability.entry_points: existence check (fail-fast) -----
+
+    def test_configured_entry_point_missing_from_repo_fails_loud_before_scan(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = "gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - src/does-not-exist.py\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert (
+            "ERROR: gates.reachability.entry_points names a path that is not present in the repo: "
+            "src/does-not-exist.py" in captured.err
+        )
+
+    # -- gates.reachability.entry_points: repo-relativity is enforced -----
+
+    @pytest.mark.parametrize(
+        "entry_point",
+        [
+            pytest.param("/etc/hostname", id="absolute_path"),
+            pytest.param("../escape.py", id="parent_traversal"),
+        ],
+    )
+    def test_configured_entry_point_outside_repo_fails_loud_at_config_load(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        entry_point: str,
+    ) -> None:
+        """code_review round-2 MISSING_AC_EVIDENCE finding: an absolute path
+        or a ``..`` escape must never reach
+        ``_reachability_missing_entry_point``'s ``.is_file()`` existence
+        check at all -- ``repo_path / entry_point`` silently discards
+        *repo_path* for an absolute right operand, so a bare existence
+        check alone is not a safe guard. Both shapes are now rejected
+        fail-fast during config load (schema ``pattern`` on
+        ``entry_points`` items, config-schema.json), before
+        ``cmd_check_reachability`` ever resolves the gate or scans a
+        candidate.
+
+        test_review round-2 non-discriminating-assertion finding
+        (``parent_traversal`` only -- ``absolute_path`` already
+        discriminates): ``../escape.py`` never existed on disk here, so a
+        mutant that deleted all three repo-relativity guards (the schema
+        ``pattern``, ``_parse_reachability_entry_points``'s own ``..``
+        rejection, and ``_reachability_missing_entry_point``'s
+        ``resolve()``/``is_relative_to()`` containment check) still hit
+        the harmless ``candidate.is_file()`` branch, since a nonexistent
+        path is not a file either way, and produced the identical
+        ``ERROR: ... names a path that is not present in the repo``
+        output -- indistinguishable from the guards-intact result this
+        test pins. A real file now sits at the escaped location
+        (``tmp_path / "escape.py"``, sibling of the ``checkout`` repo
+        directory ``../escape.py`` resolves to) so that if all three
+        guards were absent, ``.is_file()`` would find it and the run
+        would proceed past the existence check entirely -- printing
+        non-empty stdout and no ``ERROR:`` line, which fails the
+        assertions below and makes this test able to catch that
+        regression."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (tmp_path / "escape.py").write_text("# genuinely exists outside the checkout\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = f"gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - {entry_point}\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "gates.reachability.entry_points" in captured.err
 
 
 class TestCmdGetDiffModeAware:

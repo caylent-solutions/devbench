@@ -498,12 +498,17 @@
       "properties": {
         "reachability": {
           "type": "object",
-          "description": "check-reachability gate (caylent-solutions/devbench-internal-backlog#10). No gate-specific tunables beyond enabled.",
+          "description": "check-reachability gate (caylent-solutions/devbench-internal-backlog#10). entry_points seeds the transitive reachability walk (issue #10 AC2).",
           "additionalProperties": false,
           "properties": {
             "enabled": {
               "type": "boolean",
               "description": "Enable the reachability gate for this workspace. Default false."
+            },
+            "entry_points": {
+              "type": "array",
+              "description": "Repo-relative paths seeding the transitive reachability walk (issue #10 AC2, spec 4.4 bullet 2). Absent or empty defaults to the built-in source_classification-derived entry-point stem set (main, app, index, __init__, setup, conftest, wsgi, asgi) matched against each candidate importer's own basename stem. Each path must be repo-relative: no leading '/' (absolute) and no '..' parent-traversal segment, or config load fails fast naming the offending value.",
+              "items": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$" }
             }
           }
         },

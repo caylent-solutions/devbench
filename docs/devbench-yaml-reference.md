@@ -315,6 +315,7 @@ git_ops:
   auto_finalize: false          # auto-run git-ops-finalize when all WUs terminal
   auto_merge: false             # auto-merge after CI green (requires auto_finalize + defer_pr)
   orphan_patterns: []           # replaces built-in orphan fnmatch list when non-empty
+  # provenance_path: docs/release-notes/provenance-map.json  # PR-body provenance map (below)
   pr_review_resolution:
     enabled: false
     agents: []
@@ -322,6 +323,64 @@ git_ops:
     settle_seconds: 60
     poll_interval: 5
 ```
+
+### `git_ops.provenance_path` -- PR-body provenance map (spec 4.13; D-17)
+
+Path to a JSON provenance map that `git-ops-finalize` reads to compose the batch PR body: the PR
+title, one `###`-headed per-epic summary section, then a closing-keyword block with one
+`Fixes ...` line per mapped issue (`Fixes <org>/<repo>#<n>` cross-repo, `Fixes #<n>` same-repo,
+both rendered by the same code path). Without a resolved map, `git-ops-finalize` composes a plain
+body that carries no closing-keyword block, so issues in the batch never auto-close on merge
+(the gap observed on PR #334).
+
+- **Default:** unset. With no `provenance_path` and no `--provenance` flag, the composed body is
+  byte-identical to the plain body `git-ops-finalize` has always produced -- this key is a pure
+  additive opt-in (spec Section 6).
+- **Override:** `git-ops-finalize --provenance <path>` beats this config key for a single
+  invocation; the config key alone is what lets an unattended `auto_finalize` run pick up the
+  feature with no operator step. There is no `DEVBENCH_*` environment override for this key
+  (YAML-only, the same as its sibling path/name settings `single_branch` and `branch_prefix`
+  above).
+- **Path resolution:** a relative value (from either the config key or the `--provenance` flag)
+  resolves against the TARGET REPO working tree -- the local filesystem path that
+  `repos.<org/repo>.checkout_directory` resolves to for the `<repo>` positional `git-ops-finalize`
+  runs against -- never `DEVBENCH_WORKSPACE_ROOT` and never the devbench process's current working
+  directory. An absolute path is used as-is. `git_ops` (including `provenance_path`) is a single
+  GLOBAL config block, while `git-ops-finalize <repo>` runs per repo, so in a multi-repo workspace
+  one relative `provenance_path` value resolves to a DIFFERENT file inside each repo's checkout.
+  Either point the relative value at a path that exists identically in every target repo, use an
+  absolute path, or override the value per repo with `--provenance` at invocation time.
+- **Failure mode:** a configured or passed path that is missing, unreadable, not valid JSON, or
+  parses to zero mapped issues fails the command loudly (exit 1, naming the path) before any push
+  happens -- it never silently falls back to the plain body. This list is not exhaustive: any
+  structurally malformed map fails the same way (loudly, naming the path, before any push) --
+  including a payload that does not decode to a JSON object, a missing or non-list top-level
+  `epics`, a non-object epic entry, an epic missing a non-empty `name` or `summary`, an epic whose
+  `issues` is present but not a list, a non-object issue entry, an issue missing an integer
+  `number`, and an issue `repo` that is not an `owner/name` string.
+
+Provenance map shape (required fields marked):
+
+```json
+{
+  "epics": [
+    {
+      "name": "E1: Cherry-pick integration",
+      "summary": "One-line summary of what this epic delivered.",
+      "issues": [
+        {"repo": "org/other-repo", "number": 10},
+        {"number": 335}
+      ]
+    }
+  ]
+}
+```
+
+Top-level `epics` is required and must be a list. Each epic requires a non-empty string `name`
+and a non-empty string `summary`; an epic's `issues` is optional but, when present, must be a
+list. Each `issues` entry needs an integer `number`; an omitted `repo` (or a `repo` equal to the
+target repo) renders the same-repo `Fixes #<n>` form, any other `repo` (a string matching
+`owner/name`) renders the cross-repo `Fixes <repo>#<n>` form.
 
 ---
 

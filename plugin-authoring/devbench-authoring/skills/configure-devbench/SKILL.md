@@ -616,6 +616,16 @@ When true, the orchestrate skill automatically invokes `gh pr merge --<merge_str
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
 
+#### `git_ops.provenance_path` -- PR-body provenance map
+
+Path to a JSON provenance map `git-ops-finalize` reads to compose the batch PR body: title, a per-epic summary section, and one closing-keyword `Fixes ...` line per mapped issue (cross-repo or same-repo, from a single rendering path). Overridden per-invocation by `git-ops-finalize --provenance <path>`; the flag beats this key. A relative value resolves against the TARGET REPO working tree (the `repos.<org/repo>` checkout `git-ops-finalize` runs against), never the workspace root or the devbench process CWD; this is a GLOBAL key, so one relative value resolves to a different file inside each repo's checkout in a multi-repo workspace.
+
+- **Recommended:** `unset` -- preserves the plain PR body `git-ops-finalize` has always produced.
+- **Alternatives:** `docs/release-notes/provenance-map.json` (composes the title, per-epic summary and closing-keyword block from that file's provenance map instead of the plain body; useful for unattended `auto_finalize` runs that need issues to auto-close on merge. Resolved relative to the target repo's working tree, not this workspace.)
+- **Free-form:** Enter any path to a JSON provenance map file (an absolute path, or a path relative to the target repo's working tree), or leave blank to keep the plain body. No `DEVBENCH_*` environment override exists for this key.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
 #### `git_ops.pr_review_resolution.enabled` -- PR review-bot polling (master toggle)
 
 Top-level toggle for issue #116's PR review-comment polling. When false, the entire phase is a no-op. When true, `git-ops` polls `gh pr view` for asynchronous bot review feedback before merging. Overridable via the `DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED` env var.

@@ -149,6 +149,21 @@ git_ops:
   # <workspace>/.devbench/auto-merge-fired-<repo>.marker prevents duplicates.
   # Default: false.
   auto_merge: false
+  # Spec 4.13 / D-17: path to a JSON provenance map that git-ops-finalize
+  # reads to compose the batch PR body (title, per-epic summary, and one
+  # closing-keyword "Fixes ..." line per mapped issue), instead of the
+  # plain body. Overridden per-invocation by `git-ops-finalize --provenance
+  # <path>`; the flag beats this key. Unset (the default) preserves the
+  # plain PR body git-ops-finalize has always produced. No DEVBENCH_*
+  # environment override for this key (YAML-only, like single_branch and
+  # branch_prefix above). A relative value resolves against the TARGET
+  # REPO working tree (the repos.<org/repo> checkout git-ops-finalize is
+  # running against), never against the workspace root or the devbench
+  # process CWD; an absolute path is used as-is. This key is a GLOBAL
+  # block while git-ops-finalize runs per repo, so one relative value
+  # resolves to a different file inside each repo's checkout in a
+  # multi-repo workspace -- see docs/devbench-yaml-reference.md.
+  # provenance_path: docs/release-notes/provenance-map.json
   # Issue #116: opt-in PR review-comment polling. When enabled, cmd_git_ops
   # polls `gh pr view` between CI-pass and merge for asynchronous review
   # bot comments (Copilot, Q-Dev, internal review services).

@@ -373,7 +373,7 @@ Print the work-unit content (the `.md` file body) plus the resolved repo path as
 
 ## Gates
 
-Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver` and `log-newly-reachable` -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
+Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver`, `log-newly-reachable` and the `git-ops-finalize --provenance` flag -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
 
 ### `gates`
 
@@ -475,6 +475,49 @@ Example (spec 4.9(a)):
 $ uv run devbench log-newly-reachable E9-F1-S1-T1 \
     --path src/ui/LegacyPanel.tsx --method manual --result verified
 {"unit_id": "E9-F1-S1-T1", "path": "src/ui/LegacyPanel.tsx", "method": "manual", "result": "verified"}
+```
+
+### `git-ops-finalize --provenance`
+
+```
+uv run devbench git-ops-finalize <repo> [--provenance <path>]
+```
+
+Spec 4.13 / D-17 (issue #334): `git-ops-finalize`'s PR body is composed by `GitOpsService.compose_finalize_pr_body`, which reads a JSON provenance map and renders the PR title, one per-epic summary section, then a closing-keyword block with one `Fixes ...` line per mapped issue -- so the combined PR auto-closes every issue it fixes on merge, whether or not GitHub's auto-close already fired via a per-commit reference. Full command semantics live under [`git-ops-finalize`](#git-ops-finalize) in [Git operations](#git-operations); this entry documents the flag and the map it reads.
+
+Precedence: `--provenance <path>` beats `git_ops.provenance_path` in `devbench.yaml` for this single invocation; the config key alone is what lets an unattended `auto_finalize` run pick up the feature with no operator step. With neither set, the composed body is byte-identical to the plain body `git-ops-finalize` has always produced -- this is a pure additive opt-in (spec Section 6). There is no `DEVBENCH_*` environment override for `git_ops.provenance_path` (YAML-only, like its sibling `single_branch` and `branch_prefix` settings).
+
+Path resolution: a relative value (from either `git_ops.provenance_path` or `--provenance`) resolves against the TARGET REPO working tree -- the `repos.<org/repo>` checkout `<repo>` names -- never against the workspace root and never against the devbench process's current working directory. An absolute path is used as-is. Because `git_ops` is a single GLOBAL config block while `git-ops-finalize <repo>` runs per repo, one relative `git_ops.provenance_path` value resolves to a DIFFERENT file inside each repo's checkout in a multi-repo workspace; see [devbench-yaml-reference.md](devbench-yaml-reference.md#git_ops----git-workflow-settings) for the full field reference including that consequence.
+
+Provenance map shape (JSON; required fields marked; see [devbench-yaml-reference.md](devbench-yaml-reference.md#git_ops----git-workflow-settings) for the full `git_ops.provenance_path` field reference):
+
+```json
+{
+  "epics": [
+    {
+      "name": "E1: Cherry-pick integration",
+      "summary": "One-line summary of what this epic delivered.",
+      "issues": [
+        {"repo": "org/other-repo", "number": 10},
+        {"number": 335}
+      ]
+    }
+  ]
+}
+```
+
+Top-level `epics` is required and must be a list. Each epic requires a non-empty string `name` and a non-empty string `summary`; an epic's `issues` is optional but, when present, must be a list. Each `issues` entry needs an integer `number`; an omitted `repo` (or a `repo` equal to the target repo) renders `Fixes #<n>` (same-repo); any other `repo` (a string matching `owner/name`) renders `Fixes <repo>#<n>` (cross-repo) -- both forms rendered by the same code path.
+
+Exit codes:
+
+- `0` -- the body composes successfully, the PR step completes (a new PR is created with the composed body passed to `gh pr create --body`, or, per issue #129, an already-open PR on the branch is reused as-is with the freshly-composed body computed but never posted), AND the post-PR CI watcher reports `CIResult.GREEN`. The PR stays open for human merge (or `auto_merge`, when enabled).
+- `1` -- a usage or provenance-resolution failure before any push or PR creation. Causes include: the pre-existing `single_branch` / `defer_pr` prerequisite checks; no `<repo>` positional; an unexpected extra positional argument (`ERROR: unexpected argument <arg>`); `--provenance` passed with no value; no local path configured for the resolved repo (`ERROR: No local path configured for repo '<repo>'`); and the resolved provenance path (from `--provenance` or the config key) failing to resolve to a usable map -- not just missing, unreadable, not valid JSON, or resolving to zero mapped issues, but also any structurally malformed map (a payload that does not decode to a JSON object, a missing or non-list top-level `epics`, a non-object epic, an epic missing a non-empty `name` or `summary`, an epic whose `issues` is present but not a list, a non-object issue entry, an issue missing an integer `number`, or an issue `repo` that is not an `owner/name` string). The command never silently falls back to the plain body on any of these.
+- `2` -- the PR was created (or reused), but the post-PR CI watcher did not report GREEN: CI failed and was attributed to a known task (`CIResult.FAILED_KNOWN_TASK` -- a recovery proposal is written and that task is blocked, or the attempt is logged as cascade-capped), CI failed with unknown attribution (`CIResult.FAILED_UNKNOWN` -- the most-recent active/done task is blocked), or the CI watch timed out (`CIResult.TIMEOUT` -- no task status changes). See `_handle_finalize_ci_result` / `_handle_finalize_known_task_failure` for the full four-branch dispatch.
+
+Example, with a provenance map at `docs/release-notes/provenance-map.json`:
+
+```
+$ uv run devbench git-ops-finalize caylent-solutions/devbench --provenance docs/release-notes/provenance-map.json
 ```
 
 ---
@@ -1537,10 +1580,10 @@ Both knobs resolve with the standard **env > default** precedence (`devbench.con
 ### `git-ops-finalize`
 
 ```
-uv run devbench git-ops-finalize <repo>
+uv run devbench git-ops-finalize <repo> [--provenance <path>]
 ```
 
-Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode) for the full single-branch mode reference.
+Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode) for the full single-branch mode reference. See [`git-ops-finalize --provenance`](#git-ops-finalize---provenance) in [Gates](#gates) for the optional flag, the config-key equivalent, and the provenance-map format it reads.
 
 Not applicable under `git_ops.local_only: true` -- the target repo has no remote to push to. The local single branch is the deliverable; running `git-ops-finalize` against a local-only workspace is an error.
 

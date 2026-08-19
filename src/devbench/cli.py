@@ -27,7 +27,8 @@ Commands::
                             violations; --strict also flags draft/hold Manifest conflicts
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
-    git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
+    git-ops-finalize <repo> [--provenance <path>]
+                            Push single branch and create PR (after all deferred commits)
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
     start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive);
@@ -8169,8 +8170,50 @@ def _handle_finalize_ci_result(
     return 2
 
 
-def cmd_git_ops_finalize(repo_name: str) -> int:
+def _parse_git_ops_finalize_argv(argv: tuple[str, ...] | list[str]) -> tuple[str, str] | int:
+    """Parse ``git-ops-finalize <repo> [--provenance <path>]`` argv.
+
+    Returns a ``(repo_name, provenance_flag)`` tuple on success, where
+    ``provenance_flag`` is the empty string when ``--provenance`` was not
+    passed (D-17: the flag is optional -- ``git_ops.provenance_path`` alone
+    suffices for unattended ``auto_finalize`` runs). Returns an integer
+    non-zero exit code on parse error, with the error message already
+    written to stderr.
+    """
+    repo_name = ""
+    provenance_flag = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--provenance":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --provenance requires a value", file=sys.stderr)
+                return 1
+            provenance_flag = args[i + 1]
+            i += 2
+            continue
+        if not repo_name:
+            repo_name = arg
+            i += 1
+            continue
+        print(f"ERROR: unexpected argument {arg!r}", file=sys.stderr)
+        return 1
+    if not repo_name:
+        print("ERROR: git-ops-finalize requires <repo> [--provenance <path>]", file=sys.stderr)
+        return 1
+    return repo_name, provenance_flag
+
+
+def cmd_git_ops_finalize(*argv: str) -> int:
     """Push the single branch and create a PR after all deferred commits.
+
+    Usage::
+
+        git-ops-finalize <repo> [--provenance <path>]
 
     Used after all work units are complete in single-branch / defer-PR mode.
     Pushes the accumulated commits to the remote and creates a pull request.
@@ -8184,9 +8227,25 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     - FAILED_UNKNOWN: blocks the most-recent in-review / done task, returns 2.
     - TIMEOUT: logs ``[CI_WATCH_TIMEOUT]`` and returns 2 without status changes.
 
+    The PR body is composed by
+    :meth:`~devbench.github.git_ops.GitOpsService.compose_finalize_pr_body`
+    (spec 4.13; D-17). ``--provenance <path>`` overrides
+    ``git_ops.provenance_path`` for this single invocation; when neither is
+    set, the body is the plain body ``git-ops-finalize`` has always
+    produced. An unresolvable provenance map (missing, unreadable, invalid
+    JSON, or zero mapped issues) fails loudly (exit 1, naming the path)
+    BEFORE any push happens -- it never silently falls back to the plain
+    body.
+
     Arguments:
-        repo_name: Repository name (short or fully-qualified).
+        argv: ``<repo>`` (required; short or fully-qualified) followed by
+            an optional ``--provenance <path>`` flag.
     """
+    parsed = _parse_git_ops_finalize_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    repo_name, provenance_flag = parsed
+
     from devbench.config import DEFER_PR, SINGLE_BRANCH
 
     if not SINGLE_BRANCH:
@@ -8213,11 +8272,35 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
 
     branch = format_single_branch_name(SINGLE_BRANCH, get_effective_branch_prefix(canonical_repo, RUNTIME_CONFIG))
     pr_title = FINALIZE_PR_TITLE_TEMPLATE.format(branch=branch)
-    pr_body = (
-        f"Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{canonical_repo}`"
-    )
+
+    # D-17: --provenance beats git_ops.provenance_path beats the plain-body
+    # default (None). No DEVBENCH_* env override exists for this key.
+    # GitOpsConfig.provenance_path is documented as "relative to the repo
+    # working tree, or absolute" -- anchor a relative value to repo_path
+    # (already resolved above), matching the sibling repo-scoped calls below
+    # (commit_and_push, find_open_pr, create_pr) rather than resolving
+    # against the devbench process CWD, which is the workspace root under an
+    # unattended auto_finalize run and would silently point at the wrong
+    # file in a multi-repo workspace.
+    effective_provenance_raw = provenance_flag or RUNTIME_CONFIG.git_ops.provenance_path
+    provenance_path: Path | None = None
+    if effective_provenance_raw:
+        raw_provenance_path = Path(effective_provenance_raw)
+        provenance_path = raw_provenance_path if raw_provenance_path.is_absolute() else repo_path / raw_provenance_path
 
     ops = GitOpsService()
+
+    try:
+        pr_body = ops.compose_finalize_pr_body(
+            repo=canonical_repo,
+            branch=branch,
+            title=pr_title,
+            provenance_path=provenance_path,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     mgr = BacklogManager()
 
     ops.commit_and_push(
@@ -13913,7 +13996,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     ),
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
-    "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
+    "git-ops-finalize": (
+        cmd_git_ops_finalize,
+        1,
+        "Push single branch and create PR: git-ops-finalize <repo> [--provenance <path>]",
+    ),
     "check-merge": (
         cmd_check_merge,
         1,
@@ -14282,6 +14369,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "log-waiver",
         # E2-F4-S1-T2: --path/--method/--result flags.
         "log-newly-reachable",
+        # E2-F9-S1-T1: --provenance <path> flag (spec 4.13; D-17).
+        "git-ops-finalize",
     }
 )
 

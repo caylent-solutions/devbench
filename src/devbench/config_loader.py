@@ -324,6 +324,18 @@ class GitOpsConfig:
             one downstream repo (each independently numbering tasks from
             ``E1-F1-S1-T1``) never collide on branch names.  Defaults to
             ``None`` (no prefix, original behaviour).
+        provenance_path: Path (relative to the repo working tree, or
+            absolute) to a JSON provenance map that
+            ``GitOpsService.compose_finalize_pr_body`` reads to compose the
+            ``git-ops-finalize`` PR body: title, per-epic summary and one
+            closing-keyword line per mapped issue (spec 4.13; D-17).
+            Overridden per-invocation by ``git-ops-finalize --provenance
+            <path>``.  Defaults to ``None``, which preserves the plain PR
+            body ``git-ops-finalize`` has always produced.  No
+            ``DEVBENCH_*`` environment override exists for this key --
+            consistent with its sibling path/name settings
+            ``single_branch`` and ``branch_prefix``, both of which are
+            YAML-only.
     """
 
     update_submodule: bool = False
@@ -338,6 +350,7 @@ class GitOpsConfig:
     auto_finalize: bool = False
     auto_merge: bool = False
     branch_prefix: str | None = None
+    provenance_path: str | None = None
 
 
 @dataclass
@@ -2389,6 +2402,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     auto_merge = bool(git_ops_raw.get("auto_merge", False))
     _validate_auto_finalize_auto_merge(path, defer_pr, local_only, auto_finalize, auto_merge)
     branch_prefix_raw = _parse_branch_prefix(path, "git_ops.branch_prefix", git_ops_raw.get("branch_prefix"))
+    provenance_path_raw = git_ops_raw.get("provenance_path") or None
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
@@ -2402,6 +2416,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         auto_finalize=auto_finalize,
         auto_merge=auto_merge,
         branch_prefix=branch_prefix_raw,
+        provenance_path=provenance_path_raw,
     )
     if local_only:
         missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]

@@ -1557,6 +1557,75 @@ class TestBranchPrefixConfig:
             load_runtime_config(cfg, {})
 
 
+@pytest.mark.unit
+class TestGitOpsProvenancePathConfig:
+    """git_ops.provenance_path: parsing and validation (E2-F9-S1-T1, spec 4.13, D-17).
+
+    Persistent config key for the ``git-ops-finalize`` PR-body provenance map
+    (:meth:`devbench.github.git_ops.GitOpsService.compose_finalize_pr_body`).
+    Defaults to absent (``None``), which preserves the plain PR body. A
+    non-string value fails schema validation naming the dotted key and the
+    expected type.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_provenance_path_defaults_to_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.provenance_path is None
+
+    def test_provenance_path_defaults_to_none_when_git_ops_empty(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops: {}
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.provenance_path is None
+
+    def test_provenance_path_parsed_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              provenance_path: docs/release-notes/provenance-map.json
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.provenance_path == "docs/release-notes/provenance-map.json"
+
+    def test_schema_rejects_non_string_provenance_path(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              provenance_path: 123
+            """,
+        )
+        with pytest.raises(ValueError, match=r"git_ops\.provenance_path.*is not of type 'string'"):
+            load_runtime_config(cfg, {})
+
+
 class TestManifestAmendmentConfig:
     """YAML loader correctly parses the opt-in manifest_amendment section."""
 

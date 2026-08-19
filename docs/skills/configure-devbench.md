@@ -132,7 +132,7 @@ validating each before moving to the next:
 5. **limits section** -- threshold and limit values.
 6. **agents section** -- per-agent model overrides (executor, judges, workflow agents).
 7. **git_ops section** -- `single_branch`, `branch_prefix`, `defer_pr`, `auto_finalize`,
-   `auto_merge`, `update_submodule`, `inline_orphan_cleanup`,
+   `auto_merge`, `provenance_path`, `update_submodule`, `inline_orphan_cleanup`,
    `ci_failure_retry`, `orphan_patterns`, `local_only`, `pause_before_merge`,
    and the `pr_review_resolution` sub-block (`enabled`, `agents`,
    `decision_blocks`, `settle_seconds`, `poll_interval`).

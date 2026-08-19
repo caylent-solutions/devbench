@@ -11527,6 +11527,230 @@ class TestCmdGitOpsFinalize:
         assert "defer_pr" in capsys.readouterr().err.lower()
 
 
+class TestCmdGitOpsFinalizeProvenance:
+    """Test the ``--provenance`` flag / ``git_ops.provenance_path`` config key
+    (E2-F9-S1-T1, spec 4.13, D-17, AC-24). The flag overrides the config key
+    for a single invocation; the config key alone suffices for unattended
+    ``auto_finalize`` runs; an unreadable/missing path fails loudly (exit 1)
+    naming the path before any push side effect runs."""
+
+    def test_provenance_flag_overrides_config_key_for_single_invocation(self, tmp_path: Path) -> None:
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        flag_map = tmp_path / "flag-map.json"
+        flag_map.write_text(json.dumps({"epics": []}), encoding="utf-8")
+        configured_map = tmp_path / "configured-map.json"
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={},
+            git_ops=GitOpsConfig(single_branch="feature/combined", provenance_path=str(configured_map)),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance", str(flag_map))
+
+        assert result == 0
+        mock_ops.compose_finalize_pr_body.assert_called_once()
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == flag_map
+
+    def test_config_key_alone_used_when_no_flag(self, tmp_path: Path) -> None:
+        """Unattended auto_finalize runs pick up the config key with no flag."""
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        configured_map = tmp_path / "configured-map.json"
+        configured_map.write_text(json.dumps({"epics": []}), encoding="utf-8")
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={},
+            git_ops=GitOpsConfig(single_branch="feature/combined", provenance_path=str(configured_map)),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == configured_map
+
+    def test_relative_provenance_config_key_resolves_against_repo_path(self, tmp_path: Path) -> None:
+        """Regression test (spec 4.13, Section 6): ``GitOpsConfig.provenance_path``
+        is documented as 'relative to the repo working tree, or absolute'
+        (config_loader.py). ``sample-config.yaml``, ``docs/devbench-yaml-
+        reference.md`` and ``docs/cli-reference.md`` all recommend the
+        relative form ``docs/release-notes/provenance-map.json``, and
+        AC-E2-F9-S1-T1-5 requires the config key alone to suffice for an
+        unattended ``auto_finalize`` run, whose CWD is the workspace root,
+        not the target repo. A relative ``provenance_path`` must therefore
+        resolve against the target repo's ``repo_path``, not the process
+        CWD."""
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        relative_map = "docs/release-notes/provenance-map.json"
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={},
+            git_ops=GitOpsConfig(single_branch="feature/combined", provenance_path=relative_map),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == tmp_path / relative_map
+
+    def test_absolute_provenance_flag_is_not_re_anchored(self, tmp_path: Path) -> None:
+        """An already-absolute ``--provenance`` value must be passed through
+        unchanged, not joined onto ``repo_path`` a second time."""
+        absolute_map = tmp_path / "elsewhere" / "provenance-map.json"
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance", str(absolute_map))
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == absolute_map
+
+    def test_no_flag_no_config_key_passes_none(self, tmp_path: Path) -> None:
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] is None
+
+    def test_unreadable_provenance_path_exits_1_naming_path_before_push(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bad_path = tmp_path / "does-not-exist.json"
+        mock_ops = MagicMock()
+        mock_ops.compose_finalize_pr_body.side_effect = ValueError(f"provenance map not found at '{bad_path}'")
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance", str(bad_path))
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert str(bad_path) in err
+        mock_ops.commit_and_push.assert_not_called()
+        mock_ops.create_pr.assert_not_called()
+
+    def test_provenance_flag_requires_value(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance")
+
+        assert result == 1
+        assert "--provenance" in capsys.readouterr().err
+
+    def test_no_repo_argument_requires_repo(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_git_ops_finalize()
+
+        assert result == 1
+        assert "requires <repo>" in capsys.readouterr().err
+
+    def test_unexpected_second_positional_argument_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "extra-arg")
+
+        assert result == 1
+        assert "unexpected argument" in capsys.readouterr().err
+
+    def test_leading_empty_string_argument_is_skipped(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A blank argv slot (never produced by ``main()``'s own tokenizer, but
+        defensively handled the same way ``_parse_id_and_reason`` handles it)
+        does not get mistaken for the ``<repo>`` positional."""
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_git_ops_finalize("", "caylent-solutions/git-repo")
+
+        assert result == 1
+        assert "No local path configured for repo 'caylent-solutions/git-repo'" in capsys.readouterr().err
+
+    def test_registered_as_variadic(self) -> None:
+        """'git-ops-finalize' must be in _VARIADIC_COMMANDS so main()'s dispatcher
+        forwards the full trailing argv (including ``--provenance <path>``) instead
+        of slicing it to the fixed-arity ``min_args + 1`` window. Without this
+        registration, ``devbench git-ops-finalize <repo> --provenance <path>`` is
+        truncated by main() before _parse_git_ops_finalize_argv ever sees the value,
+        even though every test in this class calls cmd_git_ops_finalize(...) directly
+        and bypasses main() entirely."""
+        assert "git-ops-finalize" in cli._VARIADIC_COMMANDS
+
+
 class TestCmdGitOpsFinalizeNotifications:
     """Issue #219: cmd_git_ops_finalize and _handle_finalize_ci_result fire
     the same Slack notifications as the per-WU cmd_git_ops path.
@@ -18591,6 +18815,7 @@ class TestVariadicCommandsCoverage:
         '"--reason"',
         '"--reasoning"',
         '"--message"',
+        '"--provenance"',
     )
 
     def test_every_flag_with_value_command_is_variadic(self) -> None:

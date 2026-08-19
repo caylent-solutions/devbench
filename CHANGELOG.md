@@ -5,6 +5,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`git-ops-finalize` composes a provenance-driven PR body with a closing-keyword
+  block instead of a plain body** (spec `integration-reality-gates-hardening.md`
+  section 4.13, D-17; AC-E2-F9-S1-T1-1 through -6; issue #334). A new persistent
+  config key, `git_ops.provenance_path` (default absent, which preserves today's
+  plain body), plus a per-invocation `--provenance <path>` flag override, points
+  `git-ops-finalize` at a JSON provenance map. When a map resolves,
+  `GitOpsService.compose_finalize_pr_body` in `src/devbench/github/git_ops.py`
+  composes the PR title, a per-epic summary section, and one closing-keyword
+  line per mapped issue (`Fixes <org>/<repo>#<n>` cross-repo, `Fixes #<n>`
+  same-repo, both rendered by the same code path), so an unattended
+  `auto_finalize` run auto-closes every mapped issue on merge with no operator
+  step -- except when a PR is already open on the branch, per issue #129, in
+  which case the open PR is reused as-is and the freshly-composed body is
+  computed but never posted. A missing, unreadable, invalid, or issue-empty
+  map fails loudly (exit 1, naming the path) BEFORE any push happens -- it
+  never silently falls back to the plain body. `--provenance` beats the
+  config key; both beat the plain-body default; there is no `DEVBENCH_*`
+  environment override for the config key
+  (YAML-only, like its sibling `single_branch` and `branch_prefix` settings).
+  `src/devbench/cli.py`'s `git-ops-finalize` command now parses the optional
+  flag and resolves the effective path before composing the body.
+  `src/devbench/config_loader.py` and `src/devbench/config-schema.json` carry
+  the new key; `sample-config.yaml` and `docs/devbench-yaml-reference.md`
+  document it; `docs/cli-reference.md` documents the flag under the `## Gates`
+  section alongside the other gate-related verbs.
+
 - **`bootstrap-environment` gains a Step 0 every-invocation interview over the
   environment decisions it owns: LLM credential source, model selection, and
   GitHub credential source** (spec `integration-reality-gates-hardening.md`

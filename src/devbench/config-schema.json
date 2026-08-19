@@ -182,6 +182,10 @@
           "type": "boolean",
           "description": "When true, the orchestrate skill automatically invokes 'gh pr merge --<merge_strategy>' once the post-E7 CI watcher reports GREEN. Requires auto_finalize: true AND defer_pr: true. Incompatible with local_only: true. When the E7 watcher is absent, emits [AUTO_MERGE_SKIPPED] no_ci_watcher and skips. A marker file at <workspace>/.devbench/auto-merge-fired-<repo>.marker prevents duplicate invocations. Default: false."
         },
+        "provenance_path": {
+          "type": "string",
+          "description": "Path to a JSON provenance map that git-ops-finalize reads to compose the batch PR body: title, per-epic summary, and one closing-keyword line ('Fixes <org>/<repo>#<n>' or 'Fixes #<n>') per mapped issue. Overridden per-invocation by 'git-ops-finalize --provenance <path>'; the flag beats this key. Default: unset, which preserves the plain PR body git-ops-finalize has always produced. No DEVBENCH_* environment override (YAML-only, like single_branch and branch_prefix). A relative value resolves against the TARGET REPO working tree (the repos.<org/repo> checkout git-ops-finalize runs against), never the workspace root or the process CWD; an absolute path is used as-is. This is a GLOBAL block while git-ops-finalize runs per repo, so one relative value resolves to a different file inside each repo's checkout in a multi-repo workspace."
+        },
         "pr_review_resolution": {
           "type": "object",
           "description": "PR review-comment polling settings (issue #116). Disabled by default. When enabled, cmd_git_ops polls gh pr view for asynchronous bot review feedback (Copilot, Q-Dev, internal review bots) before merging.",

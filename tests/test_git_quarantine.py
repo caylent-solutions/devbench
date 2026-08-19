@@ -30,6 +30,26 @@ from devbench.git_quarantine import (
 )
 
 
+def _current_branch(repo: Path) -> str:
+    """Return *repo*'s checked-out branch name.
+
+    Stash subjects embed the branch (``"On <branch>: ..."``), and this suite
+    compares those subjects verbatim. The name is whatever ``git init`` chose,
+    which follows the host's ``init.defaultBranch`` -- ``master`` on a stock
+    install, ``main`` where the operator or the distro set it. Asserting either
+    literal makes the suite pass or fail on git configuration rather than on
+    quarantine behaviour. Reading it back keeps the assertion about the parts
+    this suite actually owns: the prefix, the owner and the claiming unit.
+    """
+    return subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
     """Create a git repo with *files* committed as the baseline."""
     repo = tmp_path / "checkout"
@@ -301,9 +321,11 @@ class TestRestoreQuarantine:
         quarantine_paths(repo, ["src/orphan.py"], {}, "E1-F1-S1-T2")
 
         assert restore_quarantine(repo, UNATTRIBUTED_OWNER, {"src/orphan.py"}) is None
-        assert _stash_subjects(repo) == [
-            f"On main: {QUARANTINE_STASH_PREFIX}:{UNATTRIBUTED_OWNER}: displaced by claim of E1-F1-S1-T2"
-        ]
+        expected = (
+            f"On {_current_branch(repo)}: {QUARANTINE_STASH_PREFIX}:{UNATTRIBUTED_OWNER}"
+            ": displaced by claim of E1-F1-S1-T2"
+        )
+        assert _stash_subjects(repo) == [expected]
 
 
 class TestCheckpointWork:

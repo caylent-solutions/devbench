@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from devbench.comment_time import comment_timestamp, resolve_comment_timezone
+from devbench.comment_time import comment_timestamp, resolve_comment_timezone, tdd_timestamp
 
 
 class TestResolveCommentTimezone:
@@ -159,3 +159,78 @@ class TestEveryCommentWriterHonoursTheZone:
         BacklogManager()._append_agent_comment(wu, "orchestrator", "[WU_CLAIMED] Set E1-F1-S1-T1")
 
         assert " UTC] [agent/orchestrator] [WU_CLAIMED]" in wu.read_text(encoding="utf-8")
+
+
+class TestTddTimestamp:
+    """TDD Cycle Log entries are read by people too, so they follow the same zone.
+
+    Unlike the comment header, this one keeps a full ISO-8601 representation
+    with a numeric offset. That is what makes zoning it safe without touching a
+    single reader: an offset is unambiguous where a bare abbreviation is not,
+    and both TDD entry regexes match the timestamp as an opaque ``\\S+`` token.
+    """
+
+    def test_renders_utc_offset_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        moment = datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC)
+        assert tdd_timestamp(moment) == "2026-08-19T13:35:46.686344+00:00"
+
+    def test_converts_the_instant_into_the_configured_zone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        moment = datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC)
+        assert tdd_timestamp(moment) == "2026-08-19T09:35:46.686344-04:00"
+
+    def test_the_offset_keeps_the_instant_recoverable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Zoning must not lose information: the rendered text round-trips."""
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        moment = datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC)
+        assert datetime.fromisoformat(tdd_timestamp(moment)) == moment
+
+    def test_offset_follows_daylight_saving(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        winter = datetime(2026, 1, 15, 13, 0, tzinfo=UTC)
+        assert tdd_timestamp(winter).endswith("-05:00")
+
+    def test_a_naive_moment_is_treated_as_utc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", None, raising=False)
+        naive = datetime.fromisoformat("2026-08-19 13:35:46")
+        assert tdd_timestamp(naive) == "2026-08-19T13:35:46+00:00"
+
+    def test_rendered_token_still_matches_the_tdd_entry_regexes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both readers match the timestamp as an opaque token; prove it stays opaque."""
+        from devbench.constants import RED_OBSERVED_ENTRY_LINE_RE
+        from devbench.tdd_gate import _RED_ENTRY_LINE_RE
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        stamp = tdd_timestamp(datetime(2026, 8, 19, 13, 35, 46, 686344, tzinfo=UTC))
+        assert _RED_ENTRY_LINE_RE.search(f"- [RED] {stamp} -- failing test observed") is not None
+        assert RED_OBSERVED_ENTRY_LINE_RE.search(f"- [RED_OBSERVED] {stamp} -- node id") is not None
+
+    def test_append_tdd_entry_uses_the_configured_zone(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr("devbench.config.DISPLAY_TIMEZONE", "America/New_York", raising=False)
+        wu = tmp_path / "E1-F1-S1-T1.md"
+        wu.write_text(
+            "# E1-F1-S1-T1: T\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._append_tdd_entry(wu, "RED", "failing test observed")
+
+        entry = next(l for l in wu.read_text(encoding="utf-8").splitlines() if "[RED]" in l)
+        assert "+00:00" not in entry, f"TDD entry still stamped UTC: {entry!r}"
+        assert "-04:00" in entry or "-05:00" in entry
+
+    def test_no_tdd_writer_hardcodes_a_utc_isoformat(self) -> None:
+        """Guard: the TDD writer bypassed the earlier sweep by using isoformat()."""
+        import devbench
+
+        package_root = Path(devbench.__file__).resolve().parent
+        manager = package_root / "backlog" / "manager.py"
+        offenders = [
+            n
+            for n, line in enumerate(manager.read_text(encoding="utf-8").splitlines(), 1)
+            if "datetime.now(tz=UTC).isoformat()" in line
+        ]
+        assert offenders == [], f"manager.py:{offenders} writes a UTC-pinned work-unit timestamp"

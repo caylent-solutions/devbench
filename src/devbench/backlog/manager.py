@@ -38,12 +38,11 @@ import logging
 import re
 from collections import deque
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 
 from devbench.backlog.work_unit import WorkUnitType
-from devbench.comment_time import comment_timestamp
+from devbench.comment_time import comment_timestamp, tdd_timestamp
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
@@ -2247,7 +2246,9 @@ class BacklogManager:
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
-        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``
+        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``, the
+        timestamp in the workspace's ``display_timezone`` carrying its
+        numeric offset, or UTC when unset.
 
         The entry is inserted immediately before the next ``## `` heading after
         ``## TDD Cycle Log``.  When ``## TDD Cycle Log`` is the last section in
@@ -2274,7 +2275,7 @@ class BacklogManager:
         Raises:
             ValueError: If the ``## TDD Cycle Log`` section does not exist in the file.
         """
-        timestamp = datetime.now(tz=UTC).isoformat()
+        timestamp = tdd_timestamp()
         entry = TDD_ENTRY_TEMPLATE.format(phase=phase, timestamp=timestamp, message=message)
 
         content = work_unit_path.read_text(encoding="utf-8")

@@ -102,3 +102,28 @@ def audit_timestamp_to_utc(raw: str, zone_token: str) -> datetime:
     if zone_token.upper() == "UTC":
         return naive.replace(tzinfo=UTC)
     return naive.replace(tzinfo=resolve_comment_timezone()).astimezone(UTC)
+
+
+def tdd_timestamp(moment: datetime | None = None) -> str:
+    """Return ``moment`` formatted for a TDD Cycle Log entry.
+
+    The Cycle Log is read by the same person reading the audit comments beside
+    it, so it follows the same zone. It keeps a full ISO-8601 representation
+    rather than the comment header's shorter shape, and that is what makes
+    zoning it free: an explicit numeric offset stays unambiguous and
+    round-trips through :meth:`datetime.fromisoformat`, whereas the comment
+    header's bare abbreviation needed a resolver on the read side. Both TDD
+    entry readers match this field as an opaque token, so nothing downstream
+    has to change.
+
+    Args:
+        moment: The instant to render. Defaults to now. A naive value is read
+            as UTC, matching every call site in devbench.
+
+    Returns:
+        An ISO-8601 timestamp in the resolved zone, carrying its offset.
+    """
+    instant = datetime.now(tz=UTC) if moment is None else moment
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=UTC)
+    return instant.astimezone(resolve_comment_timezone()).isoformat()

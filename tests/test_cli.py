@@ -16998,6 +16998,38 @@ class TestStatusPanelFiltersStaleBlockedAudits:
         content = "## Comments\n\n[2026-04-01 10:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] T9\n"
         assert cli._unsuperseded_blocked_audits(content) == []
 
+    def test_cascade_reconciled_supersedes_blocked(self) -> None:
+        """``reconcile-cascade`` records its re-queue with this tag.
+
+        Omitting it meant devbench wrote a tag its own reader ignored: the unit
+        went to ``in-queue`` while every blocked-audit consumer kept reporting
+        it as operator-blocked, so the report contradicted the lifecycle for
+        the rest of the unit's life.
+        """
+        content = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] operator decision required\n"
+            "[2026-04-01 11:00 UTC] [agent/backlog_manager] [CASCADE_RECONCILED] regular deps satisfied; re-queuing\n"
+        )
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+    def test_every_unblocking_tag_devbench_writes_is_recognised(self) -> None:
+        """Guard: a tag meaning "this block is over" must be read as such.
+
+        This is the invariant the bug broke. A new unblock tag added to a
+        writer without being added here would reintroduce it silently, so the
+        set is asserted rather than left implicit.
+        """
+        for tag in ("UNBLOCKED", "CASCADE_RESOLVED", "CASCADE_RECONCILED"):
+            content = (
+                "## Comments\n\n"
+                "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] something\n"
+                f"[2026-04-01 11:00 UTC] [agent/x] [{tag}] cleared\n"
+            )
+            assert cli._unsuperseded_blocked_audits(content) == [], (
+                f"[{tag}] is written by devbench but does not supersede a [BLOCKED] marker"
+            )
+
 
 class TestCmdSweepProposalsAutoPromotesPreExisting:
     """Issue #155: ``cmd_sweep_proposals`` also picks up pre-existing

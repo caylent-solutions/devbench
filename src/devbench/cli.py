@@ -2874,7 +2874,15 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
 # ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk
 # the Comments section in chronological order and drop ``[BLOCKED]`` rows
 # that have been superseded by a later positive transition.
-_BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED)\](?P<rest>[^\n]*)")
+# ``CASCADE_RECONCILED`` belongs here for the same reason as the other two:
+# ``reconcile-cascade`` writes it when it re-queues a unit, so it means the
+# block is over. Its absence made devbench write a tag its own reader
+# ignored -- the unit reached ``in-queue`` while every blocked-audit
+# consumer kept reporting it as operator-blocked, so the report
+# contradicted the lifecycle for the rest of that unit's life.
+_BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(
+    r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED|CASCADE_RECONCILED)\](?P<rest>[^\n]*)"
+)
 
 
 def _unsuperseded_blocked_audits(content: str) -> list[str]:

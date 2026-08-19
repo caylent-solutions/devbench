@@ -401,9 +401,9 @@ validate:
 #     # path must exist in the repo checkout or `devbench check-reachability`
 #     # fails loudly at run time naming the missing path, checked before any
 #     # candidate is examined. Config load itself performs no existence
-#     # check -- it only rejects (fails fast) an absolute path or a path
-#     # containing a `..` segment, naming gates.reachability.entry_points
-#     # and the offending value.
+#     # check; it rejects a non-list value, a non-string or empty-string
+#     # element, an absolute path, or a path containing a `..` segment,
+#     # naming gates.reachability.entry_points and the offending value.
 #     entry_points: []
 #   ancestry:                           # caylent-solutions/devbench-internal-backlog#12
 #     enabled: false

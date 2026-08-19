@@ -237,7 +237,7 @@ manifest_amendment:
   enabled: true
   allowed_reasons:
     - tdd_green_production_fix          # (only currently-supported reason; required when enabled)
-  max_requests_per_execution: 1         # (built-in default; prevents amendment loops)
+  max_requests_per_execution: 2         # (built-in default; one add + one removal, bounds loops)
 
 # ---------------------------------------------------------------------------
 # Task factory loop -- ON, auto-accept ON

@@ -433,6 +433,92 @@ class TestObserveRedExitCodeClassification:
         assert prod_file.read_text(encoding="utf-8") == "x = 2\n"
 
 
+class TestObserveRedNothingStashedDiagnostic:
+    """When nothing was stashed, the rejection must name the cause.
+
+    "Nothing to stash" is legitimate on its own: the committed baseline can BE
+    the before-state, which is canonical test-first TDD (a pinning test
+    committed alongside still-broken production source genuinely fails here,
+    and TestJourneyJ8HonestBehaviorFix covers exactly that). So the run still
+    happens and the outcome still decides.
+
+    But when the named test PASSES with nothing stashed, the cause is
+    specifically that no production change was removed -- the fix is already in
+    the committed baseline. Reporting only "named test outcome was PASSED"
+    describes the symptom and leaves the operator to reverse-engineer why. An
+    observed run stranded a complete task this way after an operator commit
+    snapshotted its in-flight production file.
+    """
+
+    def _clean_repo_with_passing_test(self, tmp_path: Path) -> tuple[Path, str, str]:
+        """Repo whose committed state already satisfies the named test."""
+        repo = _init_repo(tmp_path)
+        _write(repo, "src/prod.py", "x = 2\n")
+        _write(repo, "tests/test_prod.py", "def test_x(): assert True\n")
+        _commit_all(repo, "production fix already committed")
+        node_id = "tests/test_prod.py::test_x"
+        content = _work_unit_content([f"- [RED] 2026-01-01T00:00:00+00:00 -- Command: pytest {node_id} -q. Exit: 1."])
+        return repo, node_id, content
+
+    def _reject_message(self, tmp_path: Path) -> str:
+        repo, node_id, content = self._clean_repo_with_passing_test(tmp_path)
+
+        def _passing_runner(observed_node_id: str, repo_path: Path) -> TestObservation:
+            return TestObservation(exit_code=0, node_outcome="PASSED", raw_output="1 passed")
+
+        with pytest.raises(TddGateRejectionError) as excinfo:
+            observe_red("T-9", repo, ["src/prod.py", "tests/test_prod.py"], content, test_runner=_passing_runner)
+        return str(excinfo.value)
+
+    def test_names_the_empty_stash_as_the_cause(self, tmp_path: Path) -> None:
+        message = self._reject_message(tmp_path)
+
+        assert "removed nothing" in message
+        assert "already committed or absent" in message
+
+    def test_states_the_remedy(self, tmp_path: Path) -> None:
+        """The operator must be told how to re-derive an observable RED."""
+        message = self._reject_message(tmp_path)
+
+        assert "commit the removal of the production change" in message
+        assert "staged, uncommitted state" in message
+
+    def test_explains_why_this_state_is_anomalous(self, tmp_path: Path) -> None:
+        """Naming the normal contract is what makes the anomaly recognisable."""
+        message = self._reject_message(tmp_path)
+
+        assert "leaves committing to 'devbench git-ops'" in message
+        assert "committed out of band" in message
+
+    def test_still_reports_the_underlying_outcome_and_remedies(self, tmp_path: Path) -> None:
+        """The diagnostic is additive: the standard rejection shape is intact."""
+        message = self._reject_message(tmp_path)
+
+        assert "PASSED" in message
+        assert "T-9" in message
+        for remedy in (REMEDY_1, REMEDY_2, REMEDY_3):
+            assert remedy in message
+
+    def test_diagnostic_is_absent_when_a_stash_did_happen(self, tmp_path: Path) -> None:
+        """A genuine uncommitted change that still fails to produce RED must not
+        be misdiagnosed as an out-of-band commit."""
+        repo = _init_repo(tmp_path)
+        prod_file = _write(repo, "src/prod.py", "x = 1\n")
+        _write(repo, "tests/test_prod.py", "def test_x(): assert True\n")
+        _commit_all(repo, "baseline")
+        prod_file.write_text("x = 2\n", encoding="utf-8")  # real uncommitted change to stash
+        node_id = "tests/test_prod.py::test_x"
+        content = _work_unit_content([f"- [RED] 2026-01-01T00:00:00+00:00 -- Command: pytest {node_id} -q. Exit: 1."])
+
+        def _passing_runner(observed_node_id: str, repo_path: Path) -> TestObservation:
+            return TestObservation(exit_code=0, node_outcome="PASSED", raw_output="1 passed")
+
+        with pytest.raises(TddGateRejectionError) as excinfo:
+            observe_red("T-10", repo, ["src/prod.py", "tests/test_prod.py"], content, test_runner=_passing_runner)
+
+        assert "removed nothing" not in str(excinfo.value)
+
+
 class TestObserveRedPathScopedStashWithU:
     def test_test_file_present_and_new_prod_file_absent_during_observation(self, tmp_path: Path) -> None:
         repo = _init_repo(tmp_path)

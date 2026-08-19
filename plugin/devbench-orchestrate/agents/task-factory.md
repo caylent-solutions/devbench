@@ -50,7 +50,7 @@ This is a contract failure of the upstream `blocker-resolver` agent, NOT somethi
 
 ### Known failure mode: TODO-row in Changes Manifest
 
-The Changes Manifest rows are auto-generated from `files_to_own`. A row that would literally read `TODO -- describe change` indicates `files_to_own` was populated but with no accompanying change description. `materialise-proposal` does not currently reject on this pattern alone (the row is a placeholder the operator can edit), but if you see it on multiple consecutive materialisations it signals the same blocker-resolver prompt drift as the thin-approach case. Log it in your verdict summary so the operator can correlate.
+The Changes Manifest rows are auto-generated from `files_to_own`, and the change verb is derived from the target repository itself: a path that already exists in the checkout renders as `modify`, one that does not renders as `add` (`delete` is never inferred -- an explicit deletion goes through the amendment workflow). When `files_to_own` is empty the row renders as the documented deferred-resolution sentinel `<source-drift-fix-targets-determined-at-execution>`, which the amendment workflow concretises at execution time. If you see that sentinel on multiple consecutive materialisations it signals the same blocker-resolver prompt drift as the thin-approach case -- the resolver is proposing tasks without naming any file. Log it in your verdict summary so the operator can correlate.
 
 ### CRITICAL: spec-correction recovery tasks must list ONLY the work-unit markdown file they edit (issue #136)
 

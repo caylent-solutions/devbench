@@ -66,3 +66,59 @@ class TestWhitespaceTolerance:
     def test_leading_trailing_whitespace_stripped(self) -> None:
         assert is_sentinel_manifest_value("  <verification-only>  ") is True
         assert is_sentinel_manifest_value("\t<decision-only>\n") is True
+
+
+class TestNoOutputManifest:
+    """`is_no_output_manifest` separates the two kinds of sentinel.
+
+    The canonical registry mixes two semantics that the commit path must not
+    conflate (docs/backlog-contract.md 'Accepted sentinel values'):
+
+    - no-output: `<verification-only>`, `<decision-only>`, `<no changes>`,
+      `<no-op>` -- "No source files are modified", evidence goes in
+      `## Comments`. There will never be anything to commit.
+    - deferred-resolution: `<source-drift-fix-targets-determined-at-execution>`
+      -- concrete paths are enumerated mid-execution via manifest_amendment.
+
+    git_ops._stage_for_commit treated both as deferred and told the operator to
+    "resolve the sentinel to real paths via a manifest amendment", which is
+    unsatisfiable for a no-output unit and blocked it permanently.
+    """
+
+    def test_each_no_output_sentinel_is_recognised(self):
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        for value in ("<verification-only>", "<decision-only>", "<no changes>", "<no-op>"):
+            assert is_no_output_manifest([value]) is True, value
+
+    def test_deferred_resolution_sentinel_is_not_no_output(self):
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        assert is_no_output_manifest(["<source-drift-fix-targets-determined-at-execution>"]) is False
+
+    def test_per_task_variant_form_is_recognised(self):
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        assert is_no_output_manifest(["<verification-only:E15-F5-S1-T2>"]) is True
+
+    def test_real_path_is_not_no_output(self):
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        assert is_no_output_manifest(["scripts/check_idempotency.py"]) is False
+
+    def test_mixed_manifest_is_not_no_output(self):
+        """A real path alongside a sentinel still has something to commit."""
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        assert is_no_output_manifest(["<verification-only>", "scripts/foo.py"]) is False
+
+    def test_empty_manifest_is_not_no_output(self):
+        """Empty means unscopeable, which is a different refusal -- not no-output."""
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        assert is_no_output_manifest([]) is False
+
+    def test_backtick_and_whitespace_tolerant(self):
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        assert is_no_output_manifest(["  `<verification-only>`  "]) is True

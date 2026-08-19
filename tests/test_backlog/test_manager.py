@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
-from devbench.backlog.manager import BacklogManager
+from devbench.backlog.manager import BacklogManager, count_review_fails_for_judge
+from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
 from devbench.constants import (
@@ -327,6 +328,114 @@ class TestMarkHeldAndUnheld:
         assert "input received" in wu_content
 
 
+class TestRemoveUnit:
+    """db-303 (E12-F1-S2-T1): the managed ``remove`` verb (spec 4.A, FR-16).
+
+    ``remove_unit`` deletes the work-unit file and its BACKLOG.md index row
+    under a single ``flock_backlog``, re-rolls the Status Summary, and
+    appends a ``[WU_REMOVED] <id> -- <reason>`` line to the workspace audit
+    log. An unknown id fails fast with ``ValueError`` before any file is
+    touched.
+    """
+
+    def test_remove_unit_deletes_file_and_index_row_under_flock(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "logs" / "removals.log"
+        manager = BacklogManager()
+        manager.remove_unit(
+            tmp_work_unit_file,
+            backlog_index_titlecase,
+            "E0-F1-S1-T1",
+            "superseded by E0-F1-S1-T9",
+            audit_log_path,
+        )
+
+        # (1) the work-unit file is deleted.
+        assert not tmp_work_unit_file.exists()
+
+        # (2) the BACKLOG.md index row for the removed unit is gone, while
+        # sibling rows are untouched. Matched on the row's own ID cell (not
+        # a bare substring check) since E0-F1-S1-T1 also appears in T2's
+        # Dependencies column.
+        index_content = backlog_index_titlecase.read_text()
+        assert not any(line.strip().startswith("| E0-F1-S1-T1 |") for line in index_content.splitlines())
+        assert any(line.strip().startswith("| E0-F1-S1-T2 |") for line in index_content.splitlines())
+        assert any(line.strip().startswith("| E0-F1-S1-T3 |") for line in index_content.splitlines())
+
+        # (3) the Status Summary section was re-rolled.
+        assert "## Status Summary" in index_content
+
+        # (4) the workspace audit log has the [WU_REMOVED] line.
+        audit_content = audit_log_path.read_text()
+        assert "[WU_REMOVED] E0-F1-S1-T1 -- superseded by E0-F1-S1-T9" in audit_content
+
+    def test_remove_unit_unknown_id_raises(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "logs" / "removals.log"
+        manager = BacklogManager()
+
+        with pytest.raises(ValueError, match=r"remove: work unit 'NO-SUCH-ID' not found in BACKLOG\.md"):
+            manager.remove_unit(
+                tmp_work_unit_file,
+                backlog_index_titlecase,
+                "NO-SUCH-ID",
+                "typo",
+                audit_log_path,
+            )
+
+        # Nothing was deleted: the WU file and its index row survive, and no
+        # audit line was ever written.
+        assert tmp_work_unit_file.exists()
+        assert "E0-F1-S1-T1" in backlog_index_titlecase.read_text()
+        assert not audit_log_path.exists()
+
+    def test_remove_unit_creates_audit_log_parent_directories(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "nested" / "does" / "not" / "exist" / "removals.log"
+        manager = BacklogManager()
+        manager.remove_unit(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "cleanup", audit_log_path)
+
+        assert audit_log_path.exists()
+        assert "[WU_REMOVED] E0-F1-S1-T1 -- cleanup" in audit_log_path.read_text()
+
+    def test_remove_unit_appends_to_existing_audit_log(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+        tmp_path: Path,
+    ) -> None:
+        audit_log_path = tmp_path / "logs" / "removals.log"
+        audit_log_path.parent.mkdir(parents=True)
+        audit_log_path.write_text("[2020-01-01 00:00 UTC] [WU_REMOVED] E9-F1-S1-T1 -- earlier removal\n")
+
+        manager = BacklogManager()
+        manager.remove_unit(
+            tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "second removal", audit_log_path
+        )
+
+        content = audit_log_path.read_text()
+        assert "E9-F1-S1-T1 -- earlier removal" in content
+        assert "[WU_REMOVED] E0-F1-S1-T1 -- second removal" in content
+
+    def test_remove_backlog_index_row_raises_when_index_missing(self, tmp_path: Path) -> None:
+        manager = BacklogManager()
+        missing_index = tmp_path / "does-not-exist" / "BACKLOG.md"
+        with pytest.raises(FileNotFoundError, match="Backlog index not found"):
+            manager._remove_backlog_index_row(missing_index, "E0-F1-S1-T1")
+
+
 class TestRollupParentStatus:
     """Test that marking the last child Done rolls up to parent."""
 
@@ -438,6 +547,155 @@ class TestRollupParentStatus:
             pytest.fail("E0-F1 feature row not found")
 
 
+class TestRollupFiresOnDeclinedTransition:
+    """Issue #332 / spec FR-1: ``_rollup_parent_status`` must run on ANY
+    terminal transition (``done`` OR ``declined``), not only ``done``.
+
+    Mirrors the precedent set by issue #147 for the auto-requeue cascade
+    (see ``TestAutoRequeueOnDeclineTransition``): before this fix the
+    rollup call sat behind an ``if canonical == STATUS_DONE:`` guard, so a
+    parent whose last remaining child resolved via Declined (rather than
+    Done) never triggered the promotion check at all.
+    """
+
+    def test_last_child_declined_rollup_cascades_to_feature_and_epic(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A story's sole child transitioning to Declined (never Done) must
+        still roll the story to done, cascading through the feature to the
+        epic."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+| E0-F1 | Feature | Feature | in-queue | None | git-repo | `backlog/E0-F1.md` |
+| E0 | Epic | Epic | in-queue | None | git-repo | `backlog/E0.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t1_file = backlog_dir / "E0-F1-S1-T1.md"
+        t1_file.write_text("# E0-F1-S1-T1\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+        feature_file = backlog_dir / "E0-F1.md"
+        feature_file.write_text("# E0-F1\n\n## Status: in-queue\n")
+        epic_file = backlog_dir / "E0.md"
+        epic_file.write_text("# E0\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        judge.mark_declined(t1_file, index_path, "E0-F1-S1-T1", "scope changed")
+
+        assert "## Status: done" in story_file.read_text()
+        assert "## Status: done" in feature_file.read_text()
+        assert "## Status: done" in epic_file.read_text()
+
+    def test_mixed_done_declined_children_rollup(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A parent with one Done and one freshly-Declined child rolls up."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | done | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t2_file = backlog_dir / "E0-F1-S1-T2.md"
+        t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        judge.mark_declined(t2_file, index_path, "E0-F1-S1-T2", "duplicate of T1")
+
+        assert "## Status: done" in story_file.read_text()
+
+    def test_non_terminal_sibling_blocks_declined_rollup(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Regression guard: a remaining non-terminal sibling still blocks
+        rollup after another sibling is declined."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | in-progress | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t2_file = backlog_dir / "E0-F1-S1-T2.md"
+        t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        judge.mark_declined(t2_file, index_path, "E0-F1-S1-T2", "not needed")
+
+        # T1 is still in-progress -- the story must NOT roll up.
+        assert "## Status: in-queue" in story_file.read_text()
+
+    def test_declined_transition_requeue_runs_before_rollup(self, tmp_path: Path) -> None:
+        """Ordering invariant holds for the declined branch too: the
+        sideways auto-requeue cascade must fire BEFORE the rollup check
+        runs, so a sibling freshly unblocked by the requeue is correctly
+        seen as non-terminal and blocks promotion.
+        """
+        markers = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=markers,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "in-queue")
+
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0 | Example | Epic | in-queue | None | example/repo | `backlog/E0.md` |\n"
+            "| E0-F1 | Feature | Feature | in-queue | None | example/repo | `backlog/E0-F1.md` |\n"
+            "| E0-F1-S1 | Story | Story | in-queue | None | example/repo | `backlog/E0-F1-S1.md` |\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | example/repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Dep | Task | in-queue | None | example/repo | `backlog/E0-F1-S1-T2.md` |\n",
+            encoding="utf-8",
+        )
+        (backlog_subdir / "E0.md").write_text("# E0\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_subdir / "E0-F1.md").write_text("# E0-F1\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_subdir / "E0-F1-S1.md").write_text("# E0-F1-S1\n\n## Status: in-queue\n", encoding="utf-8")
+        (backlog_subdir / "E0-F1-S1-T1.md").write_text(src_file, encoding="utf-8")
+        (backlog_subdir / "E0-F1-S1-T2.md").write_text(dep_file, encoding="utf-8")
+
+        mgr = BacklogManager()
+        mgr.mark_declined(backlog_subdir / "E0-F1-S1-T2.md", index_path, "E0-F1-S1-T2", "duplicate work")
+
+        # T1 was requeued by the marker cascade.
+        t1 = (backlog_subdir / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in t1
+
+        # Parent Story S1 was NOT auto-rolled to done because T1 is now
+        # in-queue (not terminal) -- proof the requeue ran before rollup.
+        s1 = (backlog_subdir / "E0-F1-S1.md").read_text()
+        assert "## Status: in-queue" in s1
+
+
 class TestLogToTraceabilityMatrix:
     """Test traceability matrix logging."""
 
@@ -466,6 +724,47 @@ class TestLogToTraceabilityMatrix:
         assert "AC-02" in content
         lines = [line for line in content.strip().splitlines() if line.startswith("|")]
         assert len(lines) >= 4
+
+
+class TestCountReviewFailsForJudge:
+    """Issue #122: the audit trail is the rejection-round counter."""
+
+    def test_counts_only_the_named_judge(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 02:00 UTC] [judge/code_review] [REVIEW_FAIL] b\n"
+            "[2026-08-15 03:00 UTC] [judge/doc_review] [REVIEW_FAIL] c\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 2
+        assert count_review_fails_for_judge(content, "code_review") == 1
+
+    def test_passes_are_not_counted(self) -> None:
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 02:00 UTC] [judge/doc_review] [REVIEW_PASS] b\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 1
+
+    def test_counts_across_round_boundaries(self) -> None:
+        """The budget bounds TOTAL rounds, so a REVIEW_REJECTED boundary must not reset it."""
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/doc_review] [REVIEW_FAIL] a\n"
+            "[2026-08-15 01:30 UTC] [orchestrator] [REVIEW_REJECTED] round 1 rejected\n"
+            "[2026-08-15 02:00 UTC] [judge/doc_review] [REVIEW_FAIL] b\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 2
+
+    def test_judge_name_quoted_in_prose_does_not_inflate_count(self) -> None:
+        """A judge name inside another judge's feedback text is not a verdict row."""
+        content = (
+            "[2026-08-15 01:00 UTC] [judge/code_review] [REVIEW_FAIL] "
+            "deferring to judge/doc_review on the CHANGELOG wording\n"
+        )
+        assert count_review_fails_for_judge(content, "doc_review") == 0
+
+    def test_empty_content_is_zero(self) -> None:
+        assert count_review_fails_for_judge("", "doc_review") == 0
 
 
 class TestLastRoundAllPassed:
@@ -853,6 +1152,71 @@ class TestValidate:
         judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
+
+    def test_validate_flags_file_less_task_row(self, tmp_path: Path) -> None:
+        """db-279 (spec AC-48): a file-less Task row is flagged by validate()."""
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | No File Task | Task | in-queue | none | repo |  |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert (
+            "E0-F1-S1-T1: Task-level work unit has no file path in BACKLOG.md "
+            "-- every Task row must name a materialised work-unit file"
+        ) in errors
+
+    def test_validate_tolerates_file_less_non_task_row(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """db-279 (spec AC-48): a file-less Epic/Feature/Story row is tolerated by validate()."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1 | Feature One | Feature | in-queue | none | repo |  |\n"
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert not any(e.startswith("E0-F1:") and "has no file path" in e for e in errors)
+
+    @pytest.mark.parametrize(
+        ("row_id", "row_type", "should_reject"),
+        [
+            ("E0-F1", "Feature", False),
+            ("E0-F1-S1-T1", "Task", True),
+        ],
+    )
+    def test_validate_and_parse_index_agree(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        row_id: str,
+        row_type: str,
+        should_reject: bool,
+    ) -> None:
+        """db-279 (spec AC-47, AC-48): validate() and parse_index() converge on the same verdict."""
+        anchor = self._make_wu(backlog_dir, "E0-F1-S1-T9", "in-queue")
+        # parse_work_unit_file requires an "ID: Title" heading; _make_wu's
+        # bare "# <id>" heading satisfies validate() (which never parses the
+        # heading) but not the parser used for the convergence check below.
+        anchor.write_text(anchor.read_text(encoding="utf-8").replace("# E0-F1-S1-T9\n", "# E0-F1-S1-T9: Anchor Task\n"))
+        idx = self._make_index(
+            tmp_path,
+            f"| {row_id} | No File | {row_type} | in-queue | none | repo |  |\n"
+            "| E0-F1-S1-T9 | Anchor Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T9.md` |\n",
+        )
+
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        validator_rejects = any(e.startswith(f"{row_id}:") and "has no file path" in e for e in errors)
+        assert validator_rejects is should_reject
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=idx)
+        if should_reject:
+            with pytest.raises(ValueError, match="has no file path"):
+                parser.parse_index()
+        else:
+            units = parser.parse_index()
+            assert not any(u.id == row_id for u in units)
 
 
 # ---------------------------------------------------------------------------
@@ -3267,6 +3631,67 @@ class TestIsProductionSource:
         # Random top-level .py is not classified as production source
         assert BacklogManager._is_production_source("setup.py") is False
 
+    def test_workspace_configured_prefix_is_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A workspace whose production code lives outside src/ declares its own prefixes,
+        so the task-type invariant recognises them. Without this, a repo that keeps tested
+        production modules in (for example) scripts/ cannot author a behavior-fix task."""
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/", "tools/"))
+        )
+        assert BacklogManager._is_production_source("scripts/observability.py") is True
+        assert BacklogManager._is_production_source("tools/audit_style.py") is True
+
+    def test_workspace_configured_prefix_still_excludes_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Configuring extra prefixes never reclassifies a test file or package marker."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
+        assert BacklogManager._is_production_source("scripts/tests/test_thing.py") is False
+        assert BacklogManager._is_production_source("scripts/__init__.py") is False
+        assert BacklogManager._is_production_source("scripts/notes.md") is False
+
+    def test_configured_prefixes_replace_builtins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Declaring prefixes is authoritative: the workspace states where its production
+        source lives, so an undeclared tree is not silently still counted."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("scripts/",)))
+        assert BacklogManager._is_production_source("src/foo/bar.py") is False
+
+    def test_configured_extensions_widen_production_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An infrastructure repo whose behaviour lives in YAML specs, HCL modules and
+        dashboard JSON can declare those extensions as production source. Without this,
+        rule 21 forces every such change to be typed `chore`, which drops the RED gate
+        that behavior-fix and feature exist to enforce."""
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/", "providers/"))
+        )
+        monkeypatch.setattr(
+            BacklogManager,
+            "_configured_production_source_extensions",
+            staticmethod(lambda: (".py", ".yml", ".yaml", ".tf", ".hcl", ".json")),
+        )
+        assert BacklogManager._is_production_source("servers/hp/k8s/addons/falco/falco.yml") is True
+        assert BacklogManager._is_production_source("providers/aws/references/x/main.tf") is True
+
+    def test_configured_extensions_still_exclude_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Widening extensions never reclassifies a test file as production source."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/",)))
+        monkeypatch.setattr(
+            BacklogManager, "_configured_production_source_extensions", staticmethod(lambda: (".py", ".yml"))
+        )
+        assert BacklogManager._is_production_source("servers/tests/test_thing.yml") is False
+
+    def test_unset_extensions_preserve_python_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Absent, only Python counts, exactly as before."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: ("servers/",)))
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_extensions", staticmethod(lambda: None))
+        assert BacklogManager._is_production_source("servers/hp/k8s/addons/falco/falco.yml") is False
+        assert BacklogManager._is_production_source("servers/hp/thing.py") is True
+
+    def test_unset_config_preserves_built_in_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the workspace declares nothing, behaviour is exactly as before."""
+        monkeypatch.setattr(BacklogManager, "_configured_production_source_paths", staticmethod(lambda: None))
+        assert BacklogManager._is_production_source("src/foo/bar.py") is True
+        assert BacklogManager._is_production_source("services/api/src/handler.py") is True
+        assert BacklogManager._is_production_source("scripts/observability.py") is False
+
 
 class TestIsRealManifestPath:
     """Direct tests for the placeholder-string filter."""
@@ -3348,6 +3773,12 @@ class TestTasksFormDepChainEdgeCases:
 
     def test_empty_id_list_is_trivially_a_chain(self) -> None:
         assert BacklogManager._tasks_form_dep_chain([], {}) is True
+
+    def test_chain_through_non_claimant_intermediate(self) -> None:
+        """FR-5 (db-311): C -> B(non-claimant) -> A is a chain even though B
+        is not itself one of the claimant ids being compared.
+        """
+        assert BacklogManager._tasks_form_dep_chain(["A", "C"], {"C": {"B"}, "B": {"A"}}) is True
 
 
 class TestSourceTestPairsDefensiveStemGuard:
@@ -3507,6 +3938,98 @@ class TestValidateManifestConflicts:
         )
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("Manifest conflict" in e for e in errors)
+
+    def test_in_progress_plus_in_queue_same_path_no_dep_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """FR-3 / AC-8 (db-313): an actively-executing (in-progress) claimant
+        is a HARD claimant -- it collides with an in-queue claimant of the
+        same path exactly like two in-queue claimants would.
+        """
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status="in-progress")
+        self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status="in-queue")
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-progress | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+            f"| EX-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        conflict = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+        assert len(conflict) == 1
+        assert "EX-F1-S1-T1" in conflict[0]
+        assert "EX-F1-S1-T2" in conflict[0]
+
+    def test_in_progress_conflict_survives_flip_to_blocked(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """FR-3 / AC-9 (db-313): the verdict (and the emitted error text,
+        which embeds only ids, never status) is invariant across a
+        HARD-status flip -- in-progress and blocked are both HARD claimants.
+        """
+        repo = "ex/foo"
+
+        def _run(status_a: str) -> list[str]:
+            self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status=status_a)
+            self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status="in-queue")
+            self.H.make_index(
+                tmp_path,
+                f"| EX-F1-S1-T1 | T1 | Task | {status_a} | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+                f"| EX-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+            )
+            errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+            return [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+
+        in_progress_conflict = _run("in-progress")
+        blocked_conflict = _run("blocked")
+        assert len(in_progress_conflict) == 1
+        assert len(blocked_conflict) == 1
+        assert in_progress_conflict[0] == blocked_conflict[0]
+
+    def test_two_draft_claimants_error_only_under_strict(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """FR-4 / AC-10 (db-267): two draft claimants of one path are silent
+        under the default run (preserving the all-draft rc=0 authoring gate)
+        but emit the new draft/hold ERROR once ``strict=True`` folds SOFT
+        claimants into the count.
+        """
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status="draft")
+        self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n", status="draft")
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | draft | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+            f"| EX-F1-S1-T2 | T2 | Task | draft | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        default_errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in default_errors)
+
+        strict_errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+        conflict = [e for e in strict_errors if "Manifest conflict (draft/hold)" in e]
+        assert len(conflict) == 1
+        assert "EX-F1-S1-T1" in conflict[0]
+        assert "EX-F1-S1-T2" in conflict[0]
+        assert "shared.yaml" in conflict[0]
+
+    def test_two_draft_claimants_with_explicit_dep_no_error_under_strict(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """FR-4 (db-267): an explicit Dependency between two draft claimants
+        resolves the ordering, so ``--strict`` stays silent -- mirrors
+        ``test_two_tasks_with_explicit_dep_no_error`` for the SOFT half.
+        """
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "E9-F1-S1-T1", repo, "| `shared.yaml` | new |\n", status="draft")
+        self.H.make_task(
+            backlog_dir,
+            "E9-F1-S1-T2",
+            repo,
+            "| `shared.yaml` | edit |\n",
+            status="draft",
+            deps_rows="| E9-F1-S1-T1 | dep | draft |",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| E9-F1-S1-T1 | T1 | Task | draft | none | {repo} | `backlog/E9-F1-S1-T1.md` |\n"
+            f"| E9-F1-S1-T2 | T2 | Task | draft | E9-F1-S1-T1 | {repo} | `backlog/E9-F1-S1-T2.md` |\n",
+        )
+        strict_errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path, strict=True)
+        assert not any("Manifest conflict" in e for e in strict_errors)
 
 
 class TestValidateManifestConflictsTransitiveChain:
@@ -4236,6 +4759,125 @@ class TestValidateTaskTypeTaxonomy:
             f"'not it, but something else' claim this test replaced; "
             f"got: {all_errors_for_row}"
         )
+
+    def test_docs_task_with_markdown_and_doc_pin_test_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """db-300 / AC-17: a docs task legitimately owning a
+        documentation-pinning test row (e.g. ``tests/test_docs/test_guide_pin.py``)
+        is not a false-positive rejection -- the docs OR-list also accepts
+        test-source rows."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `tests/test_docs/test_guide_pin.py` | new |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    def test_chore_task_with_config_and_changelog_rows_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """db-300 / AC-18: a chore task legitimately owning ``CHANGELOG.md``
+        is not a false-positive rejection -- the chore OR-list also accepts
+        documentation/markdown rows."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `pyproject.toml` | modify |\n| `CHANGELOG.md` | modify |\n",
+            task_type="chore",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("task-type invariant" in e for e in errors), f"Unexpected invariant error: {errors}"
+
+    def test_docs_task_with_production_source_row_still_fails(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-19: the docs OR-list widening never lets production Python
+        source under src/ through -- every named classifier rejects it."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/guide.md` | new |\n| `src/devbench/foo.py` | new |\n",
+            task_type="docs",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/devbench/foo.py" in e and "docs" in e]
+        assert matching, f"Expected a docs-invariant violation naming src/devbench/foo.py; got: {errors}"
+
+    def test_chore_task_with_production_source_row_still_fails(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-19: the chore OR-list widening never lets production Python
+        source under src/ through -- every named classifier rejects it."""
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `pyproject.toml` | modify |\n| `src/devbench/foo.py` | new |\n",
+            task_type="chore",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [e for e in errors if "EX-F1-S1-T1" in e and "src/devbench/foo.py" in e and "chore" in e]
+        assert matching, f"Expected a chore-invariant violation naming src/devbench/foo.py; got: {errors}"
+
+    @pytest.mark.parametrize(
+        "task_type,manifest_rows,expect_error",
+        [
+            ("behavior-fix", "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n", False),
+            ("behavior-fix", "| `tests/unit/test_foo.py` | new |\n", True),
+            ("feature", "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n", False),
+            ("feature", "| `tests/unit/test_foo.py` | new |\n", True),
+            ("test-only", "| `tests/unit/test_foo.py` | new |\n", False),
+            ("test-only", "| `src/foo.py` | new |\n", True),
+            ("refactor", "| `src/foo.py` | modify |\n| `docs/guide.md` | modify |\n", False),
+            ("docs", "| `docs/guide.md` | new |\n", False),
+            ("docs", "| `tests/test_docs/test_guide_pin.py` | new |\n", False),
+            ("docs", "| `src/foo.py` | new |\n", True),
+            ("chore", "| `pyproject.toml` | modify |\n", False),
+            ("chore", "| `CHANGELOG.md` | modify |\n", False),
+            ("chore", "| `src/foo.py` | new |\n", True),
+        ],
+    )
+    def test_task_type_row_invariant_matrix_unchanged(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        task_type: str,
+        manifest_rows: str,
+        expect_error: bool,
+    ) -> None:
+        """db-300: pins the accept/reject behavior of all six task types
+        across the OR-list widening. Proves the docs/chore widening only
+        ADDS acceptance of documentation-pinning-test / markdown rows
+        respectively -- it does not alter behavior-fix, feature, test-only,
+        or refactor behavior at all, and production-source rows under src/
+        are still rejected for docs/chore/test-only."""
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", manifest_rows, task_type=task_type)
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        matching = [
+            e for e in errors if "EX-F1-S1-T1" in e and ("task-type invariant" in e or "production-source" in e)
+        ]
+        if expect_error:
+            assert matching, f"Expected a task-type-invariant error for {task_type}; got: {errors}"
+        else:
+            assert not matching, f"Unexpected task-type-invariant error for {task_type}; got: {matching}"
 
 
 class TestValidateRequiredSections:
@@ -5215,6 +5857,128 @@ class TestIsValidCitation:
         assert BacklogManager.is_valid_citation("  abc1234  ") is True
 
 
+class TestValidateMarkerStatusAgreement:
+    """Check 27: a live ``[BLOCKED_PENDING_PROPOSAL]`` marker requires status ``blocked``.
+
+    Regression: the promote/wire path wrote the marker and the Dependencies row
+    but never the status, so a task blocked pending a proposal kept whatever
+    status it had. Observed with a task left ``in-progress`` after the
+    manifest-amender failed it mid-execution. That mismatch is load-bearing --
+    the ADR-07 cascade skips non-blocked candidates, so the task would never be
+    requeued once its blocker completed.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _append_marker(wu_path: Path, marker_target: str) -> None:
+        content = wu_path.read_text(encoding="utf-8")
+        entry = (
+            f"[2026-01-01 00:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] {marker_target} "
+            f"promoted and wired. [BLOCKED_PENDING_PROPOSAL] {marker_target}\n"
+        )
+        content += ("\n## Comments\n\n" + entry) if "## Comments" not in content else ("\n" + entry)
+        wu_path.write_text(content, encoding="utf-8")
+
+    def _errors_for(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        *,
+        source_status: str,
+        blocker_status: str,
+        source_id: str = "E9-F1-S1-T1",
+        blocker_id: str = "E9-F1-S1-T2",
+    ) -> list[str]:
+        source = self.H.make_task(
+            backlog_dir,
+            source_id,
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            status=source_status,
+        )
+        self._append_marker(source, blocker_id)
+        self.H.make_task(
+            backlog_dir,
+            blocker_id,
+            "ex/foo",
+            "| `src/bar.py` | new |\n| `tests/unit/test_bar.py` | new |\n",
+            status=blocker_status,
+        )
+        idx = self.H.make_index(
+            tmp_path,
+            f"| {source_id} | T | Task | {source_status} | none | ex/foo | `backlog/{source_id}.md` |\n"
+            f"| {blocker_id} | T | Task | {blocker_status} | none | ex/foo | `backlog/{blocker_id}.md` |\n",
+        )
+        return BacklogManager().validate(idx, tmp_path)
+
+    def _violations(self, errors: list[str], row_id: str = "E9-F1-S1-T1") -> list[str]:
+        return [e for e in errors if row_id in e and "BLOCKED_PENDING_PROPOSAL" in e]
+
+    @pytest.mark.parametrize("source_status", ["in-progress", "in-queue", "in-review"])
+    def test_non_blocked_status_with_live_marker_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path, source_status: str
+    ) -> None:
+        errors = self._errors_for(tmp_path, backlog_dir, source_status=source_status, blocker_status="in-queue")
+
+        matches = self._violations(errors)
+        assert len(matches) == 1, f"expected exactly one violation, got: {matches}"
+        assert source_status in matches[0]
+        assert "E9-F1-S1-T2" in matches[0], "the error must name the blocking target"
+
+    def test_error_names_the_reconciling_command(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """An operator reading the failure must be told how to clear it."""
+        errors = self._errors_for(tmp_path, backlog_dir, source_status="in-progress", blocker_status="in-queue")
+
+        assert "devbench sync-blocked" in self._violations(errors)[0]
+
+    def test_blocked_status_with_live_marker_is_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The correct state: marker present, status agrees."""
+        errors = self._errors_for(tmp_path, backlog_dir, source_status="blocked", blocker_status="in-queue")
+
+        assert not self._violations(errors)
+
+    @pytest.mark.parametrize("blocker_status", ["done", "declined"])
+    def test_terminal_marker_target_exempts_a_requeued_task(
+        self, tmp_path: Path, backlog_dir: Path, blocker_status: str
+    ) -> None:
+        """A task the cascade legitimately requeued keeps its stale marker.
+
+        Once every marker target is terminal the source is correctly back in
+        ``in-queue``, so demanding ``blocked`` here would flag correct state as a
+        defect -- the inverse failure of the bug this rule closes.
+        """
+        errors = self._errors_for(tmp_path, backlog_dir, source_status="in-queue", blocker_status=blocker_status)
+
+        assert not self._violations(errors)
+
+    @pytest.mark.parametrize("source_status", ["done", "declined"])
+    def test_terminal_source_with_stale_marker_is_exempt(
+        self, tmp_path: Path, backlog_dir: Path, source_status: str
+    ) -> None:
+        """A finished task's marker history is not a live defect."""
+        errors = self._errors_for(tmp_path, backlog_dir, source_status=source_status, blocker_status="in-queue")
+
+        assert not self._violations(errors)
+
+    def test_no_marker_means_no_constraint(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """An ordinary in-progress task with no marker is untouched by this rule."""
+        row_id = "E9-F1-S1-T3"
+        self.H.make_task(
+            backlog_dir,
+            row_id,
+            "ex/foo",
+            "| `src/baz.py` | new |\n| `tests/unit/test_baz.py` | new |\n",
+            status="in-progress",
+        )
+        idx = self.H.make_index(
+            tmp_path,
+            f"| {row_id} | T | Task | in-progress | none | ex/foo | `backlog/{row_id}.md` |\n",
+        )
+
+        assert not self._violations(BacklogManager().validate(idx, tmp_path), row_id)
+
+
 class TestValidateAlreadySatisfiedDeclineCitation:
     """Check 22: an already-satisfied decline must cite a commit or task id (FR-4.5).
 
@@ -5568,6 +6332,20 @@ class TestValidateDepCycle4Node:
         )
         return index
 
+    @staticmethod
+    def _run_check(manager: BacklogManager, index: Path, tmp_path: Path) -> list[str]:
+        """FR-1: `_check_dep_cycles` now takes `rows` + `workspace_root` too.
+
+        The fixture work-unit files here carry no `## Dependencies` table and
+        no `## Comments` section, so `rows`/`workspace_root` contribute zero
+        extra edges -- these regression cases stay pinned to index-only
+        behavior while exercising the new signature.
+        """
+        errors: list[str] = []
+        rows = manager._parse_backlog_rows(index)
+        manager._check_dep_cycles(index, rows, tmp_path, errors)
+        return errors
+
     def test_4_node_cycle_rejected(self, tmp_path: Path) -> None:
         index = self._index_with_deps(
             tmp_path,
@@ -5578,8 +6356,7 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T4": "E0-F1-S1-T3",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert any("cycle" in e for e in errors)
 
     def test_5_node_cycle_rejected(self, tmp_path: Path) -> None:
@@ -5593,8 +6370,7 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T5": "E0-F1-S1-T4",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert any("cycle" in e for e in errors)
 
     def test_4_node_dag_accepted(self, tmp_path: Path) -> None:
@@ -5608,15 +6384,13 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T4": "E0-F1-S1-T3",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert errors == []
 
     def test_self_dep_reported(self, tmp_path: Path) -> None:
         """A 1-node cycle (self-dep) is also caught."""
         index = self._index_with_deps(tmp_path, {"E0-F1-S1-T1": "E0-F1-S1-T1"})
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         assert any("cycle" in e for e in errors)
 
     def test_disjoint_cycle_reported_once(self, tmp_path: Path) -> None:
@@ -5630,15 +6404,14 @@ class TestValidateDepCycle4Node:
                 "E0-F1-S1-T4": "E0-F1-S1-T3",
             },
         )
-        errors: list[str] = []
-        BacklogManager()._check_dep_cycles(index, errors)
+        errors = self._run_check(BacklogManager(), index, tmp_path)
         cycle_errors = [e for e in errors if "cycle" in e]
         assert len(cycle_errors) == 2
 
     def test_missing_index_no_crash(self, tmp_path: Path) -> None:
         """The cycle check on a missing BACKLOG.md returns silently."""
         errors: list[str] = []
-        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", errors)
+        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", [], tmp_path, errors)
         assert errors == []
 
     def test_summary_row_skipped_when_cell_count_mismatches(self, tmp_path: Path) -> None:
@@ -5658,6 +6431,207 @@ class TestValidateDepCycle4Node:
         graph = BacklogManager()._build_dependency_graph(index)
         assert "E0-F1-S1-T1" in graph
         assert "short" not in graph
+
+
+class TestCheckDepCyclesUnionOfChannels:
+    """FR-1 (db-253 Gap 1, db-299 Defect 2): `_check_dep_cycles` unions the
+    index `Dependencies` column with each non-terminal Task's own
+    `## Dependencies` table and `[BLOCKED_PENDING_PROPOSAL]` markers. Before
+    the fix, `validate()` was blind to a cycle that existed only in the
+    table/marker channels because the index cells stayed `none`.
+    """
+
+    def test_marker_only_cycle_detected(self, tmp_path: Path) -> None:
+        """Two non-terminal tasks with MUTUAL markers and index cells 'none'."""
+        marker_to_t2 = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        marker_to_t1 = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T1\n"
+        t1 = _unit_body("E0-F1-S1-T1", "in-queue", comments=marker_to_t2)
+        t2 = _unit_body("E0-F1-S1-T2", "in-queue", comments=marker_to_t1)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "in-queue"), ("E0-F1-S1-T2", "T2", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert any("dependency cycle detected" in e for e in errors), errors
+
+    def test_work_unit_table_cycle_detected(self, tmp_path: Path) -> None:
+        """Two non-terminal tasks with MUTUAL `## Dependencies` table rows and
+        index cells 'none'.
+        """
+        t1 = _unit_body("E0-F1-S1-T1", "in-queue", deps=["E0-F1-S1-T2"])
+        t2 = _unit_body("E0-F1-S1-T2", "in-queue", deps=["E0-F1-S1-T1"])
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "in-queue"), ("E0-F1-S1-T2", "T2", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert any("dependency cycle detected" in e for e in errors), errors
+
+    def test_add_dep_refuses_the_edge_that_would_close_a_cycle(self, tmp_path: Path) -> None:
+        """AC-3: `add_dep(T1,T4)` then `add_dep(T4,T1)` is refused at write time.
+
+        This pair used to be written without complaint, and the resulting cycle
+        surfaced only on the next `validate()` sweep -- by which point nothing
+        in either work-unit file named the edge responsible. `add_dep` now runs
+        the same cycle detector `devbench next` uses against the prospective
+        graph and refuses, naming the chain, while the caller still has the
+        context to pick the other direction.
+
+        `validate()`'s own union-of-channels cycle detection is unchanged and
+        stays covered by the sibling tests in this class, which build the cycle
+        directly in the work-unit files rather than through `add_dep`.
+        """
+        from devbench.backlog.proposal import ProposalError, add_dep
+
+        t1 = _unit_body("E0-F1-S1-T1", "in-queue")
+        t4 = _unit_body("E0-F1-S1-T4", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "in-queue"), ("E0-F1-S1-T4", "T4", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T4": t4},
+        )
+        add_dep(
+            backlog_root=tmp_path / "backlog",
+            backlog_index=index,
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T4",
+        )
+        with pytest.raises(ProposalError, match="cycle"):
+            add_dep(
+                backlog_root=tmp_path / "backlog",
+                backlog_index=index,
+                blocked_task_id="E0-F1-S1-T4",
+                blocker_task_id="E0-F1-S1-T1",
+            )
+        # And the refusal left the graph acyclic rather than half-written.
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("dependency cycle detected" in e for e in errors), errors
+
+    def test_terminal_unit_stale_marker_not_a_cycle(self, tmp_path: Path) -> None:
+        """AC-4: a done/declined task's stale marker contributes no edge, so
+        it cannot resurrect a historical cycle even though the OTHER side of
+        the pair is a live, non-terminal marker edge.
+        """
+        stale_marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        live_marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T1\n"
+        t1 = _unit_body("E0-F1-S1-T1", "declined", comments=stale_marker)
+        t2 = _unit_body("E0-F1-S1-T2", "blocked", comments=live_marker)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "T1", "declined"), ("E0-F1-S1-T2", "T2", "blocked")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("dependency cycle detected" in e for e in errors), errors
+
+
+class TestValidateManifestConflictsThroughNonClaimant:
+    """FR-5 (db-311): `_tasks_form_dep_chain` traverses through a non-claimant
+    intermediate so a correctly-ordered chain is not a false Manifest
+    conflict, while genuinely unordered claimants (even considering
+    non-claimants) still conflict.
+    """
+
+    H = _ValidateRuleHarness
+    REPO = "ex/foo"
+
+    def test_chain_through_non_claimant_intermediate_no_conflict(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """T_b -> T_x(non-claimant) -> T_a resolves the ownership conflict
+        even though T_x never appears in the ownership map for the shared
+        path (db-311): T_x's Manifest claims a different file.
+        """
+        self.H.make_task(backlog_dir, "E7-F1-S1-T1", self.REPO, "| `pyproject.toml` | edit |\n")  # T_a
+        self.H.make_task(
+            backlog_dir,
+            "E7-F1-S1-T2",  # T_x, non-claimant intermediate
+            self.REPO,
+            "| `other.yaml` | edit |\n",
+            deps_rows="| E7-F1-S1-T1 | dep | proposed |",
+        )
+        self.H.make_task(
+            backlog_dir,
+            "E7-F1-S1-T3",  # T_b
+            self.REPO,
+            "| `pyproject.toml` | edit |\n",
+            deps_rows="| E7-F1-S1-T2 | dep | proposed |",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| E7-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/E7-F1-S1-T1.md` |\n"
+            "| E7-F1-S1-T2 | T2 | Task | in-queue | E7-F1-S1-T1 | ex/foo | `backlog/E7-F1-S1-T2.md` |\n"
+            "| E7-F1-S1-T3 | T3 | Task | in-queue | E7-F1-S1-T2 | ex/foo | `backlog/E7-F1-S1-T3.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_genuinely_unordered_claimants_still_conflict(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-13: two claimants with no path even through non-claimants still
+        conflict; a bystander non-claimant task (unrelated dep-free) must not
+        change the verdict.
+        """
+        self.H.make_task(backlog_dir, "E8-F1-S1-T1", self.REPO, "| `pyproject.toml` | edit |\n")
+        self.H.make_task(backlog_dir, "E8-F1-S1-T2", self.REPO, "| `pyproject.toml` | edit |\n")
+        self.H.make_task(backlog_dir, "E8-F1-S1-T3", self.REPO, "| `other.yaml` | edit |\n")
+        self.H.make_index(
+            tmp_path,
+            "| E8-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/E8-F1-S1-T1.md` |\n"
+            "| E8-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/E8-F1-S1-T2.md` |\n"
+            "| E8-F1-S1-T3 | T3 | Task | in-queue | none | ex/foo | `backlog/E8-F1-S1-T3.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        conflict = [e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e]
+        assert len(conflict) == 1
+
+
+class TestCheckDanglingMarkers:
+    """FR-7 (db-253 Gap 2b): a well-formed marker referencing a WU-ID absent
+    from the index is a `validate()` error, instead of silently surviving
+    until `reconcile-cascade` trips on it.
+    """
+
+    def test_marker_referencing_absent_id_is_error(self, tmp_path: Path) -> None:
+        marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        t1 = _unit_body("E0-F1-S1-T1", "blocked", comments=marker)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Source", "blocked")],
+            files={"E0-F1-S1-T1": t1},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        expected = (
+            "work unit E0-F1-S1-T1: [BLOCKED_PENDING_PROPOSAL] marker references "
+            "unknown task 'E0-F1-S1-T99' -- the referenced task is not in the "
+            "index; remove the marker or fix the reference (blocks reconcile-cascade)."
+        )
+        assert expected in errors
+
+    def test_marker_referencing_known_id_is_not_dangling(self, tmp_path: Path) -> None:
+        marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        t1 = _unit_body("E0-F1-S1-T1", "blocked", comments=marker)
+        t2 = _unit_body("E0-F1-S1-T2", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Source", "blocked"), ("E0-F1-S1-T2", "Target", "in-queue")],
+            files={"E0-F1-S1-T1": t1, "E0-F1-S1-T2": t2},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("marker references unknown task" in e for e in errors), errors
+
+    def test_terminal_unit_dangling_marker_not_reported(self, tmp_path: Path) -> None:
+        """A done Task's dangling marker is not reported: terminal units are
+        skipped, matching the FR-1 cycle-union gating.
+        """
+        marker = "[2026-06-01 00:00 UTC] [agent/operator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        t1 = _unit_body("E0-F1-S1-T1", "done", comments=marker)
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Source", "done")],
+            files={"E0-F1-S1-T1": t1},
+        )
+        errors = BacklogManager().validate(index, tmp_path)
+        assert not any("marker references unknown task" in e for e in errors), errors
 
 
 class TestValidateBrokenAndCanonicalBacklogFormat:

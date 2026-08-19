@@ -174,7 +174,7 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 9. Tasks have a `## Definition of Done` section
 10. No em-dash characters (U+2014) anywhere in work-unit content
 11. Manifest paths do not start with a `checkout_directory` prefix
-12. Manifest path conflicts (no two in-queue Tasks claim the same file)
+12. Manifest path conflicts (no two HARD claimants -- `in-queue`, `proposed`, `blocked`, `in-progress` -- claim the same file with no ordering dependency; checked on every run. SOFT claimants -- `draft`, `hold` -- are folded into the conflict count only under `devbench validate-backlog --strict`)
 13. Language-AC alignment (non-Python tasks must mark Python ACs N/A)
 14. Source-test atomicity (every prod source has a paired test in the same Manifest)
 15. Required sections (`## Status:`, `## Dependencies`, `## Changes Manifest`) on every Task
@@ -239,8 +239,8 @@ as `VALID_TASK_TYPES`; no call site hard-codes the type strings):
 | `feature` | Yes | At least one production-source row. |
 | `test-only` | No | Every row must be a test path. |
 | `refactor` | No | No per-row invariant -- its requirement is green-green (tests pass before AND after the change), which is a TDD-cycle-log concern, not a static Manifest shape. |
-| `docs` | No | Every row must be a documentation/markdown (`.md`) path. |
-| `chore` | No | Every row must be a dependency/config/lockfile path. |
+| `docs` | No | Every row must be a documentation/markdown (`.md`) path OR a documentation-pinning test path. |
+| `chore` | No | Every row must be a dependency/config/lockfile path OR a documentation/markdown path. |
 
 If the `## Task Type:` section is omitted entirely, the Task defaults
 to `behavior-fix` -- the strictest type -- and the `behavior-fix`
@@ -252,6 +252,41 @@ scaffolding template (`backlog/templates/task.md`) writes the literal
 value `behavior-fix` into every newly created Task, so the default
 path and the explicit declaration converge on the same value for
 freshly authored Tasks.
+
+**Task-factory drafts declare an inferred type.** A Task materialised
+from a proposal cannot rely on the `behavior-fix` default, because the
+proposal that produced it may well be a test-only, docs-only or
+chore-only remediation -- and the default's production-source
+invariant would then reject a Task that is correct as written. Nothing
+in devbench writes a `## Task Type:` section after materialisation, so
+such a Task would stay stuck until a human edited the file by hand.
+`infer_task_type` in `src/devbench/backlog/proposal.py` closes that:
+it derives the declaration from the Changes Manifest the factory is
+about to write, and the draft carries it from the moment it is
+created.
+
+Inference reuses `BacklogManager`'s own classifiers and its
+`_TASK_TYPE_ROW_INVARIANTS` table rather than restating the rules, so
+the factory and the validator cannot drift apart -- the same
+prohibition on a second, independent path classifier that
+`_is_test_source_path` documents. Because those classifiers read
+`validate.production_source_paths` and
+`validate.production_source_extensions`, the inferred type follows
+whatever layout the workspace declares and assumes nothing about any
+particular repository. Resolution order:
+
+1. Any production-source row keeps the gated `behavior-fix` default.
+   Inference never moves a Task out of the RED gate.
+2. Otherwise the first non-gated type whose per-row invariant accepts
+   every row wins, checked in the order the taxonomy narrows:
+   `test-only`, `docs`, `chore`.
+3. With no real rows to judge -- a sentinel-only Manifest whose paths
+   the amendment workflow concretises at execution time -- no row
+   claim can be made honestly, so `refactor` is declared. It is the
+   one type with no Manifest invariant, and therefore the only
+   declaration that stays valid both before and after those paths
+   resolve. The draft's "review and edit before promoting" banner is
+   what asks a human to revisit it once the real file list exists.
 
 Terminal Tasks (`done` or `declined`) are skipped by rule 21
 entirely, regardless of whether they declare a `## Task Type:`
@@ -282,9 +317,10 @@ A per-row invariant violation names the offending row, the declared type,
 and the violated invariant:
 
 ```
-EX-F1-S1-T1: task type 'docs' allows only documentation/markdown rows in
-the Changes Manifest, but 'src/devbench/cli.py' is not a
-documentation/markdown path -- task-type invariant violated. See
+EX-F1-S1-T1: task type 'docs' allows only documentation/markdown or
+documentation-pinning test rows in the Changes Manifest, but
+'src/devbench/cli.py' is not a documentation/markdown or
+documentation-pinning test path -- task-type invariant violated. See
 docs/backlog-contract.md 'Task-Type Taxonomy'.
 ```
 
@@ -299,11 +335,18 @@ source" and "is this path a Python test" are decided in exactly one
 place -- `BacklogManager._is_test_source_path` (shared by
 `_is_production_source`, Rule 14's source-test atomicity check, and this
 rule's `behavior-fix` / `feature` / `test-only` invariants). The `docs`
-and `chore` invariants introduce two new, narrower extension-based
-classifiers (`_is_documentation_path` for `.md`; `_is_chore_path` for
-lockfile / config extensions) that do not overlap the production/test
-boundary Rule 14 already owns, so the production/test classification
-itself is never duplicated.
+and `chore` invariants are each an OR-list over the three existing
+classifiers, not a fourth classifier: `docs` accepts a row when either
+`_is_documentation_path` (`.md`) or `_is_test_source_path` accepts it
+(a documentation-pinning test row, e.g. `tests/test_docs/test_guide_pin.py`,
+legitimately belongs to a `docs` task), and `chore` accepts a row when
+either `_is_chore_path` (lockfile / config extensions) or
+`_is_documentation_path` accepts it (e.g. `CHANGELOG.md` legitimately
+belongs to a `chore` task). `_is_documentation_path` and `_is_chore_path`
+remain the sole classifiers for their respective extension shapes; no
+fourth classifier is added, so every OR-list entry above is traceable
+to one of the same three classifiers, keeping a single source of
+truth for path classification.
 
 ### Dependency satisfaction (E215)
 
@@ -355,6 +398,43 @@ Below the Status Summary, one row per work unit:
 
 The `File Path` column must be a path relative to `DEVBENCH_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
+### Task-row file-path policy (db-279)
+
+Only Task rows are required to name a file path. Epic, Feature, and Story
+rows may leave the `File Path` cell empty -- those rows are scaffolding-only
+and have no corresponding leaf work-unit file. The index parser and
+`validate-backlog` enforce this identical contract, each with its own error
+surface, so a file-less Task row can never pass one layer and crash the
+other:
+
+- `parse_index` (`src/devbench/backlog/parser.py`) infers each row's type
+  from its ID via `_infer_type_from_id`. When the `File Path` cell is empty
+  it raises `ValueError(f"Task work unit '{raw_id}' has no file path in
+  BACKLOG.md")` for a Task row, and otherwise `continue`s past a file-less
+  Epic/Feature/Story row without error.
+- `BacklogManager.validate()` runs the dedicated check
+  `_check_task_rows_have_files` (`src/devbench/backlog/manager.py`), which
+  uses the same `_is_task_id` idiom other Task-only rules use to append the
+  error `"<id>: Task-level work unit has no file path in BACKLOG.md --
+  every Task row must name a materialised work-unit file"` for a file-less
+  Task row, while skipping non-Task rows (including Status-Summary Epic
+  rows and the `**TOTAL**` row) without any special-casing.
+
+### Managed removal (db-303)
+
+`devbench remove <id> --reason "<message>"` is the managed path for dropping a superseded work unit entirely -- it is the only sanctioned way to make a unit disappear from the index (as opposed to `decline`, which keeps the unit visible with a terminal `declined` status). `BacklogManager.remove_unit` runs the whole operation under a single `flock(BACKLOG.lock)` so a concurrent devbench session can never interleave a partial removal with another write:
+
+1. Deletes the `<id>` row from the `BACKLOG.md` index (`_remove_backlog_index_row`). If no row matches `<id>`, a `ValueError` is raised *before* any file is touched, so a typo can never delete an unrelated unit or leave the index and the work-unit file out of sync.
+2. Deletes the work-unit `.md` file from disk.
+3. Re-rolls the `## Status Summary` table (`_update_status_summary`) so the per-epic counts reflect the removal immediately.
+4. Appends a `[WU_REMOVED] <id> -- <reason>` line to the workspace audit log, using the same timestamped-append shape as the `[BULK_STATUS_UPDATE]` row.
+
+`--reason` is REQUIRED (the CLI refuses with rc=1 and no write when it is missing) so the removal always leaves an audit trail, and em-dashes in the reason text are rejected at the input boundary per the workspace's em-dash hygiene rule. An unknown `<id>` fails fast with rc=1 before any file is touched -- there is no partial-removal state to recover from.
+
+### Block-by-default raw-edit guard on BACKLOG.md
+
+`BACKLOG.md` is normally written only by managed verbs (`devbench remove`/`set-status`/`decline`/`mark-done`/`hold`/`unhold`/...), which write through Python I/O -- not the Claude Code `Write`/`Edit` tools -- so they never reach the PreToolUse hook layer. A raw `Write`/`Edit` to `BACKLOG.md` (at the workspace root or nested) bypasses `flock(BACKLOG.lock)`, the Status-Summary rollup, and the audit trail, so `guard-work-unit-write.sh` blocks it by default with exit 2. The operator override is `DEVBENCH_ALLOW_BACKLOG_EDIT=1` (modeled on `DEVBENCH_ALLOW_DESTRUCTIVE_GIT=1`), which the hook accepts only as the exact literal string `1` -- no truthy-string fallback (`true`, `yes`, etc. still block) -- for a one-off hand-repair. This guard is independent of the `DEVBENCH_AGENT_ROLE` caller-role check that governs writes to individual work-unit `.md` files under `backlog/`; see [architecture.md](architecture.md#9-hooks-layer) for that mechanism.
+
 ---
 
 ## Work Unit File Structure
@@ -368,6 +448,7 @@ All sections below are required unless noted as optional.
 
 ## Status: {status}
 
+## Expected Output: {commit|none}  ← optional; absent defaults to commit under rule 28; `none` skips commit/PR/CI/merge (the scaffolding template writes commit by default)
 ## Task Type: {type}         ← optional; one of behavior-fix / feature / test-only / refactor / docs / chore; absent defaults to behavior-fix under rule 21 (the scaffolding template also writes behavior-fix by default)
 
 ## Target Repository
@@ -471,16 +552,68 @@ MUST declare a non-gated `## Task Type:` value -- `test-only`,
 check never fires. See "Task-Type Taxonomy Rule (FR-4.1, rule 21)"
 above.
 
+#### Expected-Output Declaration (rule 28)
+
+A Task may declare whether executing it is expected to produce a commit:
+
+```markdown
+## Expected Output: none
+```
+
+| Value | Lifecycle |
+|-------|-----------|
+| `commit` | **Default when the section is absent.** git-ops commits, pushes, opens a PR, waits for CI, and merges. |
+| `none` | git-ops completes the Task with no commit, push, PR, CI wait, or merge. The Task records its evidence in `## Comments`. |
+
+Because an absent section resolves to `commit`, every backlog authored before
+this section existed keeps its current lifecycle exactly -- there is no
+migration and no configuration key.
+
+Rule 28 cross-checks the declaration against the Changes Manifest so an
+authoring mistake fails at `validate-backlog` time rather than surfacing at
+execution time as a Task that blocks after its review judges have already run:
+
+- `none` requires a Manifest of **only** no-output sentinels. Any real path is
+  rejected: the Task names a file to change, so skipping the commit would
+  discard that work.
+- `none` alongside `<source-drift-fix-targets-determined-at-execution>` is
+  rejected: deferred resolution enumerates real paths mid-execution, which is
+  precisely a commit.
+- An unrecognised value is rejected naming the allowed set.
+
+At execution time, git-ops refuses to complete a `none` Task that has **staged**
+changes, because staged content contradicts the declaration and completing
+would silently discard it. The check is deliberately on the staged set rather
+than a clean working tree: tooling that rewrites a lockfile on any invocation
+leaves unstaged drift that is a pre-existing repository condition, not the
+Task's output. Either way git-ops appends a `[GIT_OPS_NO_OUTPUT]` audit comment
+recording the Manifest declaration and the working-tree state, so the path
+taken is always observable.
+
+A `none` Task still needs a non-gated `## Task Type:` under rule 21, since a
+sentinel-only Manifest can never satisfy a gated type's production-source
+invariant.
+
+See ADR-35.
+
+
 Accepted sentinel values (canonical list in
 `src/devbench/backlog/sentinels.py`):
 
-| Sentinel | Semantics |
-|----------|-----------|
-| `<verification-only>` | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
-| `<decision-only>` | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
-| `<no changes>` | The task is a placeholder or audit-flip with no executor work. Rare. |
-| `<no-op>` | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |
-| `<source-drift-fix-targets-determined-at-execution>` | The task's concrete file list is enumerated at execution time via `manifest_amendment`. Acceptable when the surface depends on diagnostics that haven't run yet. |
+| Sentinel | Produces a commit? | Semantics |
+|----------|--------------------|-----------|
+| `<verification-only>` | No | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
+| `<decision-only>` | No | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
+| `<no changes>` | No | The task is a placeholder or audit-flip with no executor work. Rare. |
+| `<no-op>` | No | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |
+| `<source-drift-fix-targets-determined-at-execution>` | Yes | The task's concrete file list is enumerated at execution time via `manifest_amendment`. Acceptable when the surface depends on diagnostics that haven't run yet. |
+
+The four **no-output** sentinels and the one **deferred-resolution** sentinel
+are not interchangeable. A task whose Manifest is exclusively no-output
+sentinels may declare `## Expected Output: none` (see the Expected-Output Declaration section above) and will be
+completed by git-ops without a commit. A task carrying
+`<source-drift-fix-targets-determined-at-execution>` resolves to real paths
+mid-execution and therefore MUST NOT declare `none`.
 
 Additionally, **any** token shaped as ``<name>`` (single ``<``,
 no whitespace, single ``>``) is treated as a sentinel by the
@@ -527,7 +660,10 @@ Higher-level files require only:
 |----|-------|--------|
 ```
 
-Status rolls up automatically when all children reach `done`.
+Status rolls up automatically when every child reaches a terminal status -- `done` **or**
+`declined` (issue #332 FR-1). See [Auto-rollup behavior](#auto-rollup-behavior) below for the
+full contract, including the `reconcile-cascade` repair pass for parents stranded before that
+fix landed.
 
 ---
 
@@ -588,11 +724,23 @@ A real Comments section looks like this:
 
 ## Auto-rollup behavior
 
-When `devbench mark-done <task-id>` succeeds, `BacklogManager._rollup_parent_status()` walks up the parent chain:
+When a Task reaches a terminal status -- `done` via `devbench mark-done <task-id>` or `declined`
+via `devbench decline <task-id> --reason "<text>"` -- `BacklogManager._rollup_parent_status()`
+walks up the parent chain:
 
-1. If all sibling tasks of the parent story are now done, the parent story is marked done.
-2. If marking that story done causes all sibling stories of the parent feature to be done, the parent feature is marked done.
+1. If every direct child of the parent story is now terminal (`done` **or** `declined`), the
+   parent story is marked done.
+2. If marking that story done causes every sibling story of the parent feature to be terminal,
+   the parent feature is marked done.
 3. Likewise for feature → epic.
+
+A child counts as "terminal" -- and therefore never blocks its parent's rollup -- when its status
+is `done` OR `declined`; `_all_children_done()` (the rollup's own gate, despite the `done`-only
+name) implements exactly that check. Declined work has been intentionally taken off the table, so
+a parent whose only remaining open child gets declined rolls up exactly as one whose last child is
+marked done (issue #332 FR-1: before this fix, the rollup call fired from a `done` transition
+only, so a `declined` last child left its story, feature, and epic stranded in a non-terminal
+status forever, even though `_all_children_done()` itself already treated `declined` as terminal).
 
 Each auto-rollup writes an audit comment to the parent's Comments section so the trail is visible:
 
@@ -600,7 +748,25 @@ Each auto-rollup writes an audit comment to the parent's Comments section so the
 [2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done -- all children completed.
 ```
 
-Rollup happens synchronously inside `mark-done`. There is no background process and no race condition.
+Rollup happens synchronously inside `mark-done` and `decline` alike -- both routes flow through
+the same `_set_status()` call, which fires `_rollup_parent_status()` from any terminal transition,
+not a `done` transition only. There is no background process and no race condition.
+
+### Repair sweep for parents stranded before the fix (`reconcile-cascade`)
+
+The live rollup above only fires from a fresh terminal transition. A parent whose children were
+already all terminal *before* the issue #332 FR-1 fix landed -- or one whose promoting transition
+was lost to a crashed or partial write -- has no live event left that could promote it; the FR-1
+fix is not retroactive. `devbench reconcile-cascade` closes that gap with a second pass
+(`_repair_stranded_containers` in `cli.py`): it walks every non-terminal Story/Feature/Epic
+container, re-evaluates `_all_children_done()` fresh against the current `BACKLOG.md`, and
+promotes each qualifying container via the same `_set_status()` call `_rollup_parent_status()`
+itself uses -- so a promoted container's own terminal transition cascades to its parent exactly as
+a live rollup would. Each repaired container gets a `[CASCADE_RECONCILED]` audit comment naming
+the repair. The sweep runs under `flock_backlog` and is idempotent: running it again against an
+already-repaired backlog reports zero containers rolled up. See
+[`reconcile-cascade`](cli-reference.md#reconcile-cascade) for the command reference, its JSON
+output envelope, and summary-line format.
 
 ### Auto-tick of AC / DoD checkboxes on done
 
@@ -697,22 +863,76 @@ aborts if any error is found.
 
 ## Manifest Conflict Rule (post-Backlog-A addendum)
 
-No two in-queue Tasks MAY list the same file path in their `## Changes Manifest` tables. Each file path in the workspace MUST have a single owning Task. If two Tasks legitimately need to modify the same file at different points in time, express the order via `## Dependencies` so they execute sequentially against the same path; the LATER Task's Manifest declares the file even if the EARLIER Task created it (the later Task's edit IS the change git records when its branch is staged).
+Claimants of a `## Changes Manifest` path fall into two sets. HARD claimants
+-- `in-queue`, `proposed`, `blocked`, `in-progress` -- are checked on every
+`devbench validate-backlog` run: no two HARD claimants MAY list the same file
+path with no ordering dependency between them (FR-3, db-313). SOFT claimants
+-- `draft`, `hold` -- are pre-lifecycle authoring states; they are folded
+into the conflict count only under `devbench validate-backlog --strict`
+(FR-4, db-267), so `spec-to-backlog` has an authoring-time exit gate while
+default runs stay unchanged (an all-draft backlog still exits 0 by default).
+A status outside both sets (`done`, `declined`, `in-review`, or an
+unrecognised value) belongs to neither and is never checked. Each file path
+in the workspace MUST have a single owning Task. If two Tasks legitimately
+need to modify the same file at different points in time, express the order
+via `## Dependencies` so they execute sequentially against the same path;
+the LATER Task's Manifest declares the file even if the EARLIER Task created
+it (the later Task's edit IS the change git records when its branch is
+staged).
+
+**The dependency-edge contract (#330 FR-1).** The serial-dep chain this rule
+scans is read exclusively from each Task's `## Dependencies` table -- an
+audit-comment marker alone never satisfies it. `uv run devbench add-dep
+<blocked-task-id> <blocker-task-id>` is the canonical tool that writes the
+row this rule reads: it appends a canonical `## Dependencies` row to
+`<blocked-task-id>`'s work-unit file, in addition to (not instead of) the
+separate `[BLOCKED_PENDING_PROPOSAL]` marker consumed by the unrelated
+ADR-07 auto-requeue cascade (see
+[ADR-07](adr/07-auto-requeue-on-proposal-completion.md)). See
+[`add-dep`](cli-reference.md#add-dep) for the exit-code contract that
+governs whether the call actually produced a row this rule can see.
 
 ### Why
 
-When two in-queue Tasks both claim the same file, the orchestrator's `next` command can claim them in either order. The first Task creates / modifies the file; the second Task tries to do the same and either (a) collides with the first Task's commit, or (b) writes a conflicting version that triggers a code-review failure. In production at `caylent-telemetry-spec/`, two file-ownership conflicts were observed:
+When two HARD claimants of one path have no ordering dependency, the
+orchestrator's `next` command can claim them in either order -- and an
+actively-executing (`in-progress`) claimant is just as real a collision risk
+as a queued one, since its commit lands whenever its executor finishes,
+independent of queue order (db-313). The first claimant creates / modifies
+the file; the second tries to do the same and either (a) collides with the
+first claimant's commit, or (b) writes a conflicting version that triggers a
+code-review failure. In production at `caylent-telemetry-spec/`, two
+file-ownership conflicts were observed:
 
 - `.github/actions/monorepo-check/action.yaml` -- claimed by both `E0-F2-S1-T1` (skeleton) and `E5-F1-S1-T2` (full implementation).
 - `.github/workflows/on-pr.yaml` -- claimed by both `E0-F2-S1-T2` (stub) and `E5-F2-S1-T1` (full).
 
 The fix in both cases was to add a `## Dependencies` entry: the full-implementation Task waits on the skeleton Task. The full-implementation Task's Manifest still lists the file (because the full-impl IS its change to git), but the structural ordering prevents collision.
 
+Before FR-4 (db-267), `draft`/`hold` claimants of the same path had no
+authoring-time check at all: `spec-to-backlog` could promote two drafts that
+claimed the same file and the collision would surface only after both
+promoted to `in-queue`, by which point it is a HARD conflict blocking the
+orchestrator instead of an authoring-time warning.
+
 ### Validation
 
-`devbench validate-backlog` SHOULD reject any backlog state where two in-queue Tasks list the same file path with no explicit dependency between them. (This rule is part of the post-Backlog-A Tier 3 tooling proposal; until it lands, authors are responsible for self-checking via grep across `## Changes Manifest` blocks.)
+`devbench validate-backlog` rejects any backlog state where two or more HARD
+claimants of the same file path have no explicit dependency between them;
+this check runs on every invocation, default or `--strict`. Under
+`devbench validate-backlog --strict`, a path whose HARD claimants did not
+already trigger a conflict is re-checked with SOFT claimants folded in, and
+a resulting collision is rejected with the verbatim ERROR:
 
-For N claimants of the same path, the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
+```
+Manifest conflict (draft/hold) on {path!r}: claimed by {ids}. These units are not yet in-queue; wire a serial dep chain before promoting. See docs/backlog-contract.md 'Manifest Conflict Rule'.
+```
+
+Default (non-`--strict`) runs never evaluate SOFT claimants, so an all-draft
+backlog still exits 0; `spec-to-backlog` adopts `validate-backlog --strict`
+as its authoring-time exit gate.
+
+For N claimants of the same path (HARD, or HARD+SOFT under `--strict`), the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
 
 The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
 

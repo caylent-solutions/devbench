@@ -27,7 +27,12 @@ BLOCKED_PATTERNS=(
   "git push --force"
   "git push -f"
   "git reset --hard"
-  "git checkout --"
+  # Trailing space is load-bearing (issue #335): the destructive file-restore
+  # form is `git checkout -- <path>`, while `git checkout --theirs <path>` /
+  # `git checkout --ours <path>` are non-destructive conflict-side selection
+  # during a merge or cherry-pick. A bare "git checkout --" substring matched
+  # both. guard-destructive-git.sh already draws this same line.
+  "git checkout -- "
   "git clean -f"
   "git clean -fd"
   "git clean -fdx"

@@ -37,8 +37,9 @@ If `skills.exemplar_backlog_path` is absent OR the file does not exist, skip the
 **Step 1b -- The 15 canonical task-file sections (authoritative quality bar)**
 
 Every leaf task `.md` file MUST contain these 15 sections, in this order. One further
-OPTIONAL section, `## Task Type:`, is described immediately after the list -- author it
-whenever the task is not a behaviour fix.
+OPTIONAL sections, `## Task Type:` and `## Expected Output:`, are described immediately
+after the list -- author `## Task Type:` whenever the task is not a behaviour fix, and
+`## Expected Output: none` whenever the task produces no commit.
 
 1. `# {id}: {title}` -- top-level heading with full task ID
 2. `## Status: <value>` where `<value>` is one of `draft`, `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `declined`, `hold`. **CONSTRAINT (issue #229)**: `draft` is ONLY VALID for Task work units. The validator's `_check_status_enum` rule (see `src/devbench/backlog/manager.py`) rejects `draft` on Epic / Feature / Story with `Status "draft" is only valid for Task work units; <ID> is type <Type>.`. For non-Task levels the operator may intend a "not-ready" state -- map that intent to `hold` (the orchestrator's claim sweep promotes `in-queue` -> claimed; `hold` / `draft` / `declined` all keep the WU paused).
@@ -83,6 +84,36 @@ not decoration -- it selects which TDD evidence the review tier demands, and
 observed failing test before the fix. Letting a docs-only or chore task inherit the
 `behavior-fix` default forces it through a RED gate it can never satisfy, which surfaces
 much later as an unexplained review failure. Match the type to the work.
+
+---
+
+**Step 1d -- The optional `## Expected Output:` section (validate-backlog rule 28)**
+
+Directly beneath `## Status:`, a leaf task MAY declare whether executing it is
+expected to produce a commit:
+
+| Value | Lifecycle |
+|-------|-----------|
+| `commit` | **Default when the section is absent.** git-ops commits, pushes, opens a PR, waits for CI, and merges. |
+| `none` | git-ops completes the task with no commit, push, PR, CI wait, or merge. The task records its evidence in `## Comments`. |
+
+Author `## Expected Output: none` for every task that verifies, decides, or
+no-ops rather than changing files -- preflight gates, post-deploy validations,
+and decision-only tasks. Such a task's Changes Manifest must consist solely of
+no-output sentinels (`<verification-only>`, `<decision-only>`, `<no changes>`,
+`<no-op>`, or a per-task `<name:ID>` variant).
+
+This matters because omitting it is not neutral. A verification task that
+declares nothing inherits the `commit` default, and git-ops then tries to stage
+a Manifest that holds no concrete path -- the task blocks after every review
+judge has already passed. Rule 28 catches the mismatch at validate-backlog time
+instead: it rejects `none` alongside any real path, and rejects `none`
+alongside `<source-drift-fix-targets-determined-at-execution>`, whose paths ARE
+resolved mid-execution and therefore do produce a commit.
+
+A `none` task still requires a non-gated `## Task Type:` under rule 21, since a
+sentinel-only Manifest can never satisfy a gated type's production-source
+invariant.
 
 ---
 
@@ -309,11 +340,11 @@ Pass the workspace root via the `workspace_root` kwarg to `run_all` (Step 5d) so
 ### Status Summary table
 
 ```
-| Epic | Draft | In Queue | In Progress | In Review | Done | Blocked | Total |
-|------|-------|----------|-------------|-----------|------|---------|-------|
-| E1 -- <epic-title> | N | 0 | 0 | 0 | 0 | 0 | N |
+| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |
+|------|-------|------|-------------|----------|---------|----------|-------|
+| E1 | <epic-title> | 0 | 0 | 0 | 0 | 0 | N |
 | ... | ... | ... | ... | ... | ... | ... | ... |
-| **TOTAL** | N | 0 | 0 | 0 | 0 | 0 | N |
+| **TOTAL** |  | 0 | 0 | 0 | 0 | 0 | N |
 ```
 
 All new tasks default to `Draft`; counts in other columns are 0 at generation time.
@@ -322,12 +353,12 @@ All new tasks default to `Draft`; counts in other columns are 0 at generation ti
 
 ### Full Work Unit Index
 
-One row per leaf task in 7-column format:
+One row per work unit at every level (Epic, Feature, Story, Task), each with a File Path:
 
 ```
-| ID | Title | Status | Repo | Branch | Depends On | Changed Files |
-|----|-------|--------|------|--------|------------|---------------|
-| E1-F1-S1-T1 | <title> | Draft | <org/repo> | <branch> | E1-F1-S1-T0 (if any) | <file1>, <file2> |
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E1-F1-S1-T1 | <title> | Task | Draft | E1-F1-S1-T0 (if any) | <org/repo> | `<path/to/E1-F1-S1-T1.md>` |
 ```
 
 The total row count in the Full Work Unit Index MUST equal the TOTAL in the Status Summary table.

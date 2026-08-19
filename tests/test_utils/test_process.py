@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -120,6 +122,81 @@ class TestRunCommandFileNotFound:
             rc, stdout, stderr = run_command(["missing"])
         assert rc == 127
         assert stdout == ""
+
+
+class TestRunCommandEnv:
+    """run_command accepts an optional env mapping and forwards it verbatim."""
+
+    def test_env_forwarded_to_subprocess_run(self) -> None:
+        """
+        Given: An explicit env mapping is passed
+        When: run_command is called
+        Then: subprocess.run receives that exact mapping as its env kwarg
+        Spec: AC-E17-F2-S1-T2-1, AC-E17-F2-S1-T2-2
+        """
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+
+        injected_env = {"FOO": "bar"}
+        with patch("devbench.utils.process.subprocess.run", return_value=mock_result) as mock_run:
+            run_command(["echo", "test"], env=injected_env)
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["env"] == injected_env
+        assert kwargs["env"] is injected_env
+
+    def test_env_defaults_to_none_when_omitted(self) -> None:
+        """
+        Given: No env argument is passed
+        When: run_command is called
+        Then: subprocess.run receives env=None so the child inherits the parent environment
+        Spec: AC-E17-F2-S1-T2-1, AC-E17-F2-S1-T2-2
+        """
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+
+        with patch("devbench.utils.process.subprocess.run", return_value=mock_result) as mock_run:
+            run_command(["echo", "test"])
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["env"] is None
+
+    def test_injected_env_var_visible_in_real_subprocess(self) -> None:
+        """
+        Given: A real (non-mocked) subprocess is spawned with an injected env var
+        When: run_command is called with env={...}
+        Then: The child process genuinely sees the injected variable's value
+        Spec: AC-E17-F2-S1-T2-3
+        """
+        marker_value = "devbench-env-passthrough-marker"
+        injected_env = {"DEVBENCH_TEST_ENV_MARKER": marker_value}
+        cmd = [sys.executable, "-c", "import os; print(os.environ['DEVBENCH_TEST_ENV_MARKER'])"]
+
+        rc, stdout, stderr = run_command(cmd, env=injected_env)
+
+        assert rc == 0, f"subprocess failed: stderr={stderr!r}"
+        assert stdout.strip() == marker_value
+
+    def test_injected_env_does_not_leak_unrelated_parent_vars(self) -> None:
+        """
+        Given: An env mapping that does NOT include PATH
+        When: run_command is called with that restricted env
+        Then: The child process sees exactly the mapping supplied (not the parent's PATH),
+              proving env replaces rather than merges with os.environ
+        Spec: AC-E17-F2-S1-T2-3
+        """
+        assert "DEVBENCH_TEST_ISOLATED_MARKER" not in os.environ
+        injected_env = {"DEVBENCH_TEST_ISOLATED_MARKER": "isolated"}
+        cmd = [sys.executable, "-c", "import os; print('PATH' in os.environ)"]
+
+        rc, stdout, stderr = run_command(cmd, env=injected_env)
+
+        assert rc == 0, f"subprocess failed: stderr={stderr!r}"
+        assert stdout.strip() == "False"
 
 
 class TestRunCommandTimeout:

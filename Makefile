@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hook-deps install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -16,9 +16,14 @@ help:
 	  -e 's/\(watch-live:.*\)/\1 [INTERVAL]/'
 	@echo ""
 
-## install: Install runtime and dev dependencies
+## install: Install runtime and dev dependencies (Python venv + guard-hook runtime deps)
 install:
 	uv sync --all-extras
+	$(MAKE) install-hook-deps
+
+## install-hook-deps: Ensure jq + PyYAML (system python3) for the plugin's PreToolUse guard hooks
+install-hook-deps:
+	./scripts/install-hook-deps.sh
 
 ## install-hooks: Install pre-commit and pre-push git hooks
 install-hooks:

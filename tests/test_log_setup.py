@@ -420,3 +420,40 @@ class TestResolveSessionLogFile:
             match=r"DEVBENCH_WORKSPACE_ROOT must be set when DEVBENCH_SESSION_NAME is set",
         ):
             log_setup_mod._resolve_session_log_file()
+
+
+def test_log_timestamps_are_utc_not_local(tmp_path, monkeypatch):
+    """LOG_DATE_FORMAT ends in a literal 'Z', so emitted times must be real UTC.
+
+    Regression: logging.Formatter defaults to time.localtime, so every line
+    claimed UTC while carrying local wall-clock. In America/New_York that made
+    the report's liveness banner compute a 4h phantom idle for a busy
+    orchestrator (current=datetime.now(UTC) minus a local-time 'Z' stamp).
+    """
+    import logging
+    import re
+    import time
+    from datetime import UTC, datetime
+
+    from devbench.log_setup import build_log_formatter
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+
+    record = logging.LogRecord(
+        name="devbench.test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="probe",
+        args=(),
+        exc_info=None,
+    )
+    emitted = build_log_formatter().format(record)
+    stamp = re.match(r"(\S+Z)", emitted).group(1)
+
+    parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    drift = abs((datetime.now(UTC) - parsed).total_seconds())
+    assert drift < 60, (
+        f"log stamp {stamp} is {drift / 3600:.1f}h from real UTC -- formatter is emitting local time under a 'Z' suffix"
+    )

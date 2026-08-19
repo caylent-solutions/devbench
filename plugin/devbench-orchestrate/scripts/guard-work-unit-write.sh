@@ -4,12 +4,20 @@
 # Receives JSON on stdin with structure:
 #   { "tool_name": "Write"|"Edit", "tool_input": { "file_path": "...", "content": "..." } }
 #
-# Blocks writes to files matching backlog/**/*.md (work unit files).
+# Blocks writes to files matching backlog/**/*.md (work unit files), and
+# blocks raw Edit/Write to BACKLOG.md itself (db-303, spec 4.A, FR-16).
 # Allows:
 #   - Files outside backlog/
-#   - BACKLOG.md (top-level tracking index, managed separately)
 #   - backlog/config/AGENT-INSTRUCTIONS.md and other non-.md files in backlog/
 #   - Non-.md files anywhere under backlog/
+#
+# BACKLOG.md is the top-level tracking index. It is normally written only
+# by managed verbs (devbench remove/set-status/decline/mark-done/...), which
+# go through Python I/O -- not the Edit/Write tools -- so they are never
+# subject to this hook. A raw Edit/Write to BACKLOG.md bypasses the
+# flock(BACKLOG.lock), the Status-Summary rollup, and the audit trail, so it
+# is blocked here unless the operator sets DEVBENCH_ALLOW_BACKLOG_EDIT=1
+# (modeled on DEVBENCH_ALLOW_DESTRUCTIVE_GIT=1) for a one-off hand-repair.
 #
 # For Write/Edit calls targeting backlog/**/*.md, also validates content:
 #   Rule 10: rejects content containing an em-dash (U+2014).
@@ -45,10 +53,17 @@ if [[ -z "$FILE_PATH" ]]; then
   exit 0
 fi
 
-# Allow BACKLOG.md at any level -- this is the top-level tracking index,
-# not a work unit file. Only backlog/**/*.md files are work units.
+# BACKLOG.md at any level (db-303, spec 4.A, FR-16): block a raw Edit/Write
+# unless the operator opts in with DEVBENCH_ALLOW_BACKLOG_EDIT=1. Managed
+# verbs (devbench remove/set-status/decline/mark-done/...) write BACKLOG.md
+# via Python I/O, not the Edit/Write tools, so they never reach this hook.
 if [[ "$FILE_PATH" == "BACKLOG.md" ]] || [[ "$FILE_PATH" == */BACKLOG.md ]]; then
-  exit 0
+  if [[ "${DEVBENCH_ALLOW_BACKLOG_EDIT:-0}" == "1" ]]; then
+    printf 'guard-backlog: ALLOWED via DEVBENCH_ALLOW_BACKLOG_EDIT=1: %s\n' "$FILE_PATH" >&2
+    exit 0
+  fi
+  echo "guard-backlog: blocked Edit/Write to BACKLOG.md. Use a managed verb (devbench remove/set-status/decline/...) so the flock, Status-Summary rollup, and audit trail are preserved. Operator override: set DEVBENCH_ALLOW_BACKLOG_EDIT=1 to hand-repair." >&2
+  exit 2
 fi
 
 # Allow writes to files inside backlog/config/ -- these are configuration artifacts,
@@ -83,6 +98,17 @@ print(d.get('tool_input', {}).get('content', ''))
   if [[ -n "$CONTENT" ]] && [[ -n "${DEVBENCH_WORKSPACE_ROOT:-}" ]]; then
     YAML_PATH="${DEVBENCH_WORKSPACE_ROOT}/backlog/config/devbench.yaml"
     if [[ -f "$YAML_PATH" ]]; then
+      # Fail loudly (exit 2 = block, with the fix on stderr) when the resolved
+      # python3 cannot import PyYAML. Without this check the heredoc below dies
+      # on `import yaml` with a traceback and exit 1, which Claude Code treats
+      # as a non-blocking hook error -- Rule 11 is then silently skipped.
+      # `make -C <devbench> install` (scripts/install-hook-deps.sh) provisions
+      # PyYAML for exactly this interpreter.
+      if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        echo "guard-work-unit-write: rule 11 needs PyYAML for $(command -v python3), which cannot 'import yaml'." >&2
+        echo "Fix: run 'make -C <devbench-checkout> install' (or: $(command -v python3) -m pip install --user pyyaml), then retry the write." >&2
+        exit 2
+      fi
       CHECKOUT_DIRS=$(python3 - "$YAML_PATH" <<'PYEOF'
 import sys, yaml
 try:

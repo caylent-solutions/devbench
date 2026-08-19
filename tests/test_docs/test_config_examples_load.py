@@ -166,6 +166,45 @@ class TestConfigExamplesRoundTripLoadRuntimeConfig:
 
 
 # ---------------------------------------------------------------------------
+# sample-config.yaml advertises every field "at its default value". The
+# manifest_amendment block is not covered by the `# (built-in default)`
+# annotation drift-guard below (that guard reads the brownfield example), so
+# pin it here directly against the AmendmentConfig dataclass defaults. The
+# default of max_requests_per_execution moved 1 -> 2 in the review-rejection
+# loop fix and sample-config.yaml silently kept the old value.
+# ---------------------------------------------------------------------------
+
+_SAMPLE_CONFIG_PATH = REPO_ROOT / "sample-config.yaml"
+
+
+@pytest.mark.unit
+class TestSampleConfigManifestAmendmentMatchesDataclassDefaults:
+    """sample-config.yaml's manifest_amendment block must equal the
+    AmendmentConfig defaults field-for-field; any drift means the reference
+    config documents a value the code no longer ships."""
+
+    def test_manifest_amendment_block_equals_dataclass_defaults(self, tmp_path: Path) -> None:
+        """
+        Given: the shipped sample-config.yaml
+        When: it is round-tripped through load_runtime_config
+        Then: every manifest_amendment field equals the AmendmentConfig
+        dataclass default (enabled, allowed_reasons, max_requests_per_execution)
+        """
+        tmp_config_path = tmp_path / "devbench.yaml"
+        tmp_config_path.write_text(_SAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        loaded = load_runtime_config(tmp_config_path, {}).manifest_amendment
+        expected = AmendmentConfig()
+
+        assert loaded.enabled == expected.enabled
+        assert set(loaded.allowed_reasons) == set(expected.allowed_reasons)
+        assert loaded.max_requests_per_execution == expected.max_requests_per_execution, (
+            f"sample-config.yaml manifest_amendment.max_requests_per_execution="
+            f"{loaded.max_requests_per_execution} drifted from the AmendmentConfig default "
+            f"{expected.max_requests_per_execution}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # AC-E3-F2-S1-T2-7: retired report.token_cost_per_million_*/token_cost_discount
 # keys must not remain as live YAML guidance in any touched doc or the repaired
 # example config. Historical/migration prose (e.g. "were retired in issue

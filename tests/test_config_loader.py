@@ -653,6 +653,46 @@ class TestJsonSchemaValidation:
         with pytest.raises(ValueError, match="unknown_key"):
             load_runtime_config(cfg, {})
 
+    def test_schema_accepts_orchestrator_inactivity_timeout(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML timeouts block with an orchestrator_inactivity integer
+        When: load_runtime_config is called
+        Then: no ValueError is raised and the value is loaded (spec FR-17, db-262)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity: 900
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.timeouts.orchestrator_inactivity == 900, (
+            f"Expected orchestrator_inactivity=900, got {result.timeouts.orchestrator_inactivity!r}"
+        )
+
+    def test_schema_rejects_zero_orchestrator_inactivity_timeout(self, tmp_path: Path) -> None:
+        """
+        Given: an orchestrator_inactivity value of zero (below minimum: 1)
+        When: load_runtime_config is called
+        Then: ValueError is raised (spec FR-17, db-262, mirrors AC-4 for gh_api)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
 
 # ---------------------------------------------------------------------------
 # TimeoutConfig / LimitConfig dataclasses -- AC-9
@@ -679,6 +719,9 @@ class TestTimeoutConfigDefaults:
             f"Expected orchestrator_poll_interval=None, got {tc.orchestrator_poll_interval!r}"
         )
         assert tc.github_check is None, f"Expected github_check=None, got {tc.github_check!r}"
+        assert tc.orchestrator_inactivity is None, (
+            f"Expected orchestrator_inactivity=None, got {tc.orchestrator_inactivity!r}"
+        )
 
 
 @pytest.mark.unit
@@ -738,6 +781,27 @@ class TestRuntimeConfigPopulation:
         assert result.timeouts.gh_api == 45, f"Expected gh_api=45, got {result.timeouts.gh_api!r}"
         assert result.timeouts.test == 600, f"Expected test=600, got {result.timeouts.test!r}"
         assert result.timeouts.llm is None, f"Expected unspecified field llm=None, got {result.timeouts.llm!r}"
+
+    def test_runtime_config_populates_orchestrator_inactivity_from_yaml(self, tmp_path: Path) -> None:
+        """
+        Given: YAML with timeouts.orchestrator_inactivity set
+        When: load_runtime_config is called
+        Then: RuntimeConfig.timeouts.orchestrator_inactivity reflects the YAML value (spec FR-17, db-262)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            timeouts:
+              orchestrator_inactivity: 1200
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.timeouts.orchestrator_inactivity == 1200, (
+            f"Expected orchestrator_inactivity=1200, got {result.timeouts.orchestrator_inactivity!r}"
+        )
 
     def test_runtime_config_populates_limits_from_yaml(self, tmp_path: Path) -> None:
         """
@@ -902,6 +966,124 @@ class TestConfigLoaderNoEnvVars:
                 env_read_calls.append("os.getenv")
 
         assert env_read_calls == [], f"config_loader.py must not read env vars -- found: {env_read_calls}"
+
+
+# ---------------------------------------------------------------------------
+# orchestrate: transport-restart bound and backoff envelope
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrchestrateTransportRestartConfig:
+    """The ``orchestrate.*`` transport-restart knobs load from YAML.
+
+    These are optional: a workspace that never sets them must keep ``None`` so
+    ``config.py``'s env > YAML > default chain still reaches the built-in
+    default rather than being pinned by a stray zero.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_orchestrate_block_leaves_every_field_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts is None
+        assert result.orchestrate.transport_restart_backoff_base_seconds is None
+        assert result.orchestrate.transport_restart_backoff_max_seconds is None
+
+    def test_values_are_read_from_the_orchestrate_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restarts: 4
+              transport_restart_backoff_base_seconds: 0.5
+              transport_restart_backoff_max_seconds: 30
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts == 4
+        assert result.orchestrate.transport_restart_backoff_base_seconds == 0.5
+        # An int in YAML must still surface as a float for the arithmetic.
+        assert result.orchestrate.transport_restart_backoff_max_seconds == 30.0
+        assert isinstance(result.orchestrate.transport_restart_backoff_max_seconds, float)
+
+    def test_partial_block_leaves_the_unset_siblings_none(self, tmp_path: Path) -> None:
+        """Setting one knob must not silently pin the other two."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restarts: 7
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.max_transport_restarts == 7
+        assert result.orchestrate.transport_restart_backoff_base_seconds is None
+        assert result.orchestrate.transport_restart_backoff_max_seconds is None
+
+    @pytest.mark.parametrize(
+        ("key", "bad_value"),
+        [
+            ("max_transport_restarts", 0),
+            ("transport_restart_backoff_base_seconds", 0),
+            ("transport_restart_backoff_max_seconds", -1),
+        ],
+    )
+    def test_schema_rejects_non_positive_values(self, tmp_path: Path, key: str, bad_value: object) -> None:
+        """Fail fast at load time: a zero or negative delay is the busy-loop
+        defect the backoff exists to prevent."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              {key}: {bad_value}
+            """,
+        )
+
+        with pytest.raises((ValueError, jsonschema.ValidationError)):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_orchestrate_key(self, tmp_path: Path) -> None:
+        """``additionalProperties: false`` -- a typo must be loud, not ignored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_transport_restart: 4
+            """,
+        )
+
+        with pytest.raises((ValueError, jsonschema.ValidationError)):
+            load_runtime_config(cfg, {})
 
 
 # ---------------------------------------------------------------------------
@@ -1479,7 +1661,9 @@ class TestManifestAmendmentConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.manifest_amendment.enabled is True
-        assert result.manifest_amendment.max_requests_per_execution == 1
+        # 2 admits one addition plus one row removal in a single execution, the
+        # combination AC-FINAL-015 can require when a declared row goes stale.
+        assert result.manifest_amendment.max_requests_per_execution == 2
         assert "tdd_green_production_fix" in result.manifest_amendment.allowed_reasons
 
     def test_enabled_from_yaml(self, tmp_path: Path) -> None:
@@ -1511,6 +1695,77 @@ class TestManifestAmendmentConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.manifest_amendment.allowed_reasons == frozenset({"tdd_green_production_fix"})
+
+    def test_amendment_allowed_reasons_default_includes_doc_sync(self, tmp_path: Path) -> None:
+        """FR-11 Leg A1: the default allowed_reasons set carries both sanctioned reasons."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.allowed_reasons == frozenset(
+            {"tdd_green_production_fix", "doc_sync_review_fix"}
+        )
+
+    def test_config_schema_allowed_reasons_enum_includes_doc_sync(self) -> None:
+        """The config-schema.json enum must accept 'doc_sync_review_fix' for schema validation to pass."""
+        schema_path = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+        with schema_path.open(encoding="utf-8") as fh:
+            schema = json.load(fh)
+        enum = schema["properties"]["manifest_amendment"]["properties"]["allowed_reasons"]["items"]["enum"]
+        assert set(enum) == {"tdd_green_production_fix", "doc_sync_review_fix"}, (
+            f"config-schema.json ({schema_path}) manifest_amendment.allowed_reasons.items.enum "
+            f"must list exactly the two sanctioned reasons; got {enum}"
+        )
+
+    def test_production_source_paths_from_yaml(self, tmp_path: Path) -> None:
+        """validate.production_source_paths is parsed into a tuple on ValidateConfig."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_paths:\n    - scripts/\n    - tools/\n"
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.validate.production_source_paths == ("scripts/", "tools/")
+
+    def test_production_source_paths_absent_defaults_to_none(self, tmp_path: Path) -> None:
+        """Absent means built-in behaviour, expressed as None rather than an empty tuple."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
+        assert load_runtime_config(cfg, {}).validate.production_source_paths is None
+
+    def test_production_source_extensions_supports_extensionless_names(self, tmp_path: Path) -> None:
+        """An entry is a filename SUFFIX, so an extensionless source file can be declared.
+        Inferring a leading dot would make `Makefile` unmatchable."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_extensions:\n    - .py\n    - Makefile\n"
+        )
+        assert load_runtime_config(cfg, {}).validate.production_source_extensions == (".py", "makefile")
+
+    def test_production_source_paths_rejects_non_list(self, tmp_path: Path) -> None:
+        """A scalar is a config error, not silently coerced."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\nvalidate:\n  production_source_paths: scripts/\n"
+        )
+        with pytest.raises(ValueError, match="production_source_paths"):
+            load_runtime_config(cfg, {})
+
+    def test_production_source_paths_rejects_empty_entry(self, tmp_path: Path) -> None:
+        """An empty entry would match every path; reject it loudly."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  production_source_paths:\n    - scripts/\n    - '  '\n"
+        )
+        with pytest.raises(ValueError, match="must not contain an empty entry"):
+            load_runtime_config(cfg, {})
 
     def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -3442,6 +3697,129 @@ _NEW_LINEUP_MODEL_IDS = (
 )
 
 
+#: Real ``us.anthropic.claude*`` inference-profile ids, taken verbatim from
+#: ``aws bedrock list-inference-profiles --region us-east-1`` (all reported
+#: ACTIVE, 2026-08-14). Three distinct shapes appear in AWS's own naming, and
+#: issue #342's pattern accepted only the first:
+#:   * ``-v<N>``            (older, e.g. opus-4-6-v1)
+#:   * no version segment   (current generation, e.g. opus-5)
+#:   * dated ``-v<N>:<M>``  (e.g. sonnet-4-5-20250929-v1:0)
+#: Pinned as data rather than synthesised (``f"us.anthropic.{id}-v1"``) because
+#: a synthesised id cannot catch a naming convention AWS does not follow -- that
+#: is exactly how the over-strict pattern survived until a real Bedrock run.
+_REAL_BEDROCK_PROFILE_IDS: tuple[str, ...] = (
+    "us.anthropic.claude-opus-4-6-v1",
+    "us.anthropic.claude-opus-5",
+    "us.anthropic.claude-sonnet-5",
+    "us.anthropic.claude-opus-4-8",
+    "us.anthropic.claude-opus-4-7",
+    "us.anthropic.claude-sonnet-4-6",
+    "us.anthropic.claude-fable-5",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "us.anthropic.claude-opus-4-5-20251101-v1:0",
+    "us.anthropic.claude-opus-4-1-20250805-v1:0",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+)
+
+
+@pytest.mark.unit
+class TestRealBedrockProfileIdsAccepted:
+    """Issue #342: every real ACTIVE profile id must load under use_bedrock.
+
+    The previous pattern required a trailing ``-v<N>``, accepting 1 of the 12
+    ACTIVE non-haiku profiles in a live account and failing config load for
+    every current-generation model, so the Bedrock backend could only run on
+    ``us.anthropic.claude-opus-4-6-v1``.
+    """
+
+    @pytest.mark.parametrize("model_id", _REAL_BEDROCK_PROFILE_IDS)
+    def test_real_profile_id_accepted(self, model_id: str) -> None:
+        from devbench.config_loader import validate_agent_model_value
+
+        validate_agent_model_value("yaml", "executor", model_id, True)
+
+    @pytest.mark.parametrize("model_id", _REAL_BEDROCK_PROFILE_IDS)
+    def test_real_profile_id_matches_the_pattern_directly(self, model_id: str) -> None:
+        from devbench.constants import BEDROCK_AGENT_MODEL_PATTERN
+
+        assert BEDROCK_AGENT_MODEL_PATTERN.match(model_id), (
+            f"{model_id!r} is a real ACTIVE Bedrock inference profile and must validate"
+        )
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "us.anthropic.claude-opus-5",  # no version segment
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",  # dated, ':' in id
+        ],
+    )
+    def test_both_previously_rejected_shapes_round_trip_via_yaml(self, tmp_path: Path, model_id: str) -> None:
+        """A full config-load round trip, not just the validator in isolation."""
+        cfg = self._write_bedrock_cfg(tmp_path / f"cfg-{abs(hash(model_id))}.yaml", model_id)
+
+        rt = load_runtime_config(cfg, {})
+
+        assert rt.agent_models.executor == model_id
+
+    @staticmethod
+    def _write_bedrock_cfg(path: Path, model_id: str) -> Path:
+        path.write_text(
+            textwrap.dedent(
+                f"""\
+                repos:
+                  org/repo:
+                    default_branch: main
+                use_bedrock: true
+                agents:
+                  executor: {model_id}
+                """
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "anthropic.claude-opus-5",  # missing the us. cross-region prefix
+            "eu.anthropic.claude-opus-5",  # wrong region prefix
+            "us.anthropic.titan-text-v1",  # wrong model family
+            "us.amazon.claude-opus-5",  # wrong vendor
+            "claude-opus-5",  # first-party id, not a Bedrock profile
+            "opus",  # short name
+        ],
+    )
+    def test_non_bedrock_shapes_still_rejected(self, model_id: str) -> None:
+        """Relaxing the version suffix must not turn the check into a no-op."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="not a valid Bedrock model id"):
+            validate_agent_model_value("yaml", "executor", model_id, True)
+
+    def test_haiku_profile_id_still_rejected(self) -> None:
+        """The haiku ban (issue #198) runs before the pattern check, so a
+        structurally valid haiku profile id must still fail -- and fail with the
+        haiku rationale, not a pattern complaint."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="devbench#198"):
+            validate_agent_model_value("yaml", "executor", "us.anthropic.claude-haiku-4-5-20251001-v1:0", True)
+
+    def test_rejection_message_names_a_real_profile_id(self) -> None:
+        """The old message's example, 'us.anthropic.claude-opus-4-7-v1', is not a
+        real profile id (the real one has no '-v1'), so it pointed operators at a
+        value AWS rejects at invocation."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError) as excinfo:
+            validate_agent_model_value("yaml", "executor", "opus", True)
+        message = str(excinfo.value)
+
+        assert "us.anthropic.claude-opus-4-7-v1" not in message
+        assert "us.anthropic.claude-opus-5" in message
+        assert "aws bedrock list-inference-profiles" in message
+
+
 @pytest.mark.unit
 class TestNewLineupModelIdsAccepted:
     """AC-E3-F1-S1-T1-6: validate_agent_model_value accepts every new-lineup
@@ -3852,3 +4230,185 @@ class TestSkillsConfig:
         rt = load_runtime_config(cfg, {})
         assert rt.skills.exemplar_backlog_path is None
         assert rt.skills.exemplar_spec_path is None
+
+
+# ---------------------------------------------------------------------------
+# orchestrate: reasoning effort and per-turn thinking budget
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrchestrateEffortAndThinkingBudget:
+    """The ``orchestrate.effort`` / ``max_thinking_tokens`` knobs load from YAML.
+
+    Left unset the SDK session adopts the ambient Claude Code effort, so an
+    unattended run's cost profile is decided by whatever the operator's last
+    interactive session happened to use. Both must stay ``None`` when absent
+    so ``config.py``'s env > YAML > default chain still reaches the built-in
+    default rather than being pinned by a stray zero.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_keys_leave_both_fields_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              max_cascade_depth: 3
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort is None
+        assert result.orchestrate.max_thinking_tokens is None
+
+    def test_values_are_read_from_the_orchestrate_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: medium
+              max_thinking_tokens: 8000
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "medium"
+        assert result.orchestrate.max_thinking_tokens == 8000
+
+    def test_the_new_keys_coexist_with_the_transport_restart_knobs(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: low
+              max_thinking_tokens: 4096
+              max_transport_restarts: 7
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "low"
+        assert result.orchestrate.max_thinking_tokens == 4096
+        assert result.orchestrate.max_transport_restarts == 7
+
+    def test_setting_one_key_leaves_its_sibling_none(self, tmp_path: Path) -> None:
+        """Pinning effort must not silently pin the thinking budget too."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            orchestrate:
+              effort: xhigh
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.orchestrate.effort == "xhigh"
+        assert result.orchestrate.max_thinking_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# git_ops: per-unit worktree isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGitOpsIsolateWorktrees:
+    """``git_ops.isolate_worktrees`` opts into per-unit checkouts.
+
+    The combination with ``single_branch`` is rejected at load rather than at
+    the first claim: git allows a branch to be checked out in exactly one
+    worktree at a time, so the pair would otherwise surface as an opaque git
+    error partway through an unattended run.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_defaults_to_false_when_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.isolate_worktrees is False
+
+    def test_opting_in_is_read_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              isolate_worktrees: true
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.isolate_worktrees is True
+
+    def test_combining_with_single_branch_is_rejected(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              isolate_worktrees: true
+              single_branch: feat/everything
+              defer_pr: true
+            """,
+        )
+
+        with pytest.raises(ValueError, match=re.escape("mutually exclusive with git_ops.single_branch")):
+            load_runtime_config(cfg, {})
+
+    def test_single_branch_alone_still_loads(self, tmp_path: Path) -> None:
+        """The guard must not reject the single-branch mode it coexists with."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: feat/everything
+              defer_pr: true
+            """,
+        )
+
+        result = load_runtime_config(cfg, {})
+
+        assert result.git_ops.single_branch == "feat/everything"
+        assert result.git_ops.isolate_worktrees is False

@@ -240,6 +240,54 @@ def append_rows(content: str, new_rows: list[ManifestRow]) -> str:
     return content[: match.start()] + replacement + content[match.end() :]
 
 
+def remove_rows(content: str, paths: list[str]) -> str:
+    """Return ``content`` with the Changes Manifest rows for ``paths`` removed.
+
+    The counterpart to :func:`append_rows`, reusing the same section regex,
+    body parser, and canonical renderer so content outside the Changes
+    Manifest section is left byte-for-byte identical and the surviving table
+    stays internally consistent.
+
+    A path that is not in the manifest is an error rather than a silent no-op:
+    the caller believes it is correcting the manifest, so a typo'd or
+    already-removed path must surface instead of reporting success while the
+    real stale row remains and keeps failing ``AC-FINAL-015``.
+
+    Returns ``content`` unchanged when ``paths`` is empty. Raises
+    ``ManifestParseError`` if the section is missing or malformed, if any path
+    is absent, or if the removal would empty the manifest -- a work unit that
+    declares no files has nothing to verify staged changes against, so that is
+    a manifest to rewrite by hand, not to arrive at by amendment.
+    """
+    if not paths:
+        return content
+
+    match = _SECTION_RE.search(content)
+    if match is None:
+        raise ManifestParseError(f"'## {MANIFEST_HEADER}' section not found in work-unit content")
+
+    existing = _parse_body(match.group(2))
+    declared = {row.file for row in existing}
+    missing = [p for p in paths if p not in declared]
+    if missing:
+        raise ManifestParseError(
+            f"Cannot remove manifest row(s) not declared in the Changes Manifest: {missing}. "
+            f"Manifest declares: {sorted(declared)}"
+        )
+
+    doomed = set(paths)
+    survivors = [row for row in existing if row.file not in doomed]
+    if not survivors:
+        raise ManifestParseError(
+            "Refusing to remove every row from the Changes Manifest: a work unit must declare "
+            f"at least one file. Requested removal of all {len(existing)} declared row(s)."
+        )
+
+    rendered = render_manifest_rows(survivors)
+    replacement = match.group(1) + "\n" + rendered + "\n"
+    return content[: match.start()] + replacement + content[match.end() :]
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

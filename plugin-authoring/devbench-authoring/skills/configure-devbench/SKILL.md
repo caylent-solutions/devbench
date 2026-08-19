@@ -140,7 +140,8 @@ Ask the operator for each sub-field:
 >   llm          -- LLM API call timeout [default: env DEVBENCH_LLM_TIMEOUT or 300]
 >   command      -- Shell command execution timeout [default: env DEVBENCH_COMMAND_TIMEOUT or 120]
 >   orchestrator_poll_interval -- Orchestrator polling interval [default: 10]
->   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]"
+>   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]
+>   orchestrator_inactivity -- Orchestrator SDK message inactivity timeout [default: env DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT or 1800]"
 
 Validate each provided value is a positive integer. Reject with:
 
@@ -216,6 +217,14 @@ Ask the operator:
 >                         Use only when target repos are git submodules. [true/false, default: false]
 >   inline_orphan_cleanup -- Run orphan-path cleanup as a chore commit before the task commit.
 >                            [true/false, default: true]
+>   orphan_patterns    -- fnmatch globs identifying build/state artifacts to untrack.
+>                         REPLACES the built-in list wholesale when non-empty (the env var
+>                         DEVBENCH_ORPHAN_IGNORE_PATTERNS wins over it), so a workspace that
+>                         sets it owns the complete set and a devbench upgrade cannot
+>                         reintroduce a pattern it removed on purpose. Dependency LOCK files
+>                         (uv.lock, package-lock.json, .terraform.lock.hcl, Chart.lock) are
+>                         deliberately absent from the built-in list -- they pin versions and
+>                         belong in git. [list of globs, default: [] = built-in list]
 >   ci_failure_retry   -- Return rc=2 on CI failure to trigger an executor retry. [true/false, default: true]
 >   local_only         -- Target repos have no origin remote; never push or create PRs.
 >                         Requires defer_pr: true. [true/false, default: false]"
@@ -263,7 +272,7 @@ Ask the operator:
 >   allowed_reasons            -- List of amendment reasons accepted by the pre-filter.
 >                                 Default: [tdd_green_production_fix]
 >                                 (Enter comma-separated values, or leave blank for the default.)
->   max_requests_per_execution -- Max amendments applied to one task per executor run. [integer >= 1, default: 1]"
+>   max_requests_per_execution -- Max amendments applied to one task per executor run. [integer >= 1, default: 2 -- one addition plus one row removal so a unit can satisfy AC-FINAL-015 in both directions within a single run]"
 
 ---
 
@@ -436,6 +445,33 @@ Validate each provided `report.models.<id>` entry requires both `input` and `out
 
 ## Step 17 -- Final validation and write
 
+> **`orchestrate.*` transport-restart knobs -- what to tell the operator.**
+> These are emitted at their built-in defaults like every other FR-3.6 tuning
+> section, and most workspaces should leave them alone. Raise them only if the
+> operator explicitly asks, and explain the trade-off rather than just setting
+> the number:
+>
+> - `max_transport_restarts` (default `14`) bounds consecutive restarts after
+>   an SDK **transport** failure. It is deliberately NOT the quota ceiling
+>   (`max_quota_resumes`, default `1000`). Those two must not be conflated: a
+>   quota window must elapse before a resume can succeed, so quota resumes
+>   self-throttle, whereas a transport fault recurs as fast as the SDK can
+>   reject a session. Pairing a four-figure budget with transport faults is
+>   what previously let a single persistent fault burn ~1000 restarts in 39
+>   minutes and end an unattended run.
+> - `transport_restart_backoff_base_seconds` (default `1.0`) and
+>   `transport_restart_backoff_max_seconds` (default `60.0`) space those
+>   restarts as `base * 2 ** restarts_already_done`, clamped to the ceiling.
+>   Both must be `> 0`; the schema rejects zero or negative at load time.
+> - Operational caveat worth stating out loud: the ceiling also bounds how
+>   long an in-flight backoff wait can delay a `devbench stop`. An operator who
+>   raises the ceiling to many minutes is also making shutdown that much less
+>   responsive.
+> - If the operator is running unattended (`--daemon`) and wants to survive a
+>   longer upstream outage, the right lever is usually a **higher ceiling**
+>   (fewer, more spaced attempts), not a much higher cap -- a high cap with a
+>   low ceiling just retries a dead transport more often.
+
 Assemble the complete YAML from all collected sections. In addition to the operator-supplied sections above, the assembled YAML must also emit every remaining FR-3.6 tuning section at its resolved built-in default, so a freshly configured workspace is self-documenting (issue #260, spec FR-3.6, AC-40, Journey J-7): `timeouts`, `limits`, `stop_hook`, `hook_tail`, `orchestrate`, `report` (including `models`, `default_model`, and every multiplier field), `backlog`, `validate`, `skills`, `max_executor_retries`, `max_executor_retries_per_judge`, and `log_file`. An operator who later wants to tune a knob sees it in the file with its default value and annotated comment already present, instead of discovering the knob only by reading `config_loader.py`.
 
 Source every emitted default value and its comment from `sample-config.yaml` (ref) -- copy the value and comment verbatim; never restate a number by hand from memory. Written values must equal built-in defaults exactly; any drift between an emitted value and the corresponding built-in default in `src/devbench/constants.py` / `config_loader.py` is a defect (FR-3.6 error handling).
@@ -515,6 +551,8 @@ _MODULE_CONSTANTS = [
     \"STOP_HOOK_MAX_BLOCKS\", \"STOP_HOOK_WINDOW_SECONDS\", \"STOP_HOOK_STALE_TASK_MINUTES\",
     \"HOOK_TAIL_AGENT_WIDTH\", \"HOOK_TAIL_TOOL_WIDTH\", \"HOOK_TAIL_DESCRIPTION_MAX\",
     \"HOOK_TAIL_STDOUT_PREVIEW_MAX\", \"MAX_CASCADE_DEPTH\",
+    \"MAX_TRANSPORT_RESTARTS\", \"TRANSPORT_RESTART_BACKOFF_BASE_SECONDS\",
+    \"TRANSPORT_RESTART_BACKOFF_MAX_SECONDS\",
     \"REPORT_MODEL_RATES\", \"REPORT_DEFAULT_MODEL_RATES\", \"REPORT_CACHE_READ_MULTIPLIER\",
     \"REPORT_CACHE_WRITE_5MIN_MULTIPLIER\", \"REPORT_CACHE_WRITE_1HR_MULTIPLIER\",
     \"REPORT_DATA_RESIDENCY_MULTIPLIER\", \"REPORT_FAST_MODE_MULTIPLIER\",

@@ -3,6 +3,533 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] -- 2026-08-19
+
+- **A review-rejection loop had no bound in code, so one task could be rejected
+  and reworked indefinitely while every health signal read green.** Issue #122
+  shipped `max_executor_retries_per_judge` with a config field, a runtime
+  validator, a JSON-schema entry and reference docs, but no code consumer: the
+  only enforcement was orchestrate SKILL.md prose instructing the orchestrator
+  to read the budget via `devbench config-resolve`, **a verb that did not
+  exist**. The budget was therefore unreadable at runtime and never applied.
+  `cmd_log_verdict` wrote `[REVIEW_FAIL]` and returned 0 unconditionally -- no
+  counting, no cap, no escalation -- so `[RETRY_BUDGET_EXHAUSTED]` was never
+  emitted and `backlog.proposal`'s classifier never saw the tag it needs to
+  raise `OPERATOR_ACTION_REQUIRED`. Observed on a live run: one docs task spent
+  4 review rounds across 4 claim cycles over ~5 hours against a configured
+  budget of 10, with zero work units completed in the final window and no error
+  logged. Three changes close it: the missing `config-resolve` verb now exists
+  and prints resolved config as JSON (unknown field exits non-zero rather than
+  returning a silent `null`); `cmd_log_verdict` counts the failing judge's prior
+  `[REVIEW_FAIL]` rows in the work unit -- the audit trail is the counter, so
+  there is no new state to drift -- and on exhaustion writes the verbatim
+  `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` row, forces the unit to `blocked`, and
+  sends the operator notification, mirroring `_handle_ci_failure`'s existing
+  escalation shape; and `devbench report` gains a `Review rejections` row
+  showing rounds spent per judge against budget for every non-terminal task, so
+  a stalling task is no longer indistinguishable from a progressing one. Only
+  the five canonical reviewers charge a budget -- audit-only workflow agents own
+  no review gate, a boundary that matters because `manifest_amender` logged 3
+  `REVIEW_FAIL`s against the same task. `log-verdict`'s JSON now carries
+  `retry_budget_exhausted` so the orchestrator can tell a bounded rejection from
+  a terminal one. Enforcement and display share one
+  `backlog.manager.resolve_judge_retry_budget`, so the budget shown can never
+  disagree with the budget applied. Below budget, behaviour is unchanged.
+
+- **The amendment pre-filter was dead code from the CLI, so a backlog's
+  configured `allowed_reasons` narrowing was silently ignored.**
+  `amendment.PreFilter` implements 7 deterministic checks but was referenced
+  nowhere in `cli.py`: `cmd_request_amendment` claimed in its own docstring to
+  "fail fast on unknown reasons" while calling none of them, and
+  `apply_amendment` validated against the module-level
+  `ALLOWED_AMENDMENT_REASONS` (what devbench implements) instead of the
+  per-backlog `AmendmentConfig.allowed_reasons` (what the backlog permits) --
+  a fail-open bypass in which the config was loaded, schema-validated, and then
+  disregarded at every gate. `request-amendment` now runs the full pre-filter
+  before writing, so a request that cannot be approved never reaches disk or
+  occupies the single pending-request slot, and both gates enforce the
+  configured set. The set can only be narrowed, never widened: a configured
+  reason devbench does not implement stays refused.
+
+- **A judge could mandate a Changes Manifest correction that was impossible to
+  perform.** `AC-FINAL-015` requires the Manifest to match the files git changed
+  exactly -- "no extra, no missing" -- so a declared row whose file ends up with
+  a zero-line diff (its work having landed under a sibling unit) is a real
+  violation, and `changes_manifest` correctly fails the unit and prescribes an
+  amendment. But `AmendmentRequest` was add-only: no `files_to_remove`,
+  `files_to_drop`, or equivalent field existed, so the prescribed remedy could
+  not be carried out. Adds `files_to_remove` (optional, defaults to empty so
+  existing request JSON still parses) and a `manifest.remove_rows` counterpart
+  to `append_rows` that reuses the same section regex, body parser and renderer
+  so content outside the Changes Manifest stays byte-identical. Removal is
+  gated on a deterministic safety property: a row may only be dropped once its
+  file has **no staged, unstaged, or untracked changes**
+  (`manifest.list_changed_files`), because the row is the only thing authorising
+  a file to appear in the unit's commit -- permitting removal for a file with
+  real changes would let work leave the unit's reviewed scope, the violation
+  `assert_staged_matches_manifest` exists to stop. Removals ride the same atomic
+  write and rollback envelope as additions, so a Layer 3 post-check failure
+  restores the Manifest whole; the post-check needed no change, and its existing
+  source-test atomicity rule still catches a removal that orphans a pair.
+  Removing every row, removing an undeclared path, and adding plus removing the
+  same path are each refused. The `[AMENDMENT_APPLIED]` audit row now names
+  removals, so a dropped row is never invisible to a reviewer.
+  `manifest_amendment.max_requests_per_execution` default rises from 1 to 2:
+  a unit correcting its Manifest in both directions needs two amendments, which
+  a limit of 1 made impossible to satisfy.
+
+- **Wiring a `[BLOCKED_PENDING_PROPOSAL]` marker never wrote the status, so the
+  ADR-07 auto-requeue cascade silently skipped the task forever.**
+  `proposal.promote_proposal` wrote the marker into Comments and the row into
+  the Dependencies table, but nothing in the promote path -- or in the sibling
+  `add-dep` operator path, which writes the byte-identical marker -- set
+  `## Status:` to `blocked`. A task blocked pending a proposal therefore kept
+  whatever status it had. Observed with a work unit left `in-progress` after the
+  manifest-amender failed it mid-execution: the report showed two tasks
+  in-progress when only one was running.
+
+  The mismatch is load-bearing, not cosmetic. Three consumers read marker and
+  status independently: `_auto_requeue_marker_dependents` skips any candidate
+  whose status is not `blocked`, so the task would never be requeued when its
+  promoted dependency completed -- stranding permanently with a *satisfied*
+  dependency, the exact outcome the cascade exists to prevent;
+  `cli._should_auto_restart_after_no_actionable` refuses to restart while any
+  task is `in-progress`, so a target wired mid-execution suppresses auto-restart
+  indefinitely; and `BacklogParser.find_next_actionable` *prioritises*
+  `in-progress` over `in-queue`, so a claim sweep could re-claim the task while
+  its blocker was unresolved and re-run work that was deliberately halted.
+  `classify_blocked_task` keys off marker presence rather than status, so it
+  reported the task as auto-clearing while the status line disagreed -- neither
+  view cross-checked the other, which is why this survived until an operator
+  read both.
+
+  Both writers now set the status through `BacklogManager.force_status` (so the
+  `[STATUS]` audit row and the `BACKLOG.md` index row are written too), ordered
+  marker-then-status: a crash between them leaves a marker with a stale status,
+  which `sync-blocked` reconciles, rather than a `blocked` status with no marker,
+  which `classify_blocked_task` buckets as `OPERATOR_ACTION_REQUIRED` and only a
+  human can clear. New validate-backlog rule 27 makes the invariant
+  unviolatable by any future path: a non-terminal Task carrying a marker whose
+  target is itself non-terminal MUST be `blocked`. Markers whose targets are all
+  terminal are exempt, since the cascade has legitimately requeued the task --
+  demanding `blocked` there would flag correct state.
+
+  Same shape as issue #332 (rollup fired its audit comment but not its status
+  write), one path over: marker-writing and status-writing were separate steps
+  with no invariant tying them together. Rule 27 is that invariant.
+
+- **The Bedrock backend could not run any current-generation model** (issue
+  #342). `BEDROCK_AGENT_MODEL_PATTERN` required every id to end in `-v<N>`
+  (`^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$`), a convention AWS does not
+  follow. Two whole shapes of real inference-profile id were rejected: current
+  generations carry no version segment (`us.anthropic.claude-opus-5`,
+  `...-sonnet-5`, `...-opus-4-8`, `...-opus-4-7`), and dated profiles end
+  `-v1:0` whose `:0` failed the `$` anchor. Measured against
+  `aws bedrock list-inference-profiles`: of 12 ACTIVE non-haiku
+  `us.anthropic.claude*` profiles the pattern accepted **1**, so
+  `use_bedrock: true` plus any current model failed at config load with a
+  `ValueError` and nothing started -- pinning Bedrock operators to
+  `us.anthropic.claude-opus-4-6-v1`. The rejection message's own example,
+  `us.anthropic.claude-opus-4-7-v1`, is not a real profile id (the real one
+  has no `-v1`), so it steered operators toward a value AWS rejects at
+  invocation.
+
+  The pattern is now `^us\.anthropic\.claude-[a-z0-9.:-]+$`, keeping what
+  devbench actually depends on (the `us.` cross-region prefix, the
+  `anthropic.claude` family, the separately-enforced haiku ban) and dropping
+  the false version-suffix assumption; `.` and `:` are admitted so dated ids
+  parse. The message now names a real id and points at
+  `aws bedrock list-inference-profiles`. A validator cannot confirm a model is
+  *enabled* in the caller's account -- that needs an API call config load must
+  not make -- so the contract is deliberately "structurally a Bedrock Claude
+  id", with genuine access errors surfacing at first invocation where AWS names
+  the real failure. New tests parametrize over real profile ids captured from
+  the live API rather than synthesising `f"us.anthropic.{id}-v1"`, which is how
+  the over-strict pattern survived until a real Bedrock run.
+
+- **The test suite was unrunnable in a shell configured for Bedrock** (issue
+  #342). `tests/conftest.py` forces every other backend-affecting variable but
+  left `DEVBENCH_USE_BEDROCK` / `DEVBENCH_BEDROCK_REGION` inherited. Since env
+  beats yaml, an operator who had legitimately exported them for their real
+  workspace saw `use_bedrock` silently flip for the whole suite: five
+  `tests/test_config.py` cases asserting the Anthropic path failed with Bedrock
+  complaints. Both are now popped alongside `DEVBENCH_SESSION_NAME`, so the
+  fixture YAML stays the single source of truth and cases that exercise either
+  backend set the variable explicitly.
+
+- **Blocking a task destroyed every uncommitted change in the target repo**
+  (issue #340). `cli._clean_target_repo_on_block` ran `git reset --hard HEAD`
+  plus `git clean -fd` against the target checkout on every transition to
+  `blocked`. The executor stages production changes and leaves committing to
+  `devbench git-ops`, so a task that blocked after finishing its work had that
+  work annihilated -- unconditionally, irreversibly, and with no operator
+  confirmation. The tell was the orchestrator routing around its own tool: an
+  observed run deliberately chose `hold` over `blocked` to keep a complete
+  task's verified work alive. Block-time cleanup now delegates to
+  `git_quarantine.quarantine_paths`, the same non-destructive primitive
+  claim-time quarantine (`_prepare_worktree_for_claim`) already used, so the
+  shared checkout is still cleared for the next claim but the residue lands in
+  recoverable `git stash` entries, one per owning unit, discoverable via
+  `git stash list` and recorded with the new
+  `[BLOCK_QUARANTINE] <unit-id> owner=<id> paths=<n> stash=<message>` audit
+  line. The two "clear this shared checkout" paths now share one
+  implementation instead of disagreeing about whether the work survives.
+
+- **The RED gate rejected an out-of-band-committed production change by
+  reporting only the symptom** (issue #341). When every production-source row
+  is already committed, `git stash push -u -- <rows>` removes nothing, the
+  named test necessarily passes, and `tdd_gate.observe_red` rejected with
+  `named test outcome was PASSED` -- true but describing a consequence, so the
+  operator had to reverse-engineer the cause. An observed run stranded a
+  complete work unit exactly this way after an operator commit snapshotted its
+  in-flight production file. The rejection now names the cause when nothing was
+  stashed: that no production change was removed, that this normally means the
+  rows were committed out of band, and how to re-derive an observable RED.
+  Deliberately diagnostic-only -- the pass/fail decision is unchanged and no
+  reconstruction is attempted. "Nothing to stash" remains legitimate on its own
+  (test-first TDD, where a pinning test committed alongside still-broken
+  production source genuinely fails; `TestJourneyJ8HonestBehaviorFix` pins
+  that path), so the run still happens and the outcome still decides.
+
+- **The orchestrator exited permanently, and reported a clean exit, when the
+  model ended its own turn with the backlog unfinished** (issue #339). The
+  orchestrate loop is designed to stop on exactly three conditions --
+  `ALL_DONE`, `NO_ACTIONABLE`, or an operator drain -- but a fourth path
+  ended it silently. Observed 2026-08-14T14:44 with 105 of 138 work units
+  outstanding: the orchestrator attempted `git add` itself (out of scope; a
+  guard hook correctly denied it), then ended its turn claiming "the executor
+  agent is running in the background ... I've scheduled a fallback check-in
+  ... I'll continue the orchestrate loop automatically". devbench has no
+  background execution, no completion callback, and no scheduler; nothing
+  resumed it and the daemon exited rc=0.
+
+  Three defects, fixed together:
+
+  1. `cmd_start._run` treated the SDK generator's `StopAsyncIteration` as a
+     normal exit (a bare `break`), leaving the fastest-firing failure mode as
+     the only one with no recovery, while a model going *silent* for the
+     inactivity window -- a slower form of the same failure -- already earned
+     a bounded fresh-session restart. It now raises the new
+     `_OrchestratePrematureTurnEnd` sentinel (a `BaseException`, matching its
+     quota / inactivity / transport siblings) carrying the model's last result
+     text, and `_drive_orchestrate_with_quota_resume` disposes of it as a
+     bounded restart on the remaining backlog. A genuine end-of-run never
+     reaches this path: the loop returns as soon as a terminal sentinel is
+     observed. The restart is bounded by its own
+     `DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS` cap (new
+     `DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS`, default 10) rather than the
+     shared 1000-resume ceiling: quota, inactivity, and transport faults each
+     self-throttle, whereas an immediate turn end can repeat immediately, so
+     sharing that ceiling would let one reproducible prompt-following failure
+     burn a thousand consecutive sessions unattended.
+  2. `_resolve_clean_stop_reason` promoted ANY non-empty
+     `ResultMessage.result` text to `clean exit: <text>`, so the model's own
+     narration was reported to the operator as a clean exit, indistinguishable
+     from a finished backlog. This truthy check predates the
+     premature-turn-end bucket (added later, by db-271) and made that bucket
+     unreachable whenever the model said anything at all before stopping.
+     Rule 1 now requires the text to actually carry a terminal sentinel
+     (`_is_terminal_orchestrate_result`, the same helper the SDK loop uses),
+     and the premature label retains the non-terminal text verbatim so the
+     operator sees what the model claimed instead of losing the only
+     diagnostic. Issue #217's intent -- surfacing
+     `NO_ACTIONABLE -- 190/212 done, 11 blocked` in the ping -- is preserved
+     unchanged for genuine end-of-run text.
+  3. The orchestrate SKILL gained two rules: Agent tool calls are synchronous
+     and no background task, completion notification, callback, scheduler,
+     wakeup timer, or fallback check-in exists, so ending a turn on any such
+     claim is a fabrication that kills the run; and the orchestrator never
+     issues state-changing git commands (staging belongs to the executor,
+     committing to `devbench git-ops`), with read-only inspection still
+     permitted and a guard denial explicitly not a reason to end a turn.
+
+- **`backlog_post_processor._find_section_bounds` matched heading text quoted
+  in another section's prose** (issue #337). The unanchored
+  `text.find(header)` let a Description that discusses "the task's
+  `## Acceptance Criteria` line" hijack the section bounds, so
+  `suffix_ref_on_orphan_paths` appended ` (ref)` to path tokens far outside
+  the Acceptance Criteria / Definition of Done sections -- including inside
+  `### Code Standards` blocks, which `verify_code_standards_canonical` then
+  reported as permanent drift the two passes re-created on every `run_all`.
+  The heading is now matched as a whole line (`^<header>$`, MULTILINE),
+  mirroring the anchored `_NEXT_H2_RE` end bound and the validator's
+  line-anchored `_extract_sections`, so the post-processor and
+  validate-backlog Rule 20 agree about section membership.
+
+- **`guard-bash.sh` over-blocked `git checkout --theirs` / `git checkout
+  --ours`** (issue #335). The blocked pattern was the bare substring
+  `git checkout --`, which matched conflict-side selection during a merge
+  or cherry-pick as well as the destructive file-restore form it was
+  aimed at -- and unlike `guard-destructive-git.sh` there is no override
+  environment variable, so agent-driven conflict resolution was hard
+  blocked. The pattern is now `git checkout -- ` (trailing space),
+  matching the line `guard-destructive-git.sh` already draws, and the
+  previously untested hook gained its missing
+  `tests/unit/test_guard_bash.py` module.
+
+- **`guard-git-stage.sh` rule 2 (manifest-scope enforcement on `git
+  add`) was dead code in production** (issue #336). The rule gated on
+  the `CURRENT_WORK_UNIT_FILE` environment variable, which nothing in
+  the codebase ever set -- hook processes inherit the long-lived
+  orchestrator environment, so a per-work-unit variable can never reach
+  them, and the silent-skip branch hid the gap while the hook's own
+  tests set the variable themselves. `devbench claim` now records the
+  claimed unit's file path in `.devbench/active-work-unit[-<session>]`
+  under the same `BACKLOG.lock` as the status write, and the hook
+  resolves the active unit from that marker when the environment
+  variable is absent, enforcing only while the resolved unit still
+  declares `## Status: in-progress` (a stale marker is a designed skip,
+  so no clear-on-terminal-transition wiring is needed).
+
+- **Orchestrator inactivity net and cooperative SDK teardown** (FR-17,
+  issues db-262 / db-325). `devbench start`'s `_run` SDK message loop
+  no longer idles forever on a wound-down turn with no terminal
+  sentinel (an observed hang ran 2h24m before this fix): the loop now
+  awaits `agen.__anext__()` under a bounded `asyncio.wait_for`, and a
+  stall raises a new `_OrchestrateInactivityTimeout` sentinel that
+  `_drive_orchestrate_with_quota_resume` disposes as a bounded
+  fresh-session restart, reusing the same cap as
+  `DEVBENCH_MAX_QUOTA_RESUMES` -- never a stateful `ClaudeSDKClient`
+  continuation. The wait window is configurable via the new
+  `timeouts.orchestrator_inactivity` key in
+  `backlog/config/devbench.yaml` and the
+  `DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT` environment variable,
+  defaulting to the new `DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS`
+  constant (1800 seconds). A `finally: await agen.aclose()` around the
+  loop (db-325) guarantees cooperative teardown before a quota or
+  inactivity sentinel unwinds, so `aclose()` is never invoked while
+  the generator is still running and the CLI subprocess is never
+  orphaned.
+
+- **`Recent pace (last N tasks)` and `Average time per task` still
+  understated the real execution window by roughly an order of magnitude
+  even after issue #326's same-session gate** (issue #329). Two compounding
+  defects. Defect A: the unanchored transition regex scanned the entire log
+  line rather than requiring the emitting logger, so a `devbench.cli` line
+  that echoed a prior transition -- for example inside an SDK
+  `ToolResultBlock` payload reproducing an earlier audit comment -- was
+  ingested as a genuine transition; on the reproduction log 85% of
+  `in-progress` matches and 47% of `done` matches were echoes, not
+  transitions. Defect B: even with Defect A fixed, a genuinely re-claimed
+  task (claimed, bounced by review, re-claimed in the same session) was
+  anchored to its LAST claim (`MAX(ts_epoch_us)`) rather than its first,
+  discarding the review-bounce time as if it were idle. On the
+  reproduction log (`logs/orchestrator.log`) the combined effect
+  understated the median execution window by ~10.6x (32.1 min true median
+  vs 3.0 min as sampled) and projected the remaining ETA at 0.5 h where the
+  corrected figure is 5.3 h. `event_index.py`'s transition queries now bind
+  `logger = 'devbench.backlog_manager'` -- the sole in-tree emitter of the
+  quoted `Set <id> to '<status>'` record -- as a SQL predicate so an
+  echoed line can never match, and `_execution_anchor` (`report.py`) now
+  selects the EARLIEST same-session claim rather than the latest.
+  Candidate `in-progress` rows rejected for failing the logger predicate
+  are surfaced rather than silently dropped: the `Average time per task`
+  and `Recent pace (last N tasks)` cells append a
+  `(<k> non-transition rows rejected)` suffix, composed AFTER the #326
+  `(<k> excluded: no execution window)` suffix, naming how many candidate
+  rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
+  the anchor contract and both suffixes.
+
+### Fixed
+
+- **A single Claude Agent SDK transport hiccup ended a multi-hour unattended
+  `devbench start` run with no retry** (issue #331). `_run`'s SDK message
+  loop caught only `StopAsyncIteration` and `TimeoutError`; any other
+  exception raised from `agen.__anext__()` -- for example the upstream
+  `Exception: Claude Code returned an error result: success` frame reported
+  at anthropics/claude-agent-sdk-python#1203 -- propagated uncaught through
+  `asyncio.run` and killed the daemon; this happened twice in twelve hours.
+  `_run` now re-raises any other SDK-generator-boundary exception as a new
+  `_OrchestrateTransportError` (carrying the original as `__cause__`), and
+  `_drive_orchestrate_with_quota_resume` gains an
+  `except _OrchestrateTransportError` arm that logs the verbatim exception at
+  ERROR with its restart ordinal and cap, then restarts a fresh SDK session
+  -- bounded by the SAME `DEVBENCH_MAX_QUOTA_RESUMES` cap that already bounds
+  quota resumes and inactivity restarts, tracked with its own independent
+  counter -- or re-raises once the cap is exhausted, preserving the legacy
+  non-zero exit and the verbatim final exception. Classification is
+  structural (which call raised), never message-based: the observed
+  trigger's exception text was the literal word `success`, so pattern-
+  matching upstream text would be brittle exactly when it matters.
+  `_label_stop_reason` gains the `transport-error-restart-cap-exhausted`
+  class so the `orchestrator_stop` notification names the exhausted-cap case
+  instead of an unlabelled crash, and `devbench report` renders a
+  `Transport restarts <n>` row (only when `n > 0`) via the new
+  `report.transport_restarts_line`, counting `[ORCHESTRATOR_TRANSPORT_RESTART]`
+  audit lines. `docs/cli-reference.md` documents the recovery path and the
+  report row; `docs/adr/34-orchestrator-transport-restart.md` records the
+  design decisions, including why classification is structural rather than
+  message-based.
+
+- **`add-dep` reported `"wired": true` and exited 0 even when the printed
+  Manifest-conflict remedy stayed inert** (issue #330 FR-1, FR-2). The
+  Manifest Conflict Rule's dep-chain scan reads the `## Dependencies`
+  table, but `add-dep` wrote only the `[BLOCKED_PENDING_PROPOSAL]`
+  marker, whose ADR-07 cascade fires solely on `blocked` units -- for a
+  non-blocked unit the two never met, yet the command still reported
+  success. `cmd_add_dep` (`src/devbench/cli.py`) now writes a canonical
+  `## Dependencies` row for the blocked task alongside the existing
+  marker, with the Title and Status cells carrying the blocker's real,
+  current values (not a placeholder), idempotently and under
+  `flock_backlog`. `"wired": true` now means the blocked task's
+  `## Dependencies` table carries a validator-visible row for the
+  blocker as of that call (true whether newly written or already
+  present on a repeat call); a request that cannot produce such a row
+  reports `"wired": false`, exits non-zero, and populates `reason`,
+  leaving no partial write. The status warning now names the
+  consequence (the ADR-07 cascade will not fire until the blocked task
+  is itself `blocked`) rather than implying the marker is merely
+  deferred. `docs/cli-reference.md`, `docs/manual-blockers.md`, and
+  `docs/cross-backlog-dependencies.md` document the corrected contract.
+
+- **A full backlog run finished 101 done and 9 declined tasks -- zero remaining -- and never
+  rolled its epics to `done` or opened a pull request** (issue #332). Two independent defects,
+  either alone enough to break the finish line. First, `BacklogManager._rollup_parent_status`
+  was invoked only from a fresh `STATUS_DONE` transition, so a Story/Feature/Epic whose last
+  remaining child resolved via `decline` (not `mark-done`) was stranded in a non-terminal status
+  forever, even though `_all_children_done` already treated `declined` as terminal; the rollup
+  call now fires from any terminal transition (`done` **or** `declined`), and `devbench
+  reconcile-cascade` gained a second pass (`_repair_stranded_containers`) that walks every
+  non-terminal container, re-evaluates `_all_children_done` fresh, and promotes qualifying
+  containers -- cascading upward exactly as a live rollup would -- reported in the command's JSON
+  envelope as `rolled_up` and idempotent on a second run. Second, the finalize auth gap:
+  `GitOpsService._git()` never carried `GH_TOKEN` in its subprocess environment the way `_gh()`
+  already did, so every `git push` -- including the one `git-ops-finalize` depends on -- fell
+  back to whatever ambient credential helper the launching shell had; with `defer_pr: true` that
+  push happens at the very end of a multi-hour run, exactly when an inherited VS Code
+  credential-helper socket is most likely stale, and the observed failure (`remote: No anonymous
+  write access. fatal: Authentication failed`) occurred twice against a token that was valid
+  throughout. `_git()` now builds the same `GH_TOKEN`-backed environment and inline
+  `credential.helper` as `_gh()`, so a drained backlog's finalize push authenticates identically.
+  A new integration test (`tests/test_integration/test_drained_backlog_finalize.py`) drives a
+  backlog with a declined leaf to fully terminal and asserts both that the rollup reaches the
+  epic and that `git-ops-finalize` is reached and attempts a push, pinning the whole "every task
+  terminal" to "a PR exists" path so the defect cannot regress silently again. `docs/cli-
+  reference.md` documents `reconcile-cascade`'s repair pass and summary-line format;
+  `docs/backlog-contract.md` documents the terminal-rollup contract.
+
+- **An interrupted work unit lost everything it had produced, and the run had
+  no way to give it back.** A quota limit or a stop parked the in-flight unit
+  as `blocked`; the next unit's claim then displaced its uncommitted files into
+  a `devbench-quarantine:<owner>` stash, and nothing ever read that stash back
+  -- the audit comment said so in as many words, instructing the next executor
+  to re-execute from the Changes Manifest. Observed cost of one pass: a unit
+  that had run four hours and passed every review round was re-queued to start
+  again from an empty checkout. Each link is now cut. `restore_quarantine`
+  hands a displaced unit its work back when that unit is itself the one
+  claiming, bounded by its own Manifest and refusing to overwrite a newer
+  attempt, with the entry consumed on success so it cannot apply twice; a
+  refusal fails the claim rather than discarding an expensive attempt.
+  `_force_block_in_flight_wu` becomes `_requeue_in_flight_wu`, returning the
+  unit to `in-queue` with an `[INTERRUPTED_ON_STOP]` audit line -- `blocked`
+  encodes "waiting on a dependency", and when the stop happened after every
+  dependency was already terminal, no such event is ever coming. Before work
+  becomes unreachable, at the stop handler and again before any quarantine, the
+  checkout is snapshotted to `refs/devbench/checkpoint/<unit-id>` via `git
+  stash create`, which touches neither worktree nor index; a ref stays
+  reachable where a stash entry does not survive `git stash clear`. Both
+  snapshot call sites are best-effort, because raising inside a SIGTERM handler
+  would strand the unit `in-progress` with no run left to advance it.
+  `git_ops.isolate_worktrees` additionally offers per-unit checkouts so nothing
+  need be displaced at all; it requires per-unit branches and is rejected at
+  config load alongside `single_branch`, since git allows a branch in exactly
+  one worktree at a time.
+
+- **The orchestrator session inherited whatever reasoning effort the ambient
+  configuration carried, and an unbounded thinking budget silently multiplied
+  the cost of every turn.** An unattended run reached `xhigh` without anyone
+  choosing it. Effort is not a free dial: a turn that reasons for longer than
+  the prompt-cache lifetime returns to a cold cache, so the whole prompt is
+  re-uploaded and re-cached rather than read back. Measured on a live run, one
+  executor turn ran 634 seconds and returned 64000 output tokens -- the cap --
+  and the turn after it read 0 cached tokens while creating 68002. Token burn
+  per turn climbs sharply, the run reaches its quota limit sooner, and quota
+  exhaustion is what interrupts units mid-flight. `orchestrate.effort` and
+  `orchestrate.max_thinking_tokens` now resolve env > YAML > default at `high`
+  and 16000 and are passed explicitly to the SDK session.
+
+- **The task factory materialised drafts with no `## Task Type:` section, so
+  any test-only remediation was born unable to validate** (#345).
+  `DRAFT_TEMPLATE` rendered straight from `## Status:` to `## Target
+  Repository`. Rule 21 defaults an absent declaration to `behavior-fix`, and
+  rule 22 requires a `behavior-fix` task to carry at least one
+  production-source row, so a proposal whose fix was test-only, docs-only or
+  chore-only produced a work unit that could never pass `validate-backlog` --
+  and nothing in devbench writes that section afterwards, only reads it, so it
+  stayed stuck until a human edited the file. Observed twice in one run, each
+  time halting a 137-unit backlog with 56 units transitively blocked behind
+  the pair; one of them had already passed its full pipeline at 266 tests and
+  100% coverage before the gate rejected it on the missing line alone.
+  `infer_task_type` derives the declaration from the Manifest the factory is
+  about to write, reusing `BacklogManager`'s classifiers and
+  `_TASK_TYPE_ROW_INVARIANTS` rather than restating the rules, so the two
+  cannot drift; because those classifiers read
+  `validate.production_source_paths`, the result follows whatever layout the
+  workspace declares. A production row keeps the gated default, so inference
+  never moves a task out of the RED gate; otherwise the first non-gated type
+  whose invariant accepts every row wins; and a sentinel-only Manifest gets
+  `refactor`, the one type with no Manifest invariant and so the only
+  declaration that survives the amendment workflow concretising those paths.
+
+- **Work-unit timestamps ignored `display_timezone`, which every other
+  timestamp-rendering surface honours** (#344). `report`, `hook-tail` and
+  `watch` all resolved the setting; audit comments and TDD Cycle Log entries
+  hard-coded UTC, so a run's own audit trail read in a different zone from the
+  output an operator has open beside it, and every comparison needed a mental
+  offset that DST makes easy to misread as a stall. Comments now resolve the
+  zone through hook-tail's own resolver and `COMMENT_TIMESTAMP_FORMAT` carries
+  `%Z` so the header names the zone it used; Cycle Log entries keep full
+  ISO-8601 and carry a numeric offset, which is what makes them unambiguous
+  and round-trippable. The default stays UTC rather than the OS local zone --
+  deliberately diverging from the terminal-rendering commands -- because a
+  work-unit file is committed and read on other machines, so following the
+  runner's zone would make one file's timestamps depend on who wrote each
+  line, and would retroactively change the meaning of every comment already
+  written. Unset, the rendered text is byte-identical to before. The read side
+  moved with it: `_AUDIT_PROGRESS_RE` and `_BLOCKED_AUDIT_RE` captured the
+  zone token instead of pinning the literal `UTC`, and
+  `audit_timestamp_to_utc` interprets it, since a relaxed regex alone would
+  have read local times as UTC and reported durations off by the offset.
+  Guard tests walk the installed package and fail on any writer that inlines a
+  UTC-pinned format or any parser that assumes one -- the first pass migrated
+  only the sites referencing the format constant and missed eight that inlined
+  the literal string, including the writer behind every `[WU_CLAIMED]` line.
+
+- **`reconcile-cascade` wrote an audit tag its own reader ignored, so a
+  re-queued unit reported as operator-blocked forever** (#347).
+  `_BLOCKED_AUDIT_LINE_RE` matched `BLOCKED`, `UNBLOCKED` and
+  `CASCADE_RESOLVED`, but the cascade records its re-queue as
+  `[CASCADE_RECONCILED]`. The unit reached `in-queue` while every blocked-audit
+  consumer kept treating the original `[BLOCKED]` row as live: `devbench
+  report` listed it under "Blocked tasks (operator action required)" with "No
+  automation path; operator must inspect and resolve manually", and the
+  classification-transition notifier could ping Slack about a unit that was in
+  fact queued and actionable. The two halves of devbench disagreed and the
+  half an operator reads was the wrong one. A guard test now asserts every tag
+  devbench writes to mean "this block is over" is recognised by the reader
+  that consumes blocks.
+
+### Changed
+
+- **Dependabot PRs #216 (`idna`) and #179 (`urllib3`) reconfirmed already
+  superseded on current `main`; GitHub closure stays deferred to the
+  batch-PR merge** (`spec/dep-remedy-and-dependency-currency.md` FR-4,
+  Section 8). Both targets' floors (`idna` >= 3.15, `urllib3` >= 2.7.0)
+  are already exceeded by the locked `idna` 3.18 and `urllib3` 2.7.0,
+  landed in the 0.4.0 release by task E6-F1-S1-T2 (`uv lock
+  --upgrade-package idna --upgrade-package urllib3`, commit
+  `4338773`). `uv lock --dry-run` reports zero lockfile changes on
+  current `main`, so re-running the bump would require hand-editing
+  `uv.lock` or moving an unrelated pin, both forbidden by spec decision
+  D-4; the task that would have re-landed the bump (E14-F2-S1-T1) is
+  therefore declined as already-satisfied rather than re-doing a
+  resolution with no unresolved constraint left to satisfy. `make
+  validate` re-confirms the full suite is green at or above the 98%
+  coverage floor on the current lock. Closing #216 and #179 on GitHub
+  remains deferred until the single batch PR carrying `feat/bug-closure`
+  merges to `main`, matching the posture already recorded for this
+  identical PR pair.
+
 ## [0.4.0] -- 2026-08-12
 
 ### Changed (model defaults)

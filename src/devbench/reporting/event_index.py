@@ -103,13 +103,56 @@ _KIND_TRANSCRIPT = "transcript"
 # Same regex shape as the existing one in report.py; kept private here so
 # the index can advance one line at a time during incremental reads.
 _LOG_LINE_RE = re.compile(rb"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z \[([^\]]+)\]")
-# Mirrors the existing ``_DONE_RE`` / ``_PROGRESS_RE`` regexes in report.py:
-# task IDs must start with ``E`` (the backlog work-unit-ID convention) to be
-# counted as transition events. This keeps any future ``Set foo to 'bar'``
-# log line from leaking into the task aggregates.
-_TASK_TRANSITION_RE = re.compile(rb"Set (E\S+) to '([^']+)'")
+# Issue #329 FR-1b (ingestion-side hardening). Task IDs must start with
+# ``E`` (the backlog work-unit-ID convention) to be counted as transition
+# events. Issue #329 FR-3: report.py used to carry its own pair of
+# module-level transition regexes restating this same shape; they were
+# deleted as dead code once every consumer read through this indexed
+# query instead, so this pattern is now the single place the transition
+# shape is expressed as a regex.
+#
+# The leading `` [A-Z]+ `` matches the level token (e.g. ``INFO``) that
+# ``_LOG_LINE_RE`` does not itself capture. This pattern is applied with
+# ``.match(raw_line, pos)`` where ``pos`` is the offset immediately after
+# the ``_LOG_LINE_RE`` match (i.e. right after the closing ``]`` of the
+# logger tag) -- ``.match()`` with an explicit ``pos`` requires the match to
+# START at that exact byte offset, so a transition phrase quoted later in
+# the same line (e.g. inside an echoed SDK ``ToolResultBlock`` payload that
+# reproduces a prior audit comment) can never match. Only the line's OWN
+# ``LEVEL Set <id> to '<status>'`` record -- the text the logging framework
+# itself wrote immediately after the prefix -- can match. Previously this
+# was `` _TASK_TRANSITION_RE.search(raw_line)``, which scanned the entire
+# line and let a later, unrelated quote win.
+_TASK_TRANSITION_RE = re.compile(rb" [A-Z]+ Set (E\S+) to '([^']+)'")
+
+# Issue #329 FR-1a (query-side, authoritative). The only in-tree emitter of
+# the quoted ``Set <id> to '<status>'`` record is
+# ``BacklogManager._set_status`` via ``self.logger`` -- defaulted to
+# ``logging.getLogger("devbench.backlog_manager")`` at manager.py -- which is
+# a code-level invariant of the emitter, not operator configuration, hence a
+# module constant rather than a YAML/env key. ``devbench.cli`` logs
+# transitions unquoted (``Set %s to %s``, no ``'``) and so never matches
+# ``_TASK_TRANSITION_RE`` on its own account; it only leaked prior
+# transition rows into the index by echoing other loggers' quoted text
+# inside a later payload (issue #329 Defect A). Both transition-query
+# methods bind this constant as a ``logger = ?`` predicate so only rows the
+# real emitter wrote count as evidence of a transition.
+_TRANSITION_LOGGER = "devbench.backlog_manager"
 
 
+# Issue #329 FR-1a: ``orch_log_events.logger`` is nullable rather than
+# ``NOT NULL``. No in-tree ingestion path inserts a NULL ``logger`` today --
+# ``_LOG_LINE_RE``'s logger-name capture group requires at least one
+# character, so a row is only ever created with a populated logger -- but
+# the column stays nullable so the transition-query predicate
+# (``logger = _TRANSITION_LOGGER``) is provably defensive against a
+# corrupt/unattributable row rather than merely "correct by the ingestion
+# code's current behaviour". SQL's three-valued comparison already makes
+# ``NULL = 'devbench.backlog_manager'`` evaluate to NULL (never TRUE), so a
+# NULL row is excluded by the existing predicate with no extra ``IS NOT
+# NULL`` clause needed. This does not require a schema-version bump: it
+# widens what MAY be stored, so every row a pre-change cache already holds
+# (always non-NULL) remains valid, and no rebuild is triggered.
 _INIT_SQL = """
 CREATE TABLE IF NOT EXISTS source_files (
     file_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +167,7 @@ CREATE TABLE IF NOT EXISTS orch_log_events (
     file_id INTEGER NOT NULL,
     line_offset INTEGER NOT NULL,
     ts_epoch_us INTEGER NOT NULL,
-    logger TEXT NOT NULL,
+    logger TEXT,
     task_id TEXT,
     transition TEXT,
     PRIMARY KEY (file_id, line_offset),
@@ -443,7 +486,7 @@ class EventIndex:
             except ValueError:
                 continue
             logger_name = m.group(2).decode("utf-8", errors="replace")
-            task_match = _TASK_TRANSITION_RE.search(raw_line)
+            task_match = _TASK_TRANSITION_RE.match(raw_line, m.end())
             task_id = task_match.group(1).decode("utf-8", errors="replace") if task_match else None
             transition = task_match.group(2).decode("utf-8", errors="replace") if task_match else None
             rows.append((file_id, offset, ts_epoch_us, logger_name, task_id, transition))
@@ -717,6 +760,15 @@ class EventIndex:
         shards). Reduces to the legacy single-file behaviour when the
         workspace has no shards. ``MAX(ts_epoch_us) GROUP BY task_id``
         preserves the assignment-overwrites-earlier semantic.
+
+        Issue #329 FR-1a: rows are additionally restricted to
+        ``logger = _TRANSITION_LOGGER``. A row whose ``logger`` is anything
+        else -- including ``NULL``, which SQL's three-valued comparison
+        already excludes from an ``=`` predicate -- is not evidence of a
+        transition, so it is dropped rather than counted. This is query-side
+        because ``logger`` is already persisted on every cached row, so a
+        cache populated before this predicate existed is corrected on the
+        very next query with no rebuild and no cache-version bump.
         """
         file_ids = self._orch_log_file_ids_for_workspace(workspace_root, live_log_path)
         if not file_ids:
@@ -732,12 +784,114 @@ class EventIndex:
                 "SELECT task_id, MAX(ts_epoch_us) FROM orch_log_events ",
                 "WHERE file_id IN (",
                 placeholders,
+                ") AND transition = ? AND logger = ? AND task_id IS NOT NULL ",
+                "GROUP BY task_id",
+            ]
+        )
+        rows = self._conn.execute(sql, (*file_ids, transition, _TRANSITION_LOGGER)).fetchall()
+        return {tid: _epoch_us_to_dt(int(ts)) for tid, ts in rows}
+
+    def task_transition_time_series_for_workspace(
+        self,
+        workspace_root: Path,
+        live_log_path: Path,
+        transition: str,
+    ) -> dict[str, list[datetime]]:
+        """Every matching timestamp per task_id, ascending (issue #329 FR-2).
+
+        Same file_id/transition/logger predicates as
+        ``task_transition_times_for_workspace`` (FR-1a) -- the difference is
+        that this method performs NO ``MAX(...)`` aggregation, so every row
+        that satisfies the predicate contributes its timestamp. Consumers
+        that need "the most recent transition" still have
+        ``task_transition_times_for_workspace`` for that; this method exists
+        for ``report._execution_anchor``, which needs the FULL set of
+        candidate claims to select the earliest one that is both same-session
+        with, and no later than, a task's completion.
+
+        Rows are ordered ``task_id, ts_epoch_us ASC`` so each task's list is
+        already ascending on return -- no client-side sort is required.
+        """
+        file_ids = self._orch_log_file_ids_for_workspace(workspace_root, live_log_path)
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        # SQL composed via list-join rather than an f-string so the static
+        # analyser does not misclassify the variable-arity ``IN`` clause
+        # as user-controlled input. ``placeholders`` is a comma-joined
+        # string of literal ``?`` characters; values bind through the
+        # parameter tuple below.
+        sql = "".join(
+            [
+                "SELECT task_id, ts_epoch_us FROM orch_log_events ",
+                "WHERE file_id IN (",
+                placeholders,
+                ") AND transition = ? AND logger = ? AND task_id IS NOT NULL ",
+                "ORDER BY task_id, ts_epoch_us ASC",
+            ]
+        )
+        rows = self._conn.execute(sql, (*file_ids, transition, _TRANSITION_LOGGER)).fetchall()
+        series: dict[str, list[datetime]] = {}
+        for tid, ts in rows:
+            series.setdefault(tid, []).append(_epoch_us_to_dt(int(ts)))
+        return series
+
+    def task_transition_candidate_counts_for_workspace(
+        self,
+        workspace_root: Path,
+        live_log_path: Path,
+        transition: str,
+    ) -> dict[str, int]:
+        """Per-task count of candidate rows matching ``transition``, BEFORE the FR-1a logger filter.
+
+        Issue #329 FR-6: same ``file_id``/``transition`` predicates as
+        ``task_transition_time_series_for_workspace``, but WITHOUT the
+        ``logger = _TRANSITION_LOGGER`` predicate, so it counts every row
+        that has a populated ``task_id``/``transition`` regardless of which
+        logger wrote it.
+
+        On a cache built entirely under the current ingestion code this
+        returns the SAME counts as the logger-filtered query: FR-1b anchors
+        ``_TASK_TRANSITION_RE`` to the position right after a line's own
+        ``LEVEL`` token, so an echoed line (e.g. a ``devbench.cli`` SDK
+        payload quoting a prior transition) never populates
+        ``task_id``/``transition`` at ingestion time -- there is nothing
+        extra to count. The difference is non-zero only for a cache that was
+        populated BEFORE the FR-1b ingestion hardening landed and has not
+        been rebuilt: such a cache still holds the phantom ``task_id``/
+        ``transition`` values the old, unanchored ``.search(raw_line)``
+        match wrote for an echoed line (see ``_refresh_orchestrator_log_locked``'s
+        FR-1b history) -- rows FR-1a's query-side predicate already excludes
+        from every anchor-selection consumer, but which are real evidence of
+        exactly how many non-transition rows were silently miscounted before
+        this fix. ``report._compute_window_stats`` uses this method's counts,
+        minus ``len(progress_claims[tid])``, to populate
+        ``WindowStats.rejected_row_count`` (the FR-6 provenance suffix).
+
+        A row whose ``task_id`` is ``NULL`` never matched ``_TASK_TRANSITION_RE``
+        at all (no candidate to count) and is excluded by the same
+        ``task_id IS NOT NULL`` predicate used everywhere else in this class.
+        """
+        file_ids = self._orch_log_file_ids_for_workspace(workspace_root, live_log_path)
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        # SQL composed via list-join rather than an f-string so the static
+        # analyser does not misclassify the variable-arity ``IN`` clause
+        # as user-controlled input. ``placeholders`` is a comma-joined
+        # string of literal ``?`` characters; values bind through the
+        # parameter tuple below.
+        sql = "".join(
+            [
+                "SELECT task_id, COUNT(*) FROM orch_log_events ",
+                "WHERE file_id IN (",
+                placeholders,
                 ") AND transition = ? AND task_id IS NOT NULL ",
                 "GROUP BY task_id",
             ]
         )
         rows = self._conn.execute(sql, (*file_ids, transition)).fetchall()
-        return {tid: _epoch_us_to_dt(int(ts)) for tid, ts in rows}
+        return {tid: int(count) for tid, count in rows}
 
     def all_log_timestamps_for_workspace(
         self,
@@ -792,21 +946,26 @@ class EventIndex:
     def task_transition_times(self, log_path: Path, transition: str) -> dict[str, datetime]:
         """Return the most-recent timestamp per task_id for the given transition in ``log_path``.
 
-        Equivalent to the existing ``_DONE_RE.finditer`` /
-        ``_PROGRESS_RE.finditer`` loops in report.py: each task
-        contributes its newest matching line within the named log file.
-        The ``MAX(ts_epoch_us) GROUP BY task_id`` matches the
-        assignment-overwrites-earlier semantic of the original
-        dict-build.
+        Each task contributes its newest matching line within the named
+        log file (issue #329 FR-3: report.py's earlier, module-level
+        finditer-based equivalent of this query was deleted as dead code
+        once every consumer moved to this indexed path). The
+        ``MAX(ts_epoch_us) GROUP BY task_id`` matches the
+        assignment-overwrites-earlier semantic of a per-task dict build
+        where a later assignment overwrites an earlier one.
+
+        Issue #329 FR-1a: see ``task_transition_times_for_workspace`` for the
+        ``logger = _TRANSITION_LOGGER`` predicate rationale; the same
+        invariant applies here for the single-file case.
         """
         file_id = self._file_id_for(log_path)
         if file_id is None:
             return {}
         rows = self._conn.execute(
             "SELECT task_id, MAX(ts_epoch_us) FROM orch_log_events "
-            "WHERE file_id = ? AND transition = ? AND task_id IS NOT NULL "
+            "WHERE file_id = ? AND transition = ? AND logger = ? AND task_id IS NOT NULL "
             "GROUP BY task_id",
-            (file_id, transition),
+            (file_id, transition, _TRANSITION_LOGGER),
         ).fetchall()
         return {tid: _epoch_us_to_dt(int(ts)) for tid, ts in rows}
 

@@ -36,8 +36,11 @@ class TestPathMatchesOrphan:
             ("infra/.terragrunt-cache/abc/main.tf", True),
             ("svc/sub/.terragrunt-cache/x/y.tf", True),
             # Terraform provider lock at root or nested
-            (".terraform.lock.hcl", True),
-            ("infra/.terraform.lock.hcl", True),
+            # Dependency lock files are NOT orphans: they pin resolved
+            # versions and belong in version control, like uv.lock and
+            # package-lock.json which this list has never matched.
+            (".terraform.lock.hcl", False),
+            ("infra/.terraform.lock.hcl", False),
             # .terraform internals
             ("infra/.terraform/providers/aws/x", True),
             # Python pycache + bytecode at any depth
@@ -273,3 +276,123 @@ class TestOrphanReportShape:
         assert report.dry_run is False
         assert isinstance(report.detected, list)
         assert isinstance(report.removed, list)
+
+
+@pytest.mark.unit
+class TestConfigurableOrphanPatterns:
+    """Orphan patterns are a constant with an env > YAML > default resolution.
+
+    The list was a module-private tuple hardcoded in git_orphans.py, so a
+    workspace whose repository legitimately tracks one of those paths had no
+    way to say so short of replacing the whole list through an env var.
+    """
+
+    def test_default_patterns_live_in_constants(self):
+        from devbench.constants import DEFAULT_ORPHAN_PATTERNS
+
+        assert isinstance(DEFAULT_ORPHAN_PATTERNS, tuple)
+        assert "**/*.tfstate" in DEFAULT_ORPHAN_PATTERNS
+
+    def test_dependency_lock_files_are_never_orphans(self):
+        """A lock file pins dependency versions and belongs in version control.
+
+        devbench already treats uv.lock, package-lock.json, poetry.lock,
+        Cargo.lock and go.sum as ordinary tracked files. .terraform.lock.hcl is
+        the same category -- listing it caused git-ops to `git rm --cached` 20
+        committed lock files as a "build artifact", a reproducibility
+        regression.
+        """
+        from devbench.constants import DEFAULT_ORPHAN_PATTERNS
+        from devbench.git_orphans import path_matches_orphan
+
+        for lock in (
+            "accounts/aws/foundation/.terraform.lock.hcl",
+            "uv.lock",
+            "package-lock.json",
+            "poetry.lock",
+            "Cargo.lock",
+            "go.sum",
+        ):
+            assert not path_matches_orphan(lock, DEFAULT_ORPHAN_PATTERNS), lock
+
+    def test_genuine_state_artifacts_still_match(self):
+        """Removing the lock file must not weaken the real state-artifact rules."""
+        from devbench.constants import DEFAULT_ORPHAN_PATTERNS
+        from devbench.git_orphans import path_matches_orphan
+
+        for artifact in (
+            "accounts/aws/foundation/terraform.tfstate",
+            "accounts/aws/foundation/.terraform/providers/x.json",
+            "live/.terragrunt-cache/abc/main.tf",
+            "scripts/__pycache__/foo.pyc",
+        ):
+            assert path_matches_orphan(artifact, DEFAULT_ORPHAN_PATTERNS), artifact
+
+    def test_yaml_override_replaces_the_default_list(self, monkeypatch):
+        from devbench import git_orphans
+
+        monkeypatch.delenv("DEVBENCH_ORPHAN_IGNORE_PATTERNS", raising=False)
+        monkeypatch.setattr(git_orphans, "_yaml_orphan_patterns", lambda: ("**/*.custom",))
+        assert git_orphans.configured_patterns() == ("**/*.custom",)
+
+    def test_env_var_wins_over_yaml(self, monkeypatch):
+        from devbench import git_orphans
+
+        monkeypatch.setenv("DEVBENCH_ORPHAN_IGNORE_PATTERNS", "**/*.fromenv")
+        monkeypatch.setattr(git_orphans, "_yaml_orphan_patterns", lambda: ("**/*.fromyaml",))
+        assert git_orphans.configured_patterns() == ("**/*.fromenv",)
+
+    def test_default_used_when_neither_is_set(self, monkeypatch):
+        from devbench import git_orphans
+        from devbench.constants import DEFAULT_ORPHAN_PATTERNS
+
+        monkeypatch.delenv("DEVBENCH_ORPHAN_IGNORE_PATTERNS", raising=False)
+        monkeypatch.setattr(git_orphans, "_yaml_orphan_patterns", lambda: None)
+        assert git_orphans.configured_patterns() == DEFAULT_ORPHAN_PATTERNS
+
+
+@pytest.mark.unit
+class TestEcosystemOrphanPatterns:
+    """Build/state artifacts for the ansible / helm / terraform toolchains.
+
+    Each entry is an artifact a tool regenerates on demand. Lock files are
+    deliberately excluded -- see TestConfigurableOrphanPatterns.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "ansible/site.retry",
+            "playbooks/deploy.retry",
+            "charts/app/charts/redis-17.3.2.tgz",
+            "deploy/charts/postgres-1.0.0.tgz",
+            "accounts/aws/foundation/plan.tfplan",
+            "infra/.venv/lib/python3.12/site.py",
+            "src/devbench.egg-info/PKG-INFO",
+        ],
+    )
+    def test_ecosystem_artifacts_match(self, path):
+        from devbench.constants import DEFAULT_ORPHAN_PATTERNS
+        from devbench.git_orphans import path_matches_orphan
+
+        assert path_matches_orphan(path, DEFAULT_ORPHAN_PATTERNS), path
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "charts/app/Chart.lock",
+            "charts/app/Chart.yaml",
+            "charts/app/values.yaml",
+            "charts/app/templates/deployment.yaml",
+            "ansible/site.yml",
+            "ansible/roles/common/tasks/main.yml",
+            "argocd/applications/app.yaml",
+            "accounts/aws/foundation/main.tf",
+        ],
+    )
+    def test_real_source_and_lock_files_never_match(self, path):
+        """A false positive here means git-ops untracks committed source."""
+        from devbench.constants import DEFAULT_ORPHAN_PATTERNS
+        from devbench.git_orphans import path_matches_orphan
+
+        assert not path_matches_orphan(path, DEFAULT_ORPHAN_PATTERNS), path

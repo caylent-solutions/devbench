@@ -26,9 +26,9 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -39,18 +39,26 @@ if TYPE_CHECKING:
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
+from devbench.comment_time import audit_timestamp_to_utc, comment_timestamp
 from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
+    DEPENDENCY_NONE_VALUES,
+    STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
     STATUS_DRAFT,
     STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
+    TASK_TYPE_BEHAVIOR_FIX,
+    TASK_TYPE_CHORE,
+    TASK_TYPE_DOCS,
+    TASK_TYPE_REFACTOR,
+    TASK_TYPE_TEST_ONLY,
 )
+from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -273,8 +281,14 @@ _REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
 # there is nothing left to try". Case-sensitive for the same reason as
 # ``_REJECTION_TAG_RE``: a lower-case occurrence is prose quoting the tag.
 _RETRY_EXHAUSTED_TAG_RE: re.Pattern[str] = re.compile(r"\[RETRY_BUDGET_EXHAUSTED\]")
+# The zone token is captured rather than pinned to "UTC": comments are stamped
+# in the workspace's ``display_timezone`` when one is set, so pinning it would
+# make every one of these scans blind in exactly the workspaces that configure
+# it. Files written before that setting was honoured carry "UTC" and still
+# match.
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
-    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(?P<zone>[A-Za-z0-9_+\-]+)\]"
+    r"\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
 # Issue #183(d): structured payloads that used to be emitted by
 # review-supervisor's Step 0 self-check when the Agent tool dropped out
@@ -420,7 +434,7 @@ def _has_runtime_degradation_signal(
         if not _RUNTIME_DEGRADATION_BODY_RE.search(match.group("body")):
             continue
         try:
-            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+            ts = audit_timestamp_to_utc(match.group("ts"), match.group("zone"))
         except ValueError:
             continue
         if since is not None and ts < since:
@@ -460,7 +474,7 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
         if match is None:
             continue
         try:
-            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+            ts = audit_timestamp_to_utc(match.group("ts"), match.group("zone"))
         except ValueError:
             continue
         if most_recent is None or ts > most_recent[0]:
@@ -1347,6 +1361,8 @@ DRAFT_TEMPLATE: str = """\
 
 ## Status: {status}
 
+## Task Type: {task_type}
+
 ## Target Repository
 
 - **Repo:** `{repo}`
@@ -1392,6 +1408,101 @@ DRAFT_TEMPLATE: str = """\
 """
 
 
+def manifest_change_verb(repo: str, path: str) -> str:
+    """Return the Changes Manifest change verb for *path* in *repo*.
+
+    Derived from the target repository itself rather than declared by the
+    proposer: a path that already exists in the checkout is a ``modify``, a
+    path that does not is an ``add``. That keeps the factory backlog- and
+    application-agnostic -- it needs no knowledge of any particular repo
+    layout, language, or naming convention.
+
+    ``delete`` is never inferred. A proposer that means to delete a file says
+    so through the amendment workflow, where the intent is explicit; guessing
+    it from absence would turn every not-yet-created file into a deletion.
+
+    Falls back to ``modify`` when the repository has no resolvable local
+    checkout, because with no evidence either way ``modify`` is the verb that
+    asserts the least: it claims the file is expected to exist, which
+    validate-backlog and the review judges then check against reality.
+    """
+    from devbench.config import REPO_LOCAL_PATHS
+
+    repo_path = REPO_LOCAL_PATHS.get(repo)
+    if repo_path is None:
+        return "modify"
+    try:
+        return "modify" if (repo_path / path).exists() else "add"
+    except OSError:
+        return "modify"
+
+
+def infer_task_type(manifest_paths: Sequence[str]) -> str:
+    """Return the task type whose Manifest invariant ``manifest_paths`` satisfies.
+
+    A materialised draft that declares no ``## Task Type:`` section is not
+    neutral: ``validate-backlog`` defaults an absent declaration to
+    ``behavior-fix``, the strictest type, which requires at least one
+    production-source row. A proposal whose remediation is test-only,
+    documentation-only or chore-only therefore materialises into a work unit
+    that can never validate, and no command writes the section after the fact,
+    so the unit stays stuck until a human edits the file by hand.
+
+    Inference removes that failure mode by deriving the declaration from the
+    Changes Manifest the factory is about to write. It reuses
+    :class:`~devbench.backlog.manager.BacklogManager`'s own classifiers and its
+    ``_TASK_TYPE_ROW_INVARIANTS`` table rather than restating the rules, so the
+    factory and the validator cannot drift apart -- the same prohibition on a
+    second, independent path classifier that ``_is_test_source_path`` documents.
+    Because those classifiers read ``validate.production_source_paths`` and
+    ``validate.production_source_extensions``, inference follows whatever layout
+    the workspace declares and assumes nothing about any particular repository.
+
+    Resolution order:
+
+    1. Any production-source row means the work changes shipped behaviour, so
+       the gated ``behavior-fix`` default stands. Inference never moves a task
+       out of the RED gate.
+    2. Otherwise the first non-gated type whose per-row invariant accepts every
+       row wins, checked in the order the taxonomy narrows: ``test-only``,
+       ``docs``, ``chore``.
+    3. With no real rows to judge -- a Manifest holding only sentinels, whose
+       paths the amendment workflow concretises at execution time -- no row
+       claim can be made honestly. ``refactor`` is the one type the validator
+       exempts from a Manifest invariant entirely, so it is the only
+       declaration that stays valid both before and after those paths resolve.
+       The draft's own "review and edit before promoting" banner is what asks a
+       human to revisit it once the real file list exists.
+
+    Args:
+        manifest_paths: The Changes Manifest rows about to be written. Sentinel
+            rows are ignored, since they name no file to classify.
+
+    Returns:
+        One member of :data:`~devbench.constants.VALID_TASK_TYPES`.
+    """
+    from devbench.backlog.manager import BacklogManager
+
+    real_paths = [path for path in manifest_paths if BacklogManager._is_real_manifest_path(path)]
+    if not real_paths:
+        return TASK_TYPE_REFACTOR
+    if any(BacklogManager._is_production_source(path) for path in real_paths):
+        return TASK_TYPE_BEHAVIOR_FIX
+
+    for candidate in (TASK_TYPE_TEST_ONLY, TASK_TYPE_DOCS, TASK_TYPE_CHORE):
+        classifier_names, _description = BacklogManager._TASK_TYPE_ROW_INVARIANTS[candidate]
+        classifiers = [getattr(BacklogManager, name) for name in classifier_names]
+        if all(any(classifier(path) for classifier in classifiers) for path in real_paths):
+            return candidate
+
+    # Rows that are neither production source nor accepted by any non-gated
+    # type's invariant -- a Manifest mixing, say, a documentation file with a
+    # lockfile. No per-row type fits, and claiming a gated one would fail the
+    # production-source check, so the invariant-free type is again the only
+    # declaration that validates.
+    return TASK_TYPE_REFACTOR
+
+
 def generate_draft_md(
     proposed: ProposedTask,
     *,
@@ -1412,9 +1523,12 @@ def generate_draft_md(
         else "- [ ] AC-TODO-001 human must author AC"
     )
     manifest_lines = (
-        "\n".join(f"| `{path}` | TODO -- describe change |" for path in proposed.files_to_own)
+        "\n".join(f"| `{path}` | {manifest_change_verb(repo, path)} |" for path in proposed.files_to_own)
         if proposed.files_to_own
-        else "| `TODO` | TODO -- describe change |"
+        # No known file set yet: use the documented deferred-resolution
+        # sentinel so the row is a valid Manifest entry the amendment workflow
+        # can concretise, rather than a file literally named "TODO".
+        else "| `<source-drift-fix-targets-determined-at-execution>` | modify |"
     )
     return DRAFT_TEMPLATE.format(
         task_id=proposed.suggested_id,
@@ -1428,6 +1542,7 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=manifest_lines,
+        task_type=infer_task_type(proposed.files_to_own),
     )
 
 
@@ -1728,6 +1843,21 @@ def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) 
     atomic_write_text(backlog_index, "\n".join(lines) + "\n")
 
 
+def _placeholder_dep_row(dep_id: str) -> str:
+    """Return the shared placeholder ``## Dependencies`` row text for ``dep_id``.
+
+    Single source of truth for the ``| <id> | (auto) | proposed |`` row
+    written by :func:`_append_dependency_to_source` when no better title or
+    status is known yet (e.g. a just-materialised draft). Callers that later
+    learn the dependency's real title/status (such as
+    ``cli._canonicalize_add_dep_row``, #330 AC-2) match against this exact
+    text to find and replace the placeholder -- consuming this one helper
+    instead of an independently hardcoded copy means the writer and the
+    matcher can never silently drift apart.
+    """
+    return f"| {dep_id} | (auto) | {STATUS_PROPOSED} |"
+
+
 def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source_task_id: str, new_dep_id: str) -> None:
     """Append ``new_dep_id`` to ``source_task_id``'s Dependencies table."""
     source_unit = _find_source_task_file(backlog_root, backlog_index, source_task_id)
@@ -1745,11 +1875,54 @@ def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source
     # Replace a placeholder ``| none | | |`` row when the dependencies table
     # is currently empty; otherwise append a new row to the end of the table.
     none_row_re = re.compile(r"^\|\s*none\s*\|\s*\|\s*\|\s*$", re.IGNORECASE | re.MULTILINE)
+    placeholder_row = _placeholder_dep_row(new_dep_id)
     if none_row_re.search(section):
-        section = none_row_re.sub(f"| {new_dep_id} | (auto) | proposed |", section, count=1)
+        section = none_row_re.sub(placeholder_row, section, count=1)
     else:
-        section = section.rstrip("\n") + f"\n| {new_dep_id} | (auto) | proposed |\n"
+        section = section.rstrip("\n") + f"\n{placeholder_row}\n"
     atomic_write_text(source_unit, content[:idx] + section + remainder)
+
+
+def _append_dependency_to_index(backlog_index: Path, blocked_task_id: str, blocker_task_id: str) -> None:
+    """Sync the Dependencies cell (``cells[5]``) of ``blocked_task_id``'s BACKLOG.md row.
+
+    Mirrors :func:`_rewrite_backlog_status`: locates the row via
+    :data:`_BACKLOG_ROW_RE`, then replaces an empty or
+    :data:`~devbench.constants.DEPENDENCY_NONE_VALUES` cell with
+    ``blocker_task_id`` or appends ``, <blocker_task_id>`` when the cell
+    already carries other dependency tokens. Idempotent by construction: a
+    ``blocker_task_id`` already present among the comma-separated tokens is
+    left untouched, so a repeated call never writes a duplicate token.
+
+    Raises:
+        ProposalError: No row for ``blocked_task_id`` exists in
+            ``backlog_index`` -- a corruption guard, since the caller has
+            already validated the id is present in the parsed index.
+    """
+    content = backlog_index.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        match = _BACKLOG_ROW_RE.match(line)
+        if match is None or match.group(1) != blocked_task_id:
+            continue
+        cells = line.split("|")
+        # Cells layout: ['', ' ID ', ' Title ', ' Type ', ' Status ', ' Deps ', ' Repo ', ' Path ', '']
+        if len(cells) < 6:
+            continue
+        current = cells[5].strip()
+        tokens = [token.strip() for token in current.split(",") if token.strip()]
+        if blocker_task_id in tokens:
+            return
+        if not current or current.lower() in DEPENDENCY_NONE_VALUES:
+            cells[5] = f" {blocker_task_id} "
+        else:
+            cells[5] = f" {current}, {blocker_task_id} "
+        lines[i] = "|".join(cells)
+        atomic_write_text(backlog_index, "\n".join(lines) + "\n")
+        return
+    raise ProposalError(
+        f"add-dep: cannot sync index Dependencies cell -- row for '{blocked_task_id}' not found in {backlog_index}"
+    )
 
 
 def _find_source_task_file(backlog_root: Path, backlog_index: Path, task_id: str) -> Path | None:
@@ -1865,10 +2038,66 @@ def promote_proposal(
             if dep_on_source or target_id != proposal.source_task_id:
                 _append_dependency_to_source(backlog_root, backlog_index, target_id, task_id)
                 _append_promote_comment(source_file, target_id, task_id, audit_suffix=audit_suffix)
+                _block_wired_target(backlog_index, source_file, target_id, task_id)
                 wired_targets.append(target_id)
                 logger.info("promote-proposal: wired marker + dep on %s", target_id)
 
     return PromoteResult(draft_path=draft, wired_targets=wired_targets)
+
+
+def _block_wired_target(
+    backlog_index: Path,
+    source_file: Path,
+    target_id: str,
+    promoted_task_id: str,
+) -> None:
+    """Set a freshly-wired target to ``blocked`` so its marker and status agree.
+
+    Writing the ``[BLOCKED_PENDING_PROPOSAL]`` marker without also writing the
+    status left the two disagreeing, and three independent consumers read them
+    separately:
+
+    - :meth:`~devbench.backlog.manager.BacklogManager._auto_requeue_marker_dependents`
+      (the ADR-07 cascade) skips any candidate whose status is not ``blocked``,
+      so a marked-but-not-blocked task is never auto-requeued when its promoted
+      dependency completes -- it strands permanently with a satisfied
+      dependency, which is the exact outcome the cascade exists to prevent.
+    - ``cli._should_auto_restart_after_no_actionable`` refuses to restart while
+      any task is ``in-progress``, so a target wired mid-execution suppresses
+      auto-restart indefinitely.
+    - ``BacklogParser.find_next_actionable`` PRIORITISES ``in-progress`` over
+      ``in-queue``, so a claim sweep could re-claim the target while its blocker
+      is still unresolved and re-run work that was deliberately halted.
+
+    ``classify_blocked_task`` keys off marker presence rather than status, so it
+    reported such a task as auto-clearing while the status line still read
+    ``in-progress``: the two views disagreed and neither cross-checked the
+    other, which is why this went unnoticed until an operator read both.
+
+    Ordering is deliberate. The caller writes the dependency row and the marker
+    FIRST, then this status write. A crash between them leaves a marker with a
+    stale status, which ``devbench sync-blocked`` reconciles and
+    ``validate-backlog``'s marker/status rule reports. The reverse order would
+    leave a ``blocked`` status with no marker, which
+    :func:`classify_blocked_task` buckets as ``OPERATOR_ACTION_REQUIRED`` --
+    a state only a human can clear.
+
+    Idempotent: ``force_status`` writes the same value on a re-promote, and a
+    target already ``blocked`` is unchanged.
+
+    Args:
+        backlog_index: Path to ``BACKLOG.md``, updated alongside the unit file.
+        source_file: Path to the target's work-unit ``.md`` file.
+        target_id: The work unit being blocked on *promoted_task_id*.
+        promoted_task_id: The promoted draft, named in the log line only.
+    """
+    BacklogManager().force_status(source_file, backlog_index, target_id, STATUS_BLOCKED)
+    logger.info(
+        "promote-proposal: set %s to '%s' pending %s",
+        target_id,
+        STATUS_BLOCKED,
+        promoted_task_id,
+    )
 
 
 def delete_proposal_if_consumed(workspace_root: Path, backlog_root: Path, proposal: Proposal | None) -> None:
@@ -1931,7 +2160,7 @@ def _append_promote_comment(
     accept path to record that no human pressed the button. Default empty
     preserves pre-ADR-11 byte-identical audit output.
     """
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     suffix = f" {audit_suffix.strip()}" if audit_suffix.strip() else ""
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
@@ -1967,7 +2196,7 @@ def _append_manual_dep_comment(
     Idempotent: callers pass a source file already verified to not contain
     the marker; this helper only does the write.
     """
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     reason_body = f": {reason}" if reason else ""
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
@@ -2015,6 +2244,12 @@ def add_dep(
     cross-task markers post-promote, for hand-authored tasks, or to correct a
     proposal that was authored without ``affected_task_ids``.
 
+    Whenever the Dependencies-table row is newly written, the BACKLOG.md index
+    Dependencies cell for ``blocked_task_id`` is synced in the same call (see
+    :func:`_append_dependency_to_index`) so the index never diverges from the
+    work-unit file's own table. Both writes run under a single
+    ``flock_backlog`` so a concurrent claim cannot observe a half-written index.
+
     Fail-fast:
       - ``blocker_task_id`` must be present in the backlog index.
       - ``blocker_task_id`` must NOT be in a terminal state (``done`` / ``declined``).
@@ -2055,15 +2290,52 @@ def add_dep(
             f"(status={blocker_unit.status.value}); wiring a dep on a terminal task is a no-op."
         )
 
+    # Acyclicity: refuse an edge that would close a cycle. Two callers reach
+    # here without knowing the rest of the graph -- the task factory wiring a
+    # promoted child as a dependency of the parent that proposed it, and an
+    # operator following the Manifest Conflict Rule remedy, which prints one
+    # add-dep per conflicting pair without checking whether the reverse edge
+    # already exists. Left unguarded, either writes a cycle that only surfaces
+    # much later as a validate-backlog error with nothing in the work-unit file
+    # naming the edge responsible. Reuses the same detector `devbench next`
+    # runs rather than introducing a second cycle implementation.
+    from devbench.cli import _detect_units_dependency_cycle
+
+    probe = [
+        replace(u, dependencies=[*u.dependencies, blocker_task_id]) if u.id == blocked_task_id else u for u in units
+    ]
+    chain = _detect_units_dependency_cycle(probe)
+    if chain:
+        raise ProposalError(
+            f"add-dep: wiring '{blocked_task_id}' to depend on '{blocker_task_id}' would create a "
+            f"dependency cycle: {chain}. Wire the edge in the other direction, or break the existing "
+            f"path first. See docs/backlog-contract.md 'Manifest Conflict Rule' for how to order a "
+            f"conflicting set without closing a loop."
+        )
+
     wrote_row = False
     if not _dep_row_has_task(blocked_file, blocker_task_id):
-        _append_dependency_to_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)
+        workspace_root = backlog_index.parent
+        with flock_backlog(workspace_root):
+            _append_dependency_to_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)
+            _append_dependency_to_index(backlog_index, blocked_task_id, blocker_task_id)
         wrote_row = True
 
     wrote_marker = False
     if not _comments_have_marker(blocked_file, blocker_task_id):
         _append_manual_dep_comment(blocked_file, blocked_task_id, blocker_task_id, reason)
         wrote_marker = True
+
+    # Same marker, so the same status invariant applies: this operator path
+    # writes the byte-identical [BLOCKED_PENDING_PROPOSAL] marker the promote
+    # path writes, and the ADR-07 cascade skips any candidate whose status is
+    # not `blocked`. Wiring a dep without the status write would strand the task
+    # exactly as the promote path did. Runs whenever the marker is present --
+    # including a re-run that wrote nothing new -- so a target left with a stale
+    # status by an earlier partial write is reconciled rather than needing
+    # `sync-blocked`. See :func:`_block_wired_target` for the full rationale.
+    if _comments_have_marker(blocked_file, blocker_task_id):
+        _block_wired_target(backlog_index, blocked_file, blocked_task_id, blocker_task_id)
 
     return wrote_row or wrote_marker
 
@@ -2255,7 +2527,7 @@ def _reject_unmaterialised_proposal(
 
     source_file = _find_source_task_file(backlog_root, backlog_index, source_task_id)
     if source_file is not None:
-        timestamp_human = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        timestamp_human = comment_timestamp()
         message = f"[PROPOSAL_JSON_REJECTED] {source_task_id} rejected (un-materialised): {reason}"
         entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp_human, name="task_factory", message=message)
         content = source_file.read_text(encoding="utf-8")
@@ -2270,7 +2542,7 @@ def _reject_unmaterialised_proposal(
 
 def _append_reject_audit_comment(source_file: Path, task_id: str, reason: str) -> None:
     """Write a ``[PROPOSAL_REJECTED]`` audit line to the source task."""
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     message = f"[PROPOSAL_REJECTED] {task_id} rejected: {reason}"
     entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp, name="task_factory", message=message)
     content = source_file.read_text(encoding="utf-8")

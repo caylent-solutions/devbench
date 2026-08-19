@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from devbench.backlog.manager import BacklogManager
 from devbench.constants import (
     DEFAULT_CACHE_READ_MULTIPLIER,
     DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
@@ -1120,6 +1121,121 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
         assert "DAG" in content or "acyclic" in content.lower() or "dependency" in content.lower(), (
             "spec-to-backlog/SKILL.md rubric must require the dependency graph to be a DAG "
             "(validated by validate-backlog)"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogStep6Templates:
+    """AC-49 (db-279 + db-280): pin the corrected Step 6 templates so a
+    regression in either the canonical header shapes (FR-21) or the
+    file-path contract (FR-20) is caught before it reaches the operator.
+
+    The two header-pin tests assert the exact canonical strings are
+    present in Step 6 of SKILL.md; the load-bearing
+    ``test_authoring_step6_templates_validate`` extracts those same
+    literal header lines directly out of SKILL.md and builds a
+    BACKLOG.md from them plus a matching task file, asserting the result
+    validates clean. Because the load-bearing test reads its header text
+    from SKILL.md rather than duplicating a second hard-coded copy,
+    reverting the Step 6 templates to their pre-correction shape (e.g.
+    restoring E12-F2-S2-T2's SKILL.md change) makes every test in this
+    class fail for real, proving the pins are genuine.
+    """
+
+    STATUS_SUMMARY_HEADER: str = "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |"
+    FULL_INDEX_HEADER: str = "| ID | Title | Type | Status | Dependencies | Repo | File Path |"
+
+    def test_step6_status_summary_header_is_canonical(self) -> None:
+        """AC-E12-F2-S2-T3-1 (spec AC-49): Step 6's Status Summary table
+        header must carry all eight canonical columns (Declined and Draft
+        included), matching STATUS_SUMMARY_TABLE_HEADER in constants.py.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert self.STATUS_SUMMARY_HEADER in content, (
+            "spec-to-backlog/SKILL.md Step 6 must contain the canonical Status "
+            f"Summary header '{self.STATUS_SUMMARY_HEADER}' (FR-21, db-280); "
+            "the pre-correction template header omitted the Declined and/or "
+            "Draft columns."
+        )
+
+    def test_step6_index_header_is_canonical(self) -> None:
+        """AC-E12-F2-S2-T3-2 (spec AC-49): Step 6's Full Work Unit Index
+        table header must carry the seven canonical columns including File
+        Path, matching BacklogManager._CANONICAL_FULL_INDEX_HEADER_CELLS.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert self.FULL_INDEX_HEADER in content, (
+            "spec-to-backlog/SKILL.md Step 6 must contain the canonical Full "
+            f"Work Unit Index header '{self.FULL_INDEX_HEADER}' (FR-21, db-280); "
+            "the pre-correction template header omitted the File Path column."
+        )
+
+    @staticmethod
+    def _extract_fenced_header_lines(content: str, section_marker: str) -> tuple[str, str]:
+        """Return the ``(header, separator)`` lines of the first fenced code
+        block that follows *section_marker* in *content*.
+
+        Reading the literal header and separator lines straight out of
+        SKILL.md -- instead of hard-coding a second copy of the string --
+        is what makes ``test_authoring_step6_templates_validate`` a real
+        regression pin: a reverted template drifts the extracted text
+        itself, not just a duplicated constant living in this test file.
+        """
+        marker_pos = content.find(section_marker)
+        assert marker_pos != -1, f"{section_marker!r} not found in spec-to-backlog SKILL.md"
+        fence_start = content.find("```", marker_pos)
+        assert fence_start != -1, f"No fenced code block found after {section_marker!r}"
+        block_start = content.find("\n", fence_start) + 1
+        fence_end = content.find("```", block_start)
+        assert fence_end != -1, f"Unterminated fenced code block after {section_marker!r}"
+        block_lines = content[block_start:fence_end].splitlines()
+        return block_lines[0], block_lines[1]
+
+    def test_authoring_step6_templates_validate(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-E12-F2-S2-T3-3 (spec AC-49, AC-47, AC-48): a BACKLOG.md built
+        from the literal Step 6 templates plus a matching task file must
+        validate clean, pinning FR-21's canonical headers and FR-20's
+        file-path contract (every Task row carries a File Path) together
+        in one executable assertion.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        summary_header, summary_separator = self._extract_fenced_header_lines(content, "### Status Summary table")
+        index_header, index_separator = self._extract_fenced_header_lines(content, "### Full Work Unit Index")
+
+        task_id = "E1-F1-S1-T1"
+        task_path = backlog_dir / f"{task_id}.md"
+        task_path.write_text(
+            f"# {task_id}\n\n"
+            "## Status: draft\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nStep 6 template pin fixture task.\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 Placeholder\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `src/example.py` | New |\n| `tests/unit/test_example.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            "## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
+
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            f"{summary_header}\n"
+            f"{summary_separator}\n"
+            "| E1 | Step 6 Template Pin Epic | 0 | 0 | 0 | 0 | 0 | 1 |\n"
+            "| **TOTAL** |  | 0 | 0 | 0 | 0 | 0 | 1 |\n\n"
+            "## Full Work Unit Index\n\n"
+            f"{index_header}\n"
+            f"{index_separator}\n"
+            f"| {task_id} | Step 6 Template Pin Task | Task | Draft | none | org/repo | `backlog/{task_id}.md` |\n",
+            encoding="utf-8",
+        )
+
+        errors = BacklogManager().validate(index_path, tmp_path)
+        assert errors == [], (
+            f"Greenfield BACKLOG.md built from the literal Step 6 templates failed validate(): {errors}"
         )
 
 

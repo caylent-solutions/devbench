@@ -14,6 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from test_tdd_gate import commit_scratch_repo as _tdd_gate_commit_all
+from test_tdd_gate import init_scratch_repo as _init_scratch_repo_for_cli
+from test_tdd_gate import write_scratch_file as _tdd_gate_write
 
 from devbench import cli as cli_mod
 from devbench.backlog.work_unit import WorkUnit
@@ -24,52 +27,106 @@ from devbench.backlog.work_unit import WorkUnit
 
 
 class TestCleanTargetRepoOnBlock:
-    """Every branch of the local-repo cleanup helper."""
+    """Blocking a task clears the shared checkout WITHOUT destroying work.
+
+    This helper used to run ``git reset --hard HEAD`` plus ``git clean -fd``,
+    which annihilated every uncommitted change in the target repo -- including
+    work that was complete and verified but not yet committed, since the
+    executor stages and leaves committing to ``devbench git-ops``. An observed
+    run had the orchestrator deliberately choose ``hold`` over ``blocked`` to
+    keep a finished task's work alive, which is the tell that the status was
+    unsafe. It now delegates to the same non-destructive quarantine claim-time
+    uses, so residue lands in recoverable stash entries.
+    """
+
+    _UNIT_ID = "E9-F1-S1-T1"
+
+    def _repo_with_uncommitted_work(self, tmp_path: Path) -> Path:
+        """Real git repo whose tree holds one committed and one uncommitted file."""
+        repo = _init_scratch_repo_for_cli(
+            tmp_path,
+            dir_name="block-repo",
+            author_email="block@example.com",
+            author_name="Block Test",
+        )
+        _tdd_gate_write(repo, "src/kept.py", "COMMITTED = 1\n")
+        _tdd_gate_commit_all(repo, "baseline")
+        _tdd_gate_write(repo, "src/precious.py", "FINISHED_BUT_UNCOMMITTED = 1\n")
+        return repo
+
+    def _wu(self, tmp_path: Path, repo: Path) -> Path:
+        wu = tmp_path / "wu.md"
+        wu.write_text(f"- **Local path:** `{repo}`\n", encoding="utf-8")
+        return wu
 
     def test_read_error_returns_one(self, tmp_path: Path) -> None:
-        # Path that exists as a directory cannot be read_text()'d (IsADirectoryError → OSError).
+        # A directory cannot be read_text()'d (IsADirectoryError -> OSError).
         d = tmp_path / "actually-a-dir"
         d.mkdir()
-        assert cli_mod._clean_target_repo_on_block(d) == 1
+        assert cli_mod._clean_target_repo_on_block(d, self._UNIT_ID) == 1
 
     def test_missing_local_path_marker_returns_zero(self, tmp_path: Path) -> None:
         wu = tmp_path / "wu.md"
         wu.write_text("no local path marker here", encoding="utf-8")
-        assert cli_mod._clean_target_repo_on_block(wu) == 0
+        assert cli_mod._clean_target_repo_on_block(wu, self._UNIT_ID) == 0
 
     def test_local_path_missing_on_disk_returns_zero(self, tmp_path: Path) -> None:
         wu = tmp_path / "wu.md"
         wu.write_text("- **Local path:** `/no-such-dir-on-disk-12345`\n", encoding="utf-8")
-        assert cli_mod._clean_target_repo_on_block(wu) == 0
+        assert cli_mod._clean_target_repo_on_block(wu, self._UNIT_ID) == 0
 
-    def test_git_reset_failure_returns_one(self, tmp_path: Path) -> None:
-        local = tmp_path / "repo"
-        local.mkdir()
-        wu = tmp_path / "wu.md"
-        wu.write_text(f"- **Local path:** `{local}`\n", encoding="utf-8")
-        # Mock subprocess.run so the reset call fails.
-        bad_reset = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="reset failed")
-        with patch("devbench.cli.subprocess.run", return_value=bad_reset):
-            assert cli_mod._clean_target_repo_on_block(wu) == 1
+    def test_already_clean_tree_is_a_no_op(self, tmp_path: Path) -> None:
+        repo = _init_scratch_repo_for_cli(
+            tmp_path,
+            dir_name="clean-repo",
+            author_email="clean@example.com",
+            author_name="Clean Test",
+        )
+        _tdd_gate_write(repo, "src/kept.py", "COMMITTED = 1\n")
+        _tdd_gate_commit_all(repo, "baseline")
 
-    def test_git_clean_failure_returns_one(self, tmp_path: Path) -> None:
-        local = tmp_path / "repo"
-        local.mkdir()
-        wu = tmp_path / "wu.md"
-        wu.write_text(f"- **Local path:** `{local}`\n", encoding="utf-8")
-        good = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        bad_clean = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="clean failed")
-        with patch("devbench.cli.subprocess.run", side_effect=[good, bad_clean]):
-            assert cli_mod._clean_target_repo_on_block(wu) == 1
+        assert cli_mod._clean_target_repo_on_block(self._wu(tmp_path, repo), self._UNIT_ID) == 0
 
-    def test_happy_path_returns_zero(self, tmp_path: Path) -> None:
-        local = tmp_path / "repo"
-        local.mkdir()
-        wu = tmp_path / "wu.md"
-        wu.write_text(f"- **Local path:** `{local}`\n", encoding="utf-8")
-        good = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with patch("devbench.cli.subprocess.run", return_value=good):
-            assert cli_mod._clean_target_repo_on_block(wu) == 0
+    def test_uncommitted_work_is_quarantined_not_destroyed(self, tmp_path: Path) -> None:
+        """The regression that mattered: the file leaves the tree but survives.
+
+        Under the old ``reset --hard`` + ``clean -fd`` path this content was
+        gone for good with no way back.
+        """
+        repo = self._repo_with_uncommitted_work(tmp_path)
+
+        rc = cli_mod._clean_target_repo_on_block(self._wu(tmp_path, repo), self._UNIT_ID)
+
+        assert rc == 0
+        assert not (repo / "src" / "precious.py").exists(), "tree must be cleared for the next claim"
+        stash_list = subprocess.run(
+            ["git", "stash", "list"], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout
+        assert "devbench-quarantine" in stash_list, f"work must be recoverable, got: {stash_list!r}"
+        assert self._UNIT_ID in stash_list, "the blocking unit must be named in the stash message"
+
+    def test_quarantined_work_is_actually_restorable(self, tmp_path: Path) -> None:
+        """Recoverable in practice, not just present in ``git stash list``."""
+        repo = self._repo_with_uncommitted_work(tmp_path)
+
+        assert cli_mod._clean_target_repo_on_block(self._wu(tmp_path, repo), self._UNIT_ID) == 0
+        subprocess.run(["git", "stash", "pop"], cwd=repo, capture_output=True, text=True, check=True)
+
+        assert (repo / "src" / "precious.py").read_text(encoding="utf-8") == "FINISHED_BUT_UNCOMMITTED = 1\n"
+
+    def test_committed_baseline_is_left_untouched(self, tmp_path: Path) -> None:
+        """Quarantine is scoped to changed paths; committed files never move."""
+        repo = self._repo_with_uncommitted_work(tmp_path)
+
+        assert cli_mod._clean_target_repo_on_block(self._wu(tmp_path, repo), self._UNIT_ID) == 0
+
+        assert (repo / "src" / "kept.py").read_text(encoding="utf-8") == "COMMITTED = 1\n"
+
+    def test_quarantine_failure_returns_one(self, tmp_path: Path) -> None:
+        """A quarantine that cannot clear the tree is a loud failure, not a pass."""
+        repo = self._repo_with_uncommitted_work(tmp_path)
+        with patch("devbench.git_quarantine.quarantine_paths", side_effect=RuntimeError("stash refused")):
+            assert cli_mod._clean_target_repo_on_block(self._wu(tmp_path, repo), self._UNIT_ID) == 1
 
 
 # ---------------------------------------------------------------------------

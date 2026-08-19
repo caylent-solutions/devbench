@@ -313,6 +313,44 @@ class TestConfigOverrides:
         with patch.dict(os.environ, {"DEVBENCH_GH_TIMEOUT": "600"}, clear=False):
             importlib.reload(config)
 
+    def test_check_quorum_stable_polls_default(self) -> None:
+        """db-328 / FR-15: with no env override, the stable-poll knob resolves to its
+        named module-level default constant (no YAML backing -- config.py-only scope)."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_CHECK_QUORUM_STABLE_POLLS"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.CHECK_QUORUM_STABLE_POLLS == config._DEFAULT_CHECK_QUORUM_STABLE_POLLS
+
+        importlib.reload(config)
+
+    def test_check_quorum_stable_polls_from_env(self) -> None:
+        with patch.dict(os.environ, {"DEVBENCH_CHECK_QUORUM_STABLE_POLLS": "7"}, clear=False):
+            importlib.reload(config)
+            assert config.CHECK_QUORUM_STABLE_POLLS == 7
+
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_CHECK_QUORUM_STABLE_POLLS"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+
+    def test_check_quorum_poll_interval_seconds_default(self) -> None:
+        """db-328 / FR-15: with no env override, the poll-interval knob resolves to its
+        named module-level default constant (no YAML backing -- config.py-only scope)."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_CHECK_QUORUM_POLL_INTERVAL_SECONDS"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.CHECK_QUORUM_POLL_INTERVAL_SECONDS == config._DEFAULT_CHECK_QUORUM_POLL_INTERVAL_SECONDS
+
+        importlib.reload(config)
+
+    def test_check_quorum_poll_interval_seconds_from_env(self) -> None:
+        with patch.dict(os.environ, {"DEVBENCH_CHECK_QUORUM_POLL_INTERVAL_SECONDS": "2"}, clear=False):
+            importlib.reload(config)
+            assert config.CHECK_QUORUM_POLL_INTERVAL_SECONDS == 2
+
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_CHECK_QUORUM_POLL_INTERVAL_SECONDS"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+
     def test_backlog_root_derived_from_workspace_root(self) -> None:
         """BACKLOG_ROOT is always derived from DEVBENCH_WORKSPACE_ROOT, not from env."""
         from devbench.constants import BACKLOG_SUBDIR

@@ -51,6 +51,11 @@ def _run_hook_tail(
     # Force color off so the tests can assert on plain substrings without
     # having to strip ANSI escapes from the output.
     env["NO_COLOR"] = "1"
+    # hook-tail renders in the OS local zone when neither --tz nor
+    # display_timezone is set; pin the child's TZ so the wall-clock
+    # assertions below hold on non-UTC hosts (the --tz tests cover zone
+    # conversion explicitly).
+    env["TZ"] = "UTC"
     return subprocess.run(
         [sys.executable, "-m", "devbench.cli", "hook-tail", *extra_args],
         capture_output=True,

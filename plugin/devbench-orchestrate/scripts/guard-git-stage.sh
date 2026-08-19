@@ -12,9 +12,18 @@
 #    Changes Manifest: exit 2 with a manifest-scope violation message.
 #    This catches TRACE_FILE / dst/ / fixture-pollution style bugs at the
 #    earliest possible boundary -- before a single bad file is staged.
+#    The active work unit is resolved from CURRENT_WORK_UNIT_FILE when set
+#    (explicit pin: tests, operator overrides), otherwise from the
+#    active-work-unit marker `devbench claim` writes under
+#    $DEVBENCH_WORKSPACE_ROOT/.devbench/ (issue #336 -- hook processes
+#    inherit the long-lived orchestrator environment, so a per-work-unit
+#    env var can never be pinned for them; the marker is the production
+#    activation path). Named sessions read their own suffixed marker.
 #    The check is skipped when:
-#      - CURRENT_WORK_UNIT_FILE env var is unset (no work unit context);
+#      - no work unit resolves (neither env var nor marker present);
 #      - the work-unit file can't be read;
+#      - the resolved work unit no longer declares `## Status: in-progress`
+#        (a stale marker is a designed skip -- claim never clears it);
 #      - the command is `git add -A` / `git add .` / `git add -u` -- those
 #        are blanket-stage forms and the downstream commit-time assertion
 #        (src/devbench/backlog/manifest.py::assert_staged_matches_manifest)
@@ -53,20 +62,45 @@ fi
 # -----------------------------------------------------------------------------
 # Rule 2: `git add <path>` must target paths in the Changes Manifest.
 #
-# Skipped when no work-unit file is pinned (CURRENT_WORK_UNIT_FILE env var);
-# skipped for blanket forms (-A, -u, .) because the commit-time assertion
-# rejects them precisely. Honours CURRENT_WORK_UNIT_FILE as the path to the
-# active work unit's .md file.
+# Resolution order for the active work unit (issue #336):
+#   1. CURRENT_WORK_UNIT_FILE env var -- explicit pin (tests, operator).
+#   2. The active-work-unit marker written by `devbench claim` under
+#      $DEVBENCH_WORKSPACE_ROOT/.devbench/ (session-suffixed when
+#      DEVBENCH_SESSION_NAME is set).
+# Skipped when neither resolves, when the resolved file is unreadable, or
+# when the resolved unit is no longer in-progress (stale marker). Skipped
+# for blanket forms (-A, -u, .) because the commit-time assertion rejects
+# them precisely.
 # -----------------------------------------------------------------------------
 if ! printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])git[[:space:]]+add([[:space:]]|$)'; then
   exit 0
 fi
 
-# Skip if no work-unit file pinned in env.
-if [[ -z "${CURRENT_WORK_UNIT_FILE:-}" ]]; then
+# Resolve the active work unit: explicit env pin wins; otherwise the marker
+# `devbench claim` wrote for this session.
+WORK_UNIT_FILE="${CURRENT_WORK_UNIT_FILE:-}"
+if [[ -z "$WORK_UNIT_FILE" && -n "${DEVBENCH_WORKSPACE_ROOT:-}" ]]; then
+  MARKER="${DEVBENCH_WORKSPACE_ROOT}/.devbench/active-work-unit"
+  if [[ -n "${DEVBENCH_SESSION_NAME:-}" ]]; then
+    MARKER="${MARKER}-${DEVBENCH_SESSION_NAME}"
+  fi
+  if [[ -r "$MARKER" ]]; then
+    WORK_UNIT_FILE="$(head -n 1 "$MARKER")"
+  fi
+fi
+
+# Skip if no work unit resolved.
+if [[ -z "$WORK_UNIT_FILE" ]]; then
   exit 0
 fi
-if [[ ! -r "${CURRENT_WORK_UNIT_FILE}" ]]; then
+if [[ ! -r "$WORK_UNIT_FILE" ]]; then
+  exit 0
+fi
+
+# Staleness gate: enforce only while the resolved unit is actually
+# in-progress. `devbench claim` never clears the marker; a terminal or
+# re-queued status here means there is no active claim context.
+if ! grep -qE '^##[[:space:]]+Status:[[:space:]]*in-progress[[:space:]]*$' "$WORK_UNIT_FILE"; then
   exit 0
 fi
 
@@ -99,7 +133,7 @@ MANIFEST_FILES=$(awk '
     gsub(/^`|`$/, "", line)
     if (length(line) > 0) print line
   }
-' "${CURRENT_WORK_UNIT_FILE}" 2>/dev/null || true)
+' "$WORK_UNIT_FILE" 2>/dev/null || true)
 
 # If the manifest couldn't be parsed, allow (fail-open on parse failure;
 # the commit-time assertion will catch scope violations regardless).

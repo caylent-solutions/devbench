@@ -23,7 +23,8 @@ Commands::
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
     hold <id> --reason M    Mark unit Hold (deferred / under debate); orchestrator skips it
     unhold <id> --reason M  Return a held unit to in-queue and capture why it was released
-    validate-backlog [--fix] Check backlog integrity; --fix auto-corrects rule-10/11 violations
+    validate-backlog [--fix] [--strict] Check backlog integrity; --fix auto-corrects rule-10/11
+                            violations; --strict also flags draft/hold Manifest conflicts
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
     git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
@@ -38,6 +39,8 @@ Plugin agent bridge commands (used by devbench plugin agents)::
 
     read-unit <id>                          Return work unit content and repo path as JSON
     get-diff <id>                           Return combined git diff for the work unit's repo
+    check-manifest-scope <id>               Print out-of-Manifest staged paths; exit non-zero
+                                             on mismatch (read-only, no LLM judgement)
     run-tests <id>                          Run test suite for the work unit's repo
     tdd-gate <id>                           Run the machine-observed RED gate for a gated task;
                                              on a genuine RED, records the orchestrator-only
@@ -69,6 +72,7 @@ import asyncio
 import contextlib
 import functools
 import getpass
+import io
 import json
 import logging
 import os
@@ -77,11 +81,11 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Coroutine, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, NamedTuple
+from typing import IO, TYPE_CHECKING, Any, NamedTuple, cast
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -110,6 +114,7 @@ from devbench.backlog.amendment import (
     REVIEW_FAILURES_DIR_NAME,
     AmendmentError,
     AmendmentRequest,
+    PreFilter,
     apply_amendment,
     read_review_failure_files,
     reject_amendment,
@@ -141,8 +146,11 @@ from devbench.backlog.manager import (
     _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE,
     BacklogManager,
     _build_remedies_rejection_message,
+    _extract_wu_title,
+    count_review_fails_for_judge,
     green_green_observed_satisfied,
     red_gate_satisfied,
+    resolve_judge_retry_budget,
 )
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
@@ -153,7 +161,9 @@ from devbench.backlog.proposal import (
     ProposalMatch,
     ProposalTaskState,
     _compute_fix_signature,
+    _dep_row_has_task,
     _extract_intent_phrase,
+    _placeholder_dep_row,
     add_dep,
     classify_blocked_task,
     classify_proposed_task,
@@ -178,19 +188,28 @@ from devbench.backlog.work_unit import (
     WorkUnitStatus,
     WorkUnitType,
 )
+from devbench.comment_time import audit_timestamp_to_utc, comment_timestamp
 from devbench.config import (
     AGENT_MODELS,
     BACKLOG_INDEX,
     BACKLOG_ROOT,
     BLOCKED_RECOVERY_WINDOW_SECONDS,
     MAX_CASCADE_DEPTH,
+    MAX_TRANSPORT_RESTARTS,
+    ORCHESTRATE_EFFORT,
+    ORCHESTRATE_MAX_THINKING_TOKENS,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
+    TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+    TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
     UPDATE_SUBMODULE,
     WORKSPACE_ROOT,
     _read_env,
     resolve_repo,
     validate_repo,
+)
+from devbench.config import (
+    ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS as _ORCH_INACTIVITY_TIMEOUT,
 )
 from devbench.config_loader import (
     QuotaHandlingConfig,
@@ -204,17 +223,19 @@ from devbench.constants import (
     AGENT_WRITABLE_TDD_PHASES,
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
+    BACKLOG_REPO_RE,
     BACKLOG_STATUS_RE,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_LOG_FILENAME,
     DEFAULT_LOG_SUBDIR,
+    DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS,
     DEFAULT_MAX_QUOTA_RESUMES,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
     EM_DASH,
+    EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_MAX_LENGTH,
     FAILURE_DIGEST_MIN_LENGTH,
     FAILURE_DIGEST_RE,
@@ -222,10 +243,12 @@ from devbench.constants import (
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX,
     ORCHESTRATOR_ONLY_TDD_PHASES,
     ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
     ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    ORCHESTRATOR_RETRY_BUDGET_EXHAUSTED_AUDIT_TAG,
     RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_TIMEOUT_SECONDS,
     RED_OBSERVED_FIELD_EXIT_CODE,
@@ -243,6 +266,7 @@ from devbench.constants import (
     SESSION_STARTED_AT_FILENAME,
     SESSION_STARTED_BY_FILENAME,
     STATUS_BLOCKED,
+    STATUS_DECLINED,
     STATUS_DONE,
     STATUS_DRAFT,
     STATUS_IN_PROGRESS,
@@ -257,7 +281,10 @@ from devbench.constants import (
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
 from devbench.git_orphans import OrphanReport
-from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord
+from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord, RestoreRecord
+
+if TYPE_CHECKING:
+    from claude_agent_sdk.types import EffortLevel
 from devbench.github.git_ops import GitOpsService
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
@@ -284,7 +311,7 @@ from devbench.quota import (
 # the banner is implemented there and reporting must not depend on cli.py. See
 # the ``__all__``-vs-self-aliased-``as`` rationale above the
 # ``devbench.backlog.manager`` re-export block.
-from devbench.reporting.report import _format_duration
+from devbench.reporting.report import _format_duration, read_all_drain_states
 from devbench.scope import (
     InvalidScopeError,
     ScopeFilter,
@@ -417,29 +444,57 @@ def _render_scope_banner(include: list[str], exclude: list[str], started_at: str
     print(f"SCOPE: {include_part} {exclude_part} {started_part}")
 
 
-def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
-    """Print the ``DRAIN REQUESTED: at <ts> by <user> (reason: <text>)`` banner.
+def _format_drain_status_line(session_name: str | None, state: DrainState) -> str:
+    """Format one ``DRAIN REQUESTED`` line for the banner and ``drain --status``.
 
-    Reads the drain signal file from *workspace_root* non-destructively via
-    :func:`~devbench.drain.read_drain_state`. When no signal is present this
-    function is a no-op. Output goes to *file* (default ``sys.stdout``)
-    immediately before the Status Summary header (spec section 4.3.5, AC-188-7).
+    db-306 (spec Section 4 FR-19, AC-46): the root-scope form omits the
+    session qualifier; the per-session form inserts ``[session=<name>]``
+    immediately after ``DRAIN REQUESTED`` so an operator scanning ``report``,
+    ``status``, or ``drain --status`` output can tell at a glance which
+    signal(s) are pending and where each one came from.
 
     Args:
-        workspace_root: Workspace directory from which the drain signal path is
+        session_name: ``None`` for the workspace-root signal; the session
+            directory name for a per-session signal.
+        state: The parsed drain state to render.
+
+    Returns:
+        A single formatted line with no trailing newline.
+    """
+    reason_part = state.reason if state.reason else "(none)"
+    scope_part = f" [session={session_name}]" if session_name is not None else ""
+    return (
+        f"DRAIN REQUESTED{scope_part}: at {state.requested_at.isoformat()} "
+        f"by {state.requested_by} (reason: {reason_part})"
+    )
+
+
+def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
+    """Print one ``DRAIN REQUESTED`` line per pending drain signal.
+
+    db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2): reads every
+    drain signal in *workspace_root* non-destructively via
+    :func:`~devbench.reporting.report.read_all_drain_states` -- the
+    workspace-root signal AND every per-session signal, regardless of
+    ``DEVBENCH_SESSION_NAME`` -- so a per-session drain is visible to an
+    operator whose shell never exported that variable. When no signal is
+    present this function is a no-op. Output goes to *file* (default
+    ``sys.stdout``) immediately before the Status Summary header (spec
+    section 4.3.5, AC-188-7).
+
+    Args:
+        workspace_root: Workspace directory from which drain signal paths are
             resolved.
         file: Output stream to write the banner to. Defaults to ``sys.stdout``
             when ``None``. Callers may pass an ``io.StringIO`` instance to
             capture banner text without capturing the full process stdout.
     """
-    state = read_drain_state(workspace_root)
-    if state is None:
+    states = read_all_drain_states(workspace_root)
+    if not states:
         return
-    reason_part = state.reason if state.reason else "(none)"
-    print(
-        f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})",
-        file=file if file is not None else sys.stdout,
-    )
+    out = file if file is not None else sys.stdout
+    for session_name, state in states:
+        print(_format_drain_status_line(session_name, state), file=out)
 
 
 def _print_active_units(active: list[WorkUnit]) -> None:
@@ -743,13 +798,17 @@ def _print_blocked_row(u: WorkUnit, units_by_id: dict[str, WorkUnit]) -> None:
     plus any unsuperseded ``[BLOCKED]`` audit lines beneath it."""
     wu_file = _resolve_unit_file(u)
     content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
-    # Issue #148: walk the markers and surface only non-terminal targets.
-    markers = [
+    # Issue #148 / FR-6 (db-253 Gap 2a): walk the markers via the strict,
+    # Comments-scoped, end-anchored helper -- prose that merely quotes the
+    # marker syntax elsewhere in the file cannot mint a phantom target --
+    # and surface only non-terminal targets.
+    marker_ids = BacklogManager()._extract_pending_proposal_markers(wu_file) if wu_file is not None else set()
+    markers = sorted(
         marker
-        for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
+        for marker in marker_ids
         if (target := units_by_id.get(marker)) is None
         or target.status not in {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
-    ]
+    )
     unsatisfied = _first_unsatisfied_dep(u, units_by_id)
     note_parts: list[str] = []
     if markers:
@@ -852,9 +911,16 @@ _LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
     re.MULTILINE,
 )
 # Fallback: agent-comment audit row of the form
-#   [2026-05-02 12:34 UTC] [agent/orchestrator] Set <id> to 'in-progress'
+#   [2026-05-02 12:34 EDT] [agent/orchestrator] Set <id> to 'in-progress'
+# (the zone token is whatever display_timezone resolved to; UTC when unset)
+# The zone token is captured rather than pinned to "UTC": comments are stamped
+# in the workspace's ``display_timezone`` when one is set, so a workspace that
+# configures it would otherwise stop matching here and lose the duration
+# readout entirely. Files written before that setting existed still carry
+# "UTC" and keep matching unchanged.
 _AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
-    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+UTC\][^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(?P<zone>[A-Za-z0-9_+\-]+)\]"
+    r"[^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
 )
 
 
@@ -914,7 +980,7 @@ def _latest_audit_in_progress_ts(task_id: str) -> datetime | None:
         if match.group("id") != task_id:
             continue
         try:
-            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+            ts = audit_timestamp_to_utc(match.group("ts"), match.group("zone"))
         except ValueError:
             continue
         if latest is None or ts > latest:
@@ -1056,6 +1122,75 @@ def _parse_next_argv(argv: tuple[str, ...]) -> tuple[str, str, int]:
     return include_str, exclude_str, 0
 
 
+def _detect_units_dependency_cycle(units: list[WorkUnit]) -> str:
+    """Return an ``A -> B -> C -> A`` cycle chain among ``units``' declared
+    dependencies, or ``""`` when no cycle exists.
+
+    FR-8 (db-253 Gap 2c): a cheap, in-memory companion to
+    :meth:`BacklogManager._check_dep_cycles` -- the authoritative,
+    file-scanning cycle check that ``validate-backlog`` runs. This helper
+    walks ONLY the already-parsed ``unit.dependencies`` edges (no extra file
+    I/O) via DFS-with-recursion-stack, so it stays cheap enough to run on
+    every ``devbench next`` invocation. It is a diagnostic pointer at
+    ``validate-backlog`` for the authoritative answer, not a replacement
+    for it.
+    """
+    graph = {u.id: u.dependencies for u in units}
+    color: dict[str, int] = dict.fromkeys(graph, 0)
+    stack: list[str] = []
+    chain = ""
+
+    def visit(node: str) -> None:
+        nonlocal chain
+        color[node] = 1
+        stack.append(node)
+        for nxt in graph.get(node, ()):
+            if chain:
+                break
+            if nxt not in color:
+                continue
+            if color[nxt] == 1:
+                cycle_start = stack.index(nxt)
+                cycle = stack[cycle_start:]
+                chain = " -> ".join([*cycle, cycle[0]])
+                break
+            if color[nxt] == 0:
+                visit(nxt)
+        stack.pop()
+        color[node] = 2
+
+    for node in sorted(graph):
+        if chain:
+            break
+        if color.get(node) == 0:
+            visit(node)
+    return chain
+
+
+def _no_actionable_diagnostic(units: list[WorkUnit]) -> str:
+    """Build the FR-8 (db-253 Gap 2c) diagnostic line ``cmd_next`` appends
+    after the terminal ``NO_ACTIONABLE`` token when nothing is actionable.
+
+    Computed entirely from the already-parsed ``units`` list -- no extra
+    file reads -- so the diagnostic is cheap on every invocation (D-R1-2).
+    Names how many TASK units are still non-terminal, splits out the
+    blocked and on-hold counts, and appends a dependency-cycle chain among
+    them when one is detected, pointing the operator at
+    ``validate-backlog`` and ``reconcile-cascade`` for the next step.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    remaining = [u for u in units if u.unit_type is WorkUnitType.TASK and u.status not in terminal]
+    blocked_count = sum(1 for u in remaining if u.status is WorkUnitStatus.BLOCKED)
+    hold_count = sum(1 for u in remaining if u.status is WorkUnitStatus.HOLD)
+    chain = _detect_units_dependency_cycle(remaining)
+    cycle_clause = f", dependency cycle: {chain}" if chain else ""
+    return (
+        f"# {len(remaining)} unit(s) remain and none are actionable: "
+        f"{blocked_count} blocked, {hold_count} on hold{cycle_clause}. "
+        "Run 'devbench validate-backlog' and 'devbench reconcile-cascade' to diagnose."
+    )
+
+
 def cmd_next(*argv: str) -> int:
     """Print the next actionable work unit.
 
@@ -1068,6 +1203,13 @@ def cmd_next(*argv: str) -> int:
     When neither flag is supplied, the active ``scope.json`` (if any) is
     consulted instead.  When a scope is active and no candidates match, prints
     ``NO_ACTIONABLE_IN_SCOPE`` and returns 0 (AC-190-15).
+
+    FR-8 (db-253 Gap 2c, AC-16): when no scope is active and nothing is
+    actionable, line 1 stays the literal ``NO_ACTIONABLE`` token (existing
+    consumers, including ``_is_terminal_orchestrate_result``, match on this
+    substring) and a second diagnostic line names the cause -- how many
+    units remain, the blocked/hold split, and any detected dependency-cycle
+    chain -- via :func:`_no_actionable_diagnostic`.
 
     Args:
         *argv: Optional flag arguments (``--include``, ``--exclude``).
@@ -1097,6 +1239,7 @@ def cmd_next(*argv: str) -> int:
             print("ALL_DONE")
         else:
             print("NO_ACTIONABLE")
+            print(_no_actionable_diagnostic(units))
         return 0
 
     unit = candidates[0]
@@ -1204,9 +1347,16 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
 
     Quarantine is non-destructive. Each stash entry carries a discoverable
     ``devbench-quarantine:<owner-id>`` message and stays recoverable via
-    ``git stash list``. Nothing is auto-restored: a blocked unit re-executes
-    from its Changes Manifest when it unblocks, and re-injecting a superseded
-    attempt into a later run's tree would recreate the contamination.
+    ``git stash list``.
+
+    Displaced work is handed back before the scan runs: when the claiming unit
+    is itself a previously-displaced owner, ``restore_quarantine`` returns its
+    entry to the tree first, so the unit resumes from the attempt it already
+    paid for instead of re-executing from an empty checkout. The restore is
+    bounded by the unit's own Changes Manifest and refuses to overwrite a
+    newer attempt, so it cannot reintroduce the contamination the quarantine
+    removes; a refusal leaves the entry intact and blocks the claim rather
+    than silently discarding an expensive attempt.
 
     Re-claiming an ``in-progress`` unit is unaffected, because the unit's own
     manifest files are in scope and are never quarantined.
@@ -1230,7 +1380,7 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
         supposed to clear.
     """
     from devbench.backlog.manifest import list_changed_files, parse_manifest
-    from devbench.git_quarantine import quarantine_paths
+    from devbench.git_quarantine import quarantine_paths, restore_quarantine
 
     canonical_repo = resolve_repo(unit.repo)
     repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
@@ -1244,9 +1394,17 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
 
     manifest_files = {row.file for row in parse_manifest(wu_file.read_text(encoding="utf-8"))}
     try:
+        restored = restore_quarantine(repo_path, unit_id, manifest_files)
+    except RuntimeError as exc:
+        return f"ERROR: cannot prepare the checkout for {unit_id!r}: {exc}"
+    if restored is not None:
+        _log_quarantine_restore(restored)
+
+    try:
         foreign = [path for path in list_changed_files(repo_path) if path not in manifest_files]
         if not foreign:
             return None
+        _checkpoint_owners_before_quarantine(repo_path, foreign, canonical_repo)
         records = quarantine_paths(repo_path, foreign, _non_terminal_manifests(canonical_repo), unit_id)
         remaining = [path for path in list_changed_files(repo_path) if path not in manifest_files]
     except RuntimeError as exc:
@@ -1262,6 +1420,38 @@ def _prepare_worktree_for_claim(unit: WorkUnit, wu_file: Path, unit_id: str) -> 
     for record in records:
         _log_quarantine(record, unit_id)
     return None
+
+
+def _checkpoint_owners_before_quarantine(repo_path: Path, foreign: list[str], canonical_repo: str) -> None:
+    """Snapshot the checkout before foreign work is stashed out of it.
+
+    One snapshot covers every displaced owner, because ``git stash create``
+    captures the whole tree rather than a path subset. That is deliberately
+    coarser than the per-owner stash entries: the checkpoint is a safety net
+    for the case where the stash stack is lost, not the primary recovery path,
+    and a single reachable commit holding everything is both cheaper and
+    harder to lose than one ref per owner.
+
+    Best-effort: a failed snapshot is logged and the quarantine proceeds. The
+    stash is still written, so refusing to continue here would stop an
+    unattended run to protect a backup of a backup.
+    """
+    from devbench.git_quarantine import checkpoint_work, group_paths_by_owner
+
+    owners = [
+        owner
+        for owner in group_paths_by_owner(foreign, _non_terminal_manifests(canonical_repo))
+        if owner != UNATTRIBUTED_OWNER
+    ]
+    if not owners:
+        return
+    try:
+        sha = checkpoint_work(repo_path, sorted(owners)[0])
+    except RuntimeError as exc:
+        logger.warning("[CHECKPOINT_SKIPPED] pre-quarantine snapshot failed: %s", exc)
+        return
+    if sha:
+        logger.info("[WORK_CHECKPOINTED] pre-quarantine snapshot %s covers %s", sha, sorted(owners))
 
 
 def _non_terminal_manifests(canonical_repo: str) -> dict[str, list[str]]:
@@ -1332,11 +1522,72 @@ def _log_quarantine(record: QuarantineRecord, claiming_unit_id: str) -> None:
             "orchestrator",
             f"[WORK_QUARANTINED] {len(paths)} uncommitted path(s) from this unit were displaced from the "
             f"shared checkout when {claiming_unit_id} claimed: {paths}. They are preserved in a git stash "
-            f"titled {stash_message!r} and are recoverable with 'git stash list'. Nothing was restored "
-            "automatically: re-execute from this unit's Changes Manifest when it unblocks.",
+            f"titled {stash_message!r} and are recoverable with 'git stash list'. They are restored "
+            "automatically the next time this unit claims the checkout, so resume from them rather than "
+            "re-executing this unit's Changes Manifest from scratch.",
         )
     except (OSError, ValueError) as exc:
         logger.warning("quarantine audit comment failed for %s: %s", owner_id, exc)
+
+
+def _log_quarantine_restore(record: RestoreRecord) -> None:
+    """Record that a unit's displaced work was handed back on its re-claim.
+
+    The counterpart to :func:`_log_quarantine`. The owning unit's next
+    executor reads this line to learn that its previous attempt is already in
+    the tree, which is the difference between resuming a finished attempt and
+    redoing every review round that produced it.
+
+    Comment-write failures are logged and not raised, matching the quarantine
+    side: the restore itself has already succeeded by this point, and losing
+    an audit line must not stop an unattended run.
+    """
+    owner_id = record.owner_id
+    paths = list(record.paths)
+    logger.info(
+        "[WORK_RESTORED] %d path(s) returned to %s from quarantine %r",
+        len(paths),
+        owner_id,
+        record.stash_message,
+    )
+    try:
+        owner_file = _resolve_unit_file_by_id(owner_id)
+        if owner_file is None:
+            return
+        BacklogManager()._append_agent_comment(
+            owner_file,
+            "orchestrator",
+            f"[WORK_RESTORED] {len(paths)} previously displaced path(s) were restored into the shared "
+            f"checkout for this claim: {paths}. They come from the quarantine stash titled "
+            f"{record.stash_message!r}, which has now been consumed. This is the attempt this unit had "
+            "already produced, so verify and continue from it rather than starting the Changes Manifest "
+            "over.",
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("quarantine restore audit comment failed for %s: %s", owner_id, exc)
+
+
+def _active_work_unit_marker_path(session_name: str | None) -> Path:
+    """Return the active-work-unit marker path for the given session.
+
+    Issue #336: ``guard-git-stage.sh`` rule 2 resolves the claimed work unit
+    from this marker because hook processes inherit the long-lived
+    orchestrator environment and cannot receive a per-work-unit environment
+    variable.  Named sessions get a suffixed marker so concurrent sessions
+    in one workspace never read each other's claim.
+
+    Args:
+        session_name: Optional named-session name from ``DEVBENCH_SESSION_NAME``.
+
+    Returns:
+        Absolute marker path under ``<workspace>/.devbench/``.
+    """
+    from devbench.constants import ACTIVE_WORK_UNIT_MARKER_PATH
+
+    marker = WORKSPACE_ROOT / ACTIVE_WORK_UNIT_MARKER_PATH
+    if session_name:
+        marker = marker.with_name(f"{marker.name}-{session_name}")
+    return marker
 
 
 def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:
@@ -1345,6 +1596,12 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
     Returns an error message string when the claim fails (race, timeout, or missing
     status line), or ``None`` on success.  Keeps ``cmd_claim`` within the
     PLR0911 return-statement budget.
+
+    On success, also records the claimed unit's file path in the
+    active-work-unit marker (issue #336) so ``guard-git-stage.sh`` rule 2
+    can enforce manifest scope on ``git add`` for the duration of the claim.
+    The marker is written under the same ``BACKLOG.lock`` as the status
+    transition, so the hook can never observe a claim without its marker.
 
     Args:
         wu_file: Absolute path to the work-unit ``.md`` file.
@@ -1355,7 +1612,10 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
         ``None`` on success; a human-readable error string on failure.
 
     Raises:
-        OSError: Unexpected OS error from ``fcntl.flock`` (propagated to caller).
+        OSError: Unexpected OS error from ``fcntl.flock`` or from writing the
+            active-work-unit marker (propagated to caller -- a claim whose
+            marker cannot be recorded must fail loudly, not degrade the
+            guard silently).
     """
     try:
         with flock_backlog(WORKSPACE_ROOT):
@@ -1374,6 +1634,9 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
                 )
             mgr = BacklogManager()
             mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS, session_name=session_name)
+            marker = _active_work_unit_marker_path(session_name)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(marker, f"{wu_file.resolve()}\n")
     except ClaimRaceError as exc:
         return (
             f"ERROR: claim race on {unit_id!r} -- another session already changed the status. "
@@ -1497,7 +1760,7 @@ def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
     logger.info("Set %s to %s", unit_id, new_status)
 
     if new_status.lower() == "blocked":
-        rc = _clean_target_repo_on_block(wu_file)
+        rc = _clean_target_repo_on_block(wu_file, unit_id)
         if rc != 0:
             print(f"WARNING: target repo cleanup failed for '{unit_id}' (exit {rc})", file=sys.stderr)
 
@@ -1770,12 +2033,26 @@ def _apply_bulk_set_status(
     )
 
 
-def _clean_target_repo_on_block(wu_file: Path) -> int:
-    """Reset and clean the target repo's working tree when a task transitions to blocked.
+def _clean_target_repo_on_block(wu_file: Path, unit_id: str) -> int:
+    """Quarantine the target repo's working tree when a task transitions to blocked.
 
-    Reads the ``Local path:`` field from the work-unit file and runs
-    ``git reset --hard HEAD`` and ``git clean -fd`` against that directory.
-    Both commands are run with ``check=False``; returns 1 if either fails.
+    A shared single-branch checkout must not carry a blocked task's residue
+    into the next unit's claim, but clearing it MUST NOT destroy it. This
+    previously ran ``git reset --hard HEAD`` plus ``git clean -fd``, which
+    annihilated every uncommitted change in the target repo -- including work
+    that was complete and verified but not yet committed, since the executor
+    stages and leaves committing to ``devbench git-ops``. The destruction was
+    unconditional, irreversible, and silent, and it made ``blocked`` a status
+    the orchestrator had to actively avoid: an observed run chose ``hold`` over
+    ``blocked`` specifically to keep a finished task's work alive.
+
+    Now delegates to :func:`~devbench.git_quarantine.quarantine_paths` -- the
+    same non-destructive primitive claim-time quarantine already uses
+    (:func:`_prepare_worktree_for_claim`) -- so the tree is cleared into
+    recoverable ``git stash`` entries, one per owning unit, discoverable via
+    ``git stash list``. Blocking a task can no longer lose work, and the two
+    "clear this shared checkout" paths now share one implementation instead of
+    disagreeing about whether the work survives.
 
     If ``Local path:`` is absent from the file (e.g. validation gates with no
     local path), logs a warning and returns 0 as a defensive skip -- this is
@@ -1784,10 +2061,13 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
 
     Args:
         wu_file: Path to the work-unit ``.md`` file.
+        unit_id: The blocking unit's ID, recorded in each stash message so the
+            audit trail shows which block triggered the quarantine.
 
     Returns:
-        0 on success or when ``Local path:`` is absent; 1 if a git command
-        errors.
+        0 on success, when the tree is already clean, or when ``Local path:``
+        is absent; 1 when the work-unit file is unreadable or the quarantine
+        could not clear the tree.
     """
     try:
         content = wu_file.read_text()
@@ -1811,35 +2091,43 @@ def _clean_target_repo_on_block(wu_file: Path) -> int:
         )
         return 0
 
-    reset_result = subprocess.run(
-        ["git", "-C", local_path, "reset", "--hard", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if reset_result.returncode != 0:
-        logger.warning(
-            "_clean_target_repo_on_block: git reset failed for '%s': %s",
-            local_path,
-            reset_result.stderr.strip(),
+    from devbench.backlog.manifest import list_changed_files
+    from devbench.git_quarantine import quarantine_paths
+
+    repo_path = Path(local_path)
+    changed = list_changed_files(repo_path)
+    if not changed:
+        logger.info("_clean_target_repo_on_block: target repo at '%s' is already clean", local_path)
+        return 0
+
+    repo_match = BACKLOG_REPO_RE.search(content)
+    canonical_repo = resolve_repo(repo_match.group(1).strip()) if repo_match else ""
+    try:
+        records = quarantine_paths(
+            repo_path,
+            changed,
+            _non_terminal_manifests(canonical_repo) if canonical_repo else {},
+            unit_id,
         )
+    except RuntimeError as exc:
+        logger.warning("_clean_target_repo_on_block: quarantine failed for '%s': %s", local_path, exc)
         return 1
 
-    clean_result = subprocess.run(
-        ["git", "-C", local_path, "clean", "-fd"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if clean_result.returncode != 0:
-        logger.warning(
-            "_clean_target_repo_on_block: git clean failed for '%s': %s",
-            local_path,
-            clean_result.stderr.strip(),
+    for record in records:
+        logger.info(
+            "%s%s owner=%s paths=%d stash=%s",
+            ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX,
+            unit_id,
+            record.owner_id,
+            len(record.paths),
+            record.stash_message,
         )
-        return 1
-
-    logger.info("_clean_target_repo_on_block: cleaned target repo at '%s'", local_path)
+    logger.info(
+        "_clean_target_repo_on_block: quarantined %d path(s) out of '%s' into %d recoverable stash entry(ies)",
+        len(changed),
+        local_path,
+        len(records),
+    )
     return 0
 
 
@@ -2260,8 +2548,7 @@ def cmd_sync_blocked() -> int:
             wu_file = _resolve_unit_file(unit)
             if wu_file is None:
                 continue
-            content = wu_file.read_text(encoding="utf-8")
-            if _has_open_proposal_marker(content, units_by_id):
+            if _has_open_proposal_marker(wu_file, units_by_id):
                 # Issue #148: only skip when at least one marker target is
                 # still non-terminal. Stale markers pointing at finished
                 # tasks no longer represent active cascade work and must
@@ -2374,7 +2661,17 @@ def cmd_reconcile_cascade() -> int:
     Tasks left blocked are reported with the reason (open marker, unknown
     marker target, unsatisfied dep) so the operator can decide what to do.
 
-    Returns 0 always; output is a JSON envelope listing flips + skips.
+    Issue #332 FR-2: a second pass repairs containers (Story/Feature/Epic)
+    that were stranded BEFORE the FR-1 live-rollup fix existed. The
+    triggering terminal transition that would have promoted such a
+    container has already happened, so no live event remains to promote
+    it. This pass walks every non-terminal container, evaluates
+    ``BacklogManager._all_children_done`` fresh, and promotes qualifying
+    containers -- cascading upward exactly as a live rollup would. See
+    :func:`_repair_stranded_containers`.
+
+    Returns 0 always; output is a JSON envelope listing flips + skips +
+    rolled-up containers.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -2397,8 +2694,10 @@ def cmd_reconcile_cascade() -> int:
             skipped.append({"unit_id": unit.id, "reason": "work-unit file missing"})
             continue
 
-        content = wu_file.read_text(encoding="utf-8")
-        marker_ids = sorted(set(_BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)))
+        # FR-6 (db-253 Gap 2a): route through the strict, Comments-scoped,
+        # end-anchored helper so prose that merely quotes the marker syntax
+        # elsewhere in the file cannot mint a phantom marker target.
+        marker_ids = sorted(BacklogManager()._extract_pending_proposal_markers(wu_file))
 
         # Marker evaluation: every target must be terminal AND known.
         unresolved_marker = ""
@@ -2430,16 +2729,115 @@ def cmd_reconcile_cascade() -> int:
         manager._append_agent_comment(wu_file, "backlog_manager", message)
         flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
 
+    # Issue #332 FR-2: repair containers stranded before the FR-1 rollup fix
+    # existed -- walk every non-terminal Story/Feature/Epic, promote the
+    # ones whose children are all terminal, cascading upward exactly as a
+    # live rollup would.
+    rolled_up = _repair_stranded_containers(manager, BACKLOG_INDEX, skipped)
+
     # Issues #207, #209: surface classification transitions for tasks that remain
     # blocked after the reconcile sweep -- a stale ``[BLOCKED]`` audit that
     # has drifted into ``OPERATOR_ACTION_REQUIRED`` produces exactly one
     # Slack ping.  Cache-backed, idempotent across repeated invocations.
     _notify_blocked_classification_transitions(units)
 
-    output = {"flipped": flipped, "skipped": skipped}
+    output = {"flipped": flipped, "skipped": skipped, "rolled_up": rolled_up}
     print(json.dumps(output))
-    logger.info("reconcile-cascade: %d flipped, %d skipped", len(flipped), len(skipped))
+    logger.info(
+        "reconcile-cascade: %d flipped, %d skipped, %d parent(s) rolled up",
+        len(flipped),
+        len(skipped),
+        len(rolled_up),
+    )
     return 0
+
+
+# Matches Epic / Feature / Story compound IDs (0, 1, or 2 hyphens) while
+# explicitly excluding Task IDs (which always carry a trailing ``-T<n>``
+# segment) and non-ID table noise (header cells, separator rows, the
+# Status Summary table's numeric rows -- none of which match ``E\d+...``).
+_CONTAINER_ID_RE = re.compile(r"^E\d+(-F\d+(-S\d+)?)?$")
+
+
+def _repair_stranded_containers(
+    manager: BacklogManager,
+    backlog_index: Path,
+    skipped: list[dict[str, str]],
+) -> list[str]:
+    """Promote already-stranded Story/Feature/Epic containers (#332 FR-2).
+
+    The live auto-rollup cascade (``BacklogManager._set_status`` ->
+    ``_rollup_parent_status``) only fires from a fresh terminal transition.
+    A container stranded BEFORE that trigger existed -- or missed by a
+    crashed/partial write -- has no event left that could promote it. This
+    walks every non-terminal container directly from ``BACKLOG.md`` (via
+    ``BacklogManager._parse_backlog_rows``, which -- unlike
+    ``BacklogParser.parse_index`` -- does not require the container's own
+    ``.md`` file to exist, so a file-less container row is still visible
+    here rather than crashing the whole command), evaluates
+    ``BacklogManager._all_children_done`` fresh for each, and promotes
+    qualifying containers via ``BacklogManager._set_status`` -- the exact
+    private call ``_rollup_parent_status`` itself uses, so a promotion's
+    own terminal transition re-triggers ``_rollup_parent_status`` for its
+    own parent, cascading upward exactly as a live rollup would.
+
+    Runs the whole evaluate-and-promote sequence under a single
+    ``flock_backlog`` acquisition so a concurrent orchestrator process
+    cannot interleave a write mid-sweep.
+
+    Args:
+        manager: Shared ``BacklogManager`` instance.
+        backlog_index: Path to ``BACKLOG.md``.
+        skipped: The reconcile-cascade skip list; a container whose
+            work-unit file cannot be resolved is appended here (never
+            silently dropped).
+
+    Returns:
+        Every container ID that was non-terminal when the sweep started
+        and is ``done`` when it finished -- credits both containers
+        promoted directly by this sweep and ones promoted purely as a
+        cascade side-effect of promoting a descendant.
+    """
+    terminal_statuses = {STATUS_DONE, STATUS_DECLINED}
+
+    with flock_backlog(WORKSPACE_ROOT):
+        rows = manager._parse_backlog_rows(backlog_index)
+        # Rows with an empty status (e.g. the Status Summary table's
+        # numeric-count rows, which share Epic IDs with the Full Work Unit
+        # Index but carry no recognised status cell) never contribute a
+        # status here, so the dict naturally prefers the real Index row.
+        containers_by_id: dict[str, str] = {
+            row_id: status for row_id, status, _file_path in rows if status and _CONTAINER_ID_RE.match(row_id)
+        }
+        candidates = [cid for cid, status in containers_by_id.items() if status not in terminal_statuses]
+        # Deepest (Story) first: a promoted Story's own terminal transition
+        # cascades upward automatically, so later Feature/Epic entries in
+        # this same pass are usually already ``done`` by the time they are
+        # reached directly below.
+        candidates.sort(key=lambda cid: cid.count("-"), reverse=True)
+
+        for container_id in candidates:
+            fresh_rows = manager._parse_backlog_rows(backlog_index)
+            if not manager._all_children_done(fresh_rows, container_id):
+                continue
+            container_file = manager._find_work_unit_file(fresh_rows, container_id, backlog_index.parent)
+            if container_file is None:
+                skipped.append({"unit_id": container_id, "reason": "container work-unit file missing"})
+                logger.warning(
+                    "reconcile-cascade: cannot resolve work-unit file for container %s -- counted as skipped",
+                    container_id,
+                )
+                continue
+            manager._set_status(container_file, backlog_index, container_id, STATUS_DONE)
+            manager._append_agent_comment(
+                container_file,
+                "backlog_manager",
+                "[CASCADE_RECONCILED] all children terminal; rolling up to done via repair sweep",
+            )
+
+        final_rows = manager._parse_backlog_rows(backlog_index)
+        final_statuses = {row_id: status for row_id, status, _file_path in final_rows if status}
+        return [cid for cid in candidates if final_statuses.get(cid) == STATUS_DONE]
 
 
 def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> str:
@@ -2472,13 +2870,19 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
     return ""
 
 
-_BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
-
 # Captures the audit-comment classifier tag (``[BLOCKED]`` / ``[UNBLOCKED]`` /
 # ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk
 # the Comments section in chronological order and drop ``[BLOCKED]`` rows
 # that have been superseded by a later positive transition.
-_BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED)\](?P<rest>[^\n]*)")
+# ``CASCADE_RECONCILED`` belongs here for the same reason as the other two:
+# ``reconcile-cascade`` writes it when it re-queues a unit, so it means the
+# block is over. Its absence made devbench write a tag its own reader
+# ignored -- the unit reached ``in-queue`` while every blocked-audit
+# consumer kept reporting it as operator-blocked, so the report
+# contradicted the lifecycle for the rest of that unit's life.
+_BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(
+    r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED|CASCADE_RECONCILED)\](?P<rest>[^\n]*)"
+)
 
 
 def _unsuperseded_blocked_audits(content: str) -> list[str]:
@@ -2511,8 +2915,8 @@ def _unsuperseded_blocked_audits(content: str) -> list[str]:
     return pending_audits
 
 
-def _has_open_proposal_marker(content: str, units_by_id: dict[str, WorkUnit]) -> bool:
-    """Return ``True`` iff ``content`` carries at least one ``[BLOCKED_PENDING_PROPOSAL]``
+def _has_open_proposal_marker(wu_file: Path, units_by_id: dict[str, WorkUnit]) -> bool:
+    """Return ``True`` iff ``wu_file`` carries at least one ``[BLOCKED_PENDING_PROPOSAL]``
     marker whose target task is still non-terminal.
 
     Issue #148: the prior ``_BLOCKED_PENDING_PROPOSAL_OPEN_RE`` regex flagged
@@ -2524,9 +2928,14 @@ def _has_open_proposal_marker(content: str, units_by_id: dict[str, WorkUnit]) ->
     status (anything other than ``done`` / ``declined``). Unknown target
     IDs (rejected drafts whose backlog row was removed) count as
     non-terminal so the cascade owner stays in charge of clearing them.
+
+    FR-6 (db-253 Gap 2a): markers are read via the strict, Comments-scoped,
+    end-anchored ``BacklogManager._extract_pending_proposal_markers`` helper
+    so prose that merely quotes the marker syntax elsewhere in the file can
+    never be mistaken for a live target.
     """
     terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
-    for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content):
+    for marker in BacklogManager()._extract_pending_proposal_markers(wu_file):
         target = units_by_id.get(marker)
         if target is None:
             return True
@@ -2647,6 +3056,52 @@ def cmd_unhold(*argv: str) -> int:
     BacklogManager().unmark_held(wu_file, BACKLOG_INDEX, task_id, reason)
     logger.info("Unheld %s: %s", task_id, reason)
     print(json.dumps({"task_id": task_id, "status": "in-queue", "reason": reason}))
+    return 0
+
+
+def cmd_remove(*argv: str) -> int:
+    """Remove a work unit through the managed path (db-303, spec 4.A, FR-16).
+
+    Usage::
+
+        remove <id> --reason "<message>"
+
+    Deletes the work-unit ``.md`` file and its BACKLOG.md index row under a
+    single ``flock(BACKLOG.lock)``, re-rolls the Status Summary, and appends
+    a ``[WU_REMOVED] <id> -- <reason>`` line to the workspace audit log
+    (``BacklogManager.remove_unit``). ``BACKLOG.md`` is otherwise protected
+    by ``guard-work-unit-write.sh``: a raw Edit/Write is blocked unless the
+    operator sets ``DEVBENCH_ALLOW_BACKLOG_EDIT=1``, so this managed verb --
+    which writes through Python I/O, not the Edit/Write tools -- is the
+    normal path to drop a superseded unit. The ``--reason`` is REQUIRED so
+    the removal leaves an audit trail; em-dashes are rejected at the input
+    boundary. An unknown ``<id>`` fails fast before any file is touched.
+    """
+    parsed = _parse_id_and_reason(argv, "remove")
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason = parsed
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    audit_log_path = WORKSPACE_ROOT / RUNTIME_CONFIG.backlog.bulk_update_audit_path
+    try:
+        BacklogManager().remove_unit(wu_file, BACKLOG_INDEX, task_id, reason, audit_log_path)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    logger.info("Removed %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "removed", "reason": reason}))
     return 0
 
 
@@ -2901,17 +3356,22 @@ def cmd_validate_backlog(*argv: str) -> int:
     - All dependency IDs reference real work unit IDs.
     - Status Summary table exists and counts match the Full Work Unit Index.
 
-    Optional flag:
+    Optional flags:
     - ``--fix``: Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory
       prefix) violations in place and append an audit comment to each corrected
       file's ``## Comments`` section. Prints a summary of corrections made.
+    - ``--strict``: Additionally report draft/hold Manifest conflicts (FR-4,
+      db-267). Default runs report only in-queue/proposed/blocked/in-progress
+      conflicts (FR-3, db-313); ``spec-to-backlog`` runs this flag as its
+      authoring-time exit gate.
 
     Exits 0 if the backlog is consistent (or all violations were fixed); 1 with
     actionable error messages if any inconsistencies remain.
     """
     fix = "--fix" in argv
+    strict = "--strict" in argv
     mgr = BacklogManager()
-    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix)
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix, strict=strict)
     if fix:
         fix_count, files_fixed = mgr._fix_summary
         print(f"Fixed {fix_count} violation(s) across {files_fixed} file(s).")
@@ -3078,6 +3538,55 @@ def _check_repo_preflight(
         if pr_err:
             errors.append(pr_err)
     return errors
+
+
+def cmd_config_resolve(*argv: str) -> int:
+    """Print resolved runtime-config values as one-line JSON: ``config-resolve <field>...``.
+
+    Exposes the fully-resolved configuration (env > YAML > built-in default)
+    so an agent can read a setting deterministically instead of re-deriving
+    the precedence chain itself, or worse, assuming a default.
+
+    Added because orchestrate SKILL.md already instructed the orchestrator to
+    read its retry budget via this verb while the verb did not exist: the call
+    failed, so ``max_executor_retries_per_judge`` was unreadable at runtime
+    and the review-rejection loop it was meant to bound ran unbounded.
+
+    Field names are ``RuntimeConfig`` attribute names, e.g.
+    ``max_executor_retries``, ``max_executor_retries_per_judge``. Nested
+    dataclass sections are returned as JSON objects. An unknown field name is
+    a hard error naming the valid choices -- never a silent ``null``, which
+    would read as "configured empty" and hide a typo.
+
+    Returns 0 on success; 1 when no field is given or any field is unknown.
+    """
+    from dataclasses import asdict, fields, is_dataclass
+
+    from devbench.config import RUNTIME_CONFIG
+
+    names = [a for a in argv if a]
+    if not names:
+        valid = ", ".join(sorted(f.name for f in fields(RUNTIME_CONFIG)))
+        print(f"ERROR: config-resolve requires at least one field name. Valid fields: {valid}", file=sys.stderr)
+        return 1
+
+    known = {f.name for f in fields(RUNTIME_CONFIG)}
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        print(
+            f"ERROR: unknown config field(s): {', '.join(unknown)}. Valid fields: {', '.join(sorted(known))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    resolved: dict[str, Any] = {}
+    for name in names:
+        value = getattr(RUNTIME_CONFIG, name)
+        # ``is_dataclass`` narrows to the type, not the instance, so the
+        # non-type guard keeps mypy satisfied without a cast.
+        resolved[name] = asdict(value) if is_dataclass(value) and not isinstance(value, type) else value
+    print(json.dumps(resolved, default=str))
+    return 0
 
 
 def cmd_check() -> int:
@@ -3432,6 +3941,14 @@ def cmd_report(
     above the report body, and the WU lists shown in the report are filtered
     to the resolved scope.
 
+    db-306 (spec Section 0 item 7, Section 4 FR-19, AC-46): a ``DRAIN
+    REQUESTED`` line is printed above the report body for every pending
+    drain signal (workspace-root and per-session).  The banner is rendered
+    LIVE on all three emit paths -- the cached-snapshot fast-path, the
+    one-shot live path, and every streamed frame -- and is never baked into
+    ``generate_report``'s cached snapshot string, so a stale snapshot never
+    hides a drain requested after it was written.
+
     Issue #163: streams continuously by default when stdout is a TTY.
     Pass ``once=True`` (or pipe / redirect stdout) to get the legacy
     one-shot behaviour suitable for scripts and CI consumers.
@@ -3518,6 +4035,10 @@ def cmd_report(
 
             cached = read_snapshot(WORKSPACE_ROOT, log_file)
             if cached is not None:
+                # db-306 (spec Section 4 FR-19, AC-46): rendered LIVE, kept OUT
+                # of the cached snapshot string, so a drain requested after the
+                # snapshot was written is never hidden behind a stale cache.
+                _render_drain_banner(WORKSPACE_ROOT)
                 print(cached.report_text)
                 return 0
         report = generate_report(
@@ -3527,6 +4048,9 @@ def cmd_report(
             session_name=session_name,
             by_role=by_role,
         )
+        # db-306 (spec Section 4 FR-19, AC-46): rendered LIVE, immediately
+        # before the report body, not baked into generate_report's return value.
+        _render_drain_banner(WORKSPACE_ROOT)
         print(report)
         return 0
 
@@ -3546,7 +4070,13 @@ def cmd_report(
     report_started_at = datetime.now(UTC)
 
     def _render(*, log_path: Path) -> str:
-        return generate_report(
+        # db-306 (spec Section 4 FR-19, AC-46): the drain banner is rendered
+        # to a StringIO and prepended to every frame so it stays LIVE across
+        # streaming redraws, rather than being baked into generate_report's
+        # cached return value.
+        banner_buf = io.StringIO()
+        _render_drain_banner(WORKSPACE_ROOT, file=banner_buf)
+        report_text = generate_report(
             log_path=log_path,
             since=since_dt,
             report_started_at=report_started_at,
@@ -3554,6 +4084,7 @@ def cmd_report(
             session_name=session_name,
             by_role=by_role,
         )
+        return banner_buf.getvalue() + report_text
 
     return stream_report(log_file, _render)
 
@@ -3757,8 +4288,16 @@ def _resolve_default_branch(canonical_repo: str, repo_path: Path) -> str | None:
     return stdout.strip().removeprefix("origin/")
 
 
-def _render_untracked_hunks(repo_path: Path) -> list[str]:
-    """Return synthetic diff hunks for every untracked file the repo reports."""
+def _render_untracked_hunks(repo_path: Path, allowed: set[str]) -> list[str]:
+    """Return synthetic diff hunks for every untracked file that is IN ``allowed``.
+
+    ``allowed`` is the calling work unit's real Changes Manifest path set (db-296,
+    FR-12). Without this filter, ``git ls-files --others`` reports every untracked
+    file in the shared checkout, including a sibling task's dirty residue -- which
+    then leaks into this unit's diff and misleads the review judges. An untracked
+    file outside ``allowed`` is silently skipped, exactly like a Manifest-scoped
+    ``git diff`` pathspec skips a tracked file outside the Manifest.
+    """
     hunks: list[str] = []
     rc, stdout, _ = run_command(
         ["git", "ls-files", "--others", "--exclude-standard"],
@@ -3769,7 +4308,7 @@ def _render_untracked_hunks(repo_path: Path) -> list[str]:
 
     for raw_filepath in stdout.splitlines():
         filepath = raw_filepath.strip()
-        if not filepath:
+        if not filepath or filepath not in allowed:
             continue
         abs_path = repo_path / filepath
         try:
@@ -3789,51 +4328,159 @@ def _render_untracked_hunks(repo_path: Path) -> list[str]:
     return hunks
 
 
-def cmd_get_diff(unit_id: str) -> int:
-    """Return the combined git diff for the work unit's target repo.
+def _load_manifest_paths_or_report(unit_id: str, wu_file: Path | None) -> list[str] | None:
+    """Return the unit's real Changes Manifest file paths, or ``None`` on failure.
 
-    Mode-aware per ADR-12. In the default per-task-branch mode, emits
-    staged + unstaged + branch-vs-default + untracked hunks. In defer_pr
-    mode (single_branch + defer_pr: true), the branch-vs-default hunk is
-    omitted because it accumulates every prior task's commits on the
-    shared branch; instead the function emits staged + unstaged +
-    untracked, and substitutes `git show HEAD` when staged/unstaged are
-    both empty (a post-commit judge invocation).
-
-    Used by plugin agents instead of running raw git commands so they do
-    not need to know the repo path or the mode.
+    Shared by :func:`cmd_get_diff` (FR-12) and :func:`cmd_check_manifest_scope`
+    (spec 4.C) so a missing work-unit file or a malformed ``## Changes Manifest``
+    table is reported identically from either verb. ``_is_real_manifest_path``
+    filters sentinel/placeholder cells (``(none)``, ``<verification-only>``, ...)
+    so callers never see a non-file token as a pathspec entry or a Manifest match
+    target. On failure, the verbatim ERROR is already printed to stderr; the
+    caller must return 1 without printing anything further.
     """
-    from devbench.config import DEFER_PR
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
 
+    if wu_file is None:
+        print(f"ERROR: Cannot scope diff for '{unit_id}': work-unit file not found", file=sys.stderr)
+        return None
+    try:
+        rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+    except ManifestParseError as exc:
+        print(f"ERROR: Cannot scope diff for '{unit_id}': Changes Manifest is malformed: {exc}", file=sys.stderr)
+        return None
+    return sorted({row.file for row in rows if BacklogManager._is_real_manifest_path(row.file)})
+
+
+def _render_task_commit_hunks(unit_id: str, repo_path: Path, pathspec: list[str]) -> list[str] | None:
+    """Return Manifest-scoped ``git show`` hunks for this unit's own commit(s).
+
+    Replaces the unconditional ``git show HEAD`` substitution ADR-12 originally
+    specified (superseded in place, db-247/FR-13): in single-branch + defer_pr
+    mode, HEAD may belong to a sibling task that committed after this unit's own
+    commit landed, so post-commit attribution MUST resolve this unit's own
+    commit(s) by subject (``^<unit_id>:``, the exact prefix ``cmd_git_ops`` writes
+    every commit message with) instead of trusting HEAD. A task may carry more
+    than one commit of its own (an initial commit plus a later
+    ``pr_review_resolution`` fix commit); every matching commit is emitted, each
+    scoped to the Manifest pathspec so the combined query is
+    ``git show --format= <sha> -- <manifest_paths>``.
+
+    Returns ``None`` (having already printed the fail-fast diagnostic to stderr)
+    when no commit subject matches -- there is no HEAD fallback.
+    """
+    rc, stdout, _ = run_command(
+        ["git", "log", "--grep", f"^{unit_id}:", "--format=%H"],
+        cwd=repo_path,
+    )
+    shas = [line.strip() for line in stdout.splitlines() if line.strip()] if rc == 0 else []
+    if not shas:
+        _, branch_out, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+        branch = branch_out.strip()
+        print(
+            "\n".join(
+                [
+                    f"ERROR: get-diff (defer_pr, post-commit): no commit found for work unit "
+                    f"'{unit_id}' on branch '{branch}'.",
+                    "The working tree is clean but no commit subject matches "
+                    f"'^{unit_id}:'. This task's changes were not",
+                    "committed under its own name (possibly bundled into a sibling's "
+                    "commit, or the commit is missing).",
+                    f"Inspect with: git log --grep '^{unit_id}:' --format='%H %s' in {repo_path}.",
+                ]
+            ),
+            file=sys.stderr,
+        )
+        return None
+
+    hunks: list[str] = []
+    for sha in shas:
+        rc, stdout, _ = run_command(["git", "show", "--format=", sha, *pathspec], cwd=repo_path)
+        if rc == 0 and stdout.strip():
+            hunks.append(stdout)
+    return hunks
+
+
+def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | None:
+    """Return ``(unit, canonical_repo, repo_path)`` for ``unit_id``, or ``None`` on failure.
+
+    Shared by :func:`cmd_get_diff` and :func:`cmd_check_manifest_scope` so both
+    verbs report "unit not found" / "no local path configured" identically.
+    Prints the ERROR itself; the caller's job is only to propagate a non-zero
+    exit code.
+    """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     unit = _find_unit(units, unit_id)
     if unit is None:
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
-        return 1
+        return None
 
     canonical_repo = resolve_repo(unit.repo)
     validate_repo(canonical_repo)
     repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
     if repo_path is None:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return None
+    return unit, canonical_repo, repo_path
+
+
+def cmd_get_diff(unit_id: str) -> int:
+    """Return the combined git diff for the work unit's target repo.
+
+    Mode-aware per ADR-12, and Manifest-scoped per db-296/db-247 (spec FR-12,
+    FR-13). Every git query below is restricted to the unit's real Changes
+    Manifest paths (:func:`_load_manifest_paths_or_report`) so a sibling task's
+    dirty residue in the shared checkout can never leak into this unit's diff.
+
+    In the default per-task-branch mode, emits staged + unstaged +
+    branch-vs-default + untracked hunks, all pathspec-scoped. In defer_pr mode
+    (single_branch + defer_pr: true), the branch-vs-default hunk is omitted
+    because it accumulates every prior task's commits on the shared branch;
+    instead the function emits staged + unstaged + untracked, and when both
+    staged and unstaged are empty (a post-commit judge invocation) resolves
+    and emits this unit's own commit(s) via
+    :func:`_render_task_commit_hunks` instead of the old unconditional
+    ``git show HEAD``.
+
+    A missing work-unit file or a malformed Changes Manifest fails fast. An
+    empty (verification-only) Manifest returns ``(no changes)`` -- never an
+    unscoped whole-tree diff.
+
+    Used by plugin agents instead of running raw git commands so they do not
+    need to know the repo path or the mode.
+    """
+    from devbench.config import DEFER_PR
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
         return 1
+    unit, canonical_repo, repo_path = resolved
+
+    manifest_paths = _load_manifest_paths_or_report(unit_id, _resolve_unit_file(unit))
+    if manifest_paths is None:
+        return 1
+    if not manifest_paths:
+        print("(no changes)")
+        return 0
+    pathspec = ["--", *manifest_paths]
 
     parts: list[str] = []
 
-    rc, stdout, _ = run_command(["git", "diff", "--cached"], cwd=repo_path)
+    rc, stdout, _ = run_command(["git", "diff", "--cached", *pathspec], cwd=repo_path)
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 
-    rc, stdout, _ = run_command(["git", "diff"], cwd=repo_path)
+    rc, stdout, _ = run_command(["git", "diff", *pathspec], cwd=repo_path)
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 
     if DEFER_PR:
         if not parts:
-            rc, stdout, _ = run_command(["git", "show", "--format=", "HEAD"], cwd=repo_path)
-            if rc == 0 and stdout.strip():
-                parts.append(stdout)
+            task_commit_hunks = _render_task_commit_hunks(unit_id, repo_path, pathspec)
+            if task_commit_hunks is None:
+                return 1
+            parts.extend(task_commit_hunks)
     else:
         default_branch = _resolve_default_branch(canonical_repo, repo_path)
         if default_branch is None:
@@ -3843,13 +4490,49 @@ def cmd_get_diff(unit_id: str) -> int:
                 file=sys.stderr,
             )
             return 1
-        rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}"], cwd=repo_path)
+        rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}", *pathspec], cwd=repo_path)
         if rc == 0 and stdout.strip():
             parts.append(stdout)
 
-    parts.extend(_render_untracked_hunks(repo_path))
+    parts.extend(_render_untracked_hunks(repo_path, allowed=set(manifest_paths)))
 
     print("\n".join(parts) if parts else "(no changes)")
+    return 0
+
+
+def cmd_check_manifest_scope(unit_id: str) -> int:
+    """Read-only check: is the staged file set within ``unit_id``'s Changes Manifest?
+
+    Exposes :func:`devbench.backlog.manifest.assert_staged_matches_manifest`'s
+    check without mutating anything (spec 4.C, db-296 x db-327). The
+    changes-manifest judge shells out to this verb to get a deterministic
+    staged-vs-Manifest signal that a judged read of the diff cannot drift from,
+    now that ``get-diff`` is Manifest-scoped and a staged-but-unmanifested file
+    no longer appears in the diff it reads (FR-11-A2).
+
+    Prints the out-of-Manifest staged paths (embedded in the underlying
+    ``RuntimeError``) and exits non-zero when the staged set is not within the
+    Manifest; exits zero when it is. A missing work-unit file or malformed
+    Manifest fails fast with the same verbatim ERROR as ``get-diff``.
+    """
+    from devbench.backlog.manifest import assert_staged_matches_manifest
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    unit, _canonical_repo, repo_path = resolved
+
+    manifest_paths = _load_manifest_paths_or_report(unit_id, _resolve_unit_file(unit))
+    if manifest_paths is None:
+        return 1
+
+    try:
+        assert_staged_matches_manifest(repo_path, manifest_paths)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"check-manifest-scope: staged set for '{unit_id}' is within the Changes Manifest.")
     return 0
 
 
@@ -3992,6 +4675,60 @@ def _validate_agent_free_text(field_name: str, text: str) -> int | None:
     )
 
 
+def _enforce_judge_retry_budget(judge_name: str, unit_id: str, wu_file: Path, content: str) -> bool:
+    """Block *unit_id* when *judge_name* has spent its retry budget. Return whether it blocked.
+
+    Called only for canonical review judges after a ``REVIEW_FAIL`` row has
+    been written, so the row just appended is included in the count and the
+    audit trail stays the single source of truth.
+
+    On exhaustion this appends the ``[BLOCKED]``
+    ``[RETRY_BUDGET_EXHAUSTED]`` audit row (the verbatim tag
+    ``backlog.proposal`` matches to classify the unit
+    ``OPERATOR_ACTION_REQUIRED``), forces the unit to ``blocked``, and
+    notifies the operator -- the same escalation shape
+    ``_handle_ci_failure`` uses when the CI retry budget is spent.
+
+    Args:
+        judge_name: Canonical judge that just failed the unit.
+        unit_id: The work-unit identifier.
+        wu_file: Path to the work-unit ``.md`` file.
+        content: The work-unit text INCLUDING the verdict row just written.
+
+    Returns:
+        ``True`` when the budget was exhausted and the unit was blocked;
+        ``False`` when rounds remain and nothing was changed.
+    """
+    budget = resolve_judge_retry_budget(judge_name)
+    fails = count_review_fails_for_judge(content, judge_name)
+    if fails < budget:
+        return False
+
+    mgr = BacklogManager()
+    reason = (
+        f"{judge_name} rejected this unit {fails} time(s), spending its executor retry budget "
+        f"of {budget}; no further executor round is coming and an operator must review"
+    )
+    mgr._append_agent_comment(
+        wu_file,
+        "orchestrator",
+        f"[BLOCKED] {ORCHESTRATOR_RETRY_BUDGET_EXHAUSTED_AUDIT_TAG} {reason}",
+    )
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_BLOCKED)
+    logger.info(
+        "log-verdict: %s exhausted its retry budget (%d of %d) for %s; unit set to '%s'",
+        judge_name,
+        fails,
+        budget,
+        unit_id,
+        STATUS_BLOCKED,
+    )
+    from devbench.notifications import notify_work_unit_blocked_operator
+
+    notify_work_unit_blocked_operator(unit_id, _extract_wu_title(wu_file, unit_id), reason)
+    return True
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -4009,6 +4746,17 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     ``[judge/<name>] [REVIEW_PASS|REVIEW_FAIL] <feedback>``
 
     Feedback is also written to the orchestrator log for audit purposes.
+
+    Issue #122: a ``REVIEW_FAIL`` from one of the canonical
+    ``ALL_REQUIRED_JUDGE_NAMES`` also enforces that judge's executor retry
+    budget. When the budget is spent, this command appends the
+    ``[RETRY_BUDGET_EXHAUSTED]`` audit row, forces the unit to ``blocked``,
+    and notifies the operator -- see ``_enforce_judge_retry_budget``. The
+    emitted JSON carries ``retry_budget_exhausted`` so the caller can tell a
+    bounded rejection from a terminal one. Enforcement lives here because
+    this is the single choke point every judge verdict passes through; the
+    previous contract lived only in orchestrate SKILL.md prose and was
+    unenforceable.
     """
     verdict_lower = verdict.strip().lower()
     if verdict_lower not in ("pass", "fail"):
@@ -4057,7 +4805,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
 
     action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
     agent_id = f"judge/{judge_name}"
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     entry = COMMENT_ENTRY_TEMPLATE.format(
         timestamp=timestamp,
         agent_id=agent_id,
@@ -4076,14 +4824,33 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     if feedback:
         logger.info("%s judge feedback for %s: %s", judge_name, unit_id, feedback)
 
-    print(json.dumps({"unit_id": unit_id, "judge": judge_name, "verdict": verdict_lower}))
+    # Issue #122: bound the review-rejection loop. Only the canonical
+    # reviewers charge the budget -- workflow agents on the broader
+    # ``KNOWN_JUDGE_NAMES`` allowlist (``executor``, ``task_factory``,
+    # ``blocker_resolver``, ``manifest_amender``) write audit-only verdicts
+    # that must not count against a review budget they do not own.
+    budget_exhausted = False
+    if action == "REVIEW_FAIL" and judge_clean in ALL_REQUIRED_JUDGE_NAMES:
+        budget_exhausted = _enforce_judge_retry_budget(judge_clean, unit_id, wu_file, content)
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "judge": judge_name,
+                "verdict": verdict_lower,
+                "retry_budget_exhausted": budget_exhausted,
+            }
+        )
+    )
     return 0
 
 
 def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
     """Append a non-verdict agent comment to the work unit's Comments section.
 
-    Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<name>] <message>``
+    Writes: ``[YYYY-MM-DD HH:MM ZONE] [agent/<name>] <message>``, where ZONE
+    is the workspace's ``display_timezone`` abbreviation, or ``UTC`` when unset.
 
     Use for non-judge actors (executor, blocker-resolver, review-supervisor summary)
     that need to log progress without emitting a REVIEW_PASS/REVIEW_FAIL token.
@@ -4108,7 +4875,7 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
 
     wu_file = _resolve_work_unit_file(unit)
 
-    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    timestamp = comment_timestamp()
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
         name=agent_name,
@@ -4789,6 +5556,12 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
     manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
     manifest_files = [r.file for r in manifest_rows]
+
+    # A unit declaring '## Expected Output: none' produces no commit; skip the
+    # whole commit/PR/CI/merge sequence rather than failing to stage nothing.
+    if _unit_expects_no_output(wu_file, manifest_files):
+        return _complete_no_output_unit(unit_id, wu_file, repo_path, manifest_files)
+
     assert_staged_matches_manifest(repo_path, manifest_files)
 
     ops.commit_local(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
@@ -5669,6 +6442,97 @@ def _refuse_unscoped_commit(unit_id: str, wu_file: Path | None) -> bool:
     return True
 
 
+def _unit_expects_no_output(wu_file: Path | None, manifest_files: list[str]) -> bool:
+    """Return ``True`` when this unit declares it produces no commit.
+
+    Requires BOTH the explicit ``## Expected Output: none`` declaration and a
+    Manifest of only no-output sentinels. Requiring both means a Manifest that
+    happens to be sentinel-only never silently changes a legacy unit's
+    lifecycle: a backlog authored before this section existed declares nothing,
+    resolves to the ``commit`` default, and keeps its current behaviour exactly.
+    validate-backlog rule 28 rejects any disagreement between the two at
+    authoring time.
+    """
+    if wu_file is None:
+        return False
+    from devbench.backlog.sentinels import is_no_output_manifest
+
+    declared = BacklogManager._extract_expected_output(wu_file.read_text(encoding="utf-8"))
+    return declared == EXPECTED_OUTPUT_NONE and is_no_output_manifest(manifest_files)
+
+
+def _git_ops_pre_commit_outcome(unit_id: str, unit: WorkUnit, wu_file: Path | None, repo_path: Path) -> int | None:
+    """Return an exit code when git-ops must stop before committing, else ``None``.
+
+    Collapses the three independent pre-commit outcomes into one decision so the
+    caller has a single early exit:
+
+    - orphan-pattern pollution in the target repo (emits a cleanup proposal)
+    - an unscopeable commit (no resolvable Changes Manifest)
+    - a unit declaring ``## Expected Output: none``, which completes with no
+      commit, push, PR, CI wait, or merge (rule 28, ADR-35)
+    """
+    from devbench.backlog.manifest import parse_manifest
+
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path) or _refuse_unscoped_commit(unit_id, wu_file):
+        return 1
+    assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
+    manifest_files = [r.file for r in parse_manifest(wu_file.read_text(encoding="utf-8"))]
+    if _unit_expects_no_output(wu_file, manifest_files):
+        return _complete_no_output_unit(unit_id, wu_file, repo_path, manifest_files)
+    return None
+
+
+def _complete_no_output_unit(unit_id: str, wu_file: Path | None, repo_path: Path, manifest_files: list[str]) -> int:
+    """Complete a ``## Expected Output: none`` unit without a commit (ADR-35).
+
+    A verification / decision / no-op unit declares that it modifies no source
+    file and records its evidence in ``## Comments``. There is nothing to stage,
+    so commit, push, PR, CI and merge are all skipped and the unit completes.
+
+    One refusal guards the dangerous direction: if anything is already STAGED,
+    the unit contradicts its own declaration and completing would silently
+    discard real work, so this returns 1 loudly instead. The check is on the
+    staged set rather than a clean working tree on purpose -- tooling that
+    rewrites a lockfile on any invocation (``uv run`` rewriting ``uv.lock``, for
+    example) leaves unstaged drift that is a pre-existing repository condition,
+    not this unit's output, and must not block it.
+
+    The working-tree state is recorded in the audit comment either way, so the
+    path taken is always observable rather than silent.
+    """
+    _, staged_out, _ = run_command(["git", "diff", "--cached", "--name-only"], cwd=repo_path)
+    if staged_out.strip():
+        staged_list = ", ".join(staged_out.split())
+        print(
+            f"ERROR: {unit_id} declares '## Expected Output: none' but has staged changes "
+            f"({staged_list}). Completing it without a commit would discard them. Either unstage "
+            f"them, or declare '## Expected Output: commit' and list the paths in the Changes "
+            f"Manifest.",
+            file=sys.stderr,
+        )
+        return 1
+
+    _, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_path)
+    tree_state = "dirty" if status_out.strip() else "clean"
+    declared = ", ".join(manifest_files) or "(empty)"
+    logger.info(
+        "[GIT_OPS_NO_OUTPUT] %s completed without a commit; Manifest declares %s; working tree %s",
+        unit_id,
+        declared,
+        tree_state,
+    )
+    if wu_file is not None:
+        BacklogManager()._append_agent_comment(
+            wu_file,
+            "git_ops",
+            f"[GIT_OPS_NO_OUTPUT] completed without a commit, push, PR, or merge; "
+            f"Manifest declares {declared}; working tree {tree_state}; "
+            f"evidence recorded in ## Comments.",
+        )
+    return 0
+
+
 def cmd_git_ops(unit_id: str) -> int:
     """Run the full git operations sequence for a completed work unit.
 
@@ -5711,17 +6575,18 @@ def cmd_git_ops(unit_id: str) -> int:
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
 
-    # Two pre-commit refusals: orphan-pattern pollution (see _git_ops_deferred
-    # for rationale, auto-emits a cleanup proposal) and an unscopeable commit.
-    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path) or _refuse_unscoped_commit(unit_id, wu_file):
-        return 1
+    # Every reason git-ops stops before committing, resolved in one place: orphan-pattern
+    # pollution (see _git_ops_deferred for rationale, auto-emits a cleanup proposal), an
+    # unscopeable commit, and a unit that declares it produces no commit at all.
+    pre_commit_rc = _git_ops_pre_commit_outcome(unit_id, unit, wu_file, repo_path)
+    if pre_commit_rc is not None:
+        return pre_commit_rc
 
     # Manifest-scope check: every staged path must be in the work unit's Changes
     # Manifest. Catches scope-violation pollution deterministically before the
     # commit, and supplies the pathspec that scopes the commit itself.
-    assert wu_file is not None  # narrowed by _refuse_unscoped_commit above
-    manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-    manifest_files = [r.file for r in manifest_rows]
+    assert wu_file is not None  # narrowed by _git_ops_pre_commit_outcome above
+    manifest_files = [r.file for r in parse_manifest(wu_file.read_text(encoding="utf-8"))]
     assert_staged_matches_manifest(repo_path, manifest_files)
 
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message, manifest_files=manifest_files)
@@ -6849,6 +7714,133 @@ class _QuotaDetected(BaseException):
         self.quota_exc = quota_exc
 
 
+#: Verbatim inactivity diagnostic (spec FR-17, db-262). ``{timeout}`` is the
+#: configured ``DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT`` value (seconds)
+#: that was exceeded. Single source of truth for both the logged ERROR and
+#: :class:`_OrchestrateInactivityTimeout`'s message so the two can never
+#: drift apart.
+_INACTIVITY_TIMEOUT_ERROR_TEMPLATE: str = (
+    "ERROR: orchestrator inactivity timeout: no SDK message for {timeout}s "
+    "(DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT).\n"
+    "The SDK ended a turn without a terminal sentinel and produced no follow-up. "
+    "Investigate the last\n"
+    "'[ORCHESTRATOR ...]' audit line; the backlog on disk is intact and a fresh "
+    "'devbench start' resumes it."
+)
+
+
+class _OrchestrateInactivityTimeout(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when no SDK message arrives in time.
+
+    Sibling of :class:`_QuotaDetected`: a :class:`BaseException` subclass (not
+    :class:`Exception`) so that ``asyncio.run`` propagates it through the
+    event loop without being caught by any broad ``except Exception`` handler
+    between the message loop and ``asyncio.run`` (spec FR-17, db-262).
+    Raised when ``asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)``
+    times out -- the SDK ended a turn without a terminal sentinel and produced
+    no follow-up message, which previously left the orchestrator idling
+    forever (observed 2h24m). Unwinds through ``_run``'s
+    ``finally: await agen.aclose()`` exactly like a quota sentinel (db-325)
+    before :func:`_drive_orchestrate_with_quota_resume` disposes it as a
+    bounded fresh-session restart.
+
+    Args:
+        timeout_seconds: The configured inactivity timeout (seconds) that was
+            exceeded without a follow-up SDK message.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, timeout_seconds: int) -> None:
+        super().__init__(_INACTIVITY_TIMEOUT_ERROR_TEMPLATE.format(timeout=timeout_seconds))
+        self.timeout_seconds = timeout_seconds
+
+
+class _OrchestrateTransportError(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when the SDK generator boundary raises (#331).
+
+    Sibling of :class:`_QuotaDetected` and :class:`_OrchestrateInactivityTimeout`: a
+    :class:`BaseException` subclass (not :class:`Exception`) so that ``asyncio.run``
+    propagates it through the event loop without being caught by any broad
+    ``except Exception`` handler between the SDK generator boundary and
+    ``asyncio.run`` (spec FR-1).
+
+    Wraps ONLY an exception raised by ``await
+    asyncio.wait_for(agen.__anext__(), ...)`` -- the SDK generator boundary itself
+    (spec section 1.1, decision D-5). ``StopAsyncIteration`` and ``TimeoutError``
+    keep their existing handling and are never wrapped. ``SystemExit``,
+    ``KeyboardInterrupt``, and :class:`asyncio.CancelledError` are
+    :class:`BaseException` subclasses that are not :class:`Exception`, so the
+    ``except Exception`` clause that raises this sentinel never matches them
+    either -- they are never wrapped (spec AC-3). A devbench-originated exception
+    raised elsewhere in the loop body (e.g. by :func:`_check_quota_and_drain`) is
+    outside this narrow boundary and is never wrapped (decision D-5): wrapping the
+    whole loop body would turn a genuine devbench defect into a silent restart
+    loop.
+
+    Classification is structural (which call raised, not what the message says,
+    decision D-4): upstream may raise a bare ``Exception`` with arbitrary text --
+    as observed, ``Exception: Claude Code returned an error result: success`` --
+    so branching on the message string is explicitly forbidden.
+
+    Args:
+        original: The exception raised from the SDK generator boundary. Callers
+            preserve it verbatim as ``__cause__`` via ``raise ... from original``
+            at the raise site; its ``str()`` becomes this sentinel's own message
+            so the ERROR log line :func:`_drive_orchestrate_with_quota_resume`
+            emits on each restart carries the upstream text unmodified (spec
+            AC-6, "verbatim").
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
+class _OrchestratePrematureTurnEnd(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when the SDK session ends with work left.
+
+    Sibling of :class:`_QuotaDetected`, :class:`_OrchestrateInactivityTimeout`
+    and :class:`_OrchestrateTransportError`: a :class:`BaseException` subclass
+    (not :class:`Exception`) so ``asyncio.run`` propagates it without any broad
+    ``except Exception`` handler swallowing it.
+
+    Raised when ``agen.__anext__()`` reports ``StopAsyncIteration`` -- the SDK
+    generator is exhausted -- WITHOUT the loop having already returned on a
+    terminal sentinel. A genuine end-of-run returns early from
+    :func:`_log_terminal_exit_if_applicable` the moment ``ALL_DONE`` /
+    ``NO_ACTIONABLE`` is observed, so reaching the end of the generator instead
+    means the model ended its own turn while backlog work remained.
+
+    Before this sentinel, that path was a bare ``break``: the orchestrator
+    exited permanently, rc=0, and the ``orchestrator_stop`` notification
+    labelled it a clean exit. That left the fastest-firing failure mode as the
+    only one with no recovery at all, while a model going *silent* for the
+    inactivity window (a slower form of the same failure) already earned a
+    bounded fresh-session restart. The observed trigger was a model ending its
+    turn on the claim that it had scheduled a background notification to wake
+    itself, a capability devbench does not have.
+
+    Args:
+        result_text: The last ``ResultMessage.result`` text observed before the
+            generator ended, or ``None`` when the SDK emitted none. Carried into
+            this sentinel's message so the restart log line records what the
+            model actually said instead of discarding the only diagnostic.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, result_text: str | None) -> None:
+        detail = f": {result_text}" if result_text else " (no SDK result text)"
+        super().__init__(f"SDK session ended with no terminal sentinel{detail}")
+        self.result_text = result_text
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -7165,6 +8157,7 @@ async def _handle_quota_pause(
                 recovery_probe,
                 timeout_seconds=RECOVERY_PROBE_TIMEOUT_SECONDS,
                 request_size_tokens=RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+                source=exc.source,
             ),
             backoff_config=backoff,
             emit_structured_events=emit_structured_events,
@@ -7418,6 +8411,35 @@ def _resolve_max_quota_resumes() -> int:
     return DEFAULT_MAX_QUOTA_RESUMES
 
 
+def _resolve_max_premature_turn_end_restarts() -> int:
+    """Return the effective premature-turn-end restart cap (env > default).
+
+    Mirrors :func:`_resolve_max_quota_resumes`'s fail-safe parse for
+    ``DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS``: a missing, empty,
+    non-integer, or non-positive value falls back to
+    :data:`~devbench.constants.DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS` so a
+    typo can neither remove the bound nor disable the restart loop.
+
+    This cap is deliberately separate from (and much lower than) the shared
+    quota / inactivity / transport ceiling -- see the constant's own comment for
+    why a fast-repeating turn end needs a tighter cost guard than the three
+    self-throttling failure modes.
+
+    Returns:
+        The maximum number of consecutive in-process premature-turn-end
+        restarts ``cmd_start`` performs before failing fast.
+    """
+    raw = os.environ.get("DEVBENCH_MAX_PREMATURE_TURN_END_RESTARTS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+        if parsed > 0:
+            return parsed
+    return DEFAULT_MAX_PREMATURE_TURN_END_RESTARTS
+
+
 def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> bool:
     """Decide whether ``cmd_start`` may resume the orchestrate skill in-process.
 
@@ -7455,6 +8477,282 @@ def _should_resume_after_quota_recovery(resumes_used: int, max_resumes: int) -> 
         ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX,
         resumes_used + 1,
         max_resumes,
+    )
+    return True
+
+
+#: Audit markers for the inactivity-timeout bounded-restart disposition
+#: (spec FR-17, db-262). Distinct from the ``[ORCHESTRATOR_QUOTA_RESUME*]``
+#: markers so operators can tell a hung-turn restart apart from a
+#: quota-driven resume in the log.
+_ORCHESTRATOR_INACTIVITY_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_INACTIVITY_RESTART]"
+_ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED]"
+
+
+def _should_restart_after_inactivity_timeout(restarts_used: int, max_resumes: int) -> bool:
+    """Decide whether ``cmd_start`` may reopen a fresh SDK session after an inactivity timeout.
+
+    Mirrors :func:`_should_resume_after_quota_recovery`'s bounded-restart
+    shape but for :class:`_OrchestrateInactivityTimeout` instead of a quota
+    signal (spec FR-17, db-262): reuses the SAME :func:`_resolve_max_quota_resumes`
+    cap so a hung-turn recovery loop is bounded by the same operator-tunable
+    ceiling, while counting its own restarts independently of quota resumes
+    (a quota resume never consumes inactivity-restart budget and vice versa).
+
+    - When *restarts_used* (restarts already performed, BEFORE this one) is
+      below *max_resumes*, emits
+      ``[ORCHESTRATOR_INACTIVITY_RESTART] attempt=<n> max=<cap>`` and returns
+      ``True`` (caller re-runs ``_run`` in a fresh session).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED] max=<cap>`` and returns
+      ``False`` so the caller fails fast (re-raises the sentinel).
+
+    Args:
+        restarts_used: Number of in-process inactivity restarts already
+            performed during this ``cmd_start`` invocation (0 on the first
+            timeout).
+        max_resumes: The cap from :func:`_resolve_max_quota_resumes`.
+
+    Returns:
+        ``True`` when another in-process restart is permitted; ``False`` when
+        the cap is exhausted and the run must fail fast.
+    """
+    if restarts_used >= max_resumes:
+        logger.info("%s max=%d", _ORCHESTRATOR_INACTIVITY_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_resumes)
+        return False
+    logger.info(
+        "%s attempt=%d max=%d",
+        _ORCHESTRATOR_INACTIVITY_RESTART_AUDIT_PREFIX,
+        restarts_used + 1,
+        max_resumes,
+    )
+    return True
+
+
+#: Audit markers for the transport-error bounded-restart disposition (#331 spec
+#: FR-2). Distinct from the ``[ORCHESTRATOR_QUOTA_RESUME*]`` and
+#: ``[ORCHESTRATOR_INACTIVITY_RESTART*]`` markers so operators can tell a
+#: transport-boundary restart apart from a quota-driven resume or an
+#: inactivity-timeout restart in the log. ``_ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX``
+#: tags the single combined ERROR line (verbatim exception + ordinal + cap,
+#: spec AC-6) that :func:`_drive_orchestrate_with_quota_resume` emits BEFORE
+#: consulting :func:`_should_restart_after_transport_error`, which in turn
+#: emits its own INFO-level restart/exhausted markers below.
+_ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_ERROR]"
+_ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_RESTART]"
+_ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = "[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED]"
+
+
+# Arithmetic overflow guard for the doubling below -- NOT an operator tunable.
+# ``base * 2 ** restarts_used`` with an operator-set cap in the thousands would
+# build an integer wide enough to raise OverflowError on the float multiply
+# before ``min()`` ever clamps it. Any exponent past this point is already
+# astronomically beyond every reachable ``max_seconds``, so clamping the
+# exponent changes no observable delay.
+_TRANSPORT_RESTART_BACKOFF_EXPONENT_CAP: int = 32
+
+
+def _sleep_between_transport_restarts(seconds: float) -> None:
+    """Pause *seconds* before reopening the SDK session after a transport error.
+
+    Isolated as its own module-level function so the pacing is a patchable
+    seam. Driving the restart loop in a test must not burn real wall-clock
+    time, and patching this one call is far narrower -- and far less likely to
+    mask an unrelated regression -- than patching the global ``time.sleep``,
+    which the report watch loop and the process-readiness poller also use.
+
+    Args:
+        seconds: Delay from :func:`_transport_restart_backoff_seconds`.
+    """
+    import time
+
+    time.sleep(seconds)
+
+
+def _transport_restart_backoff_seconds(restarts_used: int, base_seconds: float, max_seconds: float) -> float:
+    """Return how long to wait before the next SDK-transport restart.
+
+    Exponential with a ceiling: ``base_seconds * 2 ** restarts_used``, clamped
+    to ``max_seconds``. ``restarts_used`` counts restarts already performed, so
+    the first restart waits exactly ``base_seconds``.
+
+    Why this exists: a quota window must elapse and an inactivity restart costs
+    a full timeout window, so both self-throttle. A transport fault does not --
+    it recurs as fast as the SDK can reject a session. Retrying with no delay
+    therefore spends the entire restart budget in seconds (observed in the
+    field: ~1000 restarts in 39 minutes) and converts a transient fault into a
+    dead daemon. Spacing the attempts lets a genuinely transient fault recover
+    while keeping a persistent one inside its bound.
+
+    Args:
+        restarts_used: Transport restarts already performed this run (0 before
+            the first).
+        base_seconds: Delay before the first restart. Must be > 0.
+        max_seconds: Ceiling on the delay. Must be > 0.
+
+    Returns:
+        The delay in seconds: ``min(base_seconds * 2 ** restarts_used, max_seconds)``.
+
+    Raises:
+        ValueError: If ``restarts_used`` is negative, or either bound is not
+            positive. The YAML schema already enforces positivity, but the
+            environment-variable path bypasses the schema, so the invariant is
+            enforced here and fails fast rather than silently degrading into a
+            busy loop (a zero or negative delay is exactly the defect this
+            function exists to prevent).
+    """
+    if restarts_used < 0:
+        raise ValueError(f"restarts_used must be >= 0, got {restarts_used}")
+    if base_seconds <= 0:
+        raise ValueError(
+            "transport restart backoff base must be > 0 seconds, got "
+            f"{base_seconds} -- check DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS "
+            "or orchestrate.transport_restart_backoff_base_seconds"
+        )
+    if max_seconds <= 0:
+        raise ValueError(
+            "transport restart backoff ceiling must be > 0 seconds, got "
+            f"{max_seconds} -- check DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS "
+            "or orchestrate.transport_restart_backoff_max_seconds"
+        )
+    exponent = min(restarts_used, _TRANSPORT_RESTART_BACKOFF_EXPONENT_CAP)
+    return min(base_seconds * (2**exponent), max_seconds)
+
+
+def _should_restart_after_transport_error(restarts_used: int, max_restarts: int, backoff_seconds: float) -> bool:
+    """Decide whether ``cmd_start`` may reopen a fresh SDK session after a transport error.
+
+    Mirrors :func:`_should_restart_after_inactivity_timeout`'s bounded-restart
+    shape but for :class:`_OrchestrateTransportError` instead of an inactivity
+    timeout (spec FR-2, decision D-3), counting its own restarts independently
+    of quota resumes and inactivity restarts (a transport restart never
+    consumes quota-resume or inactivity-restart budget and vice versa).
+
+    The cap is :data:`~devbench.config.MAX_TRANSPORT_RESTARTS`, which is
+    deliberately its own setting rather than the shared
+    :func:`_resolve_max_quota_resumes` ceiling: a transport fault self-throttles
+    no more than a busy loop does, so pairing a 1000-restart budget with an
+    immediate retry let one persistent fault burn the whole budget in minutes
+    and end the run. *backoff_seconds* (from
+    :func:`_transport_restart_backoff_seconds`) is recorded in the audit line so
+    the pacing is visible in the log and in ``devbench report``.
+
+    - When *restarts_used* (restarts already performed, BEFORE this one) is
+      below *max_resumes*, emits
+      ``[ORCHESTRATOR_TRANSPORT_RESTART] attempt=<n> max=<cap>`` and returns
+      ``True`` (caller re-runs ``_run`` in a fresh session).
+    - When the cap is reached, emits
+      ``[ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED] max=<cap>`` and returns
+      ``False`` so the caller fails fast (re-raises the sentinel), preserving
+      the verbatim final exception as ``__cause__`` (spec AC-7).
+
+    Args:
+        restarts_used: Number of in-process transport restarts already
+            performed during this ``cmd_start`` invocation (0 on the first
+            transport error).
+        max_restarts: The transport-specific cap
+            (:data:`~devbench.config.MAX_TRANSPORT_RESTARTS`; env > YAML >
+            :data:`~devbench.constants.DEFAULT_MAX_TRANSPORT_RESTARTS`).
+        backoff_seconds: The delay the caller will observe before the restart,
+            recorded in the audit line for operator visibility.
+
+    Returns:
+        ``True`` when another in-process restart is permitted; ``False`` when
+        the cap is exhausted and the run must fail fast.
+    """
+    if restarts_used >= max_restarts:
+        logger.info("%s max=%d", _ORCHESTRATOR_TRANSPORT_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_restarts)
+        return False
+    logger.info(
+        "%s attempt=%d max=%d backoff=%.1fs",
+        _ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX,
+        restarts_used + 1,
+        max_restarts,
+        backoff_seconds,
+    )
+    return True
+
+
+#: Audit markers for the premature-turn-end bounded-restart path. Siblings of
+#: the transport-error markers above; the orchestrate loop is designed to stop
+#: only on ``ALL_DONE`` / ``NO_ACTIONABLE`` / operator drain, so a turn end with
+#: work remaining is a recoverable fault that earns a fresh session, not an exit.
+_ORCHESTRATOR_PREMATURE_TURN_END_AUDIT_PREFIX: str = "[ORCHESTRATOR_PREMATURE_TURN_END]"
+_ORCHESTRATOR_PREMATURE_TURN_END_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_PREMATURE_TURN_END_RESTART]"
+_ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED_AUDIT_PREFIX: str = (
+    "[ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED]"
+)
+
+
+def _has_actionable_work_remaining() -> bool:
+    """Return ``True`` when the backlog still holds a claimable task.
+
+    Gates the premature-turn-end escalation in ``cmd_start._run``: the loop must
+    never end while work remains, but with nothing actionable left, the SDK
+    session ending IS the ``NO_ACTIONABLE`` condition -- just discovered here
+    rather than announced by the model -- so a restart would spend another
+    session re-deriving the same answer.
+
+    Delegates to :meth:`~devbench.backlog.parser.BacklogParser.find_next_actionable`,
+    the same selector ``devbench next`` uses, so this check can never disagree
+    with the orchestrate loop about what counts as actionable (it resumes
+    ``in-progress`` tasks before ``in-queue`` ones, and treats a task with
+    unsatisfied dependencies as not actionable).
+
+    A backlog that cannot be read is reported as "no actionable work": the SDK
+    session has already ended by the time this runs, so the alternative would be
+    to restart into a workspace whose index is unreadable and fail again there.
+    The parse failure is logged rather than swallowed, and the run still stops
+    with the honest premature-turn-end label.
+
+    Returns:
+        ``True`` when at least one task is actionable; ``False`` when none is or
+        the backlog index cannot be parsed.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        return parser.find_next_actionable(parser.parse_index()) is not None
+    except (OSError, ValueError) as exc:
+        logger.error(
+            "premature-turn-end actionability check could not read the backlog index: %r; "
+            "treating as no actionable work",
+            exc,
+        )
+        return False
+
+
+def _should_restart_after_premature_turn_end(restarts_used: int, max_restarts: int) -> bool:
+    """Decide whether ``cmd_start`` may reopen a fresh SDK session after a premature turn end.
+
+    Mirrors :func:`_should_restart_after_transport_error`'s bounded-restart
+    shape, but bounded by :func:`_resolve_max_premature_turn_end_restarts`
+    rather than the shared quota ceiling, because this fault can repeat
+    immediately whereas quota / inactivity / transport faults each self-throttle.
+
+    - Below the cap: emits ``[ORCHESTRATOR_PREMATURE_TURN_END_RESTART]
+      attempt=<n> max=<cap>`` and returns ``True`` (caller re-runs ``_run`` in a
+      fresh session on the remaining backlog).
+    - At the cap: emits ``[ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED]
+      max=<cap>`` and returns ``False`` so the caller fails fast rather than
+      looping without progress.
+
+    Args:
+        restarts_used: Premature-turn-end restarts already performed during this
+            ``cmd_start`` invocation (0 on the first occurrence).
+        max_restarts: The cap from :func:`_resolve_max_premature_turn_end_restarts`.
+
+    Returns:
+        ``True`` when another in-process restart is permitted; ``False`` when the
+        cap is exhausted and the run must fail fast.
+    """
+    if restarts_used >= max_restarts:
+        logger.info("%s max=%d", _ORCHESTRATOR_PREMATURE_TURN_END_RESTARTS_EXHAUSTED_AUDIT_PREFIX, max_restarts)
+        return False
+    logger.info(
+        "%s attempt=%d max=%d",
+        _ORCHESTRATOR_PREMATURE_TURN_END_RESTART_AUDIT_PREFIX,
+        restarts_used + 1,
+        max_restarts,
     )
     return True
 
@@ -7509,6 +8807,19 @@ def _drive_orchestrate_with_quota_resume(
     - A recovered wait whose resume cap is exhausted -> ``terminal_rc=0`` with the
       ``"quota-resume-cap-exhausted"`` stop reason (the exhausted audit line was
       emitted by :func:`_should_resume_after_quota_recovery`).
+    - :class:`_OrchestrateInactivityTimeout` (spec FR-17, db-262) -> logs the
+      verbatim inactivity ERROR, then either restarts a fresh session (bounded
+      by the SAME :func:`_resolve_max_quota_resumes` cap, tracked
+      independently of quota resumes via :func:`_should_restart_after_inactivity_timeout`)
+      or re-raises to fail fast once that cap is exhausted.
+    - :class:`_OrchestrateTransportError` (#331 spec FR-1/FR-2) -> logs the
+      verbatim SDK-boundary exception at ERROR with its restart ordinal and
+      the cap, then either restarts a fresh session (bounded by the SAME
+      :func:`_resolve_max_quota_resumes` cap, tracked independently of quota
+      resumes and inactivity restarts via
+      :func:`_should_restart_after_transport_error`) or re-raises -- preserving
+      the original exception as ``__cause__`` -- to fail fast once that cap is
+      exhausted.
 
     Extracted from ``cmd_start`` so the added resume loop does not push that
     function over ruff PLR0912's 12-branch ceiling.
@@ -7516,7 +8827,7 @@ def _drive_orchestrate_with_quota_resume(
     Args:
         run: The ``cmd_start._run`` closure; a no-arg coroutine factory awaited
             fresh on every iteration. No conversation handle, transcript, or
-            other session state is threaded between iterations (D-6).
+            other session state is threaded between iterations (D-6, D-2).
         session_name: Current session name, forwarded to
             :func:`_dispatch_quota_detection` for the quota checkpoint.
 
@@ -7530,9 +8841,24 @@ def _drive_orchestrate_with_quota_resume(
         ValueError: Propagated from :func:`~devbench.quota._apply_resume_strategy`
             (via :func:`_handle_quota_pause`) when a recovered wait's configured
             ``resume_strategy`` is not one of the three recognised values.
+        :class:`_OrchestrateInactivityTimeout`: Re-raised (legacy non-zero
+            exit, mirroring the quota ``fail`` disposition above) once the
+            bounded-restart cap is exhausted.
+        :class:`_OrchestrateTransportError`: Re-raised (legacy non-zero exit,
+            mirroring the inactivity-timeout cap-exhaustion above), carrying
+            the original SDK-boundary exception as ``__cause__``, once the
+            bounded transport-restart cap is exhausted (#331 spec FR-2, AC-7).
     """
     resumes_used = 0
+    inactivity_restarts_used = 0
+    transport_restarts_used = 0
+    premature_restarts_used = 0
     max_resumes = _resolve_max_quota_resumes()
+    max_premature_restarts = _resolve_max_premature_turn_end_restarts()
+    # Bound once at loop entry. The name resolves through this module's
+    # globals at call time, so a test (or an operator override applied before
+    # the loop starts) that rebinds ``cli.MAX_TRANSPORT_RESTARTS`` is honoured.
+    max_transport_restarts = MAX_TRANSPORT_RESTARTS
     while True:
         try:
             asyncio.run(run())
@@ -7549,6 +8875,47 @@ def _drive_orchestrate_with_quota_resume(
                     continue
                 return _OrchestrateLoopResult(0, "quota-resume-cap-exhausted", False)
             return _OrchestrateLoopResult(0, stop_reason, stop_reason in _QUOTA_DRAIN_STOP_REASONS)
+        except _OrchestrateInactivityTimeout as exc:
+            logger.error(str(exc))
+            if _should_restart_after_inactivity_timeout(inactivity_restarts_used, max_resumes):
+                inactivity_restarts_used += 1
+                continue
+            raise
+        except _OrchestrateTransportError as exc:
+            logger.error(
+                "%s restart=%d max=%d: %s",
+                _ORCHESTRATOR_TRANSPORT_ERROR_AUDIT_PREFIX,
+                transport_restarts_used + 1,
+                max_transport_restarts,
+                exc,
+            )
+            backoff_seconds = _transport_restart_backoff_seconds(
+                transport_restarts_used,
+                TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+                TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+            )
+            if _should_restart_after_transport_error(transport_restarts_used, max_transport_restarts, backoff_seconds):
+                transport_restarts_used += 1
+                # Space the retries. A transport fault imposes no delay of its
+                # own, so without this the bounded budget is spent as fast as
+                # the SDK can reject a session -- the failure mode this arm
+                # exists to survive. SIGTERM during the wait is delivered
+                # normally; the ceiling bounds how long a stop can be delayed.
+                _sleep_between_transport_restarts(backoff_seconds)
+                continue
+            raise
+        except _OrchestratePrematureTurnEnd as exc:
+            logger.error(
+                "%s restart=%d max=%d: %s",
+                _ORCHESTRATOR_PREMATURE_TURN_END_AUDIT_PREFIX,
+                premature_restarts_used + 1,
+                max_premature_restarts,
+                exc,
+            )
+            if _should_restart_after_premature_turn_end(premature_restarts_used, max_premature_restarts):
+                premature_restarts_used += 1
+                continue
+            raise
         return _OrchestrateLoopResult(None, "clean", False)
 
 
@@ -7570,6 +8937,127 @@ class _CmdStartArgs:
     name: str = SESSION_DEFAULT_NAME
     allow_overlap: bool = False
     daemon: bool = False
+
+
+def _assert_running_package_matches_its_venv() -> None:
+    """Fail fast when the venv in use is serving a DIFFERENT checkout's package.
+
+    Self-hosting means two checkouts publish a package named ``devbench``: the
+    harness that RUNS the orchestration and the target that it EDITS. A venv
+    records which one is importable in a single-line editable ``.pth``, so
+    installing one into the other's environment silently swaps which codebase
+    executes. :func:`_agent_environment` removes the usual cause; it cannot
+    remove the collision, because an operator, a Makefile or a future tool can
+    still re-point the install.
+
+    The invariant checked is "a venv serves the checkout it lives inside":
+    ``<checkout>/.venv`` should import ``<checkout>/src/devbench``. Comparing
+    the imported package against ``__file__`` instead would be circular -- this
+    module IS the package, so a re-pointed install relocates both and the
+    comparison always passes. ``sys.prefix`` is the one anchor that does not
+    move with the swap.
+
+    Silent when the layout does not apply (no ``src/devbench`` beside the venv,
+    e.g. a non-editable install or a packaged deployment): this exists to catch
+    one specific, well-understood corruption, not to police every install shape.
+    A false positive here would block startup for a workspace doing nothing
+    wrong, which is worse than the miss it guards against.
+
+    Raises:
+        RuntimeError: When both paths resolve and disagree, naming each one and
+            the repair, because the symptoms are otherwise nearly
+            undiagnosable: the harness begins running the target's code, so
+            config keys, CLI verbs and schemas silently disagree with the files
+            on disk.
+    """
+    checkout = Path(sys.prefix).resolve().parent
+    expected = checkout / "src" / "devbench"
+    if not expected.is_dir():
+        return
+    actual = Path(__file__).resolve().parent
+    if actual != expected:
+        raise RuntimeError(
+            f"devbench package re-point detected: the active environment lives in {checkout}, "
+            f"whose package is {expected}, but the code now running is {actual}. "
+            "Both checkouts in this self-hosted workspace publish a package named 'devbench', "
+            "so an install into the wrong environment rewrites the editable pointer and swaps "
+            f"which codebase executes. Repair: uv pip install -e {checkout} against that venv, "
+            "then restart. Prevention: see _agent_environment."
+        )
+
+
+#: Environment variables stripped from the environment handed to spawned agents.
+#: ``VIRTUAL_ENV`` is the load-bearing one -- see
+#: :func:`_agent_environment` for why it cannot be inherited.
+_AGENT_ENV_STRIPPED_VARS: tuple[str, ...] = ("VIRTUAL_ENV",)
+
+
+def _agent_environment(base_env: Mapping[str, str]) -> dict[str, str]:
+    """Return the environment for spawned agents, with unsafe vars removed.
+
+    The orchestrator is normally launched as ``uv run --project
+    harness/devbench ...``, and ``uv run`` EXPORTS ``VIRTUAL_ENV`` pointing at
+    the harness venv to its child. The daemon then hands its own environment to
+    the SDK unchanged, so every agent shell inherits it -- including agents
+    whose working directory is the TARGET repo.
+
+    That combination is destructive because this project is developed with
+    itself: the harness checkout and the target checkout both publish a package
+    named ``devbench``, and the harness venv records which one is importable in
+    a single-line ``_editable_impl_devbench.pth``. Any command that installs
+    into the ACTIVE environment (``uv pip install``, ``uv pip sync``, the
+    ``--active`` variants) therefore rewrites that pointer to the target's
+    ``src`` while an agent is merely doing ordinary work in the target repo.
+    The harness CLI then fails in a way that looks nothing like its cause: the
+    observed symptom was an ``orchestrate`` schema mismatch on
+    ``max_transport_restarts``, a key only the harness checkout defines. It was
+    hit and hand-repaired twice inside a single run before anyone connected it
+    to ``uv``.
+
+    Stripping ``VIRTUAL_ENV`` does not restrict agents. Project commands --
+    ``uv run pytest``, ``uv run ruff``, ``make validate`` -- resolve the
+    project's own ``.venv`` from the working directory, which is what an agent
+    in the target repo should be using anyway. Only the install-into-the-active
+    -environment commands change behaviour, and those now land in the target's
+    own venv instead of the harness's.
+
+    Preferred over a ``PreToolUse`` hook that blocks the dangerous verbs: this
+    removes the cause rather than policing the symptom, cannot block legitimate
+    work, and cannot be sidestepped by a command shape nobody enumerated
+    (``pip install``, ``python -m pip``, ``uv pip --python``, and so on).
+
+    Args:
+        base_env: The environment to derive from, normally ``os.environ``.
+
+    Returns:
+        A plain ``dict`` copy with :data:`_AGENT_ENV_STRIPPED_VARS` removed.
+        Absent names are not an error -- a directly-invoked interpreter never
+        sets ``VIRTUAL_ENV`` in the first place.
+    """
+    return {key: value for key, value in base_env.items() if key not in _AGENT_ENV_STRIPPED_VARS}
+
+
+def _drop_console_log_handlers_after_redirect() -> None:
+    """Detach console log handlers once std streams point at the log file.
+
+    Called by :func:`_daemonize_to_background` immediately after its ``dup2``
+    redirect. A ``StreamHandler`` on ``sys.stderr`` and the ``FileHandler`` on
+    the aggregate log are two handlers writing one file once fd 2 has been
+    pointed at that file, so every record is emitted twice.
+
+    ``logging.FileHandler`` subclasses ``logging.StreamHandler``, so the
+    isinstance test must exclude it explicitly -- removing file handlers here
+    would silence the daemon's log entirely rather than merely de-duplicate it.
+
+    Nothing stops being captured: genuine writes to fd 2 (uncaught tracebacks,
+    subprocess stderr) still reach the log through the redirect itself. Only
+    the logging module's second copy is dropped.
+    """
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            root_logger.removeHandler(handler)
+            handler.close()
 
 
 def _daemonize_to_background(workspace_root: Path) -> None:
@@ -7632,6 +9120,24 @@ def _daemonize_to_background(workspace_root: Path) -> None:
     os.dup2(log_fd, 2)
     os.close(null_fd)
     os.close(log_fd)
+
+    # fd 2 now points AT the log file, so the stderr StreamHandler that
+    # ``setup_logging`` attached and the FileHandler writing ``log_path`` have
+    # become two handlers on one file -- and every record is emitted twice.
+    # ``setup_logging`` runs at CLI entry, before this redirect, so it cannot
+    # see the collision coming; it already refuses to attach the per-session
+    # handler when that path equals the aggregate log, for exactly this reason.
+    # This is the same guard, applied to the case the redirect creates.
+    #
+    # Measured before the fix: 152,276 lines in one workspace's log against
+    # 78,191 distinct, i.e. ~1.93x, every day since the log began. One-shot CLI
+    # invocations were never affected (their stderr is the terminal), which is
+    # why the doubling only ever appeared under ``--daemon``.
+    #
+    # Only the logging module's duplicate copy goes away. Genuine writes to
+    # fd 2 -- uncaught tracebacks, subprocess stderr -- still land in the log
+    # through the dup2 above, so nothing stops being captured.
+    _drop_console_log_handlers_after_redirect()
 
 
 def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
@@ -7923,6 +9429,21 @@ def _log_terminal_exit_if_applicable(text: str | None) -> bool:
     return True
 
 
+#: db-271 (spec FR-18 Part A): the distinct label for a premature turn end
+#: -- a clean SDK loop exit (``StopAsyncIteration``, no drain/quota/inactivity
+#: exhaustion) that captured no terminal-sentinel ``ResultMessage``
+#: (``_sdk_result_text`` stayed empty).  Previously this bucket kept the bare
+#: ``"clean"`` seed all the way to the Slack ping, indistinguishable from a
+#: finished run.  Coordinate wording changes with the FR-17
+#: inactivity-timeout owner: this string is assigned to ``_stop_reason``
+#: only after the SDK loop has already exited, so it is never fed back
+#: through :func:`_is_terminal_orchestrate_result` as if it were a second
+#: SDK turn -- keep it that way.
+_PREMATURE_TURN_END_REASON: str = (
+    "premature turn end -- SDK loop exhausted with no terminal sentinel (ALL_DONE / NO_ACTIONABLE)"
+)
+
+
 def _label_stop_reason(exc: BaseException) -> str:
     """Return a human-readable label for the orchestrator's exit (#213).
 
@@ -7935,6 +9456,10 @@ def _label_stop_reason(exc: BaseException) -> str:
       cleanly.
     - ``KeyboardInterrupt`` -> operator interrupt (Ctrl+C / SIGINT).  Not a
       crash; the operator chose to stop the run.
+    - :class:`_OrchestrateTransportError` -> ``"transport-error-restart-cap-exhausted"``
+      (#331 spec FR-3, AC-10). Reaches this helper only after
+      :func:`_drive_orchestrate_with_quota_resume` has exhausted the bounded
+      transport-restart cap and re-raised, so this label is unambiguous.
     - Anything else (including ``SystemExit`` with non-zero code, unhandled
       exceptions) -> crash with the exception type + message.
 
@@ -7946,7 +9471,55 @@ def _label_stop_reason(exc: BaseException) -> str:
         return "clean exit (SystemExit 0)"
     if isinstance(exc, KeyboardInterrupt):
         return "interrupted by operator (Ctrl+C / SIGINT)"
+    if isinstance(exc, _OrchestrateTransportError):
+        return "transport-error-restart-cap-exhausted"
     return f"crash: {type(exc).__name__}: {exc}"
+
+
+def _resolve_clean_stop_reason(current_reason: str, sdk_result_text: str | None) -> str:
+    """Resolve the final stop-reason label after a clean SDK loop exit.
+
+    Three-way resolution (issue #217 / db-271 spec FR-18 Part A), extracted
+    from ``cmd_start`` so its branch count stays under ruff's PLR0912
+    ceiling:
+
+    1. ``sdk_result_text`` actually CARRIES a terminal sentinel
+       (:func:`_is_terminal_orchestrate_result`) -> ``"clean exit: <text>"``
+       (issue #217: surfaces the orchestrate skill's ``ALL_DONE`` /
+       ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` end-of-run summary).
+    2. Otherwise, when ``current_reason`` is still the ``"clean"`` seed ->
+       the distinct :data:`_PREMATURE_TURN_END_REASON` (db-271), with any
+       non-terminal result text appended verbatim for diagnosis.
+    3. Otherwise, ``current_reason`` already carries the loop-provided
+       drain / quota disposition -- returned unchanged.
+
+    Rule 1 tests the text for a terminal sentinel rather than merely for
+    being non-empty. The original truthy check (PR #202) predates the
+    premature-turn-end bucket and made rule 2 unreachable whenever the model
+    said ANYTHING before stopping: an observed run ended on the model's own
+    narration ("the executor agent is running in the background... I'll
+    continue automatically", a capability devbench does not have) and that
+    narration was reported to the operator as ``clean exit``, indistinguishable
+    from a finished backlog. Only the two sentinels the orchestrate skill
+    actually emits at end-of-run may claim a clean exit; the text is retained
+    on the premature path so the operator sees what the model claimed instead
+    of losing the only diagnostic.
+
+    Args:
+        current_reason: The ``_stop_reason`` value accumulated so far.
+        sdk_result_text: The last captured ``ResultMessage.result`` text, or
+            ``None`` / empty when the SDK never emitted one.
+
+    Returns:
+        The resolved stop-reason label.
+    """
+    if _is_terminal_orchestrate_result(sdk_result_text):
+        return f"clean exit: {sdk_result_text}"
+    if current_reason == "clean":
+        if sdk_result_text:
+            return f"{_PREMATURE_TURN_END_REASON}; last SDK result text: {sdk_result_text}"
+        return _PREMATURE_TURN_END_REASON
+    return current_reason
 
 
 def _fire_orchestrator_stop_notification(reason: str) -> None:
@@ -7957,19 +9530,38 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
     cmd_start's outer try/finally cannot mask the real exit reason.
     Extracted from ``cmd_start`` body so the branch-count of that
     function stays under the project's ruff PLR0912 ceiling (12).
+
+    db-271 (spec FR-18 Part C): also computes a ``(done, total)`` progress
+    tuple over every work unit in the backlog index and passes it through so
+    the Slack ping's ``Progress`` field reads ``X/Y done``.  On a backlog
+    parse failure the progress computation degrades to ``None`` (the
+    ``Progress`` field is omitted from the payload) and the failure is
+    logged to stderr -- never silently swallowed -- while the in-flight
+    lookup keeps its existing best-effort fallback so a parse failure never
+    masks the real exit reason.
     """
     try:
         from devbench.notifications import notify_orchestrator_stop
 
         in_flight_id: str | None = None
+        progress: tuple[int, int] | None = None
         try:
             stop_parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
             stop_units = stop_parser.parse_index()
             stop_wu = _find_in_flight_wu(stop_units)
             in_flight_id = stop_wu.id if stop_wu is not None else None
-        except (OSError, ValueError):
+            progress = (
+                sum(unit.status is WorkUnitStatus.DONE for unit in stop_units),
+                len(stop_units),
+            )
+        except (OSError, ValueError) as exc:
             in_flight_id = None
-        notify_orchestrator_stop(reason, in_flight_id)
+            progress = None
+            print(
+                f"[WARN] orchestrator-stop progress lookup failed: {exc!r}",
+                file=sys.stderr,
+            )
+        notify_orchestrator_stop(reason, in_flight_id, progress=progress)
     except Exception as exc:  # broad guard: notification must never mask real exit
         print(
             f"[WARN] orchestrator-stop notification failed: {exc!r}",
@@ -7986,6 +9578,11 @@ def _setup_daemon_and_pid_file(parsed: _CmdStartArgs) -> None:
     enumerable via ``devbench instances`` until next start).
     """
     from devbench.instances import write_pid_file
+
+    # Checked BEFORE daemonising, so a re-pointed install fails on the
+    # operator's terminal rather than disappearing into the log of a run that
+    # is already executing the wrong codebase.
+    _assert_running_package_matches_its_venv()
 
     if parsed.daemon:
         _daemonize_to_background(WORKSPACE_ROOT)
@@ -8094,6 +9691,44 @@ def cmd_start(*argv: str) -> int:
     exit-path cleanup via :func:`_cancel_drain_unless_requested` so the next
     ``devbench start`` invocation still honours it.
 
+    **Inactivity net and cooperative teardown (spec FR-17, db-262 + db-325):**
+    ``_run`` awaits ``asyncio.wait_for(agen.__anext__(),
+    timeout=_ORCH_INACTIVITY_TIMEOUT)`` per message instead of a bare
+    ``async for`` -- when a turn ends without a terminal sentinel and
+    produces no follow-up message, the wait times out and ``_run`` raises
+    :class:`_OrchestrateInactivityTimeout` (previously this idled the
+    orchestrator forever). ``_run``'s ``finally: await agen.aclose()`` always
+    runs first, so both this sentinel and :class:`_QuotaDetected` unwind
+    through cooperative teardown -- driving the SDK's own subprocess
+    teardown -- before ``_drive_orchestrate_with_quota_resume`` disposes
+    them. On inactivity, that disposition is a bounded fresh-session restart
+    reusing the SAME ``DEVBENCH_MAX_QUOTA_RESUMES`` cap (tracked
+    independently of quota resumes via
+    :func:`_should_restart_after_inactivity_timeout`); fail-fast (legacy
+    non-zero exit) once that cap is exhausted.
+
+    **Transport-error boundary and bounded restart (#331 spec FR-1/FR-2/FR-3):**
+    Any OTHER exception raised by ``agen.__anext__()`` -- one that is neither
+    ``StopAsyncIteration`` nor ``TimeoutError`` -- is re-raised by ``_run`` as
+    :class:`_OrchestrateTransportError`, carrying the original exception as
+    ``__cause__``. Classification is structural, never message-based (decision
+    D-4): an upstream frame that is simultaneously ``is_error=True`` and
+    ``subtype="success"`` with an empty ``errors`` list previously surfaced as
+    the literal string ``"success"``, which no sensible pattern would match.
+    Only the ``agen.__anext__()`` boundary itself is wrapped -- never the rest
+    of the loop body -- so a genuine devbench defect still fails loudly
+    instead of being silently retried (decision D-5).
+    ``_drive_orchestrate_with_quota_resume`` disposes this sentinel exactly
+    like the inactivity timeout above: it logs the verbatim exception at
+    ERROR with its restart ordinal and the cap, then either restarts a fresh
+    session (bounded by the SAME ``DEVBENCH_MAX_QUOTA_RESUMES`` cap, tracked
+    independently of quota resumes and inactivity restarts via
+    :func:`_should_restart_after_transport_error`) or re-raises -- preserving
+    the original exception as ``__cause__`` -- once that cap is exhausted.
+    On exhaustion, :func:`_label_stop_reason` labels the exit
+    ``"transport-error-restart-cap-exhausted"`` (spec FR-3) and the
+    always-fire ``orchestrator_stop`` notification below still fires.
+
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
 
@@ -8119,10 +9754,20 @@ def cmd_start(*argv: str) -> int:
             (via :func:`~devbench.quota._apply_resume_strategy`) when a
             recovered wait's configured ``resume_strategy`` is not one of the
             three recognised values.
-        Nothing else from this function's own scope for quota / drain
-        signals -- both dispositions are otherwise fully handled by
-        :func:`_drive_orchestrate_with_quota_resume`. Any other SDK
-        exception propagates as-is through the asyncio boundary.
+        :class:`_OrchestrateInactivityTimeout`: Propagates from
+            :func:`_drive_orchestrate_with_quota_resume` once the bounded
+            inactivity-restart cap is exhausted (legacy non-zero exit,
+            mirroring the quota ``fail`` disposition above).
+        :class:`_OrchestrateTransportError`: Propagates from
+            :func:`_drive_orchestrate_with_quota_resume` once the bounded
+            transport-restart cap is exhausted (#331 spec FR-1/FR-2, legacy
+            non-zero exit, carrying the original SDK-boundary exception as
+            ``__cause__``).
+        Nothing else from this function's own scope for quota / drain /
+        inactivity / transport signals -- all four dispositions are otherwise
+        fully handled by :func:`_drive_orchestrate_with_quota_resume`.
+        ``SystemExit``, ``KeyboardInterrupt``, and :class:`asyncio.CancelledError`
+        propagate as-is (spec AC-3).
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -8194,18 +9839,18 @@ def cmd_start(*argv: str) -> int:
     os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
 
     # AC-192-9: Register a SIGTERM handler so that ``devbench stop --session``
-    # can force the in-flight work unit to ``blocked`` before this process exits.
+    # releases the in-flight work unit back to the queue before this process exits.
     # The handler reads the current backlog, finds the in-progress WU, sets it to
-    # ``blocked``, appends a ``[FORCED_BLOCKED_ON_STOP]`` audit comment, then
+    # ``in-queue``, appends an ``[INTERRUPTED_ON_STOP]`` audit comment, then
     # exits rc=0.  The previous handler is restored in the finally block.
     _session_name_for_sigterm = parsed.name
 
     def _sigterm_handler(_signum: int, _frame: object) -> None:
-        """SIGTERM handler: force in-flight WU to blocked then exit.
+        """SIGTERM handler: release the in-flight WU to the queue then exit.
 
         Reads the backlog, locates the single in-progress work unit (if any),
-        transitions it to ``blocked``, appends a
-        ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit entry, then calls
+        transitions it to ``in-queue``, appends an
+        ``[INTERRUPTED_ON_STOP] session=<name>`` audit entry, then calls
         ``raise SystemExit(0)`` so the ``finally`` block in ``cmd_start`` runs
         to restore ``DEVBENCH_SESSION_NAME``.
 
@@ -8222,9 +9867,9 @@ def cmd_start(*argv: str) -> int:
             parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
             units = parser.parse_index()
             wu = _find_in_flight_wu(units)
-            _force_block_in_flight_wu(wu, session_name=_session_name_for_sigterm)
+            _requeue_in_flight_wu(wu, session_name=_session_name_for_sigterm)
         except (OSError, ValueError) as exc:
-            logger.error("[SIGTERM_HANDLER_ERROR] could not force-block in-flight WU: %s", exc)
+            logger.error("[SIGTERM_HANDLER_ERROR] could not requeue in-flight WU: %s", exc)
         raise SystemExit(0)
 
     _prev_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -8236,16 +9881,52 @@ def cmd_start(*argv: str) -> int:
     _sdk_result_text: str | None = None
 
     async def _run() -> None:
-        """Iterate SDK messages with quota detection and drain enforcement.
+        """Iterate SDK messages with an inactivity net and cooperative teardown.
 
-        Processes SDK messages and calls :func:`_check_quota_and_drain` once
-        per message, which raises :class:`_QuotaDetected` when a quota /
-        rate-limit signal is observed (issue #236) or :class:`_DrainRequested`
-        when a ``devbench claim`` tool-use is detected while a drain is
-        pending (issues #188/#212). Both sentinels are :class:`BaseException`
+        FR-17 (db-262 + db-325): rewritten as a ``try/finally`` around
+        ``agen = query(...)``, awaiting
+        ``asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)``
+        per message instead of a bare ``async for``. Breaks the loop cleanly
+        on ``StopAsyncIteration``; a timed-out wait raises
+        :class:`_OrchestrateInactivityTimeout` (db-262 -- the SDK ended a turn
+        without a terminal sentinel and produced no follow-up, which
+        previously left the orchestrator idling forever). The ``finally``
+        ALWAYS awaits ``agen.aclose()`` (suppressing aclose's own exceptions)
+        so a quota or inactivity sentinel unwinds through cooperative teardown
+        while the generator is suspended -- not running -- before it escapes
+        this coroutine (db-325): this drives the SDK's own subprocess
+        teardown before ``asyncio.run``'s ``shutdown_asyncgens()`` would
+        otherwise hit the generator mid-flight. The sentinel re-raises after
+        teardown, preserving the :class:`BaseException` contract.
+
+        Any OTHER exception raised by ``agen.__anext__()`` -- an
+        :class:`Exception` that is neither ``StopAsyncIteration`` nor
+        ``TimeoutError`` -- is re-raised as :class:`_OrchestrateTransportError`
+        with the original preserved as ``__cause__`` (#331 spec FR-1). This is
+        deliberately narrow: ONLY the ``agen.__anext__()`` boundary is wrapped,
+        never the rest of the loop body, so a genuine devbench defect (e.g. a
+        bug in :func:`_check_quota_and_drain`) still propagates unwrapped and
+        fails loudly instead of being silently retried (decision D-5).
+        ``SystemExit``, ``KeyboardInterrupt``, and :class:`asyncio.CancelledError`
+        are :class:`BaseException` subclasses that are not :class:`Exception`,
+        so the ``except Exception`` clause that raises this sentinel never
+        matches them -- they are never wrapped (spec AC-3).
+
+        Per-message, calls :func:`_check_quota_and_drain` once, which raises
+        :class:`_QuotaDetected` when a quota / rate-limit signal is observed
+        (issue #236) or :class:`_DrainRequested` when a ``devbench claim``
+        tool-use is detected while a drain is pending (issues #188/#212).
+        Both sentinels -- and :class:`_OrchestrateInactivityTimeout` and
+        :class:`_OrchestrateTransportError` -- are :class:`BaseException`
         subclasses (spec AC-20, decision D-4) so they propagate through
         ``asyncio.run`` without being caught by any broad ``except Exception``
         handler in between.
+
+        Does NOT break on any ``ResultMessage``: the orchestrate skill emits
+        one per turn across a single long ``query()`` (num_turns ~185); only
+        the two ``_TERMINAL_ORCHESTRATE_MARKERS`` end the loop early, and the
+        inactivity timeout -- not result-classification -- is the liveness
+        lever (spec AC-40).
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
@@ -8254,22 +9935,86 @@ def cmd_start(*argv: str) -> int:
                 message.
             _DrainRequested: A drain signal is present when a ``cmd_claim``
                 tool-use is observed.
+            _OrchestrateInactivityTimeout: No SDK message arrived within
+                ``_ORCH_INACTIVITY_TIMEOUT`` seconds of the previous one.
+            _OrchestrateTransportError: ``agen.__anext__()`` raised any other
+                exception (#331 spec FR-1).
         """
         nonlocal _sdk_result_text
-        async for message in query(
-            prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-            options=ClaudeAgentOptions(
-                plugins=[{"type": "local", "path": str(plugin_path)}],
-                permission_mode="bypassPermissions",
+        # The SDK's `query()` return-type annotation is the narrower
+        # `AsyncIterator[...]` (no `aclose()`), but its actual runtime type is
+        # always an async generator (the SDK implements it with `yield`).
+        # Cast to `AsyncGenerator` so `agen.aclose()` below type-checks
+        # without a bypass annotation.
+        agen = cast(
+            "AsyncGenerator[object, None]",
+            query(
+                prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
+                options=ClaudeAgentOptions(
+                    plugins=[{"type": "local", "path": str(plugin_path)}],
+                    permission_mode="bypassPermissions",
+                    env=_agent_environment(os.environ),
+                    # Pinned rather than inherited. Without these the session
+                    # picks up the ambient Claude Code effort, so an unattended
+                    # run's cost profile depends on whatever the operator's
+                    # last interactive session happened to be set to, and a
+                    # turn that reasons past the prompt-cache lifetime returns
+                    # to a cold cache and re-uploads the whole prompt.
+                    effort=cast("EffortLevel", ORCHESTRATE_EFFORT),
+                    max_thinking_tokens=ORCHESTRATE_MAX_THINKING_TOKENS,
+                ),
             ),
-        ):
-            logger.info("sdk message: %s", message)
-            _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-            if _log_terminal_exit_if_applicable(_sdk_result_text):
-                return
-            _check_quota_and_drain(message)
-        # Clean exit from the SDK loop -- done.
-        return
+        )
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(agen.__anext__(), timeout=_ORCH_INACTIVITY_TIMEOUT)
+                except StopAsyncIteration:
+                    # The generator is exhausted WITHOUT the loop having already
+                    # returned on a terminal sentinel: a genuine end-of-run
+                    # returns from _log_terminal_exit_if_applicable the moment
+                    # ALL_DONE / NO_ACTIONABLE is observed. Reaching here means
+                    # the model stopped talking without announcing why.
+                    #
+                    # Escalate to the bounded-restart path ONLY when the backlog
+                    # still holds actionable work: that is the case the loop must
+                    # never end on (it stops only on a terminal sentinel or an
+                    # operator drain), and it was previously a bare ``break`` --
+                    # the one failure mode with no recovery, while a model going
+                    # silent for the inactivity window already earned a restart.
+                    # With nothing actionable left, ending here IS the
+                    # NO_ACTIONABLE condition, just discovered by us rather than
+                    # announced by the model, so restarting would only re-derive
+                    # the same answer at the cost of another session.
+                    if _has_actionable_work_remaining():
+                        raise _OrchestratePrematureTurnEnd(_sdk_result_text) from None
+                    break
+                except TimeoutError:
+                    raise _OrchestrateInactivityTimeout(_ORCH_INACTIVITY_TIMEOUT) from None
+                except Exception as exc:
+                    # #331 FR-1: only the SDK generator boundary itself is
+                    # classified as a transport error (decision D-5). Any
+                    # BaseException that is not an Exception -- SystemExit,
+                    # KeyboardInterrupt, asyncio.CancelledError -- does not
+                    # match this clause and propagates unchanged (spec AC-3).
+                    raise _OrchestrateTransportError(exc) from exc
+                logger.info("sdk message: %s", message)
+                _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+                if _log_terminal_exit_if_applicable(_sdk_result_text):
+                    return
+                _check_quota_and_drain(message)
+        finally:
+            # db-325: cooperative teardown -- always close the generator, but
+            # never let aclose's OWN failure (e.g. a mid-flight SDK teardown
+            # error) mask the sentinel that is unwinding through this frame.
+            # Local aliased import (mirrors the outer `finally` blocks below):
+            # `cmd_start` binds an unaliased `contextlib` local later in its
+            # own body, which would otherwise shadow the module-level import
+            # for this nested closure's free-variable lookup.
+            import contextlib as _run_contextlib
+
+            with _run_contextlib.suppress(Exception):
+                await agen.aclose()
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop
@@ -8314,14 +10059,11 @@ def cmd_start(*argv: str) -> int:
         # operator inspection.
         ScopeFilter.clear(WORKSPACE_ROOT)
 
-        # Issue #217: bubble the SDK's final ResultMessage text into the
-        # Slack reason so ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` and
-        # similar end-of-run summaries reach the operator.  Without this,
-        # the reason stayed at the literal ``"clean"`` initial value,
-        # masking whether the backlog actually finished or just ran out of
-        # actionable work mid-cascade.  Ternary form (rather than an
-        # ``if`` block) keeps the branch count under ruff's PLR0912 cap.
-        _stop_reason = f"clean exit: {_sdk_result_text}" if _sdk_result_text else _stop_reason
+        # Issue #217 / db-271: resolve the final stop-reason label after a
+        # clean SDK loop exit.  Delegated to ``_resolve_clean_stop_reason``
+        # (rather than an inline ``if``/``elif`` chain) so ``cmd_start``'s
+        # branch count stays under ruff's PLR0912 cap.
+        _stop_reason = _resolve_clean_stop_reason(_stop_reason, _sdk_result_text)
 
         restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
         return restart_rc
@@ -9152,7 +10894,7 @@ def cmd_drain(*argv: str) -> int:
         devbench drain                        -- request workspace-root drain (empty reason)
         devbench drain --reason "<text>"      -- request workspace-root drain with reason
         devbench drain --cancel               -- withdraw workspace-root drain; idempotent
-        devbench drain --status               -- print workspace-root drain state; rc=0
+        devbench drain --status               -- print every pending drain (root + per-session); rc=0
         devbench drain --session <name>       -- drain only the named session (AC-192-7)
         devbench drain --all                  -- drain every active session (AC-192-8)
 
@@ -9188,11 +10930,12 @@ def cmd_drain(*argv: str) -> int:
         return 0
 
     if mode == "status":
-        state = read_drain_state(WORKSPACE_ROOT)
-        if state is None:
+        states = read_all_drain_states(WORKSPACE_ROOT)
+        if not states:
             print("no drain pending")
         else:
-            print(str(state))
+            for session_name, state in states:
+                print(_format_drain_status_line(session_name, state))
         return 0
 
     if session_target == "__all__":
@@ -9328,8 +11071,8 @@ def cmd_sessions(*argv: str) -> int:
 
 #: Audit-log prefix written when cmd_start intercepts SIGTERM and forces the
 #: in-flight work unit to ``blocked``.  Format:
-#: ``[FORCED_BLOCKED_ON_STOP] session=<name>``.
-_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX: str = "[FORCED_BLOCKED_ON_STOP] session="
+#: ``[INTERRUPTED_ON_STOP] session=<name>``.
+_INTERRUPTED_ON_STOP_AUDIT_PREFIX: str = "[INTERRUPTED_ON_STOP] session="
 
 
 def _parse_stop_argv(argv: tuple[str, ...]) -> tuple[str | None, int, str]:
@@ -9409,18 +11152,28 @@ def _find_in_flight_wu(units: list[WorkUnit]) -> WorkUnit | None:
     return None
 
 
-def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
-    """Set *wu* to ``blocked`` and append a ``[FORCED_BLOCKED_ON_STOP]`` audit comment.
+def _requeue_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
+    """Return *wu* to ``in-queue`` and append an ``[INTERRUPTED_ON_STOP]`` audit comment.
 
-    This is called by the SIGTERM handler in ``cmd_start`` to mark the
-    in-flight work unit as ``blocked`` with a session-tagged audit entry,
-    satisfying spec section 4.4.5 and AC-192-9.
+    Called by the SIGTERM handler in ``cmd_start`` to release the in-flight
+    work unit when the run stops, so the next run picks it up where it left
+    off (spec section 4.4.5, AC-192-9).
+
+    The unit goes to ``in-queue`` rather than ``blocked`` because a stop is
+    not a dependency problem, and ``blocked`` is how devbench encodes exactly
+    that. A unit parked in ``blocked`` waits for a dependency to go terminal;
+    when the stop happened after every dependency was already terminal, no
+    such event is ever coming and only a ``reconcile-cascade`` sweep can
+    release it. Interrupted work is immediately actionable, so it belongs in
+    the queue it was claimed from -- and pairing that with the quarantine
+    restore on the claim path means the unit resumes on the attempt it had
+    already produced.
 
     When *wu* is ``None`` (no in-flight unit found), this function is a no-op.
 
     Args:
         wu: The in-flight :class:`~devbench.backlog.work_unit.WorkUnit` to
-            force-block, or ``None`` for a no-op.
+            release, or ``None`` for a no-op.
         session_name: The session name to embed in the audit comment
             (e.g. ``"default"``).
 
@@ -9431,13 +11184,50 @@ def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
     if wu is None:
         return
 
+    checkpoint_sha = _checkpoint_in_flight_work(wu)
+
     mgr = BacklogManager()
-    mgr.force_status(wu.file_path, BACKLOG_INDEX, wu.id, STATUS_BLOCKED)
+    mgr.force_status(wu.file_path, BACKLOG_INDEX, wu.id, STATUS_IN_QUEUE)
+    detail = f" checkpoint={checkpoint_sha}" if checkpoint_sha else ""
     mgr._append_agent_comment(
         wu.file_path,
         "orchestrator",
-        f"{_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX}{session_name}",
+        f"{_INTERRUPTED_ON_STOP_AUDIT_PREFIX}{session_name}{detail}",
     )
+
+
+def _checkpoint_in_flight_work(wu: WorkUnit) -> str | None:
+    """Snapshot ``wu``'s in-flight work to its checkpoint ref before the run exits.
+
+    The stop path is the last moment devbench controls before an interrupted
+    unit's uncommitted work depends on something else keeping it safe. The
+    snapshot costs one git command, touches neither the worktree nor the
+    index, and gives the work a reachable ref that a later ``git stash clear``
+    cannot discard.
+
+    Best-effort by design: this runs inside a SIGTERM handler, so a repo that
+    cannot be resolved or a git call that fails is logged and passed over. The
+    unit is still released to the queue, and its work is still in the tree --
+    a missing checkpoint costs a safety net, whereas raising here would leave
+    the unit stuck ``in-progress`` with no run to advance it.
+
+    Returns:
+        The checkpoint commit SHA, or ``None`` when there was nothing in
+        flight or the snapshot could not be taken.
+    """
+    from devbench.git_quarantine import checkpoint_work
+
+    try:
+        repo_path = REPO_LOCAL_PATHS.get(resolve_repo(wu.repo))
+        if repo_path is None or not (repo_path / ".git").exists():
+            return None
+        sha = checkpoint_work(repo_path, wu.id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("[CHECKPOINT_SKIPPED] could not snapshot %s: %s", wu.id, exc)
+        return None
+    if sha:
+        logger.info("[WORK_CHECKPOINTED] %s snapshotted to %s", wu.id, sha)
+    return sha
 
 
 def _send_sigterm_to_session(session_name: str) -> tuple[int, str, str]:
@@ -9531,7 +11321,7 @@ def cmd_stop(*argv: str) -> int:
     Reads the PID from ``<workspace>/.devbench/sessions/<name>/pid`` and sends
     ``SIGTERM`` to that process.  The SIGTERM handler registered by ``cmd_start``
     catches the signal, forces any in-flight work unit to ``blocked`` with a
-    ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit comment, then exits rc=0.
+    ``[INTERRUPTED_ON_STOP] session=<name>`` audit comment, then exits rc=0.
 
     Exit codes:
 
@@ -9569,18 +11359,59 @@ def cmd_request_amendment(unit_id: str) -> int:
 
     Reads the request payload as JSON on stdin. Expected fields:
     ``reason``, ``justification``, ``files_to_add`` (list of ``{path, change}``),
-    ``linked_acs`` (list of AC IDs). The ``task_id`` and ``requested_at``
-    fields are filled in by this command -- the caller does not provide them.
+    ``linked_acs`` (list of AC IDs), and the optional ``files_to_remove`` (list
+    of repo-relative paths whose Manifest rows should be dropped). The
+    ``task_id`` and ``requested_at`` fields are filled in by this command --
+    the caller does not provide them. At least one of ``files_to_add`` /
+    ``files_to_remove`` must be non-empty.
+
+    A row may only be removed when its file has no staged, unstaged, or
+    untracked changes, so a removal can never carry real work out of the unit's
+    reviewed scope.
+
+    Every Layer 1 pre-filter check runs BEFORE the request is written, so a
+    request that cannot be approved never reaches disk and never occupies the
+    single pending-request slot. The checks are deterministic: the reason must
+    be in this backlog's configured ``allowed_reasons``, the task must be
+    in-progress, linked ACs must exist, added files must not already be in the
+    Manifest and must be present in the staged diff.
+
+    Previously ``PreFilter`` was wired to no CLI path at all, so a backlog that
+    narrowed ``manifest_amendment.allowed_reasons`` had that narrowing silently
+    ignored and every request was accepted regardless.
 
     On success, writes the request to
     ``<DEVBENCH_WORKSPACE_ROOT>/.devbench/amendments/<unit_id>.json`` and prints
-    a one-line JSON summary. Fails fast on schema errors, duplicate pending
-    requests, or unknown reasons.
+    a one-line JSON summary. Returns 1 on any pre-filter or schema failure.
     """
+    from devbench.backlog.manifest import list_changed_files, list_staged_files
+
+    # Parse stdin BEFORE resolving the repo so a malformed payload reports the
+    # schema error the caller can act on, rather than a repo-configuration error
+    # that says nothing about what was wrong with the request.
     try:
         request = _build_amendment_request_from_stdin(unit_id)
-        written_path = write_request(WORKSPACE_ROOT, request)
-    except (_AmendmentRequestInputError, AmendmentError) as exc:
+    except _AmendmentRequestInputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    _, _, repo_path = resolved
+
+    try:
+        PreFilter(BACKLOG_INDEX, RUNTIME_CONFIG.manifest_amendment).run_all(
+            request,
+            staged_files=frozenset(list_staged_files(repo_path)),
+            changed_files=frozenset(list_changed_files(repo_path)),
+        )
+        written_path = write_request(
+            WORKSPACE_ROOT,
+            request,
+            allowed_reasons=RUNTIME_CONFIG.manifest_amendment.allowed_reasons,
+        )
+    except AmendmentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -9590,6 +11421,7 @@ def cmd_request_amendment(unit_id: str) -> int:
                 "task_id": unit_id,
                 "request_path": str(written_path),
                 "files_to_add": [f.path for f in request.files_to_add],
+                "files_to_remove": list(request.files_to_remove),
                 "reason": request.reason,
             }
         )
@@ -9635,7 +11467,12 @@ def cmd_apply_amendment(unit_id: str) -> int:
     is restored to its pre-amendment content and this command exits non-zero.
     """
     try:
-        apply_amendment(WORKSPACE_ROOT, BACKLOG_INDEX, unit_id)
+        apply_amendment(
+            WORKSPACE_ROOT,
+            BACKLOG_INDEX,
+            unit_id,
+            allowed_reasons=RUNTIME_CONFIG.manifest_amendment.allowed_reasons,
+        )
     except AmendmentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -10879,9 +12716,16 @@ def cmd_add_dep(*argv: str) -> int:
 
         add-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
 
-    Writes a Dependencies-table row and a ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>``
-    audit comment on the blocked task's file. The ADR-07 auto-requeue cascade
-    then auto-unblocks the task when the blocker reaches ``done`` / ``declined``.
+    Writes a canonical ``## Dependencies`` row -- the form
+    ``validate-backlog``'s Manifest Conflict Rule reads -- alongside the
+    existing ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>`` audit
+    marker on the blocked task's file (#330 FR-1). The row's Title and
+    Status cells carry the blocker's real, current values as of this call,
+    not a placeholder. The ADR-07 auto-requeue cascade still only
+    auto-unblocks the blocked task when the blocker reaches ``done`` /
+    ``declined`` AND the blocked task's own status is ``blocked``; the
+    Dependencies row has no such restriction, so it is what satisfies the
+    validator regardless of the blocked task's current status.
 
     Used for three scenarios the ``promote-proposal`` flow does not cover:
 
@@ -10893,22 +12737,31 @@ def cmd_add_dep(*argv: str) -> int:
     3. Operator corrects a proposal authored without ``affected_task_ids``
        retroactively.
 
-    Fail-fast:
+    Fail-fast (#330 FR-1 error handling): every path below exits non-zero,
+    prints a message naming the file (when one is implicated) and the
+    reason, and leaves no partial write behind -- validation runs to
+    completion before anything is written.
+
       - Both IDs must match the task-ID regex.
+      - Blocked must exist in the backlog index.
       - Blocker must exist in the backlog index.
       - Blocker must not be in a terminal state (``done`` / ``declined``).
-      - Blocked must exist in the backlog index.
       - Blocked and blocker cannot be the same.
+      - The blocked task's file must be readable and contain a
+        ``## Dependencies`` section.
 
     Warns (but does not refuse) when the blocked task is not currently in
-    ``blocked`` status. The cascade only fires on blocked tasks, so wiring a
-    marker on an in-queue task is harmless metadata; the operator almost
-    certainly meant to flip to blocked first.
+    ``blocked`` status: the ADR-07 cascade will not fire until it is, but
+    (#330 FR-2) the ``## Dependencies`` row this call writes satisfies the
+    validator now regardless of that status.
 
-    Idempotent: if either the dep row or the marker is already present, the
-    corresponding write is skipped. ``wired: true`` in the output JSON means
-    at least one of the two was newly written on this call; ``wired: false``
-    means the call was a complete no-op.
+    Idempotent: calling ``add-dep`` twice for the same pair leaves exactly
+    one Dependencies row and one marker. ``wired: true`` in the output JSON
+    means the blocked task's ``## Dependencies`` table carries a
+    validator-visible row for the blocker as of THIS call -- true whether
+    the row was newly written or already present. ``wired: false`` means no
+    such row could be produced; the exit code is non-zero in that case and
+    ``reason`` explains why (#330 FR-2).
     """
     blocked_task_id, blocker_task_id, reason = _parse_add_dep_argv(argv)
     if blocked_task_id is None:
@@ -10918,39 +12771,42 @@ def cmd_add_dep(*argv: str) -> int:
     if rc is not None:
         return rc
 
-    # Warn when blocked is not in `blocked` status (ADR-10 soft guidance).
     try:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
         units = parser.parse_index()
     except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
-        return 1
+        return _fail_add_dep(blocked_task_id, blocker_task_id, f"cannot read backlog index: {exc}")
+
     blocked_unit = next((u for u in units if u.id == blocked_task_id), None)
-    if blocked_unit is None:
-        print(
-            f"ERROR: add-dep: blocked task '{blocked_task_id}' not found in backlog index",
-            file=sys.stderr,
+    blocker_unit = next((u for u in units if u.id == blocker_task_id), None)
+    if blocked_unit is None or blocker_unit is None:
+        role, missing_id = ("blocked", blocked_task_id) if blocked_unit is None else ("blocker", blocker_task_id)
+        return _fail_add_dep(
+            blocked_task_id, blocker_task_id, f"add-dep: {role} task '{missing_id}' not found in backlog index"
         )
-        return 1
+
+    # Warn when blocked is not in `blocked` status (ADR-10 soft guidance).
     if blocked_unit.status != WorkUnitStatus.BLOCKED:
         print(
             f"WARNING: add-dep: {blocked_task_id} is currently '{blocked_unit.status.value}', "
-            "not 'blocked'. The ADR-07 cascade only fires on blocked tasks -- the marker "
-            "written by this call will be inert until the task is blocked.",
+            "not 'blocked'. The ADR-07 cascade will not fire until the task is blocked -- "
+            "but the '## Dependencies' row this call writes to the blocked unit's file "
+            "satisfies the Manifest Conflict Rule now, independent of that status.",
             file=sys.stderr,
         )
 
     try:
-        wired = add_dep(
+        wired = _write_add_dep_edge(
             backlog_root=BACKLOG_ROOT,
             backlog_index=BACKLOG_INDEX,
             blocked_task_id=blocked_task_id,
+            blocked_file=blocked_unit.file_path,
             blocker_task_id=blocker_task_id,
+            blocker_unit=blocker_unit,
             reason=reason,
         )
-    except ProposalError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    except (ProposalError, OSError, UnicodeDecodeError) as exc:
+        return _fail_add_dep(blocked_task_id, blocker_task_id, str(exc))
 
     logger.info(
         "add-dep: %s blocked on %s (wired=%s)",
@@ -10968,7 +12824,129 @@ def cmd_add_dep(*argv: str) -> int:
             }
         )
     )
-    return 0
+    return 0 if wired else 1
+
+
+def _fail_add_dep(blocked_task_id: str, blocker_task_id: str, message: str) -> int:
+    """Print an ``add-dep`` failure, emit ``wired: false`` JSON, and return 1.
+
+    Centralises the AC-4 / AC-5 failure contract (#330 FR-1, FR-2): every
+    path that cannot produce a validator-visible Dependencies row exits
+    non-zero, names the reason, and reports ``"wired": false`` on the same
+    JSON payload the success path uses (same keys, per AC-6) so a caller
+    parsing stdout never observes a stale ``"wired": true"``.
+    """
+    print(f"ERROR: {message}", file=sys.stderr)
+    print(
+        json.dumps(
+            {
+                "blocked": blocked_task_id,
+                "blocker": blocker_task_id,
+                "wired": False,
+                "reason": message,
+            }
+        )
+    )
+    return 1
+
+
+def _write_add_dep_edge(
+    *,
+    backlog_root: Path,
+    backlog_index: Path,
+    blocked_task_id: str,
+    blocked_file: Path,
+    blocker_task_id: str,
+    blocker_unit: WorkUnit,
+    reason: str,
+) -> bool:
+    """Write the ``add-dep`` edge and report whether it is validator-visible (#330 FR-1, FR-2).
+
+    Delegates the row + marker + BACKLOG.md index-cell writes to
+    :func:`devbench.backlog.proposal.add_dep`, which already validates
+    self-wire, blocker existence, blocker terminal status, and a readable
+    ``## Dependencies`` section on the blocked file -- raising
+    :class:`~devbench.backlog.proposal.ProposalError` (or propagating an
+    ``OSError`` / ``UnicodeDecodeError`` from a malformed file) before any
+    write happens, so a rejected call leaves no partial write. ``add_dep``
+    writes the shared placeholder row (:func:`~devbench.backlog.proposal._placeholder_dep_row`),
+    which is correct for its other caller (``promote-proposal``, wiring a
+    just-materialised draft with no better text available yet); this then
+    rewrites that placeholder to the blocker's real title and current status
+    (AC-2), already resolved by the caller from the parsed backlog index,
+    under its own ``flock_backlog`` acquisition (FR-1) so the rewrite cannot
+    lose a concurrent flocked update to the same file.
+
+    Returns ``True`` iff, after this call, the blocked file's
+    ``## Dependencies`` table carries a row for the blocker -- true whether
+    the row was newly written this call or already present from a prior
+    call, so idempotent repeats stay validator-visible / ``wired: true``.
+    """
+    add_dep(
+        backlog_root=backlog_root,
+        backlog_index=backlog_index,
+        blocked_task_id=blocked_task_id,
+        blocker_task_id=blocker_task_id,
+        reason=reason,
+    )
+    _canonicalize_add_dep_row(
+        blocked_file,
+        blocker_task_id,
+        blocker_unit.title,
+        _add_dep_raw_status_text(blocker_unit.status),
+        workspace_root=backlog_index.parent,
+    )
+    return _dep_row_has_task(blocked_file, blocker_task_id)
+
+
+def _add_dep_raw_status_text(status: WorkUnitStatus) -> str:
+    """Return the lowercase-hyphenated markdown form of a ``WorkUnitStatus``.
+
+    E.g. ``WorkUnitStatus.IN_QUEUE`` (``value == "In Queue"``) becomes
+    ``"in-queue"``, matching the ``STATUS_*`` string constants
+    (:mod:`devbench.constants`) used in ``## Status:`` lines and
+    Dependencies-table rows across the backlog -- distinct from
+    ``WorkUnitStatus.value``'s title-case display form used in BACKLOG.md's
+    Status Summary and in CLI warning text.
+    """
+    return status.value.lower().replace(" ", "-")
+
+
+def _canonicalize_add_dep_row(
+    blocked_file: Path, blocker_task_id: str, title: str, status: str, *, workspace_root: Path
+) -> None:
+    """Upgrade the placeholder Dependencies row ``add_dep()`` writes to real title/status (#330 AC-2).
+
+    :func:`devbench.backlog.proposal.add_dep` writes the shared placeholder
+    row text (:func:`devbench.backlog.proposal._placeholder_dep_row`) via its
+    ``_append_dependency_to_source`` helper -- correct for its other caller,
+    ``promote-proposal``, where the blocker is a freshly materialised draft
+    and no better text exists yet. ``add-dep``'s caller already knows the
+    blocker's real, current title and status from the parsed backlog index,
+    so this rewrites the placeholder cells to that real text. Matching the
+    placeholder text against the SAME helper ``add_dep()`` used to write it
+    (rather than a second, independently hardcoded copy) means the two can
+    never drift apart and silently defeat the match.
+
+    Idempotent: only replaces the exact placeholder row text for
+    ``blocker_task_id``. A row already carrying real text -- from a prior
+    corrected call, or authored directly -- has no placeholder to match and
+    is left untouched, so repeat calls never re-write it.
+
+    Runs the read-modify-write under ``flock_backlog(workspace_root)`` (#330
+    FR-1, DoD): ``add_dep()`` releases the backlog flock before returning, so
+    without its own lock this full-file rewrite could race a concurrent
+    flocked write to the same file and lose it. Acquiring the lock here
+    guarantees the content read at the start of this call is read fresh
+    under the same lock the write is performed under.
+    """
+    with flock_backlog(workspace_root):
+        content = blocked_file.read_text(encoding="utf-8")
+        placeholder = _placeholder_dep_row(blocker_task_id)
+        if placeholder not in content:
+            return
+        real_row = f"| {blocker_task_id} | {title} | {status} |"
+        atomic_write_text(blocked_file, content.replace(placeholder, real_row, 1))
 
 
 def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
@@ -11193,6 +13171,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "unhold <id> --reason <message>. Refuses units not currently on hold."
         ),
     ),
+    "remove": (
+        cmd_remove,
+        2,
+        (
+            "Remove a work unit through the managed path: remove <id> --reason <message> "
+            "(deletes the WU file + BACKLOG.md index row under flock, re-rolls the Status "
+            "Summary, and audits [WU_REMOVED]; db-303)"
+        ),
+    ),
     "promote": (
         cmd_promote,
         0,
@@ -11217,7 +13204,9 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         (
             "Walk every blocked task; flip eligible ones (markers all terminal "
             "AND regular deps satisfied) to in-queue with a [CASCADE_RECONCILED] "
-            "audit. Returns JSON envelope of flips + skips."
+            "audit. Also repairs already-stranded Story/Feature/Epic containers "
+            "(#332 FR-2), promoting any whose children are all terminal and "
+            "cascading upward. Returns JSON envelope of flips + skips + rolled_up."
         ),
     ),
     "new-task": (
@@ -11231,7 +13220,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "derived from the ID's last segment (T/S/F/E)."
         ),
     ),
-    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity [--fix: auto-correct rule-10/11]"),
+    "validate-backlog": (
+        cmd_validate_backlog,
+        0,
+        "Validate backlog integrity [--fix: auto-correct rule-10/11] "
+        "[--strict: also flag draft/hold Manifest conflicts]",
+    ),
     "check": (
         cmd_check,
         0,
@@ -11405,6 +13399,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     # Plugin agent bridge commands -- used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
+    "check-manifest-scope": (
+        cmd_check_manifest_scope,
+        1,
+        "Print out-of-Manifest staged paths and exit non-zero on mismatch (read-only, "
+        "deterministic; spec 4.C): check-manifest-scope <id>",
+    ),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "tdd-gate": (
         cmd_tdd_gate,
@@ -11454,6 +13454,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_log_rejection_feedback,
         3,
         "Persist review-judge rejection JSON: log-rejection-feedback <judge> <id> --json '<payload>'",
+    ),
+    "config-resolve": (
+        cmd_config_resolve,
+        1,
+        "Print resolved config values as JSON: config-resolve <field> [<field>...]",
     ),
     "list-proposals": (
         cmd_list_proposals,
@@ -11517,11 +13522,15 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "green-green-check",
         "hold",
         "unhold",
+        # db-303 (E12-F1-S2-T1): --reason <message> is multi-token like hold/unhold/decline.
+        "remove",
         "status",
         "new-task",
         "reject-proposal",
         "validate-backlog",
         "log-rejection-feedback",
+        # Issue #122: variadic list of RuntimeConfig field names to resolve.
+        "config-resolve",
         # Issue #162 Phase 6: pre-render the report into a snapshot file.
         "write-snapshot",
         # Issue #162 Phase 2: rebuild per-task window-stats aggregates from the log.

@@ -116,15 +116,21 @@ class TestGuardWorkUnitWriteHook:
             "src/devbench/config.py",
             "tests/unit/test_something.py",
             "README.md",
-            "BACKLOG.md",
-            "/workspace/BACKLOG.md",
             "docs/architecture.md",
             "/home/user/plugin/devbench-orchestrate/scripts/guard-bash.sh",
             "plugin/devbench-orchestrate/hooks/hooks.json",
         ],
     )
     def test_non_backlog_file_paths_are_allowed(self, file_path: str) -> None:
-        """AC-3: Non-backlog file paths exit 0 (allowed)."""
+        """AC-3: Non-backlog file paths exit 0 (allowed).
+
+        BACKLOG.md is intentionally NOT in this list: db-303 (E12-F1-S2-T1,
+        spec 4.A / FR-16) flipped the previously-unconditional BACKLOG.md
+        carve-out to block-by-default (escape hatch:
+        DEVBENCH_ALLOW_BACKLOG_EDIT=1). See
+        ``tests/test_plugin/test_guard_backlog_write.py`` for the dedicated
+        BACKLOG.md block/override coverage.
+        """
         payload = _make_write_payload(file_path)
         result = _run_hook(payload)
         assert result.returncode == 0, (
@@ -198,6 +204,40 @@ class TestGuardWorkUnitWriteContentValidation:
             f"Expected exit 2 for checkout_directory prefix content, got {result.returncode}. stderr: {result.stderr}"
         )
         assert "rule 11" in result.stderr
+
+    def test_missing_pyyaml_fails_loudly_with_install_hint(self, tmp_path: Path) -> None:
+        """Rule 11 precondition: when the hook's python3 cannot import PyYAML the
+        hook must block (exit 2) and name the fix (make install / pip --user
+        pyyaml) instead of dying on the heredoc's `import yaml` with a
+        traceback and exit 1 -- which Claude Code treats as a NON-blocking hook
+        error, silently skipping Rule 11. Simulated portably by shadowing
+        `yaml` with a PYTHONPATH package that raises ImportError."""
+        yaml_content = "repos:\n  org/kanon:\n    checkout_directory: kanon\n"
+        config_dir = tmp_path / "backlog" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "devbench.yaml").write_text(yaml_content)
+        shadow = tmp_path / "no-yaml-shim" / "yaml"
+        shadow.mkdir(parents=True)
+        (shadow / "__init__.py").write_text("raise ImportError('PyYAML deliberately unavailable in this test')\n")
+
+        content = "## Changes Manifest\n| `kanon/src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T2.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(
+            payload,
+            extra_env={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path), "PYTHONPATH": str(shadow.parent)},
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 (blocked, loud) when PyYAML is missing, got {result.returncode}. stderr: {result.stderr}"
+        )
+        assert "needs PyYAML" in result.stderr
+        assert "make -C <devbench-checkout> install" in result.stderr
+        assert "Traceback" not in result.stderr
 
     def test_valid_content_and_manifest_paths_pass(self) -> None:
         """Content with no em-dashes and repo-relative paths exits 0 (path-based block still applies)."""

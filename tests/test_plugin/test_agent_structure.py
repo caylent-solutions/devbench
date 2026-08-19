@@ -700,17 +700,30 @@ class TestBlockerResolverSuggestedApproachStructure:
 
 @pytest.mark.unit
 class TestTaskFactoryTodoRowRefusal:
-    """ADR-08 slice H: task-factory must warn about thin-approach and TODO-row refusal."""
+    """ADR-08 slice H: task-factory must warn about thin-approach and empty-file-set drafts."""
 
     _TASK_FACTORY_PATH = AGENTS_DIR / "task-factory.md"
 
-    def test_prompt_mentions_todo_row_refusal(self) -> None:
-        """The prompt must explain that literal 'TODO -- describe change' rows cause refusal."""
+    def test_prompt_explains_the_derived_change_verb(self) -> None:
+        """The prompt must describe how the Manifest change verb is produced.
+
+        The renderer no longer emits a literal 'TODO -- describe change' cell:
+        the verb is derived from the target repository (existing path renders
+        as modify, absent path as add), and an empty file set renders as the
+        deferred-resolution sentinel. The prompt has to describe what the
+        factory actually writes, or the agent reasons about a Manifest shape
+        that can no longer occur.
+        """
         content = self._TASK_FACTORY_PATH.read_text()
-        assert "TODO -- describe change" in content, (
-            "task-factory.md must warn that a literal 'TODO -- describe change' Changes Manifest row "
-            "will be refused by materialise-proposal so drafts never enter the backlog half-written."
+        assert "TODO -- describe change" not in content, (
+            "task-factory.md still describes the retired 'TODO -- describe change' row."
         )
+        assert "<source-drift-fix-targets-determined-at-execution>" in content, (
+            "task-factory.md must name the sentinel an empty files_to_own renders as, so the agent "
+            "can recognise the blocker-resolver drift it signals."
+        )
+        for verb in ("modify", "add"):
+            assert verb in content, f"task-factory.md must explain when a row renders as '{verb}'."
 
     def test_prompt_mentions_thin_approach_refusal(self) -> None:
         """The prompt must explain that a too-short suggested_approach causes refusal."""
@@ -1239,3 +1252,50 @@ class TestSkillRoutesJudgeEvidenceInputs:
             "SKILL.md must state that a judge unable to evaluate REVIEW_FAILs with the cause, never a pass-by-default."
         )
         assert "pass-by-default" in content
+
+
+@pytest.mark.unit
+class TestExecutorDocSyncAmendmentBranch:
+    """FR-11 Leg A3: executor.md's Resolution protocol names the
+    ``doc_sync_review_fix`` amendment path for a ``doc_review``-mandated
+    out-of-Manifest documentation fix.
+    """
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_prompt_has_doc_sync_amendment_branch(self) -> None:
+        content = self._EXECUTOR_PATH.read_text(encoding="utf-8")
+        assert "doc_sync_review_fix" in content, (
+            "executor.md must name the 'doc_sync_review_fix' amendment reason in its "
+            "Resolution protocol so a doc_review-mandated out-of-Manifest fix has a sanctioned path."
+        )
+        assert "request-amendment" in content, (
+            "executor.md's doc_sync_review_fix branch must instruct the agent to run request-amendment."
+        )
+        assert "doc_review" in content, (
+            "executor.md's doc_sync_review_fix branch must cite the doc_review REVIEW_FAIL as the trigger."
+        )
+
+
+@pytest.mark.unit
+class TestManifestAmenderDocSyncBranch:
+    """FR-11 Leg A3: manifest-amender.md authorizes ``doc_sync_review_fix``
+    only when a current-round ``doc_review`` REVIEW_FAIL record for the task
+    exists under ``.devbench/review-failures/``.
+    """
+
+    _AMENDER_PATH = AGENTS_DIR / "manifest-amender.md"
+
+    def test_manifest_amender_prompt_has_doc_sync_branch(self) -> None:
+        content = self._AMENDER_PATH.read_text(encoding="utf-8")
+        assert "doc_sync_review_fix" in content, (
+            "manifest-amender.md must name 'doc_sync_review_fix' so the amender knows how to authorize it."
+        )
+        assert "doc_review" in content, (
+            "manifest-amender.md's doc_sync_review_fix branch must require a current-round "
+            "doc_review REVIEW_FAIL record."
+        )
+        assert ".devbench/review-failures/" in content, (
+            "manifest-amender.md's doc_sync_review_fix branch must name the review-failures "
+            "directory it checks for the authorizing record."
+        )

@@ -128,6 +128,35 @@ class TestCascadeDepthConstant:
         assert DEFAULT_MAX_CASCADE_DEPTH == 2
 
 
+class TestTransportRestartConstants:
+    """The transport-restart bound and its backoff envelope.
+
+    These exist as their OWN settings rather than reusing the quota ceiling: a
+    quota window must elapse and an inactivity restart costs a full timeout
+    window, so both self-throttle, whereas a transport fault recurs as fast as
+    the SDK can reject a session.
+    """
+
+    def test_transport_restart_cap_is_far_below_the_quota_ceiling(self) -> None:
+        """The pairing that caused the field failure was a 1000-restart budget
+        with no delay. The transport cap must be a cost guard, not that."""
+        from devbench.constants import DEFAULT_MAX_QUOTA_RESUMES, DEFAULT_MAX_TRANSPORT_RESTARTS
+
+        assert DEFAULT_MAX_TRANSPORT_RESTARTS == 14
+        assert DEFAULT_MAX_TRANSPORT_RESTARTS < DEFAULT_MAX_QUOTA_RESUMES
+
+    def test_backoff_base_and_ceiling_are_positive_and_ordered(self) -> None:
+        from devbench.constants import (
+            DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+            DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+        )
+
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS == 1.0
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS == 60.0
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS > 0
+        assert DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS < DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS
+
+
 class TestSessionConstants:
     """AC-T6-2: SESSION_* constants in constants.py have correct types and spec-mandated values (spec 4.4.1)."""
 
@@ -632,6 +661,36 @@ class TestOrchestratorQuotaResumeConstants:
         assert ORCHESTRATOR_QUOTA_RESUME_AUDIT_PREFIX != ORCHESTRATOR_QUOTA_RESUMES_EXHAUSTED_AUDIT_PREFIX
 
 
+class TestOrchestratorInactivityConstant:
+    """AC-E11-F3-S2-T1-5 (spec FR-17, db-262): the orchestrator SDK message
+    inactivity net's default timeout lives in constants.py, not inlined at
+    a cli.py/config.py call site."""
+
+    @pytest.mark.unit
+    def test_default_orchestrator_inactivity_seconds_value_and_type(self) -> None:
+        from devbench.constants import DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS
+
+        assert DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS == 1800
+        assert isinstance(DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS, int)
+
+    @pytest.mark.unit
+    def test_default_orchestrator_inactivity_seconds_is_positive(self) -> None:
+        """The built-in default must itself be a usable positive timeout."""
+        from devbench.constants import DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS
+
+        assert DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS > 0
+
+    @pytest.mark.unit
+    def test_default_orchestrator_inactivity_exceeds_a_conservative_long_turn(self) -> None:
+        """Must be a genuinely conservative multi-minute default (spec FR-17):
+        long enough that a legitimate Task subagent invocation cannot false-
+        positive trip the inactivity net."""
+        from devbench.constants import DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS
+
+        ten_minutes_in_seconds = 600
+        assert ten_minutes_in_seconds < DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS
+
+
 class TestTaskTypeTaxonomyConstants:
     """FR-4.1 / AC-E4-F2-S1-T1-4: the six-type taxonomy vocabulary lives in
     constants.py so no type string is hard-coded at any call site."""
@@ -914,3 +973,34 @@ class TestGreenGreenObservedTddPhaseConstant:
 
         content = "## Comments\n\n- [RED_OBSERVED] ts -- exit_code=1 test_node_id=t failure_digest=deadbeef01\n"
         assert TDD_CYCLE_LOG_SECTION_BODY_RE.search(content) is None
+
+
+class TestMinutesPerHourConstant:
+    """#329 FR-5 (E13-F2-S2-T1): ``MINUTES_PER_HOUR`` names the divisor a
+    minutes-valued quantity uses to become hours, distinct from
+    ``SECONDS_PER_MINUTE`` (the divisor a seconds-valued quantity uses to
+    become minutes). Both happen to equal 60 today, so introducing this
+    constant changes no rendered output -- it only gives the ETA conversion
+    in report.py a name that matches what it actually divides."""
+
+    @pytest.mark.unit
+    def test_minutes_per_hour_equals_60(self) -> None:
+        from devbench.constants import MINUTES_PER_HOUR
+
+        assert MINUTES_PER_HOUR == 60
+
+    @pytest.mark.unit
+    def test_minutes_per_hour_is_int(self) -> None:
+        from devbench.constants import MINUTES_PER_HOUR
+
+        assert isinstance(MINUTES_PER_HOUR, int)
+
+    @pytest.mark.unit
+    def test_minutes_per_hour_is_own_module_level_name_not_an_import_alias(self) -> None:
+        """``MINUTES_PER_HOUR`` must be a real module-level binding in
+        constants.py (not merely re-exported from elsewhere), so a future
+        edit to one conversion constant cannot silently change the other."""
+        import devbench.constants as constants_module
+
+        assert "MINUTES_PER_HOUR" in vars(constants_module)
+        assert constants_module.MINUTES_PER_HOUR == constants_module.SECONDS_PER_MINUTE == 60

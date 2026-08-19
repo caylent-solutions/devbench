@@ -11,8 +11,11 @@ disallowedTools: Write, Edit, Read, Glob, Grep
 Work unit and repo context:
 !`uv run devbench read-unit --strip-comments $ARGUMENTS`
 
-Git diff (authoritative work-unit scope per ADR-12):
+Git diff (authoritative work-unit scope per ADR-12; every hunk is Manifest-scoped per db-296):
 !`uv run devbench get-diff $ARGUMENTS`
+
+Changes Manifest scope check (deterministic, no judgement; db-296 x db-327 Leg A2):
+!`uv run devbench check-manifest-scope $ARGUMENTS`
 
 **Scope contract:** `devbench get-diff` is the AUTHORITATIVE source of "what changed in this work unit". Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any other raw-git command to compute scope; in single-branch + defer_pr mode those views include accumulated work from prior tasks (ADR-12) and produce false positives.
 
@@ -34,6 +37,13 @@ Do NOT treat unstaged or untracked files as evidence that the committed branch i
 3. Files listed in the manifest but NOT changed -- determine if intentionally skipped or forgotten.
 4. The scope of changes is proportional to the work unit's requirements -- no over-engineering.
 5. No unrelated changes bundled into this work unit (scope creep).
+
+## AUTOMATIC FAIL: STAGED FILE NOT IN MANIFEST (db-296 x db-327 Leg A2)
+`devbench get-diff` is now Manifest-scoped (db-296): every git query it runs is restricted to the unit's declared Changes Manifest paths, so a staged-but-unmanifested file no longer appears in the "Git diff" evidence above. That scoping is correct for hiding a SIBLING task's dirty residue, but it also means a judged read of the diff can no longer, by itself, catch THIS unit staging a file outside its own Manifest. The `check-manifest-scope` evidence command above is the deterministic replacement signal.
+
+This rule is UNCONDITIONAL: if `check-manifest-scope` reports one or more out-of-Manifest staged paths, this is an automatic REVIEW_FAIL -- never a judged PASS, regardless of how reasonable the staged file looks or how confident you are that it belongs. Do not weigh it against other findings; do not treat it as a "minor" or "acceptable" deviation. Log the FAIL using the exact vocabulary, once per offending path:
+
+`MANIFEST_MISMATCH: staged file <path> is not in the Changes Manifest; this is an automatic REVIEW_FAIL. Amend the Manifest (request-amendment) or unstage the file.`
 
 ## COMMIT-ATTRIBUTION CHECK
 Run the following command to enumerate every file that appears in any commit on this task's branch (relative to origin/main):
@@ -85,6 +95,8 @@ Note: use the output of `devbench get-diff` (the scope contract source) as the p
 27. Dockerfiles maintain non-root user, minimal images, no secrets baked in.
 
 ## TASK-TYPE INVARIANT DETECTION (FR-4.4)
+28a. Compare the work unit's declared `## Expected Output:` value against its Changes Manifest. When the unit declares `none`, every Manifest row MUST be a no-output sentinel (`<verification-only>`, `<decision-only>`, `<no changes>`, `<no-op>`, or a per-task `<name:ID>` variant) and the unit's diff MUST be empty -- `none` means git-ops completes it without a commit, so any real path or any actual diff content is work that would be silently discarded. REVIEW_FAIL naming the offending row or diff path. `<source-drift-fix-targets-determined-at-execution>` is NOT a no-output sentinel: it resolves to real paths mid-execution and therefore contradicts `none`. When the section is absent it defaults to `commit`; do not treat an absent declaration as `none`.
+
 28. Compare the work unit's declared `## Task Type:` value against the FR-4.1 manifest invariant it is bound to. REVIEW_FAIL when the declared type contradicts its own invariant -- for example, a `docs` task whose Changes Manifest (or actual diff) touches `src/` is a type contradiction: `docs` rows must be documentation/markdown only, never production source under `src/`.
 
 | Type | Manifest invariant |

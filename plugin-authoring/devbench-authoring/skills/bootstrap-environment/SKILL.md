@@ -194,6 +194,28 @@ If all repos succeeded:
 
 ---
 
+## Orchestrator resilience env vars (mention, do not set)
+
+Bootstrapping only clones repos, installs toolchains and runs `make validate`
+baselines -- it does not tune the orchestrator. But operators frequently ask
+about these right after a first unattended run, so know they exist and where
+they belong. All are optional, resolve **env > YAML > built-in default**, and
+have YAML equivalents under `orchestrate:` that `configure-devbench` writes:
+
+| Env var | YAML key | Default |
+| --- | --- | --- |
+| `DEVBENCH_MAX_TRANSPORT_RESTARTS` | `orchestrate.max_transport_restarts` | `14` |
+| `DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS` | `orchestrate.transport_restart_backoff_base_seconds` | `1.0` |
+| `DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS` | `orchestrate.transport_restart_backoff_max_seconds` | `60.0` |
+
+Prefer the YAML keys: they are version-controlled with the workspace, whereas
+an env var set in one shell silently does not apply to a daemon started from
+another. Do not export these during bootstrap. If an operator reports an
+unattended run that died on repeated SDK transport errors, point them at
+`devbench report`'s `Transport restarts` row -- it counts per window
+(all-time / session / this run), so a stale storm is distinguishable from an
+active one -- and at `docs/devbench-yaml-reference.md`.
+
 ## Self-critique loop (bounded)
 
 The retry loop on a failing `make validate` must terminate -- either when

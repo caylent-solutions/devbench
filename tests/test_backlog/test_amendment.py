@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ from devbench.backlog.amendment import (
     AMENDMENT_APPLIED_ACTION,
     AMENDMENT_DIR_NAME,
     AMENDMENT_REJECTED_ACTION,
+    DOC_SYNC_REVIEW_FIX_REASON,
     AmendmentError,
     AmendmentFileEntry,
     AmendmentRequest,
@@ -352,16 +354,22 @@ class TestApplyAmendment:
         with pytest.raises(AmendmentError, match="not in allowed reasons"):
             apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id)
 
-    def test_rollback_when_post_check_fails_via_em_dash(self, tmp_workspace: Path) -> None:
-        # Craft a request whose "change" text contains an em-dash substring encoded
-        # *post* parse_manifest's em-dash guard. ManifestRow rejects em-dash at
-        # construction, so we bypass that by injecting directly into the .md.
-        # Instead, simulate a corrupted workspace: the BACKLOG.md is deliberately
-        # out of sync, so validate-backlog will fail after the write.
+    def test_preexisting_unrelated_error_does_not_roll_back_amendment(
+        self, tmp_workspace: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """FR-10 / AC-20: the whole-backlog validate() check is baseline-relative.
+
+        A backlog error that predates the amendment (here: BACKLOG.md's
+        dependency cell references a nonexistent ID) is captured in
+        ``baseline_errors`` before the write; since the amendment does not
+        introduce that error, it must not roll back. The surviving error is
+        logged as a WARNING, never silently dropped.
+        """
         task_id = "EX-F1-S1-T1"
         write_request(tmp_workspace, _sample_request(task_id))
 
-        # Damage BACKLOG.md so validate-backlog fails (dep references nonexistent ID)
+        # Damage BACKLOG.md BEFORE the amendment is applied so the error
+        # already exists in the baseline (dep references nonexistent ID).
         backlog_md = tmp_workspace / "BACKLOG.md"
         current = backlog_md.read_text()
         damaged = current.replace(
@@ -371,14 +379,64 @@ class TestApplyAmendment:
         backlog_md.write_text(damaged)
 
         wu_file = tmp_workspace / "backlog" / f"{task_id}.md"
-        before = wu_file.read_text(encoding="utf-8")
 
-        with pytest.raises(AmendmentError, match="Post-check"):
+        with caplog.at_level(logging.WARNING, logger="devbench.backlog.amendment"):
             apply_amendment(tmp_workspace, backlog_md, task_id)
 
-        # Rollback: work-unit file restored to pre-amendment content
+        # No rollback: the amendment applied, manifest now has 2 rows.
+        updated = wu_file.read_text(encoding="utf-8")
+        rows = parse_manifest(updated)
+        assert len(rows) == 2
+        assert rows[1].file == "src/example/example.py"
+
+        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("NONEXISTENT-ID" in msg for msg in warning_messages), (
+            f"expected a WARNING naming the surviving pre-existing error; got {warning_messages}"
+        )
+
+    def test_amendment_introduced_error_rolls_back(self, tmp_workspace: Path) -> None:
+        """FR-10 / AC-21: an amendment that introduces a NEW validate error rolls back.
+
+        The requested Manifest row (a glob pattern) trips the deterministic
+        no-glob-in-manifest rule, which did not fire on the pre-amendment
+        backlog. The rollback must restore the work-unit file byte-for-byte.
+        """
+        task_id = "EX-F1-S1-T1"
+        data = _sample_request_dict(task_id)
+        data["files_to_add"] = [
+            {"path": "docs/glob*.md", "change": "glob path introduces a new backlog integrity error"}
+        ]
+        write_request(tmp_workspace, AmendmentRequest.from_dict(data))
+
+        wu_file = tmp_workspace / "backlog" / f"{task_id}.md"
+        before = wu_file.read_text(encoding="utf-8")
+
+        with pytest.raises(AmendmentError, match=r"introduced \d+ new backlog integrity error"):
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id)
+
+        # Rollback: work-unit file restored byte-for-byte to pre-amendment content
         after = wu_file.read_text(encoding="utf-8")
         assert after == before
+
+    def test_clean_amendment_over_clean_backlog_applies(
+        self, tmp_workspace: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A clean amendment over an unmodified backlog applies with no warnings logged."""
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+
+        with caplog.at_level(logging.WARNING, logger="devbench.backlog.amendment"):
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id)
+
+        wu_file = tmp_workspace / "backlog" / f"{task_id}.md"
+        updated = wu_file.read_text(encoding="utf-8")
+        rows = parse_manifest(updated)
+        assert len(rows) == 2
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f"expected no WARNING logs for a clean amendment; got {[r.getMessage() for r in warning_records]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +537,71 @@ class TestAllowedReasonsConstant:
     def test_has_at_least_one_reason(self) -> None:
         assert len(ALLOWED_AMENDMENT_REASONS) >= 1
         assert "tdd_green_production_fix" in ALLOWED_AMENDMENT_REASONS
+
+
+# ---------------------------------------------------------------------------
+# FR-11 Leg A1: doc_sync_review_fix -- a second, path-restricted amendment
+# reason for doc_review-mandated out-of-Manifest documentation fixes.
+# ---------------------------------------------------------------------------
+
+
+class TestDocSyncReviewFixReason:
+    def test_write_request_accepts_doc_sync_review_fix(self, tmp_path: Path) -> None:
+        data = _sample_request_dict()
+        data["reason"] = "doc_sync_review_fix"
+        data["files_to_add"] = [{"path": "docs/manifest-amendments.md", "change": "document the new reason"}]
+        req = AmendmentRequest.from_dict(data)
+
+        written = write_request(tmp_path, req)
+
+        assert written.exists()
+        loaded = read_request(tmp_path, req.task_id)
+        assert loaded.reason == "doc_sync_review_fix"
+
+    def test_apply_amendment_accepts_doc_sync_review_fix(self, tmp_workspace: Path) -> None:
+        task_id = "EX-F1-S1-T1"
+        data = _sample_request_dict(task_id)
+        data["reason"] = "doc_sync_review_fix"
+        data["files_to_add"] = [{"path": "docs/example.md", "change": "sync doc with new behavior"}]
+        write_request(tmp_workspace, AmendmentRequest.from_dict(data))
+
+        apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id)
+
+        wu_file = tmp_workspace / "backlog" / f"{task_id}.md"
+        updated = wu_file.read_text(encoding="utf-8")
+        rows = parse_manifest(updated)
+        assert any(row.file == "docs/example.md" for row in rows)
+        assert "doc_sync_review_fix" in updated
+
+    def test_doc_sync_review_fix_rejects_non_doc_path(self, tmp_workspace: Path) -> None:
+        task_id = "EX-F1-S1-T1"
+        data = _sample_request_dict(task_id)
+        data["reason"] = "doc_sync_review_fix"
+        data["files_to_add"] = [{"path": "src/foo.py", "change": "unrelated production fix"}]
+
+        with pytest.raises(AmendmentError, match="only permits documentation"):
+            write_request(tmp_workspace, AmendmentRequest.from_dict(data))
+
+        # apply_amendment enforces the same guard even when a pending request
+        # bypasses write_request's own check (e.g. a hand-edited request file).
+        path = request_path(tmp_workspace, task_id)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(data))
+        with pytest.raises(AmendmentError, match="only permits documentation"):
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id)
+
+    def test_doc_sync_review_fix_accepts_md_and_doc_pin_test(self, tmp_path: Path) -> None:
+        data = _sample_request_dict()
+        data["reason"] = "doc_sync_review_fix"
+        data["files_to_add"] = [
+            {"path": "docs/example.md", "change": "sync doc wording"},
+            {"path": "tests/test_docs/test_example_doc_pin.py", "change": "pin new doc wording"},
+        ]
+        req = AmendmentRequest.from_dict(data)
+
+        written = write_request(tmp_path, req)
+
+        assert written.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -775,3 +898,224 @@ class TestAmenderRejectionPersistsFeedbackJson:
 
         paths = read_review_failure_files(tmp_workspace, task_id)
         assert legacy_file in paths
+
+
+# ---------------------------------------------------------------------------
+# Per-backlog allowed_reasons enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestPerBacklogAllowedReasons:
+    """A backlog's configured ``allowed_reasons`` narrowing must actually be enforced.
+
+    ``write_request`` / ``apply_amendment`` previously checked the module-level
+    ``ALLOWED_AMENDMENT_REASONS`` (what devbench IMPLEMENTS) rather than the
+    per-backlog config (what this backlog PERMITS), so a narrowing was loaded,
+    schema-validated, and then ignored at every gate.
+    """
+
+    def test_write_request_refuses_reason_outside_configured_narrowing(self, tmp_workspace: Path) -> None:
+        request = AmendmentRequest.from_dict(
+            {
+                **_sample_request_dict(),
+                "reason": DOC_SYNC_REVIEW_FIX_REASON,
+                "files_to_add": [{"path": "docs/thing.md", "change": "document it"}],
+            }
+        )
+        narrowed = frozenset({"tdd_green_production_fix"})
+
+        with pytest.raises(AmendmentError, match="not in allowed reasons"):
+            write_request(tmp_workspace, request, allowed_reasons=narrowed)
+
+        assert not request_path(tmp_workspace, request.task_id).exists(), (
+            "a refused request must not occupy the single pending-request slot"
+        )
+
+    def test_write_request_accepts_reason_inside_configured_narrowing(self, tmp_workspace: Path) -> None:
+        request = _sample_request()
+        written = write_request(tmp_workspace, request, allowed_reasons=frozenset({"tdd_green_production_fix"}))
+        assert written.exists()
+
+    def test_none_config_enforces_implemented_set(self, tmp_workspace: Path) -> None:
+        """A direct library call with no config still refuses an unimplemented reason."""
+        request = AmendmentRequest.from_dict({**_sample_request_dict(), "reason": "not_a_real_reason"})
+        with pytest.raises(AmendmentError, match="not in allowed reasons"):
+            write_request(tmp_workspace, request, allowed_reasons=None)
+
+    def test_config_cannot_widen_beyond_implemented_set(self, tmp_workspace: Path) -> None:
+        """A config naming a reason devbench does not implement does not enable it."""
+        request = AmendmentRequest.from_dict({**_sample_request_dict(), "reason": "invented_reason"})
+        with pytest.raises(AmendmentError, match="not in allowed reasons"):
+            write_request(tmp_workspace, request, allowed_reasons=frozenset({"invented_reason"}))
+
+    def test_apply_amendment_rechecks_against_configured_narrowing(self, tmp_workspace: Path) -> None:
+        """Hand-editing a pending request's reason on disk cannot bypass the narrowing."""
+        request = _sample_request()
+        target = write_request(tmp_workspace, request, allowed_reasons=None)
+        smuggled = json.loads(target.read_text(encoding="utf-8"))
+        smuggled["reason"] = DOC_SYNC_REVIEW_FIX_REASON
+        smuggled["files_to_add"] = [{"path": "docs/thing.md", "change": "document it"}]
+        target.write_text(json.dumps(smuggled), encoding="utf-8")
+
+        with pytest.raises(AmendmentError, match="not in allowed reasons"):
+            apply_amendment(
+                tmp_workspace,
+                tmp_workspace / "BACKLOG.md",
+                request.task_id,
+                allowed_reasons=frozenset({"tdd_green_production_fix"}),
+            )
+
+
+# ---------------------------------------------------------------------------
+# files_to_remove -- Manifest row removal
+# ---------------------------------------------------------------------------
+
+
+class TestFilesToRemoveParsing:
+    """``files_to_remove`` is optional, validated, and round-trips."""
+
+    def test_absent_field_defaults_to_empty(self) -> None:
+        """Requests written before this field existed must still parse."""
+        request = AmendmentRequest.from_dict(_sample_request_dict())
+        assert request.files_to_remove == []
+
+    def test_round_trips_through_to_dict(self) -> None:
+        payload = {**_sample_request_dict(), "files_to_remove": ["tests/test_stale.py"]}
+        request = AmendmentRequest.from_dict(payload)
+        assert request.files_to_remove == ["tests/test_stale.py"]
+        assert AmendmentRequest.from_dict(request.to_dict()).files_to_remove == ["tests/test_stale.py"]
+
+    def test_non_list_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="files_to_remove must be a list"):
+            AmendmentRequest.from_dict({**_sample_request_dict(), "files_to_remove": "tests/test_stale.py"})
+
+    def test_non_string_entry_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be strings"):
+            AmendmentRequest.from_dict({**_sample_request_dict(), "files_to_remove": [{"path": "x"}]})
+
+    def test_blank_entry_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            AmendmentRequest.from_dict({**_sample_request_dict(), "files_to_remove": ["  "]})
+
+    def test_removal_only_request_is_valid(self) -> None:
+        """Dropping a stale row is a complete amendment on its own."""
+        request = AmendmentRequest.from_dict(
+            {**_sample_request_dict(), "files_to_add": [], "files_to_remove": ["tests/test_stale.py"]}
+        )
+        assert request.files_to_add == []
+        assert request.files_to_remove == ["tests/test_stale.py"]
+
+    def test_empty_in_both_directions_is_rejected(self) -> None:
+        """A request that changes nothing is a no-op, not a valid amendment."""
+        with pytest.raises(ValueError, match="both empty"):
+            AmendmentRequest.from_dict({**_sample_request_dict(), "files_to_add": [], "files_to_remove": []})
+
+
+class TestApplyAmendmentWithRemoval:
+    """Removals apply inside the same atomic envelope as additions."""
+
+    def _seed_two_row_manifest(self, tmp_workspace: Path) -> Path:
+        wu = tmp_workspace / "backlog" / "EX-F1-S1-T1.md"
+        content = wu.read_text(encoding="utf-8").replace(
+            "| `tests/test_example.py` | add new tests |",
+            "| `tests/test_example.py` | add new tests |\n| `tests/test_stale.py` | modify |",
+        )
+        wu.write_text(content, encoding="utf-8")
+        return wu
+
+    def test_removal_drops_only_the_named_row(self, tmp_workspace: Path) -> None:
+        wu = self._seed_two_row_manifest(tmp_workspace)
+        request = AmendmentRequest.from_dict(
+            {**_sample_request_dict(), "files_to_add": [], "files_to_remove": ["tests/test_stale.py"]}
+        )
+        write_request(tmp_workspace, request)
+
+        apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)
+
+        files = [row.file for row in parse_manifest(wu.read_text(encoding="utf-8"))]
+        assert files == ["tests/test_example.py"]
+
+    def test_removal_is_recorded_in_the_audit_trail(self, tmp_workspace: Path) -> None:
+        """A dropped row changes what the unit may commit, so it must be visible."""
+        wu = self._seed_two_row_manifest(tmp_workspace)
+        request = AmendmentRequest.from_dict(
+            {**_sample_request_dict(), "files_to_add": [], "files_to_remove": ["tests/test_stale.py"]}
+        )
+        write_request(tmp_workspace, request)
+
+        apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)
+
+        content = wu.read_text(encoding="utf-8")
+        assert "removed 1 row(s): tests/test_stale.py" in content
+
+    def test_add_and_remove_in_one_request(self, tmp_workspace: Path) -> None:
+        """Both directions land together -- the combination AC-FINAL-015 can require.
+
+        The added path is a test file so the source-test atomicity rule is not
+        the thing under test here; that rule's interaction with removal is
+        covered by ``test_post_check_rollback_restores_both_directions``.
+        """
+        wu = self._seed_two_row_manifest(tmp_workspace)
+        request = AmendmentRequest.from_dict(
+            {
+                **_sample_request_dict(),
+                "files_to_add": [{"path": "tests/test_new_helper.py", "change": "add tests"}],
+                "files_to_remove": ["tests/test_stale.py"],
+            }
+        )
+        write_request(tmp_workspace, request)
+
+        apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)
+
+        files = [row.file for row in parse_manifest(wu.read_text(encoding="utf-8"))]
+        assert files == ["tests/test_example.py", "tests/test_new_helper.py"]
+
+    def test_post_check_rollback_restores_both_directions(self, tmp_workspace: Path) -> None:
+        """A Layer 3 failure rolls back the removal too -- never a half-amended Manifest.
+
+        Adding a production source with no paired test violates the source-test
+        atomicity rule, so ``_post_check`` rejects the amendment. The removal
+        requested alongside it must be undone as well, proving both operations
+        share one atomic envelope and that the existing post-check still guards
+        a removal without modification.
+        """
+        wu = self._seed_two_row_manifest(tmp_workspace)
+        before = wu.read_text(encoding="utf-8")
+        request = AmendmentRequest.from_dict(
+            {
+                **_sample_request_dict(),
+                "files_to_add": [{"path": "src/example/unpaired.py", "change": "add helper"}],
+                "files_to_remove": ["tests/test_stale.py"],
+            }
+        )
+        write_request(tmp_workspace, request)
+
+        with pytest.raises(AmendmentError, match="no matching test"):
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)
+
+        assert wu.read_text(encoding="utf-8") == before
+        files = [row.file for row in parse_manifest(wu.read_text(encoding="utf-8"))]
+        assert "tests/test_stale.py" in files, "the removal must be rolled back with the addition"
+
+    def test_undeclared_removal_fails_and_leaves_file_untouched(self, tmp_workspace: Path) -> None:
+        wu = tmp_workspace / "backlog" / "EX-F1-S1-T1.md"
+        before = wu.read_text(encoding="utf-8")
+        request = AmendmentRequest.from_dict(
+            {**_sample_request_dict(), "files_to_add": [], "files_to_remove": ["tests/never_declared.py"]}
+        )
+        write_request(tmp_workspace, request)
+
+        with pytest.raises(AmendmentError, match="not declared"):
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)
+
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_removing_every_row_is_refused(self, tmp_workspace: Path) -> None:
+        """A unit with an empty Manifest has nothing to verify staged changes against."""
+        request = AmendmentRequest.from_dict(
+            {**_sample_request_dict(), "files_to_add": [], "files_to_remove": ["tests/test_example.py"]}
+        )
+        write_request(tmp_workspace, request)
+
+        with pytest.raises(AmendmentError, match="at least one file"):
+            apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)

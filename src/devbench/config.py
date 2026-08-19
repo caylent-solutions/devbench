@@ -56,7 +56,11 @@ from devbench.constants import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
+    DEFAULT_MAX_TRANSPORT_RESTARTS,
     DEFAULT_MODEL_RATES,
+    DEFAULT_ORCHESTRATE_EFFORT,
+    DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS,
+    DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
     DEFAULT_PAUSE_BEFORE_MERGE,
@@ -71,6 +75,9 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+    VALID_ORCHESTRATE_EFFORTS,
     ModelRates,
 )
 
@@ -247,6 +254,16 @@ GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
     RUNTIME_CONFIG.timeouts.github_check,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
 )
+# db-262 / FR-17: orchestrator SDK message inactivity net. `cmd_start._run`
+# resolves this once at import time and awaits
+# `asyncio.wait_for(agen.__anext__(), timeout=ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS)`
+# per message; expiry raises `_OrchestrateInactivityTimeout` and is disposed
+# as a bounded fresh-session restart reusing `_resolve_max_quota_resumes`.
+ORCHESTRATOR_INACTIVITY_TIMEOUT_SECONDS: int = _resolve_int(
+    "DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT",
+    RUNTIME_CONFIG.timeouts.orchestrator_inactivity,
+    DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS,
+)
 # Issue #114: workflow-registration race defence. The retry loop runs
 # `gh pr checks` up to CHECK_REGISTRATION_RETRIES times when the local
 # `<repo>/.github/workflows/*.y[a]ml` glob proves CI exists but `gh`
@@ -263,6 +280,23 @@ CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
     "DEVBENCH_CHECK_REGISTRATION_DELAY_SECONDS",
     RUNTIME_CONFIG.debug.check_registration_delay_seconds,
     DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
+)
+# db-328 / FR-15: head-SHA-pinned CI check quorum (see
+# GitOpsService._confirm_check_quorum). Env-only knobs -- this task's
+# Changes Manifest scopes it to config.py, so no `debug:` YAML field is
+# added to config_loader.py and no DEFAULT_* constant is added to
+# constants.py; the defaults are declared locally, module-private, below.
+_DEFAULT_CHECK_QUORUM_STABLE_POLLS: int = 3
+_DEFAULT_CHECK_QUORUM_POLL_INTERVAL_SECONDS: int = 5
+CHECK_QUORUM_STABLE_POLLS: int = _resolve_int(
+    "DEVBENCH_CHECK_QUORUM_STABLE_POLLS",
+    None,
+    _DEFAULT_CHECK_QUORUM_STABLE_POLLS,
+)
+CHECK_QUORUM_POLL_INTERVAL_SECONDS: int = _resolve_int(
+    "DEVBENCH_CHECK_QUORUM_POLL_INTERVAL_SECONDS",
+    None,
+    _DEFAULT_CHECK_QUORUM_POLL_INTERVAL_SECONDS,
 )
 # Recency cap for the AWAITING_AUTO_RECOVERY audit-comment heuristic in
 # the 3-state blocked-task classifier. Lives under YAML `debug:` for
@@ -485,6 +519,48 @@ MAX_CASCADE_DEPTH: int = _resolve_int(
     "DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH",
     RUNTIME_CONFIG.orchestrate.max_cascade_depth,
     DEFAULT_MAX_CASCADE_DEPTH,
+)
+# SDK-transport restart bound and its exponential-backoff envelope.
+# env > YAML > default, matching MAX_CASCADE_DEPTH above. Kept separate from
+# DEVBENCH_MAX_QUOTA_RESUMES because a transport fault, unlike a quota window,
+# imposes no delay of its own -- see DEFAULT_MAX_TRANSPORT_RESTARTS.
+MAX_TRANSPORT_RESTARTS: int = _resolve_int(
+    "DEVBENCH_MAX_TRANSPORT_RESTARTS",
+    RUNTIME_CONFIG.orchestrate.max_transport_restarts,
+    DEFAULT_MAX_TRANSPORT_RESTARTS,
+)
+ORCHESTRATE_EFFORT: str = _resolve_str(
+    "DEVBENCH_ORCHESTRATE_EFFORT",
+    RUNTIME_CONFIG.orchestrate.effort,
+    DEFAULT_ORCHESTRATE_EFFORT,
+)
+if ORCHESTRATE_EFFORT not in VALID_ORCHESTRATE_EFFORTS:
+    raise ValueError(
+        f"orchestrate.effort must be one of {list(VALID_ORCHESTRATE_EFFORTS)}; got {ORCHESTRATE_EFFORT!r}. "
+        "Set it in backlog/config/devbench.yaml under 'orchestrate:' or via DEVBENCH_ORCHESTRATE_EFFORT."
+    )
+
+ORCHESTRATE_MAX_THINKING_TOKENS: int = _resolve_int(
+    "DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS",
+    RUNTIME_CONFIG.orchestrate.max_thinking_tokens,
+    DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS,
+)
+if ORCHESTRATE_MAX_THINKING_TOKENS <= 0:
+    raise ValueError(
+        "orchestrate.max_thinking_tokens must be a positive number of tokens; got "
+        f"{ORCHESTRATE_MAX_THINKING_TOKENS}. Remove the key to accept the default of "
+        f"{DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS}."
+    )
+
+TRANSPORT_RESTART_BACKOFF_BASE_SECONDS: float = _resolve_float(
+    "DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS",
+    RUNTIME_CONFIG.orchestrate.transport_restart_backoff_base_seconds,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
+)
+TRANSPORT_RESTART_BACKOFF_MAX_SECONDS: float = _resolve_float(
+    "DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS",
+    RUNTIME_CONFIG.orchestrate.transport_restart_backoff_max_seconds,
+    DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "DEVBENCH_STOP_MAX_BLOCKS",

@@ -56,6 +56,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from devbench.backlog.actionability import actionability_line
 from devbench.backlog.index_errors import exit_with_index_error
+from devbench.backlog.manager import count_review_fails_for_judge, resolve_judge_retry_budget
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
@@ -75,15 +76,25 @@ from devbench.config import (
     WORKSPACE_ROOT,
 )
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
     DEFAULT_SESSION_GAP_MINUTES,
+    LOG_DATE_FORMAT,
     LOG_NOISE_LOGGER_NAME,
     MIN_PACE_SAMPLES,
+    MINUTES_PER_HOUR,
     MS_PER_SECOND,
     PERCENT_MULTIPLIER,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
+)
+from devbench.drain import (
+    DRAIN_SIGNAL_NAME,
+    SESSION_DRAIN_SIGNAL_FILENAME,
+    SESSION_SESSIONS_BASE_DIR,
+    DrainState,
+    _parse_drain_signal,
 )
 from devbench.instances import pid_file_path
 from devbench.reporting.event_index import EventIndex
@@ -94,8 +105,6 @@ _log = logging.getLogger("devbench.reporting.report")
 # Match a log line of the form "YYYY-MM-DDTHH:MM:SSZ [logger.name] LEVEL ...",
 # capturing the ISO-8601 timestamp (group 1) and the logger name (group 2).
 _LOG_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z \[([^\]]+)\]", re.MULTILINE)
-_DONE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to 'done'", re.MULTILINE)
-_PROGRESS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to 'in-progress'", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -188,6 +197,16 @@ class WindowStats:
     # number of the most-recent completions dropped from ``recent_pace_minutes``
     # for having no execution window.
     recent_pace_excluded_count: int = 0
+    # Issue #329 FR-6: count of in-window candidate "in-progress" rows that
+    # were never genuine transitions -- rejected because they failed the
+    # FR-1a ``logger = _TRANSITION_LOGGER`` predicate (an echoed log line
+    # such as a `devbench.cli` SDK payload quoting a prior transition).
+    # Orthogonal to ``pace_excluded_count``/``recent_pace_excluded_count``:
+    # those name completions with NO valid execution window; this names
+    # candidate rows that were never a transition in the first place. Zero
+    # for every window computed without ``unfiltered_progress_claim_counts``
+    # (the default), which keeps a clean log byte-identical (spec AC-19).
+    rejected_row_count: int = 0
     # Wall-clock completion moment = now() + est_hours. None when est_hours is
     # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
     # to the resolved display timezone.
@@ -360,6 +379,33 @@ def _same_session(a: datetime, b: datetime, boundaries: Sequence[datetime]) -> b
     default for direct callers that have no log to segment.
     """
     return _session_index_for(a, boundaries) == _session_index_for(b, boundaries)
+
+
+def _execution_anchor(
+    claims: Sequence[datetime],
+    done_at: datetime,
+    boundaries: Sequence[datetime],
+) -> datetime | None:
+    """Return the earliest same-session claim ``<= done_at``, or ``None``.
+
+    Issue #329 FR-2: the correct anchor for a genuinely re-claimed task's
+    execution window is its FIRST same-session claim, not the most recent
+    one -- a task claimed twice in the same session was actively worked from
+    the first claim onward, so measuring from the last claim understates the
+    elapsed time (spec D-2: review-bounce time inside a session counts as
+    elapsed, predictive of an ETA). A claim strictly later than ``done_at``
+    (clock anomaly) is never eligible, and neither is a claim in a different
+    orchestrator session (``_same_session``). Returns ``None`` when no claim
+    satisfies both conditions -- the caller counts the completion as excluded
+    rather than defaulting to a zero-length or synthetic window.
+
+    This is the SINGLE place both anchor consumers (``_compute_window_stats``
+    and ``_recent_pace_minutes``) obtain their anchor from (AC-11); neither
+    re-implements this selection. Pure and raise-free: an empty ``claims``
+    sequence simply has no eligible entries.
+    """
+    eligible = [claim for claim in claims if claim <= done_at and _same_session(claim, done_at, boundaries)]
+    return min(eligible) if eligible else None
 
 
 def _walk_for_session_boundary(events: list[datetime], gap_minutes: int) -> datetime | None:
@@ -802,7 +848,7 @@ def _compute_cost(
 
 def _recent_pace_minutes(
     done_times: dict[str, datetime],
-    progress_times: dict[str, datetime],
+    progress_claims: dict[str, list[datetime]],
     session_starts: Sequence[datetime],
     n: int,
 ) -> tuple[float | None, int]:
@@ -811,17 +857,22 @@ def _recent_pace_minutes(
     Looks log-wide (not window-bounded) so the metric reflects current
     orchestrator pace rather than being anchored by historical completions.
 
-    Issue #326 (FR-2): a completion is a valid sample iff it has an
-    ``in-progress`` anchor (``tid in progress_times``) AND that anchor is in
-    the same orchestrator session as ``done`` (``_same_session``, boundaries
-    from ``session_starts``) AND the resulting duration is positive. The
-    first two failure modes mean the completion has no execution window at
-    all -- it is counted in the returned ``excluded`` total instead of
-    contributing a duration. Walking stops once ``n`` valid samples are
-    gathered. Returns ``(None, excluded)`` when fewer than ``n`` valid
-    samples exist log-wide; otherwise returns ``(statistics.median(durations),
-    excluded)`` -- the median replaces the pre-#326 arithmetic mean so a
-    single stale-claim completion cannot dominate the estimate.
+    Issue #326 (FR-2): a completion is a valid sample iff ``_execution_anchor``
+    resolves an anchor for it (a same-session claim, from ``progress_claims[tid]``,
+    that is no later than ``done``, boundaries from ``session_starts``) AND the
+    resulting duration is positive. ``anchor is None`` means the completion has
+    no execution window at all -- it is counted in the returned ``excluded``
+    total instead of contributing a duration. Walking stops once ``n`` valid
+    samples are gathered. Returns ``(None, excluded)`` when fewer than ``n``
+    valid samples exist log-wide; otherwise returns
+    ``(statistics.median(durations), excluded)`` -- the median replaces the
+    pre-#326 arithmetic mean so a single stale-claim completion cannot
+    dominate the estimate.
+
+    Issue #329 FR-2: ``progress_claims[tid]`` is the FULL time series of a
+    task's claims (ascending), not just its most recent one, so a task
+    re-claimed twice in the same session is measured from its FIRST claim
+    (see ``_execution_anchor``).
 
     Pure and raise-free: ``statistics.median`` is only reached once
     ``len(durations) == n >= 1``, so it never sees an empty sequence.
@@ -831,14 +882,11 @@ def _recent_pace_minutes(
     durations: list[float] = []
     excluded = 0
     for tid, dt in task_done:
-        if tid not in progress_times:
+        anchor = _execution_anchor(progress_claims.get(tid, []), dt, session_starts)
+        if anchor is None:
             excluded += 1
             continue
-        claim_time = progress_times[tid]
-        if not _same_session(claim_time, dt, session_starts):
-            excluded += 1
-            continue
-        dur = (dt - claim_time).total_seconds() / SECONDS_PER_MINUTE
+        dur = (dt - anchor).total_seconds() / SECONDS_PER_MINUTE
         if dur > 0:
             durations.append(dur)
         if len(durations) >= n:
@@ -1047,7 +1095,7 @@ def _compute_window_stats(
     window_start: datetime,
     window_end: datetime,
     done_times: dict[str, datetime],
-    progress_times: dict[str, datetime],
+    progress_claims: dict[str, list[datetime]],
     tasks_active: int,
     tasks_blocked_recovery: int = 0,
     tasks_blocked_auto: int = 0,
@@ -1057,6 +1105,7 @@ def _compute_window_stats(
     recent_per_task_cost: float | None = None,
     lifetime_total_cost: float | None = None,
     session_starts: Sequence[datetime] = (),
+    unfiltered_progress_claim_counts: dict[str, int] | None = None,
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
@@ -1093,6 +1142,30 @@ def _compute_window_stats(
     execution window are counted in ``pace_excluded_count`` /
     ``recent_pace_excluded_count`` and surfaced in the rendered cells
     instead of silently narrowing the sample set.
+
+    Issue #329 FR-2: ``progress_claims[tid]`` is the FULL time series of a
+    task's claims (ascending), not just its most recent one. The anchor for
+    each in-window completion is resolved via ``_execution_anchor`` (the
+    minimum same-session claim ``<= done_at``), so a task re-claimed twice in
+    the same session is measured from its FIRST claim, not its last. The
+    ``max(anchor, window_start)`` clamp is unchanged: a claim before the
+    window start is clamped to the window boundary, not the raw claim time.
+
+    Issue #329 FR-6: ``unfiltered_progress_claim_counts`` is the per-task
+    count of candidate "in-progress" rows BEFORE the FR-1a
+    ``logger = _TRANSITION_LOGGER`` predicate is applied -- i.e. before
+    non-genuine (echoed) rows are dropped. It is ``None`` by default, which
+    yields ``rejected_row_count == 0`` (the byte-identical, clean-log case,
+    spec AC-19): a cache built entirely under the current ingestion code
+    never populates ``transition``/``task_id`` for an echoed line (FR-1b), so
+    there is nothing to report. A caller supplies real counts only when it
+    has one -- ``generate_report`` sources it from
+    ``EventIndex.task_transition_candidate_counts_for_workspace``, whose
+    docstring explains why the difference is non-zero only for a cache that
+    predates the FR-1b ingestion hardening. A task present in
+    ``progress_claims`` but absent from this mapping falls back to its own
+    filtered count (zero rejected for that task) rather than manufacturing a
+    spurious rejection.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -1101,11 +1174,22 @@ def _compute_window_stats(
 
     task_durations: list[float] = []
     pace_excluded_count = 0
+    rejected_row_count = 0
     for tid in task_ids_done:
-        if tid not in progress_times or not _same_session(progress_times[tid], done_times[tid], session_starts):
+        filtered_claim_count = len(progress_claims.get(tid, []))
+        if unfiltered_progress_claim_counts is not None:
+            unfiltered_claim_count = unfiltered_progress_claim_counts.get(tid, filtered_claim_count)
+            assert unfiltered_claim_count >= filtered_claim_count, (
+                f"unfiltered candidate count {unfiltered_claim_count} for task {tid!r} is smaller "
+                f"than its logger-filtered claim count {filtered_claim_count}; the logger-filtered "
+                "set can never be larger than the unfiltered candidates it was drawn from"
+            )
+            rejected_row_count += unfiltered_claim_count - filtered_claim_count
+        anchor = _execution_anchor(progress_claims.get(tid, []), done_times[tid], session_starts)
+        if anchor is None:
             pace_excluded_count += 1
             continue
-        effective_start = max(progress_times[tid], window_start)
+        effective_start = max(anchor, window_start)
         dur = (done_times[tid] - effective_start).total_seconds() / SECONDS_PER_MINUTE
         if dur > 0:
             task_durations.append(dur)
@@ -1113,12 +1197,16 @@ def _compute_window_stats(
     avg_minutes = statistics.median(task_durations) if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
 
     recent_pace_minutes, recent_pace_excluded_count = _recent_pace_minutes(
-        done_times, progress_times, session_starts, RECENT_PACE_TASKS
+        done_times, progress_claims, session_starts, RECENT_PACE_TASKS
     )
 
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
     eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto + tasks_blocked_runtime_degradation
-    est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
+    # pace_for_projection is minutes/task (avg_minutes or recent_pace_minutes,
+    # both derived from total_seconds() / SECONDS_PER_MINUTE elsewhere in this
+    # function), so the correct divisor here is MINUTES_PER_HOUR, not
+    # SECONDS_PER_MINUTE -- see constants.py (#329 FR-5).
+    est_hours = (eta_task_count * pace_for_projection) / MINUTES_PER_HOUR if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
     #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
@@ -1230,6 +1318,7 @@ def _compute_window_stats(
         pace_excluded_count=pace_excluded_count,
         recent_pace_minutes=recent_pace_minutes,
         recent_pace_excluded_count=recent_pace_excluded_count,
+        rejected_row_count=rejected_row_count,
         est_completion_at=est_completion_at,
         eta_active=tasks_active,
         eta_blocked_recovery=tasks_blocked_recovery,
@@ -1505,6 +1594,212 @@ def _liveness_body_not_running(
         f"(last seen {seen}) but no process is claiming this workspace",
         _COLOR_YELLOW,
     )
+
+
+# Issue #331 FR-4. Mirrors cli.py's own restart-arm marker
+# (``_ORCHESTRATOR_TRANSPORT_RESTART_AUDIT_PREFIX = "[ORCHESTRATOR_TRANSPORT_RESTART]"``,
+# logged by ``_should_restart_after_transport_error`` via
+# ``logger.info("%s attempt=%d max=%d", ...)``) by literal text, not by
+# import: ``devbench report`` runs in a separate process from
+# ``devbench start`` and only ever sees the persisted log, and importing
+# from ``cli`` here would be circular (``cli.py`` imports this module for
+# ``cmd_report``). The line is anchored start-to-end (timestamp, logger,
+# level, marker, and the ``attempt=<n> max=<cap>`` suffix cli.py's
+# ``logger.info`` call actually emits under ``LOG_FORMAT`` /
+# ``LOG_DATE_FORMAT``) so a restart marker merely quoted inside an
+# unrelated SDK message -- the same echoed-text hazard
+# ``event_index.py``'s ``_TASK_TRANSITION_RE`` already guards against for
+# task transitions -- cannot inflate the count.
+# The ``backoff=<n>s`` suffix is OPTIONAL on purpose: cli.py started recording
+# the restart delay only when transport restarts gained their own backoff, and
+# a log that predates that change still carries genuine restart lines without
+# it. Making the suffix required would silently drop every historical restart
+# from the count -- the exact class of silent-miscount bug this anchored regex
+# exists to prevent.
+_TRANSPORT_RESTART_LOG_LINE_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) \[[^\]]+\] \w+ "
+    r"\[ORCHESTRATOR_TRANSPORT_RESTART\] attempt=\d+ max=\d+(?: backoff=[\d.]+s)?$"
+)
+
+
+def _transport_restart_timestamps(log_path: Path) -> list[datetime]:
+    """Return the timestamp of every genuine transport-restart audit line.
+
+    Streams the file a line at a time rather than materialising it: the
+    orchestrator log is append-only and unrotated, and on a long-lived
+    workspace it reaches hundreds of megabytes, all of which the previous
+    ``read_text()`` pulled into memory on every single report refresh.
+
+    Only line-initial logger records count. A restart marker quoted inside an
+    unrelated SDK payload is not a restart -- the same echoed-text hazard
+    ``event_index.py``'s ``_TASK_TRANSITION_RE`` guards against.
+
+    **Byte-identical records are counted once.** The orchestrator log carries
+    every record twice: measured across five separate days of one workspace's
+    log, line-initial ``[devbench.*]`` records ran ~1.93x their distinct count
+    on every day. Counting raw matches therefore reported roughly double the
+    restarts that actually happened -- which is worse than a cosmetic error now
+    that the number is read against a cap: a reader seeing "12 of 14" would
+    believe the run was two restarts from halting when it was six from it.
+    De-duplication lives here, at the read, because the doubling is already
+    baked into hundreds of megabytes of existing log; fixing whatever emits
+    twice cannot retroactively correct a single historical count.
+
+    The de-duplication key is the whole record -- timestamp, attempt ordinal,
+    cap and backoff. Two GENUINE restarts collide only if they share a
+    wall-clock second AND an attempt ordinal, which within one run is
+    impossible (the ordinal strictly increments) and across concurrent runs on
+    one workspace is vanishingly unlikely. That residual risk undercounts by
+    one in a case that should not occur; the alternative overcounts by 2x in
+    the case that always occurs.
+
+    Args:
+        log_path: Path to the orchestrator log.
+
+    Returns:
+        Timestamps in file order (chronological for an append-only log), each
+        timezone-aware in UTC, one per distinct restart record. Empty when the
+        log holds no restart lines.
+    """
+    timestamps: list[datetime] = []
+    seen_records: set[str] = set()
+    with log_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            record = raw_line.rstrip("\n")
+            match = _TRANSPORT_RESTART_LOG_LINE_RE.match(record)
+            if match is None or record in seen_records:
+                continue
+            seen_records.add(record)
+            timestamps.append(datetime.strptime(match.group("timestamp"), LOG_DATE_FORMAT).replace(tzinfo=UTC))
+    return timestamps
+
+
+def _count_transport_restarts_since(timestamps: Sequence[datetime], start: datetime | None) -> int:
+    """Count restarts at or after *start*; all of them when *start* is ``None``.
+
+    Pure function over already-read timestamps so the windowing logic stays
+    independently testable from the file I/O in
+    :func:`_transport_restart_timestamps`.
+
+    Args:
+        timestamps: Restart timestamps, as returned by
+            :func:`_transport_restart_timestamps`.
+        start: Inclusive window start, or ``None`` for "no lower bound".
+
+    Returns:
+        The number of timestamps in the window.
+    """
+    if start is None:
+        return len(timestamps)
+    return sum(1 for stamp in timestamps if stamp >= start)
+
+
+def transport_restarts_line(
+    log_path: Path,
+    session_start: datetime | None = None,
+    report_started_at: datetime | None = None,
+) -> str | None:
+    """Render the transport-restart row for ``devbench report`` (#331 FR-4).
+
+    Every count is explicitly labelled with the window it measures. The row
+    previously rendered a single bare number counted over the WHOLE log while
+    sitting directly above a table whose columns are All-time / Session / This
+    run, so a reader attached it to the narrowest column. On a long-lived
+    workspace that is badly misleading: a five-day-old restart storm renders as
+    a four-figure number beside a healthy current run, which reads as an
+    in-progress failure. The windows here are the same ones the table uses, so
+    the two now agree by construction.
+
+    The all-time count decides whether the row appears at all, preserving the
+    "no row when it would say nothing" contract (spec D-6, AC-11): a workspace
+    that has never had a transport restart renders no row.
+
+    Args:
+        log_path: Path to the orchestrator log (``generate_report``'s own
+            ``log_path`` parameter).
+        session_start: Start of the current orchestrator session, or ``None``
+            to omit the session count.
+        report_started_at: Start of the report watch loop, or ``None`` (the
+            non-watch case) to omit the this-run count.
+
+    Returns:
+        The rendered row, or ``None`` when the log does not exist or holds no
+        restarts at all.
+    """
+    if not log_path.is_file():
+        return None
+    timestamps = _transport_restart_timestamps(log_path)
+    all_time = _count_transport_restarts_since(timestamps, None)
+    assert all_time >= 0, f"transport restart count is negative: {all_time} -- impossible by construction"
+    if all_time == 0:
+        return None
+    parts = [f"{all_time} all-time"]
+    if session_start is not None:
+        parts.append(f"{_count_transport_restarts_since(timestamps, session_start)} session")
+    if report_started_at is not None:
+        parts.append(f"{_count_transport_restarts_since(timestamps, report_started_at)} this run")
+    return f"Transport restarts        {' / '.join(parts)}"
+
+
+def _optional_banner_rows(*rows: str | None) -> list[str]:
+    """Return the rows that have something to say, in the order given.
+
+    Each banner-adjacent row builder returns ``None`` when it would say nothing,
+    so a clean run's report stays byte-identical. Collecting them here keeps
+    ``generate_report`` free of one conditional append per row.
+    """
+    return [row for row in rows if row is not None]
+
+
+def review_rejections_line(units: list[WorkUnit], budget_for_judge: Callable[[str], int]) -> str | None:
+    """Render the per-judge review-rejection row for ``devbench report``.
+
+    A task can spend hours and a large token budget looping through review
+    rejections while every other health signal reads green: the process is
+    alive, the log is advancing, and no error is ever logged. That failure mode
+    is indistinguishable from steady progress unless the rejection count is
+    surfaced, so this row exists to make a stalling task visible before the
+    budget is spent rather than after.
+
+    Only non-terminal units with at least one recorded ``REVIEW_FAIL`` are
+    reported, and only the judges that actually failed. Returns ``None`` when
+    there is nothing to say, following ``transport_restarts_line``'s
+    "no row when it wouldn't say anything" contract so a clean run's report
+    stays byte-identical.
+
+    Args:
+        units: Work units from the backlog index (only in-progress and blocked
+            tasks are considered; a done unit's history is not actionable).
+        budget_for_judge: Resolves a judge's effective retry budget, so the row
+            shows rounds spent against rounds allowed rather than a bare count.
+
+    Returns:
+        ``"Review rejections        <id> doc_review 3/10"`` style text (one
+        task per line), or ``None`` when no non-terminal task has any rejection.
+    """
+    entries: list[str] = []
+    for unit in units:
+        if unit.status not in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.BLOCKED):
+            continue
+        try:
+            content = unit.file_path.read_text(encoding="utf-8")
+        except OSError:
+            # An unreadable work unit is surfaced by the checks that need its
+            # content; it must not take the whole report down.
+            continue
+        counts = [
+            (judge, count)
+            for judge in sorted(ALL_REQUIRED_JUDGE_NAMES)
+            if (count := count_review_fails_for_judge(content, judge)) > 0
+        ]
+        if not counts:
+            continue
+        detail = ", ".join(f"{judge} {count}/{budget_for_judge(judge)}" for judge, count in counts)
+        entries.append(f"{unit.id} {detail}")
+
+    if not entries:
+        return None
+    return "Review rejections        " + "; ".join(entries)
 
 
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
@@ -1929,6 +2224,27 @@ def _no_execution_window_suffix(excluded: int) -> str:
     return f" ({excluded} excluded: no execution window)"
 
 
+def _rejected_rows_suffix(rejected: int) -> str:
+    """Return the value-cell suffix naming candidate rows rejected as non-transition lines.
+
+    Issue #329 (FR-6): ``""`` when nothing was rejected -- keeps the rendered
+    cell byte-identical to the pre-#329 form. Otherwise
+    ``" (<rejected> non-transition rows rejected)"``. Orthogonal to
+    ``_no_execution_window_suffix`` (#326): that suffix names completions
+    that have no valid execution window at all; this one names candidate
+    matches that were never genuine status transitions in the first place
+    (e.g. an echoed log line). The suffix interpolates only an ``int``, so no
+    formatting call in this helper can raise; a negative ``rejected`` is
+    impossible by construction (the logger-filtered count can never exceed
+    the unfiltered candidate count it is drawn from -- see the assertion in
+    ``_compute_window_stats``), so this helper documents that invariant by
+    trusting its caller rather than defensively clamping.
+    """
+    if rejected == 0:
+        return ""
+    return f" ({rejected} non-transition rows rejected)"
+
+
 def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS.
 
@@ -1940,6 +2256,12 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     dropped for having no execution window. The suffix is empty when nothing
     was dropped, so the zero-drop cells stay byte-identical to the pre-#326
     form.
+
+    Issue #329 (FR-6): both cells then append ``_rejected_rows_suffix(...)``,
+    AFTER the #326 suffix, naming any candidate rows rejected as
+    non-transition lines. Empty when nothing was rejected, so a clean log
+    (zero excluded, zero rejected) still renders byte-identically (spec
+    AC-19).
     """
     # API utilization > 100% means API time exceeds wall time -- concurrent
     # subagent calls (legitimate parallelism) or two orchestrators writing to
@@ -1970,11 +2292,16 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     # orchestrator session) so the reader can see the sample was pruned
     # rather than being silently narrowed.
     avg_min_display += _no_execution_window_suffix(stats.pace_excluded_count)
+    # Issue #329 (FR-6): name candidate rows rejected as non-transition
+    # lines, AFTER the #326 suffix (documented composition order).
+    avg_min_display += _rejected_rows_suffix(stats.rejected_row_count)
     # Recent pace is log-wide; same value across all window columns. None
     # when fewer than RECENT_PACE_TASKS completions exist.
     recent_pace_display = (
-        "n/a" if stats.recent_pace_minutes is None else f"{stats.recent_pace_minutes:.1f} min"
-    ) + _no_execution_window_suffix(stats.recent_pace_excluded_count)
+        ("n/a" if stats.recent_pace_minutes is None else f"{stats.recent_pace_minutes:.1f} min")
+        + _no_execution_window_suffix(stats.recent_pace_excluded_count)
+        + _rejected_rows_suffix(stats.rejected_row_count)
+    )
     est_hours_display = _format_est_hours_display(stats)
     # Wall-clock completion datetime rendered in the resolved display TZ.
     # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
@@ -2895,6 +3222,59 @@ def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
     return rendered
 
 
+def read_all_drain_states(workspace: Path) -> list[tuple[str | None, DrainState]]:
+    """Scan every drain signal in *workspace* without mutating any of them.
+
+    db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2): the enforcement
+    reader :func:`devbench.drain.read_drain_state` is env-gated -- its
+    two-candidate scan is governed by ``DEVBENCH_SESSION_NAME``, so a
+    per-session signal at
+    ``<workspace>/.devbench/sessions/<name>/drain.signal`` is invisible to a
+    caller whose shell never exported that variable. This reader is display-
+    only and unconditional: it always checks the workspace-root signal AND
+    every per-session signal directory, regardless of the environment, so an
+    operator scanning ``report`` / ``status`` / ``drain --status`` sees every
+    pending drain no matter which session (if any) wrote it.
+
+    Reuses :class:`~devbench.drain.DrainState` and
+    :func:`devbench.drain._parse_drain_signal` from ``devbench.drain`` by
+    read-only import. Never unlinks a signal file, so the drain mutation
+    surface (:func:`devbench.drain.read_drain_state`,
+    :func:`devbench.drain.consume_drain`, :func:`devbench.drain.cancel_drain`,
+    :func:`devbench.drain._both_signal_paths`) is untouched and keeps its
+    existing two-candidate, env-gated semantics.
+
+    Args:
+        workspace: Root directory of the devbench workspace.
+
+    Returns:
+        A list of ``(session_name, DrainState)`` tuples. ``session_name`` is
+        ``None`` for the workspace-root signal and the session directory
+        name for a per-session signal. The workspace-root entry (when
+        present) is listed first, followed by per-session entries sorted by
+        directory name for a deterministic display order.
+
+    Raises:
+        ValueError: A signal file contains invalid JSON, a non-dict JSON
+            root, or an unparseable ``requested_at`` value.
+        KeyError: A signal file is missing a required field.
+    """
+    states: list[tuple[str | None, DrainState]] = []
+
+    root_signal = workspace / DRAIN_SIGNAL_NAME
+    if root_signal.exists():
+        states.append((None, _parse_drain_signal(root_signal)))
+
+    sessions_dir = workspace / SESSION_SESSIONS_BASE_DIR
+    if sessions_dir.is_dir():
+        for session_dir in sorted((p for p in sessions_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
+            session_signal = session_dir / SESSION_DRAIN_SIGNAL_FILENAME
+            if session_signal.exists():
+                states.append((session_dir.name, _parse_drain_signal(session_signal)))
+
+    return states
+
+
 def generate_report(
     log_path: Path,
     since: datetime | None = None,
@@ -2996,6 +3376,13 @@ def generate_report(
 
     backlog = _backlog_totals_from_units(units)
 
+    # Per-judge review-rejection row. Rendered only when non-None so a run with
+    # no rejections stays byte-identical, matching transport_restarts_row above.
+    # Resolved lazily per judge from the same config the enforcement in
+    # ``cli.cmd_log_verdict`` reads, so the row can never disagree with the
+    # budget actually being applied.
+    review_rejections_row = review_rejections_line(units, resolve_judge_retry_budget)
+
     # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index
     # against the orchestrator log + hook log + transcripts (each call
     # is a mtime+size check + delta-only re-parse on append, full
@@ -3017,11 +3404,42 @@ def generate_report(
     event_index.refresh_transcripts(transcript_dir)
 
     done_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(WORKSPACE_ROOT, log_path, "done")
+    # Issue #329 FR-2: ``progress_times`` (most-recent claim per task) still
+    # feeds ``_recent_per_task_cost`` below, unchanged. ``progress_claims``
+    # (every claim per task, ascending) feeds the two window-stats/pace
+    # consumers so ``_execution_anchor`` can select the earliest same-session
+    # claim instead of the most recent one.
     progress_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(
+        WORKSPACE_ROOT, log_path, "in-progress"
+    )
+    progress_claims: dict[str, list[datetime]] = event_index.task_transition_time_series_for_workspace(
+        WORKSPACE_ROOT, log_path, "in-progress"
+    )
+    # Issue #329 FR-6: the unfiltered (pre-FR-1a) candidate count per task,
+    # for the provenance suffix. Non-zero only for a cache that predates the
+    # FR-1b ingestion hardening and has not been rebuilt -- see
+    # ``EventIndex.task_transition_candidate_counts_for_workspace``.
+    progress_claim_candidate_counts: dict[str, int] = event_index.task_transition_candidate_counts_for_workspace(
         WORKSPACE_ROOT, log_path, "in-progress"
     )
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
+
+    # Current-session boundary, resolved ONCE here and reused by both the
+    # transport-restart row below and the windowed table further down, so the
+    # row and the table's "Session" column can never disagree.
+    detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
+    session_start = detected_session if detected_session is not None else log_start_for_window
+
+    # Transport-restart row (issue #331 FR-4), counted per window against the
+    # same boundaries the table uses. Rendered only when the log holds at least
+    # one restart, so a clean workspace stays byte-identical to today
+    # (spec D-6, AC-11).
+    transport_restarts_row = transport_restarts_line(
+        log_path,
+        session_start=session_start,
+        report_started_at=report_started_at,
+    )
 
     # Issue #326 (FR-5): compute the full session segmentation ONCE, from the
     # same non-noise timestamp source the current-session detector already
@@ -3063,7 +3481,7 @@ def generate_report(
             log_start_for_window,
             window_end,
             done_times,
-            progress_times,
+            progress_claims,
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
@@ -3071,12 +3489,13 @@ def generate_report(
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
             session_starts=session_starts,
+            unfiltered_progress_claim_counts=progress_claim_candidate_counts,
         )
         if log_started is not None
         else None
     )
 
-    lines: list[str] = [banner_line, ""]
+    lines: list[str] = [banner_line, *_optional_banner_rows(transport_restarts_row, review_rejections_row), ""]
 
     # Spanning-row follow-up: thread the All-time cost (already paid in
     # lifetime_stats above) as the additive base for every narrower
@@ -3095,7 +3514,7 @@ def generate_report(
             since,
             window_end,
             done_times,
-            progress_times,
+            progress_claims,
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
@@ -3104,6 +3523,7 @@ def generate_report(
             recent_per_task_cost=recent_per_task_cost,
             lifetime_total_cost=lifetime_total_cost,
             session_starts=session_starts,
+            unfiltered_progress_claim_counts=progress_claim_candidate_counts,
         )
         lines.extend(backlog_state_block)
         lines.append("")
@@ -3125,8 +3545,6 @@ def generate_report(
         windows: list[WindowSpec] = [
             WindowSpec(label="All-time", start=log_start_for_window, is_log_started=True),
         ]
-        detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
-        session_start = detected_session if detected_session is not None else log_start_for_window
         windows.append(WindowSpec(label="Session", start=session_start, is_log_started=False))
         if report_started_at is not None:
             windows.append(WindowSpec(label="This run", start=report_started_at, is_log_started=False))
@@ -3142,7 +3560,7 @@ def generate_report(
                         w.start,
                         window_end,
                         done_times,
-                        progress_times,
+                        progress_claims,
                         backlog.tasks_active,
                         backlog.tasks_blocked_recovery,
                         backlog.tasks_blocked_auto,
@@ -3150,6 +3568,7 @@ def generate_report(
                         recent_per_task_cost=recent_per_task_cost,
                         lifetime_total_cost=lifetime_total_cost,
                         session_starts=session_starts,
+                        unfiltered_progress_claim_counts=progress_claim_candidate_counts,
                     )
                 )
 

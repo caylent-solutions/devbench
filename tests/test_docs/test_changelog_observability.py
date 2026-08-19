@@ -95,6 +95,26 @@ def _current_release_section(text: str) -> str:
     return _extract_section(text, match.group(0))
 
 
+def _section_containing(text: str, phrase: str) -> str:
+    """Return the ``## [...]`` version section that contains *phrase*.
+
+    Pinning the FR-D2 entry to the *newest* section was still over-specified:
+    cutting a release renames the section the entry sits in, and opening a new
+    ``## [Unreleased] -- v-next`` above it moves the entry out of "newest"
+    again. The durable invariant is that the entry is recorded under a
+    ``### Fixed`` block somewhere in the changelog, not that it sits in
+    whichever section happens to be first. Resolve the owning section instead.
+    """
+    match = _VERSION_HEADING_RE.search(text)
+    while match is not None:
+        section = _extract_section(text, match.group(0))
+        if phrase in section:
+            return section
+        nxt = _VERSION_HEADING_RE.search(text, match.end())
+        match = nxt
+    return ""
+
+
 def _extract_bullet(text: str, start_phrase: str) -> str:
     """Return one CHANGELOG bullet's full text, from *start_phrase* to the
     next bullet or heading boundary.
@@ -134,10 +154,10 @@ class TestCurrentSectionFixedSubsectionExists:
 
     def test_current_section_fixed_subsection_exists(self) -> None:
         text = _read_doc()
-        current = _current_release_section(text)
-        assert current, "CHANGELOG.md must contain a '## [<version>]' or '## [Unreleased]' section."
-        fixed_section = _extract_section(current, "### Fixed")
-        assert fixed_section, "The newest '## [...]' section must contain a '### Fixed' subsection."
+        owning = _section_containing(text, _D2_START_PHRASE)
+        assert owning, f"No '## [...]' section contains {_D2_START_PHRASE!r}."
+        fixed_section = _extract_section(owning, "### Fixed")
+        assert fixed_section, "The section carrying the FR-D2 entry must contain a '### Fixed' subsection."
 
 
 @pytest.mark.unit
@@ -147,13 +167,13 @@ class TestFrD2InstancesEntry:
 
     def test_entry_exists_under_current_fixed(self) -> None:
         text = _read_doc()
-        current = _current_release_section(text)
-        assert current, "CHANGELOG.md must contain a '## [<version>]' or '## [Unreleased]' section."
-        fixed_section = _extract_section(current, "### Fixed")
-        assert fixed_section, "The newest '## [...]' section must contain a '### Fixed' subsection."
+        owning = _section_containing(text, _D2_START_PHRASE)
+        assert owning, f"No '## [...]' section contains {_D2_START_PHRASE!r}."
+        fixed_section = _extract_section(owning, "### Fixed")
+        assert fixed_section, "The section carrying the FR-D2 entry must contain a '### Fixed' subsection."
         assert _D2_START_PHRASE in fixed_section, (
-            "The newest '## [...]' -> '### Fixed' subsection must carry the FR-D2 "
-            f"instances entry starting {_D2_START_PHRASE!r} (spec Section 4 FR-5(a), AC-13)."
+            "The FR-D2 instances entry must sit under a '### Fixed' subsection of its own "
+            f"'## [...]' section, starting {_D2_START_PHRASE!r} (spec Section 4 FR-5(a), AC-13)."
         )
 
     def test_entry_names_the_workspace_root_join_and_source_lines(self) -> None:

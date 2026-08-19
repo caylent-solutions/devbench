@@ -148,6 +148,23 @@ class TestSlackPayload:
         assert "*Backlog*" in fields_block["fields"][0]["text"]
         assert "*Task*" in fields_block["fields"][1]["text"]
 
+    def test_default_mention_is_here_unchanged(self) -> None:
+        """No ``mention`` kwarg -- byte-identical to the pre-FR-18 behaviour."""
+        payload = notifications._build_slack_payload(summary="x", fields=[], context=None)
+        assert payload["text"].startswith("<!here> ")
+        assert "<!here>" in payload["blocks"][0]["text"]["text"]
+
+    def test_mention_none_omits_here_prefix(self) -> None:
+        payload = notifications._build_slack_payload(
+            summary="x",
+            fields=[],
+            context=None,
+            mention=notifications.MENTION_LEVEL_NONE,
+        )
+        assert not payload["text"].startswith("<!here>")
+        assert "<!here>" not in payload["blocks"][0]["text"]["text"]
+        assert payload["text"] == "x"
+
 
 # ---------------------------------------------------------------------------
 # Per-event dispatchers — gating + payload shape
@@ -386,28 +403,101 @@ class TestPerEventPayloads:
         assert "ready for manual merge" in payload["text"].lower()
 
     def test_orchestrator_stop_with_inflight(self) -> None:
+        """Rewritten in place (db-271) for the new
+        ``notify_orchestrator_stop(reason, in_flight_unit_id, progress=None)``
+        signature -- reason is a completion-class label (``clean exit: ...``)
+        so this also pins that a completion stop still carries the in-flight
+        field even though it no longer pings ``<!here>``."""
         payload = self._capture_one(
             notifications.notify_orchestrator_stop,
-            "clean",
+            "clean exit: ALL_DONE",
             "E0-F1-S1-T1",
+            progress=(3, 5),
             event_name="orchestrator_stop",
         )
         assert "Orchestrator stopped" in payload["text"]
         # In-flight WU appears in a structured field.
         field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
         assert "E0-F1-S1-T1" in field_blob
+        assert "3/5 done" in field_blob
 
     def test_orchestrator_stop_without_inflight(self) -> None:
+        """Rewritten in place (db-271) for the new signature -- also pins
+        that ``progress=None`` omits the ``Progress`` field entirely, no
+        test asserts the old unconditional ``<!here>`` for this expected
+        (completion-class) stop."""
         payload = self._capture_one(
             notifications.notify_orchestrator_stop,
-            "clean",
+            "clean exit: ALL_DONE",
             None,
+            progress=None,
             event_name="orchestrator_stop",
         )
-        # In-flight field absent (only the Reason field present).
+        # In-flight and Progress fields absent (only the Reason field present).
         for block in payload["blocks"]:
             for f in block.get("fields", []):
                 assert "In-flight" not in f.get("text", "")
+                assert "Progress" not in f.get("text", "")
+        # Completion class -> no `<!here>` push (AC-E12-F3-S1-T1-2).
+        assert not payload["text"].startswith("<!here>")
+
+    def test_orchestrator_stop_progress_field(self) -> None:
+        """AC-E12-F3-S1-T1-3: the ``Progress`` field reads ``X/Y done`` when
+        ``progress=(done, total)`` is passed."""
+        payload = self._capture_one(
+            notifications.notify_orchestrator_stop,
+            "drain enforced: operator requested",
+            None,
+            progress=(7, 12),
+            event_name="orchestrator_stop",
+        )
+        field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
+        assert "7/12 done" in field_blob
+
+    def test_orchestrator_stop_completion_has_no_here(self) -> None:
+        """AC-E12-F3-S1-T1-2: an expected completion stop posts silently."""
+        payload = self._capture_one(
+            notifications.notify_orchestrator_stop,
+            "clean exit: NO_ACTIONABLE -- 190/212 done, 11 blocked",
+            None,
+            event_name="orchestrator_stop",
+        )
+        assert not payload["text"].startswith("<!here>")
+        assert "<!here>" not in payload["blocks"][0]["text"]["text"]
+
+    def test_orchestrator_stop_premature_pings_here(self) -> None:
+        """AC-E12-F3-S1-T1-2: a premature turn end is attention-worthy."""
+        payload = self._capture_one(
+            notifications.notify_orchestrator_stop,
+            "premature turn end -- SDK loop exhausted with no terminal sentinel (ALL_DONE / NO_ACTIONABLE)",
+            None,
+            event_name="orchestrator_stop",
+        )
+        assert payload["text"].startswith("<!here> ")
+
+    def test_orchestrator_stop_crash_pings_here(self) -> None:
+        """Fallback fail-visible: an unrecognised / crash reason still pings
+        ``<!here>`` so an unmapped stop-class is never silently posted."""
+        payload = self._capture_one(
+            notifications.notify_orchestrator_stop,
+            "crash: RuntimeError: boom",
+            None,
+            event_name="orchestrator_stop",
+        )
+        assert payload["text"].startswith("<!here> ")
+
+    def test_work_unit_done_still_pings_here(self) -> None:
+        """AC-E12-F3-S1-T1-5 regression pin: threading ``mention`` through
+        ``_dispatch`` / ``_build_slack_payload`` must not change any
+        non-stop dispatcher's default -- ``work_unit_done`` still pings
+        ``<!here>`` unconditionally."""
+        payload = self._capture_one(
+            notifications.notify_work_unit_done,
+            "E0-F1-S1-T1",
+            "Sample",
+            event_name="work_unit_done",
+        )
+        assert payload["text"].startswith("<!here> ")
 
     def test_auto_restart(self) -> None:
         payload = self._capture_one(
@@ -924,6 +1014,46 @@ class TestStopClassTaxonomy:
         assert mapping[notifications.STOP_CLASS_QUOTA_EXHAUSTED] == notifications.MENTION_LEVEL_HERE
 
 
+class TestStopClassTaxonomyExtension:
+    """db-271 (spec FR-18 Part B): the four remaining stop classes -- completion,
+    premature-turn-end, drain, operator-interrupt -- plus their mention-map
+    defaults (OD-1=A: crash / quota-exhausted / premature-turn-end -> here;
+    completion / drain / operator-interrupt -> none)."""
+
+    @pytest.mark.parametrize(
+        "stop_class_attr",
+        [
+            "STOP_CLASS_COMPLETION",
+            "STOP_CLASS_PREMATURE_TURN_END",
+            "STOP_CLASS_DRAIN",
+            "STOP_CLASS_OPERATOR_INTERRUPT",
+        ],
+    )
+    def test_new_stop_class_is_member_of_all_stop_classes(self, stop_class_attr: str) -> None:
+        stop_class = getattr(notifications, stop_class_attr)
+        assert stop_class in notifications.ALL_STOP_CLASSES
+
+    @pytest.mark.parametrize(
+        ("stop_class_attr", "expected_mention_attr"),
+        [
+            ("STOP_CLASS_CRASH", "MENTION_LEVEL_HERE"),
+            ("STOP_CLASS_QUOTA_EXHAUSTED", "MENTION_LEVEL_HERE"),
+            ("STOP_CLASS_PREMATURE_TURN_END", "MENTION_LEVEL_HERE"),
+            ("STOP_CLASS_COMPLETION", "MENTION_LEVEL_NONE"),
+            ("STOP_CLASS_DRAIN", "MENTION_LEVEL_NONE"),
+            ("STOP_CLASS_OPERATOR_INTERRUPT", "MENTION_LEVEL_NONE"),
+        ],
+    )
+    def test_default_mention_map_matches_od_1(self, stop_class_attr: str, expected_mention_attr: str) -> None:
+        mapping = notifications.DEFAULT_ORCHESTRATOR_STOP_MENTION_MAP
+        stop_class = getattr(notifications, stop_class_attr)
+        expected_mention = getattr(notifications, expected_mention_attr)
+        assert mapping[stop_class] == expected_mention
+
+    def test_mention_level_none_value(self) -> None:
+        assert notifications.MENTION_LEVEL_NONE == "none"
+
+
 class TestValidateStopMentionMap:
     """Task-specific error path: unknown stop-class key raises ValueError naming the allowed set."""
 
@@ -970,9 +1100,7 @@ class TestClassifyStopClass:
     @pytest.mark.parametrize(
         "reason",
         [
-            "clean exit: ALL_DONE",
             "crash: unexpected SIGKILL",
-            "interrupted by operator",
             "",
             "totally-unrecognised-reason",
         ],
@@ -981,6 +1109,39 @@ class TestClassifyStopClass:
         """Fail-visible fallback: an unrecognised reason must never be silently
         dropped -- it always resolves to a concrete, alertable stop-class."""
         assert notifications.classify_stop_class(reason) == notifications.STOP_CLASS_CRASH
+
+
+class TestClassifyStopClassNewClasses:
+    """db-271 (spec FR-18 Part B): prefix arms for the four new reason shapes
+    plus the crash fallback (AC-E12-F3-S1-T1-4).  ``"clean exit: ALL_DONE"``
+    and ``"interrupted by operator"`` used to be covered by the
+    crash-fallback parametrization in :class:`TestClassifyStopClass` above;
+    this extension supersedes that -- they now classify distinctly instead
+    of falling through."""
+
+    @pytest.mark.parametrize(
+        ("reason", "expected_class_attr"),
+        [
+            ("clean exit: ALL_DONE", "STOP_CLASS_COMPLETION"),
+            (
+                "clean exit: NO_ACTIONABLE -- 190/212 done, 11 blocked",
+                "STOP_CLASS_COMPLETION",
+            ),
+            ("clean exit (SystemExit 0)", "STOP_CLASS_COMPLETION"),
+            (
+                "premature turn end -- SDK loop exhausted with no terminal sentinel (ALL_DONE / NO_ACTIONABLE)",
+                "STOP_CLASS_PREMATURE_TURN_END",
+            ),
+            ("drain enforced: operator requested", "STOP_CLASS_DRAIN"),
+            ("interrupted by operator (Ctrl+C / SIGINT)", "STOP_CLASS_OPERATOR_INTERRUPT"),
+            ("interrupted by operator", "STOP_CLASS_OPERATOR_INTERRUPT"),
+            ("crash: RuntimeError: boom", "STOP_CLASS_CRASH"),
+            ("totally-unrecognised-reason", "STOP_CLASS_CRASH"),
+        ],
+    )
+    def test_classify_stop_class_new_classes(self, reason: str, expected_class_attr: str) -> None:
+        expected_class = getattr(notifications, expected_class_attr)
+        assert notifications.classify_stop_class(reason) == expected_class
 
 
 class TestNotifyQuotaWaiting:

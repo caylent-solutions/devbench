@@ -8,8 +8,11 @@ handling, and the command registry are all covered end-to-end.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -87,6 +90,43 @@ def _build_workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _build_target_repo(tmp_path: Path, staged: tuple[str, ...] = ()) -> Path:
+    """Create a real git repo whose *staged* paths are staged against a baseline commit.
+
+    ``cmd_request_amendment`` runs the Layer 1 pre-filter, which asks git which
+    paths are staged and which have any change at all, so the amendment path
+    needs a genuine repo rather than a stub.
+    """
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@ex.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+    (repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "baseline.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+    for rel in staged:
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("content\n", encoding="utf-8")
+        subprocess.run(["git", "add", rel], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+@contextlib.contextmanager
+def _amendment_cli_context(workspace: Path, repo: Path) -> Iterator[None]:
+    """Patch the module globals ``cmd_request_amendment`` resolves the target repo through."""
+    with (
+        patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+        patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/example": repo}),
+        patch("devbench.cli.resolve_repo", return_value="caylent-solutions/example"),
+        patch("devbench.cli.validate_repo", return_value=None),
+    ):
+        yield
+
+
 def _valid_payload() -> dict[str, Any]:
     return {
         "reason": "tdd_green_production_fix",
@@ -112,9 +152,10 @@ class TestAmendmentLifecycleHappyPath:
     ) -> None:
         workspace = _build_workspace(tmp_path)
         task_id = "EX-F1-S1-T1"
+        repo = _build_target_repo(tmp_path, staged=("src/example/example.py",))
 
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_valid_payload())))
-        with patch("devbench.cli.WORKSPACE_ROOT", workspace):
+        with _amendment_cli_context(workspace, repo):
             rc_request = cli.cmd_request_amendment(task_id)
         assert rc_request == 0, capsys.readouterr().err
 
@@ -145,9 +186,10 @@ class TestAmendmentLifecycleRejectPath:
     ) -> None:
         workspace = _build_workspace(tmp_path)
         task_id = "EX-F1-S1-T1"
+        repo = _build_target_repo(tmp_path, staged=("src/example/example.py",))
 
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_valid_payload())))
-        with patch("devbench.cli.WORKSPACE_ROOT", workspace):
+        with _amendment_cli_context(workspace, repo):
             assert cli.cmd_request_amendment(task_id) == 0, capsys.readouterr().err
 
         with (
@@ -288,14 +330,15 @@ class TestAmendmentLifecycleDuplicateRequest:
     ) -> None:
         workspace = _build_workspace(tmp_path)
         task_id = "EX-F1-S1-T1"
+        repo = _build_target_repo(tmp_path, staged=("src/example/example.py",))
 
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_valid_payload())))
-        with patch("devbench.cli.WORKSPACE_ROOT", workspace):
+        with _amendment_cli_context(workspace, repo):
             assert cli.cmd_request_amendment(task_id) == 0
 
         # Second call with identical payload must be refused.
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_valid_payload())))
-        with patch("devbench.cli.WORKSPACE_ROOT", workspace):
+        with _amendment_cli_context(workspace, repo):
             rc = cli.cmd_request_amendment(task_id)
         assert rc == 1
 
@@ -364,3 +407,103 @@ class TestAmendmentLifecycleRateLimitAtOrchestration:
 
         with pytest.raises(Exception, match="already exists"):
             write_request(workspace, req)
+
+
+class TestAmendmentLifecycleRowRemoval:
+    """End-to-end row removal, with the no-diff safety property proven against real git.
+
+    ``AC-FINAL-015`` requires the Changes Manifest to match the files git
+    changed exactly, so a declared row whose file has a zero-line diff is a real
+    violation the ``changes_manifest`` judge fails a unit for. Before
+    ``files_to_remove`` existed the judge's prescribed remedy was
+    unimplementable: an amendment could only add.
+    """
+
+    def _removal_payload(self, path: str = "tests/test_example.py") -> dict[str, Any]:
+        return {
+            "reason": "tdd_green_production_fix",
+            "justification": "The declared row has a zero-line diff; its work landed elsewhere.",
+            "files_to_add": [],
+            "files_to_remove": [path],
+            "linked_acs": ["AC-TEST-001"],
+        }
+
+    def _two_row_workspace(self, tmp_path: Path) -> Path:
+        workspace = _build_workspace(tmp_path)
+        wu = workspace / "backlog" / "EX-F1-S1-T1.md"
+        wu.write_text(
+            wu.read_text(encoding="utf-8").replace(
+                "| `tests/test_example.py` | new unit tests |",
+                "| `tests/test_example.py` | new unit tests |\n| `tests/test_stale.py` | modify |",
+            ),
+            encoding="utf-8",
+        )
+        return workspace
+
+    def test_clean_row_is_removed_end_to_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace = self._two_row_workspace(tmp_path)
+        task_id = "EX-F1-S1-T1"
+        repo = _build_target_repo(tmp_path)
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(self._removal_payload("tests/test_stale.py"))))
+        with _amendment_cli_context(workspace, repo):
+            assert cli.cmd_request_amendment(task_id) == 0, capsys.readouterr().err
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            assert cli.cmd_apply_amendment(task_id) == 0, capsys.readouterr().err
+
+        wu_content = (workspace / "backlog" / f"{task_id}.md").read_text(encoding="utf-8")
+        assert [r.file for r in parse_manifest(wu_content)] == ["tests/test_example.py"]
+        assert AMENDMENT_APPLIED_ACTION in wu_content
+
+    def test_staged_change_blocks_removal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Arm 1 of the safety property: git diff --cached."""
+        workspace = self._two_row_workspace(tmp_path)
+        repo = _build_target_repo(tmp_path, staged=("tests/test_stale.py",))
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(self._removal_payload("tests/test_stale.py"))))
+        with _amendment_cli_context(workspace, repo):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+
+        assert rc == 1
+        assert "tests/test_stale.py" in capsys.readouterr().err
+        assert not request_path(workspace, "EX-F1-S1-T1").exists()
+
+    def test_unstaged_tracked_change_blocks_removal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Arm 2: a worktree-only edit is real work that staged-only checks miss."""
+        workspace = self._two_row_workspace(tmp_path)
+        repo = _build_target_repo(tmp_path, staged=("tests/test_stale.py",))
+        subprocess.run(["git", "commit", "-m", "land it"], cwd=repo, check=True, capture_output=True)
+        (repo / "tests/test_stale.py").write_text("edited but not staged\n", encoding="utf-8")
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(self._removal_payload("tests/test_stale.py"))))
+        with _amendment_cli_context(workspace, repo):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+
+        assert rc == 1
+        assert "tests/test_stale.py" in capsys.readouterr().err
+
+    def test_untracked_file_blocks_removal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Arm 3: an untracked declared file is uncommitted work, not absence of work."""
+        workspace = self._two_row_workspace(tmp_path)
+        repo = _build_target_repo(tmp_path)
+        (repo / "tests").mkdir(parents=True, exist_ok=True)
+        (repo / "tests/test_stale.py").write_text("brand new, never added\n", encoding="utf-8")
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(self._removal_payload("tests/test_stale.py"))))
+        with _amendment_cli_context(workspace, repo):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+
+        assert rc == 1
+        assert "tests/test_stale.py" in capsys.readouterr().err

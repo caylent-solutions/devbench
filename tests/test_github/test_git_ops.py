@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -691,7 +692,56 @@ class TestCreateTag:
 
 
 class TestWaitForChecks:
-    """Test wait_for_checks method."""
+    """Test wait_for_checks method.
+
+    db-328 / FR-15: once `gh pr checks --watch` returns rc==0, the green
+    verdict is gated on a head-SHA-pinned, stability-confirmed check-run
+    quorum (`_confirm_check_quorum`). The helpers below build a `_gh`
+    side_effect that dispatches on the three call shapes involved:
+    the watch call, `gh pr view --json headRefOid`, and
+    `gh api repos/<repo>/commits/<sha>/check-runs --paginate`.
+    """
+
+    @staticmethod
+    def _head_sha_json(sha: str) -> str:
+        import json as _json
+
+        return _json.dumps({"headRefOid": sha})
+
+    @staticmethod
+    def _check_runs_json(runs: list[dict[str, object]]) -> str:
+        import json as _json
+
+        return _json.dumps({"check_runs": runs})
+
+    @staticmethod
+    def _run(run_id: str, status: str = "completed", conclusion: str | None = "success") -> dict[str, object]:
+        return {"id": run_id, "status": status, "conclusion": conclusion, "name": f"job-{run_id}"}
+
+    @classmethod
+    def _quorum_gh_stub(
+        cls,
+        watch_result: tuple[int, str, str],
+        head_sha: str,
+        check_runs_polls: list[list[dict[str, object]]],
+    ):
+        """Return a `_gh` side_effect: watch call -> head-SHA call -> N check-runs polls."""
+        polls_iter = iter(check_runs_polls)
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return watch_result
+            if args[:2] == ["pr", "view"]:
+                return (0, cls._head_sha_json(head_sha), "")
+            if args and args[0] == "api":
+                try:
+                    runs = next(polls_iter)
+                except StopIteration as exc:
+                    raise AssertionError("check-runs API polled more times than the test stubbed") from exc
+                return (0, cls._check_runs_json(runs), "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        return fake_gh
 
     def test_validates_repo(self) -> None:
         judge = GitOpsService()
@@ -699,8 +749,16 @@ class TestWaitForChecks:
             judge.wait_for_checks("evil/repo", 1)
 
     def test_returns_true_on_success(self, tmp_path: Path) -> None:
+        """A stable, all-completed, all-good head-SHA check-run set returns True. AC-4"""
+        from devbench.github import git_ops as git_ops_mod
+
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "All checks passed", "")):
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), "sha-success", [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
     def test_returns_false_on_failure(self, tmp_path: Path) -> None:
@@ -715,19 +773,33 @@ class TestWaitForChecks:
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
     def test_uses_custom_timeout(self, tmp_path: Path) -> None:
+        from devbench.github import git_ops as git_ops_mod
+
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
+        fake_gh = self._quorum_gh_stub((0, "", ""), "sha-timeout-knob", [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
             judge.wait_for_checks("caylent-solutions/git-repo", 42, timeout=999, repo_path=tmp_path)
 
-        _, kwargs = mock_gh.call_args
+        _, kwargs = mock_gh.call_args_list[0]
         assert kwargs.get("timeout") == 999
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
+        from devbench.github import git_ops as git_ops_mod
+
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
+        fake_gh = self._quorum_gh_stub((0, "", ""), "sha-repo-flag", [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
             judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
 
-        _, kwargs = mock_gh.call_args
+        _, kwargs = mock_gh.call_args_list[0]
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
     def test_no_checks_with_workflow_files_retries_then_succeeds(self, tmp_path: Path) -> None:
@@ -735,7 +807,8 @@ class TestWaitForChecks:
 
         Mock `gh pr checks` to return "no checks reported" the first call,
         then a clean exit on the second. The retry loop should bridge the
-        gap and return True without merging blind.
+        gap and, once the watch call returns rc==0, still confirm the
+        head-SHA quorum before declaring green.
         """
         from devbench.github import git_ops as git_ops_mod
 
@@ -743,10 +816,25 @@ class TestWaitForChecks:
         workflows_dir = tmp_path / ".github" / "workflows"
         workflows_dir.mkdir(parents=True)
         (workflows_dir / "ci.yml").write_text("on: push\n")
-        responses = [(1, "", "no checks reported"), (0, "All checks passed", "")]
+        watch_calls = {"n": 0}
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:3] == ["pr", "checks", "42"]:
+                watch_calls["n"] += 1
+                if watch_calls["n"] == 1:
+                    return (1, "", "no checks reported")
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json("sha-114-retry"), "")
+            if args and args[0] == "api":
+                return (0, self._check_runs_json([self._run("r1")]), "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
         with (
-            patch.object(judge, "_gh", side_effect=responses),
+            patch.object(judge, "_gh", side_effect=fake_gh),
             patch.object(git_ops_mod, "CHECK_REGISTRATION_DELAY_SECONDS", 0),
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
         ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
@@ -768,6 +856,194 @@ class TestWaitForChecks:
             patch.object(git_ops_mod, "CHECK_REGISTRATION_RETRIES", 2),
         ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
+
+    def test_wait_for_checks_pins_head_sha(self, tmp_path: Path) -> None:
+        """The green verdict resolves the head SHA and queries check-runs at that SHA. AC-2"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "deadbeef1234567890"
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, [[self._run("r1")]])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 1),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        assert result is True
+        calls = mock_gh.call_args_list
+        view_calls = [c for c in calls if c.args[0][:2] == ["pr", "view"]]
+        assert len(view_calls) == 1
+        assert view_calls[0].args[0] == ["pr", "view", "42", "--json", "headRefOid"]
+        api_calls = [c for c in calls if c.args[0][0] == "api"]
+        assert len(api_calls) == 1
+        expected_endpoint = f"repos/caylent-solutions/git-repo/commits/{head_sha}/check-runs"
+        assert api_calls[0].args[0] == ["api", expected_endpoint, "--paginate"]
+
+    def test_wait_for_checks_not_green_on_partial_registration(self, tmp_path: Path) -> None:
+        """A check-run that first appears on a later poll resets stability. AC-1"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "sha-partial-registration"
+        # Poll 1: only r1 registered and already completed. Poll 2: r2 appears
+        # (still queued) -- resets stability. Poll 3: r2 has completed and the
+        # id set now matches poll 2 -- 2 consecutive matching polls satisfies
+        # CHECK_QUORUM_STABLE_POLLS=2, so green is declared only at poll 3.
+        polls = [
+            [self._run("r1")],
+            [self._run("r1"), self._run("r2", status="queued", conclusion=None)],
+            [self._run("r1"), self._run("r2")],
+        ]
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, polls)
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 2),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        assert result is True
+        api_calls = [c for c in mock_gh.call_args_list if c.args[0][0] == "api"]
+        assert len(api_calls) == 3, "verdict must be withheld until the set is stable across 3 polls"
+
+    def test_wait_for_checks_fail_fast_on_unstable_timeout(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The check-run set never stabilizes; the method refuses to merge with the FR-15 string. AC-3"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "sha-never-stable"
+        # Every poll introduces a differently-shaped, incomplete set -- stability
+        # never accrues.
+        polls = [
+            [self._run("r1", status="in_progress", conclusion=None)],
+            [self._run("r2", status="in_progress", conclusion=None)],
+        ]
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, polls)
+        monotonic_values = iter([0.0, 0.0, 20.0])
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 5),
+            patch("devbench.github.git_ops.time.sleep"),
+            patch("devbench.github.git_ops.time.monotonic", side_effect=lambda: next(monotonic_values)),
+            caplog.at_level("WARNING", logger="devbench.git_ops"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, timeout=15, repo_path=tmp_path)
+
+        assert result is False
+        api_calls = [c for c in mock_gh.call_args_list if c.args[0][0] == "api"]
+        assert len(api_calls) == 2
+        expected = (
+            "wait_for_checks: PR #42 on caylent-solutions/git-repo: check set never stabilized "
+            f"at head {head_sha} within 20s (1 check-runs, 1 still pending across the last 2 "
+            "polls). Refusing to merge. Inspect: gh api repos/caylent-solutions/git-repo/commits/"
+            f"{head_sha}/check-runs."
+        )
+        assert expected in caplog.text
+
+    def test_wait_for_checks_failing_conclusion_returns_false(self, tmp_path: Path) -> None:
+        """Any completed check-run with a bad conclusion refuses the merge immediately. AC-4"""
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        head_sha = "sha-failing-run"
+        polls = [[self._run("r1", conclusion="success"), self._run("r2", conclusion="failure")]]
+        fake_gh = self._quorum_gh_stub((0, "All checks passed", ""), head_sha, polls)
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh) as mock_gh,
+            patch.object(git_ops_mod, "CHECK_QUORUM_STABLE_POLLS", 3),
+            patch("devbench.github.git_ops.time.sleep"),
+        ):
+            result = judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        assert result is False
+        api_calls = [c for c in mock_gh.call_args_list if c.args[0][0] == "api"]
+        assert len(api_calls) == 1, "a failing conclusion must short-circuit further polling"
+
+    def test_wait_for_checks_raises_when_head_sha_resolution_fails(self, tmp_path: Path) -> None:
+        """A `gh pr view` failure on the head-SHA lookup surfaces loudly -- never swallowed into green."""
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (1, "", "gh: could not resolve to a PullRequest")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="failed to resolve head SHA"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_head_sha_json_malformed(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, "{not json", "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="malformed 'gh pr view"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_head_sha_empty(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json(""), "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with patch.object(judge, "_gh", side_effect=fake_gh), pytest.raises(RuntimeError, match="empty headRefOid"):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_check_runs_api_fails(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json("sha-api-fail"), "")
+            if args and args[0] == "api":
+                return (1, "", "gh: rate limited")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="failed to query check-runs"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_wait_for_checks_raises_when_check_runs_json_malformed(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+
+        def fake_gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if args[:2] == ["pr", "checks"]:
+                return (0, "All checks passed", "")
+            if args[:2] == ["pr", "view"]:
+                return (0, self._head_sha_json("sha-bad-json"), "")
+            if args and args[0] == "api":
+                return (0, "{not json", "")
+            raise AssertionError(f"unexpected _gh call: {args}")
+
+        with (
+            patch.object(judge, "_gh", side_effect=fake_gh),
+            pytest.raises(RuntimeError, match="malformed check-runs JSON"),
+        ):
+            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
 
 
 class TestListWorkflowFiles:
@@ -843,20 +1119,198 @@ class TestUpdateParentSubmoduleRef:
 
 
 class TestGitHelper:
-    """Test _git helper method."""
+    """Test _git helper method.
+
+    #332 FR-3 / AC-9, AC-10, AC-11: ``_git()`` must authenticate on the same
+    ``GH_TOKEN`` the ``gh`` helper (:meth:`GitOpsService._gh`) already uses,
+    carried only through the subprocess environment -- never in ``argv``, a
+    remote URL, or a log line.
+    """
 
     def test_raises_runtime_error_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch("devbench.github.git_ops.run_command", return_value=(1, "", "fatal: error")):
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok"),
+            patch("devbench.github.git_ops.run_command", return_value=(1, "", "fatal: error")),
+        ):
             with pytest.raises(RuntimeError, match=r"git .* failed"):
                 judge._git(["status"], tmp_path)
 
     def test_returns_tuple_on_success(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch("devbench.github.git_ops.run_command", return_value=(0, "output", "")):
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok"),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "output", "")),
+        ):
             rc, stdout, stderr = judge._git(["status"], tmp_path)
         assert rc == 0
         assert stdout == "output"
+
+    def test_git_carries_gh_token_via_env(self, tmp_path: Path) -> None:
+        """AC-9: ``_git()`` resolves ``get_gh_token()`` and threads it through env."""
+        judge = GitOpsService()
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok-abc-123"),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")) as mock_run,
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["env"]["GH_TOKEN"] == "tok-abc-123"
+
+    def test_git_token_never_in_argv_or_remote_url(self, tmp_path: Path) -> None:
+        """AC-9: the token value never appears in any element of argv (incl. a remote URL)."""
+        judge = GitOpsService()
+        token = "tok-abc-123"
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value=token),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")) as mock_run,
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        cmd = mock_run.call_args.args[0]
+        assert all(token not in part for part in cmd), f"token leaked into argv: {cmd}"
+        assert all("@" not in part or token not in part for part in cmd), f"token leaked into a URL: {cmd}"
+
+    def test_git_debug_log_never_contains_token(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-11: no log line emitted by ``_git()`` renders the token value."""
+        judge = GitOpsService()
+        token = "tok-super-secret-999"
+        caplog.set_level(logging.DEBUG, logger="devbench.git_ops")
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value=token),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "ok stdout", "")),
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        assert token not in caplog.text
+
+    def test_git_failing_push_raises_with_stderr_surfaced(self, tmp_path: Path) -> None:
+        """AC-10: a failing push exits non-zero (via RuntimeError) with git's stderr surfaced."""
+        judge = GitOpsService()
+        stderr = "remote: No anonymous write access. fatal: Authentication failed for 'https://github.com/x/y.git/'"
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value="tok"),
+            patch("devbench.github.git_ops.run_command", return_value=(1, "", stderr)),
+        ):
+            with pytest.raises(RuntimeError, match="Authentication failed"):
+                judge._git(["push", "origin", "feature/x"], tmp_path)
+
+    def test_git_raises_when_token_unavailable(self, tmp_path: Path) -> None:
+        """A missing token fails fast at get_gh_token() before any subprocess runs, for a remote op."""
+        judge = GitOpsService()
+        with (
+            patch(
+                "devbench.github.git_ops.get_gh_token",
+                side_effect=RuntimeError("GitHub token not found. Provide it via ..."),
+            ),
+            patch("devbench.github.git_ops.run_command") as mock_run,
+        ):
+            with pytest.raises(RuntimeError, match="GitHub token not found"):
+                judge._git(["push", "origin", "feature/x"], tmp_path)
+        mock_run.assert_not_called()
+
+    def test_git_credential_helper_resolves_token_from_env_via_real_git(self, tmp_path: Path) -> None:
+        """The real ``credential.helper`` string _git() builds genuinely reads GH_TOKEN.
+
+        Captures the exact argv/env ``_git()`` constructs for a remote
+        subcommand (``push``), then re-executes it through git's own
+        ``credential fill`` plumbing -- the same mechanism a real ``git
+        push`` uses internally to fetch credentials -- so a shell syntax
+        bug in the inline helper (invisible to a fully-mocked test) fails
+        this test.
+        """
+        judge = GitOpsService()
+        token = "test-token-value-xyz"
+        captured_cmd: list[str] = []
+        captured_env: dict[str, str] | None = None
+
+        def _capture_run_command(
+            cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            nonlocal captured_cmd, captured_env
+            captured_cmd = cmd
+            captured_env = env
+            return 0, "", ""
+
+        with (
+            patch("devbench.github.git_ops.get_gh_token", return_value=token),
+            patch("devbench.github.git_ops.run_command", side_effect=_capture_run_command),
+        ):
+            judge._git(["push", "origin", "feature/x"], tmp_path)
+
+        # The first five elements are git plus two -c flags: an empty-valued
+        # credential.helper reset (so an ambient system/global helper cannot
+        # also answer, and potentially win over, this one) followed by the
+        # helper that reads GH_TOKEN. See GitOpsService._git's docstring.
+        helper_prefix = captured_cmd[:5]
+        assert helper_prefix[0] == "git"
+        assert helper_prefix[1] == "-c"
+        assert helper_prefix[2] == "credential.helper="
+        assert helper_prefix[3] == "-c"
+        assert helper_prefix[4].startswith("credential.helper=")
+
+        result = subprocess.run(
+            [*helper_prefix, "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True,
+            text=True,
+            env=captured_env,
+            cwd=tmp_path,
+            check=True,
+        )
+        assert f"password={token}" in result.stdout
+        assert "username=x-access-token" in result.stdout
+
+    def test_git_local_subcommand_never_calls_get_gh_token(self, tmp_path: Path) -> None:
+        """AC-E17-F2-S1-T3-1/2: a local-only subcommand (status) never resolves GH_TOKEN and runs with env=None."""
+        judge = GitOpsService()
+        with (
+            patch("devbench.github.git_ops.get_gh_token") as mock_token,
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")) as mock_run,
+        ):
+            judge._git(["status"], tmp_path)
+
+        mock_token.assert_not_called()
+        assert mock_run.call_args.kwargs["env"] is None
+        cmd = mock_run.call_args.args[0]
+        assert cmd == ["git", "status"]
+
+    def test_git_local_add_and_commit_succeed_without_any_token(self, tmp_path: Path) -> None:
+        """AC-E17-F2-S1-T3-2: real ``git add``/``git commit`` through _git() succeed with no token resolvable.
+
+        Reproduces the batch PR #334 CI symptom (get_gh_token raising
+        'GitHub token not found') and proves local subcommands never
+        trigger it: get_gh_token is patched to raise, and the two local
+        git operations must still complete against a real subprocess.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for init_args in (
+            ["init", "-q"],
+            ["config", "user.email", "x@y.z"],
+            ["config", "user.name", "test"],
+            ["config", "commit.gpgsign", "false"],
+        ):
+            subprocess.run(["git", "-C", str(repo), *init_args], check=True)
+        (repo / "file.txt").write_text("hello\n")
+
+        judge = GitOpsService()
+        with patch(
+            "devbench.github.git_ops.get_gh_token",
+            side_effect=RuntimeError("GitHub token not found. Provide it via ..."),
+        ) as mock_token:
+            judge._git(["add", "file.txt"], repo)
+            judge._git(["commit", "-m", "add file"], repo)
+
+        mock_token.assert_not_called()
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--oneline"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "add file" in log.stdout
 
 
 class TestGhHelper:
@@ -1208,6 +1662,138 @@ class TestCommitScopedToManifest:
                 manifest_files=["mine.py"],
                 stage_all=True,
             )
+
+
+@pytest.mark.unit
+class TestStagedDeletionPathspecExclusion:
+    """A Manifest delete row commits cleanly (db-310).
+
+    On git 2.55.0, once the executor ``git rm``s a Manifest delete-row path,
+    the file is gone from the worktree, so ``_stage_for_commit`` re-adding it
+    via a plain pathspec (``git add -- <path>``) dies with
+    ``fatal: pathspec '<path>' did not match any files`` (exit 128) even
+    though the deletion is already correctly staged. ``_stage_for_commit``
+    must exclude exactly the paths that are BOTH already staged as deletions
+    AND absent from the worktree, so the commit succeeds without losing
+    fail-fast behavior on a genuinely bogus path. Spec FR-14, AC-33, AC-34.
+    """
+
+    def test_commit_local_handles_manifest_delete_row(self, tmp_path: Path) -> None:
+        """A delete-row (`git rm`) plus another change commits cleanly. AC-33"""
+        repo = _real_repo(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "theirs.py"], check=True)
+        (repo / "mine.py").write_text("edited by the unit\n")  # left unstaged
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo",
+            repo,
+            "feature/x",
+            "E0-F1-S1-T1: delete row plus edit",
+            manifest_files=["mine.py", "theirs.py"],
+        )
+
+        committed = _committed_files(repo)
+        assert committed == {"mine.py", "theirs.py"}
+        assert not (repo / "theirs.py").exists()
+        assert (repo / "mine.py").read_text() == "edited by the unit\n"
+
+    def test_commit_local_manifest_all_deletions_skips_add(self, tmp_path: Path) -> None:
+        """An all-deletions Manifest skips `git add` entirely; the deletion still commits. AC-34"""
+        judge = GitOpsService()
+        repo = _real_repo(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "theirs.py"], check=True)
+
+        with patch.object(judge, "_git", wraps=judge._git) as spy:
+            judge.commit_local(
+                "caylent-solutions/git-repo",
+                repo,
+                "feature/x",
+                "E0-F1-S1-T1: deletion only",
+                manifest_files=["theirs.py"],
+            )
+
+        add_calls = [call.args[0] for call in spy.call_args_list if call.args[0][0] == "add"]
+        assert add_calls == [], f"git add must be skipped, all Manifest paths already staged-deleted: {add_calls}"
+        assert _committed_files(repo) == {"theirs.py"}
+        assert not (repo / "theirs.py").exists()
+
+    def test_commit_local_manifest_bogus_path_still_fails(self, tmp_path: Path) -> None:
+        """A bogus, never-existed Manifest path still trips `git add`'s exit-128 fail-fast. AC-34"""
+        repo = _real_repo(tmp_path)
+
+        with pytest.raises(RuntimeError, match=r"did not match any files"):
+            GitOpsService().commit_local(
+                "caylent-solutions/git-repo",
+                repo,
+                "feature/x",
+                "msg",
+                manifest_files=["never-existed.py"],
+            )
+
+    def test_commit_local_manifest_unstaged_rm_deletion_still_committed(self, tmp_path: Path) -> None:
+        """A plain (unstaged) `rm` of a Manifest path is still staged and committed. FR-14 boundary"""
+        repo = _real_repo(tmp_path)
+        (repo / "theirs.py").unlink()  # plain rm, NOT `git rm` -- deletion is not yet staged
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo",
+            repo,
+            "feature/x",
+            "E0-F1-S1-T1: unstaged deletion",
+            manifest_files=["theirs.py"],
+        )
+
+        assert _committed_files(repo) == {"theirs.py"}
+        assert not (repo / "theirs.py").exists()
+
+    def test_commit_local_manifest_git_rm_then_recreated_commits_new_content(self, tmp_path: Path) -> None:
+        """A `git rm`'d-then-recreated path (present in the worktree) is re-added, not excluded. FR-14 boundary"""
+        repo = _real_repo(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "theirs.py"], check=True)
+        (repo / "theirs.py").write_text("recreated content\n")
+
+        GitOpsService().commit_local(
+            "caylent-solutions/git-repo",
+            repo,
+            "feature/x",
+            "E0-F1-S1-T1: recreate after git rm",
+            manifest_files=["theirs.py"],
+        )
+
+        assert _committed_files(repo) == {"theirs.py"}
+        assert (repo / "theirs.py").read_text() == "recreated content\n"
+
+    def test_commit_and_push_excludes_staged_deletions_from_add(self, tmp_path: Path) -> None:
+        """commit_and_push inherits the fix via _stage_for_commit with no per-caller edits. AC-33"""
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["diff", "--cached", "--name-only", "--diff-filter=D"]:
+                return (0, "deleted.py\n", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "D  deleted.py\nM  mine.py\n", "")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.Path.exists", return_value=False),
+        ):
+            judge.commit_and_push(
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+                "msg",
+                manifest_files=["mine.py", "deleted.py"],
+            )
+
+        add_calls = [c for c in git_calls if c[0] == "add"]
+        assert add_calls == [["add", "--", "mine.py"]], f"expected only mine.py in the add pathspec, got {add_calls}"
+        assert ["commit", "-m", "msg"] in git_calls
+        assert ["push", "origin", "feature/x"] in git_calls
 
 
 class TestCommitLocal:

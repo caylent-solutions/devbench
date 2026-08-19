@@ -31,7 +31,7 @@ For every configurable parameter:
 | `use_bedrock` | boolean | `false` | Route LLM calls via AWS Bedrock instead of the Anthropic API. |
 | `bedrock_region` | string | `us-east-1` | AWS region for Bedrock when `use_bedrock: true`. |
 | `allowed_orgs` | list of strings | `[]` | Hard allowlist of GitHub orgs devbench may operate against. Empty means every org listed under `repos:` is permitted. |
-| `display_timezone` | IANA zone string | OS local | Timezone applied to every timestamp-rendering command (`report`, `hook-tail`, `watch`). |
+| `display_timezone` | IANA zone string | OS local | Timezone applied to every timestamp-rendering command (`report`, `hook-tail`, `watch`) and to work-unit audit comments. Comments default to UTC rather than OS local when the key is unset, because a work-unit file is committed and read on other machines. |
 | `log_file` | string (relative path) | `logs/orchestrator.log` | Shared aggregate orchestrator log. Named sessions additionally write a per-session log at `.devbench/sessions/<name>/orchestrator.log` (read via `report --session <name>`). An explicit value (or `DEVBENCH_LOG_FILE`) overrides; relative values are workspace-relative. |
 
 ---
@@ -130,9 +130,21 @@ timeouts:
   command: 120
   orchestrator_poll_interval: 10
   github_check: 600
+  orchestrator_inactivity: 1800
 ```
 
 Environment variable overrides are applied by `config.py` (not this module).
+
+**`orchestrator_inactivity`** (integer, seconds, default `1800`) -- FR-17 (issues
+db-262 / db-325). Bounds how long `devbench start`'s `_run` SDK message loop
+will await the next message (`agen.__anext__()`) before treating the session
+as hung. On expiry the loop raises `_OrchestrateInactivityTimeout`, which
+`_drive_orchestrate_with_quota_resume` disposes as a bounded fresh-session
+restart (reusing the same cap enforced by `DEVBENCH_MAX_QUOTA_RESUMES`) rather
+than idling forever. Overridden at runtime by the
+`DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT` environment variable; the code
+default lives in `DEFAULT_ORCHESTRATOR_INACTIVITY_SECONDS`
+(`src/devbench/constants.py`).
 
 ---
 
@@ -164,6 +176,9 @@ git_ops:
   auto_finalize: false          # auto-run git-ops-finalize when all WUs terminal
   auto_merge: false             # auto-merge after CI green (requires auto_finalize + defer_pr)
   orphan_patterns: []           # replaces built-in orphan fnmatch list when non-empty
+                                # built-in list covers terraform state/plan, terragrunt
+                                # cache, python caches/venv/egg-info, ansible *.retry, helm
+                                # charts/*.tgz, node_modules, .DS_Store. LOCK FILES ARE EXCLUDED.
   pr_review_resolution:
     enabled: false
     agents: []
@@ -209,8 +224,86 @@ hook_tail:
 
 ```yaml
 orchestrate:
-  max_cascade_depth: 2  # recovery-of-recovery cascade depth cap
+  max_cascade_depth: 2                        # recovery-of-recovery cascade depth cap
+  max_transport_restarts: 14                  # bounded restarts after an SDK transport error (~1h budget)
+  transport_restart_backoff_base_seconds: 1.0 # first wait; doubles per restart
+  transport_restart_backoff_max_seconds: 60.0 # ceiling on that doubling
+  effort: high                                # reasoning effort for the orchestrator session
+  max_thinking_tokens: 16000                  # ceiling on one turn's reasoning
 ```
+
+All six keys are optional; each resolves **env > YAML > built-in default**.
+
+| Key | Env override | Default |
+| --- | --- | --- |
+| `max_cascade_depth` | `DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH` | `2` |
+| `max_transport_restarts` | `DEVBENCH_MAX_TRANSPORT_RESTARTS` | `14` |
+| `transport_restart_backoff_base_seconds` | `DEVBENCH_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS` | `1.0` |
+| `transport_restart_backoff_max_seconds` | `DEVBENCH_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS` | `60.0` |
+| `effort` | `DEVBENCH_ORCHESTRATE_EFFORT` | `high` |
+| `max_thinking_tokens` | `DEVBENCH_ORCHESTRATE_MAX_THINKING_TOKENS` | `16000` |
+
+**Effort and the thinking budget.** `effort` accepts `low`, `medium`, `high`,
+`xhigh` or `max`, and applies to the orchestrator SDK session and every agent
+it spawns. devbench pins it rather than inheriting it: an unset value means the
+session adopts whatever effort the ambient Claude Code configuration carries,
+so an unattended run's cost profile is decided by the operator's last
+interactive session.
+
+`max_thinking_tokens` bounds how much one turn may reason, and the reason it
+exists is not only cost. Prompt-cache entries have a limited lifetime. A turn
+that reasons for longer than that lifetime returns to a cold cache, so the
+whole prompt is re-uploaded and re-cached instead of being read back at cache
+rates, and the run reaches its quota limit sooner. Quota exhaustion is what
+interrupts units mid-flight, so an unbounded thinking budget is upstream of
+the interruption-and-recovery machinery described in
+[`git-ops-modes.md`](git-ops-modes.md).
+
+Raise `effort` deliberately, and when you do, check that turns still finish
+inside the cache window rather than assuming more reasoning is free.
+
+**Transport restarts.** When the Claude Agent SDK fails at its transport
+boundary, the orchestrator opens a fresh SDK session on the remaining backlog
+rather than exiting. `max_transport_restarts` bounds how many times in a row it
+will do that, and the two backoff keys space the attempts:
+
+```text
+delay = transport_restart_backoff_base_seconds * 2 ** restarts_already_done
+        clamped to transport_restart_backoff_max_seconds
+```
+
+With the defaults the waits run 1s, 2s, 4s, 8s, 16s, 32s, then 60s thereafter.
+
+`max_transport_restarts` is sized as a **time budget**, not an attempt count.
+Each restart costs one full SDK session lifetime plus one backoff wait.
+Measured against a live Anthropic 529 `overloaded` outage, an SDK session burns
+its own internal retries and raises after ~199s, so the default 14 restarts
+(15 sessions + ~9 min of backoff) gives **roughly one hour** of riding out a
+provider outage before the run halts with
+`transport-error-restart-cap-exhausted`.
+
+That ~199s figure is a property of the SDK's retry schedule under one observed
+failure mode, not a constant -- a fault that rejects instantly makes each cycle
+much shorter and the same cap exhausts far sooner. Decide the wall-clock window
+you want and re-derive the count; do not nudge the integer blindly.
+
+This bound is deliberately separate from -- and far below --
+`DEVBENCH_MAX_QUOTA_RESUMES` (default 1000), which bounds quota resumes and
+inactivity restarts. A quota window must elapse and an inactivity restart costs
+a full timeout window, so both self-throttle. A transport fault does not: it
+recurs as fast as the SDK can reject a session. Sharing a 1000-restart budget
+with no delay meant one persistent fault could spend the entire budget in
+minutes and end the run unattended. Exhausting this smaller bound is the
+intended signal that the transport is down rather than flapping.
+
+Both backoff values must be greater than zero; the schema rejects zero or
+negative values at load time, and the env-var path raises rather than degrading
+into a busy retry loop. The ceiling also bounds how long an in-flight wait can
+delay a `devbench stop`.
+
+Each restart is recorded in the orchestrator log as
+`[ORCHESTRATOR_TRANSPORT_RESTART] attempt=<n> max=<cap> backoff=<n>s` and
+surfaced by the `Transport restarts` row in `devbench report`.
 
 ---
 
@@ -248,8 +341,15 @@ manifest_amendment:
   enabled: true                    # default; set false to opt out
   allowed_reasons:
     - tdd_green_production_fix
-  max_requests_per_execution: 1
+    - doc_sync_review_fix
+  max_requests_per_execution: 2    # default; one add + one row removal
 ```
+
+`allowed_reasons` **narrows** the set of reasons devbench implements; it cannot widen it. A reason listed here that devbench does not implement is a config error and stays refused.
+
+The narrowing is enforced at both gates -- when the request is written and again when it is applied. Before this was wired up, `PreFilter` was reachable from no CLI path and the apply path checked a module-level constant instead of the config, so a backlog that narrowed this list had the narrowing silently ignored and every reason was accepted. If your backlog narrows the list, expect requests using an excluded reason to now be refused at request time with a message naming the configured set.
+
+`max_requests_per_execution` defaults to `2` so a unit correcting its Changes Manifest in both directions -- adding a file review demanded and dropping a row that went stale -- can satisfy [`AC-FINAL-015`](acceptance-criteria-canonical.md) within one execution. A limit of `1` made that combination impossible. See [`docs/manifest-amendments.md`](manifest-amendments.md) for the removal workflow and its no-diff precondition.
 
 ---
 
@@ -408,6 +508,16 @@ max_executor_retries_per_judge:
 ```
 
 Each entry falls back to `max_executor_retries` when absent.
+
+**Enforced in code (issue #122).** `devbench log-verdict <judge> <id> fail` counts that judge's prior `[REVIEW_FAIL]` rows in the work unit and, once the budget is spent, writes the `[BLOCKED] [RETRY_BUDGET_EXHAUSTED]` audit row, forces the unit to `blocked`, and notifies the operator. Enforcement counts per judge across the whole unit, so ANY single judge exhausting its own budget blocks the unit; only the five canonical reviewers charge a budget.
+
+This bound previously lived only in orchestrate SKILL.md prose, which instructed the orchestrator to read the budget via `devbench config-resolve` -- a verb that did not exist. The budget was therefore unreadable at runtime and never enforced, so reviews could reject the same unit without limit. Inspect the resolved values with:
+
+```
+uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge
+```
+
+Rounds spent against budget are also surfaced per task in the `devbench report` **Review rejections** row -- see [`docs/cli-reference.md`](cli-reference.md).
 
 ---
 

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from devbench.reporting.event_index import EventIndex
+from devbench.reporting.event_index import EventIndex, _epoch_us_to_dt
 
 
 def _write_orch_log(path: Path, lines: list[str]) -> None:
@@ -82,8 +82,8 @@ class TestOrchestratorLogIncremental:
         _write_orch_log(
             log,
             [
-                "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                "2026-05-04T10:05:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-05-04T10:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
             ],
         )
         idx = EventIndex.open(workspace)
@@ -103,7 +103,7 @@ class TestOrchestratorLogIncremental:
         log = workspace / "orch.log"
         _write_orch_log(
             log,
-            ["2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'"],
+            ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'"],
         )
         idx = EventIndex.open(workspace)
         try:
@@ -113,7 +113,7 @@ class TestOrchestratorLogIncremental:
             # Append a line; mtime must advance for the cache to notice.
             time.sleep(0.01)
             with log.open("a") as f:
-                f.write("2026-05-04T10:05:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n")
+                f.write("2026-05-04T10:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'\n")
             idx.refresh_orchestrator_log(log)
             done = idx.task_transition_times(log, "done")
             assert "E0-F1-S1-T1" in done
@@ -127,8 +127,8 @@ class TestOrchestratorLogIncremental:
         _write_orch_log(
             log,
             [
-                "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                "2026-05-04T10:05:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'done'",
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                "2026-05-04T10:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'done'",
             ],
         )
         idx = EventIndex.open(workspace)
@@ -137,7 +137,7 @@ class TestOrchestratorLogIncremental:
             assert len(idx.task_transition_times(log, "done")) == 2
             # Replace with a much shorter file (= truncation / rotation).
             log.write_text(
-                "2026-05-04T10:10:00Z [devbench.cli] INFO Set E0-F1-S1-T9 to 'done'\n",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T9 to 'done'\n",
                 encoding="utf-8",
             )
             idx.refresh_orchestrator_log(log)
@@ -150,7 +150,7 @@ class TestOrchestratorLogIncremental:
         log = workspace / "orch.log"
         # No trailing newline -> the writer hasn't finished flushing the line.
         log.write_text(
-            "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
+            "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
             encoding="utf-8",
         )
         idx = EventIndex.open(workspace)
@@ -161,7 +161,7 @@ class TestOrchestratorLogIncremental:
             # After the writer finishes the line, the next refresh picks it up.
             time.sleep(0.01)
             log.write_text(
-                "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n",
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'\n",
                 encoding="utf-8",
             )
             idx.refresh_orchestrator_log(log)
@@ -186,11 +186,11 @@ class TestQueryFiltering:
         log_b = workspace / "session-b.log"
         _write_orch_log(
             log_a,
-            ["2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'"],
+            ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'"],
         )
         _write_orch_log(
             log_b,
-            ["2026-05-04T11:00:00Z [devbench.cli] INFO Set E0-F1-S1-T9 to 'done'"],
+            ["2026-05-04T11:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T9 to 'done'"],
         )
         idx = EventIndex.open(workspace)
         try:
@@ -220,6 +220,362 @@ class TestQueryFiltering:
             non_noise = idx.non_noise_log_timestamps(log, "judges.log_setup")
             assert len(non_noise) == 2
             assert all(ts.minute != 0 or ts.second != 30 for ts in non_noise)  # 10:00:30 entry filtered
+        finally:
+            idx.close()
+
+
+class TestLoggerAnchoredTransitions:
+    """Issue #329 Defect A / FR-1: transition rows are anchored to the
+    genuine emitting logger (``devbench.backlog_manager``), both at query
+    time (FR-1a, authoritative) and at ingestion time (FR-1b, hardening).
+
+    ``devbench.cli`` lines that echo prior orchestrator log text inside an
+    SDK ``ToolResultBlock`` payload (e.g. a tool result that read the work
+    unit's ``[WU_CLAIMED]`` audit comment) previously matched the unanchored
+    ``_TASK_TRANSITION_RE.search(raw_line)`` and were counted as genuine
+    transitions under the echo's own (later) timestamp.
+    """
+
+    def test_transition_logger_constant(self) -> None:
+        """AC-1: the module constant is the real emitter's logger name."""
+        from devbench.reporting.event_index import _TRANSITION_LOGGER
+
+        assert _TRANSITION_LOGGER == "devbench.backlog_manager"
+
+    def test_query_methods_return_only_the_genuine_logger_row(self, workspace: Path) -> None:
+        """AC-2: given a genuine row and a later echo row for the same task
+        and transition, both query methods return only the genuine timestamp."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress' "
+                "in both work-unit file and BACKLOG.md",
+                "2026-05-04T10:38:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                "[WU_CLAIMED] Set E1-F1-S1-T1 to 'in-progress' session=default",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            expected = {"E1-F1-S1-T1": datetime(2026, 5, 4, 10, 0, tzinfo=UTC)}
+            assert idx.task_transition_times(log, "in-progress") == expected
+            assert idx.task_transition_times_for_workspace(workspace, log, "in-progress") == expected
+        finally:
+            idx.close()
+
+    def test_null_logger_row_is_excluded_from_both_query_methods(self, workspace: Path) -> None:
+        """AC-3: a corrupt/unattributable row (``logger IS NULL``) with a
+        populated task_id/transition never satisfies the predicate."""
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            file_id = idx._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(log),)).fetchone()[0]
+            idx._conn.execute(
+                "INSERT INTO orch_log_events "
+                "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                (file_id, 9999, 1_746_353_400_000_000, None, "E1-F1-S1-T1", "in-progress"),
+            )
+            assert idx.task_transition_times(log, "in-progress") == {}
+            assert idx.task_transition_times_for_workspace(workspace, log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_pre_existing_cache_is_corrected_with_no_rebuild(self, workspace: Path) -> None:
+        """AC-4: a cache already holding a row shaped exactly as pre-FR-1b
+        ingestion would have written it (task_id/transition populated from
+        an echo line under a non-``backlog_manager`` logger) is corrected by
+        the query-side predicate alone. No ``refresh_orchestrator_log`` call
+        happens between the direct insert and the query below, so nothing
+        gets re-ingested or rebuilt -- the existing cached row is simply
+        queried correctly the moment the new predicate exists."""
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            file_id = idx._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(log),)).fetchone()[0]
+            idx._conn.executemany(
+                "INSERT INTO orch_log_events "
+                "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (file_id, 1000, 1_746_353_400_000_000, "devbench.backlog_manager", "E1-F1-S1-T1", "in-progress"),
+                    # Shaped exactly as the unanchored pre-FR-1b ingestion
+                    # would have captured a later echo line: task_id and
+                    # transition are populated even though the logger is not
+                    # the real emitter.
+                    (file_id, 2000, 1_746_355_080_000_000, "devbench.cli", "E1-F1-S1-T1", "in-progress"),
+                ],
+            )
+            expected = {"E1-F1-S1-T1": _epoch_us_to_dt(1_746_353_400_000_000)}
+            assert idx.task_transition_times(log, "in-progress") == expected
+            assert idx.task_transition_times_for_workspace(workspace, log, "in-progress") == expected
+        finally:
+            idx.close()
+
+    def test_ingestion_anchors_to_own_message_not_a_quoted_payload(self, workspace: Path) -> None:
+        """AC-5: at ingestion, a genuine transition line is stored with
+        task_id/transition populated; an echo line whose payload quotes a
+        transition later in the same message is stored with task_id and
+        transition left NULL (over-anchoring guard: the genuine line still
+        gets captured)."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress' "
+                "in both work-unit file and BACKLOG.md",
+                "2026-05-04T10:38:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                "[WU_CLAIMED] Set E1-F1-S1-T1 to 'in-progress' session=default",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            rows = idx._conn.execute(
+                "SELECT logger, task_id, transition FROM orch_log_events ORDER BY line_offset"
+            ).fetchall()
+            assert len(rows) == 2
+            genuine, echo = rows
+            assert genuine == ("devbench.backlog_manager", "E1-F1-S1-T1", "in-progress")
+            assert echo[0] == "devbench.cli"
+            assert echo[1] is None
+            assert echo[2] is None
+        finally:
+            idx.close()
+
+
+class TestTaskTransitionTimeSeriesForWorkspace:
+    """Issue #329 FR-2 (AC-6): ``task_transition_time_series_for_workspace``
+    returns EVERY matching timestamp per task_id, ascending, under the same
+    file_id/transition/logger predicates as ``task_transition_times_for_workspace``
+    (FR-1a). Unlike that method's ``MAX(ts_epoch_us) GROUP BY task_id``, no
+    aggregation happens here -- ``_execution_anchor`` (report.py) needs every
+    candidate claim, not just the most recent one, to find the earliest
+    same-session claim before a completion.
+    """
+
+    def test_returns_every_matching_timestamp_ascending(self, workspace: Path) -> None:
+        """#329 live shape: E11-F1-S1-T2 was claimed twice before being closed."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-08-10T19:50:20Z [devbench.backlog_manager] INFO Set E11-F1-S1-T2 to 'in-progress'",
+                "2026-08-10T20:34:17Z [devbench.backlog_manager] INFO Set E11-F1-S1-T2 to 'in-progress'",
+                "2026-08-10T20:54:07Z [devbench.backlog_manager] INFO Set E11-F1-S1-T2 to 'done'",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert series == {
+                "E11-F1-S1-T2": [
+                    datetime(2026, 8, 10, 19, 50, 20, tzinfo=UTC),
+                    datetime(2026, 8, 10, 20, 34, 17, tzinfo=UTC),
+                ]
+            }
+        finally:
+            idx.close()
+
+    def test_applies_the_same_logger_predicate_as_fr1a(self, workspace: Path) -> None:
+        """A ``devbench.cli`` echo of a prior claim line never contributes a
+        series entry -- same predicate as ``task_transition_times_for_workspace``."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress' "
+                "in both work-unit file and BACKLOG.md",
+                "2026-05-04T10:38:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                "[WU_CLAIMED] Set E1-F1-S1-T1 to 'in-progress' session=default",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert series == {"E1-F1-S1-T1": [datetime(2026, 5, 4, 10, 0, tzinfo=UTC)]}
+        finally:
+            idx.close()
+
+    def test_null_logger_row_is_excluded(self, workspace: Path) -> None:
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            file_id = idx._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(log),)).fetchone()[0]
+            idx._conn.execute(
+                "INSERT INTO orch_log_events "
+                "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                (file_id, 9999, 1_746_353_400_000_000, None, "E1-F1-S1-T1", "in-progress"),
+            )
+            assert idx.task_transition_time_series_for_workspace(workspace, log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_multiple_tasks_each_get_their_own_ascending_series(self, workspace: Path) -> None:
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                "2026-05-04T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert series["E0-F1-S1-T1"] == [
+                datetime(2026, 5, 4, 10, 0, tzinfo=UTC),
+                datetime(2026, 5, 4, 10, 20, tzinfo=UTC),
+            ]
+            assert series["E0-F1-S1-T2"] == [datetime(2026, 5, 4, 10, 10, tzinfo=UTC)]
+        finally:
+            idx.close()
+
+    def test_empty_workspace_returns_empty_dict(self, tmp_path: Path) -> None:
+        (tmp_path / ".devbench").mkdir()
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        idx = EventIndex.open(tmp_path)
+        try:
+            idx.refresh_orch_log_sources(tmp_path, live_log)
+            assert idx.task_transition_time_series_for_workspace(tmp_path, live_log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_merges_shards_with_live_log(self, tmp_path: Path) -> None:
+        """Same shard-union behaviour as ``task_transition_times_for_workspace`` (issue #168)."""
+        (tmp_path / ".devbench").mkdir()
+        shard = tmp_path / "logs" / "2026-04" / "E0-F1-S1-T1.jsonl"
+        shard.parent.mkdir(parents=True)
+        _write_orch_log(
+            shard,
+            ["2026-04-15T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'"],
+        )
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        _write_orch_log(
+            live_log,
+            ["2026-05-10T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'"],
+        )
+        idx = EventIndex.open(tmp_path)
+        try:
+            idx.refresh_orch_log_sources(tmp_path, live_log)
+            series = idx.task_transition_time_series_for_workspace(tmp_path, live_log, "in-progress")
+            assert series["E0-F1-S1-T1"] == [
+                datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+                datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+            ]
+        finally:
+            idx.close()
+
+
+class TestTaskTransitionCandidateCountsForWorkspace:
+    """Issue #329 FR-6: ``task_transition_candidate_counts_for_workspace``
+    counts every row matching ``transition`` regardless of ``logger`` --
+    the "unfiltered" side of the FR-6 provenance suffix. Composed against
+    ``task_transition_time_series_for_workspace``'s (FR-1a/FR-2) logger-
+    filtered count, the difference is the number of non-transition rows
+    rejected (``report._compute_window_stats`` / ``WindowStats.rejected_row_count``).
+    """
+
+    def test_fresh_ingestion_matches_the_filtered_count(self, workspace: Path) -> None:
+        """FR-1b already anchors ingestion to the line's own message, so an
+        echoed ``devbench.cli`` line never populates ``task_id``/``transition``
+        in a cache built entirely under the current code -- the unfiltered
+        candidate count equals the logger-filtered count exactly."""
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E1-F1-S1-T1 to 'in-progress' "
+                "in both work-unit file and BACKLOG.md",
+                "2026-05-04T10:38:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                "[WU_CLAIMED] Set E1-F1-S1-T1 to 'in-progress' session=default",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            candidate_counts = idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress")
+            filtered_series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert candidate_counts == {"E1-F1-S1-T1": 1}
+            assert candidate_counts["E1-F1-S1-T1"] == len(filtered_series["E1-F1-S1-T1"])
+        finally:
+            idx.close()
+
+    def test_pre_fix_cache_counts_the_phantom_echo_row(self, workspace: Path) -> None:
+        """A cache row shaped exactly as pre-FR-1b ingestion would have
+        written it (task_id/transition populated from a non-backlog_manager
+        logger) is counted here even though the logger-filtered series
+        excludes it -- the difference is what FR-6 surfaces."""
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            file_id = idx._conn.execute("SELECT file_id FROM source_files WHERE path = ?", (str(log),)).fetchone()[0]
+            idx._conn.executemany(
+                "INSERT INTO orch_log_events "
+                "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (file_id, 1000, 1_746_353_400_000_000, "devbench.backlog_manager", "E1-F1-S1-T1", "in-progress"),
+                    # Shaped exactly as the unanchored pre-FR-1b ingestion
+                    # would have captured a later echo line.
+                    (file_id, 2000, 1_746_355_080_000_000, "devbench.cli", "E1-F1-S1-T1", "in-progress"),
+                ],
+            )
+            candidate_counts = idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress")
+            filtered_series = idx.task_transition_time_series_for_workspace(workspace, log, "in-progress")
+            assert candidate_counts == {"E1-F1-S1-T1": 2}
+            assert len(filtered_series["E1-F1-S1-T1"]) == 1
+            assert candidate_counts["E1-F1-S1-T1"] - len(filtered_series["E1-F1-S1-T1"]) == 1
+        finally:
+            idx.close()
+
+    def test_null_task_id_row_excluded(self, workspace: Path) -> None:
+        """A row that never matched ``_TASK_TRANSITION_RE`` at ingestion
+        (``task_id IS NULL``) is not a candidate and is not counted."""
+        log = workspace / "orch.log"
+        _write_orch_log(log, ["2026-05-04T10:00:00Z [devbench.backlog_manager] INFO heartbeat"])
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orchestrator_log(log)
+            assert idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress") == {}
+        finally:
+            idx.close()
+
+    def test_multiple_tasks_counted_independently(self, workspace: Path) -> None:
+        log = workspace / "orch.log"
+        _write_orch_log(
+            log,
+            [
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                "2026-05-04T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_orch_log_sources(workspace, log)
+            candidate_counts = idx.task_transition_candidate_counts_for_workspace(workspace, log, "in-progress")
+            assert candidate_counts == {"E0-F1-S1-T1": 2, "E0-F1-S1-T2": 1}
+        finally:
+            idx.close()
+
+    def test_empty_workspace_returns_empty_dict(self, tmp_path: Path) -> None:
+        (tmp_path / ".devbench").mkdir()
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        idx = EventIndex.open(tmp_path)
+        try:
+            idx.refresh_orch_log_sources(tmp_path, live_log)
+            assert idx.task_transition_candidate_counts_for_workspace(tmp_path, live_log, "in-progress") == {}
         finally:
             idx.close()
 
@@ -581,12 +937,12 @@ class TestParityAgainstParserPath:
         _write_orch_log(
             log,
             [
-                "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                "2026-05-04T10:05:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                "2026-05-04T10:05:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                "2026-05-04T10:10:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                "2026-05-04T10:10:00Z [devbench.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
-                "2026-05-04T10:15:00Z [devbench.cli] INFO Set E0-F1-S1-T3 to 'done'",
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-05-04T10:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                "2026-05-04T10:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'done'",
+                "2026-05-04T10:10:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                "2026-05-04T10:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'done'",
             ],
         )
         hook = workspace / "hook-logs.jsonl"
@@ -622,6 +978,10 @@ class TestParityAgainstParserPath:
         try:
             done_times = idx.task_transition_times(log, "done")
             progress_times = idx.task_transition_times(log, "in-progress")
+            # Issue #329 FR-2: `_compute_window_stats` now takes a claims
+            # time-series per task; this fixture models one claim per task,
+            # so a single-element list preserves the original parity intent.
+            progress_claims = {tid: [ts] for tid, ts in progress_times.items()}
             window_start = datetime(2026, 5, 4, 10, 0, tzinfo=UTC)
             window_end = datetime(2026, 5, 4, 10, 16, tzinfo=UTC)
             indexed = _compute_window_stats(
@@ -629,7 +989,7 @@ class TestParityAgainstParserPath:
                 window_start=window_start,
                 window_end=window_end,
                 done_times=done_times,
-                progress_times=progress_times,
+                progress_claims=progress_claims,
                 tasks_active=0,
                 event_index=idx,
             )
@@ -638,7 +998,7 @@ class TestParityAgainstParserPath:
                 window_start=window_start,
                 window_end=window_end,
                 done_times=done_times,
-                progress_times=progress_times,
+                progress_claims=progress_claims,
                 tasks_active=0,
                 event_index=None,
             )
@@ -680,6 +1040,66 @@ class TestParityAgainstParserPath:
         finally:
             idx.close()
 
+    def test_indexed_and_parser_paths_match_with_cli_echo_noise(self, workspace: Path) -> None:
+        """AC-15 (issue #329 FR-3): a ``devbench.cli`` echo line (Defect A
+        shape -- a ``ToolResultBlock`` payload that quotes a prior
+        ``[WU_CLAIMED]`` audit comment inside a later log line) must not
+        perturb parity between the indexed and parser ``_compute_window_stats``
+        paths, now that ``report.py`` no longer carries its own
+        ``_DONE_RE`` / ``_PROGRESS_RE`` copy of the transition contract.
+
+        ``done_times`` / ``progress_claims`` are built once, from
+        ``EventIndex``'s logger-anchored queries (``_TRANSITION_LOGGER``
+        predicate), and handed unchanged to both ``_compute_window_stats``
+        calls -- so the echo's later timestamp must never win over the
+        genuine ``devbench.backlog_manager`` 'done' timestamp, and both
+        paths must still agree given that corrected input.
+        """
+        from devbench.reporting.report import _compute_window_stats
+
+        log, _hook, idx = self._seed(workspace)
+        try:
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "2026-05-04T10:20:00Z [devbench.cli] INFO ToolResultBlock echoed prior comment: "
+                    "[WU_CLAIMED] Set E0-F1-S1-T1 to 'done' session=default\n"
+                )
+            idx.refresh_orchestrator_log(log)
+
+            done_times = idx.task_transition_times(log, "done")
+            progress_times = idx.task_transition_times(log, "in-progress")
+            progress_claims = {tid: [ts] for tid, ts in progress_times.items()}
+            # The echo's later timestamp (10:20) must never win over the
+            # genuine backlog_manager 'done' timestamp (10:05).
+            assert done_times["E0-F1-S1-T1"] == datetime(2026, 5, 4, 10, 5, tzinfo=UTC)
+
+            window_start = datetime(2026, 5, 4, 10, 0, tzinfo=UTC)
+            window_end = datetime(2026, 5, 4, 10, 21, tzinfo=UTC)
+            indexed = _compute_window_stats(
+                log_path=log,
+                window_start=window_start,
+                window_end=window_end,
+                done_times=done_times,
+                progress_claims=progress_claims,
+                tasks_active=0,
+                event_index=idx,
+            )
+            parsed = _compute_window_stats(
+                log_path=log,
+                window_start=window_start,
+                window_end=window_end,
+                done_times=done_times,
+                progress_claims=progress_claims,
+                tasks_active=0,
+                event_index=None,
+            )
+            assert indexed.totals == parsed.totals
+            assert indexed.cost.total_cost == pytest.approx(parsed.cost.total_cost)
+            assert indexed.api_hours == pytest.approx(parsed.api_hours)
+            assert indexed.tasks_in_window == parsed.tasks_in_window
+        finally:
+            idx.close()
+
 
 class TestRefreshOrchLogSourcesShardAware:
     """Issue #168: ``refresh_orch_log_sources`` + workspace-aware queries
@@ -697,8 +1117,8 @@ class TestRefreshOrchLogSourcesShardAware:
         _write_orch_log(
             shard_apr,
             [
-                "2026-04-15T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                "2026-04-15T11:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                "2026-04-15T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                "2026-04-15T11:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
             ],
         )
         shard_may_t2 = tmp_path / "logs" / "2026-05" / "E0-F1-S1-T2.jsonl"
@@ -706,8 +1126,8 @@ class TestRefreshOrchLogSourcesShardAware:
         _write_orch_log(
             shard_may_t2,
             [
-                "2026-05-01T09:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                "2026-05-01T09:30:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'blocked'",
+                "2026-05-01T09:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                "2026-05-01T09:30:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'blocked'",
             ],
         )
         # Live flat log -- empty (operator hasn't started a new orchestrate
@@ -736,7 +1156,7 @@ class TestRefreshOrchLogSourcesShardAware:
         # New post-migration event lands in the live flat log.
         _write_orch_log(
             live_log,
-            ["2026-05-10T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T3 to 'done'"],
+            ["2026-05-10T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'done'"],
         )
 
         idx = EventIndex.open(tmp_path)
@@ -759,7 +1179,7 @@ class TestRefreshOrchLogSourcesShardAware:
         _write_orch_log(
             live_log,
             [
-                "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                "2026-05-04T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
             ],
         )
         idx = EventIndex.open(tmp_path)

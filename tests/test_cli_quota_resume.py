@@ -284,7 +284,10 @@ class TestRunCallsCheckQuotaAndDrainPerMessage:
         escape undispatched as it did before the resume loop was wired.
         """
         rate_limit_message = _make_rate_limit_message()
-        fail_cfg = SimpleNamespace(quota_handling=QuotaHandlingConfig(enabled=True, on_exhaustion="fail"))
+        fail_cfg = SimpleNamespace(
+            quota_handling=QuotaHandlingConfig(enabled=True, on_exhaustion="fail"),
+            repos={},
+        )
         with patch("devbench.cli.RUNTIME_CONFIG", fail_cfg):
             with pytest.raises(QuotaExhaustedError) as excinfo:
                 self._drive_cmd_start_with_messages(tmp_path, [rate_limit_message])

@@ -29,6 +29,8 @@ See docs/faq.md and docs/adr/05-declined-status.md for the full semantics.
 -->
 ## Status: in-queue
 
+## Expected Output: {commit|none}    <!-- optional; absent defaults to commit under validate-backlog rule 28. `none` requires a sentinel-only Manifest and skips commit/PR/CI/merge. See docs/backlog-contract.md 'Expected-Output Declaration'. -->
+
 ## Task Type: {type}    <!-- optional; absent defaults to behavior-fix under validate-backlog rule 21. See docs/backlog-contract.md 'Task-Type Taxonomy'. -->
 
 ## Target Repository

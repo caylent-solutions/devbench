@@ -37,11 +37,12 @@ import itertools
 import logging
 import re
 from collections import deque
-from datetime import UTC, datetime
+from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
 
 from devbench.backlog.work_unit import WorkUnitType
+from devbench.comment_time import comment_timestamp, tdd_timestamp
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
@@ -49,12 +50,13 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
-    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
     EM_DASH,
     EPIC_ID_RE,
+    EXPECTED_OUTPUT_LINE_RE,
+    EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_RE,
     GATED_TASK_TYPES,
     RED_OBSERVED_ENTRY_LINE_RE,
@@ -67,6 +69,7 @@ from devbench.constants import (
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_LINE_RE,
+    STATUS_PROPOSED,
     STATUS_SUMMARY_SECTION_HEADER,
     STATUS_SUMMARY_TABLE_HEADER,
     STRIP_SUMMARY_RE,
@@ -80,6 +83,7 @@ from devbench.constants import (
     TDD_CYCLE_LOG_SECTION_HEADER,
     TDD_ENTRY_TEMPLATE,
     TRACEABILITY_MATRIX_HEADER,
+    VALID_EXPECTED_OUTPUTS,
     VALID_STATUSES,
     VALID_TASK_TYPES,
 )
@@ -338,6 +342,57 @@ def green_green_observed_satisfied(content: str) -> bool:
     )
 
 
+def resolve_judge_retry_budget(judge_name: str) -> int:
+    """Return the executor retry budget that applies to *judge_name*.
+
+    Precedence (issue #122): the per-judge entry in
+    ``max_executor_retries_per_judge`` when present, else the global
+    ``max_executor_retries``. Both come from resolved config -- the global is
+    already env-overridable via ``DEVBENCH_MAX_RETRIES`` -- so no bound is
+    hard-coded here.
+
+    Single implementation shared by the enforcement in ``cli.cmd_log_verdict``
+    and the display in ``reporting.report.review_rejections_line``, so the
+    budget shown to an operator can never disagree with the budget applied.
+    Imported lazily to keep config import order out of this module's contract.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS, RUNTIME_CONFIG
+
+    per_judge = RUNTIME_CONFIG.max_executor_retries_per_judge.get(judge_name)
+    return per_judge if per_judge is not None else MAX_RETRY_ATTEMPTS
+
+
+def count_review_fails_for_judge(content: str, judge_name: str) -> int:
+    """Return how many ``[REVIEW_FAIL]`` verdicts *judge_name* has recorded in *content*.
+
+    The audit trail is the counter: every judge verdict already lands in the
+    work unit's Comments section as
+    ``[<ts>] [judge/<name>] [REVIEW_FAIL|REVIEW_PASS] <feedback>``, so the
+    number of rejection rounds a judge has spent is derivable from the file
+    with no new bookkeeping state to drift out of sync. Mirrors the audit-row
+    counting ``cli._count_ci_fail_attempts`` already does for ``[CI_FAIL]``.
+
+    Matching is per line and substring-based on both bracketed tokens, the
+    same idiom ``BacklogManager._last_round_all_passed`` uses, so a judge name
+    quoted inside another judge's prose feedback cannot inflate the count --
+    the ``[judge/<name>]`` agent-id token only appears at a verdict row's
+    structural position.
+
+    Unlike ``_last_round_all_passed`` this deliberately does NOT stop at a
+    round boundary: the budget bounds the TOTAL rounds a judge may spend on a
+    unit, so every historical failure counts.
+
+    Args:
+        content: Full text of a work-unit markdown file.
+        judge_name: Underscored judge identifier, e.g. ``doc_review``.
+
+    Returns:
+        The count of ``[REVIEW_FAIL]`` rows attributed to *judge_name*.
+    """
+    token = f"[judge/{judge_name}]"
+    return sum(1 for line in content.splitlines() if token in line and "[REVIEW_FAIL]" in line)
+
+
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
@@ -589,6 +644,100 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
         self._append_comment(work_unit_path, "UNHOLD", reason)
 
+    def remove_unit(
+        self,
+        work_unit_path: Path,
+        backlog_index: Path,
+        unit_id: str,
+        reason: str,
+        audit_log_path: Path,
+    ) -> None:
+        """Remove a work unit through the managed path (db-303, spec 4.A, FR-16).
+
+        Runs under a single ``flock(BACKLOG.lock)`` so a concurrent devbench
+        session cannot interleave a partial removal with another write.
+        Deletes the ``unit_id`` row from the BACKLOG.md index first --
+        :meth:`_remove_backlog_index_row` raises ``ValueError`` before any
+        file is touched when no row matches, so a typo can never delete an
+        unrelated unit -- then deletes the work-unit ``.md`` file, re-rolls
+        the ``## Status Summary`` table via :meth:`_update_status_summary`,
+        and appends a ``[WU_REMOVED] <id> -- <reason>`` line to
+        *audit_log_path* using the same timestamped-append shape as
+        :meth:`bulk_set_status`'s ``[BULK_STATUS_UPDATE]`` row.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file to delete.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier to remove.
+            reason: Human-readable rationale for the removal, captured
+                verbatim in the ``[WU_REMOVED]`` audit line.
+            audit_log_path: Path where the ``[WU_REMOVED]`` audit row is
+                appended. The file and its parent directories are created
+                when absent.
+
+        Raises:
+            ValueError: No BACKLOG.md row matches ``unit_id``. Nothing is
+                deleted.
+            FileNotFoundError: ``backlog_index`` does not exist, or
+                ``work_unit_path`` does not exist on disk.
+            TimeoutError: The BACKLOG.lock could not be acquired within the
+                default timeout.
+            OSError: An unexpected OS error from ``fcntl.flock`` or file I/O.
+        """
+        workspace_root = backlog_index.parent
+
+        with flock_backlog(workspace_root):
+            self._remove_backlog_index_row(backlog_index, unit_id)
+            work_unit_path.unlink()
+            self._update_status_summary(backlog_index)
+
+            audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = comment_timestamp()
+            audit_row = f"[{timestamp}] [WU_REMOVED] {unit_id} -- {reason}\n"
+            with audit_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(audit_row)
+
+        self.logger.info("Removed work unit %s (reason: %s)", unit_id, reason)
+
+    def _remove_backlog_index_row(self, backlog_index: Path, unit_id: str) -> None:
+        """Delete ``unit_id``'s row from the BACKLOG.md index table.
+
+        Mirrors :meth:`_update_backlog_index`'s row-match algorithm (the
+        row's first cell, ``cells[1]``, matched exactly against
+        ``unit_id``) but removes the matched line entirely instead of
+        rewriting a status cell within it.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier whose row is removed.
+
+        Raises:
+            FileNotFoundError: ``backlog_index`` does not exist.
+            ValueError: No row in the index matches ``unit_id``.
+        """
+        if not backlog_index.exists():
+            raise FileNotFoundError(f"Backlog index not found: {backlog_index}")
+
+        content = backlog_index.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        new_lines: list[str] = []
+        removed = False
+
+        for line in lines:
+            if not removed and line.strip().startswith("|"):
+                cells = line.split("|")
+                row_id = cells[1].strip() if len(cells) > 1 else ""
+                if row_id == unit_id:
+                    removed = True
+                    continue
+            new_lines.append(line)
+
+        if not removed:
+            raise ValueError(f"remove: work unit '{unit_id}' not found in BACKLOG.md")
+
+        atomic_write_text(backlog_index, "\n".join(new_lines) + "\n")
+        self.logger.info("Removed %s row from %s", unit_id, backlog_index.name)
+
     def bulk_set_status(
         self,
         unit_ids: list[tuple[str, Path]],
@@ -653,7 +802,7 @@ class BacklogManager:
 
         count = len(unit_ids)
         audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         audit_row = f"[{timestamp}] [BULK_STATUS_UPDATE] {count} WUs set to '{canonical}' by {audit_meta}\n"
         with audit_log_path.open("a", encoding="utf-8") as fh:
             fh.write(audit_row)
@@ -666,7 +815,13 @@ class BacklogManager:
         )
         return count
 
-    def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
+    def validate(
+        self,
+        backlog_index: Path,
+        workspace_root: Path,
+        fix: bool = False,
+        strict: bool = False,
+    ) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
         Checks performed:
@@ -681,7 +836,11 @@ class BacklogManager:
         9. Task files have ## Definition of Done section.
         10. No em-dash character (U+2014) in work unit files.
         11. Changes Manifest paths do not start with a ``checkout_directory`` prefix.
-        12. Manifest path conflicts (no two in-queue Tasks claim the same file).
+        12. Manifest path conflicts: HARD claimants (``in-queue``, ``proposed``,
+            ``blocked``, ``in-progress``) of one path with no ordering dependency
+            are always an error (FR-3, db-313). Under ``strict=True``, SOFT
+            claimants (``draft``, ``hold``) are folded into the count too,
+            surfacing authoring-time draft/hold collisions (FR-4, db-267).
         13. Language-AC alignment (non-Python tasks must mark Python ACs N/A).
         14. Source-test atomicity (every prod source has a paired test in the same Manifest).
         15. Required sections (Status, Dependencies, Changes Manifest) on every Task.
@@ -705,6 +864,29 @@ class BacklogManager:
             the closing commit hash or task id somewhere in that reason; an
             uncited already-satisfied decline is an unfalsifiable claim and is
             rejected.
+        24. Dependency cycle detection (FR-1) unions three edge channels that all
+            encode the same directed ``blocked_id -> blocker_id`` edge: the index
+            ``Dependencies`` column, each non-terminal Task's ``## Dependencies``
+            table, and its ``[BLOCKED_PENDING_PROPOSAL]`` markers. Terminal
+            (``done`` / ``declined``) Tasks contribute no table/marker edge, so a
+            stale marker on a closed Task cannot resurrect a historical cycle.
+        25. Dangling ``[BLOCKED_PENDING_PROPOSAL]`` markers (FR-7): a non-terminal
+            Task's marker referencing a WU-ID absent from the index is an error,
+            surfaced here instead of silently surviving until ``reconcile-cascade``
+            trips on it.
+        26. File-path contract for Task rows (FR-20, db-279): a Task row with an
+            empty ``File Path`` cell is an error. Epic/Feature/Story rows may be
+            file-less; this converges the validator with ``parse_index``, which
+            raises on the same file-less Task row and tolerates a file-less
+            non-Task row.
+        27. Marker/status agreement: a non-terminal Task carrying a
+            ``[BLOCKED_PENDING_PROPOSAL]`` marker whose target is itself
+            non-terminal MUST have status ``blocked``. The marker and the status
+            are written by separate steps, and the ADR-07 cascade
+            (:meth:`_auto_requeue_marker_dependents`) skips non-blocked
+            candidates, so a mismatch strands the task permanently once its
+            blocker completes. Markers whose targets are all terminal are exempt
+            (the cascade has legitimately requeued the task).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -714,6 +896,9 @@ class BacklogManager:
                 audit comment to each corrected file's ``## Comments`` section.
                 Violations that were corrected are NOT included in the returned
                 error list. Without ``fix``, the method is read-only.
+            strict: When ``True``, rule 12 (Manifest path conflicts) also
+                reports draft/hold collisions (FR-4, db-267). Defaults to
+                ``False``, preserving the all-draft rc=0 authoring gate.
 
         Returns:
             A list of error strings. Empty list means the backlog is valid (or
@@ -726,9 +911,11 @@ class BacklogManager:
         self._check_full_index_has_rows(backlog_index, errors)
         self._check_unique_ids(rows, errors)
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
+        self._check_task_rows_have_files(rows, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
-        self._check_dep_cycles(backlog_index, errors)
+        self._check_dep_cycles(backlog_index, rows, workspace_root, errors)
+        self._check_dangling_markers(rows, workspace_root, known_ids, errors)
         self._check_status_summary(backlog_index, rows, errors)
         if fix:
             fix_count, fix_files = self._apply_fixes(rows, workspace_root)
@@ -737,16 +924,18 @@ class BacklogManager:
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
         self._check_no_glob_in_manifest(rows, workspace_root, errors)
-        self._check_manifest_conflicts(rows, workspace_root, errors)
+        self._check_manifest_conflicts(rows, workspace_root, errors, strict=strict)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
         self._check_task_type_taxonomy(rows, workspace_root, errors)
+        self._check_expected_output(rows, workspace_root, errors)
         self._check_required_sections(rows, workspace_root, errors)
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
+        self._check_marker_status_agreement(rows, workspace_root, errors)
         self._check_already_satisfied_decline_citation(rows, workspace_root, errors)
         return errors
 
@@ -907,7 +1096,7 @@ class BacklogManager:
             ``(fix_count, files_fixed)`` -- total individual corrections applied
             and the count of distinct files that were modified.
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         fix_count = 0
         files_fixed: set[Path] = set()
 
@@ -1083,6 +1272,37 @@ class BacklogManager:
                 errors.append(f"{row_id}: work unit file missing '## Status:' line")
         return indexed_files
 
+    def _check_task_rows_have_files(
+        self,
+        rows: list[tuple[str, str, str]],
+        errors: list[str],
+    ) -> None:
+        """Check 26: every Task row names a file path (FR-20, db-279, OD-3=A).
+
+        ``_check_files_and_statuses`` tolerates a file-less row of any type
+        (its file-existence/status checks simply have nothing to check). That
+        silent tolerance is correct for Epic/Feature/Story rows -- their
+        bodies are scaffolding -- but wrong for Task rows: ``parse_index``
+        (:mod:`devbench.backlog.parser`) hard-raises on a file-less Task row,
+        so a Task row that passes ``validate()`` while missing a file would
+        crash the orchestrator's ``set-status``/``start`` path. This rule
+        closes that gap by flagging the same file-less Task row here, using
+        the same :meth:`_is_task_id` idiom other rules use to scope Task-only
+        checks. Status-Summary Epic rows and the ``**TOTAL**`` row are never
+        Task IDs, so they are skipped without any special-casing.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if file_path_str:
+                continue
+            errors.append(
+                f"{row_id}: Task-level work unit has no file path in BACKLOG.md "
+                "-- every Task row must name a materialised work-unit file"
+            )
+
     def _check_orphans(self, workspace_root: Path, indexed_files: set[Path], errors: list[str]) -> None:
         """Check 3: no orphaned work unit files."""
         backlog_dir = workspace_root / BACKLOG_SUBDIR
@@ -1125,14 +1345,31 @@ class BacklogManager:
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
                     errors.append(f"{row_id}: dependency '{dep_id}' not found in backlog index")
 
-    def _check_dep_cycles(self, backlog_index: Path, errors: list[str]) -> None:
-        """Issue #151: detect dependency cycles via DFS-with-recursion-stack.
+    def _check_dep_cycles(
+        self,
+        backlog_index: Path,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Issue #151 / FR-1 (db-253 Gap 1, db-299 Defect 2): detect dependency
+        cycles via DFS-with-recursion-stack, over the UNION of every edge
+        channel the orchestrator honors.
 
-        Walks the dep graph derived from the Full Work Unit Index. A cycle
-        exists when, during DFS, we encounter a node that is currently in
-        the recursion stack (the "gray" set). Self-edges and chains of any
-        length (4-node, N-node) are detected because the recursion-stack
-        membership check is the unique cycle witness.
+        The dependency/ownership graph is written to three channels: the index
+        ``Dependencies`` column, each Task's own ``## Dependencies`` table, and
+        its ``[BLOCKED_PENDING_PROPOSAL]`` markers. All three encode the same
+        directed edge ``blocked_id -> blocker_id``, so unioning them cannot
+        invent a false edge -- it can only surface a cycle the index-only view
+        was blind to. See :meth:`_extend_dependency_graph_with_wu_edges` for the
+        table/marker union; terminal (``done`` / ``declined``) Tasks contribute
+        no table/marker edge there.
+
+        Walks the resulting graph via DFS. A cycle exists when, during DFS, we
+        encounter a node that is currently in the recursion stack (the "gray"
+        set). Self-edges and chains of any length (4-node, N-node) are
+        detected because the recursion-stack membership check is the unique
+        cycle witness.
 
         Reports one error per cycle, naming the participating node IDs in
         traversal order so the operator can spot the offending chain. Cycle
@@ -1141,6 +1378,7 @@ class BacklogManager:
         encounters it from multiple roots.
         """
         graph = self._build_dependency_graph(backlog_index)
+        self._extend_dependency_graph_with_wu_edges(graph, rows, workspace_root)
         if not graph:
             return
 
@@ -1218,6 +1456,118 @@ class BacklogManager:
             graph[row_id] = deps
         return graph
 
+    def _iter_non_terminal_task_files(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> Iterator[tuple[str, Path]]:
+        """Yield ``(row_id, wu_path)`` for every real, non-terminal, on-disk Task row.
+
+        Shared eligibility filter reused by :meth:`_extend_dependency_graph_with_wu_edges`
+        (FR-1) and :meth:`_check_dangling_markers` (FR-7): both read a Task's own
+        ``## Dependencies`` table / ``[BLOCKED_PENDING_PROPOSAL]`` markers only
+        when the row is a genuine Task ID with a resolvable file, and only when
+        the Task is non-terminal (``done`` / ``declined`` Tasks are closed and
+        must not contribute stale edges or resurrect stale marker complaints).
+
+        Args:
+            rows: ``(row_id, status, file_path)`` tuples from
+                :meth:`_parse_backlog_rows`.
+            workspace_root: Workspace root used to resolve ``file_path``.
+
+        Yields:
+            ``(row_id, wu_path)`` pairs for eligible rows, in ``rows`` order.
+        """
+        for row_id, status, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not self._is_task_id(row_id) or not file_path:
+                continue
+            if status in _TERMINAL_CHILD_STATUSES:
+                continue
+            wu_path = workspace_root / file_path
+            if not wu_path.exists():
+                continue
+            yield row_id, wu_path
+
+    def _extend_dependency_graph_with_wu_edges(
+        self,
+        graph: dict[str, list[str]],
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> None:
+        """FR-1: union in each non-terminal Task's ``## Dependencies`` table
+        and ``[BLOCKED_PENDING_PROPOSAL]`` marker edges, in place.
+
+        The index ``Dependencies`` column (seeded by :meth:`_build_dependency_graph`)
+        is only one of three channels the orchestrator honors as a
+        ``blocked_id -> blocker_id`` edge; the other two are each non-terminal
+        Task's own ``## Dependencies`` table (:meth:`_extract_dep_ids`) and its
+        ``[BLOCKED_PENDING_PROPOSAL]`` markers (:meth:`_extract_pending_proposal_markers`).
+        Every channel encodes the same edge direction, so the union cannot
+        invent a cycle that none of the three channels individually encodes.
+
+        Terminal (``done`` / ``declined``) Tasks are skipped (see
+        :meth:`_iter_non_terminal_task_files`): a closed Task cannot deadlock
+        the orchestrator, and reading its table/markers would risk
+        resurrecting a historical cycle from a stale marker that was never
+        cleaned up after the Task closed.
+
+        Args:
+            graph: The ``{id: [dep_id, ...]}`` adjacency map, seeded from the
+                index and mutated in place with the additional edges.
+            rows: ``(row_id, status, file_path)`` tuples from
+                :meth:`_parse_backlog_rows`.
+            workspace_root: Workspace root used to resolve ``file_path``.
+        """
+        for row_id, wu_path in self._iter_non_terminal_task_files(rows, workspace_root):
+            content = wu_path.read_text(encoding="utf-8")
+            extra_deps = self._extract_dep_ids(content) | self._extract_pending_proposal_markers(wu_path)
+            if not extra_deps:
+                continue
+            existing = graph.setdefault(row_id, [])
+            for dep_id in sorted(extra_deps):
+                if dep_id not in existing:
+                    existing.append(dep_id)
+
+    def _check_dangling_markers(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        known_ids: set[str],
+        errors: list[str],
+    ) -> None:
+        """FR-7 (db-253 Gap 2b): a well-formed marker must reference a known WU-ID.
+
+        A ``[BLOCKED_PENDING_PROPOSAL]`` marker pointing at a WU-ID absent from
+        the index previously survived :meth:`validate` silently and only
+        tripped ``reconcile-cascade`` later, when the cascade tried (and
+        failed) to resolve the reference. This check surfaces the same
+        condition at validate time so the operator can fix it before it blocks
+        the cascade.
+
+        Terminal (``done`` / ``declined``) Tasks are skipped (see
+        :meth:`_iter_non_terminal_task_files`). A missing work-unit file
+        contributes no error here -- it is already reported by
+        :meth:`_check_files_and_statuses`.
+
+        Args:
+            rows: ``(row_id, status, file_path)`` tuples from
+                :meth:`_parse_backlog_rows`.
+            workspace_root: Workspace root used to resolve ``file_path``.
+            known_ids: Every row ID present in the backlog index.
+            errors: Error accumulator; a verbatim ERROR string is appended per
+                dangling marker.
+        """
+        for row_id, wu_path in self._iter_non_terminal_task_files(rows, workspace_root):
+            for marker_id in sorted(self._extract_pending_proposal_markers(wu_path)):
+                if marker_id not in known_ids:
+                    errors.append(
+                        f"work unit {row_id}: [BLOCKED_PENDING_PROPOSAL] marker references "
+                        f"unknown task '{marker_id}' -- the referenced task is not in the "
+                        f"index; remove the marker or fix the reference (blocks reconcile-cascade)."
+                    )
+
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.
 
@@ -1228,7 +1578,7 @@ class BacklogManager:
             spec_ref: Specification reference (e.g. ``AC-FUNC-001``).
             test_ref: Test reference (e.g. ``test_user_creation``).
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
 
         if not matrix_path.exists():
             header = TRACEABILITY_MATRIX_HEADER
@@ -1402,8 +1752,16 @@ class BacklogManager:
                 # Dependencies table, no marker) were marooned. The regular-dep
                 # cascade closes that gap.
                 self._auto_requeue_regular_dep_dependents(backlog_index, unit_id)
-            if canonical == STATUS_DONE:
-                self._rollup_parent_status(backlog_index, unit_id)
+            # Issue #332: the rollup must run for every terminal transition
+            # (``done`` AND ``declined``), matching the #147 fix applied to
+            # the requeue cascade two calls above. A story whose last open
+            # child is Declined (not Done) previously never triggered this
+            # call, stranding the story -- and its feature/epic ancestors --
+            # in a non-terminal status forever. Runs AFTER both requeue
+            # calls: a child freshly unblocked by the requeue must be seen
+            # as non-terminal by ``_all_children_done`` so the rollup
+            # correctly declines to promote the parent.
+            self._rollup_parent_status(backlog_index, unit_id)
 
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.
@@ -1454,7 +1812,7 @@ class BacklogManager:
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
         # Write audit comment to parent work unit
-        timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        timestamp = comment_timestamp()
         rollup_comment = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name="orchestrator",
@@ -1818,7 +2176,7 @@ class BacklogManager:
 
     def _append_comment(self, work_unit_path: Path, action: str, message: str) -> None:
         """Append a comment entry to the Comments section of a work-unit file."""
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_ENTRY_TEMPLATE.format(
             timestamp=timestamp,
             agent_id="backlog_manager",
@@ -1839,14 +2197,16 @@ class BacklogManager:
     def _append_agent_comment(self, work_unit_path: Path, agent_name: str, message: str) -> None:
         """Append an agent comment using COMMENT_AGENT_TEMPLATE format.
 
-        Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<agent_name>] <message>``
+        Writes: ``[YYYY-MM-DD HH:MM ZONE] [agent/<agent_name>] <message>``, where
+        ZONE is the workspace's ``display_timezone`` abbreviation, or ``UTC``
+        when unset.
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
             agent_name: Agent name (e.g. ``git_ops``, ``orchestrator``).
             message: Message to append (may contain token and detail).
         """
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = comment_timestamp()
         entry = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name=agent_name,
@@ -1886,7 +2246,9 @@ class BacklogManager:
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
-        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``
+        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``, the
+        timestamp in the workspace's ``display_timezone`` carrying its
+        numeric offset, or UTC when unset.
 
         The entry is inserted immediately before the next ``## `` heading after
         ``## TDD Cycle Log``.  When ``## TDD Cycle Log`` is the last section in
@@ -1913,7 +2275,7 @@ class BacklogManager:
         Raises:
             ValueError: If the ``## TDD Cycle Log`` section does not exist in the file.
         """
-        timestamp = datetime.now(tz=UTC).isoformat()
+        timestamp = tdd_timestamp()
         entry = TDD_ENTRY_TEMPLATE.format(phase=phase, timestamp=timestamp, message=message)
 
         content = work_unit_path.read_text(encoding="utf-8")
@@ -2317,7 +2679,11 @@ class BacklogManager:
 
     @classmethod
     def _is_test_source_path(cls, path: str) -> bool:
-        """Return True if the path is a Python file located under a ``tests/`` dir.
+        """Return True if the path is a Python test file.
+
+        Recognised two ways: a ``tests/`` directory segment, or pytest's default
+        discovery convention (``test_*.py`` / ``*_test.py``) for repositories
+        that colocate tests beside the code they exercise.
 
         This is the single shared authority for "is this path a Python test
         file" used both by ``_is_production_source`` (Rule 14, source-test
@@ -2326,9 +2692,19 @@ class BacklogManager:
         classifier is prohibited -- both call sites must reuse this method
         so the production/test boundary can never drift out of sync.
         """
-        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+        if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
-        return path.startswith("tests/") or "/tests/" in path
+        if path.startswith("tests/") or "/tests/" in path:
+            return True
+        # pytest's default discovery convention (``python_files = test_*.py
+        # *_test.py``). A repository that colocates tests beside the code they
+        # exercise has no ``tests/`` segment to key on, and treating those files
+        # as production source makes Rule 14 demand a test for the test --
+        # ``test_render.py`` requiring ``test_test_render.py`` -- which is
+        # unsatisfiable by construction.
+        basename = path.rsplit("/", 1)[-1]
+        stem = basename.rsplit(".", 1)[0]
+        return basename.startswith("test_") or stem.endswith("_test")
 
     @classmethod
     def _is_production_source(cls, path: str) -> bool:
@@ -2340,7 +2716,7 @@ class BacklogManager:
         any ``tests/`` segment, per ``_is_test_source_path``) are excluded --
         they are not production source even when their extension is ``.py``.
         """
-        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+        if not any(path.lower().endswith(ext) for ext in cls._production_source_extensions()):
             return False
         # Exclude test files
         if cls._is_test_source_path(path):
@@ -2350,9 +2726,52 @@ class BacklogManager:
 
         if PurePosixPath(path).name == "__init__.py":
             return False
+        # A workspace whose production code lives outside src/ declares its own
+        # prefixes via validate.production_source_paths. Absent (the default),
+        # the built-in prefixes apply unchanged.
+        configured = cls._configured_production_source_paths()
+        if configured is not None:
+            return any(path.startswith(prefix) for prefix in configured)
         return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
             seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
         )
+
+    @staticmethod
+    def _configured_production_source_paths() -> tuple[str, ...] | None:
+        """Return the workspace's declared production-source prefixes, or None.
+
+        Isolated so the classifier stays import-light and so a workspace that
+        never configures the key pays no behavioural cost.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.production_source_paths
+        except Exception:
+            return None
+
+    @classmethod
+    def _production_source_extensions(cls) -> tuple[str, ...]:
+        """The effective source-file extensions: workspace-declared, else Python only.
+
+        Shared by ``_is_test_source_path`` and ``_is_production_source`` so the
+        production/test boundary can never drift between them.
+        """
+        return cls._configured_production_source_extensions() or cls._PYTHON_EXTS
+
+    @staticmethod
+    def _configured_production_source_extensions() -> tuple[str, ...] | None:
+        """Return the workspace's declared production-source extensions, or None.
+
+        None keeps the built-in Python-only behaviour, so a workspace that never
+        configures the key sees no change.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.production_source_extensions
+        except Exception:
+            return None
 
     @staticmethod
     def _is_documentation_path(path: str) -> bool:
@@ -2400,16 +2819,45 @@ class BacklogManager:
             return False
         return not is_sentinel_manifest_value(stripped)
 
+    # HARD claimants collide at git-ops time whether or not the operator has
+    # noticed yet -- ``in-progress`` is included (db-313, FR-3) because an
+    # actively-executing claimant is just as real a collision risk as a
+    # queued one. SOFT claimants are pre-lifecycle authoring states that
+    # have not committed to an execution order yet; they are only folded
+    # into the conflict count under ``strict=True`` (db-267, FR-4). Any
+    # other status (``done``, ``declined``, ``in-review``, or an unrecognised
+    # value) belongs to neither set and is excluded from both checks -- it
+    # can never be silently bucketed into HARD or SOFT to mask a genuine
+    # conflict.
+    _HARD_CLAIMANT_STATUSES: ClassVar[frozenset[str]] = frozenset(
+        {STATUS_IN_QUEUE, STATUS_PROPOSED, STATUS_BLOCKED, STATUS_IN_PROGRESS}
+    )
+    _SOFT_CLAIMANT_STATUSES: ClassVar[frozenset[str]] = frozenset({STATUS_DRAFT, STATUS_HOLD})
+
     def _check_manifest_conflicts(
         self,
         rows: list[tuple[str, str, str]],
         workspace_root: Path,
         errors: list[str],
+        strict: bool = False,
     ) -> None:
-        """Check 12: no two in-queue tasks in the SAME REPO own the same Manifest path.
+        """Check 12: no two in-flight claimants in the SAME REPO own the same Manifest path.
 
-        Per docs/backlog-contract.md "Manifest Conflict Rule": two in-queue
-        tasks claiming ownership of the same path collide at git-ops time.
+        Per docs/backlog-contract.md "Manifest Conflict Rule": two claimants
+        of one path collide at git-ops time. HARD claimants
+        (``in-queue``, ``proposed``, ``blocked``, ``in-progress``) are
+        checked on every run; two or more with no ordering dependency is an
+        ERROR using the unchanged Manifest-conflict wording (FR-3, db-313).
+
+        SOFT claimants (``draft``, ``hold``) are pre-lifecycle authoring
+        states. When ``strict`` is ``True``, a collision that exists only
+        once SOFT claimants are folded into the HARD set emits a distinct
+        draft/hold ERROR (FR-4, db-267), giving ``spec-to-backlog`` an
+        authoring-time exit gate. Default runs never evaluate SOFT
+        claimants, preserving the all-draft rc=0 authoring gate. A
+        collision already reported via the HARD check is not reported a
+        second time under the SOFT check.
+
         Tasks with explicit Dependencies between them are exempt because the
         ordering resolves the conflict. The check is scoped by ``(repo, path)``
         because two tasks targeting different repos can legitimately list the
@@ -2448,28 +2896,67 @@ class BacklogManager:
         for (repo, path), owners in ownership.items():
             if len(owners) < 2:
                 continue
-            # Filter to tasks not in done/declined/in-progress -- those are not
-            # in flight any more or are actively being executed; the conflict
-            # rule targets in-queue/proposed/blocked overlap.
-            relevant = [(tid, st) for tid, st in owners if st in ("in-queue", "proposed", "blocked")]
-            if len(relevant) < 2:
+            hard_ids = [tid for tid, st in owners if st in self._HARD_CLAIMANT_STATUSES]
+            hard_error = self._hard_manifest_conflict_error(path, repo, hard_ids, deps_by_task)
+            if hard_error:
+                errors.append(hard_error)
                 continue
-            # Check whether every pair is comparable via the transitive
-            # dep graph (any DAG that totally orders the set is sufficient).
-            ids = [tid for tid, _ in relevant]
-            if self._tasks_form_dep_chain(ids, deps_by_task):
+            if not strict:
                 continue
-            sorted_ids = sorted(ids)
-            chain_hint = "\n".join(
-                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
-            )
-            errors.append(
-                f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
-                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
-                f"{chain_hint}\n"
-                f"  -- or any other DAG that totally orders the set. See "
-                f"docs/backlog-contract.md 'Manifest Conflict Rule'."
-            )
+            soft_ids = [tid for tid, st in owners if st in self._SOFT_CLAIMANT_STATUSES]
+            soft_error = self._soft_manifest_conflict_error(path, hard_ids + soft_ids, deps_by_task)
+            if soft_error:
+                errors.append(soft_error)
+
+    def _hard_manifest_conflict_error(
+        self,
+        path: str,
+        repo: str,
+        hard_ids: list[str],
+        deps_by_task: dict[str, set[str]],
+    ) -> str | None:
+        """Return the unchanged Manifest-conflict ERROR text (FR-3), or ``None``.
+
+        Fires when two or more HARD claimants of ``path`` exist with no
+        ordering dependency between them (any DAG that totally orders the
+        set via transitive reachability is accepted).
+        """
+        if len(hard_ids) < 2 or self._tasks_form_dep_chain(hard_ids, deps_by_task):
+            return None
+        sorted_ids = sorted(hard_ids)
+        chain_hint = "\n".join(
+            f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+        )
+        return (
+            f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
+            f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+            f"{chain_hint}\n"
+            f"  -- or any other DAG that totally orders the set. See "
+            f"docs/backlog-contract.md 'Manifest Conflict Rule'."
+        )
+
+    def _soft_manifest_conflict_error(
+        self,
+        path: str,
+        combined_ids: list[str],
+        deps_by_task: dict[str, set[str]],
+    ) -> str | None:
+        """Return the strict-mode draft/hold Manifest-conflict ERROR text (FR-4), or ``None``.
+
+        Fires only under ``strict=True``, when the HARD check has not
+        already reported a conflict for ``path`` and folding SOFT
+        (``draft``/``hold``) claimants into the HARD set produces a
+        collision with no ordering dependency between them.
+        """
+        if len(combined_ids) < 2 or self._tasks_form_dep_chain(combined_ids, deps_by_task):
+            return None
+        sorted_combined = sorted(combined_ids)
+        return (
+            f"Manifest conflict (draft/hold) on {path!r}: "
+            f"claimed by {', '.join(sorted_combined)}. These units are not yet "
+            f"in-queue; wire a serial dep chain before promoting. See "
+            f"docs/backlog-contract.md 'Manifest Conflict Rule'."
+        )
 
     @staticmethod
     def _extract_dep_ids(content: str) -> set[str]:
@@ -2514,6 +3001,14 @@ class BacklogManager:
         canonical contract -- any DAG that totally orders the set (a clean
         N-1 chain, a branching DAG that merges, full N*(N-1)/2 pairwise
         edges) is accepted (issue #145).
+
+        FR-5 (db-311): the BFS traverses through EVERY child, including
+        non-claimant intermediates that are not themselves in ``ids`` --
+        ``deps`` (``deps_by_task``) already holds every task row's edges, so
+        the data is present. ``id_set`` is only applied at the end, via
+        ``seen & id_set``, so a correctly-ordered chain through a non-claimant
+        (``C -> B(non-claimant) -> A``) is no longer mis-scored as unordered.
+        ``seen`` still guards cycles so the traversal always terminates.
         """
         if len(ids) < 2:
             return True
@@ -2525,11 +3020,11 @@ class BacklogManager:
             while queue:
                 node = queue.popleft()
                 for child in deps.get(node, set()):
-                    if child not in id_set or child in seen:
+                    if child in seen:
                         continue
                     seen.add(child)
                     queue.append(child)
-            return seen
+            return seen & id_set
 
         reach = {tid: reachable(tid) for tid in ids}
         for i, a in enumerate(ids):
@@ -2701,6 +3196,78 @@ class BacklogManager:
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
 
+    def _check_expected_output(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 28: the ``## Expected Output:`` declaration agrees with the Manifest.
+
+        ``commit`` (the default when the section is absent) is the pre-existing
+        lifecycle: git-ops commits, pushes, opens a PR, waits for CI, merges.
+        ``none`` declares a unit that modifies no source file -- a verification,
+        decision, or no-op unit that records its evidence in ``## Comments``.
+
+        The cross-check exists because the two failure directions are both
+        silent at authoring time and expensive at execution time:
+
+        - ``none`` alongside a real Manifest path means the unit intends to
+          change a file, so skipping the commit would discard that work.
+        - ``none`` alongside ``<source-drift-fix-targets-determined-at-execution>``
+          is contradictory: deferred resolution enumerates real paths via
+          manifest_amendment mid-execution, which is precisely a commit.
+
+        Only the no-output sentinels (``<verification-only>``,
+        ``<decision-only>``, ``<no changes>``, ``<no-op>`` and their per-task
+        ``<name:ID>`` variants) satisfy ``none``.
+
+        A Task whose Manifest cannot be parsed is skipped rather than crashing
+        validate(), matching the ``except ManifestParseError: continue``
+        pattern used by every other Manifest-consuming rule in this module.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.backlog.sentinels import is_no_output_manifest
+
+        for row_id, row_status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            if row_status in _TERMINAL_CHILD_STATUSES:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            declared = self._extract_expected_output(content)
+            if declared is None:
+                continue
+            if declared not in VALID_EXPECTED_OUTPUTS:
+                allowed = ", ".join(sorted(VALID_EXPECTED_OUTPUTS))
+                errors.append(
+                    f"{row_id}: '## Expected Output: {declared}' is not a recognised value; "
+                    f"allowed values are: {allowed}."
+                )
+                continue
+            if declared != EXPECTED_OUTPUT_NONE:
+                continue
+            try:
+                manifest_files = [r.file for r in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            if is_no_output_manifest(manifest_files):
+                continue
+            offenders = ", ".join(repr(f) for f in manifest_files) or "(empty Manifest)"
+            errors.append(
+                f"{row_id}: declares '## Expected Output: none' but its Changes Manifest is not "
+                f"exclusively no-output sentinels (got {offenders}). A unit that produces no commit "
+                f"must declare only <verification-only>, <decision-only>, <no changes>, or <no-op>; "
+                f"any real path -- or <source-drift-fix-targets-determined-at-execution>, which "
+                f"resolves to real paths mid-execution -- will produce a commit, so declare "
+                f"'## Expected Output: commit' instead."
+            )
+
     def _check_task_type_taxonomy(
         self,
         rows: list[tuple[str, str, str]],
@@ -2722,12 +3289,21 @@ class BacklogManager:
         - ``behavior-fix`` / ``feature`` (RED-gated, ``GATED_TASK_TYPES``):
           the Manifest must contain at least one production-source row.
         - ``test-only``: every Manifest row must be a test path.
-        - ``docs``: every Manifest row must be a documentation/markdown path.
+        - ``docs``: every Manifest row must be a documentation/markdown path
+          OR a documentation-pinning test path (db-300: a docs task may
+          legitimately own a test that pins its own documentation).
         - ``chore``: every Manifest row must be a dependency/config/lockfile
-          path.
+          path OR a documentation/markdown path (db-300: a chore task may
+          legitimately own ``CHANGELOG.md``).
         - ``refactor``: exempt from the per-row invariants enforced here --
           its green-green runtime requirement is a TDD-cycle-log concern,
           out of scope for this static Manifest check.
+
+        Every per-row invariant still rejects production Python source under
+        ``src/`` for docs/chore/test-only: each named classifier in the
+        OR-lists above independently rejects production source, so widening
+        a type's OR-list to accept a second classifier never widens it to
+        accept production source too.
 
         An unrecognized ``## Task Type:`` value fails naming the full
         allowed set (AC-45). Every invariant rejection names the offending
@@ -2805,15 +3381,28 @@ class BacklogManager:
             paths = [p for p in manifest_paths if self._is_real_manifest_path(p)]
             self._check_task_type_manifest_invariant(row_id, task_type, paths, errors)
 
-    # Per-type Manifest invariant: type -> (row classifier, human description).
-    # ``behavior-fix`` / ``feature`` are handled separately in
-    # ``_check_task_type_manifest_invariant`` (an aggregate "at least one"
-    # check, not a per-row classifier). ``refactor`` never reaches the
-    # dispatcher -- the caller filters it out before parsing the Manifest.
-    _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[str, str]]] = {
-        TASK_TYPE_TEST_ONLY: ("_is_test_source_path", "test"),
-        TASK_TYPE_DOCS: ("_is_documentation_path", "documentation/markdown"),
-        TASK_TYPE_CHORE: ("_is_chore_path", "dependency/config/lockfile"),
+    # Per-type Manifest invariant: type -> (OR-list of row classifier names,
+    # human description). A row is accepted if ANY named classifier accepts
+    # it (db-300: a type may legitimately own rows shaped like more than one
+    # classifier -- e.g. a docs task owning a documentation-pinning test, or
+    # a chore task owning CHANGELOG.md). ``behavior-fix`` / ``feature`` are
+    # handled separately in ``_check_task_type_manifest_invariant`` (an
+    # aggregate "at least one" check, not a per-row classifier).
+    # ``refactor`` never reaches the dispatcher -- the caller filters it out
+    # before parsing the Manifest. The three classifiers below
+    # (``_is_test_source_path``, ``_is_documentation_path``,
+    # ``_is_chore_path``) are the single source of truth reused across every
+    # OR-list entry -- no fourth classifier exists.
+    _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[tuple[str, ...], str]]] = {
+        TASK_TYPE_TEST_ONLY: (("_is_test_source_path",), "test"),
+        TASK_TYPE_DOCS: (
+            ("_is_documentation_path", "_is_test_source_path"),
+            "documentation/markdown or documentation-pinning test",
+        ),
+        TASK_TYPE_CHORE: (
+            ("_is_chore_path", "_is_documentation_path"),
+            "dependency/config/lockfile or documentation/markdown",
+        ),
     }
 
     def _check_task_type_manifest_invariant(
@@ -2828,8 +3417,11 @@ class BacklogManager:
         ``behavior-fix`` / ``feature`` (``GATED_TASK_TYPES``) require an
         aggregate check -- at least one production-source row anywhere in
         the Manifest. ``test-only`` / ``docs`` / ``chore`` require a
-        per-row check via ``_TASK_TYPE_ROW_INVARIANTS`` -- every row must
-        classify as that type's allowed path shape.
+        per-row check via ``_TASK_TYPE_ROW_INVARIANTS`` -- every row must be
+        accepted by AT LEAST ONE of that type's named classifiers (an
+        OR-list, db-300). Every classifier rejects production Python source
+        under ``src/``, so the OR-list widening never lets production
+        source through.
         """
         if task_type in GATED_TASK_TYPES:
             if not any(self._is_production_source(p) for p in paths):
@@ -2848,10 +3440,10 @@ class BacklogManager:
         # future type added to VALID_TASK_TYPES without a matching entry
         # here raises immediately (fail-fast) instead of silently
         # skipping its invariant.
-        classifier_name, description = self._TASK_TYPE_ROW_INVARIANTS[task_type]
-        classifier = getattr(self, classifier_name)
+        classifier_names, description = self._TASK_TYPE_ROW_INVARIANTS[task_type]
+        classifiers = [getattr(self, classifier_name) for classifier_name in classifier_names]
         for path in paths:
-            if not classifier(path):
+            if not any(classifier(path) for classifier in classifiers):
                 errors.append(
                     f"{row_id}: task type {task_type!r} allows only "
                     f"{description} rows in the Changes Manifest, but "
@@ -3252,6 +3844,85 @@ class BacklogManager:
             out.append((token, has_ref))
         return out
 
+    def _check_marker_status_agreement(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Rule 27: a task waiting on a live ``[BLOCKED_PENDING_PROPOSAL]`` marker must be ``blocked``.
+
+        The marker and the ``## Status:`` line are written by separate steps, and
+        three consumers read them independently, so a disagreement is silently
+        load-bearing rather than cosmetic:
+
+        - :meth:`_auto_requeue_marker_dependents` (the ADR-07 cascade) skips any
+          candidate whose status is not ``blocked``, so a marked-but-unblocked
+          task is never requeued when its promoted dependency completes -- it
+          strands with a satisfied dependency, the exact outcome the cascade
+          exists to prevent.
+        - ``cli._should_auto_restart_after_no_actionable`` refuses to restart
+          while any task is ``in-progress``, so a target marked mid-execution
+          suppresses auto-restart indefinitely.
+        - :meth:`~devbench.backlog.parser.BacklogParser.find_next_actionable`
+          PRIORITISES ``in-progress`` over ``in-queue``, so a claim sweep can
+          re-claim the target while its blocker is unresolved.
+
+        ``classify_blocked_task`` keys off marker presence, not status, so it
+        reports such a task as auto-clearing while the status line disagrees;
+        neither view cross-checks the other. This rule is that cross-check, and
+        it holds regardless of which code path introduced the mismatch --
+        including future ones -- rather than relying on every marker writer
+        remembering to write the status too.
+
+        Only markers with a NON-TERMINAL target are checked. A task whose
+        markers all point at ``done``/``declined`` work is legitimately back in
+        ``in-queue`` (or already running) because the cascade requeued it, so
+        requiring ``blocked`` there would flag correct state.
+
+        Terminal statuses are exempt: a ``done`` or ``declined`` task that still
+        carries an old marker is finished, and its history is not a defect.
+
+        Args:
+            rows: ``(id, status, file_path)`` triples from the backlog index.
+            workspace_root: Workspace root that ``file_path`` is relative to.
+            errors: Accumulator appended to on violation.
+        """
+        status_by_id = {
+            row_id: (status or "").strip().lower()
+            for row_id, status, _ in rows
+            if row_id and not row_id.startswith("-") and row_id.lower() != "id"
+        }
+        terminal = {STATUS_DONE, STATUS_DECLINED}
+
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            own_status = (status or "").strip().lower()
+            if own_status in (STATUS_BLOCKED, *terminal):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            live_markers = sorted(
+                marker_id
+                for marker_id in self._extract_pending_proposal_markers(wu_path)
+                if status_by_id.get(marker_id, "") not in terminal
+            )
+            if not live_markers:
+                continue
+            errors.append(
+                f"{row_id}: status is {own_status!r} but the task carries a live "
+                f"[BLOCKED_PENDING_PROPOSAL] marker on {', '.join(live_markers)}. A task "
+                f"waiting on a promoted proposal MUST be 'blocked': the ADR-07 auto-requeue "
+                f"cascade skips non-blocked candidates, so this task would never be requeued "
+                f"when its blocker completes, and 'in-progress' additionally suppresses "
+                f"auto-restart and can be re-claimed by a sweep. Run "
+                f"'uv run devbench sync-blocked' to reconcile status against dependency state."
+            )
+
     def _check_no_orphan_path_tokens(
         self,
         rows: list[tuple[str, str, str]],
@@ -3524,6 +4195,21 @@ class BacklogManager:
         the taxonomy check.
         """
         m = TASK_TYPE_LINE_RE.search(content)
+        if not m:
+            return None
+        return m.group(2).strip().lower()
+
+    @staticmethod
+    def _extract_expected_output(content: str) -> str | None:
+        """Extract the declared ``## Expected Output:`` value from a work-unit body.
+
+        Returns the lowercased, whitespace-trimmed value, or ``None`` when the
+        section is absent. A ``None`` result resolves to
+        ``DEFAULT_EXPECTED_OUTPUT`` (``commit``) -- the pre-existing lifecycle --
+        so a backlog authored before this section existed is never
+        retroactively reinterpreted. Mirrors ``_extract_task_type``.
+        """
+        m = EXPECTED_OUTPUT_LINE_RE.search(content)
         if not m:
             return None
         return m.group(2).strip().lower()

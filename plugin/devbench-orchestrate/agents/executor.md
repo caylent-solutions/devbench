@@ -428,8 +428,22 @@ Files are ordered by judge severity (security > code > test > changes_manifest >
 
 1. **Fix it locally.** Modify the named files per the `remediation` field, re-stage, and ensure the next review iteration no longer flags the category. The orchestrator's done-gate logs `[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>` when it confirms the category is cleared in the new diff.
 2. **Escalate via dependency.** If the fix belongs upstream (a different task owns the affected files / approach), log `[NEEDS_DEP] <judge>:<code>` via `uv run devbench log-comment executor <task-id> "[NEEDS_DEP] <judge>:<code> <reason>"` AND wire the dep via `uv run devbench add-dep <this-task> <upstream-task> --reason "<msg>"`. The done-gate accepts the audit row as resolution.
+3. **Request a `doc_sync_review_fix` amendment.** If the category is a `doc_review` REVIEW_FAIL naming a required out-of-Manifest documentation fix (a `.md` file or a documentation-pinning test), stage the minimum fix and request an amendment with `reason: "doc_sync_review_fix"`, `files_to_add` limited to the named doc / doc-pin paths, `justification` citing the `doc_review` REVIEW_FAIL, and `linked_acs` naming the affected AC-DOC ids:
+   ```bash
+   cat <<'EOF' | uv run devbench request-amendment $ARGUMENTS
+   {
+     "reason": "doc_sync_review_fix",
+     "justification": "<cite the doc_review REVIEW_FAIL that mandated this out-of-Manifest doc fix>",
+     "files_to_add": [
+       {"path": "<doc.md or doc-pinning test path>", "change": "<one-line description of the diff>"}
+     ],
+     "linked_acs": ["<AC-DOC-ID linked to this fix>"]
+   }
+   EOF
+   ```
+   `doc_sync_review_fix` only accepts documentation (`.md`) or documentation-pinning test paths -- the manifest-amender rejects any other path with an `AmendmentError`. The manifest-amender in turn only authorizes this reason when a current-round `doc_review` REVIEW_FAIL record for the task exists under `.devbench/review-failures/`; if no such record exists, escalate via option 2 instead.
 
-The done-gate refuses `mark-done` until every prior `<task-id>-<judge>-*.json` rejection is cleared via one of the two paths. A `[REJECTION_FEEDBACK_OUTSTANDING]` audit naming the unresolved `<judge>:<code>` pairs is logged on every refusal.
+The done-gate refuses `mark-done` until every prior `<task-id>-<judge>-*.json` rejection is cleared via one of the three paths above. A `[REJECTION_FEEDBACK_OUTSTANDING]` audit naming the unresolved `<judge>:<code>` pairs is logged on every refusal.
 
 ## REVIEW_PASS verdicts are terminal (issue #128)
 

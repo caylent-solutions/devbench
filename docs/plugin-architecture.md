@@ -48,7 +48,11 @@ plugin/devbench-orchestrate/
     ├── guard-bash.sh            ← blocks dangerous Bash commands
     ├── guard-backlog.sh         ← blocks direct Bash writes to backlog/ tracking files
     ├── guard-verdict-format.sh  ← validates log-verdict argument format
-    ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the work unit's Changes Manifest
+    ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the
+    │                              active work unit's Changes Manifest. The active unit resolves from CURRENT_WORK_UNIT_FILE
+    │                              when set (tests, operator pins), else from the `.devbench/active-work-unit[-<session>]`
+    │                              marker `devbench claim` writes (issue #336); enforcement only while the resolved unit
+    │                              is `## Status: in-progress`
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
     ├── guard-destructive-git.sh ← blocks direct destructive git operations from non-git-ops agents
     ├── guard-review-supervisor-scope.sh

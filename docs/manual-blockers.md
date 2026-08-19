@@ -155,7 +155,7 @@ DEVBENCH_WORKSPACE_ROOT=... DEVBENCH_CLAUDE_MODEL=... \
   uv run --project ... devbench add-dep <dependent-task-id> E0-F<N>-S1-T1
 ```
 
-`add-dep` writes the manual blocker into the dependent's `## Dependencies` table with status `proposed` (the marker that auto-clearing-via-proposal looks for). When `devbench report` runs, the dependent appears under "Blocked tasks (auto-clearing via proposal)" rather than "needs operator attention", because the cascade-classifier sees a `proposed` blocker as resolvable.
+`add-dep` writes the manual blocker into the dependent's `## Dependencies` table carrying the manual blocker's real, current title and status (not a `(auto)` / `proposed` placeholder), alongside a `[BLOCKED_PENDING_PROPOSAL]` audit marker (the marker that auto-clearing-via-proposal looks for). When `devbench report` runs, the dependent appears under "Blocked tasks (auto-clearing via proposal)" rather than "needs operator attention", because the cascade-classifier keys off the `[BLOCKED_PENDING_PROPOSAL]` marker -- not the Dependencies row's status cell -- as the signal that the blocker is resolvable.
 
 Once the operator flips the manual blocker to `done`, every dependent that has only this blocker in its Dependencies table becomes claimable; dependents with additional in-flight blockers continue to wait on those.
 

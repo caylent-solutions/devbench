@@ -15,7 +15,14 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.reporting.report import HookLogTotals, WindowStats, generate_report
+from devbench.constants import SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
+from devbench.reporting.report import (
+    HookLogTotals,
+    WindowStats,
+    generate_report,
+    read_all_drain_states,
+    review_rejections_line,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -90,12 +97,12 @@ class TestGenerateReport:
         log_file.write_text(
             _make_log(
                 [
-                    "2026-03-05T09:50:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:15:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                    "2026-03-05T10:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
-                    "2026-03-05T10:45:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
+                    "2026-03-05T09:50:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T10:45:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
@@ -106,21 +113,24 @@ class TestGenerateReport:
         # real 25-min claim-to-done span). Median of [15, 5, 25] = 15.0.
         assert "15.0 min" in report
 
-    def test_report_keeps_latest_in_progress_timestamp(self, tmp_path: Path) -> None:
-        """When a task is set to 'in-progress' multiple times, the latest
-        timestamp should be used for duration calculation. Padded with two
-        more completions to clear MIN_PACE_SAMPLES."""
+    def test_report_ignores_prior_session_claim_and_uses_current_session_claim(self, tmp_path: Path) -> None:
+        """Issue #329 FR-2: when a task is set to 'in-progress' multiple
+        times across a session gap, the window is anchored to the earliest
+        CURRENT-session claim, not simply the most recent claim overall --
+        here the two happen to coincide because the older claim sits in a
+        different (prior) orchestrator session and is therefore never
+        eligible. Padded with two more completions to clear MIN_PACE_SAMPLES."""
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
                 [
-                    "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
-                    "2026-03-05T10:40:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
-                    "2026-03-05T10:40:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
-                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
+                    "2026-03-05T08:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:20:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:40:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:40:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T11:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
@@ -1272,7 +1282,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 9, 0, tzinfo=UTC),
             datetime(2026, 4, 15, 12, 0, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=1,
         )
         # 3 tasks * 20 min -> avg 20 min; only 3 completions log-wide but
@@ -1322,7 +1332,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 9, 0, tzinfo=UTC),
             datetime(2026, 4, 15, 11, 0, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=1,
         )
         assert MIN_PACE_SAMPLES >= 3
@@ -1380,7 +1390,7 @@ class TestActiveVsBlockedRemaining:
             base,
             base + timedelta(hours=n_total + 1),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=2,
         )
         # avg_minutes mixes 5- and 50-min tasks; recent_pace_minutes is exactly 50.
@@ -1428,7 +1438,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
         )
         assert stats_fallback.est_total_cost == pytest.approx(0.0)
@@ -1439,7 +1449,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
             recent_per_task_cost=50.0,
         )
@@ -1475,7 +1485,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
             recent_per_task_cost=50.0,
         )
@@ -1490,7 +1500,7 @@ class TestActiveVsBlockedRemaining:
             datetime(2026, 4, 15, 10, tzinfo=UTC),
             datetime(2026, 4, 15, 12, tzinfo=UTC),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=10,
             recent_per_task_cost=50.0,
             lifetime_total_cost=1000.0,
@@ -2440,8 +2450,8 @@ class TestSpanningRows:
         for i in range(10):
             start = f"2026-03-05T10:{i * 5:02d}:00Z"
             done = f"2026-03-05T10:{i * 5 + 4:02d}:30Z"
-            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
-            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+            log_lines.append(f"{start} [devbench.backlog_manager] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [devbench.backlog_manager] INFO Set E0-F1-S1-T{i + 1} to 'done'")
         log_file = tmp_path / "test.log"
         log_file.write_text(_make_log(log_lines))
 
@@ -3136,7 +3146,7 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
             now - timedelta(hours=1),
             now,
             done_times,
-            progress_times,
+            _as_claims(progress_times),
             tasks_active=4,
             tasks_blocked_recovery=60,
             tasks_blocked_auto=27,
@@ -3173,7 +3183,7 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
                 now - timedelta(hours=1),
                 now,
                 done_times,
-                progress_times,
+                _as_claims(progress_times),
                 tasks_active=4,
                 tasks_blocked_recovery=0,
                 tasks_blocked_auto=0,
@@ -3270,6 +3280,54 @@ class TestEtaCommentSuffixWhenBlockedDominates:
         assert "blocked-recovery 60" in out
         assert "blocked-auto 27" in out
         assert "5.6 min/task" in out
+
+
+class TestEtaMinutesPerHourRenameIsValuePreserving:
+    """#329 FR-5 (E13-F2-S2-T1): report.py's ETA-hours conversion divides
+    ``pace_for_projection`` (a minutes-valued quantity) by ``MINUTES_PER_HOUR``
+    instead of the semantically-wrong ``SECONDS_PER_MINUTE``. Both constants
+    equal 60 today, so this test pins the exact rendered ETA cell for a fully
+    deterministic window: it must pass identically whether the conversion
+    divides by ``SECONDS_PER_MINUTE`` or ``MINUTES_PER_HOUR``, proving the
+    rename introduces no output defect."""
+
+    def test_rendered_eta_is_byte_identical_across_the_rename(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from devbench.reporting.report import _compute_window_stats, _format_est_hours_display
+
+        # Pin RECENT_PACE_TASKS so the sample count needed to resolve
+        # recent_pace_minutes does not depend on the ambient environment.
+        monkeypatch.setattr("devbench.reporting.report.RECENT_PACE_TASKS", 3)
+
+        now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+        done_times: dict[str, datetime] = {}
+        progress_times: dict[str, datetime] = {}
+        for i in range(3):
+            tid = f"E0-F1-S1-T{i + 1}"
+            done_times[tid] = now - timedelta(minutes=i)
+            progress_times[tid] = done_times[tid] - timedelta(minutes=30)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            now - timedelta(hours=1),
+            now,
+            done_times,
+            _as_claims(progress_times),
+            tasks_active=2,
+            tasks_blocked_recovery=0,
+            tasks_blocked_auto=0,
+            tasks_blocked_runtime_degradation=0,
+        )
+
+        # Every sample is exactly 30 minutes, so the median pace is exactly
+        # 30.0 -- a value chosen so the est_hours division lands on an exact
+        # round number regardless of which 60-valued constant is the divisor.
+        assert stats.recent_pace_minutes == 30.0
+        assert stats.est_hours == 1.0
+        assert _format_est_hours_display(stats) == "~1.0 h (active 2 at 30.0 min/task)"
 
 
 class TestReportInProgressDurationSuffix:
@@ -4470,6 +4528,247 @@ class TestSessionSegmentationHelpers:
         assert _session_index_for(datetime(2026, 8, 10, 8, 0, tzinfo=UTC), []) == 0
 
 
+class TestExecutionAnchor:
+    """Issue #329 FR-2 (AC-E13-F1-S2-T1-2): ``_execution_anchor`` returns the
+    minimum same-session claim <= ``done_at``, else ``None``. The single
+    shared selection helper both ``_compute_window_stats`` and
+    ``_recent_pace_minutes`` delegate to (AC-11, see
+    ``TestExecutionAnchorSingleSourceOfTruth``).
+    """
+
+    def test_two_same_session_claims_anchors_to_the_earliest(self) -> None:
+        """AC-8 / #329 live shape: E11-F1-S1-T2 claimed at 19:50:20 and
+        20:34:17 (same session), done at 20:54:07 -- the anchor is the
+        FIRST claim, not the last."""
+        from devbench.reporting.report import _execution_anchor
+
+        done_at = datetime(2026, 8, 10, 20, 54, 7, tzinfo=UTC)
+        first_claim = datetime(2026, 8, 10, 19, 50, 20, tzinfo=UTC)
+        second_claim = datetime(2026, 8, 10, 20, 34, 17, tzinfo=UTC)
+        assert _execution_anchor([first_claim, second_claim], done_at, []) == first_claim
+        # Order-independence: a claims list is not required to arrive sorted.
+        assert _execution_anchor([second_claim, first_claim], done_at, []) == first_claim
+
+    def test_prior_session_only_claim_returns_none(self) -> None:
+        """AC-9: the completion's only claim sits in an earlier orchestrator
+        session -- no eligible anchor exists."""
+        from devbench.reporting.report import _execution_anchor
+
+        boundaries = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 8, 30, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        assert _execution_anchor([prior_claim], done_at, boundaries) is None
+
+    def test_mixed_prior_and_current_session_anchors_to_earliest_current(self) -> None:
+        """AC-10: one prior-session claim plus one current-session claim
+        anchors to the earliest CURRENT-session claim, never the prior one."""
+        from devbench.reporting.report import _execution_anchor
+
+        boundaries = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+        current_claim = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 30, tzinfo=UTC)
+        assert _execution_anchor([prior_claim, current_claim], done_at, boundaries) == current_claim
+
+    def test_claim_after_done_at_is_never_eligible(self) -> None:
+        """A claim later than ``done_at`` (clock anomaly) never becomes an
+        anchor, even though it is otherwise same-session."""
+        from devbench.reporting.report import _execution_anchor
+
+        done_at = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        clock_anomaly_claim = datetime(2026, 8, 10, 10, 5, tzinfo=UTC)
+        assert _execution_anchor([clock_anomaly_claim], done_at, []) is None
+
+    def test_empty_claims_returns_none(self) -> None:
+        from devbench.reporting.report import _execution_anchor
+
+        assert _execution_anchor([], datetime(2026, 8, 10, tzinfo=UTC), []) is None
+
+
+class TestExecutionAnchorSingleSourceOfTruth:
+    """AC-11 (spec AC-11 / AC-E13-F1-S2-T1-6): both anchor consumers obtain
+    the anchor from ``_execution_anchor``; neither re-implements the
+    same-session-claim-selection scan inline. ``_same_session`` is called
+    from exactly one place in the module: inside ``_execution_anchor``."""
+
+    def test_neither_consumer_reimplements_the_claim_selection(self) -> None:
+        import inspect
+
+        from devbench.reporting import report
+
+        anchor_src = inspect.getsource(report._execution_anchor)
+        window_stats_src = inspect.getsource(report._compute_window_stats)
+        recent_pace_src = inspect.getsource(report._recent_pace_minutes)
+
+        assert "_execution_anchor(" in window_stats_src
+        assert "_execution_anchor(" in recent_pace_src
+        assert "_same_session(" in anchor_src
+        assert "_same_session(" not in window_stats_src
+        assert "_same_session(" not in recent_pace_src
+
+
+class TestConsumersAnchorOnEarliestClaim:
+    """AC-8/AC-9/AC-10 (spec) via the public consumers: both
+    ``_recent_pace_minutes`` and ``_compute_window_stats`` route their claim
+    selection through ``_execution_anchor``, so the earliest-claim, prior-
+    session-exclusion, and mixed-session behaviours are visible end-to-end,
+    not just at the helper level (``TestExecutionAnchor`` above)."""
+
+    # #329 live shape: E11-F1-S1-T2 claimed twice in the same session before
+    # being closed. The true window is measured from the FIRST claim
+    # (63.8 min), not the last (19.8 min).
+    _TID = "E11-F1-S1-T2"
+    _DONE_AT = datetime(2026, 8, 10, 20, 54, 7, tzinfo=UTC)
+    _FIRST_CLAIM = datetime(2026, 8, 10, 19, 50, 20, tzinfo=UTC)
+    _SECOND_CLAIM = datetime(2026, 8, 10, 20, 34, 17, tzinfo=UTC)
+
+    def test_recent_pace_minutes_anchors_to_earliest_claim_not_last(self) -> None:
+        from devbench.reporting.report import _recent_pace_minutes
+
+        done = {self._TID: self._DONE_AT}
+        claims = {self._TID: [self._FIRST_CLAIM, self._SECOND_CLAIM]}
+
+        median, excluded = _recent_pace_minutes(done, claims, [], n=1)
+        assert median == pytest.approx(63.783333, abs=0.01)
+        assert median != pytest.approx(19.833333, abs=0.01)
+        assert median != pytest.approx(3.0, abs=0.01)
+        assert excluded == 0
+
+    def test_compute_window_stats_anchors_to_earliest_claim_not_last(self, tmp_path: Path) -> None:
+        """MIN_PACE_SAMPLES requires >= 3 in-window samples before
+        ``avg_minutes`` reports a median instead of the below-threshold
+        zero, so 2 filler tasks with the SAME target duration (single claim
+        each) pad the window without changing the expected median."""
+        from devbench.constants import MIN_PACE_SAMPLES
+        from devbench.reporting.report import _compute_window_stats
+
+        target_duration_minutes = (self._DONE_AT - self._FIRST_CLAIM).total_seconds() / 60
+        filler_base = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        done = {self._TID: self._DONE_AT}
+        claims: dict[str, list[datetime]] = {self._TID: [self._FIRST_CLAIM, self._SECOND_CLAIM]}
+        for i in range(MIN_PACE_SAMPLES - 1):
+            filler_tid = f"E0-F1-S1-T{i + 1}"
+            filler_claim = filler_base + timedelta(hours=i)
+            claims[filler_tid] = [filler_claim]
+            done[filler_tid] = filler_claim + (self._DONE_AT - self._FIRST_CLAIM)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            filler_base - timedelta(minutes=1),
+            self._DONE_AT + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+        )
+        assert stats.pace_excluded_count == 0
+        assert stats.pace_sample_count == MIN_PACE_SAMPLES
+        assert stats.avg_minutes == pytest.approx(target_duration_minutes, abs=0.01)
+        assert stats.avg_minutes != pytest.approx(19.833333, abs=0.01)
+
+    def test_compute_window_stats_excludes_prior_session_only_claim_with_byte_identical_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-9: a task whose only claim sits in an earlier orchestrator
+        session has no execution window, and the #326 suffix text is
+        byte-identical to its pre-#329 form."""
+        from devbench.reporting.report import _compute_window_stats, _no_execution_window_suffix
+
+        tid = "E0-F1-S9-T1"
+        session_starts = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 8, 30, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        done = {tid: done_at}
+        claims = {tid: [prior_claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+            done_at + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+        )
+        assert stats.pace_excluded_count == 1
+        assert stats.pace_sample_count == 0
+        assert _no_execution_window_suffix(stats.pace_excluded_count) == " (1 excluded: no execution window)"
+
+    def test_compute_window_stats_mixed_session_claims_anchor_to_earliest_current(self, tmp_path: Path) -> None:
+        """AC-10: one prior-session claim plus one current-session claim
+        anchors to the earliest CURRENT-session claim. Padded with 2
+        same-session, same-duration filler tasks to clear MIN_PACE_SAMPLES."""
+        from devbench.constants import MIN_PACE_SAMPLES
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        session_starts = [datetime(2026, 8, 1, 8, 0, tzinfo=UTC), datetime(2026, 8, 9, 8, 0, tzinfo=UTC)]
+        prior_claim = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+        current_claim = datetime(2026, 8, 9, 9, 0, tzinfo=UTC)
+        done_at = datetime(2026, 8, 9, 9, 30, tzinfo=UTC)
+        done = {tid: done_at}
+        claims: dict[str, list[datetime]] = {tid: [prior_claim, current_claim]}
+        for i in range(MIN_PACE_SAMPLES - 1):
+            filler_tid = f"E0-F1-S2-T{i + 1}"
+            filler_claim = current_claim + timedelta(hours=i + 1)
+            claims[filler_tid] = [filler_claim]
+            done[filler_tid] = filler_claim + timedelta(minutes=30)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+            done[f"E0-F1-S2-T{MIN_PACE_SAMPLES - 1}"] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+        )
+        assert stats.pace_excluded_count == 0
+        assert stats.pace_sample_count == MIN_PACE_SAMPLES
+        # 9:30 - 9:00 (current claim), not 9:30 - (8/1) 9:00 (prior session).
+        assert stats.avg_minutes == pytest.approx(30.0)
+
+    def test_generate_report_end_to_end_anchors_to_earliest_claim_via_recent_pace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-8 / #329 live shape, exercised end-to-end through the public
+        ``generate_report`` entry point rather than a private helper called
+        directly. ``RECENT_PACE_TASKS`` is patched to 1 so the single target
+        completion alone determines the rendered "Recent pace" figure -- no
+        filler samples are needed, and none can mask a wrong anchor
+        selection the way ``statistics.median`` masks a lone wrong-valued
+        sample among matching fillers (see ``TestCaseDMedianRobustness``).
+        The rendered figure must reflect the FIRST same-session claim
+        (63.8 min), never the last (19.8 min)."""
+        monkeypatch.setattr("devbench.reporting.report.RECENT_PACE_TASKS", 1)
+        # A short-lived same-session filler task splits the ~44-minute gap
+        # between the two target claims so the log-wide gap-walk never
+        # inserts a session boundary between them (session-gap threshold is
+        # DEFAULT_SESSION_GAP_MINUTES=30) -- matching the live #329 log,
+        # where other tasks' activity keeps the two claims in one session.
+        entries = [
+            f"{self._FIRST_CLAIM.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] "
+            f"INFO Set {self._TID} to 'in-progress'",
+            "2026-08-10T20:05:00Z [devbench.backlog_manager] INFO Set E0-F1-S9-T1 to 'in-progress'",
+            "2026-08-10T20:15:00Z [devbench.backlog_manager] INFO Set E0-F1-S9-T1 to 'done'",
+            f"{self._SECOND_CLAIM.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] "
+            f"INFO Set {self._TID} to 'in-progress'",
+            f"{self._DONE_AT.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] INFO Set {self._TID} to 'done'",
+        ]
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(entries))
+
+        report = generate_report(log_path=log_file)
+
+        assert "63.8 min" in report
+        assert "19.8 min" not in report
+
+
 def _pace_case_stale_claim() -> tuple[dict[str, datetime], dict[str, datetime], list[datetime]]:
     """Case (a): an operator ``set-status done`` on a stale claim from an
     earlier orchestrator session. Three normal same-session samples
@@ -4536,6 +4835,22 @@ def _pace_default_window(
     )
 
 
+def _as_claims(progress_times: dict[str, datetime]) -> dict[str, list[datetime]]:
+    """Issue #329 FR-2: wrap a single-claim-per-task mapping as a one-element
+    claims list.
+
+    Most pace/window-stats fixtures in this module model exactly one
+    ``in-progress`` claim per task (the common case). ``_compute_window_stats``
+    and ``_recent_pace_minutes`` now take ``dict[str, list[datetime]]`` (the
+    shape ``task_transition_time_series_for_workspace`` returns) so
+    ``_execution_anchor`` has every candidate claim to select from; this
+    helper converts the convenient single-claim fixture shape into that
+    shape at the call boundary, without duplicating literal claim data in
+    every test.
+    """
+    return {tid: [ts] for tid, ts in progress_times.items()}
+
+
 _PACE_GATE_CASES = [
     pytest.param(*_pace_case_stale_claim(), 3, 25.0, 1, id="case_a_stale_claim"),
     pytest.param(*_pace_case_same_session_outlier(), 4, 20.0, 0, id="case_d_same_session_outlier"),
@@ -4562,7 +4877,7 @@ class TestRecentPaceAndWindowStatsSessionGate:
     ) -> None:
         from devbench.reporting.report import _recent_pace_minutes
 
-        median, excluded = _recent_pace_minutes(done_times, progress_times, session_starts, n)
+        median, excluded = _recent_pace_minutes(done_times, _as_claims(progress_times), session_starts, n)
         assert median == pytest.approx(expected_median)
         assert excluded == expected_excluded
 
@@ -4591,7 +4906,7 @@ class TestRecentPaceAndWindowStatsSessionGate:
             window_start,
             window_end,
             done_times,
-            progress_times,
+            _as_claims(progress_times),
             tasks_active=0,
             session_starts=session_starts,
         )
@@ -4610,7 +4925,7 @@ class TestCaseDMedianRobustness:
         from devbench.reporting.report import _recent_pace_minutes
 
         done, prog, session_starts = _pace_case_same_session_outlier()
-        median, excluded = _recent_pace_minutes(done, prog, session_starts, n=4)
+        median, excluded = _recent_pace_minutes(done, _as_claims(prog), session_starts, n=4)
         raw_durations = [(done[tid] - prog[tid]).total_seconds() / 60 for tid in done]
         assert excluded == 0
         assert median == pytest.approx(statistics.median(raw_durations))
@@ -4624,7 +4939,7 @@ class TestCaseDMedianRobustness:
         log_path = tmp_path / "log.log"
         log_path.write_text("", encoding="utf-8")
         stats = _compute_window_stats(
-            log_path, window_start, window_end, done, prog, tasks_active=0, session_starts=session_starts
+            log_path, window_start, window_end, done, _as_claims(prog), tasks_active=0, session_starts=session_starts
         )
         raw_durations = [(done[tid] - prog[tid]).total_seconds() / 60 for tid in done]
         assert stats.pace_excluded_count == 0
@@ -4633,21 +4948,25 @@ class TestCaseDMedianRobustness:
 
 
 class TestRecentPaceReclaimAcrossRestart:
-    """Case (b): the LAST (post-restart) claim is same-session as done ->
-    accepted, and it does not count toward ``excluded``."""
+    """Case (b): a claim in the CURRENT session is same-session as done ->
+    accepted, and it does not count toward ``excluded``. Issue #329 FR-2:
+    now that ``progress_claims`` carries every claim (not just the most
+    recent), a stale PRE-restart claim in an earlier session and a genuine
+    POST-restart claim in the current session both feed the same task; the
+    anchor resolves to the current-session claim (the earliest one eligible)
+    and the prior-session claim is correctly ignored."""
 
-    def test_reclaimed_task_uses_last_claim_and_is_not_excluded(self) -> None:
+    def test_reclaimed_task_anchors_to_current_session_claim_and_is_not_excluded(self) -> None:
         from devbench.reporting.report import _recent_pace_minutes
 
         session_starts = [datetime(2026, 8, 10, 8, 0, tzinfo=UTC), datetime(2026, 8, 10, 12, 0, tzinfo=UTC)]
         tid = "E0-F1-S1-T1"
-        # progress_times holds only the LAST (post-restart) claim -- the
-        # report never sees an earlier pre-restart claim (upstream MAX(ts)
-        # semantics collapse a task to a single in-progress timestamp).
-        prog = {tid: datetime(2026, 8, 10, 12, 5, tzinfo=UTC)}
+        pre_restart_claim = datetime(2026, 8, 10, 9, 0, tzinfo=UTC)
+        post_restart_claim = datetime(2026, 8, 10, 12, 5, tzinfo=UTC)
+        claims = {tid: [pre_restart_claim, post_restart_claim]}
         done = {tid: datetime(2026, 8, 10, 12, 45, tzinfo=UTC)}
 
-        median, excluded = _recent_pace_minutes(done, prog, session_starts, n=1)
+        median, excluded = _recent_pace_minutes(done, claims, session_starts, n=1)
         assert median == pytest.approx(40.0)
         assert excluded == 0
 
@@ -4674,7 +4993,7 @@ class TestUniformSamplesByteIdentical:
             base,
             base + timedelta(hours=11),
             done,
-            prog,
+            _as_claims(prog),
             tasks_active=0,
         )
         assert stats.avg_minutes == pytest.approx(40.0)
@@ -4873,6 +5192,308 @@ class TestSummaryLineExclusionSuffix:
         assert "excluded" not in line
 
 
+class TestRejectedRowsSuffix:
+    """Issue #329 FR-6 (AC-18, AC-19): the rejected-row count renders as a
+    suffix on both the ``Average time per task`` and ``Recent pace`` cells,
+    composed AFTER the #326 ``_no_execution_window_suffix``."""
+
+    @pytest.mark.parametrize(
+        ("rejected", "expected"),
+        [
+            (0, ""),
+            (1, " (1 non-transition rows rejected)"),
+            (44, " (44 non-transition rows rejected)"),
+        ],
+    )
+    def test_suffix_text(self, rejected: int, expected: str) -> None:
+        from devbench.reporting.report import _rejected_rows_suffix
+
+        assert _rejected_rows_suffix(rejected) == expected
+
+    @staticmethod
+    def _make_stats(
+        avg_minutes: float,
+        pace_excluded_count: int,
+        recent_pace_minutes: float | None,
+        recent_pace_excluded_count: int,
+        rejected_row_count: int,
+    ) -> WindowStats:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        return WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=4,
+            avg_minutes=avg_minutes,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            pace_sample_count=3,
+            pace_excluded_count=pace_excluded_count,
+            recent_pace_minutes=recent_pace_minutes,
+            recent_pace_excluded_count=recent_pace_excluded_count,
+            rejected_row_count=rejected_row_count,
+        )
+
+    def test_field_defaults_to_zero_and_existing_construction_still_works(self) -> None:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        stats = WindowStats(
+            window_start=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+        )
+        assert stats.rejected_row_count == 0
+
+    def test_avg_minutes_cell_carries_rejected_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, None, 0, 44)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min (44 non-transition rows rejected)" in values
+
+    def test_avg_minutes_cell_has_no_suffix_when_nothing_rejected(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, None, 0, 0)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min" in values
+        assert "rejected" not in " ".join(values)
+
+    def test_recent_pace_cell_carries_rejected_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, 47.0, 0, 44)
+        values = _stats_to_value_list(stats)
+        assert "47.0 min (44 non-transition rows rejected)" in values
+
+    def test_recent_pace_cell_na_carries_rejected_suffix(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, None, 0, 44)
+        values = _stats_to_value_list(stats)
+        assert "n/a (44 non-transition rows rejected)" in values
+
+    def test_both_suffixes_compose_in_the_documented_order(self) -> None:
+        """AC-18: ``_no_execution_window_suffix`` (#326) renders FIRST, then
+        ``_rejected_rows_suffix`` (#329 FR-6)."""
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 1, 47.0, 2, 44)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min (1 excluded: no execution window) (44 non-transition rows rejected)" in values
+        assert "47.0 min (2 excluded: no execution window) (44 non-transition rows rejected)" in values
+
+    def test_clean_stats_render_byte_identical_to_pre_fr6(self) -> None:
+        """AC-19: zero excluded, zero rejected -> no suffix at all on either cell."""
+        from devbench.reporting.report import _stats_to_value_list
+
+        stats = self._make_stats(33.4, 0, 47.0, 0, 0)
+        values = _stats_to_value_list(stats)
+        assert "33.4 min" in values
+        assert "47.0 min" in values
+        joined = " ".join(values)
+        assert "excluded" not in joined
+        assert "rejected" not in joined
+
+
+class TestComputeWindowStatsRejectedRowCount:
+    """Issue #329 FR-6: ``_compute_window_stats`` populates
+    ``rejected_row_count`` from the difference between
+    ``unfiltered_progress_claim_counts`` (the raw candidate count) and the
+    logger-filtered ``len(progress_claims[tid])``, summed over the tasks
+    done in the window."""
+
+    def test_default_none_yields_zero(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            claim - timedelta(minutes=1),
+            done[tid] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+        )
+        assert stats.rejected_row_count == 0
+
+    def test_supplied_counts_compute_the_difference(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            claim - timedelta(minutes=1),
+            done[tid] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            unfiltered_progress_claim_counts={tid: 8},
+        )
+        assert stats.rejected_row_count == 7
+
+    def test_task_missing_from_counts_contributes_zero_not_a_spurious_rejection(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            claim - timedelta(minutes=1),
+            done[tid] + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            unfiltered_progress_claim_counts={},
+        )
+        assert stats.rejected_row_count == 0
+
+    def test_sums_across_multiple_tasks_in_the_window(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        base = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+        done: dict[str, datetime] = {}
+        claims: dict[str, list[datetime]] = {}
+        counts: dict[str, int] = {}
+        extras = (1, 2, 3)
+        for i, extra in enumerate(extras):
+            tid = f"E0-F1-S1-T{i + 1}"
+            claim_at = base + timedelta(hours=i)
+            done[tid] = claim_at + timedelta(minutes=10)
+            claims[tid] = [claim_at]
+            counts[tid] = 1 + extra
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            base - timedelta(minutes=1),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            unfiltered_progress_claim_counts=counts,
+        )
+        assert stats.rejected_row_count == sum(extras)
+
+    def test_negative_would_be_count_raises_assertion_error(self, tmp_path: Path) -> None:
+        """Documented invariant: the unfiltered candidate count can never be
+        smaller than the logger-filtered claim count it is drawn from."""
+        from devbench.reporting.report import _compute_window_stats
+
+        tid = "E0-F1-S1-T1"
+        claim = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+        done = {tid: datetime(2026, 8, 10, 10, 32, 6, tzinfo=UTC)}
+        claims = {tid: [claim]}
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        with pytest.raises(AssertionError):
+            _compute_window_stats(
+                log_path,
+                claim - timedelta(minutes=1),
+                done[tid] + timedelta(minutes=1),
+                done,
+                claims,
+                tasks_active=0,
+                unfiltered_progress_claim_counts={tid: 0},
+            )
+
+
+class TestGenerateReportSurfacesRejectedRowCount:
+    """Issue #329 FR-6 end-to-end: ``generate_report`` wires
+    ``EventIndex.task_transition_candidate_counts_for_workspace`` into every
+    ``_compute_window_stats`` call, so a cache holding a phantom pre-FR-1b
+    echo row surfaces the provenance suffix through the real report
+    pipeline, not just the unit-level helper."""
+
+    def test_phantom_cache_row_surfaces_the_suffix_in_the_rendered_report(self, tmp_path: Path) -> None:
+        from devbench.reporting.event_index import EventIndex
+
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-08-11T16:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-08-11T16:32:06Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with (
+            patch("devbench.reporting.report.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            idx = EventIndex.open(tmp_path)
+            try:
+                idx.refresh_orch_log_sources(tmp_path, log_file)
+                file_id = idx._conn.execute(
+                    "SELECT file_id FROM source_files WHERE path = ?", (str(log_file),)
+                ).fetchone()[0]
+                # Shaped exactly as pre-FR-1b ingestion would have written a
+                # devbench.cli echo of the same 'in-progress' transition.
+                idx._conn.execute(
+                    "INSERT INTO orch_log_events "
+                    "(file_id, line_offset, ts_epoch_us, logger, task_id, transition) VALUES (?, ?, ?, ?, ?, ?)",
+                    (file_id, 999_999, 1_754_929_326_000_000, "devbench.cli", "E0-F1-S1-T1", "in-progress"),
+                )
+            finally:
+                idx.close()
+
+            report = generate_report(log_path=log_file)
+
+        assert "(1 non-transition rows rejected)" in report
+
+    def test_no_phantom_row_renders_without_the_suffix(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-08-11T16:00:00Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-08-11T16:32:06Z [devbench.backlog_manager] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with (
+            patch("devbench.reporting.report.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            report = generate_report(log_path=log_file)
+
+        assert "non-transition rows rejected" not in report
+
+
 class TestGenerateReportThreadsSessionStarts:
     """FR-5: generate_report computes session_starts once and threads it
     into every _compute_window_stats call site so an operator-closed stale
@@ -4896,7 +5517,7 @@ class TestGenerateReportThreadsSessionStarts:
         from devbench.constants import DEFAULT_SESSION_GAP_MINUTES
 
         log_file = tmp_path / "test.log"
-        entries = ["2026-07-29T11:19:28Z [judges.cli] INFO Set E2-F6-S1-T1 to 'in-progress'"]
+        entries = ["2026-07-29T11:19:28Z [devbench.backlog_manager] INFO Set E2-F6-S1-T1 to 'in-progress'"]
         cursor = datetime(2026, 8, 10, 6, 0, 0, tzinfo=UTC)
         durations = (18, 19, 20, 21, 22, 23, 24, 25, 26)
         assert all(d < DEFAULT_SESSION_GAP_MINUTES for d in durations)
@@ -4904,10 +5525,12 @@ class TestGenerateReportThreadsSessionStarts:
             tid = f"E0-F1-S1-T{i + 1}"
             start = cursor
             end = cursor + timedelta(minutes=dur)
-            entries.append(f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z [judges.cli] INFO Set {tid} to 'in-progress'")
-            entries.append(f"{end.strftime('%Y-%m-%dT%H:%M:%S')}Z [judges.cli] INFO Set {tid} to 'done'")
+            entries.append(
+                f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] INFO Set {tid} to 'in-progress'"
+            )
+            entries.append(f"{end.strftime('%Y-%m-%dT%H:%M:%S')}Z [devbench.backlog_manager] INFO Set {tid} to 'done'")
             cursor = end
-        entries.append("2026-08-10T18:32:33Z [judges.cli] INFO Set E2-F6-S1-T1 to 'done'")
+        entries.append("2026-08-10T18:32:33Z [devbench.backlog_manager] INFO Set E2-F6-S1-T1 to 'done'")
         log_file.write_text(_make_log(entries))
 
         report = generate_report(log_path=log_file)
@@ -4921,3 +5544,846 @@ class TestGenerateReportThreadsSessionStarts:
         # the exclusion count must appear.
         assert "22.0 min" in report
         assert "(1 excluded: no execution window)" in report
+
+
+# --------------------------------------------------------------------------
+# #329 FR-4 (E13-F3-S2-T1, AC-16, AC-E13-F3-S2-T1-1): the regression fixture
+# built from the live-repro log's measured shape (spec/pace-anchor-integrity.md
+# Section 1.3): five completions, each with 3 to 16 candidate 'in-progress'
+# matches, of which 1 to 2 per task are genuine devbench.backlog_manager
+# transitions and the remainder are devbench.cli echoes carrying LATER
+# timestamps.
+# --------------------------------------------------------------------------
+
+_ISSUE_329_MEASURED_TABLE: tuple[dict[str, Any], ...] = (
+    {"task_id": "E11-F1-S1-T1", "genuine_claims": 1, "regex_matches": 7, "true_window_min": 32.1},
+    {"task_id": "E11-F1-S2-T1", "genuine_claims": 1, "regex_matches": 9, "true_window_min": 29.1},
+    {"task_id": "E11-F3-S1-T1", "genuine_claims": 1, "regex_matches": 3, "true_window_min": 17.1},
+    {"task_id": "E11-F1-S1-T2", "genuine_claims": 2, "regex_matches": 16, "true_window_min": 63.8},
+    {"task_id": "E11-F1-S2-T2", "genuine_claims": 1, "regex_matches": 7, "true_window_min": 32.3},
+)
+_ISSUE_329_RECLAIMED_TASK_ID = "E11-F1-S1-T2"
+# #326 regression guard: an unrelated sixth completion whose only claim
+# predates the current orchestrator session -- must stay excluded even
+# though FR-2 now selects the EARLIEST same-session claim among several.
+_ISSUE_329_STALE_TASK_ID = "E0-F9-S1-T1"
+
+
+def _issue_329_regression_fixture() -> tuple[
+    dict[str, datetime],
+    dict[str, list[datetime]],
+    dict[str, int],
+    dict[str, datetime],
+    list[datetime],
+]:
+    """Build the #329 live-repro regression shape from ``_ISSUE_329_MEASURED_TABLE``.
+
+    Each of the five measured tasks gets a ``done`` timestamp and a first
+    genuine claim placed exactly ``true_window_min`` minutes earlier, so
+    ``_execution_anchor`` resolves a window that matches the table's
+    measured value exactly by construction. ``E11-F1-S1-T2`` additionally
+    gets a SECOND, later same-session claim (genuine re-claim) that must NOT
+    win the anchor selection. ``unfiltered_progress_claim_counts`` carries each task's
+    ``regex_matches`` count, so ``_compute_window_stats`` derives
+    ``rejected_row_count`` as ``regex_matches - genuine_claims`` per task --
+    the fixture's built-in ``devbench.cli`` echo count -- without literally
+    materialising echo log lines. A sixth, stale-cross-session-claim task
+    (``_ISSUE_329_STALE_TASK_ID``) exercises the #326 exclusion guard inside
+    the SAME fixture.
+
+    Returns ``(done_times, progress_claims, unfiltered_progress_claim_counts,
+    first_claims, session_starts)``.
+    """
+    current_session_start = datetime(2026, 8, 11, 16, 0, tzinfo=UTC)
+    prior_session_start = datetime(2026, 8, 1, 8, 0, tzinfo=UTC)
+
+    done: dict[str, datetime] = {}
+    claims: dict[str, list[datetime]] = {}
+    unfiltered_counts: dict[str, int] = {}
+    first_claims: dict[str, datetime] = {}
+    for i, row in enumerate(_ISSUE_329_MEASURED_TABLE):
+        tid = row["task_id"]
+        done_at = current_session_start + timedelta(hours=i + 1)
+        first_claim = done_at - timedelta(minutes=row["true_window_min"])
+        task_claims = [first_claim]
+        if row["genuine_claims"] == 2:
+            task_claims.append(first_claim + (done_at - first_claim) * 0.6)
+        done[tid] = done_at
+        claims[tid] = task_claims
+        unfiltered_counts[tid] = row["regex_matches"]
+        first_claims[tid] = first_claim
+
+    done[_ISSUE_329_STALE_TASK_ID] = current_session_start + timedelta(hours=len(_ISSUE_329_MEASURED_TABLE) + 1)
+    claims[_ISSUE_329_STALE_TASK_ID] = [prior_session_start + timedelta(minutes=30)]
+
+    session_starts = [prior_session_start, current_session_start]
+    return done, claims, unfiltered_counts, first_claims, session_starts
+
+
+class TestIssue329RegressionFixture:
+    """FR-4 (AC-16, AC-E13-F3-S2-T1-1, spec Section 1.3): the #329 live-repro
+    regression fixture. Every assertion below is driven by
+    ``_ISSUE_329_MEASURED_TABLE`` rather than a single hardcoded expected
+    value, per the workspace standard on input-driven tests.
+    """
+
+    @pytest.mark.parametrize(
+        "row", _ISSUE_329_MEASURED_TABLE, ids=[row["task_id"] for row in _ISSUE_329_MEASURED_TABLE]
+    )
+    def test_issue_329_regression_each_task_anchors_to_its_first_genuine_claim(self, row: dict[str, Any]) -> None:
+        """Per-task guard, independent of the aggregate median below: every
+        task in the measured table -- including the twice-claimed
+        E11-F1-S1-T2 -- resolves its execution window from the FIRST
+        genuine claim, matching the table's ``true_window_min`` column."""
+        from devbench.reporting.report import _execution_anchor
+
+        done, claims, _unfiltered_counts, first_claims, session_starts = _issue_329_regression_fixture()
+        tid = row["task_id"]
+
+        anchor = _execution_anchor(claims[tid], done[tid], session_starts)
+
+        assert anchor == first_claims[tid]
+        duration_min = (done[tid] - anchor).total_seconds() / 60
+        assert duration_min == pytest.approx(row["true_window_min"], abs=0.01)
+
+    def test_issue_329_regression_average_time_per_task_equals_median_of_first_claim_windows(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-16 / AC-E13-F3-S2-T1-1: ``Average time per task`` equals the
+        median of the FIRST-claim windows -- computed from the measured
+        table at test time, not asserted as a bare literal -- and lands in
+        the corrected 17 to 64 min band, never the pre-#329 defect's
+        2.5 to 3.2 min band."""
+        from devbench.reporting.report import _compute_window_stats
+
+        done, claims, unfiltered_counts, _first_claims, session_starts = _issue_329_regression_fixture()
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            min(session_starts),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+            unfiltered_progress_claim_counts=unfiltered_counts,
+        )
+
+        expected_median = statistics.median(row["true_window_min"] for row in _ISSUE_329_MEASURED_TABLE)
+        assert stats.avg_minutes == pytest.approx(expected_median, abs=0.01)
+        assert 17.0 <= stats.avg_minutes <= 64.0
+        assert not (2.5 <= stats.avg_minutes <= 3.2)
+
+    def test_issue_329_regression_reclaimed_task_is_measured_from_first_claim_not_last(self) -> None:
+        """AC-8 / FR-4 item 3: the twice-claimed task's window is measured
+        from its FIRST claim (~63.8 min), never its second (later) claim."""
+        from devbench.reporting.report import _execution_anchor
+
+        done, claims, _unfiltered_counts, first_claims, session_starts = _issue_329_regression_fixture()
+        tid = _ISSUE_329_RECLAIMED_TASK_ID
+
+        anchor = _execution_anchor(claims[tid], done[tid], session_starts)
+
+        assert anchor == first_claims[tid]
+        assert anchor == min(claims[tid])
+        first_claim_duration = (done[tid] - anchor).total_seconds() / 60
+        second_claim_duration = (done[tid] - max(claims[tid])).total_seconds() / 60
+        assert first_claim_duration == pytest.approx(63.8, abs=0.01)
+        assert first_claim_duration != pytest.approx(second_claim_duration, abs=0.01)
+
+    def test_issue_329_regression_stale_cross_session_claim_still_excluded_with_326_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-4 item 4 / G-4: a stale cross-session claim added to the SAME
+        fixture is still excluded, and the rendered #326 exclusion suffix
+        text is byte-identical to its pre-#329 form."""
+        from devbench.reporting.report import _compute_window_stats, _no_execution_window_suffix
+
+        done, claims, unfiltered_counts, _first_claims, session_starts = _issue_329_regression_fixture()
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            min(session_starts),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+            unfiltered_progress_claim_counts=unfiltered_counts,
+        )
+
+        assert stats.pace_excluded_count == 1
+        assert _no_execution_window_suffix(stats.pace_excluded_count) == " (1 excluded: no execution window)"
+
+    def test_issue_329_regression_rejected_row_count_equals_the_fixtures_echo_count(self, tmp_path: Path) -> None:
+        """FR-4 item 5 / AC-18: the FR-6 rejected-row count equals the
+        number of devbench.cli echo lines built into the fixture -- summed,
+        across the measured table, as ``regex_matches - genuine_claims``."""
+        from devbench.reporting.report import _compute_window_stats
+
+        done, claims, unfiltered_counts, _first_claims, session_starts = _issue_329_regression_fixture()
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        stats = _compute_window_stats(
+            log_path,
+            min(session_starts),
+            max(done.values()) + timedelta(minutes=1),
+            done,
+            claims,
+            tasks_active=0,
+            session_starts=session_starts,
+            unfiltered_progress_claim_counts=unfiltered_counts,
+        )
+
+        expected_echo_count = sum(row["regex_matches"] - row["genuine_claims"] for row in _ISSUE_329_MEASURED_TABLE)
+        assert stats.rejected_row_count == expected_echo_count
+
+
+class TestReadAllDrainStates:
+    """db-306 (spec Section 0 item 7, Section 4 FR-19, R4 RC-2, AC-45):
+    ``read_all_drain_states`` scans the workspace-root drain signal AND every
+    per-session signal unconditionally -- unlike
+    ``devbench.drain.read_drain_state``, whose two-candidate scan is governed
+    by ``DEVBENCH_SESSION_NAME`` so a per-session drain is invisible to a
+    caller whose shell never exported that variable.
+    """
+
+    @staticmethod
+    def _write_signal(path: Path, requested_at: str, requested_by: str, reason: str = "") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"requested_at": requested_at, "requested_by": requested_by, "reason": reason}),
+            encoding="utf-8",
+        )
+
+    def test_read_all_drain_states_finds_session_signal_without_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-session signal is found even when DEVBENCH_SESSION_NAME is unset,
+        and the workspace-root signal is returned alongside it as session None
+        (AC-45, db-306).
+        """
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        session_signal = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        self._write_signal(session_signal, "2026-08-11T09:00:00+00:00", "alice", "per-session freeze")
+        root_signal = tmp_path / ".devbench" / "drain.signal"
+        self._write_signal(root_signal, "2026-08-11T08:00:00+00:00", "bob", "root freeze")
+
+        states = read_all_drain_states(tmp_path)
+
+        assert len(states) == 2
+        root_entry = next(s for s in states if s[0] is None)
+        session_entry = next(s for s in states if s[0] == SESSION_DEFAULT_NAME)
+        assert root_entry[1].requested_by == "bob"
+        assert root_entry[1].reason == "root freeze"
+        assert session_entry[1].requested_by == "alice"
+        assert session_entry[1].reason == "per-session freeze"
+
+    def test_read_all_drain_states_returns_empty_list_when_no_signals_present(self, tmp_path: Path) -> None:
+        """No signal anywhere in the workspace yields an empty list."""
+        assert read_all_drain_states(tmp_path) == []
+
+    def test_read_all_drain_states_root_only_signal_uses_none_session(self, tmp_path: Path) -> None:
+        """A workspace-root-only signal is returned as a single (None, state) entry."""
+        self._write_signal(tmp_path / ".devbench" / "drain.signal", "2026-08-11T08:00:00+00:00", "carol")
+
+        states = read_all_drain_states(tmp_path)
+
+        assert len(states) == 1
+        assert states[0][0] is None
+        assert states[0][1].requested_by == "carol"
+
+    def test_read_all_drain_states_multiple_sessions_sorted_by_name(self, tmp_path: Path) -> None:
+        """Per-session entries are returned in deterministic, sorted-by-name order."""
+        self._write_signal(
+            tmp_path / SESSION_SESSIONS_BASE_DIR / "zeta" / "drain.signal", "2026-08-11T08:00:00+00:00", "z"
+        )
+        self._write_signal(
+            tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha" / "drain.signal", "2026-08-11T08:00:00+00:00", "a"
+        )
+
+        states = read_all_drain_states(tmp_path)
+
+        assert [s[0] for s in states] == ["alpha", "zeta"]
+
+    def test_read_all_drain_states_never_unlinks_a_signal(self, tmp_path: Path) -> None:
+        """Read-only: repeated calls never remove the signal file (AC-5, mutation not widened)."""
+        signal = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        self._write_signal(signal, "2026-08-11T08:00:00+00:00", "dana")
+
+        read_all_drain_states(tmp_path)
+        read_all_drain_states(tmp_path)
+
+        assert signal.exists()
+
+    def test_read_all_drain_states_corrupt_signal_raises_value_error(self, tmp_path: Path) -> None:
+        """Invalid JSON in a signal surfaces as ValueError, matching read_drain_state's contract."""
+        signal = tmp_path / ".devbench" / "drain.signal"
+        signal.parent.mkdir(parents=True)
+        signal.write_text("not json", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="invalid JSON"):
+            read_all_drain_states(tmp_path)
+
+    def test_read_all_drain_states_missing_field_raises_key_error(self, tmp_path: Path) -> None:
+        """A signal missing a required field surfaces as KeyError, matching read_drain_state's contract."""
+        signal = tmp_path / ".devbench" / "drain.signal"
+        signal.parent.mkdir(parents=True)
+        signal.write_text(json.dumps({"requested_by": "eve"}), encoding="utf-8")
+
+        with pytest.raises(KeyError):
+            read_all_drain_states(tmp_path)
+
+
+def _transport_restart_log_line(attempt: int, cap: int = 5, *, timestamp: str | None = None) -> str:
+    """Build one raw ``[ORCHESTRATOR_TRANSPORT_RESTART]`` audit line, matching
+    the exact literal shape ``cli.py``'s ``_should_restart_after_transport_error``
+    logs via ``logger.info("%s attempt=%d max=%d backoff=%.1fs", ...)`` under the
+    ``"%(asctime)s [%(name)s] %(levelname)s %(message)s"`` formatter
+    (``LOG_FORMAT`` / ``LOG_DATE_FORMAT`` in ``devbench.constants``).
+
+    ``timestamp`` overrides the default so window-scoping tests can place
+    restarts on either side of a boundary. Emitted WITHOUT the ``backoff=``
+    suffix so the historical (pre-backoff) log shape stays covered; the
+    suffixed shape has its own test below.
+    """
+    stamp = timestamp if timestamp is not None else f"2026-08-12T18:38:0{attempt}Z"
+    return f"{stamp} [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] attempt={attempt} max={cap}"
+
+
+def _transport_restart_log_line_with_backoff(attempt: int, cap: int, backoff: float, timestamp: str) -> str:
+    """The post-backoff line shape cli.py emits once transport restarts are paced."""
+    return (
+        f"{timestamp} [devbench.cli] INFO [ORCHESTRATOR_TRANSPORT_RESTART] "
+        f"attempt={attempt} max={cap} backoff={backoff:.1f}s"
+    )
+
+
+class TestTransportRestartsLine:
+    """Tests for ``transport_restarts_line()`` (#331 FR-4, AC-11).
+
+    A standalone row-rendering function that returns ``None`` when there is
+    nothing to say. Every count it renders is labelled with the window it
+    measures, so the row cannot be misread as belonging to the narrowest
+    column of the table it sits above.
+    """
+
+    def test_returns_none_when_log_missing(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        assert transport_restarts_line(tmp_path / "does-not-exist.log") is None
+
+    def test_returns_none_when_zero_restarts(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) is None
+
+    def test_renders_labelled_all_time_count_for_single_restart(self, tmp_path: Path) -> None:
+        """With no window boundaries supplied the row still names its window,
+        so a bare number can never be mistaken for a run-scoped count."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([_transport_restart_log_line(1)]))
+
+        line = transport_restarts_line(log_file)
+
+        assert line == "Transport restarts        1 all-time"
+
+    @pytest.mark.parametrize("restart_count", [2, 3, 5])
+    def test_renders_labelled_all_time_count_for_multiple_restarts(self, tmp_path: Path, restart_count: int) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        attempts = range(1, restart_count + 1)
+        restart_lines = [_transport_restart_log_line(attempt, cap=restart_count) for attempt in attempts]
+        log_file.write_text(_make_log(restart_lines))
+
+        line = transport_restarts_line(log_file)
+
+        assert line == f"Transport restarts        {restart_count} all-time"
+
+    def test_counts_lines_carrying_the_backoff_suffix(self, tmp_path: Path) -> None:
+        """The paced line shape cli.py emits once backoff is applied must count
+        exactly like the historical unsuffixed shape."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 10, 1.0, "2026-08-12T18:38:01Z"),
+                    _transport_restart_log_line_with_backoff(2, 10, 2.0, "2026-08-12T18:38:03Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_mixed_historical_and_paced_lines_are_both_counted(self, tmp_path: Path) -> None:
+        """A log spanning the change must not silently drop its older half --
+        the regression the optional ``backoff=`` suffix exists to prevent."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T18:38:01Z"),
+                    _transport_restart_log_line_with_backoff(2, 10, 2.0, "2026-08-12T18:38:05Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_session_window_excludes_restarts_before_the_session_started(self, tmp_path: Path) -> None:
+        """The defect this row's labelling fixes: an old restart storm must not
+        be attributed to the current session."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    _transport_restart_log_line(2, timestamp="2026-08-12T02:00:00Z"),
+                    _transport_restart_log_line(3, timestamp="2026-08-12T10:00:00Z"),
+                ]
+            )
+        )
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        3 all-time / 1 session"
+
+    def test_session_window_counts_a_restart_exactly_on_the_boundary(self, tmp_path: Path) -> None:
+        """The window is inclusive of its start instant."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([_transport_restart_log_line(1, timestamp="2026-08-12T09:00:00Z")]))
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        1 all-time / 1 session"
+
+    def test_renders_all_three_windows_in_watch_mode(self, tmp_path: Path) -> None:
+        """A healthy current run beside an old storm: the whole point of the row."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    _transport_restart_log_line(2, timestamp="2026-08-12T01:00:05Z"),
+                    _transport_restart_log_line(3, timestamp="2026-08-12T09:30:00Z"),
+                ]
+            )
+        )
+
+        line = transport_restarts_line(
+            log_file,
+            session_start=datetime(2026, 8, 12, 9, 0, tzinfo=UTC),
+            report_started_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+        )
+
+        assert line == "Transport restarts        3 all-time / 1 session / 0 this run"
+
+    def test_ignores_marker_text_echoed_mid_line(self, tmp_path: Path) -> None:
+        """A restart marker quoted inside an unrelated SDK payload line (not
+        the logger's own line-initial record) must not inflate the count --
+        the same echoed-text hazard ``event_index.py``'s ``_TASK_TRANSITION_RE``
+        already guards against for task transitions."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-08-12T18:40:00Z [devbench.cli] INFO sdk message: "
+                    "text='previously logged: [ORCHESTRATOR_TRANSPORT_RESTART] attempt=1 max=5'"
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) is None
+
+    def test_transport_restarts_line_asserts_on_impossible_negative_count(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Task-specific error path: a negative count is impossible by
+        construction (``_count_transport_restarts_since`` returns either a
+        ``len`` or a ``sum`` of ones, neither of which can be negative) and is
+        documented by an assertion at the rendering boundary rather than a
+        defensive clamp. The counter is monkeypatched (a legitimate, mockable
+        seam) rather than trying to coerce ``len`` itself to return a negative
+        number, which the interpreter refuses."""
+        from devbench.reporting import report as report_module
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(["irrelevant"]))
+        monkeypatch.setattr(report_module, "_count_transport_restarts_since", lambda timestamps, start: -1)
+
+        with pytest.raises(AssertionError, match="negative"):
+            report_module.transport_restarts_line(log_file)
+
+
+class TestTransportRestartDeduplication:
+    """The orchestrator log emits every record twice (~1.93x measured across
+    five days of one workspace's log), so raw match counting reported roughly
+    double the real restarts. That is read against a cap, so an inflated count
+    misleads about how close a run is to halting."""
+
+    def test_byte_identical_duplicate_emission_counts_once(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        line = _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log([line, line]))  # the doubling the orchestrator actually produces
+
+        assert transport_restarts_line(log_file) == "Transport restarts        1 all-time"
+
+    def test_the_real_world_doubling_pattern_is_halved(self, tmp_path: Path) -> None:
+        """Reproduces the observed shape: each restart written twice, in order."""
+        from devbench.reporting.report import transport_restarts_line
+
+        entries = []
+        for attempt, stamp in ((1, "2026-08-18T17:41:28Z"), (2, "2026-08-18T17:44:49Z")):
+            line = _transport_restart_log_line_with_backoff(attempt, 14, float(2 ** (attempt - 1)), stamp)
+            entries.extend([line, line])
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(entries))
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_distinct_restarts_sharing_a_second_are_both_counted(self, tmp_path: Path) -> None:
+        """De-duplication keys on the WHOLE record, not the timestamp: two
+        restarts in the same second with different ordinals are two restarts."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z"),
+                    _transport_restart_log_line_with_backoff(2, 14, 2.0, "2026-08-18T17:41:28Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_same_ordinal_in_a_later_second_is_a_separate_restart(self, tmp_path: Path) -> None:
+        """A fresh run restarts at attempt=1 again; a different timestamp keeps
+        it distinct, so a long-lived log does not collapse runs together."""
+        from devbench.reporting.report import transport_restarts_line
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T17:41:28Z"),
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-19T03:10:00Z"),
+                ]
+            )
+        )
+
+        assert transport_restarts_line(log_file) == "Transport restarts        2 all-time"
+
+    def test_dedup_applies_within_each_window_not_just_all_time(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import transport_restarts_line
+
+        dupe = _transport_restart_log_line_with_backoff(3, 14, 4.0, "2026-08-18T18:00:00Z")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T01:00:00Z"),
+                    _transport_restart_log_line_with_backoff(1, 14, 1.0, "2026-08-18T01:00:00Z"),
+                    dupe,
+                    dupe,
+                ]
+            )
+        )
+
+        line = transport_restarts_line(log_file, session_start=datetime(2026, 8, 18, 12, 0, tzinfo=UTC))
+
+        assert line == "Transport restarts        2 all-time / 1 session"
+
+
+class TestCountTransportRestartsSince:
+    """Direct unit tests for the pure windowing function, independent of file I/O."""
+
+    @pytest.mark.parametrize(
+        ("start", "expected"),
+        [
+            (None, 3),
+            (datetime(2026, 8, 12, 0, 0, tzinfo=UTC), 3),
+            (datetime(2026, 8, 12, 2, 0, tzinfo=UTC), 2),
+            (datetime(2026, 8, 12, 10, 0, tzinfo=UTC), 0),
+        ],
+    )
+    def test_counts_only_timestamps_at_or_after_start(self, start: datetime | None, expected: int) -> None:
+        from devbench.reporting.report import _count_transport_restarts_since
+
+        stamps = [
+            datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 3, 0, tzinfo=UTC),
+        ]
+
+        assert _count_transport_restarts_since(stamps, start) == expected
+
+    def test_empty_timestamps_count_zero(self) -> None:
+        from devbench.reporting.report import _count_transport_restarts_since
+
+        assert _count_transport_restarts_since([], datetime(2026, 8, 12, tzinfo=UTC)) == 0
+
+
+class TestTransportRestartTimestamps:
+    """The streaming reader that replaced a whole-file ``read_text()``."""
+
+    def test_returns_timestamps_in_file_order_as_utc(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _transport_restart_timestamps
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    _transport_restart_log_line(1, timestamp="2026-08-12T01:00:00Z"),
+                    "2026-08-12T01:30:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    _transport_restart_log_line(2, timestamp="2026-08-12T02:00:00Z"),
+                ]
+            )
+        )
+
+        assert _transport_restart_timestamps(log_file) == [
+            datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+        ]
+
+
+class TestGenerateReportTransportRestartsRow:
+    """Tests for the ``transport_restarts_line()`` row wired into
+    ``generate_report()`` (#331 FR-4, AC-11, spec D-6)."""
+
+    @staticmethod
+    def _write_log(tmp_path: Path, extra_entries: list[str] | None = None) -> Path:
+        log_file = tmp_path / "test.log"
+        entries = [
+            "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+        ]
+        if extra_entries:
+            entries = extra_entries + entries
+        log_file.write_text(_make_log(entries))
+        return log_file
+
+    def test_row_renders_when_restarts_present(self, tmp_path: Path) -> None:
+        """Non-watch mode: All-time and Session are rendered (the table shows
+        both), This run is not (there is no watch loop to scope it to)."""
+        restarts = [_transport_restart_log_line(1), _transport_restart_log_line(2)]
+        log_file = self._write_log(tmp_path, extra_entries=restarts)
+
+        report = generate_report(log_path=log_file)
+        report_lines = report.split("\n")
+
+        # The transport-restarts row is the first line after the banner.
+        assert report_lines[1] == "Transport restarts        2 all-time / 2 session"
+        assert report_lines[2] == ""
+
+    def test_row_scopes_each_window_independently_in_watch_mode(self, tmp_path: Path) -> None:
+        """The reported defect: restarts that predate the current watch loop
+        must render as 0 for This run rather than inflating it, so a stale
+        storm can no longer read as an in-progress failure."""
+        restarts = [
+            _transport_restart_log_line(1, timestamp="2026-03-05T09:00:00Z"),
+            _transport_restart_log_line(2, timestamp="2026-03-05T09:00:05Z"),
+        ]
+        log_file = self._write_log(tmp_path, extra_entries=restarts)
+
+        report = generate_report(
+            log_path=log_file,
+            report_started_at=datetime(2026, 3, 5, 11, 0, tzinfo=UTC),
+        )
+        report_lines = report.split("\n")
+
+        assert report_lines[1].startswith("Transport restarts        2 all-time")
+        assert report_lines[1].endswith("0 this run")
+
+    def test_row_omitted_when_no_restarts_byte_identical(self, tmp_path: Path) -> None:
+        """Spec D-6 / AC-11: a clean run (zero restarts) renders nothing for
+        this row, so the report stays byte-identical to the pre-FR-4 layout
+        -- banner line, then blank."""
+        log_file = self._write_log(tmp_path)
+
+        report = generate_report(log_path=log_file)
+        report_lines = report.split("\n")
+
+        assert "Transport restarts" not in report
+        assert report_lines[1] == ""
+
+    def test_rest_of_report_still_renders_with_restarts_row(self, tmp_path: Path) -> None:
+        log_file = self._write_log(tmp_path, extra_entries=[_transport_restart_log_line(1)])
+
+        report = generate_report(log_path=log_file)
+
+        assert "Transport restarts        1" in report
+        assert "Tasks completed" in report
+        assert "Tasks remaining" in report
+
+
+class TestReviewRejectionsLine:
+    """Tests for ``review_rejections_line()`` -- making a review stall visible.
+
+    A task can burn hours and a large token budget looping through review
+    rejections while every health signal reads green: process alive, log
+    advancing, zero errors logged. This row is what distinguishes that from
+    steady progress.
+    """
+
+    def _unit(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        status: WorkUnitStatus,
+        verdicts: str = "",
+    ) -> WorkUnit:
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}\n\n## Comments\n\n{verdicts}", encoding="utf-8")
+        return WorkUnit(
+            id=unit_id,
+            title="Sample",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/example",
+            dependencies=[],
+        )
+
+    def _fail_rows(self, judge: str, count: int) -> str:
+        return "".join(
+            f"[2026-08-15 0{i}:00 UTC] [judge/{judge}] [REVIEW_FAIL] round {i}\n\n" for i in range(1, count + 1)
+        )
+
+    def test_returns_none_when_no_units(self) -> None:
+        assert review_rejections_line([], lambda _judge: 10) is None
+
+    def test_returns_none_when_no_rejections(self, tmp_path: Path) -> None:
+        """The clean-run contract: no row when there is nothing to say."""
+        units = [self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS)]
+        assert review_rejections_line(units, lambda _judge: 10) is None
+
+    def test_reports_count_and_budget(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 3),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "E0-F1-S1-T1" in row
+        assert "doc_review 3/10" in row
+
+    def test_reports_only_the_judges_that_failed(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 2) + self._fail_rows("code_review", 1),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 5)
+        assert row is not None
+        assert "doc_review 2/5" in row
+        assert "code_review 1/5" in row
+        assert "test_review" not in row
+
+    def test_per_judge_budget_is_reflected(self, tmp_path: Path) -> None:
+        """The denominator comes from the resolver, so it tracks per-judge config."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("doc_review", 1),
+            )
+        ]
+        row = review_rejections_line(units, lambda judge: 2 if judge == "doc_review" else 99)
+        assert row is not None
+        assert "doc_review 1/2" in row
+
+    def test_done_units_are_ignored(self, tmp_path: Path) -> None:
+        """A completed task's rejection history is not actionable."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.DONE,
+                self._fail_rows("doc_review", 4),
+            )
+        ]
+        assert review_rejections_line(units, lambda _judge: 10) is None
+
+    def test_blocked_units_are_reported(self, tmp_path: Path) -> None:
+        """A blocked task with a spent budget is exactly what an operator must see."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.BLOCKED,
+                self._fail_rows("doc_review", 10),
+            )
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "doc_review 10/10" in row
+
+    def test_multiple_units_are_all_listed(self, tmp_path: Path) -> None:
+        units = [
+            self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS, self._fail_rows("doc_review", 1)),
+            self._unit(tmp_path, "E0-F1-S1-T2", WorkUnitStatus.BLOCKED, self._fail_rows("code_review", 2)),
+        ]
+        row = review_rejections_line(units, lambda _judge: 10)
+        assert row is not None
+        assert "E0-F1-S1-T1" in row
+        assert "E0-F1-S1-T2" in row
+
+    def test_unreadable_work_unit_does_not_break_the_report(self, tmp_path: Path) -> None:
+        """A missing file is surfaced by the checks that need it, not by killing the report."""
+        unit = self._unit(tmp_path, "E0-F1-S1-T1", WorkUnitStatus.IN_PROGRESS, self._fail_rows("doc_review", 1))
+        unit.file_path.unlink()
+        assert review_rejections_line([unit], lambda _judge: 10) is None
+
+    def test_non_canonical_judge_is_not_counted(self, tmp_path: Path) -> None:
+        """``manifest_amender`` writes audit-only verdicts and owns no review budget."""
+        units = [
+            self._unit(
+                tmp_path,
+                "E0-F1-S1-T1",
+                WorkUnitStatus.IN_PROGRESS,
+                self._fail_rows("manifest_amender", 3),
+            )
+        ]
+        assert review_rejections_line(units, lambda _judge: 10) is None

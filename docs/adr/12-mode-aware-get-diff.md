@@ -36,7 +36,7 @@ Make `cmd_get_diff` mode-aware, gated on the existing `git_ops.defer_pr` config 
 **defer_pr mode** (`defer_pr: true`):
 
 1. Emit staged and unstaged.
-2. If BOTH are empty the executor has just committed; substitute `git show --format= HEAD` so the post-commit security review still sees this task's commit.
+2. If BOTH are empty the executor has just committed; resolve THIS unit's own commit(s) via `git log --grep '^<unit_id>:' --format=%H` (ALL matching SHAs) and substitute `git show --format= <sha>` per commit, so the post-commit security review still sees this task's commit even when HEAD belongs to a sibling task that committed later on the shared branch. **Superseded in place, db-247 -- see "Correction (db-247, db-296)" below**; the original decision point 2 substituted an unconditional `git show --format= HEAD`, which is a defect this correction fixes.
 3. Emit untracked synthetic hunks unchanged.
 4. DO NOT emit `git diff origin/<default>`. That hunk is the source of the misread and has no correct interpretation in this mode.
 
@@ -47,10 +47,20 @@ All five review judge prompts additionally carry a defensive "Scope contract" li
 ## Consequences
 
 - **Kanon (and every future `defer_pr: true` backlog) sees scope-correct review output.** The T3 / T6 failure mode does not recur.
-- **No behaviour change in the default posture.** Per-task-branch workflows keep the four-hunk output byte-identically.
-- **Post-commit reviews work.** When the executor has committed and the working tree is clean, `get-diff` returns `git show HEAD` instead of an empty string, so security-review (which typically runs after commit) still sees the task's actual changes.
+- **No behaviour change in the default posture.** Per-task-branch workflows keep the four-hunk output byte-identically (as of db-296, also Manifest-scoped -- see the correction note below).
+- **Post-commit reviews work, attributed to the right task.** When the executor has committed and the working tree is clean, `get-diff` resolves and returns THIS unit's own commit(s) (`git log --grep '^<unit_id>:'` then `git show`) instead of an empty string, so security-review (which typically runs after commit) still sees the task's actual changes -- and, per the db-247 correction below, sees the RIGHT task's changes even when a sibling task committed after it on the shared branch.
 - **Regression surface shrinks.** Three plugin-structure regression pins (`TestReviewJudgesUseGetDiffForScope`) now fail any PR that drops the "use get-diff for scope" contract or reintroduces the `git diff origin/main` anti-pattern in a judge prompt.
 - **No new configuration to maintain.** The fix reuses `devbench.config.DEFER_PR`, already populated by `config_loader` from `git_ops.defer_pr`. Operators do not learn a new flag.
+
+## Correction (db-247, db-296)
+
+The original decision point 2 above (and the matching "Post-commit reviews work" consequence) substituted an unconditional `git show --format= HEAD` when staged and unstaged were both empty. That is a defect, not a stylistic choice: in `single_branch` + `defer_pr` mode, multiple tasks commit to the SAME branch, so by the time a later task's post-commit review runs, HEAD may already point at a SIBLING task's commit rather than this task's own commit (db-247). A judge reading `git show HEAD` in that state reviews the wrong task's diff under this task's identity.
+
+This is fixed in place, not via a new ADR, because it corrects a defect in the original decision rather than introducing a new architectural direction (Section 6, spec/bug-closure.md). The fix: resolve this unit's own commit(s) by subject via `git log --grep '^<unit_id>:' --format=%H` (matching the exact `<unit_id>: <title>` commit-message shape `cmd_git_ops` writes) and `git show --format= <sha>` per matching SHA -- a task may carry more than one of its own commits (an initial commit plus a later `pr_review_resolution` fix commit), and every match is emitted. Zero matching commits fails fast with a diagnostic naming the unit, the branch, and the `git log --grep` command to inspect with; there is no HEAD fallback.
+
+Landed together with a second, related fix (db-296): every git query `cmd_get_diff` runs (staged, unstaged, the task-commit `git show`, and non-defer_pr's `git diff origin/<default>`) is now scoped to the unit's real Changes Manifest paths via an explicit `-- <manifest_paths>` pathspec, and `_render_untracked_hunks` intersects `git ls-files --others` against the same path set. Without this, a sibling task's dirty residue in the shared checkout (untracked or unstaged) leaks into a review judge's view of what THIS unit changed. An empty (verification-only) Manifest returns `(no changes)` immediately -- never an unscoped whole-tree diff -- and a malformed Manifest fails fast with `ERROR: Cannot scope diff for '<unit_id>': Changes Manifest is malformed: <exc>`. The two fixes land as one coordinated edit to `cmd_get_diff` (spec Section 9 constraint 1): the combined post-commit query is `git show --format= <sha> -- <manifest_paths>`.
+
+A new companion read-only verb, `devbench check-manifest-scope <unit>`, exposes the staged-vs-Manifest check (`assert_staged_matches_manifest`) without mutating anything. The changes-manifest judge now runs it and treats a non-empty out-of-Manifest staged set as an automatic REVIEW_FAIL, because Manifest-scoping `get-diff` means a staged-but-unmanifested file no longer appears in the diff the judge reads -- `check-manifest-scope` is the deterministic replacement signal (spec Section 9 constraint 6).
 
 ## Alternatives considered and rejected
 
@@ -67,19 +77,22 @@ All five review judge prompts additionally carry a defensive "Scope contract" li
 ## Related files
 
 ### Python
-- `src/devbench/cli.py::cmd_get_diff` -- mode-aware branch on `DEFER_PR`, `git show HEAD` substituted when working tree is empty in `defer_pr` mode, `git diff origin/<default>` skipped entirely in `defer_pr` mode.
+- `src/devbench/cli.py::cmd_get_diff` -- mode-aware branch on `DEFER_PR`; every git query (staged, unstaged, task-commit `git show`, non-defer_pr `git diff origin/<default>`) is scoped to the unit's Changes Manifest pathspec (db-296); `git diff origin/<default>` skipped entirely in `defer_pr` mode; post-commit substitution resolves this unit's own commit(s) via `git log --grep '^<unit_id>:'` instead of HEAD (db-247, corrected in place -- see above).
+- `src/devbench/cli.py::_render_untracked_hunks` -- takes an `allowed: set[str]` parameter and intersects `git ls-files --others` against it (db-296).
+- `src/devbench/cli.py::cmd_check_manifest_scope` -- new read-only verb exposing `assert_staged_matches_manifest`'s check (spec 4.C, db-296 x db-327).
 
 ### Plugin prompts
-- `plugin/devbench/agents/review_team/code-reviewer.md` -- scope-contract line added after get-diff invocation.
-- `plugin/devbench/agents/review_team/test-reviewer.md` -- same.
-- `plugin/devbench/agents/review_team/doc-reviewer.md` -- same.
-- `plugin/devbench/agents/review_team/changes-manifest.md` -- same.
-- `plugin/devbench/agents/security-reviewer.md` -- same.
+- `plugin/devbench-orchestrate/agents/review_team/code-reviewer.md` -- scope-contract line added after get-diff invocation.
+- `plugin/devbench-orchestrate/agents/review_team/test-reviewer.md` -- same.
+- `plugin/devbench-orchestrate/agents/review_team/doc-reviewer.md` -- same.
+- `plugin/devbench-orchestrate/agents/review_team/changes-manifest.md` -- same; also runs `check-manifest-scope` and auto-fails on a non-empty out-of-Manifest staged set (FR-11-A2).
+- `plugin/devbench-orchestrate/agents/security-reviewer.md` -- same.
 
 ### Tests
-- `tests/test_cli.py::TestCmdGetDiffModeAware` -- 7 unit cases (non-defer_pr back-compat pin, defer_pr excludes branch-vs-main, pre-commit returns staged+unstaged, post-commit returns git-show-HEAD, accumulated prior commits do not leak, untracked still rendered, all-empty returns "(no changes)").
+- `tests/test_cli.py::TestCmdGetDiffModeAware` -- 7 unit cases (non-defer_pr back-compat pin, defer_pr excludes branch-vs-main, pre-commit returns staged+unstaged, post-commit resolves the task's own commit via `git log --grep`, accumulated prior commits do not leak, untracked still rendered, all-empty returns "(no changes)").
+- `tests/test_cli.py::TestCmdGetDiffManifestScoping`, `TestCmdGetDiffTaskCommitAttribution`, `TestCmdCheckManifestScope`, `TestChangesManifestJudgeAutoFailsOnManifestMismatch` -- db-296/db-247/FR-11-A2 unit cases (sibling residue exclusion, empty/malformed Manifest, task-commit resolution and no-commit fail-fast, `check-manifest-scope`, and the judge-prompt co-land proof).
 - `tests/test_plugin/test_agent_structure.py::TestReviewJudgesUseGetDiffForScope` -- 3 regression pins parametrized across all 5 judges.
-- `tests/test_integration/test_get_diff_defer_pr_mode.py` -- 2 end-to-end cases (real git repo with 3 prior commits on a shared branch; defer_pr returns task-local scope only, non-defer_pr keeps branch-vs-default hunk).
+- `tests/test_integration/test_get_diff_defer_pr_mode.py` -- 3 end-to-end cases (real git repo with 3 prior commits on a shared branch; defer_pr returns task-local scope only, non-defer_pr keeps the Manifest-scoped branch-vs-default hunk, and a two-task post-commit scenario proves task-commit attribution over HEAD).
 
 ### Docs
 - `docs/adr/12-mode-aware-get-diff.md` (this file).

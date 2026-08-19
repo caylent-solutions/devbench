@@ -16,11 +16,38 @@ from pathlib import Path
 import pytest
 
 from devbench.git_quarantine import (
+    CHECKPOINT_REF_PREFIX,
     QUARANTINE_STASH_PREFIX,
     UNATTRIBUTED_OWNER,
+    _paths_with_local_work,
+    checkpoint_ref,
+    checkpoint_work,
+    find_checkpoint,
+    find_quarantine_stash,
     group_paths_by_owner,
     quarantine_paths,
+    restore_quarantine,
 )
+
+
+def _current_branch(repo: Path) -> str:
+    """Return *repo*'s checked-out branch name.
+
+    Stash subjects embed the branch (``"On <branch>: ..."``), and this suite
+    compares those subjects verbatim. The name is whatever ``git init`` chose,
+    which follows the host's ``init.defaultBranch`` -- ``master`` on a stock
+    install, ``main`` where the operator or the distro set it. Asserting either
+    literal makes the suite pass or fail on git configuration rather than on
+    quarantine behaviour. Reading it back keeps the assertion about the parts
+    this suite actually owns: the prefix, the owner and the claiming unit.
+    """
+    return subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
@@ -166,3 +193,231 @@ class TestQuarantinePaths:
             pytest.raises(RuntimeError, match="timed out"),
         ):
             quarantine_paths(repo, ["src/a.py"], {}, "E1-F1-S1-T1")
+
+
+class TestFindQuarantineStash:
+    def test_none_when_the_owner_has_no_quarantine(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") is None
+
+    def test_owners_own_entry_is_found(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("work\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") == "stash@{0}"
+
+    def test_another_owners_entry_is_not_returned(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("work\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+        assert find_quarantine_stash(repo, "E9-F9-S9-T9") is None
+
+    def test_a_human_stash_is_never_matched(self, tmp_path: Path) -> None:
+        """Only devbench-created entries are eligible; a hand-made stash is the operator's."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("human work\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "stash", "push", "--message", "E1-F1-S1-T1 my own notes"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") is None
+
+    def test_most_recent_entry_wins_when_an_owner_was_displaced_twice(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        manifests = {"E1-F1-S1-T1": ["src/a.py"]}
+        (repo / "src/a.py").write_text("first attempt\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], manifests, "E1-F1-S1-T2")
+        (repo / "src/a.py").write_text("second attempt\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], manifests, "E1-F1-S1-T3")
+        # git pushes each new entry at stash@{0}, so index 0 is the newest.
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") == "stash@{0}"
+
+
+class TestRestoreQuarantine:
+    def test_none_when_there_is_nothing_to_restore(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        assert restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"}) is None
+
+    def test_displaced_work_comes_back_into_the_worktree(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        work = "expensive executor output\n"
+        (repo / "src/a.py").write_text(work, encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+        assert (repo / "src/a.py").read_text(encoding="utf-8") == "baseline\n"
+
+        record = restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"})
+
+        assert record is not None
+        assert record.owner_id == "E1-F1-S1-T1"
+        assert record.paths == ("src/a.py",)
+        assert (repo / "src/a.py").read_text(encoding="utf-8") == work
+
+    def test_untracked_work_comes_back(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/new.py").write_text("brand new\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/new.py"], {"E1-F1-S1-T1": ["src/new.py"]}, "E1-F1-S1-T2")
+        assert not (repo / "src/new.py").exists()
+
+        restore_quarantine(repo, "E1-F1-S1-T1", {"src/new.py"})
+
+        assert (repo / "src/new.py").read_text(encoding="utf-8") == "brand new\n"
+
+    def test_staged_state_is_preserved_across_the_round_trip(self, tmp_path: Path) -> None:
+        """The manifest-scope check reads the index, so staged-ness must survive."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("staged work\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/a.py"], cwd=repo, check=True, capture_output=True)
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+
+        restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"})
+
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"], cwd=repo, check=True, capture_output=True, text=True
+        )
+        assert staged.stdout.split() == ["src/a.py"]
+
+    def test_the_entry_is_consumed_so_it_cannot_apply_twice(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("work\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+
+        restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"})
+
+        assert _stash_subjects(repo) == []
+        assert restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"}) is None
+
+    def test_refuses_when_the_stash_holds_a_path_outside_the_manifest(self, tmp_path: Path) -> None:
+        """Restoring out-of-scope work would recreate the contamination quarantine removes."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n", "src/b.py": "baseline\n"})
+        (repo / "src/a.py").write_text("in scope\n", encoding="utf-8")
+        (repo / "src/b.py").write_text("out of scope\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py", "src/b.py"], {"E1-F1-S1-T1": ["src/a.py", "src/b.py"]}, "E1-F1-S1-T2")
+
+        with pytest.raises(RuntimeError, match="outside its Changes Manifest"):
+            restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"})
+
+        # The entry survives the refusal: nothing is lost when the restore declines.
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") == "stash@{0}"
+
+    def test_refuses_when_a_target_path_already_holds_local_work(self, tmp_path: Path) -> None:
+        """A newer attempt in the tree outranks an older displaced one; never clobber it."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("older attempt\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+        (repo / "src/a.py").write_text("newer attempt\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="already holds uncommitted work"):
+            restore_quarantine(repo, "E1-F1-S1-T1", {"src/a.py"})
+
+        assert (repo / "src/a.py").read_text(encoding="utf-8") == "newer attempt\n"
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") == "stash@{0}"
+
+    def test_unattributed_work_is_never_restored(self, tmp_path: Path) -> None:
+        """The unattributed bucket has no owner to hand it back to."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/orphan.py").write_text("nobody claims me\n", encoding="utf-8")
+        quarantine_paths(repo, ["src/orphan.py"], {}, "E1-F1-S1-T2")
+
+        assert restore_quarantine(repo, UNATTRIBUTED_OWNER, {"src/orphan.py"}) is None
+        expected = (
+            f"On {_current_branch(repo)}: {QUARANTINE_STASH_PREFIX}:{UNATTRIBUTED_OWNER}"
+            ": displaced by claim of E1-F1-S1-T2"
+        )
+        assert _stash_subjects(repo) == [expected]
+
+
+class TestCheckpointWork:
+    def test_clean_checkout_produces_no_checkpoint(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        assert checkpoint_work(repo, "E1-F1-S1-T1") is None
+        assert find_checkpoint(repo, "E1-F1-S1-T1") is None
+
+    def test_in_flight_work_is_snapshotted_to_a_ref(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("in flight\n", encoding="utf-8")
+
+        sha = checkpoint_work(repo, "E1-F1-S1-T1")
+
+        assert sha is not None
+        assert find_checkpoint(repo, "E1-F1-S1-T1") == sha
+
+    def test_the_worktree_is_not_disturbed(self, tmp_path: Path) -> None:
+        """Checkpointing runs at stop time; it must never move the files it snapshots."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("in flight\n", encoding="utf-8")
+
+        checkpoint_work(repo, "E1-F1-S1-T1")
+
+        assert (repo / "src/a.py").read_text(encoding="utf-8") == "in flight\n"
+        assert _porcelain(repo) == ["src/a.py"]
+        assert _stash_subjects(repo) == []
+
+    def test_checkpoint_content_is_recoverable(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        work = "expensive executor output\n"
+        (repo / "src/a.py").write_text(work, encoding="utf-8")
+
+        sha = checkpoint_work(repo, "E1-F1-S1-T1")
+
+        shown = subprocess.run(["git", "show", f"{sha}:src/a.py"], cwd=repo, check=True, capture_output=True, text=True)
+        assert shown.stdout == work
+
+    def test_checkpoint_survives_a_stash_clear(self, tmp_path: Path) -> None:
+        """The whole reason for a ref: the stash stack is not a safe sole copy."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("expensive\n", encoding="utf-8")
+        sha = checkpoint_work(repo, "E1-F1-S1-T1")
+        quarantine_paths(repo, ["src/a.py"], {"E1-F1-S1-T1": ["src/a.py"]}, "E1-F1-S1-T2")
+
+        subprocess.run(["git", "stash", "clear"], cwd=repo, check=True, capture_output=True)
+
+        assert _stash_subjects(repo) == []
+        assert find_checkpoint(repo, "E1-F1-S1-T1") == sha
+        shown = subprocess.run(["git", "show", f"{sha}:src/a.py"], cwd=repo, check=True, capture_output=True, text=True)
+        assert shown.stdout == "expensive\n"
+
+    def test_a_newer_snapshot_supersedes_the_previous_one(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("first\n", encoding="utf-8")
+        first = checkpoint_work(repo, "E1-F1-S1-T1")
+        (repo / "src/a.py").write_text("second\n", encoding="utf-8")
+
+        second = checkpoint_work(repo, "E1-F1-S1-T1")
+
+        assert second != first
+        assert find_checkpoint(repo, "E1-F1-S1-T1") == second
+
+    def test_each_unit_gets_its_own_ref(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("t1 work\n", encoding="utf-8")
+        first = checkpoint_work(repo, "E1-F1-S1-T1")
+        (repo / "src/a.py").write_text("t2 work\n", encoding="utf-8")
+        second = checkpoint_work(repo, "E1-F1-S1-T2")
+
+        assert find_checkpoint(repo, "E1-F1-S1-T1") == first
+        assert find_checkpoint(repo, "E1-F1-S1-T2") == second
+        assert first != second
+
+    def test_ref_name_is_namespaced_under_the_devbench_prefix(self) -> None:
+        assert checkpoint_ref("E1-F1-S1-T1") == f"{CHECKPOINT_REF_PREFIX}/E1-F1-S1-T1"
+
+
+class TestRestoreEdgeCases:
+    def test_no_paths_means_nothing_is_reported_dirty(self, tmp_path: Path) -> None:
+        """Guard for the empty case: `git status -- ` with no pathspec scans everything."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        (repo / "src/a.py").write_text("dirty\n", encoding="utf-8")
+        assert _paths_with_local_work(repo, ()) == ()
+
+    def test_stash_listing_lines_without_the_separator_are_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A malformed listing line must not crash the lookup or mint a false match."""
+        repo = _repo(tmp_path, {"src/a.py": "baseline\n"})
+        monkeypatch.setattr(
+            "devbench.git_quarantine._git",
+            lambda _repo, _args: "garbage-without-separator\n",
+        )
+        assert find_quarantine_stash(repo, "E1-F1-S1-T1") is None

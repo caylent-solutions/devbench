@@ -188,7 +188,14 @@ class BacklogParser:
                 )
 
             if not raw_file_path:
-                raise ValueError(f"Work unit '{raw_id}' has no file path in BACKLOG.md")
+                # FR-20 (db-279, OD-3=A): only Task rows require a file path.
+                # A file-less Epic/Feature/Story row is scaffolding-only and
+                # is tolerated here -- this must match the validator's
+                # ``_check_task_rows_have_files`` tolerance so the two layers
+                # never disagree on the same row.
+                if unit_type is WorkUnitType.TASK:
+                    raise ValueError(f"Task work unit '{raw_id}' has no file path in BACKLOG.md")
+                continue
 
             file_path = (self._backlog_root.parent / raw_file_path).resolve()
             try:
